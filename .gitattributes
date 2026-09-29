@@ -1,0 +1,21 @@
+# 统一换行符策略：任何平台 clone 后工作区都用 LF。
+#
+# 背景：本项目的门禁里有"逐字节一致"断言——test/expert-group-client-integration.test.mjs
+# 与 test/client-shared-boundary.test.mjs 会把 scripts/assemble-client.mjs 现场拼接出的
+# client-bundle.js 与磁盘上的文件逐字节比对。若不固定换行，Windows 上 clone 得到 CRLF
+# 而生成逻辑里含 \n 字面量，就会出现"生成文件与提交内容不一致"的假故障。
+#
+# eol=lf 的优先级高于 core.autocrlf，因此无论各机器怎么配 autocrlf 都保持一致。
+* text=auto eol=lf
+
+# 二进制文件不做任何换行与编码转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.wav  binary
+*.zip  binary
+*.tgz  binary
+*.woff binary
+*.woff2 binary

@@ -1,0 +1,10 @@
+# dsh-expert-group bundle 补丁。
+# 仅插入一个 Host 行；客户端半由该行的包名经 dsh.client 清单发现。
+- insert:
+    - id: dsh-expert-group
+      name: dsh-expert-group
+      config:
+        # 根会话默认启用上游 orchestrator 的主代理编排提示词。
+        enableOrchestrator: true
+        # 裸 Config 默认关闭；安装 bundle 在此显式开启视觉观察员。
+        enableObserver: true

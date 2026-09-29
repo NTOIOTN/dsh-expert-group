@@ -1,0 +1,138 @@
+{
+  "name": "dsh-expert-group",
+  "version": "0.1.1",
+  "description": "DSH 专家子代理、Expert Group 任务侧边栏与设置页（双面 bundle）",
+  "type": "module",
+  "main": "./index.js",
+  "bin": {
+    "prompt-inspector": "./bin/prompt-inspector.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client-bundle.js",
+    "./client-freshness": "./client-freshness.js",
+    "./shared": "./shared.js",
+    "./role-registry": "./role-registry.js",
+    "./resource-budget": "./resource-budget.js",
+    "./orchestrator": "./orchestrator.js",
+    "./image-routing": "./image-routing.js",
+    "./storage": "./storage.js",
+    "./prompt-inspector": "./prompt-inspector.js",
+    "./prompt-sidecar": "./prompt-sidecar.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client-bundle.js",
+    "client.js",
+    "client-notifications.js",
+    "client-expert-group-model.js",
+    "client-expert-group-sidebar.js",
+    "client-model-config.js",
+    "client-freshness.js",
+    "shared.js",
+    "role-registry.js",
+    "resource-budget.js",
+    "host/composition.js",
+    "host/expert-group-snapshot.js",
+    "host/expert-group-runtime.js",
+    "host/fanout-runtime.js",
+    "host/handoff.js",
+    "host/lineage.js",
+    "host/notifications.js",
+    "host/rpc-transport.js",
+    "host/settings-source.js",
+    "host/recovery.js",
+    "host/settings-runtime.js",
+    "host/storage-binding.js",
+    "host/persistence-health.js",
+    "host/system-toast.js",
+    "orchestrator.js",
+    "prompt-contracts.js",
+    "image-routing.js",
+    "storage.js",
+    "prompt-inspector.js",
+    "prompt-sidecar.js",
+    "fanout.js",
+    "fanout-host.js",
+    "rpc-host.js",
+    "assets/notification-whoosh.wav",
+    "scripts/assemble-client.mjs",
+    "scripts/build.mjs",
+    "bin/prompt-inspector.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "LICENSE",
+    "install.ps1",
+    "uninstall.ps1"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-modules",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "dsh-better-sidebar"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-agent": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-attachment": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-modules": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-connection": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-conversation": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-workspace": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-client-ui-sidebar-right": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-invariants": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-scope": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-session": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-session-projection": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-settings": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-storage": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-storage-domain": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-subagent": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-user-approval": "^0.2.0-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "dsh-better-sidebar": "^0.19.1",
+    "react": "^18.2.0",
+    "zod": "^4.4.3"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-client-ui-sidebar-right": {
+      "optional": true
+    },
+    "dsh-better-sidebar": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepare": "npm run build",
+    "test": "node --test \"test/*.test.mjs\"",
+    "release-gate": "node --test test/release-gate.test.mjs test/package-portability.test.mjs test/client-shared-boundary.test.mjs test/model-config.test.mjs",
+    "release": "node scripts/sync-dsh-version.mjs && pnpm run build && pnpm run test && pnpm run release-gate"
+  },
+  "license": "MIT",
+  "optionalDependencies": {
+    "sharp": "^0.35.4"
+  }
+}

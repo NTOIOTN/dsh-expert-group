@@ -1,0 +1,6361 @@
+window.__ModuleLoader__.load({
+  id: "dsh-expert-group",
+  factory: (require) => {
+    /**
+     * freshness/RPC 纯逻辑的唯一实现位于 client-freshness.js（浏览器安全 ES 模块）。
+     * 本文件是 Host 直接原样下发的 classic bundle，浏览器 classic script 解析不支持
+     * import/export，因此这里只保留一个 ModuleLoader adapter：先用 client-freshness
+     * 模块自己的登记函数把它放进同一张模块表，再按模块 id 取回唯一实现。
+     * 宿主只加载包 exports["./client"] 指向的装配产物（scripts/assemble-client.mjs），
+     * 该产物恒含 classic 投影片段，因此共享模块一定先于本 descriptor 登记；client.js
+     * 不再内联第二份同语义实现（那份副本让安装体积双份，且两份代码会各自漂移）。
+     * 取 specifier 时不做路径归一：DSH 的 require 命中同一张 id 表，只有
+     * `<id>/client` 这种 exports 子路径会被 stripClientSuffix 归一。
+     */
+    const FRESHNESS_MODULE_ID = "dsh-expert-group/client-freshness";
+    const freshnessModule = (() => {
+      if (typeof require !== "function") return void 0;
+      for (const specifier of [FRESHNESS_MODULE_ID, "./" + FRESHNESS_MODULE_ID, "./client-freshness.js"]) {
+        try {
+          const loaded = require(specifier);
+          if (loaded !== null && typeof loaded === "object") return loaded;
+        } catch { /* 未登记，尝试下一个 specifier 形式。 */ }
+      }
+      return void 0;
+    })();
+    if (typeof freshnessModule?.registerClientFreshnessModule === "function"
+      && typeof globalThis !== "undefined" && globalThis.__ModuleLoader__ !== void 0) {
+      // 由本模块把自己的 descriptor 登记回同一张表：client-freshness.js 不能被单独
+      // serve（bundle 路由只服务 package exports["./client"]），登记是它进入运行期的唯一路径。
+      freshnessModule.registerClientFreshnessModule(globalThis.__ModuleLoader__);
+    }
+    var module = { exports: {} };
+    var exports = module.exports;
+    Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
+    const react = require("react");
+    const primitives = require("@deepseek-ai/dsh-client-ui-primitives");
+    // assembler 保证两个浏览器安全 IIFE 先于唯一 ModuleLoader descriptor 执行；
+    // 直接加载 client.js 的旧 Host/测试没有这些 Symbol 时保持无侧栏降级。
+    const expertGroupModel = globalThis[Symbol.for("dsh-expert-group/client-expert-group-model")];
+    const expertGroupSidebar = globalThis[Symbol.for("dsh-expert-group/client-expert-group-sidebar")];
+
+    // ── 设置页样式：仅保留 dsh-expert-group settings section 使用的规则。
+    const css = "" +
+      ".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:760px;color:var(--dsw-alias-label-primary)}" +
+      ".deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}" +
+      ".deg_settings_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}" +
+      ".deg_settings_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);align-items:center;gap:20px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_settings_management_row{grid-template-columns:minmax(0,1fr) auto minmax(180px,280px)}" +
+      ".deg_settings_management_row>.deg_settings_checkbox{white-space:nowrap}" +
+      ".deg_settings_management_row>.deg_settings_control{justify-self:end}" +
+      ".deg_settings_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}" +
+      ".deg_settings_control{display:flex;align-items:center;gap:10px;min-width:0}" +
+      ".deg_settings_control input[type=range]{width:100%;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      ".deg_settings_control input[type=number]{width:72px;box-sizing:border-box;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}" +
+      ".deg_settings_control select{width:100%;min-width:0;box-sizing:border-box;padding:7px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}" +
+      ".deg_settings_control select:disabled,.deg_settings_control input:disabled{opacity:.5;cursor:not-allowed}" +
+      ".deg_settings_checkbox{display:flex;align-items:center;gap:8px;cursor:pointer}" +
+      ".deg_settings_checkbox input{width:16px;height:16px;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      ".deg_settings_table_wrap{width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}" +
+      // 模型名称通常最长；压缩角色、供应商和思考深度列，把可用空间优先留给模型选择。
+      ".deg_settings_table{display:grid;min-width:540px;grid-template-columns:minmax(84px,.6fr) minmax(132px,.82fr) minmax(210px,1.5fr) minmax(96px,.62fr);border-top:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_settings_table_head,.deg_settings_table_cell{min-width:0;padding:10px 6px;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_settings_table_head{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);font-weight:600}" +
+      ".deg_settings_table_cell{display:flex;align-items:center;font-size:13px;line-height:20px}" +
+      ".deg_settings_table_cell select{width:100%;min-width:0;box-sizing:border-box;padding:6px 6px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}" +
+      ".deg_settings_table_cell select.deg_settings_provider_select{max-width:170px}" +
+      ".deg_settings_table_cell select.deg_settings_model_select{max-width:260px}" +
+      ".deg_settings_table_cell select.deg_settings_effort_select{max-width:112px}" +
+      ".deg_settings_table_cell select:disabled{opacity:.5;cursor:not-allowed}" +
+      ".deg_settings_role_cell{padding:0;align-items:center}" +
+      ".deg_settings_role_button{display:flex;align-items:center;justify-content:center;gap:7px;flex:0 0 74px;width:74px;height:28px;min-height:28px;padding:4px 6px;box-sizing:border-box;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;line-height:20px;cursor:pointer;text-align:center}" +
+      ".deg_settings_role_button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-label-secondary)}" +
+      ".deg_settings_role_button:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}" +
+      ".deg_settings_role_button[aria-pressed=true]{background:var(--dsw-alias-interactive-bg-secondary,var(--dsw-alias-bg-layer-2));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}" +
+      ".deg_settings_role_button:disabled{opacity:.45;cursor:not-allowed}" +
+      ".deg_settings_prompt_customized_dot{display:inline-block;width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}" +
+      ".deg_settings_prompt_editor{display:flex;flex-direction:column;gap:14px;min-width:0}" +
+      ".deg_prompt_header{display:flex;align-items:center;justify-content:center;min-width:0}" +
+      ".deg_prompt_header .deg_settings_title{margin:0;overflow-wrap:anywhere;text-align:center}" +
+      ".deg_prompt_back{flex:0 0 auto}" +
+      ".deg_prompt_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);font-weight:600}" +
+      ".deg_prompt_textarea{display:block;width:100%;min-height:320px;max-height:60vh;box-sizing:border-box;resize:vertical;overflow:auto;padding:12px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:13px/20px var(--ds-font-family-code,var(--ds-font-family-sans));white-space:pre-wrap}" +
+      ".deg_prompt_textarea:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}" +
+      ".deg_prompt_textarea:disabled{opacity:.55;cursor:not-allowed}" +
+      ".deg_prompt_counter{display:flex;justify-content:flex-end;margin-top:-8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_prompt_counter_warning{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-secondary))}" +
+      ".deg_prompt_counter_error{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}" +
+      ".deg_prompt_readonly{padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}" +
+      ".deg_prompt_readonly strong{display:block;margin-bottom:4px;color:var(--dsw-alias-label-primary);font-weight:600}" +
+      ".deg_prompt_readonly p{margin:0}" +
+      ".deg_prompt_status{min-height:18px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_prompt_footer{display:flex;align-items:center;gap:8px;padding-top:4px}" +
+      ".deg_prompt_footer .deg_btn{flex:0 0 auto;min-width:88px}" +
+      ".deg_prompt_footer .deg_prompt_status{margin-right:auto}" +
+      ".deg_btn_primary{color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      ".deg_btn_primary:hover:not(:disabled){filter:brightness(1.08)}" +
+      ".deg_settings_table_cell .deg_settings_role_button + *{min-width:0}" +
+      ".deg_settings_footer{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding-top:4px}" +
+      ".deg_settings_status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin-right:auto}" +
+      ".deg_settings_error{font-size:12px;line-height:18px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));white-space:pre-wrap}" +
+      ".deg_btn{flex:1;box-sizing:border-box;min-height:32px;padding:6px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;cursor:pointer}" +
+      ".deg_btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}" +
+      ".deg_btn:disabled{opacity:.45;cursor:not-allowed}" +
+      ".deg_btn.deg_btn_primary{color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      ".deg_prompt_dialog_backdrop{position:fixed;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.45)}" +
+      ".deg_prompt_dialog{width:min(100%,440px);box-sizing:border-box;padding:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;box-shadow:0 12px 28px rgba(0,0,0,.28)}" +
+      ".deg_prompt_dialog h3{margin:0 0 8px;font-size:16px;line-height:24px;color:var(--dsw-alias-label-primary)}" +
+      ".deg_prompt_dialog p{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}" +
+      ".deg_prompt_dialog_actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-top:18px}" +
+      // 通知设置是紧凑工具条：标签不换行，停留时间选择器固定宽度，音量组吸收剩余空间。
+      ".deg_settings_notification_row{display:flex;align-items:center;gap:16px;min-width:0;white-space:nowrap}" +
+      ".deg_settings_notification_row>.deg_settings_checkbox{flex:0 0 auto}" +
+      ".deg_settings_notification_row>.deg_settings_control:nth-child(2){flex:0 0 auto}" +
+      ".deg_settings_notification_row>.deg_settings_control:nth-child(2) .deg_settings_label{white-space:nowrap}" +
+      ".deg_settings_notification_row>.deg_settings_control:nth-child(2) select{flex:0 0 74px;width:74px}" +
+      ".deg_settings_notification_row>.deg_settings_control:nth-child(3){flex:1 1 auto;min-width:0}" +
+      ".deg_settings_notification_row>.deg_settings_control:nth-child(3) .deg_settings_label{flex:0 0 auto;white-space:nowrap}" +
+      ".deg_settings_notification_row>.deg_settings_control:nth-child(3) input[type=range]{flex:1 1 auto;min-width:48px}" +
+      ".deg_settings_notification_row>.deg_settings_control:nth-child(3) input[type=number]{flex:0 0 72px;width:72px}" +
+      "@media (max-width:520px){.deg_settings_notification_row{flex-wrap:wrap;row-gap:12px}.deg_settings_notification_row>.deg_settings_control:nth-child(3){flex-basis:100%}}" +
+      ".deg_subagent_metadata{display:block;box-sizing:border-box;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary,var(--dsw-alias-label-primary));font-size:11px;line-height:16px}" +
+      ".deg_full_system_prompt_root[data-open]{padding-bottom:4px}" +
+      ".deg_full_system_prompt_chevron{color:var(--dsw-alias-label-secondary)}" +
+      ".deg_full_system_prompt_body{box-sizing:border-box;width:calc(100% - 22px - var(--dsh-content-font-delta, 0px));margin:4px 0 0 calc(22px + var(--dsh-content-font-delta, 0px));max-height:141px;overflow:auto;padding:10px 16px 12px 12px;border:none;border-radius:8px;background:var(--dsw-alias-markdown-code-block);color:var(--dsw-alias-label-tertiary);font:400 11px/16px var(--ds-font-family-code)}" +
+      ".deg_full_system_prompt{box-sizing:border-box;margin:0;white-space:pre-wrap;overflow-wrap:anywhere}" +
+      // ── 「模型配置」区域：默认折叠的 section + 按需展开的 provider 卡片 ──────────
+      ".deg_mc_section{display:flex;flex-direction:column;gap:10px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_mc_header{display:flex;align-items:center;gap:8px;min-width:0}" +
+      ".deg_mc_toggle{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;padding:0;color:var(--dsw-alias-label-primary);background:transparent;border:none;font:inherit;font-size:13px;line-height:20px;font-weight:600;text-align:left;cursor:pointer}" +
+      ".deg_mc_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}" +
+      ".deg_mc_chevron{flex:0 0 auto;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_body{display:flex;flex-direction:column;gap:10px;min-width:0}" +
+      ".deg_mc_cards{display:flex;flex-direction:column;gap:8px;margin:0;padding:0;list-style:none}" +
+      ".deg_mc_card{display:flex;flex-direction:column;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}" +
+      ".deg_mc_card_head{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}" +
+      ".deg_mc_card_name{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}" +
+      ".deg_mc_card_route{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);font-family:var(--ds-font-family-code,inherit)}" +
+      ".deg_mc_card_actions{display:flex;align-items:center;gap:8px;margin-left:auto}" +
+      ".deg_mc_card_actions .deg_btn{flex:0 0 auto;min-width:64px}" +
+       ".deg_mc_card_actions .deg_mc_delete_btn{color:var(--dsw-alias-state-error-primary,#ef4444)}" +
+       ".deg_mc_dot[data-state=available]{background:var(--dsw-alias-state-success-primary,#22c55e)}" +
+      ".deg_mc_dot{display:inline-block;width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_badge{font-size:11px;line-height:16px;padding:1px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_field{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,240px);align-items:center;gap:12px}" +
+      ".deg_mc_field_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}" +
+      ".deg_mc_input,.deg_mc_select{box-sizing:border-box;width:100%;min-width:0;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}" +
+      ".deg_mc_input:disabled,.deg_mc_select:disabled{opacity:.5;cursor:not-allowed}" +
+      ".deg_mc_input:focus-visible,.deg_mc_select:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}" +
+      ".deg_mc_models{display:flex;flex-direction:column;gap:8px;min-width:0;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_mc_models_head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}" +
+      ".deg_mc_models_title{font-size:12px;line-height:18px;font-weight:600;color:var(--dsw-alias-label-primary)}" +
+      ".deg_mc_models_meta{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_models_head .deg_btn{margin-left:auto;flex:0 0 auto;min-width:auto}" +
+      ".deg_mc_model{display:flex;flex-direction:column;gap:6px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1)}" +
+      ".deg_mc_model_main{display:flex;align-items:center;gap:6px;min-width:0}" +
+      ".deg_mc_model_main .deg_mc_input{flex:1 1 0;min-width:0}" +
+      ".deg_mc_icon_btn{flex:0 0 auto;min-width:auto;width:26px;height:26px;padding:0;line-height:1}" +
+      ".deg_mc_model_advanced{display:grid;grid-template-columns:max-content minmax(64px,1fr) max-content minmax(64px,1fr);column-gap:8px;row-gap:8px;padding-top:6px;border-top:1px dashed var(--dsw-alias-border-l2)}" +
+       ".deg_mc_model_advanced>.deg_mc_field{display:contents}" +
+       ".deg_mc_model_advanced>.deg_mc_field .deg_mc_field_label{align-self:center;min-width:0}" +
+       ".deg_mc_model_advanced>.deg_mc_field .deg_mc_input{min-width:0;text-align:center}" +
+       ".deg_mc_model_advanced>.deg_mc_efforts{grid-column:1 / -1}" +
+       "@media (max-width:640px){.deg_mc_model_advanced{grid-template-columns:max-content minmax(64px,1fr)}.deg_mc_model_advanced>.deg_mc_efforts{grid-column:1 / -1}}" +
+      ".deg_mc_efforts{margin:0;padding:0;border:none;min-width:0}" +
+      ".deg_mc_efforts_label{padding:0;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_efforts_row{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px}" +
+      ".deg_mc_effort{display:inline-flex;align-items:center;gap:4px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);cursor:pointer}" +
+      ".deg_mc_effort input{width:14px;height:14px;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      ".deg_mc_input_types{display:flex;flex-wrap:wrap;gap:10px}" +
+      ".deg_mc_hint{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_error{font-size:12px;line-height:18px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));white-space:pre-wrap}" +
+      ".deg_mc_card_footer{display:flex;align-items:center;gap:8px;padding-top:2px}" +
+      ".deg_mc_card_footer .deg_mc_status{margin-right:auto}" +
+      ".deg_mc_card_footer .deg_btn{flex:0 0 auto;min-width:76px}" +
+      ".deg_mc_conflict{display:flex;flex-direction:column;gap:6px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}" +
+      ".deg_mc_conflict_actions{display:flex;gap:8px}" +
+      ".deg_mc_conflict_actions .deg_btn{flex:0 0 auto;min-width:96px}" +
+      ".deg_mc_add{display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%}" +
+      ".deg_mc_add .deg_mc_select{width:auto;min-width:160px;flex:0 1 auto}" +
+      // 两个 provider 入口与原生模型设置页同级、等宽、同风格。
+      ".deg_mc_entries{display:flex;align-items:center;gap:8px;flex:1 1 100%;width:100%;min-width:0}" +
+      ".deg_mc_entries>.deg_btn{flex:1 1 0;min-width:0;border-style:dashed}" +
+       ".deg_mc_entries>.deg_btn::before{content:\"+\";display:inline-block;margin-right:4px;font-size:16px;line-height:1}" +
+      ".deg_mc_create{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}" +
+      ".deg_mc_create_head{display:flex;align-items:center;gap:8px;min-width:0}" +
+      ".deg_mc_create_title{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary)}" +
+      ".deg_mc_field_error{border-color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}" +
+      ".deg_mc_field_row{display:flex;flex-direction:column;gap:4px;min-width:0}" +
+      ".deg_mc_field_message{font-size:11px;line-height:16px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}" +
+      ".deg_mc_create_footer{display:flex;align-items:center;gap:8px;padding-top:2px}" +
+      ".deg_mc_create_footer .deg_mc_status{margin-right:auto}" +
+      ".deg_mc_create_footer .deg_btn{flex:0 0 auto;min-width:88px}" +
+      ".deg_mc_fetch_list{display:flex;flex-direction:column;gap:4px;max-height:240px;overflow:auto;margin:6px 0 0;padding:0;list-style:none}" +
+      ".deg_mc_fetch_item{display:flex;align-items:center;gap:6px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}" +
+       ".deg_mc_modal_backdrop{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.45)}" +
+       ".deg_mc_modal{display:flex;flex-direction:column;gap:12px;width:min(100%,380px);max-height:min(80vh,420px);box-sizing:border-box;padding:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;box-shadow:0 12px 28px rgba(0,0,0,.28)}" +
+       ".deg_mc_modal_header{display:flex;align-items:center;gap:8px;min-width:0}" +
+       ".deg_mc_modal_title{flex:1 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;color:var(--dsw-alias-label-primary)}" +
+       ".deg_mc_modal_close{flex:0 0 auto;width:28px;height:28px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:20px;line-height:28px;cursor:pointer}" +
+       ".deg_mc_modal_close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}" +
+       ".deg_mc_modal_description{margin:0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}" +
+       ".deg_mc_candidate_toolbar{display:flex;align-items:center;gap:8px;min-width:0}" +
+       ".deg_mc_candidate_search{flex:1 1 auto;min-width:0}" +
+       ".deg_mc_candidate_toolbar .deg_btn{flex:0 0 auto;min-width:auto;white-space:nowrap}" +
+       ".deg_mc_candidate_list{display:flex;flex-direction:column;gap:2px;max-height:240px;margin:0;overflow:auto;padding:0;list-style:none}" +
+       ".deg_mc_candidate_item{border-radius:6px}" +
+       ".deg_mc_candidate_label{display:flex;align-items:center;gap:8px;padding:6px 8px;color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px;cursor:pointer}" +
+       ".deg_mc_candidate_id{flex:1 1 auto;min-width:0;overflow-wrap:anywhere;font-family:var(--ds-font-family-code,inherit)}" +
+       ".deg_mc_candidate_empty{margin:18px 0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:center}" +
+       ".deg_mc_modal_footer{display:flex;justify-content:flex-end;gap:8px;padding-top:2px}" +
+       ".deg_mc_modal_footer .deg_btn{flex:0 0 auto;min-width:76px}" +
+       // 设置页导航行的品牌图标适配：宿主按 section id 硬编码 navIcon，未知 id 回退齿轮，
+       // 插件无法在注册字段里声明图标，因此只能在其 DOM 上做适配——
+       // 隐藏宿主原生 svg（不替换它的内容，React 重渲染会按 fiber 位置回写 path），
+       // 并让 DEG 自己插入的 svg 只占图标列（不参与伸缩），label 位置因此不变。
+       "[data-deg-settings-nav-native]{display:none}" +
+       "[data-deg-settings-nav-icon]{flex:none}";
+
+
+    const cssTagId = "dsh-expert-group/settings.module.css";
+    /** 已注入过样式表的 document：同一 document 只注入一次，设置页适配样式不会重复注入。 */
+    const cssInjectedDocuments = typeof WeakSet === "function" ? new WeakSet() : null;
+
+    /**
+     * 幂等注入插件样式表。
+     * 模块求值可能早于 document 可用（测试替身、SSR、装配期求值），此时首次注入会被跳过；
+     * 设置页导航和模型配置需要的样式在运行期补注入；只写 DEG 自己的 style 标签，
+     * 不触碰 DSH 宿主样式。
+     */
+    function ensurePluginStylesheet() {
+      const doc = typeof document !== "undefined" ? document : null;
+      if (doc === null || typeof doc !== "object") return false;
+      if (cssInjectedDocuments?.has(doc) === true) return true;
+      const selector = "style[data-plugin-css=" + JSON.stringify(cssTagId) + "]";
+      if (typeof doc.querySelector === "function" && doc.querySelector(selector) !== null) {
+        cssInjectedDocuments?.add(doc);
+        return true;
+      }
+      if (typeof doc.createElement !== "function" || typeof doc.head?.appendChild !== "function") return false;
+      const tag = doc.createElement("style");
+      tag.dataset.plugin = "dsh-expert-group";
+      tag.dataset.pluginCss = cssTagId;
+      tag.textContent = css;
+      doc.head.appendChild(tag);
+      cssInjectedDocuments?.add(doc);
+      return true;
+    }
+    ensurePluginStylesheet();
+
+    // 路由路径是插件固定接口，供 Host 与 Client 共享；纯内部标识，用户不可见。
+    const RPC_PATH = "/api/dsh-expert-group";
+    const RPC_CHANNEL = "/dsh-expert-group";
+    const RPC_ENDPOINT = "rpc";
+
+    /** RPC 路由常量打包成 seam，交由 client-freshness.js 使用（不在两处硬编码路径）。 */
+    const RPC_TARGET = Object.freeze({ path: RPC_PATH, channel: RPC_CHANNEL, endpoint: RPC_ENDPOINT });
+
+    /**
+     * freshness/RPC 共享缝的**唯一实现**在 client-freshness.js（浏览器安全 ES 模块）。
+     * 构建期投影片段已把同一份实现登记进本 bundle 的模块表，因此下面只保留转发壳：
+     * 不再内联第二份同语义实现——那份副本既让安装体积双份，又会与权威实现各自漂移。
+     * 共享模块缺失意味着契约外直载 client.js 或装配产物被裁剪（宿主只加载
+     * exports["./client"] 的装配结果，其中投影恒在本 descriptor 之前执行），此时必须
+     * 显式失败：静默降级成"看起来能用"的另一套实现，正是本波要消除的漂移风险。
+     *
+     * 每次调用都重新经过模块表解析（`require` 是 DSH 模块表的唯一入口）：HMR 换掉
+     * client-freshness 的登记工厂后，本插件必须转发到**新的**那份实现，而不是记住
+     * factory 执行瞬间的那一份。
+     */
+    function resolveFreshnessSurface() {
+      if (typeof require === "function") {
+        for (const specifier of [FRESHNESS_MODULE_ID, "./" + FRESHNESS_MODULE_ID, "./client-freshness.js"]) {
+          try {
+            const loaded = require(specifier);
+            if (loaded !== null && typeof loaded === "object") return loaded;
+          } catch { /* 未登记，尝试下一个 specifier 形式。 */ }
+        }
+      }
+      return freshnessModule;
+    }
+
+    function requireFreshnessSurface() {
+      const surface = resolveFreshnessSurface();
+      if (surface === void 0) {
+        throw new Error("dsh-expert-group: freshness 共享模块未装载（发布 bundle 缺少 client-freshness 投影片段）");
+      }
+      return surface;
+    }
+
+    /** 错误 code → status 映射由共享实现统一（Connection envelope 与 legacy fetch 同一份判定）。 */
+    function rpcErrorStatus(error) {
+      return requireFreshnessSurface().rpcErrorStatus(error);
+    }
+
+    /** 将 Connection envelope 归一为 fetch-like Response，保持两条传输的错误字段一致。 */
+    function normalizePluginRpcResult(result) {
+      return requireFreshnessSurface().normalizePluginRpcResult(result);
+    }
+
+    /**
+     * 优先使用 DSH Connection 的独立插件 channel，认证和 envelope 由 Connection 统一处理；
+     * 没有新 Connection 的旧 Host 才回落到同源 fetch，路由常量由这里注入（不在两处硬编码）。
+     */
+    async function requestPluginRpc(connection, request, init = {}, fetchImpl = globalThis.fetch) {
+      return requireFreshnessSurface().requestPluginRpc(connection, request, init, fetchImpl, RPC_TARGET);
+    }
+
+    /**
+     * Client 双面共享的 freshness seam：唯一实现位于 client-freshness.js，
+     * 这里只做 ModuleLoader 投影转发（共享实现已在 bundle 内登记）。
+     */
+    function createClientFreshnessBoundary(options = {}) {
+      return requireFreshnessSurface().createClientFreshnessBoundary(options);
+    }
+
+    // ── Fan-out 客户端快照纯函数 ───────────────────────────────────────────
+    // 这些函数只处理 JSON 兼容数据，不读取 React/DOM，既可供面板使用也可供契约测试复用。
+    const FANOUT_SHARD_STATUS_KEYS = ["queued", "running", "succeeded", "failed", "cancelled", "timed_out", "interrupted"];
+    const FANOUT_TERMINAL_SHARD_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
+    const FANOUT_RETRYABLE_SHARD_STATUSES = new Set(["failed", "timed_out", "cancelled", "interrupted"]);
+    const FANOUT_STATUS_LABELS = {
+      queued: "排队中",
+      running: "运行中",
+      succeeded: "成功",
+      failed: "失败",
+      cancelled: "已取消",
+      timed_out: "已超时",
+      interrupted: "已中断",
+      pending: "等待中",
+      completed: "已完成",
+      completed_with_errors: "部分失败",
+    };
+
+    function fanoutIsObject(value) {
+      return value !== null && typeof value === "object" && !Array.isArray(value);
+    }
+
+    /** 深拷贝 RPC JSON，避免旧快照中的 result/error 被后续事件引用污染。 */
+    function cloneFanoutValue(value, seen = new WeakMap()) {
+      if (value === null || typeof value !== "object") return value;
+      if (seen.has(value)) return seen.get(value);
+      if (Array.isArray(value)) {
+        const clone = [];
+        seen.set(value, clone);
+        for (const item of value) clone.push(cloneFanoutValue(item, seen));
+        return clone;
+      }
+      const clone = {};
+      seen.set(value, clone);
+      for (const key of Object.keys(value)) clone[key] = cloneFanoutValue(value[key], seen);
+      return clone;
+    }
+
+    function fanoutString(value, fallback = void 0) {
+      if (typeof value !== "string") return fallback;
+      const text = value.trim();
+      return text.length > 0 ? text : fallback;
+    }
+
+    function fanoutStatusOf(value, fallback) {
+      return fanoutString(value, fallback) ?? fallback;
+    }
+
+    function fanoutTimestampOf(value) {
+      return typeof value === "number" && Number.isFinite(value) ? value : null;
+    }
+
+    function fanoutCountOf(value, fallback = 0) {
+      return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+    }
+
+    function normalizeFanoutAttempt(rawAttempt, index, fallbackStatus) {
+      const source = fanoutIsObject(rawAttempt) ? rawAttempt : {};
+      const attempt = Number.isSafeInteger(source.attempt) && source.attempt > 0
+        ? source.attempt
+        : index + 1;
+      const normalized = {
+        attempt,
+        status: fanoutStatusOf(source.status, fallbackStatus),
+      };
+      for (const field of ["error", "result", "childId", "messageId"]) {
+        if (!Object.prototype.hasOwnProperty.call(source, field) || source[field] === void 0) continue;
+        normalized[field] = cloneFanoutValue(source[field]);
+      }
+      return normalized;
+    }
+
+    function normalizeFanoutShard(rawShard) {
+      if (!fanoutIsObject(rawShard)) return null;
+      const shardId = fanoutString(rawShard.shardId);
+      if (shardId === void 0) return null;
+      const status = fanoutStatusOf(rawShard.status, "queued");
+      const attempts = Array.isArray(rawShard.attempts)
+        ? rawShard.attempts.map((attempt, index) => normalizeFanoutAttempt(attempt, index, status))
+        : [];
+      return {
+        shardId,
+        prompt: typeof rawShard.prompt === "string" ? rawShard.prompt : "",
+        status,
+        attempts,
+      };
+    }
+
+    function deriveFanoutCounts(shards) {
+      const counts = {};
+      for (const key of FANOUT_SHARD_STATUS_KEYS) counts[key] = 0;
+      for (const shard of Array.isArray(shards) ? shards : []) {
+        if (Object.prototype.hasOwnProperty.call(counts, shard?.status)) counts[shard.status] += 1;
+      }
+      counts.pending = counts.queued + counts.running;
+      return counts;
+    }
+
+    function normalizeFanoutCounts(rawCounts, shards) {
+      const derived = deriveFanoutCounts(shards);
+      const source = fanoutIsObject(rawCounts) ? rawCounts : {};
+      const counts = {};
+      for (const key of FANOUT_SHARD_STATUS_KEYS) counts[key] = fanoutCountOf(source[key], derived[key]);
+      counts.pending = fanoutCountOf(source.pending, counts.queued + counts.running);
+      return counts;
+    }
+
+    /** 将 Host 快照裁成稳定的、只含面板所需字段的不可变视图。 */
+    function normalizeFanoutTask(rawTask) {
+      if (!fanoutIsObject(rawTask)) return null;
+      const parentTaskId = fanoutString(rawTask.parentTaskId);
+      if (parentTaskId === void 0) return null;
+      const shards = (Array.isArray(rawTask.shards) ? rawTask.shards : [])
+        .map(normalizeFanoutShard)
+        .filter((shard) => shard !== null);
+      return {
+        parentTaskId,
+        role: fanoutString(rawTask.role, "unknown"),
+        basePrompt: typeof rawTask.basePrompt === "string" ? rawTask.basePrompt : "",
+        status: fanoutStatusOf(rawTask.status, "pending"),
+        createdAt: fanoutTimestampOf(rawTask.createdAt),
+        updatedAt: fanoutTimestampOf(rawTask.updatedAt),
+        settledAt: fanoutTimestampOf(rawTask.settledAt),
+        counts: normalizeFanoutCounts(rawTask.counts, shards),
+        shards,
+      };
+    }
+
+    function fanoutTaskLabel(task) {
+      const role = fanoutString(task?.role, "unknown");
+      const parentTaskId = fanoutString(task?.parentTaskId, "unknown");
+      return role + " · " + parentTaskId;
+    }
+
+    function fanoutStatusLabel(status) {
+      return FANOUT_STATUS_LABELS[status] ?? fanoutString(status, "未知状态");
+    }
+
+    function fanoutTerminalCount(task) {
+      return (Array.isArray(task?.shards) ? task.shards : [])
+        .filter((shard) => FANOUT_TERMINAL_SHARD_STATUSES.has(shard?.status)).length;
+    }
+
+    function fanoutCanCancelShard(shard) {
+      const status = typeof shard === "string" ? shard : shard?.status;
+      return !FANOUT_TERMINAL_SHARD_STATUSES.has(status);
+    }
+
+    function fanoutCanRetryShard(shard) {
+      const status = typeof shard === "string" ? shard : shard?.status;
+      return FANOUT_RETRYABLE_SHARD_STATUSES.has(status);
+    }
+
+    function fanoutCanCancelParent(task) {
+      return (Array.isArray(task?.shards) ? task.shards : []).some(fanoutCanCancelShard);
+    }
+
+    /** 失败/非契约响应直接返回原 state，保证旧快照不会被错误响应清空或半更新。 */
+    function normalizeFanoutListResponse(payload, previousState = { tasks: [], cursor: 0, loaded: false }) {
+      const previous = fanoutIsObject(previousState)
+        ? previousState
+        : { tasks: [], cursor: 0, loaded: false };
+      if (payload?.ok !== true || !Array.isArray(payload.tasks)) return previous;
+      const tasks = payload.tasks.map(normalizeFanoutTask).filter((task) => task !== null);
+      const cursor = Number.isSafeInteger(payload.cursor) && payload.cursor >= 0
+        ? payload.cursor
+        : fanoutCountOf(previous.cursor, 0);
+      return { ...previous, tasks, cursor, loaded: true };
+    }
+
+    /**
+     * 合并可选 fanout-events 事件。事件只通过 parentTaskId/shardId 定位，绝不按数组下标；
+     * 事件字段不完整时保留旧 prompt、attempt 历史，下一次 list 刷新仍是权威快照。
+     */
+    function mergeFanoutEvent(task, event) {
+      const current = normalizeFanoutTask(task);
+      if (current === null || !fanoutIsObject(event) || event.parentTaskId !== current.parentTaskId) return current;
+      const updates = Array.isArray(event.shards)
+        ? event.shards.filter((shard) => fanoutString(shard?.shardId) !== void 0)
+        : fanoutString(event.shardId) === void 0 ? [] : [event];
+      const updateByShardId = new Map(updates.map((shard) => [fanoutString(shard.shardId), shard]));
+      const shards = current.shards.map((shard) => {
+        const update = updateByShardId.get(shard.shardId);
+        if (!fanoutIsObject(update)) return shard;
+        const nextStatus = fanoutStatusOf(update.status, shard.status);
+        const attempts = shard.attempts.map((attempt) => ({ ...attempt }));
+        const eventAttempt = Number.isSafeInteger(update.attempt) && update.attempt > 0 ? update.attempt : void 0;
+        const declaredAttempts = Number.isSafeInteger(update.attempts) && update.attempts >= 0 ? update.attempts : 0;
+        if (eventAttempt !== void 0) {
+          while (attempts.length < eventAttempt) {
+            attempts.push({ attempt: attempts.length + 1, status: "queued" });
+          }
+          const attemptIndex = attempts.findIndex((attempt) => attempt.attempt === eventAttempt);
+          const baseAttempt = attemptIndex >= 0 ? attempts[attemptIndex] : { attempt: eventAttempt, status: nextStatus };
+          const mergedAttempt = normalizeFanoutAttempt({ ...baseAttempt, ...update, attempt: eventAttempt, status: nextStatus }, attemptIndex >= 0 ? attemptIndex : attempts.length, nextStatus);
+          if (attemptIndex >= 0) attempts[attemptIndex] = mergedAttempt;
+          else attempts.push(mergedAttempt);
+        }
+        while (attempts.length < declaredAttempts) {
+          attempts.push({ attempt: attempts.length + 1, status: nextStatus });
+        }
+        return { ...shard, status: nextStatus, attempts };
+      });
+      const next = {
+        ...current,
+        shards,
+        counts: normalizeFanoutCounts(event.counts, shards),
+        updatedAt: fanoutTimestampOf(event.at) ?? current.updatedAt,
+      };
+      if (event.type === "task_settled") {
+        next.status = fanoutStatusOf(event.status, current.status);
+        next.settledAt = fanoutTimestampOf(event.at) ?? current.settledAt;
+      } else if (updates.some((update) => update.status === "queued" || update.status === "running")) {
+        next.status = "pending";
+        next.settledAt = null;
+      }
+      return normalizeFanoutTask(next);
+    }
+
+    /**
+     * 只应用 sequence 严格晚于当前 cursor 的事件；旧事件和缺失序号事件都忽略，
+     * 防止 list 请求与事件请求竞态时把较新的 shard 状态回退。
+     */
+    function mergeFanoutEvents(previousState, payload) {
+      if (!fanoutIsObject(previousState) || payload?.ok !== true || !Array.isArray(payload.events)) return previousState;
+      const currentCursor = fanoutCountOf(previousState.cursor, 0);
+      const events = payload.events
+        .filter((event) => Number.isSafeInteger(event?.sequence) && event.sequence > currentCursor)
+        .sort((left, right) => left.sequence - right.sequence);
+      const tasksById = new Map((Array.isArray(previousState.tasks) ? previousState.tasks : [])
+        .map((task) => [task.parentTaskId, task]));
+      for (const event of events) {
+        const current = tasksById.get(event.parentTaskId);
+        if (current !== undefined) tasksById.set(event.parentTaskId, mergeFanoutEvent(current, event));
+      }
+      const reportedCursor = Number.isSafeInteger(payload.cursor) && payload.cursor >= currentCursor
+        ? payload.cursor
+        : currentCursor;
+      if (events.length === 0 && reportedCursor === currentCursor) return previousState;
+      return {
+        ...previousState,
+        tasks: [...tasksById.values()],
+        cursor: reportedCursor,
+      };
+    }
+
+    // ── 当前页面运行状态桥：只读取当前会话的 running 与插件 role，并复用 DSH 原生状态行。
+    //    DEG 不创建第二个状态容器，只在宿主原生主文本节点存在且前缀匹配时替换角色文案；
+    //    宿主自己的鲸鱼动画、计时器、class、style 和 aria 始终由 DSH 保持。 ───────────────
+    // 浏览器 bundle 通过 window.__ModuleLoader__ 加载，运行期不能 import role-registry.js，
+    // 因此这里保留唯一一份"协议适配"投影：role id 列表 + 英文状态标签。
+    // 权威来源是 role-registry.js 的 id/statusLabel；新增或改名角色必须同时更新这里，
+    // 并由 test/role-registry.test.mjs（注册表侧）与既有客户端契约测试（页面侧）共同锁定。
+    const STATUS_ROLE_IDS = ["explorer", "librarian", "oracle", "designer", "fixer", "observer"];
+    // role id 始终保持小写用于身份匹配；页面显示只使用这里的固定英文标签。
+    const STATUS_ROLE_LABELS = {
+      explorer: "Explorer",
+      librarian: "Librarian",
+      oracle: "Oracle",
+      designer: "Designer",
+      fixer: "Fixer",
+      observer: "Observer",
+    };
+    const STATUS_ROLE_MARKER = "__degExpertRole";
+
+    /** 只接受插件定义的英文 role id；未知/外部角色不参与文案替换。 */
+    function normalizeStatusRole(role) {
+      if (typeof role !== "string") return void 0;
+      const normalized = role.trim().toLowerCase();
+      return STATUS_ROLE_IDS.includes(normalized) ? normalized : void 0;
+    }
+
+    /** 只有 DSH 明确给出 parentId、subagent origin 或 session snapshot subagent 时才判定为 child。 */
+    function isPluginChildSession(session) {
+      return session !== null
+        && typeof session === "object"
+        && ((typeof session.parentId === "string" && session.parentId.length > 0)
+          || (typeof session.parentSessionId === "string" && session.parentSessionId.length > 0)
+          || session.origin === "subagent"
+          || (session.subagent !== null && typeof session.subagent === "object"));
+    }
+
+    /** 从当前 session 绑定的 RPC 响应解析 child kind 与英文 role；未知响应不猜测身份。 */
+    function resolveStatusIdentity({ sessionId, responseSessionId, response } = {}) {
+      if (typeof sessionId !== "string" || sessionId.length === 0) return null;
+      const reportedSessionId = response?.sessionId ?? responseSessionId;
+      if (reportedSessionId !== sessionId) return null;
+      if (response?.ok === false) return { sessionId, kind: "unknown", role: void 0 };
+      if (response?.kind === "child") {
+        return { sessionId, kind: "child", role: normalizeStatusRole(response?.child?.role) };
+      }
+      if (response?.kind === "root") return { sessionId, kind: "root", role: void 0 };
+      return { sessionId, kind: "unknown", role: void 0 };
+    }
+
+    /**
+     * 当前会话状态文案的唯一决策点：running-only、单一当前角色、未知回退。
+     * 已有插件 marker 优先确认 child；无 marker 的旧 child 再由 RPC kind=child 补足。
+     *
+     * 返回值是**不带末尾省略号**的前缀文案（"Explorer running" / "Orchestrator running"）：
+     * 它与 shared.js 的同名实现语义同步，用来替换宿主原生文案里的运行前缀
+     * （见 replaceNativeStatusPrefix）；逗号、用时与末尾省略号仍由宿主自己的文本提供。
+     */
+    function resolveRunningStatusText({ sessionId, currentSessionId, running, session, kind, role } = {}) {
+      if (sessionId === void 0 || sessionId === null || sessionId !== currentSessionId || running !== true) return null;
+      const markedChild = isPluginChildSession(session);
+      const normalizedRole = normalizeStatusRole(role);
+      const roleText = normalizedRole === void 0 ? null : STATUS_ROLE_LABELS[normalizedRole] + " running";
+      if (kind === "pending") return markedChild ? roleText : null;
+      if (kind === "unknown") return markedChild ? roleText : null;
+      if (kind === "child") return roleText;
+      if (kind === "root") return markedChild ? null : "Orchestrator running";
+      if (kind !== void 0 && kind !== null) return null;
+      if (markedChild) return roleText;
+      return "Orchestrator running";
+    }
+
+    /**
+     * DSH 会话边界可能使用任一公开 data-* 属性；状态行自身没有属性时还要沿祖先查找。
+     * markerless DOM 只能在所有已发现属性都精确指向当前会话时写入，否则保持原生文案。
+     */
+    const NATIVE_SESSION_ATTRIBUTES = [
+      "data-session-id",
+      "data-conversation-session-id",
+      "data-conversation-session",
+      "data-session",
+    ];
+
+    function nativeStatusSessionValues(node, boundary) {
+      const values = [];
+      let current = node;
+      while (current !== null && current !== void 0) {
+        if (typeof current.getAttribute === "function") {
+          for (const name of NATIVE_SESSION_ATTRIBUTES) {
+            const value = current.getAttribute(name);
+            if (typeof value === "string" && value.length > 0) values.push(value);
+          }
+        }
+        if (boundary !== void 0 && current === boundary) break;
+        current = current.parentNode;
+      }
+      return values;
+    }
+
+    /**
+     * 按指定边界校验候选节点：markerless 需要至少一条当前会话证据；已有 scope 时即使
+     * 只靠 scope 证明归属，也必须拒绝节点自身或祖先携带的冲突 session 属性。
+     */
+    function nativeStatusNodeMatchesSession(node, sessionId, boundary, requireEvidence) {
+      if (sessionId === void 0 || sessionId === null || String(sessionId).length === 0) return false;
+      const values = nativeStatusSessionValues(node, boundary);
+      const expected = String(sessionId);
+      return (!requireEvidence || values.length > 0) && values.every((value) => value === expected);
+    }
+
+    /**
+     * 优先使用 session-scoped bridge 自身的 DOM anchor；右侧 subagentchat 与主视图可同时存在
+     * 多棵可见 conversation scope，此 anchor 是唯一不依赖可见性猜测的归属证据。
+     * 没有 scope marker 时仍监听 root，但实际写入必须由原生状态节点或祖先的精确会话属性证明归属。
+     */
+    function findNativeConversationScope(root, sessionId, anchor) {
+      const anchoredScope = anchor?.closest?.("[data-conversation-scroll]");
+      if (anchoredScope !== null && anchoredScope !== void 0) return anchoredScope;
+
+      const scopes = [];
+      if (root?.matches?.("[data-conversation-scroll]")) scopes.push(root);
+      for (const scope of Array.from(root?.querySelectorAll?.("[data-conversation-scroll]") ?? [])) {
+        if (!scopes.includes(scope)) scopes.push(scope);
+      }
+      if (scopes.length === 0) {
+        // DSH RC1 的 ChatView 真实 DOM 没有稳定的 conversation scope marker。
+        // 即使 TurnStatus 尚未创建，也必须监听 root；节点出现后 observer 才能即时接管首帧。
+        // findNativeStatusTextNode 会再要求候选节点沿祖先链提供精确会话属性。
+        return root;
+      }
+
+      // 会话证据与候选边界共用同一份定义：RC1 的会话标记在 scroll 的
+      // [data-conversation-content] 外层，只读 scope 自身会把当前会话判成"无标记"。
+      const scopeIds = (scope) => nativeStatusScopeIds(scope);
+      const exact = sessionId === void 0 || sessionId === null
+        ? []
+        : scopes.filter((scope) => scopeIds(scope).includes(String(sessionId)));
+      const tagged = scopes.filter((scope) => scopeIds(scope).length > 0);
+      let candidates = [];
+      if (exact.length === 1) {
+        candidates = exact;
+      } else if (exact.length > 1) {
+        const visible = exact.filter((scope) => typeof scope?.getClientRects === "function" && scope.getClientRects().length > 0);
+        if (visible.length === 1) candidates = visible;
+      } else if (tagged.length === 0 && scopes.length === 1) {
+        candidates = scopes;
+      } else if (tagged.length === 0) {
+        const visible = scopes.filter((scope) => typeof scope?.getClientRects === "function" && scope.getClientRects().length > 0);
+        if (visible.length === 1) candidates = visible;
+      }
+      return candidates.length === 1 ? candidates[0] : void 0;
+    }
+
+    /**
+     * CSS Module 稳定局部名匹配：只认局部名本身，不绑定构建 hash 形态。
+     * Vite 默认产物是 `_label_hash_line`，旧夹具/其它工具链是 `hash_label`；两种形状都只
+     * 依赖 "label" 这一个稳定局部名，因此既不能硬编码完整 hash，也不能只认某一种拼接。
+     */
+    const localClassTokenPatterns = new Map();
+    function hasLocalClassToken(className, localName) {
+      if (typeof className !== "string") return false;
+      // 局部名只来自本文件的常量；缓存两个正则是因为这段代码在每次 observer 通知里对
+      // 每个候选元素都会跑一遍，热路径上不值得反复编译同一个正则。
+      let patterns = localClassTokenPatterns.get(localName);
+      if (patterns === void 0) {
+        patterns = [new RegExp("(?:^|_)" + localName + "$"), new RegExp("^_" + localName + "(?:_|$)")];
+        localClassTokenPatterns.set(localName, patterns);
+      }
+      return className.split(/\s+/).some((token) => patterns[0].test(token) || patterns[1].test(token));
+    }
+
+    /**
+     * DSH 0.1.7 的隐藏 announcement 语义。aria-atomic=true 是它最稳定的标记，
+     * visuallyHidden 局部名 / hidden / aria-hidden=true 是等价的隐藏形状。
+     * 只按属性语义判断，不读布局：CSS Module hash 变化不会影响判定，隐藏节点永远不会被写成可见文案。
+     */
+    function isHiddenStatusCandidate(node) {
+      if (node === null || node === void 0 || typeof node?.getAttribute !== "function") return false;
+      if (node.getAttribute("aria-atomic") === "true") return true;
+      if (node.getAttribute("aria-hidden") === "true") return true;
+      const hidden = node.getAttribute("hidden");
+      if (hidden !== null && hidden !== void 0) return true;
+      return hasLocalClassToken(node.getAttribute("class"), "visuallyHidden");
+    }
+
+    /**
+     * 唯一主文本节点：恰好一个 trim 后非空的直接 Text，其余子节点只能是 aria-hidden=true 计时器。
+     * 新旧两种形状共用同一形状约束，避免命中拼装状态、notice 或带额外子节点的容器。
+     */
+    function singleNativeStatusTextNode(node) {
+      const childNodes = Array.from(node?.childNodes ?? []);
+      const textNodes = childNodes.filter((child) => child?.nodeType === 3);
+      const accessoryNodes = childNodes.filter((child) => child?.nodeType !== 3);
+      const hasOnlyAriaHiddenAccessories = accessoryNodes.every((child) =>
+        child?.nodeType === 1 && typeof child?.getAttribute === "function" && child.getAttribute("aria-hidden") === "true"
+      );
+      if (textNodes.length !== 1 || typeof textNodes[0].nodeValue !== "string" || textNodes[0].nodeValue.trim().length === 0 || !hasOnlyAriaHiddenAccessories) return void 0;
+      return textNodes[0];
+    }
+
+    /** 深度优先收集后代元素；label 查找只在 button 子树内做，范围固定且很小。 */
+    function collectDescendantElements(node, out = []) {
+      for (const child of Array.from(node?.childNodes ?? [])) {
+        if (child?.nodeType !== 1) continue;
+        out.push(child);
+        collectDescendantElements(child, out);
+      }
+      return out;
+    }
+
+    /**
+     * DSH 0.1.7 的可见状态目标是 span，不是任意带 label 局部名的元素：
+     * 按钮内部的图标/计时器容器或嵌套控件同样可能叫 label，但只有 span 承担可见文案。
+     * 大小写不敏感（真实 DOM 给 SPAN，fake DOM 给 span），缺失 tagName 时保守拒绝。
+     */
+    function isSpanStatusLabelElement(element) {
+      return typeof element?.tagName === "string" && element.tagName.toLowerCase() === "span";
+    }
+
+    /** 读取节点自身携带的全部公开会话属性值（空值忽略）。 */
+    function sessionValuesOf(node) {
+      const values = [];
+      if (typeof node?.getAttribute === "function") {
+        for (const name of NATIVE_SESSION_ATTRIBUTES) {
+          const value = node.getAttribute(name);
+          if (typeof value === "string" && value.length > 0) values.push(value);
+        }
+      }
+      return values;
+    }
+
+    /**
+     * 定位 DSH 0.2.0-rc1 的会话证据容器。
+     *
+     * RC1 的 data-conversation-session 不在 [data-conversation-scroll] 上，而在它的
+     * [data-conversation-content] 外层容器上；只读 scroll 自身会把当前会话判定成"无标记"，
+     * 于是两棵 conversation 并存时整体放弃，新运行行完全漏掉。
+     *
+     * 语义边界（与 shared.js 同名实现同步）：
+     * - 没有 [data-conversation-content] 祖先时返回 undefined：绝不越过 scroll 向上猜证据，
+     *   既有 legacy 形态（会话属性直接落在 scope 或状态节点上）语义完全不变；
+     * - 有 content 祖先时，就近取它或它最近带会话属性的祖先作为证据容器；冲突属性仍由
+     *   nativeStatusNodeMatchesSession 的"链上所有已发现属性必须一致"兜住。
+     */
+    function nativeConversationEvidenceOwner(scope) {
+      let content;
+      let current = scope;
+      while (current !== null && current !== void 0) {
+        if (typeof current.getAttribute === "function" && current.getAttribute("data-conversation-content") !== null) {
+          content = current;
+          break;
+        }
+        current = current.parentNode;
+      }
+      if (content === void 0) return void 0;
+      let node = content;
+      while (node !== null && node !== void 0) {
+        if (typeof node.getAttribute === "function" && sessionValuesOf(node).length > 0) return node;
+        node = node.parentNode;
+      }
+      return content;
+    }
+
+    /** scope 的会话证据：scope 自身的会话属性 + RC1 content 外层的会话属性。 */
+    function nativeStatusScopeIds(scope) {
+      return [...sessionValuesOf(scope), ...sessionValuesOf(nativeConversationEvidenceOwner(scope))];
+    }
+
+    /** 候选节点的会话证据边界：RC1 用 content 外层，legacy 用 scope 自身。 */
+    function nativeStatusSessionBoundary(scope) {
+      return nativeConversationEvidenceOwner(scope) ?? scope;
+    }
+
+    /**
+     * RC1 装饰子树判定：aria-hidden=true / inert / hidden / visuallyHidden 局部名都属于
+     * "不承载可见文案"的动画副本（TextShimmer 的扫光副本就在这里）。
+     *
+     * 与 isHiddenStatusCandidate 分开：后者还要把 aria-atomic 的隐藏 announcement 视为不可见
+     * 候选，而这里只用于"在跑马灯里找真实可见文案"。
+     */
+    function isDecorativeNativeStatusNode(node) {
+      if (node === null || node === void 0 || typeof node?.getAttribute !== "function") return false;
+      if (node.getAttribute("aria-hidden") === "true") return true;
+      const hidden = node.getAttribute("hidden");
+      if (hidden !== null && hidden !== void 0) return true;
+      const inert = node.getAttribute("inert");
+      if (inert !== null && inert !== void 0) return true;
+      return hasLocalClassToken(node.getAttribute("class"), "visuallyHidden");
+    }
+
+    /**
+     * 收集非装饰子树里的可见 Text（深度优先）。
+     * 装饰子树整棵跳过：它的文字与真实可见文案相同，但属于宿主动画的一部分。
+     */
+    function collectVisibleStatusTextNodes(node, out = [], hidden = false) {
+      const hiddenHere = hidden || isDecorativeNativeStatusNode(node);
+      for (const child of Array.from(node?.childNodes ?? [])) {
+        if (child?.nodeType === 3) {
+          if (!hiddenHere && typeof child.nodeValue === "string" && child.nodeValue.trim().length > 0) out.push(child);
+          continue;
+        }
+        if (child?.nodeType !== 1) continue;
+        collectVisibleStatusTextNodes(child, out, hiddenHere);
+      }
+      return out;
+    }
+
+    /**
+     * DSH 0.2.0-rc1 官方运行行的字段集合（与 shared.js 同名实现同步）。
+     *
+     * 结构（实测 DOM）：
+     * conversation[data-conversation-content][data-conversation-session]
+     *   > [data-conversation-scroll] > [data-chat-running]
+     *     ├─ role=status/aria-live=polite/aria-atomic=true 的隐藏 announcement
+     *     ├─ 鲸鱼尾巴等 aria-hidden 装饰
+     *     └─ [data-shimmer="true"]
+     *         ├─ 可见子树：唯一的真实文案 Text（含"深度求索中，用时8分12秒..."）
+     *         └─ aria-hidden/inert 装饰副本：data-shimmer-text 保存同一份完整标签
+     *
+     * fail-closed：行、跑马灯容器、可见 Text 任一项不是恰好一个就整体放弃，绝不猜可见性；
+     * 归属由行到会话边界的属性链证明（冲突或缺证据时放弃）。
+     */
+    function findNativeRunningRowParts(scope, sessionId, requireSessionEvidence = false, sessionBoundary = void 0) {
+      if (scope == null) return void 0;
+      const rows = [];
+      if (scope?.matches?.("[data-chat-running]")) rows.push(scope);
+      for (const row of Array.from(scope?.querySelectorAll?.("[data-chat-running]") ?? [])) {
+        if (!rows.includes(row)) rows.push(row);
+      }
+      if (rows.length !== 1) return void 0;
+      const row = rows[0];
+      if (!nativeStatusNodeMatchesSession(row, sessionId, sessionBoundary, requireSessionEvidence)) return void 0;
+
+      const shimmers = collectDescendantElements(row).filter((element) => element?.getAttribute?.("data-shimmer") === "true");
+      if (shimmers.length !== 1) return void 0;
+      const visibleTexts = collectVisibleStatusTextNodes(shimmers[0]);
+      if (visibleTexts.length !== 1) return void 0;
+      const visibleText = visibleTexts[0];
+      // 不只校验 running row：实际被写入的 Text 和属性节点也可能带冲突会话标记。
+      if (!nativeStatusNodeMatchesSession(visibleText, sessionId, sessionBoundary, requireSessionEvidence)) return void 0;
+
+      const shimmerTextNodes = collectDescendantElements(row).filter((element) => {
+        const value = element?.getAttribute?.("data-shimmer-text");
+        return value !== null && value !== void 0;
+      });
+      if (shimmerTextNodes.some((node) => !nativeStatusNodeMatchesSession(node, sessionId, sessionBoundary, requireSessionEvidence))) return void 0;
+      const announcementTexts = [];
+      for (const element of collectDescendantElements(row)) {
+        if (element?.getAttribute?.("role") !== "status") continue;
+        if (element?.getAttribute?.("aria-live") !== "polite") continue;
+        if (element?.getAttribute?.("aria-atomic") !== "true") continue;
+        const textNode = singleNativeStatusTextNode(element);
+        if (textNode !== void 0) announcementTexts.push(textNode);
+      }
+      if (announcementTexts.some((node) => !nativeStatusNodeMatchesSession(node, sessionId, sessionBoundary, requireSessionEvidence))) return void 0;
+      return { visibleText, shimmerTextNodes, announcementTexts };
+    }
+
+    /**
+     * DSH 0.1.7 把可见运行状态放进 button[data-turn-process] 内的 span.label。
+     * 只有可见、且恰好唯一命中的 label 才是候选：隐藏 announcement 永不入选，非 span 元素
+     * 与多义候选（同 scope 多个可见 label，例如历史 turn 的按钮）一律放弃，交由 legacy 兜底而不是猜。
+     */
+    function findNativeTurnProcessLabelTextNode(scope, sessionId, requireSessionEvidence = false, sessionBoundary = void 0) {
+      if (scope == null) return void 0;
+      const matches = [];
+      for (const button of Array.from(scope?.querySelectorAll?.("button[data-turn-process]") ?? [])) {
+        if (button?.getAttribute?.("data-turn-process") === null || button?.getAttribute?.("data-turn-process") === void 0) continue;
+        if (isHiddenStatusCandidate(button)) continue;
+        for (const candidate of collectDescendantElements(button)) {
+          if (!isSpanStatusLabelElement(candidate)) continue;
+          if (!hasLocalClassToken(candidate?.getAttribute?.("class"), "label")) continue;
+          if (isHiddenStatusCandidate(candidate)) continue;
+          const textNode = singleNativeStatusTextNode(candidate);
+          if (textNode === void 0) continue;
+          if ((requireSessionEvidence || sessionBoundary !== void 0)
+            && !nativeStatusNodeMatchesSession(textNode, sessionId, sessionBoundary, requireSessionEvidence)) continue;
+          matches.push(textNode);
+        }
+      }
+      return matches.length === 1 ? matches[0] : void 0;
+    }
+
+    /**
+     * 在已确定的会话 scope 内定位 legacy（非 RC1）形态的运行状态主文本节点。
+     * 文案只检查为非空 Text，不绑定任何 locale；候选优先级为 DSH 0.1.7 的可见 turn-process
+     * label，其次是 0.1.6 的 legacy turnStatus。新版缺失或多义时回退 legacy，legacy 自身多义
+     * 仍保持"不改"的保守语义；两种形状的隐藏 announcement 都永不作为目标。
+     * RC1 的 [data-chat-running] 行由 resolveNativeStatusTargets 优先处理，不在这里兜底。
+     */
+    function findNativeTurnStatusTextNode(scope, sessionId, requireSessionEvidence = false, sessionBoundary = void 0) {
+      if (scope == null) return void 0;
+      const labelNode = findNativeTurnProcessLabelTextNode(scope, sessionId, requireSessionEvidence, sessionBoundary);
+      if (labelNode !== void 0) return labelNode;
+
+      const statuses = [];
+      if (scope?.matches?.('[role="status"]')) statuses.push(scope);
+      for (const status of Array.from(scope?.querySelectorAll?.('[role="status"]') ?? [])) {
+        if (!statuses.includes(status)) statuses.push(status);
+      }
+      let match;
+      for (const status of statuses) {
+        if (status?.getAttribute?.("role") !== "status" || status?.getAttribute?.("aria-live") !== "polite") continue;
+        if (isHiddenStatusCandidate(status)) continue;
+        if (!hasLocalClassToken(status?.getAttribute?.("class"), "turnStatus")) continue;
+        const textNode = singleNativeStatusTextNode(status);
+        if (textNode === void 0) continue;
+        if ((requireSessionEvidence || sessionBoundary !== void 0)
+          && !nativeStatusNodeMatchesSession(textNode, sessionId, sessionBoundary, requireSessionEvidence)) continue;
+        if (match !== void 0) return void 0;
+        match = textNode;
+      }
+      return match;
+    }
+
+
+    /**
+     * 解析当前会话的原生运行状态**全字段**目标（纯 DOM 选择，不写入；与 shared.js 同名实现同步）：
+     * - RC1：返回 { visibleText, shimmerAttributes, announcements } 三项完整字段；
+     * - legacy（0.1.7 label / 0.1.6 turnStatus）：只返回可见 Text，另外两项为空。
+     *
+     * 会话判定：优先 data-conversation-scroll 边界；RC1 的会话标记在它的
+     * [data-conversation-content] 外层，因此证据与候选边界都按 nativeStatusScopeIds /
+     * nativeStatusSessionBoundary 取；没有 scope marker 时扫描 root 并强制要求祖先会话证据。
+     * 任何冲突、歧义或缺少证据的情况都返回 undefined，让调用方保持宿主原文。
+     */
+    function resolveNativeStatusTargets(root, sessionId) {
+      const scopes = [];
+      if (root?.matches?.("[data-conversation-scroll]")) scopes.push(root);
+      for (const scope of Array.from(root?.querySelectorAll?.("[data-conversation-scroll]") ?? [])) {
+        if (!scopes.includes(scope)) scopes.push(scope);
+      }
+
+      if (scopes.length === 0) {
+        const textNode = findNativeTurnStatusTextNode(root, sessionId, true);
+        return textNode === void 0 ? void 0 : { visibleText: textNode, shimmerAttributes: [], announcements: [] };
+      }
+
+      const exact = sessionId === void 0 || sessionId === null
+        ? []
+        : scopes.filter((scope) => nativeStatusScopeIds(scope).includes(String(sessionId)));
+      const tagged = scopes.filter((scope) => nativeStatusScopeIds(scope).length > 0);
+      let candidates = [];
+      if (exact.length === 1) {
+        candidates = exact;
+      } else if (exact.length > 1) {
+        const visible = exact.filter((scope) => typeof scope?.getClientRects === "function" && scope.getClientRects().length > 0);
+        if (visible.length === 1) candidates = visible;
+      } else if (tagged.length === 0 && scopes.length === 1) {
+        candidates = scopes;
+      } else if (tagged.length === 0) {
+        const visible = scopes.filter((scope) => typeof scope?.getClientRects === "function" && scope.getClientRects().length > 0);
+        if (visible.length === 1) candidates = visible;
+      }
+      if (candidates.length !== 1) return void 0;
+
+      const scope = candidates[0];
+      const requireSessionEvidence = nativeStatusScopeIds(scope).includes(String(sessionId));
+      const sessionBoundary = nativeStatusSessionBoundary(scope);
+      const parts = findNativeRunningRowParts(scope, sessionId, requireSessionEvidence, sessionBoundary);
+      if (parts !== void 0) {
+        return {
+          visibleText: parts.visibleText,
+          shimmerAttributes: parts.shimmerTextNodes,
+          announcements: parts.announcementTexts,
+        };
+      }
+      const textNode = findNativeTurnStatusTextNode(scope, sessionId, requireSessionEvidence, sessionBoundary);
+      return textNode === void 0 ? void 0 : { visibleText: textNode, shimmerAttributes: [], announcements: [] };
+    }
+
+    /**
+     * 选择当前页面会话的原生运行状态**可见**主文本节点（公开只读 seam）。
+     * RC1 返回 [data-shimmer="true"] 非装饰子树里的真实可见 Text；legacy 形态继续返回
+     * 各自唯一的可见 Text。选择与会话判定语义与 shared.js 的同名导出同步。
+     */
+    function findNativeStatusTextNode(root, sessionId) {
+      return resolveNativeStatusTargets(root, sessionId)?.visibleText;
+    }
+
+    /**
+     * 原生运行状态文案里唯一可替换的精确子串。
+     *
+     * DSH 0.2.0-rc1 在输入区上方渲染宿主自己的运行状态行，中文 locale 的可见文案形如
+     * 「深度求索中，用时8分12秒...」（前面还可能挂着鲸鱼尾巴节点与独立的 aria-hidden 计时器）。
+     * 插件只拥有这一段前缀：替换它就能把当前会话的角色投影到宿主原生行上，而逗号、用时、
+     * 末尾省略号以及前后兄弟节点/动画全部保持宿主原样——既不重建整行，也不创建覆盖层。
+     */
+    const NATIVE_RUNNING_STATUS_PREFIX = "深度求索中";
+
+    /**
+     * 只替换原生运行前缀的纯函数（fail-closed）。本实现与 shared.js 的同名导出语义同步
+     * （classic bundle 无法 import ESM 权威实现，两处只允许逐字保持同一份语义）。
+     *
+     * 边界语义：
+     * - 原文里没有该精确子串时返回 null：调用方必须保持宿主原文案，绝不猜测或整行重建；
+     * - 只替换**第一处**出现，其余内容逐字节保留（分隔逗号、用时、末尾省略号、空白与大小写）；
+     * - 原文或替换文案不是非空字符串时返回 null。
+     * @param {unknown} currentText - 宿主当前渲染的原生文案。
+     * @param {unknown} replacementText - 角色文案（例如 "Explorer running"，不带省略号）。
+     * @returns {string|null} 替换后的完整文案；没有可替换前缀时返回 null。
+     */
+    function replaceNativeStatusPrefix(currentText, replacementText) {
+      if (typeof currentText !== "string" || currentText.length === 0) return null;
+      if (typeof replacementText !== "string" || replacementText.length === 0) return null;
+      const at = currentText.indexOf(NATIVE_RUNNING_STATUS_PREFIX);
+      if (at === -1) return null;
+      return currentText.slice(0, at) + replacementText + currentText.slice(at + NATIVE_RUNNING_STATUS_PREFIX.length);
+    }
+
+    /**
+     * 只保存/替换/恢复一个原生主文本节点的**前缀**；不触碰 class/style、计时器或 aria，
+     * 也不重建整行。DOM 适配、MutationObserver 与 React 生命周期由调用方持有；本函数只处理
+     * 「原生前缀 → 角色文案」的保存/替换/恢复，因此可在无 DOM 的 node:test 中用最小 mock 验证。
+     *
+     * 原文跟进规则（同一个 Text 节点上的内容随时可能被宿主改写）：
+     * - 角色变化：只换前缀，逗号/用时/末尾省略号继续沿用宿主最新原文；
+     * - 宿主重渲染、locale 切换或用时刷新：当前值不再是本插件写入的那一份时，把宿主最新值
+     *   认定为原文，清理时恢复它——绝不把旧语言或旧用时写回去；
+     * - 原文没有原生前缀（例如英文 locale 的 "Deep diving..."）时不做任何写入。
+     *
+     * 可选 decorate/undecorate 钩子仅用于调用方管理附加生命周期；当前原生状态桥不传入
+     * 任何装饰钩子，因此不会向宿主节点添加 marker、样式或动画。rewriter 仍保证换目标和
+     * 清理时先处理旧目标，避免调用方留下 stale 状态。
+     */
+    function createNativeTextRewriter(options = {}) {
+      const findNode = typeof options.findNode === "function" ? options.findNode : () => void 0;
+      const getText = typeof options.getText === "function" ? options.getText : (node) => node?.nodeValue;
+      const setText = typeof options.setText === "function" ? options.setText : (node, value) => { node.nodeValue = value; };
+      const isConnected = typeof options.isConnected === "function" ? options.isConnected : (node) => node?.isConnected !== false;
+      const decorate = typeof options.decorate === "function" ? options.decorate : () => {};
+      const undecorate = typeof options.undecorate === "function" ? options.undecorate : () => {};
+      let activeNode;
+      let originalText;
+      let rewrittenText;
+
+      function restore() {
+        // 只在"当前值仍是我们写入的那一份"时回写：宿主已自行改写内容时保持宿主最新值，
+        // 避免把旧语言、旧用时或旧角色文案盖回去。
+        if (activeNode !== void 0 && isConnected(activeNode) && getText(activeNode) === rewrittenText) {
+          setText(activeNode, originalText);
+        }
+        activeNode = void 0;
+        originalText = void 0;
+        rewrittenText = void 0;
+        undecorate();
+      }
+
+      function apply(text) {
+        if (typeof text !== "string" || text.length === 0) {
+          restore();
+          return;
+        }
+        const candidate = findNode();
+        if (candidate === null || candidate === void 0) {
+          restore();
+          return;
+        }
+        const currentText = getText(candidate);
+        if (activeNode !== candidate) {
+          restore();
+          activeNode = candidate;
+          originalText = currentText;
+        } else if (currentText !== rewrittenText) {
+          // 同一 Text 节点上的原文被宿主更新（locale 切换、用时刷新、React 重写）；
+          // 跟进外部值，清理时恢复的必须是最新原文。
+          originalText = currentText;
+        }
+        const next = replaceNativeStatusPrefix(originalText, text);
+        // 没有可替换的原生前缀（英文 locale、宿主已换成完成文案等）时保持原文，不做任何写入。
+        rewrittenText = next === null ? currentText : next;
+        if (next !== null && currentText !== next) setText(activeNode, next);
+        // 装饰放在文本写入之后：无论首次接管、节点替换还是重复通知，装饰都针对当前目标。
+        decorate(activeNode);
+      }
+
+      return { apply, restore };
+    }
+
+    /**
+     * 原生状态行上的字段清单：可见 Text、data-shimmer-text 装饰属性、隐藏 announcement Text。
+     * legacy 形态只有一个可见 Text 字段。同一 (节点, 属性) 组合只保留一份，避免重复写入。
+     */
+    function nativeStatusFieldDescriptors(targets) {
+      const fields = [];
+      if (targets?.visibleText != null) fields.push({ node: targets.visibleText, attribute: void 0 });
+      for (const node of targets?.shimmerAttributes ?? []) {
+        if (node != null) fields.push({ node, attribute: "data-shimmer-text" });
+      }
+      for (const node of targets?.announcements ?? []) {
+        if (node != null) fields.push({ node, attribute: void 0 });
+      }
+      return fields.filter((field, index) => fields.findIndex(
+        (other) => other.node === field.node && other.attribute === field.attribute,
+      ) === index);
+    }
+
+    /**
+     * 原生运行行的多字段重写器。
+     *
+     * 为什么不复用"整行一个 createNativeTextRewriter"：RC1 的同一行里，可见文案、装饰副本的
+     * data-shimmer-text、隐藏 announcement 是三个互相独立的宿主字段，宿主（计时器刷新、locale
+     * 切换、React 重渲染）会分别更新它们。每个字段交给一个独立的 createNativeTextRewriter
+     * 处理，就同时得到既有语义：各自保存原文、各自跟进最新值、各自只在"值仍是我们写入的那
+     * 一份"时才恢复——既不写回旧后缀，也不碰从未覆盖过的字段、节点与动画。
+     *
+     * 目标集合在本轮变小时（会话切换、停止、节点重建、announcement 消失），旧字段立即恢复；
+     * apply(null/空) 等价于 restore()。
+     */
+    function createNativeStatusRowRewriter(options = {}) {
+      const resolveTargets = typeof options.resolveTargets === "function" ? options.resolveTargets : () => void 0;
+      let entries = [];
+
+      /** 单个字段的读写适配：Text 用 nodeValue，装饰副本用 data-shimmer-text 属性。 */
+      const createFieldRewriter = (node, attribute) => {
+        const read = () => (attribute === void 0 ? node?.nodeValue : node?.getAttribute?.(attribute));
+        const write = (value) => {
+          if (attribute === void 0) {
+            node.nodeValue = value;
+            return;
+          }
+          node?.setAttribute?.(attribute, value);
+        };
+        return createNativeTextRewriter({
+          findNode: () => node,
+          getText: () => read(),
+          setText: (_candidate, value) => write(value),
+          isConnected: () => node?.isConnected !== false,
+        });
+      };
+
+      const restoreEntries = (list) => {
+        for (const entry of list) entry.rewriter.restore();
+      };
+
+      function restore() {
+        restoreEntries(entries);
+        entries = [];
+      }
+
+      function apply(text) {
+        const targets = typeof text === "string" && text.length > 0 ? resolveTargets() : void 0;
+        const fields = targets === void 0 ? [] : nativeStatusFieldDescriptors(targets);
+        if (fields.length === 0) {
+          restore();
+          return;
+        }
+        const next = [];
+        for (const field of fields) {
+          let entry = entries.find((candidate) => candidate.node === field.node && candidate.attribute === field.attribute);
+          if (entry === void 0) {
+            entry = { node: field.node, attribute: field.attribute, rewriter: createFieldRewriter(field.node, field.attribute) };
+          }
+          entry.rewriter.apply(text);
+          next.push(entry);
+        }
+        // 本轮不再覆盖的字段必须立刻恢复：只回写插件确实写过的那一份值。
+        restoreEntries(entries.filter((entry) => !next.includes(entry)));
+        entries = next;
+      }
+
+      return { apply, restore };
+    }
+
+    /** 使用 shell.overlay 注入的全局 useSessions；旧 slot 则使用现有 sessions.list。 */
+    function useSessionList(ctx, useSessions) {
+      if (typeof useSessions === "function") return useSessions((snapshot) => snapshot);
+      return react.useSyncExternalStore(ctx.sessions.list.subscribe, ctx.sessions.list.getSnapshot);
+    }
+
+    const EMPTY_PENDING_INTERACTIONS = () => null;
+    const IDENTITY_SELECTOR = (snapshot) => snapshot;
+    const PENDING_KIND_LABELS = {
+      approval: "审批确认",
+      "plan-review": "计划确认",
+      question: "问题待答",
+    };
+
+    /** 将 sessions.byId 和 pending interaction 统一成可遍历条目；异常快照按空集合处理。 */
+    function readEntries(value) {
+      if (value == null) return [];
+      // Map.entries() 的物化结果本身也是数组；保留 [key, value]，不能再次读取数组索引。
+      if (Array.isArray(value)) {
+        if (value.every((entry) => Array.isArray(entry) && entry.length === 2)) return value;
+        return value.map((entry, index) => [String(index), entry]);
+      }
+      if (typeof value.entries === "function") {
+        try { return Array.from(value.entries()); } catch { return []; }
+      }
+      if (typeof value === "object") return Object.entries(value);
+      return [];
+    }
+
+    /**
+     * 旧版 slot owner 不提供标准 pending hook 时，从会话条目的兼容字段读取待处理操作。
+     * DSH 会话快照中的 pendingInteraction 既可能是对象，也可能直接是 kind 字符串；
+     * 两者都保留到 Map，后续统一生成稳定键并做严格 kind 过滤。
+     */
+    function readSessionPendingInteractions(sessionList) {
+      const pending = new Map();
+      for (const [fallbackId, session] of readEntries(sessionList?.byId)) {
+        const interaction = session?.pendingInteraction;
+        const sessionId = sessionIdOf(interaction, sessionIdOf(session, fallbackId));
+        if (sessionId !== void 0 && interaction !== null && (typeof interaction === "object" || typeof interaction === "string")) {
+          pending.set(sessionId, interaction);
+        }
+      }
+      return pending;
+    }
+
+    /** 标准 hook 优先；缺少 hook 时回退到当前会话列表的 pendingInteraction 字段。 */
+    function useOptionalSessionPendingInteraction(useSessionPendingInteraction, sessionList) {
+      const hook = typeof useSessionPendingInteraction === "function"
+        ? useSessionPendingInteraction
+        : EMPTY_PENDING_INTERACTIONS;
+      if (typeof useSessionPendingInteraction === "function") return hook(IDENTITY_SELECTOR);
+      return readSessionPendingInteractions(sessionList);
+    }
+
+    function sessionIdOf(session, fallbackId) {
+      const id = session?.sessionId ?? session?.id ?? fallbackId;
+      return typeof id === "string" && id.length > 0 ? id : void 0;
+    }
+
+    /**
+     * 解析 DSH 当前主视图会话。
+     *
+     * RC2 移除了 session-list 快照里的 current 字段，当前主视图改由会话行的
+     * retainedBy.mainView 持有计数表达；旧宿主仍优先使用 current。readEntries 让
+     * 两代宿主及测试替身的 object/Map/entry-array 形状保持同一套 fail-closed 语义。
+     */
+    function currentSessionIdOf(sessionList) {
+      const legacyCurrent = metadataString(sessionList?.current);
+      if (legacyCurrent !== void 0) return legacyCurrent;
+      for (const [fallbackId, session] of readEntries(sessionList?.byId)) {
+        if (!(Number(session?.retainedBy?.mainView) > 0)) continue;
+        const currentId = sessionIdOf(session, fallbackId);
+        if (currentId !== void 0) return currentId;
+      }
+      return void 0;
+    }
+
+    /** 从任意兼容形状的 session-list 快照中读取一个明确的会话条目。 */
+    function sessionEntryOf(sessionList, sessionId) {
+      if (typeof sessionId !== "string" || sessionId.length === 0) return void 0;
+      for (const [fallbackId, session] of readEntries(sessionList?.byId)) {
+        if (sessionIdOf(session, fallbackId) === sessionId) return session;
+      }
+      return void 0;
+    }
+
+    /** 当前选中 child 需沿 parentId/parentSessionId 找到所属 root，循环或缺失快照均安全停止。 */
+    function rootSessionIdOf(sessionEntries, currentSessionId) {
+      if (typeof currentSessionId !== "string" || currentSessionId.length === 0) return void 0;
+      const sessions = new Map();
+      for (const [fallbackId, session] of sessionEntries) {
+        const sessionId = sessionIdOf(session, fallbackId);
+        if (sessionId !== void 0) sessions.set(sessionId, session);
+      }
+      if (!sessions.has(currentSessionId)) return void 0;
+      let rootSessionId = currentSessionId;
+      let candidate = currentSessionId;
+      const visited = new Set();
+      while (!visited.has(candidate)) {
+        visited.add(candidate);
+        const parentId = sessions.get(candidate)?.parentId ?? sessions.get(candidate)?.parentSessionId;
+        if (typeof parentId !== "string" || parentId.length === 0 || parentId === candidate) break;
+        rootSessionId = parentId;
+        if (!sessions.has(parentId)) break;
+        candidate = parentId;
+      }
+      return rootSessionId;
+    }
+
+    /** 把任意 DSH session-list 快照变成 rootSessionIdOf 接受的稳定 entries。 */
+    function expertGroupRootSessionIdOf(sessionId, _session, snapshot) {
+      const entries = readEntries(snapshot?.byId ?? snapshot?.sessions ?? snapshot);
+      return rootSessionIdOf(entries, sessionId) ?? sessionId;
+    }
+
+    function sessionRoleOf(session) {
+      return normalizeStatusRole(
+        session?.[STATUS_ROLE_MARKER]
+          ?? session?.metadata?.[STATUS_ROLE_MARKER]
+          ?? session?.role
+          ?? session?.metadata?.role
+          ?? session?.child?.role,
+      );
+    }
+
+    const SUBAGENT_METADATA_MARKER = "data-deg-subagent-metadata";
+    const SUBAGENT_METADATA_CLASS = "deg_subagent_metadata";
+
+    /** 元数据只接受非空字符串；这样 RPC 或快照中的对象、数字不会进入用户可见文案。 */
+    function metadataString(value) {
+      if (typeof value !== "string") return void 0;
+      const text = value.trim();
+      return text.length > 0 ? text : void 0;
+    }
+
+    function readSubagentMetadataField(value, field) {
+      const sources = [value, value?.child, value?.metadata];
+      for (const source of sources) {
+        const text = metadataString(source?.[field]);
+        if (text !== void 0) return text;
+      }
+      return void 0;
+    }
+
+    /**
+     * 统一快照和 RPC 的 child 字段。没有完整的 role/provider/model/reasoningEffort
+     * 时保留空对象，由 formatSubagentMetadata 决定不渲染半截文案。
+     */
+    function normalizeSubagentMetadata(value) {
+      const source = value && typeof value === "object" ? value : {};
+      const normalized = {};
+      const role = sessionRoleOf(source) ?? normalizeStatusRole(readSubagentMetadataField(source, "role"));
+      if (role !== void 0) normalized.role = role;
+      for (const field of ["provider", "model", "reasoningEffort"]) {
+        const text = readSubagentMetadataField(source, field);
+        if (text !== void 0) normalized[field] = text;
+      }
+      return normalized;
+    }
+
+    /** 角色显示名是固定映射，未知角色、模型或思考深度都不产生 DOM 文案。 */
+    function formatSubagentMetadata(value) {
+      const metadata = normalizeSubagentMetadata(value);
+      const label = metadata.role === void 0 ? void 0 : STATUS_ROLE_LABELS[metadata.role];
+      // provider 用于确认 RPC 返回的是完整 child 配置，但问题5只展示模型与思考深度。
+      if (label === void 0 || metadata.provider === void 0 || metadata.model === void 0 || metadata.reasoningEffort === void 0) return null;
+      return [label, metadata.model, metadata.reasoningEffort].join(" · ");
+    }
+
+    function subagentTaskNameOf(value) {
+      const sources = [value, value?.child, value?.metadata];
+      for (const field of ["taskName", "task", "title", "displayTitle", "label", "name"]) {
+        for (const source of sources) {
+          const text = metadataString(source?.[field]);
+          if (text !== void 0) return text;
+        }
+      }
+      return void 0;
+    }
+
+    function subagentParentIdOf(session) {
+      const direct = metadataString(session?.parentId) ?? metadataString(session?.parentSessionId);
+      if (direct !== void 0) return direct;
+      const origin = session?.origin;
+      if (origin && typeof origin === "object") {
+        return metadataString(origin.parentId)
+          ?? metadataString(origin.parentSessionId)
+          ?? sessionIdOf(origin);
+      }
+      // origin="subagent" 只说明类型，不能据此猜测它属于哪个 root。
+      return origin !== "subagent" ? metadataString(origin) : void 0;
+    }
+
+    /**
+     * 读取一份子代理目录投影值（`projectionsBySession[sessionId].values.subagentCatalog`）。
+     *
+     * 0.1.7-alpha.2 的子代理目录是按会话 id 索引的投影值，目录项固定为数组，只保证身份类
+     * 字段（id/createdAt/mode/label）。非数组（缺失、旧形状、读取异常）一律按空目录处理。
+     */
+    function subagentCatalogEntries(value) {
+      return Array.isArray(value) ? value : [];
+    }
+
+    /**
+     * 把会话投影 `projectionsBySession` 转成有序父子关系。
+     *
+     * 每个会话的 `values.subagentCatalog` 是该会话的直系子代理；递归层级与父子树由
+     * collectSubagentCatalog 在该关系上从 root 做 DFS 重建。目录项只提供身份/时间/模式/标签：
+     * 任务标题与运行状态一律继续从 byId 投影与 DEG 自己的元数据读取，绝不用目录项冒充展示数据。
+     */
+    function readSubagentCatalogRelations(projectionsBySession) {
+      const relations = [];
+      for (const [fallbackParentId, projection] of readEntries(projectionsBySession)) {
+        const parentId = metadataString(fallbackParentId) ?? sessionIdOf(fallbackParentId);
+        if (parentId === void 0) continue;
+        const snapshot = projection && typeof projection === "object" ? projection : {};
+        for (const rawEntry of subagentCatalogEntries(snapshot.values?.subagentCatalog)) {
+          const entry = rawEntry && typeof rawEntry === "object" ? rawEntry : {};
+          const childId = sessionIdOf(entry);
+          if (childId === void 0) continue;
+          relations.push({
+            parentId,
+            childId,
+            child: entry,
+            taskName: metadataString(entry.label),
+          });
+        }
+      }
+      return relations;
+    }
+
+    /**
+     * 当前会话所属 root：byId 的父子字段优先，投影目录作为补充证据。
+     *
+     * 目录只提供父子关系（身份/层级），因此这里只沿投影里的 parent 链上溯，
+     * 不读取任何展示字段。
+     */
+    function resolveSubagentRootSessionId(sessionEntries, currentSessionId, projectionsBySession) {
+      if (typeof currentSessionId !== "string" || currentSessionId.length === 0) return void 0;
+      const fromSessions = rootSessionIdOf(sessionEntries, currentSessionId);
+      if (fromSessions !== void 0) return fromSessions;
+      const parents = new Map();
+      for (const relation of readSubagentCatalogRelations(projectionsBySession)) {
+        if (!parents.has(relation.childId)) parents.set(relation.childId, relation.parentId);
+      }
+      let candidate = currentSessionId;
+      const visited = new Set();
+      while (!visited.has(candidate)) {
+        visited.add(candidate);
+        const parentId = parents.get(candidate);
+        if (parentId === void 0 || parentId === candidate) break;
+        candidate = parentId;
+      }
+      return candidate;
+    }
+
+    /**
+     * 目录顺序优先于 byId 枚举顺序；从 root 做 DFS，既覆盖直接 child，也覆盖递归 child。
+     * 不把 root 本身放入结果，因而不会猜测根会话的模型或思考深度。
+     *
+     * 目录来源固定为会话投影 `projectionsBySession[sessionId].values.subagentCatalog`：
+     * 它只提供身份/时间/模式/标签，因此任务名与运行状态仍从 byId 投影与 DEG 元数据读取。
+     */
+    function collectSubagentCatalog(sessionList, currentRootSessionId) {
+      const sessionEntries = readEntries(sessionList?.byId);
+      const sessions = new Map();
+      for (const [fallbackId, session] of sessionEntries) {
+        const sessionId = sessionIdOf(session, fallbackId);
+        if (sessionId !== void 0) sessions.set(sessionId, session);
+      }
+      const childrenByParent = new Map();
+      const addChild = (parentId, childId, child, taskName) => {
+        if (typeof parentId !== "string" || typeof childId !== "string" || parentId === childId) return;
+        if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+        const children = childrenByParent.get(parentId);
+        if (children.some((entry) => entry.childId === childId)) return;
+        children.push({ childId, child, taskName: metadataString(taskName) });
+        if (!sessions.has(childId) && child && typeof child === "object") sessions.set(childId, child);
+      };
+      // 会话投影目录是显式顺序来源，先加入它，再用 byId 的父子字段补齐投影尚未落地的 child。
+      for (const relation of readSubagentCatalogRelations(sessionList?.projectionsBySession)) {
+        addChild(relation.parentId, relation.childId, relation.child, relation.taskName);
+      }
+      for (const [sessionId, session] of sessions) {
+        const parentId = subagentParentIdOf(session);
+        if (parentId !== void 0) addChild(parentId, sessionId, session, void 0);
+      }
+      if (typeof currentRootSessionId !== "string" || currentRootSessionId.length === 0) return [];
+
+      const result = [];
+      const visited = new Set([currentRootSessionId]);
+      const visit = (parentId) => {
+        for (const { childId, child, taskName: catalogTaskName } of childrenByParent.get(parentId) ?? []) {
+          if (visited.has(childId)) continue;
+          visited.add(childId);
+          const session = sessions.get(childId) ?? child;
+          const metadata = normalizeSubagentMetadata(session);
+          result.push({
+            sessionId: childId,
+            // catalog entry.label 是原生菜单任务名的直接来源，byId 字段只作 fallback。
+            taskName: catalogTaskName ?? subagentTaskNameOf(session),
+            ...metadata,
+            metadata,
+          });
+          visit(childId);
+        }
+      };
+      visit(currentRootSessionId);
+      return result;
+    }
+
+    /** 同源 Host RPC 的唯一 child 元数据读取入口；失败和非 child 响应都安全返回 null。 */
+    async function requestSubagentMetadata(sessionId, request = globalThis?.fetch, signal, connection) {
+      if (typeof sessionId !== "string" || sessionId.length === 0) return null;
+      if (typeof request !== "function" && typeof connection?.rpc?.call !== "function") return null;
+      try {
+        const rpc = connection?.rpc;
+        const response = typeof rpc?.call === "function"
+          ? await rpc.call(RPC_CHANNEL, RPC_ENDPOINT, { action: "get", sessionId, childHint: true }, signal)
+          : await request(RPC_PATH, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "content-type": "application/json" },
+            ...(signal === void 0 ? {} : { signal }),
+            body: JSON.stringify({ action: "get", sessionId, childHint: true }),
+          });
+        if (response?.ok !== true) return null;
+        const payload = typeof response?.json === "function" ? await response.json() : response?.value;
+        if (payload?.ok !== true || payload?.kind !== "child") return null;
+        return normalizeSubagentMetadata(payload.child);
+      } catch {
+        return null;
+      }
+    }
+
+    function nativeElementChildren(node) {
+      return Array.from(node?.childNodes ?? []).filter((child) => child?.nodeType === 1);
+    }
+
+    function nativeElements(root) {
+      if (root == null) return [];
+      const elements = root?.nodeType === 1 ? [root] : [];
+      try {
+        for (const element of Array.from(root.querySelectorAll?.("*") ?? [])) {
+          if (!elements.includes(element)) elements.push(element);
+        }
+      } catch {}
+      return elements;
+    }
+
+    /** 只遍历当前 treeitem 自己的 row；嵌套 treeitem 由独立循环处理。 */
+    function nativeRowElements(root) {
+      if (root == null) return [];
+      const elements = root?.nodeType === 1 ? [root] : [];
+      const visit = (node) => {
+        for (const child of Array.from(node?.childNodes ?? [])) {
+          if (child?.nodeType !== 1 || hasNativeRole(child, "treeitem")) continue;
+          elements.push(child);
+          visit(child);
+        }
+      };
+      visit(root);
+      return elements;
+    }
+
+    function hasNativeRole(node, role) {
+      return node?.getAttribute?.("role") === role;
+    }
+
+    function hasLocalClass(node, localName) {
+      const className = node?.getAttribute?.("class");
+      if (typeof className !== "string") return false;
+      // CSS Module 常见形态是 label_hash/label__hash；不把 not-label 拆分成 label。
+      return className.split(/\s+/).some((token) => {
+        if (token.startsWith("not-" + localName) || token.startsWith("not_" + localName)) return false;
+        return token === localName
+          || token.startsWith(localName + "_")
+          || token.startsWith(localName + "-")
+          || token.endsWith("_" + localName)
+          || token.includes("_" + localName + "_");
+      });
+    }
+
+    function findNativeTrees(root) {
+      const trees = [];
+      if (hasNativeRole(root, "tree")) trees.push(root);
+      try {
+        for (const tree of Array.from(root?.querySelectorAll?.('[role="tree"]') ?? [])) {
+          if (!trees.includes(tree)) trees.push(tree);
+        }
+      } catch {}
+      return trees;
+    }
+
+    function findTreeItems(tree) {
+      const items = [];
+      if (hasNativeRole(tree, "treeitem")) items.push(tree);
+      try {
+        for (const item of Array.from(tree?.querySelectorAll?.('[role="treeitem"]') ?? [])) {
+          if (!items.includes(item)) items.push(item);
+        }
+      } catch {}
+      return items;
+    }
+
+    function isSubagentTreeAriaLabel(value) {
+      const label = metadataString(value);
+      return label !== void 0 && /(subagent|child[ -]?agent|子代理)/i.test(label);
+    }
+
+    function nativeTreeHasCatalogTask(tree, taskNames) {
+      return findTreeItems(tree).some((item) => {
+        const parts = findNativeSubagentRowParts(item);
+        return taskNames.has(metadataString(parts.label?.textContent));
+      });
+    }
+
+    /**
+     * aria-label 能明确表明子代理菜单时只接受唯一候选；否则用目录任务名匹配，
+     * 多个候选树视为歧义并 fail closed，避免污染其他 tree。
+     */
+    function findNativeSubagentTrees(root, catalog) {
+      const trees = findNativeTrees(root);
+      if (!Array.isArray(catalog) || trees.length === 0) return [];
+      const ariaTrees = trees.filter((tree) => isSubagentTreeAriaLabel(tree?.getAttribute?.("aria-label")));
+      if (ariaTrees.length > 1) return [];
+      if (ariaTrees.length === 1) return ariaTrees;
+      const taskNames = new Set(catalog
+        .map((record) => metadataString(record?.taskName))
+        .filter((taskName) => taskName !== void 0));
+      if (taskNames.size === 0) return [];
+      const matchingTrees = trees.filter((tree) => nativeTreeHasCatalogTask(tree, taskNames));
+      return matchingTrees.length === 1 ? matchingTrees : [];
+    }
+
+    function findNativeSubagentTreeItems(root, catalog) {
+      const items = [];
+      for (const tree of findNativeSubagentTrees(root, catalog)) {
+        for (const item of findTreeItems(tree)) {
+          if (!items.includes(item)) items.push(item);
+        }
+      }
+      return items;
+    }
+
+    function nativeContains(parent, child) {
+      if (parent === child) return true;
+      if (typeof parent?.contains === "function") return parent.contains(child);
+      let current = child?.parentNode;
+      while (current != null) {
+        if (current === parent) return true;
+        current = current.parentNode;
+      }
+      return false;
+    }
+
+    /** class hash 不稳定，所以只按 token 局部名识别；没有局部名时退回 row 的稳定子节点顺序。 */
+    function findNativeSubagentRowParts(item) {
+      const elements = nativeRowElements(item).filter((element) => !isSubagentMetadataNode(element));
+      const labelNodes = elements.filter((element) => hasLocalClass(element, "label"));
+      const summaryNodes = elements.filter((element) => hasLocalClass(element, "summary"));
+      let label = labelNodes.length === 1 ? labelNodes[0] : void 0;
+      let summary = summaryNodes.length === 1 ? summaryNodes[0] : void 0;
+      const contentNodes = elements.filter((element) => hasLocalClass(element, "content"));
+      if (contentNodes.length > 1 || labelNodes.length > 1 || summaryNodes.length > 1) {
+        return { label: void 0, summary: void 0 };
+      }
+      const content = contentNodes.length === 1 ? contentNodes[0] : void 0;
+      const containers = [];
+      // 无 content class 时仅把 row 自身的恰好两个子块视为结构 fallback。
+      for (const container of content !== void 0 ? [content] : contentNodes.length === 0 ? [item] : []) {
+        if (container != null && !containers.includes(container)) containers.push(container);
+      }
+      for (const container of containers) {
+        const children = nativeElementChildren(container).filter((element) => !isSubagentMetadataNode(element));
+        // 只有恰好两个稳定 row 子块时才使用结构 fallback，避免猜测任意节点。
+        if (children.length !== 2) continue;
+        if (label === void 0 && labelNodes.length === 0) label = children[0];
+        if (summary === void 0 && summaryNodes.length === 0) summary = children.find((element) => element !== label);
+        if (label !== void 0 && summary !== void 0) break;
+      }
+      if (label === summary) return { label: void 0, summary: void 0 };
+      return { label, summary };
+    }
+
+    function isSubagentMetadataNode(node) {
+      return typeof node?.getAttribute === "function" && node.getAttribute(SUBAGENT_METADATA_MARKER) !== null;
+    }
+
+    function findSubagentMetadataNodes(root) {
+      return (root?.getAttribute?.("role") === "treeitem" ? nativeRowElements(root) : nativeElements(root))
+        .filter(isSubagentMetadataNode);
+    }
+
+    function removeSubagentMetadataNode(node) {
+      try {
+        if (typeof node?.remove === "function") node.remove();
+        else node?.parentNode?.removeChild?.(node);
+      } catch {}
+    }
+
+    function removeSubagentMetadata(root) {
+      const nodes = findSubagentMetadataNodes(root);
+      for (const node of nodes) removeSubagentMetadataNode(node);
+      return nodes.length;
+    }
+
+    function rpcMetadataFor(rpcMetadata, sessionId) {
+      if (rpcMetadata instanceof Map) return rpcMetadata.get(sessionId);
+      return rpcMetadata?.[sessionId];
+    }
+
+    function metadataForSubagentRecord(record, rpcMetadata) {
+      const rpc = rpcMetadataFor(rpcMetadata, record?.sessionId);
+      return normalizeSubagentMetadata({ ...(record?.metadata ?? {}), ...record, ...(rpc ?? {}) });
+    }
+
+    /**
+     * 只处理已选定子代理 tree 中能按任务名匹配目录的 treeitem。
+     * 唯一 label 可直接匹配；重复 label 必须有稳定 session id，否则保守跳过。
+     */
+    function nativeSubagentSessionIdOf(item) {
+      for (const name of ["data-session-id", "data-subagent-id", "data-id"]) {
+        const value = metadataString(item?.getAttribute?.(name));
+        if (value !== void 0) return value;
+      }
+      return void 0;
+    }
+
+    function applySubagentMetadata(root, catalog, rpcMetadata) {
+      const records = Array.isArray(catalog) ? catalog : [];
+      const items = findNativeSubagentTreeItems(root, records);
+      const recordsByTask = new Map();
+      const recordsBySession = new Map();
+      for (const record of records) {
+        const taskName = metadataString(record?.taskName);
+        if (taskName === void 0 || typeof record?.sessionId !== "string") continue;
+        if (!recordsByTask.has(taskName)) recordsByTask.set(taskName, []);
+        recordsByTask.get(taskName).push(record);
+        if (recordsBySession.has(record.sessionId)) recordsBySession.set(record.sessionId, null);
+        else recordsBySession.set(record.sessionId, record);
+      }
+      const rowLabelCounts = new Map();
+      const rowParts = new Map();
+      for (const item of items) {
+        const parts = findNativeSubagentRowParts(item);
+        rowParts.set(item, parts);
+        const taskName = metadataString(parts.label?.textContent);
+        if (taskName !== void 0) rowLabelCounts.set(taskName, (rowLabelCounts.get(taskName) ?? 0) + 1);
+      }
+      for (const item of items) {
+        const parts = rowParts.get(item) ?? { label: void 0, summary: void 0 };
+        const existing = findSubagentMetadataNodes(item);
+        const taskName = metadataString(parts.label?.textContent);
+        const candidates = taskName === void 0 ? [] : recordsByTask.get(taskName) ?? [];
+        const rowSessionId = nativeSubagentSessionIdOf(item);
+        let record;
+        if (rowSessionId !== void 0) {
+          const candidate = recordsBySession.get(rowSessionId);
+          if (candidate !== null && candidate?.taskName === taskName) record = candidate;
+        } else if (taskName !== void 0 && rowLabelCounts.get(taskName) === 1 && candidates.length === 1) {
+          // 唯一任务名可直接匹配；重复 label 没有稳定 id 时必须保持不注入。
+          record = candidates[0];
+        }
+        const text = parts.summary == null || record === void 0
+          ? null
+          : formatSubagentMetadata(metadataForSubagentRecord(record, rpcMetadata));
+        if (text === null || parts.summary?.parentNode == null) {
+          for (const node of existing) removeSubagentMetadataNode(node);
+          continue;
+        }
+        const node = existing[0] ?? parts.summary.ownerDocument?.createElement?.("span") ?? parts.summary.parentNode?.ownerDocument?.createElement?.("span");
+        if (node == null) continue;
+        if (existing.length > 1) {
+          for (const duplicate of existing.slice(1)) removeSubagentMetadataNode(duplicate);
+        }
+        if (!isSubagentMetadataNode(node)) {
+          node.setAttribute?.(SUBAGENT_METADATA_MARKER, "");
+          node.className = SUBAGENT_METADATA_CLASS;
+        }
+        if (node.textContent !== text) node.textContent = text;
+        if (node.parentNode !== parts.summary.parentNode || node.nextSibling !== parts.summary) {
+          parts.summary.parentNode.insertBefore(node, parts.summary);
+        }
+      }
+      // 菜单重建后旧 marker 可能暂时落在 tree 外；它们也属于插件所有权，必须立即清掉。
+      for (const node of findSubagentMetadataNodes(root)) {
+        if (!items.some((item) => nativeContains(item, node))) removeSubagentMetadataNode(node);
+      }
+      return findSubagentMetadataNodes(root).length;
+    }
+
+    /**
+     * 安装 DSH 宿主原生运行状态桥。插件只观察并替换宿主已经渲染的主文本节点，
+     * 不创建自己的状态行，不写入 class/style/aria，也不触碰宿主的鲸鱼动画和计时器。
+     * session list 负责当前会话与 running 快照，RPC 负责 root/child 身份确认；两者
+     * 都不可用时按 fail-closed 处理，保留 DSH 原生文案。
+     */
+    function installNativeStatusBridge(ctx) {
+      const doc = typeof document !== "undefined" ? document : null;
+      const root = doc?.body ?? doc?.documentElement;
+      const sessionStore = ctx?.sessions?.list;
+      if (root == null || typeof sessionStore?.getSnapshot !== "function" || typeof sessionStore?.subscribe !== "function") return () => {};
+
+      let disposed = false;
+      let sessionList = {};
+      let currentSessionId;
+      let sessionEntry;
+      let childSession = false;
+      let markedRole;
+      let identityKey = null;
+      let rpcRoleState = { sessionId: void 0, kind: "pending", role: void 0 };
+      let requestSerial = 0;
+      let controller = null;
+      let observer = null;
+
+      // RC1 行有三个独立字段（可见 Text、data-shimmer-text、隐藏 announcement），
+      // legacy 形态只有一个可见 Text；同一个行级重写器覆盖两种形态。
+      const rewriter = createNativeStatusRowRewriter({
+        resolveTargets: () => resolveNativeStatusTargets(root, currentSessionId),
+      });
+      const render = () => {
+        if (disposed) return;
+        const statusText = resolveRunningStatusText({
+          sessionId: currentSessionId,
+          currentSessionId,
+          running: sessionEntry?.running,
+          session: sessionEntry,
+          kind: rpcRoleState.sessionId === currentSessionId ? rpcRoleState.kind : "pending",
+          role: rpcRoleState.sessionId === currentSessionId ? rpcRoleState.role : void 0,
+        });
+        rewriter.apply(statusText);
+      };
+
+      const refreshIdentity = () => {
+        const nextKey = [currentSessionId ?? "", childSession ? "child" : "root", markedRole ?? ""].join("\u0000");
+        if (nextKey === identityKey) {
+          render();
+          return;
+        }
+        identityKey = nextKey;
+        requestSerial += 1;
+        controller?.abort();
+        controller = null;
+        rpcRoleState = {
+          sessionId: currentSessionId,
+          kind: markedRole !== void 0 ? "child" : "pending",
+          role: markedRole,
+        };
+        render();
+        if (typeof currentSessionId !== "string" || currentSessionId.length === 0) return;
+        const requestSessionId = currentSessionId;
+        const requestToken = requestSerial;
+        controller = typeof AbortController === "function" ? new AbortController() : null;
+        (async () => {
+          try {
+            const response = await requestPluginRpc(ctx.connection, {
+              action: "get", sessionId: requestSessionId, childHint: childSession,
+            }, controller === null ? {} : { signal: controller.signal });
+            if (disposed || requestToken !== requestSerial) return;
+            if (!response?.ok) {
+              rpcRoleState = { sessionId: requestSessionId, kind: markedRole !== void 0 ? "child" : "unknown", role: markedRole };
+              render();
+              return;
+            }
+            const json = await response.json();
+            if (disposed || requestToken !== requestSerial) return;
+            const identity = resolveStatusIdentity({ sessionId: requestSessionId, responseSessionId: requestSessionId, response: json });
+            if (identity === null) return;
+            const markerFallbackKind = markedRole !== void 0 && identity.kind === "unknown" ? "child" : identity.kind;
+            rpcRoleState = {
+              sessionId: requestSessionId,
+              kind: markerFallbackKind,
+              role: identity.role ?? markedRole,
+            };
+            render();
+          } catch (error) {
+            if (disposed || requestToken !== requestSerial || error?.name === "AbortError") return;
+            rpcRoleState = { sessionId: requestSessionId, kind: markedRole !== void 0 ? "child" : "unknown", role: markedRole };
+            render();
+          }
+        })();
+      };
+
+      const sync = () => {
+        if (disposed) return;
+        try {
+          sessionList = sessionStore.getSnapshot() ?? {};
+        } catch {
+          sessionList = {};
+        }
+        currentSessionId = currentSessionIdOf(sessionList);
+        sessionEntry = sessionEntryOf(sessionList, currentSessionId);
+        childSession = isPluginChildSession(sessionEntry);
+        markedRole = normalizeStatusRole(sessionEntry?.[STATUS_ROLE_MARKER] ?? sessionEntry?.metadata?.[STATUS_ROLE_MARKER]);
+        refreshIdentity();
+      };
+
+      let unsubscribe = () => {};
+      try {
+        const cleanup = sessionStore.subscribe(sync);
+        if (typeof cleanup === "function") unsubscribe = cleanup;
+      } catch {
+        // 会话服务拒绝订阅时仍保留一次初始渲染，并由原生文案安全降级。
+      }
+      sync();
+
+      const Observer = doc?.defaultView?.MutationObserver
+        ?? (typeof globalThis !== "undefined" ? globalThis.MutationObserver : void 0);
+      if (typeof Observer === "function") {
+        try {
+          observer = new Observer(() => render());
+          observer.observe(root, { childList: true, subtree: true, characterData: true });
+        } catch {
+          observer = null;
+        }
+      }
+      return () => {
+        if (disposed) return;
+        disposed = true;
+        requestSerial += 1;
+        controller?.abort();
+        controller = null;
+        try { unsubscribe(); } catch {}
+        try { observer?.disconnect(); } catch {}
+        observer = null;
+        rewriter.restore();
+      };
+    }
+
+    /**
+     * shell.overlay 中的独立元数据桥：仅为原生子代理菜单插入一行文本，始终返回 null。
+     * 会话快照变化时重建目录；RPC 和 observer 各自拥有 cleanup，旧响应不能污染新 root。
+     */
+    function SubagentMetadataBridge({ ctx, useSessions }) {
+      const sessionList = useSessionList(ctx, useSessions) ?? {};
+      const sessionEntries = react.useMemo(() => readEntries(sessionList.byId), [sessionList]);
+      const currentSessionId = currentSessionIdOf(sessionList);
+      const projectionsBySession = sessionList.projectionsBySession;
+      const currentRootSessionId = react.useMemo(
+        () => resolveSubagentRootSessionId(sessionEntries, currentSessionId, projectionsBySession),
+        [currentSessionId, sessionEntries, projectionsBySession],
+      );
+      const catalog = react.useMemo(
+        () => collectSubagentCatalog({ byId: sessionEntries, projectionsBySession }, currentRootSessionId),
+        [currentRootSessionId, sessionEntries, projectionsBySession],
+      );
+      const catalogRef = react.useRef(catalog);
+      catalogRef.current = catalog;
+      // 只把 root、身份、任务名和可用元数据纳入 key；activity 变化不应重启相同 RPC。
+      const catalogKey = JSON.stringify({
+        root: currentRootSessionId ?? null,
+        records: catalog.map((record) => ({
+          sessionId: record.sessionId,
+          taskName: record.taskName,
+          role: record.role,
+          provider: record.provider,
+          model: record.model,
+          reasoningEffort: record.reasoningEffort,
+        })),
+      });
+      const [rpcState, setRpcState] = react.useState(() => ({ catalogKey: "", values: new Map() }));
+      const rpcMetadata = rpcState.catalogKey === catalogKey ? rpcState.values : null;
+
+      react.useEffect(() => {
+        let cancelled = false;
+        const controller = typeof AbortController === "function" ? new AbortController() : null;
+        setRpcState({ catalogKey, values: new Map() });
+        const unresolved = catalogRef.current.filter((record) => formatSubagentMetadata(record) === null);
+        if (unresolved.length > 0) {
+          void Promise.all(unresolved.map(async (record) => [
+            record.sessionId,
+            await requestSubagentMetadata(record.sessionId, globalThis?.fetch, controller?.signal, ctx.connection),
+          ])).then((results) => {
+            if (cancelled) return;
+            const values = new Map();
+            for (const [sessionId, metadata] of results) {
+              if (typeof sessionId === "string" && metadata !== null) values.set(sessionId, metadata);
+            }
+            setRpcState((previous) => previous.catalogKey === catalogKey
+              ? { catalogKey, values }
+              : previous);
+          }).catch(() => {});
+        }
+        return () => {
+          cancelled = true;
+          controller?.abort();
+        };
+      }, [catalogKey]);
+
+      react.useEffect(() => {
+        const doc = typeof document !== "undefined" ? document : null;
+        const root = doc?.body ?? doc?.documentElement;
+        let disposed = false;
+        if (root == null) return () => {};
+        const render = () => {
+          if (!disposed) applySubagentMetadata(root, catalogRef.current, rpcMetadata);
+        };
+        render();
+        const Observer = doc?.defaultView?.MutationObserver
+          ?? (typeof globalThis !== "undefined" ? globalThis.MutationObserver : void 0);
+        if (typeof Observer !== "function") return () => {
+          disposed = true;
+          removeSubagentMetadata(root);
+        };
+        const observer = new Observer(() => {
+          // applySubagentMetadata 只在文案或位置变化时写 DOM，observer 不会因自身更新循环触发。
+          render();
+        });
+        observer.observe(root, { childList: true, subtree: true, characterData: true });
+        return () => {
+          disposed = true;
+          observer.disconnect();
+          removeSubagentMetadata(root);
+        };
+      }, [catalogKey, rpcMetadata]);
+      return null;
+    }
+
+    /**
+     * 设置页使用当前 Host 目录；每行 provider 独立决定模型和思考深度。
+     * 角色清单与标签复用上面的同一份浏览器投影，不再维护第二份重复清单；
+     * 实际展示的角色仍以 RPC meta 的 activeRoles 为准（Observer 关闭时隐藏）。
+     */
+    const SETTINGS_ROLE_IDS = STATUS_ROLE_IDS;
+    const SETTINGS_ROLE_LABELS = STATUS_ROLE_LABELS;
+    // meta 尚未返回时的初始行：只含默认角色，可选角色（observer）由 meta 决定是否展示。
+    const SETTINGS_REQUIRED_ROLE_IDS = SETTINGS_ROLE_IDS.filter((role) => role !== "observer");
+    const SETTINGS_NO_PROVIDER_LABEL = "无";
+
+    // 提示词入口始终使用完整角色表，与模型配置的 activeRoles 读取路径刻意分离；
+    // 因此 Observer 未启用时仍可配置提示词，但不会参与统一 provider 选择。
+    const PROMPT_ROLE_IDS = SETTINGS_ROLE_IDS;
+    const DEFAULT_PROMPT_MAX_GRAPHEMES = 32000;
+    const PROMPT_WARNING_RATIO = 0.9;
+    const PROMPT_DISCIPLINE_HINT = "固定执行纪律由插件在运行时自动追加且不可编辑，包含叶子 worker、工具与权限边界、continuable child 约束、交付协议和中文输出要求。";
+
+    /**
+     * grapheme 分段器按「locale + granularity」缓存。
+     *
+     * 计数位于提示词编辑器的实时校验路径上（每次按键都会重新校验草稿），而 Intl.Segmenter
+     * 的构造成本远高于一次遍历，因此在工厂作用域里复用实例。缓存键包含构造参数：切分语义
+     * 由 locale 与 granularity 共同决定，不同参数不能共用一个实例，所以是「按参数缓存」
+     * 而不是全局唯一单例。
+     * 构造失败（嵌入式 WebView 的残缺 Intl、polyfill 装到一半）不做负缓存：保持与旧实现
+     * 一致的「每次调用重试构造」，失败时由调用方回退到代理项级计数。
+     */
+    const GRAPHEME_SEGMENTER_CACHE = new Map();
+    function graphemeSegmenterOf(locale, granularity) {
+      const key = (locale === undefined ? "" : String(locale)) + "\u0000" + String(granularity);
+      const cached = GRAPHEME_SEGMENTER_CACHE.get(key);
+      if (cached !== undefined) return cached;
+      try {
+        const Segmenter = globalThis?.Intl?.Segmenter;
+        if (typeof Segmenter !== "function") return null;
+        const segmenter = new Segmenter(locale, { granularity });
+        GRAPHEME_SEGMENTER_CACHE.set(key, segmenter);
+        return segmenter;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * 按 Unicode grapheme 统计文本长度。Intl.Segmenter 是浏览器与 Node 的标准实现，
+     * 退回 Array.from 只用于极旧运行时，至少仍能把代理项当作一个字符而不截断原文。
+     */
+    function countUnicodeGraphemes(value) {
+      if (typeof value !== "string" || value.length === 0) return 0;
+      const segmenter = graphemeSegmenterOf(undefined, "grapheme");
+      if (segmenter !== null) {
+        try {
+          let count = 0;
+          for (const unused of segmenter.segment(value)) {
+            void unused;
+            count += 1;
+          }
+          return count;
+        } catch {
+          // 某些嵌入式 WebView 暴露了不完整的 Intl：segment() 本身也可能抛错，
+          // 回退计数不能阻断编辑器（异常处理范围与旧实现完全一致）。
+        }
+      }
+      return Array.from(value).length;
+    }
+
+    /**
+     * 校验提示词草稿但不修改原文：空白只影响非空判断，首尾空格和换行仍按原样保存。
+     */
+    function validatePromptText(value, maxGraphemes = DEFAULT_PROMPT_MAX_GRAPHEMES) {
+      const text = typeof value === "string" ? value : "";
+      const max = Number.isSafeInteger(maxGraphemes) && maxGraphemes > 0
+        ? maxGraphemes
+        : DEFAULT_PROMPT_MAX_GRAPHEMES;
+      const count = countUnicodeGraphemes(text);
+      if (text.trim().length === 0) {
+        return { ok: false, code: "prompt-empty", message: "提示词不能为空", count, maxGraphemes: max };
+      }
+      if (count > max) {
+        return { ok: false, code: "prompt-too-long", message: "提示词不能超过 " + max + " 个字符", count, maxGraphemes: max };
+      }
+      return { ok: true, code: null, message: null, count, maxGraphemes: max };
+    }
+
+    /** 只从 settings 快照保留已知角色的字符串覆盖，避免脏 wire 数据进入编辑器。 */
+    function normalizePromptOverrides(value, maxGraphemes = DEFAULT_PROMPT_MAX_GRAPHEMES) {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+      const normalized = {};
+      for (const role of PROMPT_ROLE_IDS) {
+        const text = value[role];
+        if (typeof text !== "string") continue;
+        if (!validatePromptText(text, maxGraphemes).ok) continue;
+        normalized[role] = text;
+      }
+      return normalized;
+    }
+
+    function promptOverridesEqual(left, right) {
+      const leftValue = left && typeof left === "object" ? left : {};
+      const rightValue = right && typeof right === "object" ? right : {};
+      const roles = [...new Set([...Object.keys(leftValue), ...Object.keys(rightValue)])].sort();
+      return roles.every((role) => leftValue[role] === rightValue[role]);
+    }
+
+    /**
+     * 将 Host rolePrompts 投影归一为固定六角色顺序。投影未完整到达时返回 null，
+     * 编辑页据此显示加载而不是先用空文本冒充一个可保存的提示词。
+     */
+    function normalizeRolePromptProjection(projection, settingsValue, snapshotOverridesAuthoritative = false) {
+      if (projection === null || typeof projection !== "object" || Array.isArray(projection)
+        || !Array.isArray(projection.entries)) return null;
+      const fallbackOverrides = normalizePromptOverrides(settingsValue?.promptOverrides, projection.maxGraphemes);
+      const settingsHasOverrides = settingsValue !== null && typeof settingsValue === "object"
+        && Object.prototype.hasOwnProperty.call(settingsValue, "promptOverrides");
+      // 纯函数两参数调用保留旧 Host 投影语义；只有设置组件在接收到完整 snapshot
+      // 后显式启用该开关，才让空映射表达“覆盖已被删除”，以抵抗滞后的 meta 响应。
+      const byRole = new Map(projection.entries
+        .filter((entry) => entry && typeof entry.role === "string")
+        .map((entry) => [entry.role, entry]));
+      const entries = [];
+      for (const role of PROMPT_ROLE_IDS) {
+        const source = byRole.get(role);
+        if (typeof source?.defaultPersona !== "string") return null;
+        // settings snapshot 到达后比一次 meta 更权威：meta 可能仍是组件首次读取的旧投影，
+        // 不能把已删除的覆盖重新渲染回来。旧 Host 没有该字段时才回退 meta 自身状态。
+        const snapshotControlsOverride = snapshotOverridesAuthoritative && settingsHasOverrides;
+        const settingsHasRoleOverride = snapshotControlsOverride && Object.prototype.hasOwnProperty.call(fallbackOverrides, role);
+        const override = snapshotControlsOverride
+          ? fallbackOverrides[role]
+          : (typeof source.override === "string" ? source.override : fallbackOverrides[role]);
+        const customized = snapshotControlsOverride
+          ? settingsHasRoleOverride
+          : source.customized === true;
+        entries.push({
+          role,
+          defaultPersona: source.defaultPersona,
+          ...(customized && typeof override === "string" ? { override } : {}),
+          customized,
+          effective: customized && typeof override === "string" ? override : source.defaultPersona,
+        });
+      }
+      const maxGraphemes = Number.isSafeInteger(projection.maxGraphemes) && projection.maxGraphemes > 0
+        ? projection.maxGraphemes
+        : DEFAULT_PROMPT_MAX_GRAPHEMES;
+      return {
+        roles: PROMPT_ROLE_IDS,
+        maxGraphemes,
+        customizable: projection.customizable === true,
+        entries,
+      };
+    }
+
+    function promptEntryOf(projection, role) {
+      return projection?.entries?.find((entry) => entry.role === role) ?? null;
+    }
+
+    /** 保存成功后只更新本地只读投影，已自定义圆点不会跟随临时草稿变化。 */
+    function updateRolePromptProjection(projection, role, text) {
+      if (projection === null || typeof projection !== "object") return projection;
+      return {
+        ...projection,
+        entries: projection.entries.map((entry) => {
+          if (entry.role !== role) return entry;
+          const customized = text !== entry.defaultPersona;
+          const next = { ...entry, customized, effective: text };
+          if (customized) next.override = text;
+          else delete next.override;
+          return next;
+        }),
+      };
+    }
+
+    /**
+     * 统一供应商只观察设置页实际展示的角色；Observer 未启用时，其旧配置不能污染选择器。
+     * 未传角色列表时沿用旧版五个必选专家，供纯函数调用和旧 Host 兼容。
+     */
+    function settingsRolesForProvider(roles) {
+      const candidates = Array.isArray(roles) ? roles : SETTINGS_REQUIRED_ROLE_IDS;
+      return [...new Set(candidates.filter((role) => SETTINGS_ROLE_IDS.includes(role)))];
+    }
+
+    /**
+     * 返回当前展示角色的共同 provider。空字符串同时表示没有可统一的 provider 和混合状态；
+     * 只有完全没有行内 provider 时才回退到旧的全局 provider，保持历史 settings 可见且可迁移。
+     */
+    function unifiedProviderOf(defaults, roles, legacyProvider = "") {
+      const activeRoles = settingsRolesForProvider(roles);
+      if (activeRoles.length === 0) return "";
+      const providers = activeRoles.map((role) => {
+        const provider = defaults?.[role]?.provider;
+        return typeof provider === "string" && provider.length > 0 ? provider : "";
+      });
+      const configured = providers.filter((provider) => provider.length > 0);
+      if (configured.length === 0) return typeof legacyProvider === "string" ? legacyProvider : "";
+      if (configured.length !== activeRoles.length) return "";
+      const first = configured[0];
+      return configured.every((provider) => provider === first) ? first : "";
+    }
+
+    const NOTIFICATION_HOLD_OPTIONS = Object.freeze([
+      { value: 5000, label: "5s" },
+      { value: 10000, label: "10s" },
+      { value: 30000, label: "30s" },
+      { value: 60000, label: "60s" },
+      { value: 300000, label: "5min" },
+      { value: 600000, label: "10min" },
+      { value: 0, label: "永久" },
+    ]);
+    const DEFAULT_NOTIFICATION_HOLD_MS = 5000;
+
+    /** 设置页只允许固定时长；旧配置或非法值回退到 5 秒。 */
+    function notificationHoldMsOf(value) {
+      const number = typeof value === "number" ? value : NaN;
+      return NOTIFICATION_HOLD_OPTIONS.some((option) => option.value === number) ? number : DEFAULT_NOTIFICATION_HOLD_MS;
+    }
+
+    function clampNotificationVolume(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? Math.min(100, Math.max(0, Math.round(number))) : 100;
+    }
+
+    /** 共享每个 role 的 running shard 上限只接受 1~64 的整数，旧配置或非法值回退到 10。 */
+    function normalizeRoleConcurrencyLimit(value) {
+      return Number.isSafeInteger(value) && value >= 1 && value <= 64 ? value : 10;
+    }
+
+    function normalizeSettingsDraft(value, roles, allowLegacyProviderFallback = true) {
+      const source = value && typeof value === "object" ? value : {};
+      const configuredProvider = typeof source.provider === "string" ? source.provider : "";
+      const activeRoles = settingsRolesForProvider(roles);
+      const entries = [];
+      for (const [role, selection] of Object.entries(source.defaults ?? {})) {
+        if (!selection || typeof selection !== "object"
+          || typeof selection.model !== "string" || selection.model.length === 0) continue;
+        const provider = typeof selection.provider === "string" && selection.provider.length > 0
+          ? selection.provider
+          : "";
+        entries.push({ role, selection, provider });
+      }
+      const hasVisibleRowProvider = entries.some(({ role, provider }) => activeRoles.includes(role) && provider.length > 0);
+      const defaults = {};
+      for (const { role, selection, provider: explicitProvider } of entries) {
+        const provider = explicitProvider.length > 0
+          ? explicitProvider
+          : (allowLegacyProviderFallback && !hasVisibleRowProvider && activeRoles.includes(role)
+            ? configuredProvider
+            : "");
+        if (provider.length === 0) continue;
+        defaults[role] = { provider, model: selection.model };
+        if (typeof selection.reasoningEffort === "string") defaults[role].reasoningEffort = selection.reasoningEffort;
+      }
+      const visibleProviders = activeRoles
+        .map((role) => defaults[role]?.provider)
+        .filter((provider) => typeof provider === "string" && provider.length > 0);
+      const inferredProvider = visibleProviders.length > 0
+        && visibleProviders.length === activeRoles.length
+        && visibleProviders.every((provider) => provider === visibleProviders[0])
+        ? visibleProviders[0]
+        : "";
+      return {
+        // 行级 provider 一旦存在就拥有优先权；只有可见行完全没有 provider 时才保留旧顶层值。
+        provider: hasVisibleRowProvider
+          ? inferredProvider
+          : (allowLegacyProviderFallback ? configuredProvider : ""),
+        defaults,
+        notificationEnabled: source.notificationEnabled !== false,
+        notificationVolume: clampNotificationVolume(source.notificationVolume),
+        notificationHoldMs: notificationHoldMsOf(source.notificationHoldMs),
+        roleConcurrencyLimit: normalizeRoleConcurrencyLimit(source.roleConcurrencyLimit),
+        // 旧客户端/Host 缺少字段时保持关闭，避免升级后改变图片路由。
+        observerPreferred: source.observerPreferred === true,
+        // 任务管理缺字段时保持开启：默认必须维持 Expert Group 注册到侧边栏的历史行为。
+        taskManagementEnabled: source.taskManagementEnabled !== false,
+      };
+    }
+
+    function settingsDraftEqual(left, right) {
+      return JSON.stringify(left) === JSON.stringify(right);
+    }
+
+    function createSettingsModelCatalog(ctx) {
+      let state = { groups: [], status: "idle", error: null };
+      let inflight = null;
+      const freshness = createClientFreshnessBoundary();
+      const listeners = new Set();
+      const publish = (next) => {
+        state = next;
+        for (const listener of listeners) listener();
+      };
+      const load = () => {
+        if (inflight !== null) return inflight;
+        const requestToken = freshness.beginRequest("catalog", "settings");
+        publish({ ...state, status: "loading", error: null });
+        inflight = Promise.resolve().then(() => ctx.remote.session.modelCatalog()).then((response) => {
+          const catalog = response?.ok === true ? response.value : response;
+          if (!catalog || !Array.isArray(catalog.groups)) throw new Error("模型目录不可用");
+          const normalizedGroups = normalizeSettingsModelGroups(catalog.groups);
+          const accepted = freshness.acceptCatalogResponse({
+            generation: requestToken.sequence,
+            groups: normalizedGroups,
+            requestToken,
+          });
+          if (accepted.accepted) publish({ groups: normalizedGroups, status: "ready", error: null });
+        }).catch((cause) => {
+          if (freshness.isCurrent(requestToken)) {
+            publish({ ...state, status: "error", error: cause instanceof Error ? cause.message : String(cause) });
+          }
+        }).finally(() => {
+          if (freshness.isCurrent(requestToken)) inflight = null;
+        });
+        return inflight;
+      };
+      const refresh = (clear) => {
+        inflight = null;
+        if (clear) publish({ groups: [], status: "idle", error: null });
+        void load();
+      };
+      const subscribe = (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      };
+      const getSnapshot = () => state;
+      const eventStops = [];
+      for (const event of ["llm/adapters-updated", "settings/document-updated", "credentials/reference-updated"]) {
+        eventStops.push(ctx.remote.$on(event, () => refresh(false)));
+      }
+      ctx.on("connection/reset", () => refresh(true));
+      ctx.effect(() => () => {
+        for (const stop of eventStops) if (typeof stop === "function") stop();
+        freshness.dispose();
+      }, "dsh-expert-group: settings catalog events");
+      return { load, subscribe, getSnapshot };
+    }
+
+    // 将 Host 目录归一化为设置页可安全消费的 provider / model / effort 结构。
+    function normalizeSettingsModelGroups(groups) {
+      return (Array.isArray(groups) ? groups : []).flatMap((group) => {
+        if (!group || typeof group.id !== "string" || group.id.length === 0) return [];
+        const models = (Array.isArray(group.models) ? group.models : [])
+          .filter((model) => model && typeof model === "object" && typeof model.id === "string" && model.id.length > 0)
+          .map((model) => {
+            const normalized = {
+              ...model,
+              name: typeof model.name === "string" && model.name.trim().length > 0 ? model.name : model.id,
+            };
+            const reasoning = model.reasoning;
+            if (!reasoning || typeof reasoning !== "object" || Array.isArray(reasoning)) {
+              delete normalized.reasoning;
+              return normalized;
+            }
+            const efforts = (Array.isArray(reasoning.efforts) ? reasoning.efforts : [])
+              .flatMap((effort) => {
+                if (!effort || typeof effort !== "object" || typeof effort.id !== "string" || effort.id.length === 0) return [];
+                return [{
+                  ...effort,
+                  name: typeof effort.name === "string" && effort.name.trim().length > 0 ? effort.name : effort.id,
+                }];
+              });
+            const defaultEffort = typeof reasoning.defaultEffort === "string"
+              && reasoning.defaultEffort.trim().length > 0
+              && efforts.some((effort) => effort.id === reasoning.defaultEffort)
+              ? reasoning.defaultEffort
+              : void 0;
+            normalized.reasoning = {
+              efforts,
+              ...(defaultEffort === void 0 ? {} : { defaultEffort }),
+            };
+            return normalized;
+          });
+        return [{
+          ...group,
+          name: typeof group.name === "string" && group.name.trim().length > 0 ? group.name : group.id,
+          models,
+        }];
+      });
+    }
+
+    /** 从模型目录条目读取用户可见的显示名称；缺失时沿用模型 ID 作为归一后的回退名称。 */
+    function modelDisplayNameOf(model) {
+      if (!model || typeof model !== "object") return "";
+      if (typeof model.name === "string" && model.name.trim().length > 0) return model.name;
+      return typeof model.id === "string" && model.id.length > 0 ? model.id : "";
+    }
+
+    /** 按目标 provider 的显示名称迁移一项选择；不兼容时返回 null，调用方负责清理。 */
+    function migrateSettingsSelection(selection, provider, groups) {
+      if (typeof provider !== "string" || provider.length === 0) return null;
+      const providerGroups = Array.isArray(groups) ? groups : [];
+      const providerGroup = providerGroups.find((group) => group?.id === provider);
+      if (!providerGroup) return null;
+      if (!selection || typeof selection !== "object"
+        || typeof selection.model !== "string" || selection.model.length === 0) return null;
+
+      // 必须先从源 provider 解析显示名称：目标 provider 的模型 ID 可能完全不同，
+      // 只有用户自定义的 name（或目录归一后的 ID 回退名称）一致时才视为同一选择。
+      const sourceGroup = typeof selection.provider === "string" && selection.provider.length > 0
+        ? providerGroups.find((group) => group?.id === selection.provider)
+        : void 0;
+      const sourceModel = Array.isArray(sourceGroup?.models)
+        ? sourceGroup.models.find((candidate) => candidate?.id === selection.model)
+        : void 0;
+      const sourceDisplayName = modelDisplayNameOf(sourceModel);
+      if (sourceDisplayName.length === 0) return null;
+
+      const model = Array.isArray(providerGroup.models)
+        ? providerGroup.models.find((candidate) => modelDisplayNameOf(candidate) === sourceDisplayName)
+        : void 0;
+      if (!model) return null;
+      const next = { provider: providerGroup.id, model: model.id };
+      const reasoning = model.reasoning;
+      if (typeof selection.reasoningEffort === "string"
+        && Array.isArray(reasoning?.efforts)
+        && reasoning.efforts.some((effort) => effort?.id === selection.reasoningEffort)) {
+        next.reasoningEffort = selection.reasoningEffort;
+      }
+      return next;
+    }
+
+    /** 按目标 provider 的同名模型迁移 defaults；不兼容的角色沿用清理语义丢弃。 */
+    function migrateSettingsDefaults(defaults, provider, groups) {
+      if (typeof provider !== "string" || provider.length === 0) return {};
+      const providerGroup = (Array.isArray(groups) ? groups : []).find((group) => group?.id === provider);
+      if (!providerGroup) return {};
+      const migrated = {};
+      for (const [role, selection] of Object.entries(defaults ?? {})) {
+        const next = migrateSettingsSelection(selection, provider, groups);
+        if (next !== null) migrated[role] = next;
+      }
+      return migrated;
+    }
+
+    /**
+     * 只同步设置页当前可见角色。没有已有模型时暂存 provider + 空 model，
+     * 让用户仍能先选 provider 再选模型；保存前 normalizeSettingsDraft 会丢弃空 model。
+     */
+    function syncSettingsDefaultsProvider(defaults, provider, groups, roles) {
+      const next = { ...(defaults && typeof defaults === "object" ? defaults : {}) };
+      if (typeof provider !== "string" || provider.length === 0) return next;
+      for (const role of settingsRolesForProvider(roles)) {
+        const migrated = migrateSettingsSelection(next[role], provider, groups);
+        next[role] = migrated ?? { provider, model: "" };
+      }
+      return next;
+    }
+
+    /**
+     * 提交响应归一：保留已有 settings 草稿形状，同时仅在 wire 明确携带时保留提示词覆盖。
+     * 这样旧 Host/旧测试的返回结构不凭空新增 promptOverrides，新 Host 则不会丢失覆盖。
+     */
+    function normalizeSettingsCommitDraft(value, roles) {
+      const normalized = normalizeSettingsDraft(value, roles);
+      if (value !== null && typeof value === "object"
+        && Object.prototype.hasOwnProperty.call(value, "promptOverrides")) {
+        normalized.promptOverrides = normalizePromptOverrides(value.promptOverrides);
+      }
+      return normalized;
+    }
+
+    /**
+     * 通过 Host 动态校验并提交完整 settings 候选，失败时不改变本地 dirty 草稿。
+     * 唯一实现位于 client-freshness.js（本文件只注入 RPC 路由常量与草稿归一函数）；
+     * 响应解析（含 code/status/currentRevision 结构化错误）同样由共享实现负责，
+     * 这里不再保留第二份提交/解析逻辑。
+     */
+    async function commitSettingsCandidate(settings, revision, request = globalThis.fetch, connection, roles) {
+      return requireFreshnessSurface().commitSettingsCandidate(settings, revision, {
+        request,
+        connection,
+        normalizeSettingsDraft: normalizeSettingsCommitDraft,
+        roles,
+        rpcTarget: RPC_TARGET,
+      });
+    }
+
+    /**
+     * 宿主 meta 只读读取（生命周期一次 + 用户显式刷新）。
+     *
+     * 角色表、能力矩阵与运行时诊断共用同一次请求：诊断面因此**不新增任何 RPC、
+     * 定时器或轮询**，也不会因为打开设置页而触碰通知权限或专家任务。
+     * body: JSON.stringify({ action: "meta" }) is retained as the legacy HTTP payload contract.
+     */
+    function useHostMeta(ctx) {
+      const [meta, setMeta] = react.useState(null);
+      const [error, setError] = react.useState(null);
+      const [version, setVersion] = react.useState(0);
+      react.useEffect(() => {
+        let cancelled = false;
+        setError(null);
+        void requestPluginRpc(ctx?.connection, { action: "meta" }).then((response) => (
+          response.ok === true ? response.json() : null
+        )).then((json) => {
+          if (cancelled) return;
+          if (json !== null && json?.ok === true) {
+            setMeta(json);
+            setError(null);
+          } else {
+            setMeta(null);
+            setError("提示词配置读取失败");
+          }
+        }).catch((cause) => {
+          if (cancelled) return;
+          setMeta(null);
+          setError(cause instanceof Error ? cause.message : "提示词配置读取失败");
+        });
+        return () => { cancelled = true; };
+      }, [ctx, version]);
+      return [meta, () => setVersion((value) => value + 1), error];
+    }
+
+    /** 从 meta 投影出启用角色；meta 缺失/不可用时沿用历史默认角色表。 */
+    function useEnabledSettingsRoles(hostMeta) {
+      return react.useMemo(() => {
+        const configuredRoles = Array.isArray(hostMeta?.activeRoles) ? hostMeta.activeRoles : hostMeta?.roles;
+        if (!Array.isArray(configuredRoles)) return SETTINGS_REQUIRED_ROLE_IDS;
+        const enabled = configuredRoles.filter((role) => SETTINGS_ROLE_IDS.includes(role));
+        if (hostMeta?.enableObserver === true && !enabled.includes("observer")) enabled.push("observer");
+        return enabled.filter((role, index) => enabled.indexOf(role) === index);
+      }, [hostMeta]);
+    }
+
+    // ── 客户端能力矩阵与只读诊断 ──────────────────────────────────────────
+    /**
+     * 诊断状态枚举白名单：宿主或客户端返回任何越界值都归一为 unknown，绝不原样回显。
+     * unknown 表示"无法证明能力可用"，与 absent 一样按不可用处理（fail-closed）。
+     */
+    const DIAGNOSTIC_STATUS_VALUES = Object.freeze(["available", "degraded", "absent", "unknown"]);
+
+    /** 诊断短标识符/状态文本允许的字符面：拒绝消息、路径、URL 与自由文本。 */
+    const DIAGNOSTIC_TEXT_PATTERN = /^[A-Za-z0-9_./-]{1,48}$/;
+
+    function diagnosticStatusOf(value) {
+      return DIAGNOSTIC_STATUS_VALUES.includes(value) ? value : "unknown";
+    }
+
+    function diagnosticTextOf(value, fallback = null) {
+      return typeof value === "string" && DIAGNOSTIC_TEXT_PATTERN.test(value) ? value : fallback;
+    }
+
+    function diagnosticCountOf(value) {
+      return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+    }
+
+    function diagnosticFlagOf(value) {
+      return value === true;
+    }
+
+    /** 安全解析可选客户端服务：Cordis 未声明服务的属性读取会抛错。 */
+    function readClientService(ctx, name) {
+      try {
+        const value = typeof ctx?.get === "function" ? ctx.get(name) : null;
+        if (value) return value;
+      } catch { /* 服务未安装或代理拒答。 */ }
+      try {
+        return ctx?.[name] ?? null;
+      } catch {
+        return null;
+      }
+    }
+
+    /** 安全读取可选方法；读取抛错与缺失等价（都表示该能力不可用）。 */
+    function readClientMethod(target, name) {
+      try {
+        const value = target?.[name];
+        return typeof value === "function" ? value : void 0;
+      } catch {
+        return void 0;
+      }
+    }
+
+    /**
+     * 客户端能力矩阵（只读探测）。
+     *
+     * 只做 typeof 判定与一次安全服务解析，绝不调用业务方法、绝不注册任何 Slot、绝不请求
+     * 通知权限。缺失可选 UI 能力时的语义与安装路径一致：
+     * - absent：服务不存在 → 只禁用受影响能力，不重复注册、也不回退到另一种注册方式；
+     * - degraded：能力存在但只满足降级路径（例如只有旧 openTabIn、没有公开 openTab）。
+     */
+    function describeExpertGroupClientCapabilities(ctx) {
+      const better = readClientService(ctx, "betterSidebar");
+      const sidebarRight = readClientService(ctx, "sidebarRight");
+      const layout = readClientService(ctx, "layout");
+      const slots = ctx?.slots;
+      const betterOpen = better !== null && readClientMethod(better, "openTab") !== void 0;
+      const nativeOpen = sidebarRight !== null && readClientMethod(sidebarRight, "openTab") !== void 0;
+      const nativeLegacy = sidebarRight !== null && readClientMethod(sidebarRight, "openTabIn") !== void 0;
+      const layoutAction = readClientMethod(layout, "openRightbar");
+      const layoutPanels = layout !== null && readClientMethod(layout?.panels, "setRightbar") !== void 0;
+      return Object.freeze([
+        {
+          id: "connection",
+          label: "Connection RPC",
+          required: true,
+          status: readClientMethod(ctx?.connection?.rpc, "call") === void 0 ? "degraded" : "available",
+          detail: readClientMethod(ctx?.connection?.rpc, "call") === void 0 ? "legacy-http" : "connection-rpc",
+        },
+        {
+          id: "slots",
+          label: "客户端 Slot 注册",
+          required: true,
+          status: readClientMethod(slots, "register") !== void 0 && readClientMethod(slots, "inject") !== void 0
+            ? "available"
+            : "absent",
+          detail: "settings-and-overlay",
+        },
+        {
+          id: "betterSidebar",
+          label: "better-sidebar 页面",
+          required: false,
+          status: better === null ? "absent" : betterOpen ? "available" : "degraded",
+          detail: better === null ? "not-installed-no-native-fallback" : betterOpen ? "openTab" : "openTab-missing",
+        },
+        {
+          id: "nativeSidebar",
+          label: "原生右侧栏",
+          required: false,
+          status: nativeOpen ? "available" : nativeLegacy ? "degraded" : "absent",
+          detail: nativeOpen ? "scoped-openTab" : nativeLegacy ? "legacy-openTabIn" : "unavailable",
+        },
+        {
+          // 公开 openTab 接缝是 ticket 08 能力矩阵的独立条目：better-sidebar 与原生右栏
+          // 各自拥有一个，旧 openTabIn 只是兼容路径（因此整体状态降级而非缺失）。
+          id: "openTab",
+          label: "公开 openTab 接缝",
+          required: false,
+          status: betterOpen || nativeOpen ? "available" : nativeLegacy ? "degraded" : "absent",
+          detail: betterOpen
+            ? "better-sidebar-openTab"
+            : nativeOpen ? "sidebarRight-openTab" : nativeLegacy ? "legacy-openTabIn" : "unavailable",
+        },
+        {
+          id: "layout",
+          label: "布局动作",
+          required: false,
+          status: layoutAction !== void 0 ? "available" : layoutPanels ? "degraded" : "absent",
+          detail: layoutAction !== void 0 ? "openRightbar" : layoutPanels ? "panels-setRightbar-only" : "unavailable",
+        },
+        {
+          id: "taskSidebar",
+          label: "任务侧栏注册",
+          required: false,
+          status: typeof expertGroupSidebar?.installExpertGroupSidebar === "function" ? "available" : "absent",
+          detail: "expert-group-page",
+        },
+      ]);
+    }
+
+    /**
+     * 宿主诊断字段白名单：只按固定路径提取已声明的数值/状态字段。
+     *
+     * 白名单同时是敏感性边界——即使宿主或中间层返回了额外字段（prompt、路径、token…），
+     * 这里也不会读取，更不会渲染。
+     */
+    const HOST_DIAGNOSTIC_FIELDS = Object.freeze([
+      { id: "activeChildren", label: "活动专家 child", path: ["children", "active"], kind: "count" },
+      { id: "trackedChildren", label: "已登记 child", path: ["children", "tracked"], kind: "count" },
+      { id: "fanoutActiveParents", label: "进行中的父任务", path: ["fanout", "activeParents"], kind: "count" },
+      { id: "fanoutQueuedShards", label: "fan-out 排队分片", path: ["fanout", "queuedShards"], kind: "count" },
+      { id: "fanoutRunningShards", label: "fan-out 运行分片", path: ["fanout", "runningShards"], kind: "count" },
+      { id: "roleConcurrencyDefault", label: "角色并发默认上限", path: ["fanout", "concurrency", "default"], kind: "count" },
+      { id: "recoveryRebuilds", label: "待重建恢复", path: ["recovery", "rebuilds"], kind: "count" },
+      { id: "recoveryContexts", label: "恢复上下文", path: ["recovery", "trackedContexts"], kind: "count" },
+      { id: "pendingSettingsWrites", label: "在途 settings 写入", path: ["settings", "pendingWrites"], kind: "count" },
+      { id: "settingsGeneration", label: "模型目录代次", path: ["settings", "generation"], kind: "count" },
+      { id: "storageGeneration", label: "storage generation", path: ["storage", "generation"], kind: "count" },
+      { id: "handoffPending", label: "goal handoff 记录", path: ["handoff", "pending"], kind: "count" },
+      { id: "notificationRoots", label: "已登记通知根会话", path: ["notifications", "roots"], kind: "count" },
+      { id: "fanoutRestorePending", label: "fan-out 待恢复", path: ["fanout", "restorePending"], kind: "flag" },
+      { id: "storageStatus", label: "storage 状态", path: ["storage", "status"], kind: "token" },
+    ]);
+
+    /** 宿主能力矩阵到客户端展示面的映射（状态语义统一为 available/degraded/absent/unknown）。 */
+    const HOST_CAPABILITY_FIELDS = Object.freeze([
+      { key: "goals", id: "host.goals", label: "Goal handoff（宿主 goals）" },
+      { key: "connectionRpc", id: "host.connectionRpc", label: "Connection RPC 通道" },
+      { key: "storageDomain", id: "host.storageDomain", label: "storage domain 绑定" },
+      { key: "attachments", id: "host.attachments", label: "附件/图片规范化" },
+      { key: "sessionQuery", id: "host.sessionQuery", label: "冷会话读取" },
+    ]);
+
+    /** 宿主能力状态到统一枚举的映射；无法识别一律 unknown（按不可用处理）。 */
+    function hostCapabilityStatusOf(status) {
+      if (status === "available" || status === "ready") return "available";
+      if (status === "incomplete" || status === "degraded" || status === "fail-closed" || status === "legacy" || status === "partial") return "degraded";
+      if (status === "absent" || status === "missing" || status === "none") return "absent";
+      return "unknown";
+    }
+
+    function readDiagnosticPath(source, path) {
+      let current = source;
+      for (const key of path) {
+        if (current === null || typeof current !== "object") return void 0;
+        current = current[key];
+      }
+      return current;
+    }
+
+    /**
+     * 归一为只读诊断报告。
+     *
+     * 输入可以只有客户端能力（宿主 meta 不可用时），也可以是宿主完整响应；输出结构固定，
+     * 所有字符串都经过字符面与长度校验，所有数值都归一为非负整数。报告是纯数据，
+     * 不携带任何会话 id、agent id、prompt、原始请求体、token、Cookie 或文件系统路径。
+     *
+     * 客户端不再持有任何通知运行期计数：通知投递由 Host 负责（系统通知是唯一通知界面），
+     * 客户端侧既没有轮询、也没有投递，因此报告里没有 client 计数块。
+     *
+     * @param {object} [options]
+     * @param {object[]} [options.clientCapabilities] - describeExpertGroupClientCapabilities 的结果。
+     * @param {object|null} [options.hostMeta] - meta 只读响应。
+     */
+    function describeExpertGroupDiagnostics({ clientCapabilities = [], hostMeta = null } = {}) {
+      const host = hostMeta !== null && typeof hostMeta === "object" ? hostMeta : {};
+      const hostCapabilities = host.capabilities !== null && typeof host.capabilities === "object" ? host.capabilities : null;
+      const hostDiagnostics = host.diagnostics !== null && typeof host.diagnostics === "object" ? host.diagnostics : null;
+      const capabilityEntries = [];
+      const clientList = Array.isArray(clientCapabilities) ? clientCapabilities : [];
+      for (const entry of clientList) {
+        if (entry === null || typeof entry !== "object") continue;
+        capabilityEntries.push({
+          id: diagnosticTextOf(entry.id, "client.unknown"),
+          label: typeof entry.label === "string" ? entry.label.slice(0, 32) : "客户端能力",
+          required: diagnosticFlagOf(entry.required),
+          status: diagnosticStatusOf(entry.status),
+          detail: diagnosticTextOf(entry.detail, null),
+          scope: "client",
+        });
+      }
+      if (hostCapabilities !== null) {
+        const hostEntries = hostCapabilities.host;
+        for (const field of HOST_CAPABILITY_FIELDS) {
+          const entry = hostEntries !== null && typeof hostEntries === "object" ? hostEntries[field.key] : void 0;
+          if (entry === null || typeof entry !== "object") continue;
+          capabilityEntries.push({
+            id: field.id,
+            label: field.label,
+            required: diagnosticFlagOf(entry.required),
+            status: hostCapabilityStatusOf(entry.status),
+            // 降级说明只接受固定 token；宿主返回的自由文本一律丢弃。
+            detail: diagnosticTextOf(entry.degradation, null),
+            scope: "host",
+          });
+        }
+      }
+      const runtime = [];
+      for (const field of HOST_DIAGNOSTIC_FIELDS) {
+        const value = readDiagnosticPath(hostDiagnostics, field.path);
+        if (field.kind === "flag") runtime.push({ id: field.id, label: field.label, value: diagnosticFlagOf(value), kind: "flag" });
+        else if (field.kind === "token") runtime.push({ id: field.id, label: field.label, value: diagnosticTextOf(value, "none"), kind: "token" });
+        else runtime.push({ id: field.id, label: field.label, value: diagnosticCountOf(value), kind: "count" });
+      }
+      // 角色级并发上限：角色名是公开契约；其它键与非法值一律丢弃。
+      const roleLimits = readDiagnosticPath(hostDiagnostics, ["fanout", "concurrency", "roles"]);
+      const roleEntries = [];
+      if (roleLimits !== null && typeof roleLimits === "object" && !Array.isArray(roleLimits)) {
+        for (const role of Object.keys(roleLimits).sort()) {
+          if (!/^[A-Za-z][A-Za-z0-9_-]{0,23}$/.test(role)) continue;
+          if (!Number.isSafeInteger(roleLimits[role])) continue;
+          roleEntries.push({ id: "roleLimit." + role, label: role + " 并发上限", value: roleLimits[role], kind: "count" });
+        }
+      }
+      // RPC 错误类别：只有结构化 code 与次数，没有消息、请求体或路径。
+      const recentErrors = readDiagnosticPath(hostDiagnostics, ["rpc", "recentErrors"]);
+      const rpcErrors = [];
+      if (Array.isArray(recentErrors)) {
+        for (const entry of recentErrors.slice(0, 8)) {
+          const code = diagnosticTextOf(entry?.code, null);
+          if (code === null) continue;
+          rpcErrors.push({ code, count: diagnosticCountOf(entry?.count) });
+        }
+      }
+      return Object.freeze({
+        version: 1,
+        hostAvailable: hostDiagnostics !== null,
+        capabilities: Object.freeze(capabilityEntries.map((entry) => Object.freeze(entry))),
+        runtime: Object.freeze([...runtime, ...roleEntries].map((entry) => Object.freeze(entry))),
+        rpcErrors: Object.freeze(rpcErrors.map((entry) => Object.freeze(entry)))
+      });
+    }
+
+    /** 单条能力矩阵行（只读展示；data 属性同时作为诊断契约供测试与维护者读取）。 */
+    function renderDiagnosticCapability(entry) {
+      return react.createElement("div", {
+        key: entry.id,
+        className: "deg_settings_diagnostic_row",
+        "data-deg-capability": entry.id,
+        "data-deg-status": entry.status,
+        "data-deg-required": entry.required ? "true" : "false",
+        "data-deg-scope": entry.scope,
+      },
+        react.createElement("span", { className: "deg_settings_diagnostic_label" }, entry.label + (entry.required ? "（必需）" : "")),
+        react.createElement("span", { className: "deg_settings_diagnostic_value" },
+          entry.detail === null ? entry.status : entry.status + " · " + entry.detail));
+    }
+
+    /** 单条运行时诊断行；kind 只影响展示格式，值早已按白名单归一。 */
+    function renderDiagnosticRuntime(entry) {
+      const value = entry.kind === "flag" ? (entry.value === true ? "是" : "否") : String(entry.value);
+      return react.createElement("div", {
+        key: entry.id,
+        className: "deg_settings_diagnostic_row",
+        "data-deg-diagnostic": entry.id,
+        "data-deg-value": value,
+      },
+        react.createElement("span", { className: "deg_settings_diagnostic_label" }, entry.label),
+        react.createElement("span", { className: "deg_settings_diagnostic_value" }, value));
+    }
+
+    // ── 「模型配置」区域：默认折叠，provider 卡片按需展开且独立应用/取消 ───────────
+    /** 装配期侧车模块的检查点键（与相邻 IIFE 模块的 Symbol 约定一致）。 */
+    const MODEL_CONFIG_GLOBAL_KEY = "dsh-expert-group/client-model-config";
+
+    /**
+     * 自定义 provider 的 settings 命名空间与 profile 基路径。
+     *
+     * `llm-pi-ai` 是 DSH 中唯一支持手写 route 的 adapter family（它的 schema 也是唯一
+     * 暴露协议联合类型的），因此自定义 provider 只能落在它下面。
+     */
+    const CUSTOM_PROVIDER_NS = "llm-pi-ai";
+    const CUSTOM_PROFILE_BASE_PATH = Object.freeze(["providers"]);
+    /**
+     * 读取协议词表用的探针 route。
+     *
+     * `api` 字段是 `providers` 字典里的固定形状，因此任何 route 名都能走到同一个 union 节点；
+     * 用下划线前缀声明一个不可能与真实 route 冲突、也不符合 route 词表的探针名。
+     */
+    const CUSTOM_ROUTE_PROBE = "_probe";
+
+    /**
+     * 解析「模型配置」的唯一纯数据流实现。
+     *
+     * 正常路径从 `globalThis` 的检查点取回（装配期先于本 descriptor 执行的 IIFE 已写入）；
+     * 测试替身/宿主注入路径允许把同一份实现作为可选客户端服务传入，两条路径取到的是
+     * 同一个对象，不存在第二份实现。
+     *
+     * 注意：这里的宿主上下文只能来自参数——绝不能闭包引用 apply 作用域里的 `ctx`，
+     * 否则会命中暂时性死区并让整个区域静默消失。
+     */
+    function resolveModelConfig(hostCtx, sidecar) {
+      if (sidecar !== null && sidecar !== undefined) return sidecar;
+      try {
+        const fromCtx = typeof hostCtx?.get === "function" ? hostCtx.get(MODEL_CONFIG_GLOBAL_KEY) : null;
+        if (fromCtx !== null && fromCtx !== undefined) return fromCtx;
+      } catch { /* 服务未安装或代理拒答。 */ }
+      try {
+        return globalThis[Symbol.for(MODEL_CONFIG_GLOBAL_KEY)];
+      } catch {
+        return undefined;
+      }
+    }
+
+    /**
+     * 模型配置的数据流与宿主面适配层。
+     *
+     * 唯一纯函数实现在 client-model-config.js（装配期先于本 descriptor 执行的 IIFE）；
+     * 这里只负责把它接到公开 API 上：`remote.llm`（provider 目录与"获取模型"）、
+     * `remote.credentials`（API Key 只写不读明文）、`remote.settings`（按 namespace revision
+     * 提交路径操作）与 `configForms.describe()`（命名空间视图与 schema，与旧 binder describe 同形状）。
+     *
+     * 直接调用 `remote.settings.mutate` 而不是配置表单的 `mutate`：后者不返回结果，
+     * 无法把 schema 拒绝与 revision 冲突如实报给用户，而需求要求"拒绝时显示错误且不落盘"。
+     */
+    function createModelConfigHost(hostCtx, describeSource, sidecar) {
+      const config = resolveModelConfig(hostCtx, sidecar);
+      if (config === undefined) return null;
+      /**
+       * 读取一个宿主服务或 Remote 命名空间。
+       *
+       * 两条路径缺一不可：
+       * 1. `ctx.get(name)` —— 真实宿主的正确入口。gateway 把每个命名空间注册成**独立的
+       *    Cordis 服务** `remote.<namespace>`，而 `ctx.get` 不带 inject 门控。直接写
+       *    `ctx.remote.llm` 会命中 traceable 代理的 inject 校验并抛
+       *    `cannot get property "remote.llm" without inject`，让整个客户端 fiber FAILED
+       *    （真实宿主表现为启动页 “dsh-expert-group: failed”，入口未能激活）。
+       * 2. 逐段属性回退 —— 兼容把命名空间挂在其父服务对象上的旧宿主与测试替身
+       *    （`ctx.remote.llm` 是普通属性，不存在 traceable 门控）。
+       *
+       * 任何一层缺失或代理拒答都返回 null：模型配置是可选能力，缺失时只降级为只读提示，
+       * 绝不让整条客户端入口失败。
+       */
+      const readService = (name) => {
+        if (typeof hostCtx?.get === "function") {
+          try {
+            const value = hostCtx.get(name);
+            if (value !== undefined && value !== null) return value;
+          } catch { /* 服务未安装或代理拒答，继续尝试属性回退。 */ }
+        }
+        let current = hostCtx;
+        for (const segment of String(name).split(".")) {
+          if (segment.length === 0) continue;
+          if (current === undefined || current === null) return null;
+          try {
+            current = current[segment];
+          } catch {
+            return null;
+          }
+        }
+        return current === undefined ? null : current;
+      };
+      const readMethod = (target, name) => {
+        try {
+          const value = target?.[name];
+          return typeof value === "function" ? value : null;
+        } catch {
+          return null;
+        }
+      };
+      // 统一经 readService 解析：缺失时整段模型配置降级为只读提示，不影响角色配置与侧边栏。
+      const llm = readService("remote.llm");
+      const credentials = readService("remote.credentials");
+      const settingsRemote = readService("remote.settings");
+      // describe 面唯一来源是 `configForms.describe()`（0.1.7-alpha.2 的 settings 服务公开面，
+      // 与旧 binder describe 同形状：getSnapshot/subscribe/ensure/acceptView）。
+      // 已删除的 settingsScope binder 与 bound scope 双回退链一并移除：宿主没有这个面时
+      // 模型配置的区域视图降级为 null（不崩溃、不影响角色配置与侧边栏）。
+      const describeFace = (() => {
+        try {
+          return typeof describeSource?.describe === "function" ? describeSource.describe() : null;
+        } catch {
+          return null;
+        }
+      })();
+      // 每个 schema 信封只 rehydrate 一次：React 每次渲染都会读同一份视图，
+      // 按信封对象缓存既避免重复构造，也让派生值保持稳定引用。
+      const schemaCache = new WeakMap();
+      const adapter = (() => {
+        const schemaService = readService("settingsSchema");
+        return config.createSchemaAdapter({
+          rehydrate: (() => {
+            const rehydrate = readMethod(schemaService, "rehydrate");
+            if (rehydrate === null) return null;
+            return (serialized) => {
+              // 每个 schema 信封只 rehydrate 一次：React 每次渲染都会读同一份视图，
+              // 按信封对象缓存既避免重复构造，也让派生值保持稳定引用。
+              if (serialized !== null && typeof serialized === "object") {
+                const cached = schemaCache.get(serialized);
+                if (cached !== undefined) return cached;
+                const node = rehydrate(serialized);
+                schemaCache.set(serialized, node);
+                return node;
+              }
+              return rehydrate(serialized);
+            };
+          })(),
+          validate: (() => {
+            const validate = readMethod(schemaService, "validate");
+            return validate === null ? null : (schema, draft) => validate(schema, draft);
+          })(),
+          nodeAtPath: (() => {
+            const nodeAtPath = readMethod(schemaService, "nodeAtPath");
+            return nodeAtPath === null ? null : (root, path) => nodeAtPath(root, path);
+          })(),
+        });
+      })();
+      let views = [];
+      let writable = false;
+      let credentialStates = {};
+      let describeError = null;
+      // 宿主视图版本与"外部失效"版本必须分开，否则会形成无限刷新环。
+      //
+      // 宿主对象自身不触发渲染，所以这里维护两个单调递增计数：
+      // - `hostRevision`：**任何**视图前进都递增（包括本组件自己 load 触发的重读）。它只用于
+      //   memo 依赖，让卡片在重读后拿到新的 user 层与 revision。
+      // - `hostInvalidation`：只有**外部**事件（settings mirror、连接重置）才递增。区域的加载
+      //   effect 只依赖它，因此"load -> refresh -> notify -> load"不会自激；一次外部失效
+      //   恰好触发一次重新加载。
+      let hostRevision = 0;
+      let hostInvalidation = 0;
+      const hostListeners = new Set();
+      const notifyHostChange = (external) => {
+        hostRevision += 1;
+        if (external === true) hostInvalidation += 1;
+        for (const listener of [...hostListeners]) {
+          try {
+            listener();
+          } catch { /* 单个订阅者抛错不得影响其它订阅者与 settings 视图。 */ }
+        }
+      };
+      const subscribeHost = (listener) => {
+        if (typeof listener !== "function") return () => {};
+        hostListeners.add(listener);
+        return () => hostListeners.delete(listener);
+      };
+
+      const operations = {
+        listProviderDirectory: async () => {
+          const listProviders = readMethod(llm, "listProviders");
+          const listConfigurable = readMethod(llm, "listConfigurableProviders");
+          if (listConfigurable === null) throw new Error("当前宿主没有提供 provider 配置目录接口");
+          const [registered, declared] = await Promise.all([
+            listProviders === null ? Promise.resolve({ ok: true, value: [] }) : listProviders.call(llm),
+            listConfigurable.call(llm),
+          ]);
+          if (declared?.ok !== true) throw new Error(declared?.error?.message ?? "provider 目录读取失败");
+          if (registered !== null && registered?.ok !== true) throw new Error(registered?.error?.message ?? "provider 列表读取失败");
+          return config.joinProviderDirectory(
+            registered === null ? [] : registered.value,
+            Array.isArray(declared.value) ? declared.value : [],
+          );
+        },
+        describeCredentials: async (refs) => {
+          const describe = readMethod(credentials, "describe");
+          const wanted = [...new Set((Array.isArray(refs) ? refs : []).filter((ref) => typeof ref === "string" && ref.length > 0))];
+          if (describe === null || wanted.length === 0) {
+            credentialStates = {};
+            return {};
+          }
+          const response = await describe.call(credentials, wanted);
+          credentialStates = response?.ok === true && response.value !== null && typeof response.value === "object" ? response.value : {};
+          return credentialStates;
+        },
+        credentialState: (ref) => (typeof ref === "string" ? credentialStates[ref] : undefined),
+        /** API Key 只走 credentials 服务：明文既不进入 settings，也不进入客户端状态快照。 */
+        storeKey: async (ref, value) => {
+          const set = readMethod(credentials, "set");
+          if (set === null) return "当前宿主没有提供凭据写入接口";
+          try {
+            const response = await set.call(credentials, ref, value);
+            return response?.ok === true ? null : (response?.error?.message ?? "API Key 保存失败");
+          } catch (error) {
+            return error instanceof Error ? error.message : String(error);
+          }
+        },
+        removeKey: async (ref) => {
+          const unset = readMethod(credentials, "unset");
+          if (unset === null) return "当前宿主没有提供凭据写入接口";
+          try {
+            const response = await unset.call(credentials, ref);
+            return response?.ok === true ? null : (response?.error?.message ?? "API Key 删除失败");
+          } catch (error) {
+            return error instanceof Error ? error.message : String(error);
+          }
+        },
+        discoverModels: async (namespace, request) => {
+          const discover = readMethod(llm, "discoverModels");
+          if (discover === null) return { kind: "refused", message: "当前宿主没有提供「获取模型」接口" };
+          try {
+            const response = await discover.call(llm, namespace, request);
+            if (response?.ok !== true) return { kind: "refused", message: response?.error?.message ?? "获取模型失败" };
+            return { kind: "found", models: Array.isArray(response.value) ? response.value : [] };
+          } catch (error) {
+            return { kind: "refused", message: error instanceof Error ? error.message : String(error) };
+          }
+        },
+      };
+
+      const refreshSettingsView = async () => {
+        describeError = null;
+        if (describeFace === null) {
+          describeError = "当前宿主没有提供 settings namespace 视图";
+          views = [];
+          writable = false;
+          return;
+        }
+        try {
+          await describeFace.ensure();
+        } catch { /* 读取失败由下面的一致性检查报错。 */ }
+        const snapshot = describeFace.getSnapshot?.() ?? {};
+        const view = snapshot.view;
+        if (view === undefined) {
+          describeError = snapshot.error ?? "settings 命名空间不可用";
+          views = [];
+          // 视图缺失时必须显式落回只读：否则一次成功的读取会把 writable 留在 true，
+          // 后续读取失败时写入按钮仍然可点，最终只会在宿主边界失败。
+          writable = false;
+          return;
+        }
+        views = Array.isArray(view.namespaces) ? view.namespaces : [];
+        // 写入权限是**整页**事实：DSH 的 settings describe 只在 view 上给出 writable，
+        // namespace 条目本身不保证重复携带该字段。缺失时绝不能让可写页面降级为只读。
+        writable = view.writable !== false;
+        // 主动重读也通知一次（外部失效=false）：memo 依赖据此前进，但加载 effect 不受影响。
+        notifyHostChange(false);
+      };
+      const invalidationStops = [];
+      const remote = readService("remote");
+      const remoteOn = readMethod(remote, "$on");
+      if (remoteOn !== null) {
+        for (const event of ["llm/adapters-updated", "settings/document-updated", "credentials/reference-updated"]) {
+          try {
+            invalidationStops.push(remoteOn.call(remote, event, () => notifyHostChange(true)));
+          } catch { /* 旧宿主不支持该事件时保持设置页可用。 */ }
+        }
+      }
+      const hostOn = readMethod(hostCtx, "on");
+      if (hostOn !== null) {
+        try {
+          invalidationStops.push(hostOn.call(hostCtx, "connection/reset", () => notifyHostChange(true)));
+        } catch { /* 旧宿主没有连接事件面时无需额外刷新。 */ }
+      }
+      if (typeof hostCtx?.effect === "function") {
+        hostCtx.effect(() => () => {
+          for (const stop of invalidationStops) if (typeof stop === "function") stop();
+          hostListeners.clear();
+        }, "dsh-expert-group: model config settings mirror events");
+      }
+
+      const namespaceView = (ns) => {
+        if (describeFace !== null) return config.namespaceViewOf({ namespaces: views }, ns);
+        return undefined;
+      };
+      const settingsSchemaInfo = (ns) => {
+        const view = namespaceView(ns);
+        return config.namespaceSchemaInfo(view ?? {}, adapter);
+      };
+      /**
+       * 一次原子提交：本地 schema 先拦，正式 settings API 再拦。
+       *
+       * 任一拒绝都不写盘，并把宿主诊断原样回传；冲突只按 revision 语义判定，
+       * 绝不把 schema 拒绝伪装成冲突（那样会让用户以为重新加载就能解决）。
+       */
+      const writeNamespace = async ({ ns, ops, expectedRevision }) => {
+        const mutate = readMethod(settingsRemote, "mutate");
+        if (mutate === null) return { ok: false, conflict: false, message: "当前宿主没有提供 settings 写入接口" };
+        if (!config.hasOps(ops)) return { ok: true, view: namespaceView(ns) };
+        const current = namespaceView(ns)?.revision;
+        if (config.revisionConflictOf(expectedRevision, current)) {
+          return { ok: false, conflict: true, message: "配置已被其它会话或页面修改，本卡片的修改未提交；请重新打开该 provider 卡片后再试。" };
+        }
+        let response;
+        try {
+          response = await mutate.call(settingsRemote, ns, ops, expectedRevision);
+        } catch (error) {
+          return { ok: false, conflict: false, message: error instanceof Error ? error.message : String(error) };
+        }
+        if (response?.ok === true) {
+          const view = response.value;
+          // 提交边界已经落到宿主权威视图上：把它折叠回共享镜像，界面无需额外读取。
+          try {
+            describeFace?.acceptView?.(view);
+          } catch { /* 镜像折叠失败不影响本次提交结果。 */ }
+          views = Array.isArray(view?.namespaces)
+            ? view.namespaces
+            : views.map((entry) => (entry?.ns === ns ? view : entry));
+          return { ok: true, view };
+        }
+        const code = response?.error?.code;
+        const message = response?.error?.message ?? "保存失败";
+        if (code === "settings/conflict" || code === "settings-conflict") {
+          return { ok: false, conflict: true, message: `配置已被其它会话或页面修改：${message}。请重新打开该 provider 卡片后再试。` };
+        }
+        return { ok: false, conflict: false, message };
+      };
+
+      return {
+        config,
+        adapter,
+        operations,
+        refreshSettingsView,
+        namespaceView,
+        settingsSchemaInfo,
+        writeNamespace,
+        subscribe: subscribeHost,
+        getSnapshot: () => hostRevision,
+        /** 外部失效计数：只有 mirror 事件与连接重置会推进它（主动重读不会）。 */
+        getInvalidation: () => hostInvalidation,
+        describeError: () => describeError,
+        readView: () => ({ namespaces: views, writable }),
+      };
+    }
+
+    /** 折叠区标题行：整个标题是可点击按钮，展开状态由 aria-expanded 表达。 */
+    function ModelConfigDisclosure({ section, onToggle, extra }) {
+      return react.createElement("div", { className: "deg_mc_header" },
+        react.createElement("button", {
+          type: "button",
+          className: "deg_mc_toggle",
+          "aria-expanded": section.disclosure.expanded,
+          "aria-controls": section.disclosure.bodyId,
+          "data-deg-model-config-toggle": "true",
+          onClick: onToggle,
+        },
+          react.createElement("span", { className: "deg_mc_chevron", "aria-hidden": "true" }, section.disclosure.expanded ? "▾" : "▸"),
+          react.createElement("span", null, section.title)),
+        extra);
+    }
+
+    /**
+     * 一张 provider 卡片的编辑手感：草稿与"应用/取消"完全属于卡片自己。
+     *
+     * 进入编辑态时固定 baseline（user 层的 profile 子树 + revision），应用时先算最小路径操作，
+     * 再做角色联动守卫与 revision 复核；任何拒绝都只更新卡片自己的错误行，不落盘、不改动其它卡片。
+     */
+/**
+     * 一张 provider 卡片：草稿、应用/取消与凭据输入全部属于卡片自己。
+     *
+     * 所有判定都走 client-model-config.js 的纯函数面（`createCardSession` / `cardModel(…)`）：
+     * 会话持有草稿、进入编辑态时固定的 user 基线、revision 栅栏与凭据输入，`plan()` 给出
+     * 要提交的路径操作与守卫结论，`accept()` 接受宿主返回的权威视图作为新基线。
+     * 因此"每个卡片独立应用/取消 + revision 冲突保护 + 角色联动守卫"与测试断言的是同一份实现。
+     */
+    function ModelProviderCard({ row, namespace, host, roleLabels, onSaved, onRemove }) {
+      const config = host.config;
+      const profilePath = Array.isArray(row.settingsPath) ? row.settingsPath : [];
+      const [open, setOpen] = react.useState(false);
+      const [saving, setSaving] = react.useState(false);
+      const [error, setError] = react.useState(null);
+      const [saved, setSaved] = react.useState(false);
+      const [conflict, setConflict] = react.useState(false);
+      const [expandedRows, setExpandedRows] = react.useState(() => new Set());
+      const [fetchState, setFetchState] = react.useState(null);
+      const [keyDraft, setKeyDraft] = react.useState("");
+      // createCardSession 是可变会话；版本号把会话草稿变化桥接到 React 渲染。
+      const [, setDraftRevision] = react.useState(0);
+      // 会话在卡片挂载时创建一次：revision 栅栏与 user 基线必须固定，外部提交只能被拒绝。
+      const [session] = react.useState(() => config.createCardSession({
+        provider: row.provider,
+        settingsNs: namespace?.ns,
+        profilePath,
+        storedUser: namespace?.user,
+        base: namespace?.base,
+        value: namespace?.value,
+        revision: namespace?.revision,
+        roleDefaults: roleLabels.defaults,
+      }));
+      const schemaInfo = react.useMemo(() => {
+        const info = host.settingsSchemaInfo(namespace?.ns);
+        return {
+          ...info,
+          protocols: config.protocolChoices(info.root, row.provider, host.adapter, profilePath),
+        };
+      }, [host, namespace, row.provider, profilePath, config]);
+      const credentialRef = config.credentialRefOf(row, namespace);
+      // 写入权限继承模型配置宿主的**整页** writable：namespace 条目只提供 schema、
+      // user/base/value、revision 与路径，不承担整页权限字段。
+      const pageWritable = host.readView().writable === true;
+      const card = session.cardModel({
+        protocols: schemaInfo.protocols,
+        defaultInput: schemaInfo.defaultInput,
+        credentialRef,
+        credential: host.operations.credentialState(credentialRef),
+        typed: keyDraft,
+        readOnly: !pageWritable,
+        expandedRows,
+        draft: session.draft,
+      });
+      const disabled = card.readOnly || saving;
+      const removable = config.providerRemovable(row, namespace);
+      const removeAction = removable && typeof onRemove === "function"
+         ? react.createElement("button", {
+           type: "button",
+           className: "deg_btn deg_mc_delete_btn",
+           disabled: saving || card.readOnly,
+           "aria-label": card.displayName + " 删除",
+           onClick: () => { void onRemove(); },
+         }, "删除")
+         : null;
+
+      const edit = (update) => {
+        session.edit(update);
+        setDraftRevision((value) => value + 1);
+        setSaved(false);
+        setError(null);
+      };
+      const patchRow = (index, patch) => {
+        edit((draft) => ({
+          ...draft,
+          models: session.modelRows.map((model, at) => (
+            at === index ? config.patchModelDraft(model, patch) : model
+          )),
+        }));
+      };
+      const toggleEffort = (index, level) => {
+        edit((draft) => {
+          const rows = session.modelRows;
+          const selection = config.effortSelectionFor(rows[index]);
+          return { ...draft, models: config.setModelEffortSelection(rows, index, { ...selection, [level]: selection[level] !== true }) };
+        });
+      };
+      const toggleInput = (index, modality) => {
+        edit((draft) => {
+          const rows = session.modelRows;
+          const selected = config.modelInputOf(rows[index], schemaInfo.defaultInput);
+          const next = selected.includes(modality) ? selected.filter((value) => value !== modality) : [...selected, modality];
+          return { ...draft, models: config.setModelInputSelection(rows, index, next) };
+        });
+      };
+      const toggleRow = (index) => {
+        setExpandedRows((previous) => {
+          const next = new Set(previous);
+          if (!next.delete(index)) next.add(index);
+          return next;
+        });
+      };
+      const cancel = () => {
+        session.cancel();
+        setExpandedRows(new Set());
+        setFetchState(null);
+        setError(null);
+        setSaved(false);
+        setConflict(false);
+        setKeyDraft("");
+      };
+      const apply = async () => {
+        if (disabled) return false;
+        setSaving(true);
+        setError(null);
+        setSaved(false);
+        setConflict(false);
+        try {
+          const plan = session.plan();
+          if (plan.ok !== true) {
+            setError(plan.error);
+            return false;
+          }
+          if (config.hasOps(plan.ops)) {
+            const schemaNode = profilePath.length === 0
+              ? host.adapter.rehydrate(namespace?.schema)
+              : host.adapter.nodeAtPath(host.adapter.rehydrate(namespace?.schema), profilePath);
+            if (schemaNode !== undefined) {
+              // 本地 schema 先拦一道；正式 settings API 仍会在持久化边界再校验一次。
+              const failure = host.adapter.validate(schemaNode, session.draft);
+              if (failure !== undefined) {
+                setError("设置校验未通过，已拒绝写入：" + failure);
+                return false;
+              }
+            }
+            const written = await host.writeNamespace({
+              ns: namespace.ns,
+              ops: plan.ops,
+              expectedRevision: plan.expectedRevision,
+            });
+            if (!written.ok) {
+              setConflict(written.conflict === true);
+              setError(written.message);
+              return false;
+            }
+            // 提交边界把权威用户层与 revision 交回来：卡片立即接受它作为新基线，
+            // 因此下一次应用是"相对权威状态"的最小 diff，而不是重放旧基线。
+            if (written.view !== undefined) session.accept(written.view);
+          }
+          if (plan.keyValue !== undefined) {
+            const stored = await host.operations.storeKey(credentialRef, plan.keyValue);
+            if (stored !== null) {
+              setError(stored);
+              return false;
+            }
+            session.typeKey("");
+            setKeyDraft("");
+          }
+          await host.refreshSettingsView();
+          setSaved(true);
+          onSaved();
+          return true;
+        } catch (cause) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+          return false;
+        } finally {
+          setSaving(false);
+        }
+      };
+      const fetchModels = async () => {
+        setSaving(true);
+        setError(null);
+        try {
+          const draft = session.draft;
+          const baseURL = typeof draft.baseURL === "string" && draft.baseURL.length > 0 ? draft.baseURL : undefined;
+          const api = typeof draft.api === "string" && draft.api.length > 0 ? draft.api : undefined;
+          const typed = session.keyValue;
+          const answer = await host.operations.discoverModels(namespace.ns, {
+            provider: row.provider,
+            ...(baseURL === undefined ? {} : { baseURL }),
+            ...(api === undefined ? {} : { api }),
+            ...(typed.length === 0 ? {} : { apiKey: typed }),
+          });
+          if (answer.kind === "refused") {
+            setFetchState({ error: answer.message, candidates: null });
+            return;
+          }
+          if (answer.models.length === 0) {
+            setFetchState({ error: "该端点没有返回任何模型", candidates: null });
+            return;
+          }
+          setFetchState({ error: null, candidates: answer.models.map((model) => ({ ...model, picked: false })) });
+        } finally {
+          setSaving(false);
+        }
+      };
+      react.useEffect(() => {
+        if (!open || row.declared === true || namespace?.ns === "llm-deepseek") return undefined;
+        let active = true;
+        void host.operations.discoverModels(namespace.ns, { provider: row.provider }).then((answer) => {
+          if (!active || answer.kind !== "found" || answer.models.length === 0 || session.modelRows.length > 0) return;
+          session.setFallbackModels(answer.models);
+          setDraftRevision((value) => value + 1);
+        }).catch(() => {
+          // 自动目录探测是增强能力，失败时保留 settings 中的模型与手工编辑入口。
+        });
+        return () => { active = false; };
+      }, [host, namespace?.ns, open, row.declared, row.provider, session]);
+
+      const adoptPicked = () => {
+        const candidates = fetchState?.candidates ?? [];
+        const picked = candidates.filter((candidate) => candidate.picked === true);
+        edit((draft) => ({
+          ...draft,
+          models: config.adoptModels(session.modelRows, picked.length > 0 ? picked : candidates),
+        }));
+        setFetchState(null);
+      };
+
+      if (!config.providerEditable(row, namespace)) return null;
+
+      if (!open) {
+        return react.createElement("li", { className: "deg_mc_card" },
+          react.createElement("div", { className: "deg_mc_card_head" },
+            react.createElement("span", { className: "deg_mc_card_name" }, card.displayName),
+            card.provider === card.displayName ? null : react.createElement("span", { className: "deg_mc_card_route" }, card.provider),
+            card.apiKey.placeholder === "已配置（留空表示不修改）"
+              ? react.createElement("span", {
+                className: "deg_mc_dot",
+                role: "img",
+                "aria-label": "API Key 已配置",
+                title: "API Key 已配置",
+                "data-state": "available",
+                 style: { background: "var(--dsw-alias-state-success-primary,#22c55e)" },
+              })
+              : null,
+            react.createElement("span", { className: "deg_mc_card_actions" }, removeAction,
+              react.createElement("button", {
+                type: "button",
+                className: "deg_btn",
+                "aria-label": card.displayName + " 编辑",
+                onClick: () => { setOpen(true); setError(null); setSaved(false); setConflict(false); },
+              }, "编辑"))),
+          row.error === undefined ? null : react.createElement("p", { className: "deg_mc_error", role: "alert" }, row.error));
+      }
+
+      /**
+       * 一条模型条目的高级设置：容量、七个思考档位与输入类型。
+       *
+       * 七档始终按 REASONING_EFFORTS 的顺序渲染，与当前目录是否声明支持无关；已有映射
+       * 恢复勾选，新模型全部不勾选（`buildModelCardModel` 已经算好每一档的勾选状态）。
+       */
+      const advancedSectionOf = (model) => (!model.advancedOpen ? null : react.createElement("div", { className: "deg_mc_model_advanced" },
+        react.createElement("label", { className: "deg_mc_field" },
+          react.createElement("span", { className: "deg_mc_field_label" }, "上下文窗口"),
+          react.createElement("input", {
+            className: "deg_mc_input",
+            type: "text",
+            inputMode: "numeric",
+            value: model.contextWindow.value,
+            placeholder: model.contextWindow.placeholder,
+            "aria-label": "上下文窗口 " + String(model.position),
+            disabled,
+            onChange: (event) => patchRow(model.index, { contextWindow: config.parseCapacity(event.target.value) }),
+          })),
+        react.createElement("label", { className: "deg_mc_field" },
+          react.createElement("span", { className: "deg_mc_field_label" }, "最大输出 token"),
+          react.createElement("input", {
+            className: "deg_mc_input",
+            type: "text",
+            inputMode: "numeric",
+            value: model.maxTokens.value,
+            placeholder: model.maxTokens.placeholder,
+            "aria-label": "最大输出 token " + String(model.position),
+            disabled,
+            onChange: (event) => patchRow(model.index, { maxTokens: config.parseCapacity(event.target.value) }),
+          })),
+        react.createElement("fieldset", { className: "deg_mc_efforts" },
+          react.createElement("legend", { className: "deg_mc_efforts_label" }, "思考档位（可多选）"),
+          react.createElement("div", { className: "deg_mc_efforts_row" },
+            model.efforts.map((effort) => react.createElement("label", {
+              key: effort.level,
+              className: "deg_mc_effort",
+            }, react.createElement("input", {
+              type: "checkbox",
+              checked: effort.checked,
+              disabled,
+              "data-deg-effort": effort.level,
+              "data-deg-model-index": model.index,
+              "aria-label": "模型 " + String(model.position) + " 思考档位 " + effort.level,
+              onChange: () => toggleEffort(model.index, effort.level),
+            }), react.createElement("span", null, effort.level))))),
+        react.createElement("fieldset", { className: "deg_mc_efforts" },
+          react.createElement("legend", { className: "deg_mc_efforts_label" }, "输入类型"),
+          react.createElement("div", { className: "deg_mc_input_types" },
+            model.inputs.map((input) => react.createElement("label", {
+              key: input.modality,
+              className: "deg_mc_effort",
+            }, react.createElement("input", {
+              type: "checkbox",
+              checked: input.checked,
+              disabled: disabled || input.locked === true,
+              "data-deg-input": input.modality,
+              "data-deg-model-index": model.index,
+              "aria-label": "模型 " + String(model.position) + " 输入类型 " + input.modality,
+              onChange: () => toggleInput(model.index, input.modality),
+            }), react.createElement("span", null, input.modality)))))));
+
+      const modelRows = card.models.map((model) => react.createElement("div", {
+        key: "model-" + String(model.index),
+        className: "deg_mc_model",
+        "data-deg-model-index": model.index,
+      }, react.createElement("div", { className: "deg_mc_model_main" },
+        react.createElement("input", {
+            className: "deg_mc_input",
+            type: "text",
+            value: model.id.value,
+            placeholder: "模型 ID",
+            "aria-label": "模型 ID " + String(model.position),
+            disabled,
+            onChange: (event) => patchRow(model.index, { id: event.target.value }),
+          }),
+          react.createElement("input", {
+            className: "deg_mc_input",
+            type: "text",
+            value: model.name.value,
+            placeholder: "显示名",
+            "aria-label": "模型显示名 " + String(model.position),
+            disabled,
+            onChange: (event) => patchRow(model.index, { name: event.target.value }),
+          }),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn deg_mc_icon_btn",
+            "aria-label": "模型高级设置 " + String(model.position),
+            "aria-expanded": model.advancedOpen,
+            onClick: () => toggleRow(model.index),
+          }, model.advancedOpen ? "▾" : "▸"),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn deg_mc_icon_btn",
+            "aria-label": "删除模型 " + String(model.position),
+            disabled,
+            onClick: () => edit((draft) => ({ ...draft, models: config.removeModelRow(session.modelRows, model.index) })),
+          }, "✕")), advancedSectionOf(model)));
+
+      const candidates = fetchState?.candidates ?? null;
+      const fetchList = candidates === null
+        ? null
+        : react.createElement("div", null,
+          react.createElement("p", { className: "deg_mc_hint" }, "勾选要采纳的模型（已存在的行不会被覆盖）："),
+          react.createElement("ul", { className: "deg_mc_fetch_list" },
+            candidates.map((candidate) => react.createElement("li", {
+              key: candidate.id,
+              className: "deg_mc_fetch_item",
+            }, react.createElement("label", { className: "deg_mc_effort" },
+              react.createElement("input", {
+                type: "checkbox",
+                checked: candidate.picked === true,
+                disabled,
+                "data-deg-candidate": candidate.id,
+                onChange: () => setFetchState((previous) => ({
+                  ...previous,
+                  candidates: previous.candidates.map((entry) => (entry.id === candidate.id
+                    ? { ...entry, picked: entry.picked !== true }
+                    : entry)),
+                })),
+              }),
+              react.createElement("span", null, candidate.id))))),
+          react.createElement("div", { className: "deg_mc_conflict_actions" },
+            react.createElement("button", { type: "button", className: "deg_btn deg_btn_primary", disabled, onClick: adoptPicked }, "采纳所选"),
+            react.createElement("button", { type: "button", className: "deg_btn", disabled, onClick: () => setFetchState(null) }, "取消")));
+
+      return react.createElement("li", { className: "deg_mc_card", "data-deg-provider": row.provider },
+        react.createElement("div", { className: "deg_mc_card_head" },
+          react.createElement("span", { className: "deg_mc_card_name" }, card.displayName),
+          card.provider === card.displayName ? null : react.createElement("span", { className: "deg_mc_card_route" }, card.provider),
+          react.createElement("span", { className: "deg_mc_card_actions" }, removeAction,
+            react.createElement("button", {
+              type: "button",
+              className: "deg_btn",
+              disabled: saving,
+              onClick: () => { setOpen(false); cancel(); },
+            }, "收起"))),
+        row.error === undefined ? null : react.createElement("p", { className: "deg_mc_error", role: "alert" }, row.error),
+        react.createElement("label", { className: "deg_mc_field" },
+          react.createElement("span", { className: "deg_mc_field_label" }, "API Key"),
+          react.createElement("input", {
+            className: "deg_mc_input",
+            type: card.apiKey.type,
+            autoComplete: card.apiKey.autoComplete,
+            value: keyDraft,
+            disabled: disabled || card.apiKey.disabled,
+            "data-deg-api-key": row.provider,
+            "aria-label": card.displayName + " API Key",
+            placeholder: card.apiKey.placeholder,
+            onChange: (event) => { setKeyDraft(event.target.value); session.typeKey(event.target.value); },
+          })),
+        react.createElement("p", { className: "deg_mc_hint" }, card.apiKey.hint),
+        react.createElement("label", { className: "deg_mc_field" },
+          react.createElement("span", { className: "deg_mc_field_label" }, "Base URL"),
+          react.createElement("input", {
+            className: "deg_mc_input",
+            type: "text",
+            value: card.baseUrl.value,
+            disabled,
+            placeholder: card.baseUrl.placeholder,
+            "data-deg-base-url": row.provider,
+            "aria-label": card.displayName + " Base URL",
+            onChange: (event) => {
+              const value = event.target.value;
+              edit((draft) => {
+                const next = { ...draft };
+                if (value.trim().length === 0) Reflect.deleteProperty(next, "baseURL");
+                else next.baseURL = value;
+                return next;
+              });
+            },
+          })),
+        react.createElement("label", { className: "deg_mc_field" },
+          react.createElement("span", { className: "deg_mc_field_label" }, "协议"),
+          react.createElement("select", {
+            className: "deg_mc_select",
+            value: card.protocol.value,
+            disabled,
+            "data-deg-protocol": row.provider,
+            "aria-label": card.displayName + " 协议",
+            onChange: (event) => {
+              const value = event.target.value;
+              edit((draft) => {
+                const next = { ...draft };
+                if (value.length === 0) Reflect.deleteProperty(next, "api");
+                else next.api = value;
+                return next;
+              });
+            },
+          }, card.protocol.options.map((option) => react.createElement("option", { key: option.value, value: option.value }, option.label)))),
+
+        react.createElement("div", { className: "deg_mc_models" },
+          react.createElement("div", { className: "deg_mc_models_head" },
+            react.createElement("span", { className: "deg_mc_models_title" }, "模型"),
+            react.createElement("span", { className: "deg_mc_models_meta" }, card.modelCatalog.label),
+            card.modelCatalog.canReset
+              ? react.createElement("button", {
+                type: "button",
+                className: "deg_btn",
+                disabled,
+                "data-deg-reset-models": row.provider,
+                onClick: () => {
+                  session.resetModels();
+                  setDraftRevision((value) => value + 1);
+                  setExpandedRows(new Set());
+                  setFetchState(null);
+                  setSaved(false);
+                  setError(null);
+                },
+              }, "恢复默认")
+              : null,
+            react.createElement("button", {
+              type: "button",
+              className: "deg_btn",
+              disabled: disabled || card.actions.fetchModels === "disabled",
+              "data-deg-fetch-models": row.provider,
+              onClick: () => { void fetchModels(); },
+            }, "获取模型")),
+          card.models.length === 0
+            ? react.createElement("p", { className: "deg_mc_hint" }, card.modelCatalog.emptyHint)
+            : react.createElement("div", { className: "deg_mc_model" }, modelRows),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn",
+            disabled,
+            "data-deg-add-model": row.provider,
+            onClick: () => edit((draft) => ({ ...draft, models: config.appendModelRow(session.modelRows) })),
+          }, "添加模型"),
+          fetchState?.error === null || fetchState?.error === undefined
+            ? null
+            : react.createElement("p", { className: "deg_mc_error", role: "alert" }, fetchState.error),
+          fetchList),
+        error === null ? null : react.createElement("p", { className: "deg_mc_error", role: "alert", "data-deg-card-error": row.provider }, error),
+        conflict
+          ? react.createElement("div", { className: "deg_mc_conflict" },
+            react.createElement("p", { className: "deg_mc_error" }, "配置冲突：本卡片的修改未提交。"),
+            react.createElement("div", { className: "deg_mc_conflict_actions" },
+              react.createElement("button", {
+                type: "button",
+                className: "deg_btn",
+                disabled: saving,
+                onClick: async () => {
+                  await host.refreshSettingsView();
+                  cancel();
+                },
+              }, "重新打开（加载最新配置）")))
+          : null,
+        react.createElement("div", { className: "deg_mc_card_footer" },
+          react.createElement("span", { className: "deg_mc_status deg_settings_status", role: "status" }, saved ? "已保存" : ""),
+          react.createElement("button", { type: "button", className: "deg_btn", disabled: saving, onClick: cancel }, "取消"),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn deg_btn_primary",
+            disabled,
+            "data-deg-apply": row.provider,
+            onClick: () => { void apply(); },
+          }, saving ? "应用中…" : "应用")));
+    }
+    /**
+     * 自定义 provider 的可用模型选择弹窗：候选只进入当前草稿，不在探测成功时自动写 settings。
+     *
+     * 交互与 DSH 原生模型页保持一致：搜索当前候选、当前结果全选/取消全选、逐项勾选，
+     * 最后由“添加所选”调用父卡片的 adoptModels 合并。弹窗关闭不会丢弃卡片里已有模型。
+     */
+    function ModelDiscoveryDialog({ candidates, query, onQueryChange, onToggle, onToggleVisible, onClose, onAdopt }) {
+      const source = Array.isArray(candidates) ? candidates : [];
+      const normalizedQuery = typeof query === "string" ? query.trim().toLowerCase() : "";
+      const visible = normalizedQuery.length === 0
+        ? source
+        : source.filter((candidate) => {
+          const id = typeof candidate?.id === "string" ? candidate.id : "";
+          const name = typeof candidate?.name === "string" ? candidate.name : "";
+          return id.toLowerCase().includes(normalizedQuery) || name.toLowerCase().includes(normalizedQuery);
+        });
+      const allVisiblePicked = visible.length > 0 && visible.every((candidate) => candidate.picked === true);
+      const list = visible.length === 0
+        ? react.createElement("p", { className: "deg_mc_candidate_empty", role: "status" }, "没有匹配的模型")
+        : react.createElement("ul", { className: "deg_mc_candidate_list" }, visible.map((candidate) => (
+          react.createElement("li", { key: candidate.id, className: "deg_mc_candidate_item" },
+            react.createElement("label", { className: "deg_mc_candidate_label" },
+              react.createElement("input", {
+                type: "checkbox",
+                checked: candidate.picked === true,
+                "data-deg-create-candidate": candidate.id,
+                "aria-label": "选择模型 " + candidate.id,
+                onChange: () => onToggle(candidate.id),
+              }),
+              react.createElement("span", { className: "deg_mc_candidate_id" }, candidate.id))))));
+      return react.createElement("div", { className: "deg_mc_modal_backdrop" },
+        react.createElement("div", {
+          className: "deg_mc_modal",
+          role: "dialog",
+          "aria-modal": "true",
+          "aria-labelledby": "deg-model-discovery-title",
+        },
+          react.createElement("div", { className: "deg_mc_modal_header" },
+            react.createElement("h3", { className: "deg_mc_modal_title", id: "deg-model-discovery-title" }, "选择要添加的模型"),
+            react.createElement("button", {
+              type: "button",
+              className: "deg_mc_modal_close",
+              "aria-label": "关闭",
+              onClick: onClose,
+            }, "×")),
+          react.createElement("p", { className: "deg_mc_modal_description" }, "以下是模型提供方的可用模型，勾选要添加的模型。"),
+          react.createElement("div", { className: "deg_mc_candidate_toolbar" },
+            react.createElement("input", {
+              className: "deg_mc_input deg_mc_candidate_search",
+              type: "search",
+              value: query,
+              placeholder: "搜索模型",
+              "aria-label": "搜索模型",
+              onChange: (event) => onQueryChange(event.target.value),
+            }),
+            react.createElement("button", {
+              type: "button",
+              className: "deg_btn",
+              disabled: visible.length === 0,
+              onClick: () => onToggleVisible(visible.map((candidate) => candidate.id)),
+            }, allVisiblePicked ? "取消全选" : "全选")),
+          list,
+          react.createElement("div", { className: "deg_mc_modal_footer" },
+            react.createElement("button", { type: "button", className: "deg_btn", onClick: onClose }, "取消"),
+            react.createElement("button", { type: "button", className: "deg_btn deg_btn_primary", onClick: onAdopt }, "添加所选"))));
+    }
+
+    /**
+     * 自定义 provider 创建卡片。
+     *
+     * 与 DSH 原生模型页的 CustomProviderCard 同层、同字段顺序（route id → 显示名 → Base URL
+     * → 协议 → API Key → 模型），但不复制 DSH 源码：模型行复用 DEG 已有的模型草稿、容量、
+     * 输入类型与七档 reasoning effort 语义。
+     *
+     * 提交是二阶段的：settings（profile）先写，API Key 再单独写 credentials。settings 成功后
+     * 状态机把"profile 已写入"固定下来，因此 credentials 失败后的重试只重试 credentials。
+     */
+    function CustomProviderCard({ draft, protocols, host, onClose, onCreated, pageWritable, profileBasePath, directoryRows, liveRevision, fenceState }) {
+      const [fetching, setFetching] = react.useState(false);
+      const config = host.config;
+      const [expandedRows, setExpandedRows] = react.useState(() => new Set());
+      const [, setDraftRevision] = react.useState(0);
+      const [saving, setSaving] = react.useState(false);
+      const [error, setError] = react.useState(null);
+      const [errors, setErrors] = react.useState({});
+      const [fetchState, setFetchState] = react.useState(null);
+      const [candidateQuery, setCandidateQuery] = react.useState("");
+      const schemaInfo = react.useMemo(() => {
+        const info = host.settingsSchemaInfo("llm-pi-ai");
+        return {
+          ...info,
+          protocols: config.protocolChoices(info.root, CUSTOM_ROUTE_PROBE, host.adapter, []),
+        };
+      }, [host, config]);
+      const card = config.buildCustomCardModel({
+        draft: draft.draft,
+        protocols: Array.isArray(protocols) && protocols.length > 0 ? protocols : schemaInfo.protocols,
+        errors,
+        error,
+        readOnly: pageWritable !== true,
+        saving,
+        submitted: draft.settingsCommitted,
+        // 已提交时用状态机固定的引用，保证界面展示的引用与真正写凭据的一致。
+        credentialRef: draft.credentialRef,
+        defaultInput: schemaInfo.defaultInput,
+        expandedRows,
+      });
+      const disabled = card.readOnly || saving;
+      // 已提交后只允许重试 API Key：route 与凭据引用已经落盘，继续编辑会导致
+      // "旧 profile + 新 route 的凭据"错配。其余字段与模型编辑统一禁用。
+      const profileDisabled = card.profileLocked || saving;
+      // 只同步已占用 route 词表；revision 由状态机一次性固定（rebase 内部只在 undefined 时初始化）。
+      react.useEffect(() => {
+        draft.rebase({
+          takenRoutes: (Array.isArray(directoryRows) ? directoryRows : [])
+            .map((row) => row.provider)
+            .filter((id) => typeof id === "string"),
+        });
+      }, [draft, directoryRows]);
+
+      // 一次提交前的栅栏处理：未贴出时用最新的 revision 纠正（覆盖"打开时 Describe 视图还没
+      // 更新"）；贴出之后（用户已编辑或已有外部失效）保持陈旧栅栏，让宿主按 revision 语义拒绝。
+      // 回调由父区域持有，卡片只负责在合适的时机通知。
+      const fence = fenceState ?? { settled: true, external: true, epoch: 0 };
+      const edit = (patch) => {
+        draft.edit(patch);
+        setDraftRevision((value) => value + 1);
+        setErrors({});
+        setError(null);
+      };
+      const modelRows = config.modelDraftsOf(draft.draft.models);
+      const setModels = (models) => edit({ models });
+       const customBaseURL = typeof draft.draft.baseURL === "string" ? draft.draft.baseURL.trim() : "";
+       const canFetchModels = !card.readOnly && !profileDisabled && config.validateBaseUrl(customBaseURL) === null;
+      const patchRow = (index, patch) => setModels(modelRows.map((model, at) => (
+        at === index ? config.patchModelDraft(model, patch) : model
+      )));
+      const toggleRow = (index) => {
+        setExpandedRows((previous) => {
+          const next = new Set(previous);
+          if (!next.delete(index)) next.add(index);
+          return next;
+        });
+      };
+      const closeModelPicker = () => {
+         setFetchState(null);
+         setCandidateQuery("");
+       };
+       const fetchModels = async () => {
+         if (card.readOnly || profileDisabled) return;
+         const current = draft.draft;
+         const baseURL = typeof current.baseURL === "string" ? current.baseURL.trim() : "";
+         if (config.validateBaseUrl(baseURL) !== null) {
+           setFetchState({ error: "请先填写有效的 Base URL", candidates: null });
+           return;
+         }
+         setFetching(true);
+         setFetchState(null);
+         setCandidateQuery("");
+         try {
+           const api = typeof current.api === "string" && current.api.length > 0 ? current.api : undefined;
+           const apiKey = typeof current.apiKey === "string" ? current.apiKey.trim() : "";
+           const answer = await host.operations.discoverModels(draft.settingsNs, {
+             baseURL,
+             ...(api === undefined ? {} : { api }),
+             ...(apiKey.length === 0 ? {} : { apiKey }),
+           });
+           if (answer.kind === "refused") {
+             setFetchState({ error: answer.message, candidates: null });
+             return;
+           }
+           if (answer.models.length === 0) {
+             setFetchState({ error: "该端点没有返回任何模型", candidates: null });
+             return;
+           }
+           const known = new Set(config.modelDraftsOf(draft.draft.models)
+             .map((model) => (typeof model.id === "string" ? model.id.trim() : ""))
+             .filter((id) => id.length > 0));
+           setFetchState({
+             error: null,
+             candidates: answer.models.map((model) => ({
+               ...model,
+               picked: typeof model.id === "string" && model.id.length > 0 && !known.has(model.id),
+             })),
+           });
+         } finally {
+           setFetching(false);
+         }
+       };
+       const toggleCandidate = (id) => {
+         setFetchState((previous) => previous === null || !Array.isArray(previous.candidates)
+           ? previous
+           : {
+             ...previous,
+             candidates: previous.candidates.map((candidate) => candidate.id === id
+               ? { ...candidate, picked: candidate.picked !== true }
+               : candidate),
+           });
+       };
+       const toggleVisibleCandidates = (ids) => {
+         const wanted = new Set(Array.isArray(ids) ? ids : []);
+         setFetchState((previous) => {
+           if (previous === null || !Array.isArray(previous.candidates)) return previous;
+           const visible = previous.candidates.filter((candidate) => wanted.has(candidate.id));
+           const allPicked = visible.length > 0 && visible.every((candidate) => candidate.picked === true);
+           return {
+             ...previous,
+             candidates: previous.candidates.map((candidate) => wanted.has(candidate.id)
+               ? { ...candidate, picked: !allPicked }
+               : candidate),
+           };
+         });
+       };
+       const adoptFetchedModels = () => {
+         const candidates = fetchState?.candidates;
+         const picked = (Array.isArray(candidates) ? candidates : []).filter((candidate) => candidate.picked === true);
+         edit({ models: config.adoptModels(config.modelDraftsOf(draft.draft.models), picked) });
+         closeModelPicker();
+       };
+
+       const submit = async () => {
+        if (disabled) return false;
+        setSaving(true);
+        setError(null);
+        setErrors({});
+        try {
+          // 栅栏定稿：只在"还没定稿、也还没写盘"时用父区域读到的最新 revision 纠正一次。
+          // 定稿之后（用户开始编辑、或第一次提交之后）mirror/load 的推进都不再改写它，
+          // 因此并发写入仍然由宿主的 revision 语义拒绝，而不是被静默覆盖。
+          // 栅栏纠正：只在还没有外部并发失效时，用父区域读到的最新 revision 纠正一次
+          // （覆盖"打开时 Describe 视图还没更新"）。栅栏贴出之后到达的外部写入必须保持
+          // 陈旧栅栏，让宿主按 revision 语义拒绝，绝不静默覆盖别人的写入。
+          if (fence.external !== true && !draft.settingsCommitted && Number.isSafeInteger(liveRevision)) {
+            draft.rebase({ revision: liveRevision });
+          }
+          // 首次提交即定稿：此后再来的 mirror/load 都不允许改写栅栏。
+          draft.rebase({ frozen: true });
+          fence.settled = true;
+          const plan = draft.plan();
+          if (plan.ok !== true) {
+            setErrors(plan.errors ?? {});
+            setError(plan.error);
+            return false;
+          }
+          if (plan.phase === "settings") {
+            // 本地 schema 先拦一道：把新 profile 放进它自己的路径下，用命名空间 schema
+            // 校验整段候选（`{ providers: { <route>: profile } }`），正式 settings API 仍会
+            // 在持久化边界再校验一次。
+            const op = Array.isArray(plan.ops) ? plan.ops[0] : undefined;
+            if (op !== undefined) {
+              const sectionCandidate = config.setPath({}, profileBasePath, {
+                [op.path[op.path.length - 1]]: op.value,
+              });
+              const failure = host.adapter.validate(schemaInfo.root, sectionCandidate);
+              if (failure !== undefined) {
+                setError("设置校验未通过，已拒绝写入：" + failure);
+                return false;
+              }
+            }
+            const written = await host.writeNamespace({
+              ns: draft.settingsNs,
+              ops: plan.ops,
+              expectedRevision: plan.expectedRevision,
+            });
+            if (!written.ok) {
+              setError(written.message);
+              return false;
+            }
+            draft.acceptSettings(written.view, plan.credentialRef);
+            setDraftRevision((value) => value + 1);
+          }
+          if (plan.keyValue !== undefined && plan.phase !== "done") {
+            const stored = await host.operations.storeKey(plan.credentialRef, plan.keyValue);
+            if (stored !== null) {
+              // settings 已经写成功；这里只报告凭据失败，重试只重试 credentials。
+              setError("provider 配置已保存，但 API Key 写入失败：" + stored);
+              return false;
+            }
+            draft.acceptCredential();
+            setDraftRevision((value) => value + 1);
+          }
+          await host.refreshSettingsView();
+          onCreated();
+          return true;
+        } catch (cause) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+          return false;
+        } finally {
+          setSaving(false);
+        }
+      };
+
+      const fieldMessage = (key) => (config.isNonEmptyString(card[key]?.error) ? react.createElement(
+        "span",
+        { className: "deg_mc_field_message", role: "alert", "data-deg-create-error": key },
+        card[key].error,
+      ) : null);
+
+      return react.createElement("div", { className: "deg_mc_create", "data-deg-custom-provider": "true" },
+        react.createElement("div", { className: "deg_mc_create_head" },
+          react.createElement("span", { className: "deg_mc_create_title" }, card.title)),
+        react.createElement("label", { className: "deg_mc_field_row" },
+          react.createElement("span", { className: "deg_mc_field_label" }, "路由 ID"),
+          react.createElement("input", {
+            className: "deg_mc_input" + (card.routeId.error === null ? "" : " deg_mc_field_error"),
+            type: "text",
+            value: card.routeId.value,
+            disabled: profileDisabled,
+            placeholder: "例如 my-gateway",
+            "data-deg-create-route": "true",
+            "aria-label": "自定义 provider 路由 ID",
+            onChange: (event) => edit({ routeId: event.target.value }),
+          }),
+          card.routeId.credentialRef.length === 0
+            ? null
+            : react.createElement("span", { className: "deg_mc_hint" }, "凭据引用：" + card.routeId.credentialRef),
+          fieldMessage("routeId")),
+        react.createElement("label", { className: "deg_mc_field_row" },
+          react.createElement("span", { className: "deg_mc_field_label" }, "显示名"),
+          react.createElement("input", {
+            className: "deg_mc_input" + (card.displayName.error === null ? "" : " deg_mc_field_error"),
+            type: "text",
+            value: card.displayName.value,
+            disabled: profileDisabled,
+            placeholder: "留空则使用路由 ID",
+            "data-deg-create-name": "true",
+            "aria-label": "自定义 provider 显示名",
+            onChange: (event) => edit({ displayName: event.target.value }),
+          }),
+          fieldMessage("displayName")),
+        react.createElement("label", { className: "deg_mc_field_row" },
+          react.createElement("span", { className: "deg_mc_field_label" }, "Base URL"),
+          react.createElement("input", {
+            className: "deg_mc_input" + (card.baseUrl.error === null ? "" : " deg_mc_field_error"),
+            type: "text",
+            value: card.baseUrl.value,
+            disabled: profileDisabled,
+            placeholder: card.baseUrl.placeholder,
+            "data-deg-create-base-url": "true",
+            "aria-label": "自定义 provider Base URL",
+            onChange: (event) => edit({ baseURL: event.target.value }),
+          }),
+          fieldMessage("baseUrl")),
+        react.createElement("label", { className: "deg_mc_field_row" },
+          react.createElement("span", { className: "deg_mc_field_label" }, "协议"),
+          react.createElement("select", {
+            className: "deg_mc_select" + (card.protocol.error === null ? "" : " deg_mc_field_error"),
+            value: card.protocol.value,
+            disabled: profileDisabled,
+            "data-deg-create-protocol": "true",
+            "aria-label": "自定义 provider 协议",
+            onChange: (event) => edit({ api: event.target.value }),
+          },
+            react.createElement("option", { value: "" }, "选择协议"),
+            card.protocol.options.map((option) => react.createElement("option", { key: option.value, value: option.value }, option.label))),
+          fieldMessage("api")),
+        react.createElement("label", { className: "deg_mc_field_row" },
+          react.createElement("span", { className: "deg_mc_field_label" }, "API Key"),
+          react.createElement("input", {
+            className: "deg_mc_input",
+            type: card.apiKey.type,
+            autoComplete: card.apiKey.autoComplete,
+            value: card.apiKey.value,
+            disabled: disabled || card.apiKey.disabled,
+            placeholder: card.apiKey.placeholder,
+            "data-deg-create-api-key": "true",
+            "aria-label": "自定义 provider API Key",
+            onChange: (event) => edit({ apiKey: event.target.value }),
+          }),
+          react.createElement("span", { className: "deg_mc_hint" }, "API Key 只写入 credentials 服务，不进入 settings 快照，保存后不回显明文。")),
+        react.createElement("div", { className: "deg_mc_models" },
+          react.createElement("div", { className: "deg_mc_models_head" },
+            react.createElement("span", { className: "deg_mc_models_title" }, "模型"),
+            react.createElement("span", { className: "deg_mc_models_meta" }, "至少配置一个模型"),
+             react.createElement("button", {
+               type: "button",
+               className: "deg_btn",
+               disabled: !canFetchModels || fetching,
+               "data-deg-create-fetch-models": "true",
+               onClick: () => { void fetchModels(); },
+             }, fetching ? "获取中…" : "获取可用模型")),
+          card.models.length === 0
+            ? react.createElement("p", { className: "deg_mc_hint" }, "还没有模型。")
+            : react.createElement("div", { className: "deg_mc_model" }, card.models.map((model) => react.createElement("div", {
+              key: "create-model-" + String(model.index),
+              className: "deg_mc_model",
+              "data-deg-create-model-index": model.index,
+            },
+              react.createElement("div", { className: "deg_mc_model_main" },
+                react.createElement("input", {
+                  className: "deg_mc_input",
+                  type: "text",
+                  value: model.id.value,
+                  placeholder: "模型 ID",
+                  disabled: profileDisabled,
+                  "data-deg-create-model-id": model.index,
+                  "aria-label": "自定义 provider 模型 ID " + String(model.position),
+                  onChange: (event) => patchRow(model.index, { id: event.target.value }),
+                }),
+                react.createElement("input", {
+                  className: "deg_mc_input",
+                  type: "text",
+                  value: model.name.value,
+                  placeholder: "显示名",
+                  disabled: profileDisabled,
+                  "aria-label": "自定义 provider 模型显示名 " + String(model.position),
+                  onChange: (event) => patchRow(model.index, { name: event.target.value }),
+                }),
+                react.createElement("button", {
+                  type: "button",
+                  className: "deg_btn deg_mc_icon_btn",
+                  "aria-label": "模型高级设置 " + String(model.position),
+                  "aria-expanded": model.advancedOpen,
+                  onClick: () => toggleRow(model.index),
+                }, model.advancedOpen ? "▾" : "▸"),
+                react.createElement("button", {
+                  type: "button",
+                  className: "deg_btn deg_mc_icon_btn",
+                  "aria-label": "删除模型 " + String(model.position),
+                  disabled: profileDisabled,
+                  onClick: () => setModels(config.removeModelRow(modelRows, model.index)),
+                }, "✕")),
+              model.advancedOpen ? react.createElement("div", { className: "deg_mc_model_advanced" },
+                react.createElement("label", { className: "deg_mc_field" },
+                  react.createElement("span", { className: "deg_mc_field_label" }, "上下文窗口"),
+                  react.createElement("input", {
+                    className: "deg_mc_input",
+                    type: "text",
+                    inputMode: "numeric",
+                    value: model.contextWindow.value,
+                    placeholder: model.contextWindow.placeholder,
+                    disabled: profileDisabled,
+                    "aria-label": "上下文窗口 " + String(model.position),
+                    onChange: (event) => patchRow(model.index, { contextWindow: config.parseCapacity(event.target.value) }),
+                  })),
+                react.createElement("label", { className: "deg_mc_field" },
+                  react.createElement("span", { className: "deg_mc_field_label" }, "最大输出 token"),
+                  react.createElement("input", {
+                    className: "deg_mc_input",
+                    type: "text",
+                    inputMode: "numeric",
+                    value: model.maxTokens.value,
+                    placeholder: model.maxTokens.placeholder,
+                    disabled: profileDisabled,
+                    "aria-label": "最大输出 token " + String(model.position),
+                    onChange: (event) => patchRow(model.index, { maxTokens: config.parseCapacity(event.target.value) }),
+                  })),
+                react.createElement("fieldset", { className: "deg_mc_efforts" },
+                  react.createElement("legend", { className: "deg_mc_efforts_label" }, "思考档位（可多选）"),
+                  react.createElement("div", { className: "deg_mc_efforts_row" },
+                    model.efforts.map((effort) => react.createElement("label", {
+                      key: effort.level,
+                      className: "deg_mc_effort",
+                    }, react.createElement("input", {
+                      type: "checkbox",
+                      checked: effort.checked,
+                      disabled: profileDisabled,
+                      "data-deg-effort": effort.level,
+                      "data-deg-model-index": model.index,
+                      "aria-label": "模型 " + String(model.position) + " 思考档位 " + effort.level,
+                      onChange: () => {
+                        const selection = config.effortSelectionFor(modelRows[model.index]);
+                        setModels(config.setModelEffortSelection(
+                          modelRows,
+                          model.index,
+                          { ...selection, [effort.level]: selection[effort.level] !== true },
+                        ));
+                      },
+                    }), react.createElement("span", null, effort.level))))),
+                react.createElement("fieldset", { className: "deg_mc_efforts" },
+                  react.createElement("legend", { className: "deg_mc_efforts_label" }, "输入类型"),
+                  react.createElement("div", { className: "deg_mc_input_types" },
+                    model.inputs.map((input) => react.createElement("label", {
+                      key: input.modality,
+                      className: "deg_mc_effort",
+                    }, react.createElement("input", {
+                      type: "checkbox",
+                      checked: input.checked,
+                      disabled: profileDisabled || input.locked === true,
+                      "data-deg-input": input.modality,
+                      "data-deg-model-index": model.index,
+                      "aria-label": "模型 " + String(model.position) + " 输入类型 " + input.modality,
+                      onChange: () => {
+                        const selected = config.modelInputOf(modelRows[model.index], schemaInfo.defaultInput);
+                        const next = selected.includes(input.modality)
+                          ? selected.filter((value) => value !== input.modality)
+                          : [...selected, input.modality];
+                        setModels(config.setModelInputSelection(modelRows, model.index, next));
+                      },
+                    }), react.createElement("span", null, input.modality))))))
+                : null))),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn",
+            disabled: profileDisabled,
+            "data-deg-create-add-model": "true",
+            onClick: () => setModels(config.appendModelRow(modelRows)),
+          }, "添加模型"),
+          config.isNonEmptyString(card.modelsError)
+            ? react.createElement("p", { className: "deg_mc_error", role: "alert", "data-deg-create-error": "models" }, card.modelsError)
+            : null),
+        config.isNonEmptyString(fetchState?.error)
+           ? react.createElement("p", { className: "deg_mc_error", role: "alert", "data-deg-create-fetch-error": "true" }, fetchState.error)
+           : null,
+         card.error === null || card.modelsError === card.error
+          ? null
+          : react.createElement("p", { className: "deg_mc_error", role: "alert", "data-deg-create-card-error": "true" }, card.error),
+        react.createElement("div", { className: "deg_mc_create_footer" },
+          react.createElement("span", { className: "deg_mc_status deg_settings_status", role: "status" },
+            card.submitted ? "配置已保存" : ""),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn",
+            disabled: saving,
+            "data-deg-create-cancel": "true",
+            onClick: () => { onClose(draft.settingsCommitted); },
+          }, "取消"),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn deg_btn_primary",
+            disabled,
+            "data-deg-create-submit": "true",
+            onClick: () => { void submit(); },
+          }, saving ? "创建中…" : (card.submitted ? "重试保存 API Key" : "创建")),
+         fetchState !== null && Array.isArray(fetchState.candidates)
+           ? react.createElement(ModelDiscoveryDialog, {
+             candidates: fetchState.candidates,
+             query: candidateQuery,
+             onQueryChange: setCandidateQuery,
+             onToggle: toggleCandidate,
+             onToggleVisible: toggleVisibleCandidates,
+             onClose: closeModelPicker,
+             onAdopt: adoptFetchedModels,
+           })
+           : null));
+    }
+
+    /**
+     * 折叠的「模型配置」区域。
+     *
+     * 默认折叠时不读取 provider 目录；展开后读取 provider 目录、凭据状态与 settings 命名空间；
+     * 卡片各自独立应用/取消，区域本身不提供任何保存按钮，角色配置的保存按钮与既有行为不变。
+     * 组件由设置页标题后立即挂载，模型配置先于下方角色表显示。
+     */
+    function ModelConfigSection({ host, roleDefaults, roleLabelOf }) {
+      const config = host.config;
+      const [open, setOpen] = react.useState(false);
+      const [directory, setDirectory] = react.useState({ status: "idle", rows: [], error: null });
+      const [adding, setAdding] = react.useState(false);
+      const [addChoice, setAddChoice] = react.useState("");
+      const [settingsError, setSettingsError] = react.useState(null);
+      // 宿主替身/host 对象自身不触发渲染，因此每次重新读取宿主视图时手动推进一个版本号，
+      // 让 provider 卡片拿到最新的 user 层与 revision（而不是首次渲染时的那一份）。
+      const [viewRevision, setViewRevision] = react.useState(0);
+      const [hostRevision, setHostRevision] = react.useState(() => (
+        typeof host.getSnapshot === "function" ? host.getSnapshot() : 0
+      ));
+      // 外部失效版本单独保存：区域的加载 effect 只依赖它。主动 load 会重读宿主视图并推进
+      // hostRevision（memo 需要），但绝不再推进这里的计数，因此刷新不会自激。
+      const [hostInvalidation, setHostInvalidation] = react.useState(() => (
+        typeof host.getInvalidation === "function" ? host.getInvalidation() : 0
+      ));
+      react.useEffect(() => {
+        if (typeof host.subscribe !== "function") return undefined;
+        return host.subscribe(() => {
+          setHostRevision((previous) => (
+            typeof host.getSnapshot === "function" ? host.getSnapshot() : previous + 1
+          ));
+          setHostInvalidation((previous) => (
+            typeof host.getInvalidation === "function" ? host.getInvalidation() : previous + 1
+          ));
+        });
+      }, [host]);
+      // 「已配置 / 可添加」的划分走同一份纯函数（用户层存在该 profile 才算已配置）；
+      // viewRevision 让宿主视图刷新后重新划分。
+      const providerSections = react.useMemo(() => config.providerListSections(
+        directory.rows,
+        (ns) => host.namespaceView(ns),
+      ), [config, host, directory.rows, viewRevision, hostRevision]);
+      // 自定义 provider 的协议来自宿主 schema 的 `providers.<route>.api` 联合类型；
+      // 用一个探针 route 读出词表（DSH 的设置页也是从同一份 schema 读协议选项）。
+      const customNamespace = host.namespaceView(CUSTOM_PROVIDER_NS);
+      const customSchemaInfo = react.useMemo(
+        () => host.settingsSchemaInfo(CUSTOM_PROVIDER_NS),
+        [host, hostRevision],
+      );
+      const customProtocols = react.useMemo(
+        () => (config.isPlainObject(customNamespace)
+          ? config.protocolChoices(customSchemaInfo.root, CUSTOM_ROUTE_PROBE, host.adapter, [])
+          : []),
+        [config, customSchemaInfo, host.adapter, customNamespace],
+      );
+      const pageWritable = host.readView().writable === true;
+      // 创建卡片的状态机与卡片本身同生命周期：打开入口时读一次 namespace，并用那一刻的
+      // revision 作为 CAS 栅栏新建草稿；route 候选词表则随时刷新。
+      //
+      // revision 的漂移规则（两个方向都必须防）：
+      // - Describe 视图在打开那一刻可能还没读到/已经过期（refreshSettingsView 是异步的），
+      //   用陈旧栅栏会让每一次正常提交都被宿主误判成并发冲突；因此在**第一次提交之前**，
+      //   允许用父区域读到的最新 revision 纠正一次。
+      // - 栅栏贴出之后才到达的外部写入（mirror 事件）是真正的并发：此时绝不能自动跟随，
+      //   否则会静默覆盖别人的写入。这种情况保持陈旧栅栏，由宿主按 revision 语义拒绝。
+      const [customOpen, setCustomOpen] = react.useState(false);
+      const [customDraft, setCustomDraft] = react.useState(null);
+      const customFence = react.useRef({ settled: false, external: false, epoch: 0, openedAt: 0 });
+      const openCustomProvider = () => {
+        customFence.current = {
+          settled: false,
+          external: false,
+          epoch: 0,
+          openedAt: typeof host.getInvalidation === "function" ? host.getInvalidation() : 0,
+        };
+        if (typeof host.refreshSettingsView === "function") void host.refreshSettingsView();
+        const namespace = host.namespaceView(CUSTOM_PROVIDER_NS);
+        if (!config.isPlainObject(namespace) || !pageWritable) return;
+        setAdding(false);
+        setAddChoice("");
+        setCustomDraft(config.createCustomProviderDraft({
+          settingsNs: CUSTOM_PROVIDER_NS,
+          profileBasePath: [...CUSTOM_PROFILE_BASE_PATH],
+          revision: namespace.revision,
+          protocols: config.protocolChoices(
+            host.settingsSchemaInfo(CUSTOM_PROVIDER_NS).root,
+            CUSTOM_ROUTE_PROBE,
+            host.adapter,
+          ),
+          takenRoutes: directory.rows.map((row) => row.provider).filter((id) => typeof id === "string"),
+          models: [],
+        }));
+        setCustomOpen(true);
+      };
+      // 栅栏打开之后到达的每一次外部失效才记一笔：提交时据此判断"revision 变化是不是并发"。
+      // 打开那一刻的计数是基线，因此卡片刚挂载时不会误判成并发。
+      react.useEffect(() => {
+        if (!customOpen || customDraft === null) return;
+        if (hostInvalidation <= customFence.current.openedAt) return;
+        customFence.current.external = true;
+        customFence.current.epoch += 1;
+      }, [customOpen, customDraft, hostInvalidation]);
+      // 栅栏尚未贴出（打开时 namespace 还没读到）：补一次初始化，之后按上面的规则冻结。
+      react.useEffect(() => {
+        if (!customOpen || customDraft === null) return;
+        if (typeof customDraft.revision === "number") return;
+        const namespace = host.namespaceView(CUSTOM_PROVIDER_NS);
+        if (config.isPlainObject(namespace)) customDraft.rebase({ revision: namespace.revision });
+      }, [config, customOpen, customDraft, customNamespace, hostRevision]);
+      // 折叠区的渲染面由纯函数给出（标题、默认折叠、动作可用性）：界面与测试共用同一份判定。
+      const section = config.buildSectionModel({
+        open,
+        status: directory.status,
+        error: settingsError ?? directory.error,
+        writable: pageWritable,
+        configured: providerSections.configured,
+        addable: providerSections.addable,
+        protocols: customProtocols,
+        canCreateCustom: config.canCreateCustomProvider({
+          namespace: customNamespace,
+          protocols: customProtocols,
+          writable: pageWritable,
+        }),
+      });
+      // 加载 effect 只依赖 open 与**外部失效**版本：主动 load 内部会 refreshSettingsView()，
+      // 若这里依赖"任意视图版本"就会形成 load -> refresh -> notify -> load 的无限环。
+      //
+      // 并发用一个"尾随重跑"标记收口：正在加载时到来的请求不会并发跑两次，但一定会在
+      // 当前这轮结束后再跑一轮，因此调用方（例如取消半完成创建的卡片）拿到的始终是新视图。
+      const loadStateRef = react.useRef({ running: false, again: false });
+      const runLoad = react.useCallback(async () => {
+        setDirectory((previous) => ({ ...previous, status: "loading", error: null }));
+        setSettingsError(null);
+        try {
+          const rows = await host.operations.listProviderDirectory();
+          await host.refreshSettingsView();
+          const refs = rows
+            .filter((row) => config.providerEditable(row, host.namespaceView(row.settingsNs)))
+            .map((row) => config.credentialRefOf(row, host.namespaceView(row.settingsNs)));
+          await host.operations.describeCredentials(refs);
+          setDirectory({ status: "ready", rows, error: null });
+          setSettingsError(host.describeError());
+        } catch (error) {
+          setDirectory({ status: "error", rows: [], error: error instanceof Error ? error.message : String(error) });
+        } finally {
+          setViewRevision((value) => value + 1);
+        }
+      }, [config, host]);
+
+      const load = react.useCallback(async () => {
+        const state = loadStateRef.current;
+        if (state.running) {
+          state.again = true;
+          return;
+        }
+        state.running = true;
+        try {
+          do {
+            state.again = false;
+            await runLoad();
+          } while (state.again);
+        } finally {
+          state.running = false;
+        }
+      }, [runLoad]);
+
+      react.useEffect(() => {
+        if (!open) return;
+        void load();
+      }, [open, load, hostInvalidation]);
+
+      const editableRows = directory.rows.filter((row) => config.providerEditable(row, host.namespaceView(row.settingsNs)));
+      const configured = providerSections.configured.map((entry) => entry.row);
+      const addable = providerSections.addable.map((entry) => entry.row);
+      const removeProvider = async (row) => {
+        const namespace = host.namespaceView(row.settingsNs);
+        const label = typeof row.displayName === "string" && row.displayName.length > 0 ? row.displayName : row.provider;
+        if (typeof globalThis.confirm === "function" && !globalThis.confirm(`确定删除 provider「${label}」及其配置吗？`)) return;
+        const affected = config.rolesAffectedByChange(roleDefaults, { provider: row.provider, removeProvider: true });
+        if (affected.length > 0) {
+          setSettingsError(config.reasoningGuardMessage(["（整个 provider）"], affected, roleLabelOf));
+          return;
+        }
+        const credentialRef = config.credentialRefOf(row, namespace);
+        if (host.operations.credentialState(credentialRef)?.configured === true) {
+          const removed = await host.operations.removeKey(credentialRef);
+          if (removed !== null) {
+            setSettingsError(removed);
+            return;
+          }
+        }
+        const written = await host.writeNamespace({
+          ns: row.settingsNs,
+          ops: [{ op: "unset", path: [...row.settingsPath] }],
+          expectedRevision: namespace?.revision,
+        });
+        if (!written.ok) {
+          setSettingsError(written.message);
+          return;
+        }
+        await load();
+      };
+
+      const body = section.open ? react.createElement("div", { className: "deg_mc_body", id: section.disclosure.bodyId },
+        react.createElement("p", { className: "deg_settings_hint" }, section.hint),
+        directory.status === "error" ? react.createElement("p", { className: "deg_mc_error", role: "alert" }, directory.error) : null,
+        settingsError === null ? null : react.createElement("p", { className: "deg_mc_error", role: "alert" }, settingsError),
+        directory.status === "ready" && editableRows.length === 0
+          ? react.createElement("p", { className: "deg_mc_hint" }, "当前宿主没有可配置的 provider。")
+          : null,
+        react.createElement("ul", { className: "deg_mc_cards", "data-deg-view-revision": viewRevision },
+          configured.map((row) => react.createElement(ModelProviderCard, {
+            // 每次重新读取宿主视图都换 key：卡片用新的 user 层与 revision 重建基线，
+            // 不会带着上一轮的旧草稿/旧栅栏继续编辑。
+            key: row.provider + "#" + String(viewRevision),
+            row,
+            namespace: host.namespaceView(row.settingsNs),
+            host,
+            roleLabels: { defaults: roleDefaults, labelOf: roleLabelOf },
+            onSaved: () => { void load(); },
+            onRemove: () => removeProvider(row),
+          }))),
+        react.createElement("div", { className: "deg_mc_add" },
+          adding
+            ? react.createElement(react.Fragment, null,
+              react.createElement("select", {
+                className: "deg_mc_select",
+                value: addChoice,
+                "aria-label": "选择要添加的 provider",
+                disabled: directory.status !== "ready",
+                onChange: (event) => setAddChoice(event.target.value),
+              },
+                react.createElement("option", { value: "" }, "选择 provider"),
+                addable.map((row) => react.createElement("option", { key: row.provider, value: row.provider }, row.displayName))),
+              react.createElement("button", {
+                type: "button",
+                className: "deg_btn deg_btn_primary",
+                disabled: addChoice === "" || directory.status !== "ready",
+                "data-deg-confirm-add-provider": "true",
+                onClick: async () => {
+                  const row = addable.find((candidate) => candidate.provider === addChoice);
+                  if (row === undefined) return;
+                  const written = await host.writeNamespace({
+                    ns: row.settingsNs,
+                    ops: [{ op: "set", path: [...row.settingsPath], value: {} }],
+                    expectedRevision: host.namespaceView(row.settingsNs)?.revision,
+                  });
+                  if (!written.ok) {
+                    setSettingsError(written.message);
+                    return;
+                  }
+                  setAdding(false);
+                  setAddChoice("");
+                  await load();
+                },
+              }, "添加"),
+              react.createElement("button", {
+                type: "button",
+                className: "deg_btn",
+                onClick: () => { setAdding(false); setAddChoice(""); },
+              }, "取消"))
+            : react.createElement("div", { className: "deg_mc_entries" },
+              react.createElement("button", {
+                type: "button",
+                className: "deg_btn",
+                disabled: section.actions.addProvider === "disabled",
+                "data-deg-add-provider": "true",
+                onClick: () => { setAdding(true); setCustomOpen(false); },
+              }, section.entries.addProvider.label),
+              react.createElement("button", {
+                type: "button",
+                className: "deg_btn",
+                disabled: section.actions.addCustom === "disabled",
+                "data-deg-add-custom-provider": "true",
+                onClick: openCustomProvider,
+              }, section.entries.addCustom.label))),
+        customOpen && customDraft !== null
+          ? react.createElement(CustomProviderCard, {
+            draft: customDraft,
+            protocols: customProtocols,
+            host,
+            pageWritable,
+            profileBasePath: [...CUSTOM_PROFILE_BASE_PATH],
+            directoryRows: directory.rows,
+            // 父区域每次渲染都从宿主视图读到的 revision：只用于"尚未贴出栅栏"时的纠正。
+            liveRevision: customNamespace?.revision,
+            fenceState: customFence.current,
+            // settings 已经落盘的半完成 provider 必须立刻可见：取消时也主动重读目录。
+            // 未提交的草稿取消不产生任何写入，重读只是幂等的视图刷新。
+            onClose: (committed) => {
+              setCustomOpen(false);
+              setCustomDraft(null);
+              if (committed === true) void load();
+            },
+            onCreated: () => {
+              setCustomOpen(false);
+              setCustomDraft(null);
+              void load();
+            },
+          })
+          : null,
+        react.createElement("button", {
+          type: "button",
+          className: "deg_btn",
+          disabled: section.actions.reload === "disabled",
+          "data-deg-reload-providers": "true",
+          onClick: () => { void load(); },
+        }, directory.status === "loading" ? "读取中…" : "重新读取 provider 目录"))
+        : null;
+
+      return react.createElement("div", { className: "deg_mc_section" },
+        react.createElement(ModelConfigDisclosure, { section, onToggle: () => setOpen((value) => !value) }),
+        body);
+    }
+
+    /**
+     * 专家设置页。
+     *
+     * `settingsForm` 是 `configForms.get("dsh-expert-group")` 返回的配置表单：与旧 scope 快照
+     * 同形状（status/value/base/user/revision/writable/mode），只用于**读取与订阅**。
+     * 角色配置的保存一律走 DEG 自有提交端点（settings-commit → Host commitSettingsCandidate），
+     * 绝不调用表单的 set/unset/mutate：那会绕过 DEG 的语义校验与目录代次检测。
+     */
+    function DshExpertGroupSettings({ settingsForm, modelCatalog, modelConfigHost, ctx, diagnostics }) {
+      const subscribe = react.useMemo(() => settingsForm.subscribe.bind(settingsForm), [settingsForm]);
+      const getSnapshot = react.useMemo(() => settingsForm.getSnapshot.bind(settingsForm), [settingsForm]);
+      const settingsSnapshot = react.useSyncExternalStore(subscribe, getSnapshot);
+      const catalogSubscribe = react.useMemo(() => modelCatalog.subscribe.bind(modelCatalog), [modelCatalog]);
+      const catalogGetSnapshot = react.useMemo(() => modelCatalog.getSnapshot.bind(modelCatalog), [modelCatalog]);
+      const directoryState = react.useSyncExternalStore(catalogSubscribe, catalogGetSnapshot);
+      // 宿主 meta 同时提供角色表、能力矩阵与运行时诊断；读取失败时不显示诊断块。
+      const [hostMeta, refreshHostMeta, hostMetaError] = useHostMeta(ctx);
+      const roles = useEnabledSettingsRoles(hostMeta);
+      const hostPromptProjection = react.useMemo(
+        () => normalizeRolePromptProjection(hostMeta?.rolePrompts, settingsSnapshot.value, true),
+        [hostMeta, settingsSnapshot.value],
+      );
+      react.useEffect(() => {
+        void modelCatalog.load();
+      }, [modelCatalog]);
+      const [draft, setDraft] = react.useState(() => normalizeSettingsDraft(settingsSnapshot.value, roles));
+      const [dirty, setDirty] = react.useState(false);
+      const [saving, setSaving] = react.useState(false);
+      const [error, setError] = react.useState(null);
+      const [saved, setSaved] = react.useState(false);
+      const [selectedPromptRole, setSelectedPromptRole] = react.useState(null);
+      const [promptDrafts, setPromptDrafts] = react.useState(() => ({}));
+      const [promptTouched, setPromptTouched] = react.useState({});
+      const [promptError, setPromptError] = react.useState(null);
+      // 成功提交后共享镜像可能短暂滞后，临时投影只在其 revision 更高时生效；
+      // snapshot 追上后立即回到 Host/meta + snapshot 的派生视图，绝不永久缓存旧结果。
+      const [localPromptProjection, setLocalPromptProjection] = react.useState(null);
+      const [editorBaseline, setEditorBaseline] = react.useState(null);
+      const [settingsConflict, setSettingsConflict] = react.useState(null);
+      const [externalSettingsChanged, setExternalSettingsChanged] = react.useState(false);
+      const [leaveIntent, setLeaveIntent] = react.useState(null);
+      const leaveTriggerRef = react.useRef(null);
+      const leaveCancelRef = react.useRef(null);
+      const promptProjection = localPromptProjection !== null
+        && Number.isSafeInteger(localPromptProjection.revision)
+        && localPromptProjection.revision > settingsSnapshot.revision
+        ? localPromptProjection.projection
+        : hostPromptProjection;
+      // 编辑期间固定 rolePrompts + settings revision：外部快照只能提示变化，不能悄悄
+      // 改写正在编辑的默认值或把首次 CAS 提交升级为最新 revision。
+      const baselineProjection = editorBaseline?.role === selectedPromptRole
+        ? editorBaseline.projection
+        : promptProjection;
+      const promptMaxGraphemes = baselineProjection?.maxGraphemes ?? DEFAULT_PROMPT_MAX_GRAPHEMES;
+      // 整页写权限的唯一来源是快照的 writable（远端 memory 模式永远不可写）。
+      // 旧 scope 时代的 `status === "readonly"` 分支已删除：新契约的 status 只有
+      // loading/ready/unavailable 三个取值，readonly 语义已由 writable 完整表达。
+      const settingsReadOnly = settingsSnapshot.writable !== true;
+      // meta 尚未返回才是加载中；meta 已返回但 rolePrompts 缺失属于 wire 不兼容，
+      // 必须显示错误而不能让用户永久等待空编辑器。
+      const promptLoading = hostMeta === null && hostMetaError === null;
+      const promptTextOf = (role) => {
+        if (Object.prototype.hasOwnProperty.call(promptDrafts, role)) return promptDrafts[role];
+        return promptEntryOf(baselineProjection, role)?.effective ?? "";
+      };
+      const sourcePromptOverrides = normalizePromptOverrides(settingsSnapshot.value?.promptOverrides, promptMaxGraphemes);
+      const promptTouchedRoles = Object.keys(promptTouched).filter((role) => PROMPT_ROLE_IDS.includes(role));
+      const promptDirty = baselineProjection !== null && PROMPT_ROLE_IDS.some((role) => {
+        if (!Object.prototype.hasOwnProperty.call(promptTouched, role)) return false;
+        const entry = promptEntryOf(baselineProjection, role);
+        return entry !== null && promptTextOf(role) !== entry.effective;
+      });
+      // 共享一个 saved dirty 判定：模型/通知的既有草稿与提示词草稿可以独立变回基线，
+      // 不把“曾经编辑过”误判为仍需提交，也不影响任务管理等历史控件的保存语义。
+      const settingsDirty = !settingsDraftEqual(
+        normalizeSettingsDraft(draft, roles, false),
+        normalizeSettingsDraft(settingsSnapshot.value, roles, false),
+      );
+      const hasUnsavedChanges = settingsDirty || promptDirty;
+      // 编辑器内没有模型/通知控件；外部 snapshot 造成的列表草稿差异不应被误判为
+      // 当前提示词的本地修改，否则干净编辑器无法自动刷新。
+      const editorHasUnsavedChanges = selectedPromptRole === null ? hasUnsavedChanges : promptDirty;
+
+      react.useEffect(() => {
+        if (!dirty) {
+          setDraft(normalizeSettingsDraft(settingsSnapshot.value, roles));
+          // 未编辑角色必须继续从 Host rolePrompts 读 effective 值；不能仅按 settings
+          // snapshot 填空对象，否则无覆盖时会把默认 persona 显示成空文本。
+          setPromptDrafts({});
+          setPromptTouched({});
+          setPromptError(null);
+        }
+      }, [dirty, settingsSnapshot.value, roles, promptMaxGraphemes]);
+
+      react.useEffect(() => {
+        if (selectedPromptRole === null || editorBaseline?.role !== selectedPromptRole) return;
+        if (editorBaseline.projection === null && hostPromptProjection !== null) {
+          // 只补齐进入编辑器后异步返回的投影，保留 captureEditorBaseline 锁定的
+          // settings value/revision，防止 meta 延迟期间的外部提交绕过首次 CAS。
+          setEditorBaseline((previous) => previous?.role === selectedPromptRole && previous.projection === null
+            ? { ...previous, projection: hostPromptProjection }
+            : previous);
+          return;
+        }
+        // 提交响应的 revision 高于滞后镜像时，响应是当前权威基线；
+        // 不能被旧 meta 投影再次回写。
+        if (Number.isSafeInteger(localPromptProjection?.revision)
+          && localPromptProjection.revision > settingsSnapshot.revision) return;
+        if (!Number.isSafeInteger(settingsSnapshot.revision) || settingsSnapshot.revision === editorBaseline.revision) return;
+        if (promptDirty) {
+          // 用户实际输入优先：只提示外部版本变化，绝不覆盖文本、换行或当前校验错误。
+          setExternalSettingsChanged(true);
+          return;
+        }
+        const refreshedProjection = hostPromptProjection;
+        if (refreshedProjection === null) {
+          setExternalSettingsChanged(true);
+          return;
+        }
+        // 没有本地草稿时以最新完整 snapshot 重建编辑基线，圆点与有效内容同步更新。
+        setLocalPromptProjection(null);
+        setEditorBaseline({
+          role: selectedPromptRole,
+          value: settingsSnapshot.value,
+          revision: settingsSnapshot.revision,
+          projection: refreshedProjection,
+        });
+        setDraft(normalizeSettingsDraft(settingsSnapshot.value, roles));
+        setPromptDrafts({});
+        setPromptTouched({});
+        setDirty(false);
+        setSaved(false);
+        setError(null);
+        setPromptError(null);
+        setSettingsConflict(null);
+        setExternalSettingsChanged(false);
+      }, [selectedPromptRole, editorBaseline, localPromptProjection, settingsSnapshot.revision, settingsSnapshot.value, hostPromptProjection, promptDirty, roles]);
+
+      react.useEffect(() => {
+        if (selectedPromptRole === null || !editorHasUnsavedChanges) return;
+        // 同文档的角色/列表切换由上面的应用内确认处理；这里仅覆盖刷新、关闭和浏览器
+        // 返回等跨文档离开。浏览器决定原生提示文案，且可能不拦截某些生命周期终止路径。
+        const target = typeof globalThis?.addEventListener === "function"
+          ? globalThis
+          : (typeof globalThis?.window?.addEventListener === "function" ? globalThis.window : null);
+        if (target === null) return;
+        const onBeforeUnload = (event) => {
+          event.preventDefault?.();
+          event.returnValue = "";
+          return "";
+        };
+        target.addEventListener("beforeunload", onBeforeUnload);
+        return () => target.removeEventListener?.("beforeunload", onBeforeUnload);
+      }, [selectedPromptRole, editorHasUnsavedChanges]);
+
+      const editDraft = (update) => {
+        setDirty(true);
+        setSaved(false);
+        setError(null);
+        setPromptError(null);
+        setDraft((previous) => update(previous));
+      };
+
+      const captureEditorBaseline = (role) => {
+        if (role === null) return null;
+        // 即使 rolePrompts 仍在加载，也必须先锁定进入编辑器时的 revision；
+        // 投影稍后到达时只能补齐内容，不能把首次 CAS 偷换成实时 revision。
+        return {
+          role,
+          value: settingsSnapshot.value,
+          revision: Number.isSafeInteger(settingsSnapshot.revision) && settingsSnapshot.revision >= 0
+            ? settingsSnapshot.revision
+            : null,
+          projection: promptProjection,
+        };
+      };
+      const applyPromptNavigation = (role) => {
+        setSelectedPromptRole(role);
+        setEditorBaseline(captureEditorBaseline(role));
+        setPromptDrafts({});
+        setPromptTouched({});
+        setDirty(false);
+        setSaved(false);
+        setError(null);
+        setPromptError(null);
+      };
+      const requestPromptNavigation = (role, trigger) => {
+        if (editorHasUnsavedChanges) {
+          // 对话框关闭后返回触发控件；无法取得 DOM 焦点时安全降级，不影响导航语义。
+          leaveTriggerRef.current = trigger?.currentTarget ?? (typeof document === "undefined" ? null : document.activeElement);
+          setLeaveIntent({ kind: "navigate", role });
+          return;
+        }
+        applyPromptNavigation(role);
+      };
+      const openPrompt = (role, event) => {
+        if (!PROMPT_ROLE_IDS.includes(role)) return;
+        if (selectedPromptRole !== null && selectedPromptRole !== role) {
+          requestPromptNavigation(role, event);
+          return;
+        }
+        setSelectedPromptRole(role);
+        setEditorBaseline(captureEditorBaseline(role));
+        setPromptError(null);
+        setError(null);
+      };
+      const closePrompt = (event) => requestPromptNavigation(null, event);
+      const dismissLeaveDialog = () => {
+        setLeaveIntent(null);
+        const trigger = leaveTriggerRef.current;
+        leaveTriggerRef.current = null;
+        try { trigger?.focus?.(); } catch { /* 焦点恢复失败不应阻断编辑器。 */ }
+      };
+      const editPromptText = (role, text) => {
+        const nextPromptDirty = baselineProjection !== null && PROMPT_ROLE_IDS.some((candidate) => {
+          const entry = promptEntryOf(baselineProjection, candidate);
+          if (entry === null) return false;
+          return (candidate === role ? text : promptTextOf(candidate)) !== entry.effective;
+        });
+        setPromptDrafts((previous) => ({ ...previous, [role]: text }));
+        setPromptTouched((previous) => ({ ...previous, [role]: true }));
+        // 仅提示词被改回已保存文本时要撤销 dirty；否则保存按钮会错误保持可用。
+        setDirty(settingsDirty || nextPromptDirty);
+        setSaved(false);
+        setError(null);
+        setPromptError(null);
+      };
+
+      const groups = Array.isArray(directoryState.groups) ? directoryState.groups : [];
+      const providerGroups = groups.filter((group) => group && typeof group.id === "string");
+      // 统一选择器只反映当前展示角色的共同 provider；混合状态使用空值映射到“无”。
+      const unifiedProvider = unifiedProviderOf(draft.defaults, roles, draft.provider);
+
+      const save = async ({ retry = false } = {}) => {
+        const promptOnlySave = selectedPromptRole !== null && promptTouchedRoles.length > 0;
+        if (!hasUnsavedChanges || saving || settingsSnapshot.writable !== true
+          || (!promptOnlySave && directoryState.status !== "ready")) return false;
+        const source = normalizeSettingsDraft(settingsSnapshot.value, roles);
+        // 编辑器只修改提示词时必须以当前完整 snapshot 为候选基底：首次 CAS 会因旧 revision
+        // 冲突而失败；明确重试时才以最新 snapshot + 用户实际提示词字段提交，绝不重放旧模型/通知。
+        const normalizedDraft = promptOnlySave ? source : normalizeSettingsDraft(draft, roles, false);
+        const sourceProvider = unifiedProviderOf(source.defaults, roles, source.provider);
+        const draftProviderIntent = promptOnlySave ? sourceProvider : (typeof draft.provider === "string" ? draft.provider : "");
+        const draftProvider = unifiedProviderOf(normalizedDraft.defaults, roles, draftProviderIntent);
+        const defaultsChanged = !settingsDraftEqual(normalizedDraft.defaults, source.defaults);
+        const catalogReady = directoryState.status === "ready";
+        // provider 的模型变化由 defaults 差异或用户明确改变统一选择器决定；通知字段单独保存时
+        // draftProviderIntent 与 sourceProvider 相同，因此不会把旧顶层 provider 强行写回行级配置。
+        const modelChanged = !promptOnlySave && catalogReady && (defaultsChanged || draftProviderIntent !== sourceProvider);
+
+        // 提示词是完整 settings 候选中的一个全局映射。只有被编辑过的角色才会从草稿
+        // 覆盖 source；恢复默认通过删除对应键表达，避免把默认文本固化成冗余覆盖。
+        const candidatePromptOverrides = { ...sourcePromptOverrides };
+        if (promptTouchedRoles.length > 0) {
+          if (promptProjection === null) {
+            setPromptError(hostMetaError ?? "提示词配置加载中，请稍后重试");
+            return false;
+          }
+          if (promptProjection.customizable !== true) {
+            setPromptError("当前提示词设置为只读");
+            return false;
+          }
+          for (const role of promptTouchedRoles) {
+            const entry = promptEntryOf(baselineProjection, role);
+            const text = promptTextOf(role);
+            const validation = validatePromptText(text, promptMaxGraphemes);
+            if (!validation.ok) {
+              setPromptError((SETTINGS_ROLE_LABELS[role] ?? role) + "：" + validation.message);
+              return false;
+            }
+            if (entry === null || typeof entry.defaultPersona !== "string") {
+              setPromptError("提示词默认配置不可用，请刷新后重试");
+              return false;
+            }
+            if (text === entry.defaultPersona) delete candidatePromptOverrides[role];
+            else candidatePromptOverrides[role] = text;
+          }
+        }
+        const sourceHasPromptOverrides = settingsSnapshot.value !== null
+          && typeof settingsSnapshot.value === "object"
+          && Object.prototype.hasOwnProperty.call(settingsSnapshot.value, "promptOverrides");
+        const promptChanged = !promptOverridesEqual(candidatePromptOverrides, sourcePromptOverrides);
+        const includePromptOverrides = sourceHasPromptOverrides || promptTouchedRoles.length > 0;
+        const candidate = {
+          ...normalizedDraft,
+          provider: modelChanged ? draftProvider : sourceProvider,
+          ...(modelChanged ? {} : { defaults: source.defaults }),
+          ...(includePromptOverrides ? { promptOverrides: candidatePromptOverrides } : {}),
+        };
+        const ops = [];
+        if (modelChanged) {
+          ops.push({ op: "set", path: ["provider"], value: candidate.provider });
+          ops.push({ op: "set", path: ["defaults"], value: candidate.defaults });
+        }
+        if (candidate.notificationEnabled !== source.notificationEnabled) {
+          ops.push({ op: "set", path: ["notificationEnabled"], value: candidate.notificationEnabled });
+        }
+        if (candidate.notificationVolume !== source.notificationVolume) {
+          ops.push({ op: "set", path: ["notificationVolume"], value: candidate.notificationVolume });
+        }
+        if (candidate.notificationHoldMs !== source.notificationHoldMs) {
+          ops.push({ op: "set", path: ["notificationHoldMs"], value: candidate.notificationHoldMs });
+        }
+        if (candidate.observerPreferred !== source.observerPreferred) {
+          ops.push({ op: "set", path: ["observerPreferred"], value: candidate.observerPreferred });
+        }
+        if (candidate.roleConcurrencyLimit !== source.roleConcurrencyLimit) {
+          ops.push({ op: "set", path: ["roleConcurrencyLimit"], value: candidate.roleConcurrencyLimit });
+        }
+        // 任务管理开关单独成一个保存 op，只用于判定「是否真的需要提交」；
+        // 新客户端的完整候选始终显式携带该字段，Host 按「显式字段才写 patch」处理。
+        if (candidate.taskManagementEnabled !== source.taskManagementEnabled) {
+          ops.push({ op: "set", path: ["taskManagementEnabled"], value: candidate.taskManagementEnabled });
+        }
+        if (promptChanged) {
+          ops.push({ op: "set", path: ["promptOverrides"], value: candidatePromptOverrides });
+        }
+        // 提示词首次提交必须保留进入编辑页时看到的 revision；实时 snapshot 只用于
+        // 观察外部变化，不能被拿来绕过整体 settings 的 CAS。
+        const expectedRevision = retry === true
+          ? settingsSnapshot.revision
+          : selectedPromptRole !== null && promptTouchedRoles.length > 0
+            && Number.isSafeInteger(editorBaseline?.revision)
+            ? editorBaseline.revision
+            : settingsSnapshot.revision;
+        setSaving(true);
+        setSaved(false);
+        setError(null);
+        setPromptError(null);
+        try {
+          let accepted;
+          let committed = null;
+          if (ops.length > 0) {
+            // 角色配置唯一写入路径：DEG 自有提交端点（Host commitSettingsCandidate 完成
+            // schema、语义与 revision CAS 校验）。绝不调用配置表单的 set/unset/mutate：
+            // 那会绕过 DEG 的提示词语义校验与模型目录代次检测。
+            // 共享镜像会随 settings/document-updated 自行刷新，无需本地推进 revision。
+            committed = await commitSettingsCandidate(candidate, expectedRevision, globalThis.fetch, ctx?.connection, roles);
+            accepted = committed.settings;
+          } else {
+            accepted = normalizeSettingsCommitDraft(settingsForm.getSnapshot().value, roles);
+          }
+          // Host 已在同一提交边界完成 schema、模型和 revision 校验；200 响应中的
+          // committed settings 是权威归一结果，不再与客户端草稿做易误报的 JSON 全量比较。
+          const acceptedPromptOverrides = normalizePromptOverrides(
+            Object.prototype.hasOwnProperty.call(accepted ?? {}, "promptOverrides")
+              ? accepted.promptOverrides
+              : candidatePromptOverrides,
+            promptMaxGraphemes,
+          );
+          setDraft(accepted);
+          setPromptDrafts({});
+          setPromptTouched({});
+          const responseProjection = normalizeRolePromptProjection(committed?.rolePrompts, accepted, true);
+          let acceptedProjection = responseProjection ?? promptProjection;
+          if (acceptedProjection !== null) {
+            for (const role of promptTouchedRoles) {
+              const entry = promptEntryOf(acceptedProjection, role);
+              const text = Object.prototype.hasOwnProperty.call(acceptedPromptOverrides, role)
+                ? acceptedPromptOverrides[role]
+                : entry?.defaultPersona ?? promptTextOf(role);
+              acceptedProjection = updateRolePromptProjection(acceptedProjection, role, text);
+            }
+            const committedRevision = Number.isSafeInteger(committed?.revision)
+              ? committed.revision
+              : settingsSnapshot.revision;
+            setLocalPromptProjection({ revision: committedRevision, projection: acceptedProjection });
+            if (selectedPromptRole !== null) {
+              // 提交响应已经是 Host 权威状态，立即更新编辑基线；共享镜像随后自行刷新，
+              // 直到更高或相等的外部 snapshot 到达后再自然让位。
+              setEditorBaseline({
+                role: selectedPromptRole,
+                value: accepted,
+                revision: committedRevision,
+                projection: acceptedProjection,
+              });
+            }
+          }
+          setSettingsConflict(null);
+          setExternalSettingsChanged(false);
+          setDirty(false);
+          setSaved(true);
+          return true;
+        } catch (cause) {
+          // 冲突后绝不伪装“已同步”：必须等待共享镜像提供最新完整 snapshot，
+          // 再由用户选择加载或明确重试，避免 revision 已变而候选仍是旧文档。
+          const message = cause instanceof Error ? cause.message : String(cause);
+          setError(message);
+          if (cause?.code === "settings-conflict") {
+            setSettingsConflict({ revision: cause.currentRevision, message });
+          }
+          if (promptTouchedRoles.length > 0) setPromptError(message);
+          return false;
+        } finally {
+          setSaving(false);
+        }
+      };
+
+      const discard = () => {
+        const snapshot = settingsForm.getSnapshot();
+        const refreshedProjection = normalizeRolePromptProjection(hostMeta?.rolePrompts, snapshot.value, true) ?? promptProjection;
+        setDraft(normalizeSettingsDraft(snapshot.value, roles));
+        // 重新加载时清空局部草稿，让 Host 当前 effective/default 成为编辑初值。
+        setPromptDrafts({});
+        setPromptTouched({});
+        if (selectedPromptRole !== null && refreshedProjection !== null) {
+          setEditorBaseline({
+            role: selectedPromptRole,
+            value: snapshot.value,
+            revision: Number.isSafeInteger(snapshot.revision) ? snapshot.revision : null,
+            projection: refreshedProjection,
+          });
+        }
+        setDirty(false);
+        setSaved(false);
+        setError(null);
+        setPromptError(null);
+        setSettingsConflict(null);
+        setExternalSettingsChanged(false);
+      };
+
+      const loadLatestPromptSettings = () => {
+        const snapshot = settingsForm.getSnapshot();
+        if (settingsConflict?.revision !== undefined
+          && (!Number.isSafeInteger(snapshot.revision) || snapshot.revision < settingsConflict.revision)) {
+          setPromptError("最新配置尚未到达，请稍后再加载");
+          return;
+        }
+        const projection = normalizeRolePromptProjection(hostMeta?.rolePrompts, snapshot.value, true) ?? promptProjection;
+        if (selectedPromptRole === null || projection === null) {
+          setPromptError("最新提示词配置不可用，请稍后重试");
+          return;
+        }
+        setLocalPromptProjection(null);
+        setDraft(normalizeSettingsDraft(snapshot.value, roles));
+        setPromptDrafts({});
+        setPromptTouched({});
+        setEditorBaseline({ role: selectedPromptRole, value: snapshot.value, revision: snapshot.revision, projection });
+        setDirty(false);
+        setSaved(false);
+        setError(null);
+        setPromptError(null);
+        setSettingsConflict(null);
+        setExternalSettingsChanged(false);
+      };
+
+      const retryPromptSave = async () => {
+        if (settingsConflict?.revision !== undefined
+          && (!Number.isSafeInteger(settingsSnapshot.revision) || settingsSnapshot.revision < settingsConflict.revision)) {
+          setPromptError("最新配置尚未到达，请先加载最新配置");
+          return false;
+        }
+        return save({ retry: true });
+      };
+
+      const restorePromptDefault = () => {
+        const role = selectedPromptRole;
+        const entry = promptEntryOf(baselineProjection, role);
+        if (role === null || entry === null || settingsReadOnly || saving || baselineProjection?.customizable !== true) return;
+        if (promptDirty) {
+          leaveTriggerRef.current = typeof document === "undefined" ? null : document.activeElement;
+          setLeaveIntent({ kind: "restore-default", role });
+          return;
+        }
+        editPromptText(role, entry.defaultPersona);
+      };
+
+      // 三态渲染（0.1.7-alpha.2 的 ConfigFormSnapshot.status）：
+      // - `loading`：首次读取尚未落定（value 仍是 undefined），只给可读的加载提示，
+      //   绝不用空值渲染整张表单（否则会把「还没读到」显示成「配置为空」）；
+      // - `unavailable`：条目未暴露给本客户端或远端 memory 模式，给可读的不可用提示；
+      // - `ready`（含远端 memory 但已读到值）：渲染完整表单，写权限由整页 writable 决定。
+      if (settingsSnapshot.status === "loading") {
+        return react.createElement("div", { className: "deg_settings" },
+          selectedPromptRole === null ? null : react.createElement("button", {
+            type: "button",
+            className: "deg_btn deg_prompt_back",
+            "aria-label": "返回专家列表",
+            onClick: closePrompt,
+          }, "返回专家列表"),
+          react.createElement("p", { className: "deg_settings_status", role: "status", "aria-live": "polite" }, "正在读取设置…"));
+      }
+
+      if (settingsSnapshot.status === "unavailable") {
+        return react.createElement("div", { className: "deg_settings" },
+          selectedPromptRole === null ? null : react.createElement("button", {
+            type: "button",
+            className: "deg_btn deg_prompt_back",
+            "aria-label": "返回专家列表",
+            onClick: closePrompt,
+          }, "返回专家列表"),
+          react.createElement("p", { className: "deg_settings_error", role: "status" }, "设置 namespace 不可用"));
+      }
+
+      const selectedPromptEntry = promptEntryOf(promptProjection, selectedPromptRole);
+      const selectedPromptText = selectedPromptRole === null ? "" : promptTextOf(selectedPromptRole);
+      const promptValidation = validatePromptText(selectedPromptText, promptMaxGraphemes);
+      const promptCounterClass = promptValidation.count > promptMaxGraphemes
+        ? " deg_prompt_counter_error"
+        : promptValidation.count >= promptMaxGraphemes * PROMPT_WARNING_RATIO
+          ? " deg_prompt_counter_warning"
+          : "";
+      const promptMetaMessage = hostMetaError
+        ?? (promptProjection === null && !promptLoading ? "提示词配置不可用，请刷新后重试" : null);
+      const promptStatusMessage = promptMetaMessage
+        ?? (settingsReadOnly ? "当前设置为只读，可查看提示词但不能编辑或保存。" : null);
+      // 文本变化即校验，不必点击保存才让辅助技术得知空值或超长输入。
+      const promptValidationMessage = selectedPromptRole !== null && !promptValidation.ok ? promptValidation.message : null;
+      const promptErrorMessage = promptError ?? promptValidationMessage ?? error ?? promptMetaMessage;
+      const promptLabel = selectedPromptRole === null
+        ? "专家"
+        : (SETTINGS_ROLE_LABELS[selectedPromptRole] ?? selectedPromptRole);
+      const promptEditor = selectedPromptRole === null ? null : react.createElement("div", { className: "deg_settings deg_settings_prompt_editor" },
+        react.createElement("div", { className: "deg_prompt_header" },
+          react.createElement("h2", { className: "deg_settings_title" }, promptLabel)),
+        react.createElement("label", { className: "deg_prompt_label", htmlFor: "deg-prompt-textarea-" + selectedPromptRole }, "提示词"),
+        promptProjection === null
+          ? react.createElement(react.Fragment, null,
+            react.createElement("p", { className: "deg_prompt_status", role: "status", "aria-live": "polite" }, promptStatusMessage ?? "提示词配置加载中…"),
+            promptLoading ? null : react.createElement("button", {
+              type: "button",
+              className: "deg_btn",
+              disabled: saving,
+              onClick: refreshHostMeta,
+            }, "重试加载提示词配置"))
+          : react.createElement(react.Fragment, null,
+            react.createElement("textarea", {
+              id: "deg-prompt-textarea-" + selectedPromptRole,
+              className: "deg_prompt_textarea",
+              "data-deg-prompt-role": selectedPromptRole,
+              "aria-label": promptLabel + "提示词",
+              "aria-describedby": "deg-prompt-counter-" + selectedPromptRole
+                + (promptErrorMessage === null ? "" : " deg-prompt-error-" + selectedPromptRole),
+              "aria-invalid": !promptValidation.ok || promptErrorMessage !== null,
+              value: selectedPromptText,
+              disabled: settingsReadOnly || saving || promptProjection.customizable !== true,
+              onChange: (event) => {
+                const text = typeof event?.target?.value === "string" ? event.target.value : "";
+                editPromptText(selectedPromptRole, text);
+              },
+            }),
+            react.createElement("div", {
+              id: "deg-prompt-counter-" + selectedPromptRole,
+              className: "deg_prompt_counter" + promptCounterClass,
+              role: "status",
+              "aria-live": "polite",
+            }, String(promptValidation.count) + " / " + String(promptMaxGraphemes)),
+            promptStatusMessage === null ? null : react.createElement("p", { className: "deg_prompt_status", role: "status" }, promptStatusMessage)),
+        react.createElement("div", { className: "deg_prompt_readonly" },
+          react.createElement("strong", null, "固定执行纪律"),
+          react.createElement("p", null, PROMPT_DISCIPLINE_HINT)),
+        promptErrorMessage === null ? null : react.createElement("p", {
+          id: "deg-prompt-error-" + selectedPromptRole,
+          className: "deg_settings_error",
+          role: "alert",
+          "aria-live": "assertive",
+        }, promptErrorMessage),
+        externalSettingsChanged ? react.createElement("p", {
+          className: "deg_prompt_status",
+          role: "status",
+          "aria-live": "polite",
+        }, "配置已发生外部变化") : null,
+        settingsConflict === null ? null : react.createElement("div", { className: "deg_prompt_conflict", role: "alert" },
+          react.createElement("p", { className: "deg_settings_error" }, "保存遇到配置冲突，请选择下一步。"),
+          react.createElement("div", { className: "deg_prompt_dialog_actions" },
+            react.createElement("button", { type: "button", className: "deg_btn", disabled: saving, onClick: loadLatestPromptSettings }, "加载最新配置"),
+            react.createElement("button", { type: "button", className: "deg_btn deg_btn_primary", disabled: saving, onClick: retryPromptSave }, "继续使用当前提示词重试"))),
+        react.createElement("div", { className: "deg_prompt_footer" },
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn deg_prompt_back",
+            "aria-label": "返回专家列表",
+            disabled: saving,
+            onClick: closePrompt,
+          }, "返回专家列表"),
+          react.createElement("span", { className: "deg_prompt_status", role: "status", "aria-live": "polite" }, saved ? "已保存" : hasUnsavedChanges ? "有未保存的修改" : ""),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn deg_btn_primary",
+            disabled: !promptDirty || !promptValidation.ok || saving || settingsReadOnly || promptLoading || baselineProjection?.customizable !== true,
+            onClick: save,
+          }, saving ? "保存中…" : "保存"),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn",
+            disabled: saving || settingsReadOnly || promptLoading || promptProjection?.customizable !== true
+              || selectedPromptEntry === null || selectedPromptText === selectedPromptEntry.defaultPersona,
+            onClick: restorePromptDefault,
+          }, "恢复默认")));
+      const leaveDialog = leaveIntent === null ? null : react.createElement("div", { className: "deg_prompt_dialog_backdrop" },
+        react.createElement("div", {
+          className: "deg_prompt_dialog",
+          role: "dialog",
+          "aria-modal": "true",
+          "aria-label": "未保存的提示词修改",
+          onKeyDown: (event) => {
+            if (event.key === "Escape") {
+              event.preventDefault?.();
+              dismissLeaveDialog();
+              return;
+            }
+            if (event.key !== "Tab") return;
+            const controls = Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]") ?? []);
+            if (controls.length === 0) return;
+            const current = controls.indexOf(typeof document === "undefined" ? null : document.activeElement);
+            const nextIndex = event.shiftKey
+              ? (current <= 0 ? controls.length - 1 : current - 1)
+              : (current >= controls.length - 1 ? 0 : current + 1);
+            event.preventDefault?.();
+            try { controls[nextIndex]?.focus?.(); } catch { /* 无 DOM 焦点时保持可点击按钮。 */ }
+          },
+        },
+          react.createElement("h3", null, "未保存的提示词修改"),
+          react.createElement("p", null, "离开前请选择如何处理当前草稿。"),
+          react.createElement("div", { className: "deg_prompt_dialog_actions" },
+            leaveIntent.kind === "restore-default"
+              ? react.createElement("button", {
+                type: "button",
+                className: "deg_btn deg_btn_primary",
+                "data-deg-dialog-action": "restore",
+                disabled: saving,
+                onClick: () => {
+                  const role = leaveIntent.role;
+                  const entry = promptEntryOf(baselineProjection, role);
+                  dismissLeaveDialog();
+                  if (entry !== null) editPromptText(role, entry.defaultPersona);
+                },
+              }, "恢复默认")
+              : react.createElement("button", {
+                type: "button",
+                className: "deg_btn deg_btn_primary",
+                "data-deg-dialog-action": "save",
+                disabled: saving,
+                onClick: async () => {
+                  const savedNow = await save();
+                  if (savedNow !== true) return;
+                  const intent = leaveIntent;
+                  dismissLeaveDialog();
+                  applyPromptNavigation(intent?.role ?? null);
+                },
+              }, saving ? "保存中…" : "保存并离开"),
+            leaveIntent.kind === "restore-default" ? null : react.createElement("button", {
+              type: "button",
+              className: "deg_btn",
+              "data-deg-dialog-action": "discard",
+              disabled: saving,
+              onClick: () => {
+                const intent = leaveIntent;
+                discard();
+                dismissLeaveDialog();
+                applyPromptNavigation(intent?.role ?? null);
+              },
+            }, "放弃修改"),
+            react.createElement("button", {
+              type: "button",
+              className: "deg_btn",
+              "data-deg-dialog-action": "cancel",
+              autoFocus: true,
+              ref: leaveCancelRef,
+              onClick: dismissLeaveDialog,
+            }, "取消"))));
+      react.useEffect(() => {
+        if (leaveIntent === null) return;
+        try { leaveCancelRef.current?.focus?.(); } catch { /* 不支持 focus 的嵌入宿主仍可键盘点击。 */ }
+      }, [leaveIntent]);
+      if (selectedPromptRole !== null) return react.createElement(react.Fragment, null, promptEditor, leaveDialog);
+
+      const header = react.createElement(react.Fragment, null,
+        react.createElement("span", { className: "deg_settings_table_head" }, "专家"),
+        react.createElement("span", { className: "deg_settings_table_head" }, "供应商"),
+        react.createElement("span", { className: "deg_settings_table_head" }, "模型选择"),
+        react.createElement("span", { className: "deg_settings_table_head" }, "思考深度"));
+      const rows = PROMPT_ROLE_IDS.map((role) => {
+        const roleEnabled = roles.includes(role);
+        const selection = draft.defaults[role] ?? null;
+        const rowProvider = typeof selection?.provider === "string" ? selection.provider : "";
+        const rowProviderGroup = providerGroups.find((group) => group.id === rowProvider);
+        const rowModels = rowProviderGroup?.models ?? [];
+        const currentModel = rowModels.find((model) => model.id === selection?.model);
+        const providerOptions = [
+          react.createElement("option", { key: "__empty-provider", value: "" }, "未选择供应商"),
+          ...(rowProvider && rowProviderGroup === undefined
+            ? [react.createElement("option", { key: "__unavailable-provider", value: rowProvider, disabled: true }, rowProvider + "（不可用）")]
+            : []),
+          ...providerGroups.map((group) => react.createElement("option", { key: group.id, value: group.id }, group.name ?? group.id)),
+        ];
+        const modelOptions = [];
+        if (!rowProvider) {
+          modelOptions.push(react.createElement("option", { key: "__provider", value: "" }, "先选择供应商"));
+        } else {
+          modelOptions.push(react.createElement("option", { key: "__empty", value: "" }, "未选择模型"));
+          if (selection?.model && currentModel === undefined) {
+            modelOptions.push(react.createElement("option", { key: "__unavailable", value: selection.model, disabled: true }, selection.model + "（不可用）"));
+          }
+          for (const model of rowModels) {
+            modelOptions.push(react.createElement("option", { key: model.id, value: model.id }, model.name ?? model.id));
+          }
+        }
+        const reasoning = currentModel?.reasoning;
+        const effortOptions = [];
+        if (reasoning) {
+          effortOptions.push(react.createElement("option", { key: "__default", value: "" }, "模型默认"));
+          for (const effort of reasoning.efforts ?? []) {
+            effortOptions.push(react.createElement("option", { key: effort.id, value: effort.id }, effort.name ?? effort.id));
+          }
+        } else {
+          effortOptions.push(react.createElement("option", { key: "__unsupported", value: "" }, rowProvider ? "模型无思考深度" : "先选择模型"));
+        }
+        const updateProvider = (event) => {
+          const provider = event.target.value;
+          editDraft((previous) => {
+            const defaults = { ...previous.defaults };
+            if (!provider) {
+              delete defaults[role];
+            } else if (provider !== defaults[role]?.provider) {
+              defaults[role] = migrateSettingsSelection(defaults[role], provider, providerGroups)
+                ?? { provider, model: "" };
+            }
+            return { ...previous, provider: "", defaults };
+          });
+        };
+        const updateModel = (event) => {
+          const modelId = event.target.value;
+          editDraft((previous) => {
+            const defaults = { ...previous.defaults };
+            const provider = defaults[role]?.provider ?? "";
+            if (!provider) return previous;
+            if (!modelId) {
+              defaults[role] = { provider, model: "" };
+            } else {
+              const model = providerGroups.find((group) => group.id === provider)?.models?.find((candidate) => candidate.id === modelId);
+              if (!model) return previous;
+              const next = { provider, model: model.id };
+              if (typeof model.reasoning?.defaultEffort === "string") next.reasoningEffort = model.reasoning.defaultEffort;
+              defaults[role] = next;
+            }
+            return { ...previous, defaults };
+          });
+        };
+        const updateReasoning = (event) => {
+          editDraft((previous) => {
+            const defaults = { ...previous.defaults };
+            if (!defaults[role] || !defaults[role].model) return previous;
+            const next = { ...defaults[role] };
+            if (event.target.value) next.reasoningEffort = event.target.value;
+            else delete next.reasoningEffort;
+            defaults[role] = next;
+            return { ...previous, defaults };
+          });
+        };
+        return react.createElement(react.Fragment, { key: role },
+          react.createElement("div", { className: "deg_settings_table_cell deg_settings_role_cell" },
+            react.createElement("button", {
+              type: "button",
+              className: "deg_settings_role_button",
+              "data-deg-prompt-role": role,
+              "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + "提示词"
+                + (promptEntryOf(promptProjection, role)?.customized === true ? "（已自定义提示词）" : ""),
+              "aria-pressed": selectedPromptRole === role,
+              // 读取失败仍可进入错误页并重试；只有正在提交时才锁住入口，避免永久死锁。
+              disabled: saving,
+              onClick: (event) => openPrompt(role, event),
+            },
+              react.createElement("span", null, SETTINGS_ROLE_LABELS[role] ?? role),
+              promptEntryOf(promptProjection, role)?.customized === true
+                ? react.createElement("span", {
+                  className: "deg_settings_prompt_customized_dot",
+                  "aria-hidden": "true",
+                })
+                : null)),
+          react.createElement("div", { className: "deg_settings_table_cell" },
+            react.createElement("select", {
+              className: "deg_settings_provider_select",
+              "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + " 供应商",
+              value: rowProvider,
+              disabled: saving || directoryState.status !== "ready" || !roleEnabled,
+              onChange: updateProvider,
+            }, providerOptions)),
+          react.createElement("div", { className: "deg_settings_table_cell" },
+            react.createElement("select", {
+              className: "deg_settings_model_select",
+              "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + " 模型选择",
+              value: selection?.model ?? "",
+              disabled: saving || directoryState.status !== "ready" || !roleEnabled || !rowProvider || rowProviderGroup === undefined,
+              onChange: updateModel,
+            }, modelOptions)),
+          react.createElement("div", { className: "deg_settings_table_cell" },
+            react.createElement("select", {
+              className: "deg_settings_effort_select",
+              "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + " 思考深度",
+              value: selection?.reasoningEffort ?? "",
+              disabled: saving || directoryState.status !== "ready" || !roleEnabled || reasoning === undefined || !selection?.model,
+              onChange: updateReasoning,
+            }, effortOptions)));
+      });
+
+      const modelConfigSection = typeof modelConfigHost === "undefined" || modelConfigHost === null
+        ? null
+        : react.createElement(ModelConfigSection, {
+          host: modelConfigHost,
+          roleDefaults: normalizeSettingsDraft(settingsSnapshot.value, roles).defaults,
+          roleLabelOf: (role) => SETTINGS_ROLE_LABELS[role] ?? role,
+        });
+      return react.createElement("div", { className: "deg_settings" },
+        react.createElement("h2", { className: "deg_settings_title" }, "dsh-expert-group"),
+        react.createElement("p", { className: "deg_settings_hint" }, "专家模型使用 DSH 当前已配置的 provider 和模型目录。"),
+        modelConfigSection,
+        react.createElement("div", { className: "deg_settings_row deg_settings_notification_row" },
+          react.createElement("label", { className: "deg_settings_checkbox" },
+            react.createElement("input", {
+              type: "checkbox",
+              checked: draft.notificationEnabled,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, notificationEnabled: event.target.checked })),
+            }),
+            react.createElement("span", { className: "deg_settings_label" }, "通知弹窗")),
+          react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-notification-hold" },
+            react.createElement("span", { className: "deg_settings_label" }, "弹窗停留时间"),
+            react.createElement("select", {
+              id: "deg-settings-notification-hold",
+              "aria-label": "弹窗停留时间",
+              value: draft.notificationHoldMs,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, notificationHoldMs: notificationHoldMsOf(Number(event.target.value)) })),
+            }, NOTIFICATION_HOLD_OPTIONS.map((option) => react.createElement("option", { key: option.value, value: option.value }, option.label)))),
+          react.createElement("label", { className: "deg_settings_control" },
+            react.createElement("span", { className: "deg_settings_label" }, "通知音量"),
+            react.createElement("input", {
+              type: "range", min: 0, max: 100, step: 1,
+              value: draft.notificationVolume,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, notificationVolume: clampNotificationVolume(event.target.value) })),
+            }),
+            react.createElement("input", {
+              type: "number", min: 0, max: 100, step: 1,
+              value: draft.notificationVolume,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, notificationVolume: clampNotificationVolume(event.target.value) })),
+            }))),
+        react.createElement("div", { className: "deg_settings_row" },
+          react.createElement("label", { className: "deg_settings_label", htmlFor: "deg-settings-provider" }, "统一供应商"),
+          react.createElement("div", { className: "deg_settings_control" },
+            react.createElement("select", {
+              id: "deg-settings-provider",
+              value: unifiedProvider,
+              disabled: saving || directoryState.status !== "ready",
+              onChange: (event) => editDraft((previous) => {
+                const provider = event.target.value;
+                if (!provider) {
+                  // “无”仅表示未统一/混合状态，不删除任何专家行的 provider；旧文档只有顶层
+                  // provider 且没有可见行时也保留它，避免选择器动作破坏迁移来源。
+                  const hasVisibleProvider = settingsRolesForProvider(roles).some((role) => {
+                    const value = previous.defaults?.[role]?.provider;
+                    return typeof value === "string" && value.length > 0;
+                  });
+                  return hasVisibleProvider ? { ...previous, provider: "" } : previous;
+                }
+                return {
+                  ...previous,
+                  provider,
+                  defaults: syncSettingsDefaultsProvider(previous.defaults, provider, providerGroups, roles),
+                };
+              }),
+            },
+              react.createElement("option", { value: "" }, SETTINGS_NO_PROVIDER_LABEL),
+              providerGroups.map((group) => react.createElement("option", { key: group.id, value: group.id }, group.name ?? group.id))))),
+        react.createElement("div", { className: "deg_settings_table_wrap" },
+          react.createElement("div", { className: "deg_settings_table" }, header, rows)),
+        react.createElement("div", { className: "deg_settings_row deg_settings_management_row" },
+          react.createElement("label", { className: "deg_settings_checkbox" },
+            react.createElement("input", { type: "checkbox", "aria-label": "Observer优先", checked: draft.observerPreferred, disabled: saving, onChange: (event) => editDraft((previous) => ({ ...previous, observerPreferred: event.target.checked })) }),
+            react.createElement("span", { className: "deg_settings_label" }, "Observer优先")),
+          react.createElement("label", { className: "deg_settings_checkbox" },
+            react.createElement("input", {
+              type: "checkbox",
+              "aria-label": "任务管理",
+              checked: draft.taskManagementEnabled,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, taskManagementEnabled: event.target.checked })),
+            }),
+            react.createElement("span", { className: "deg_settings_label" }, "任务管理")),
+          react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-concurrency-limit" },
+            react.createElement("span", { className: "deg_settings_label" }, "单个角色并发上限"),
+            react.createElement("input", {
+              id: "deg-settings-role-concurrency-limit",
+              type: "number",
+              "aria-label": "单个角色并发上限",
+              min: 1,
+              max: 64,
+              step: 1,
+              inputMode: "numeric",
+              value: draft.roleConcurrencyLimit,
+              disabled: saving,
+              onChange: (event) => {
+                const raw = event.target.value;
+                const number = raw === "" ? null : Number(raw);
+                editDraft((previous) => ({
+                  ...previous,
+                  roleConcurrencyLimit: raw === ""
+                    ? ""
+                    : Number.isFinite(number) ? number : previous.roleConcurrencyLimit,
+                }));
+              },
+            }))),
+        directoryState.error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, directoryState.error) : null,
+        error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, error) : null,
+        react.createElement("div", { className: "deg_settings_footer" },
+          react.createElement("span", { className: "deg_settings_status", role: "status" }, saved ? "已保存" : hasUnsavedChanges ? "有未保存的修改" : ""),
+          react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving, onClick: discard }, "放弃修改"),
+          react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving || directoryState.status !== "ready" || settingsSnapshot.writable !== true, onClick: save }, saving ? "保存中…" : "保存")));
+    }
+    /**
+     * 浏览器 FileReader 的等价字节编码：File.arrayBuffer() 取得原始字节，btoa()
+     * 生成与 DSH 原生 serializer 相同的无换行 canonical base64。此处不依赖
+     * ConversationController 的 private 方法，也不改变 File 的 MIME/name 元数据。
+     */
+    async function encodeImageFileForRoute(file) {
+      const mediaType = file?.type;
+      if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mediaType)) {
+        throw new Error("conversation.sendSession: unsupported image media type");
+      }
+      if (typeof file?.arrayBuffer !== "function") {
+        throw new Error("conversation.sendSession: image File.arrayBuffer is unavailable");
+      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let binary = "";
+      // 分块避免大图片展开参数超过浏览器调用栈限制；字节顺序仍与 FileReader 完全一致。
+      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+      }
+      const encode = globalThis?.btoa;
+      if (typeof encode !== "function") throw new Error("conversation.sendSession: btoa is unavailable");
+      return {
+        type: "image",
+        mediaType,
+        data: encode(binary),
+        ...(typeof file.name === "string" && file.name !== "" ? { name: file.name } : {}),
+      };
+    }
+
+    async function encodeImagesForRoute(attachments) {
+      return Promise.all(attachments.map((attachment) => encodeImageFileForRoute(attachment.file)));
+    }
+
+    /** Host 返回值也必须经过 PNG MIME、canonical base64 与签名校验，才可进入 prompt。 */
+    function isPngRouteImage(image) {
+      if (!image || typeof image !== "object" || image.mediaType !== "image/png" || typeof image.data !== "string") return false;
+      if (image.name !== undefined && typeof image.name !== "string") return false;
+      try {
+        const decode = globalThis?.atob;
+        const encode = globalThis?.btoa;
+        if (typeof decode !== "function" || typeof encode !== "function") return false;
+        const binary = decode(image.data);
+        if (encode(binary) !== image.data || binary.length < 8) return false;
+        return [137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => binary.charCodeAt(index) === byte);
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * 安全读取运行时方法。DSH 的 traceable Proxy 可能在读取某个兼容 API 时抛错；
+     * 单独隔离每次读取，才能让新 API 的 getter 异常继续回退到其他候选方法。
+     */
+    function readRuntimeMethod(runtime, name) {
+      if (runtime === null || runtime === void 0) return undefined;
+      try {
+        const method = runtime[name];
+        return typeof method === "function" ? method : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+
+    /**
+     * 按有序 id 数组解析草稿附件：先查新 API，再查旧 API；同一顺序同时覆盖
+     * sendSession 的 this 与注入的 conversation。返回实际运行时与解析结果，供退休回调
+     * 使用同一接收者释放草稿；方法使用 call 保留真实接收者，实际方法抛出的业务异常
+     * 不会被误判成能力缺失而再次调用其他 API。
+     */
+    function resolveDraftAttachmentsCompat(primaryRuntime, fallbackRuntime, ids) {
+      const candidates = [
+        [primaryRuntime, "resolveDraftAttachments"],
+        [fallbackRuntime, "resolveDraftAttachments"],
+        [primaryRuntime, "draftImages"],
+        [fallbackRuntime, "draftImages"],
+      ];
+      for (const [runtime, name] of candidates) {
+        const method = readRuntimeMethod(runtime, name);
+        if (method !== undefined) return { runtime, attachments: method.call(runtime, ids) };
+      }
+      throw new Error(
+        "dsh-expert-group: 当前 DSH 运行时未暴露草稿附件解析 API（resolveDraftAttachments / draftImages），无法提交图片草稿",
+      );
+    }
+
+    function releaseObservedDraftImages(runtime, attachments, settlement) {
+      if (settlement?.reason !== "observed") return;
+      if (runtime === null || runtime === void 0) return;
+      // 只调用 ConversationController 的公开释放面，且严格按各自契约传参，绝不混用参数形态：
+      // - 批量方法（新 releaseDraftAttachments / 旧 releaseDraftImages）接收附件描述符数组；
+      // - 单项方法（新 releaseDraftAttachment / 旧 releaseDraftImage）接收单个草稿 id。
+      // 释放优先级固定为新批量、新单项、旧批量、旧单项；四种释放面都缺失时静默跳过，
+      // 因为此处位于 retirement 回调内，抛出只会在提交结果之后制造二次失败。
+      const releaseDraftAttachments = readRuntimeMethod(runtime, "releaseDraftAttachments");
+      if (releaseDraftAttachments !== undefined) {
+        releaseDraftAttachments.call(runtime, attachments);
+        return;
+      }
+      const releaseDraftAttachment = readRuntimeMethod(runtime, "releaseDraftAttachment");
+      if (releaseDraftAttachment !== undefined) {
+        attachments.forEach((attachment) => releaseDraftAttachment.call(runtime, attachment.id));
+        return;
+      }
+      const releaseDraftImages = readRuntimeMethod(runtime, "releaseDraftImages");
+      if (releaseDraftImages !== undefined) {
+        releaseDraftImages.call(runtime, attachments);
+        return;
+      }
+      const releaseDraftImage = readRuntimeMethod(runtime, "releaseDraftImage");
+      if (releaseDraftImage !== undefined) {
+        attachments.forEach((attachment) => releaseDraftImage.call(runtime, attachment.id));
+      }
+    }
+
+    function waitForImageSubmissionPaint() {
+      return new Promise((resolve) => {
+        if (typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(() => setTimeout(resolve, 0));
+        } else {
+          setTimeout(resolve, 0);
+        }
+      });
+    }
+
+    // Cordis traceable Proxy 每次读取方法都可能产生新的函数代理；生命周期状态因此放在
+    // 跨 HMR 的全局 WeakMap 中，cleanup 只比较自己的 state，不读取 sendSession 做身份判断。
+    const IMAGE_ROUTE_STATES_KEY = Symbol.for("dsh-expert-group.image-submission-route-states");
+    function imageSubmissionRouteStates() {
+      const root = globalThis;
+      const existing = root[IMAGE_ROUTE_STATES_KEY];
+      if (existing instanceof WeakMap) return existing;
+      const states = new WeakMap();
+      Object.defineProperty(root, IMAGE_ROUTE_STATES_KEY, {
+        value: states,
+        configurable: false,
+        enumerable: false,
+        writable: false,
+      });
+      return states;
+    }
+
+    /**
+     * 原生 Composer 没有公开 submit hook，因此在 concrete ConversationController
+     * 的 sendSession 边界做幂等包装。只拦截根会话图片；child 仍使用原生路径。
+     * Host 先返回真实 PNG encoded image 或完成 Observer 投递，再通过公开
+     * Session.beginSubmission/prompt 维护 request id、回显、模式和退休生命周期。
+     */
+    function installImageSubmissionRoute(ctx) {
+      let conversation;
+      try { conversation = ctx.get("conversation"); } catch { return () => {}; }
+      if (!conversation || typeof conversation.sendSession !== "function") return () => {};
+      const states = imageSubmissionRouteStates();
+      const existing = states.get(conversation);
+      if (existing !== void 0) return existing.cleanup;
+      // 只保存一次原生引用；后续 cleanup 不读取 traceable Proxy 的方法身份。
+      const original = conversation.sendSession;
+      // helper 内联于 route 安装函数，旧测试/旧 Host 即使只提取该函数也能工作。
+      const rpcRequest = async (request, init = {}) => {
+        const rpc = ctx.connection?.rpc;
+        if (typeof rpc?.call === "function") {
+          const result = await rpc.call(RPC_CHANNEL, RPC_ENDPOINT, request, init.signal);
+          return {
+            ok: result?.ok === true,
+            status: result?.ok === true ? 200 : 500,
+            async json() { return result?.ok === true ? result.value : { ok: false, error: result?.error }; },
+          };
+        }
+        return fetch(RPC_PATH, {
+          ...init,
+          method: init.method ?? "POST",
+          credentials: "same-origin",
+          headers: {
+            "content-type": "application/json",
+            ...(init.headers ?? {}),
+            "x-dsh-expert-group-image": "1",
+          },
+          body: JSON.stringify(request),
+        });
+      };
+      const state = { original, cleanup: void 0, active: true, observerFinalizers: new Set() };
+      const wrapped = async function sendSessionWithImageRoute(session, text, imageIds, mode, signal) {
+        const sessionSnapshot = session?.getSnapshot?.();
+        if (!Array.isArray(imageIds) || imageIds.length === 0 || sessionSnapshot === undefined || sessionSnapshot.subagent != null) {
+          return original.call(this, session, text, imageIds, mode, signal);
+        }
+        // 先在 this 与注入服务中寻找新 API，再寻找旧 API；helper 会保留实际方法接收者，
+        // 两者都不具备时给出插件自身的明确错误。
+        const resolved = resolveDraftAttachmentsCompat(this, conversation, imageIds);
+        const runtime = resolved.runtime;
+        const attachments = resolved.attachments;
+        if (!Array.isArray(attachments) || attachments.length !== imageIds.length) {
+          throw new Error("conversation.sendSession: one or more draft images are no longer available");
+        }
+        let finishRetirement;
+        const retirement = new Promise((resolve) => { finishRetirement = resolve; });
+        // DSH 的回显协议使用 mode + attachments；每个图片附件必须包在 type/value
+        // 中。这里不能沿用旧的 images 平铺字段，否则非法回显会在聊天槽位读取
+        // submission.attachments.map 时让当前会话渲染退化为空白。
+        const submission = session.beginSubmission({
+          mode,
+          text,
+          attachments: attachments.map((attachment) => ({
+            type: "image",
+            value: {
+              previewUrl: attachment.previewUrl,
+              ...(typeof attachment.file?.name === "string" && attachment.file.name !== "" ? { name: attachment.file.name } : {}),
+              ...(attachment.width === undefined ? {} : { width: attachment.width }),
+              ...(attachment.height === undefined ? {} : { height: attachment.height }),
+            },
+          })),
+          onRetire: (settlement) => {
+            try {
+              releaseObservedDraftImages(runtime, attachments, settlement);
+            } finally {
+              finishRetirement?.(settlement);
+            }
+          },
+        });
+        // Observer commit 成功后 Host 会随响应给出一次性 cleanupToken（绑定 session +
+        // childId + exact root generation）。这里在 try 之外声明状态与收尾函数，保证
+        // prompt 失败返回、抛错、取消以及插件卸载的 catch/cleanup 路径都能看到它。
+        let observerCleanup;
+        /**
+         * 消费 Host 侧的 Observer cleanup token。
+         *
+         * cancel：失败/取消路径，让 Host 中断刚创建的 child；
+         * release：成功 observed 路径，只释放凭据（Host 绝不 interrupt），否则 token 会一直
+         * 占到 TTL，连续成功提交 64 次后新的 Observer commit 会被容量拒绝。
+         *
+         * 两种请求都不复用调用方可能已 aborted 的 signal，且都是尽力而为：失败不改变已经
+         * 成功或已经失败的 prompt 结果。
+         * @param {string} action - image-route-observer-cancel 或 ...-release。
+         */
+        const finishObserverChild = (action) => {
+          if (observerCleanup === undefined) return;
+          const pending = observerCleanup;
+          observerCleanup = undefined;
+          state.observerFinalizers.delete(pending.finalizer);
+          void rpcRequest({
+            action,
+            sessionId: pending.sessionId,
+            childId: pending.childId,
+            cleanupToken: pending.cleanupToken,
+          }, {}).catch(() => {});
+        };
+        const cancelObserverChild = () => finishObserverChild("image-route-observer-cancel");
+        const releaseObserverChild = () => finishObserverChild("image-route-observer-release");
+        try {
+          await waitForImageSubmissionPaint();
+          const encoded = await encodeImagesForRoute(attachments);
+          const response = await rpcRequest({
+            action: "image-route", sessionId: session.sessionId, text, images: encoded,
+          }, { signal });
+          let payload;
+          try { payload = await response.json(); } catch { payload = null; }
+          if (!response.ok || payload?.ok !== true) {
+            throw new Error(payload?.error?.message ?? ("图片路由失败（HTTP " + response.status + "）"));
+          }
+          // TOCTOU 复核：Host 判定能力后我们才 session.prompt，期间用户可能再次切换模型，
+          // 导致"能力判定模型"与"实际 prompt 模型"不一致。Host 回传一个不泄露 provider/model
+          // 的不透明 routeClaim；任何复核/提交失败都必须 abandon 本次提交（绝不 session.prompt）。
+          //
+          // main 路径：旧宿主没有 routeClaim 字段时保持既有提交行为（不发校验请求，也不静默
+          // 假设"校验通过"）；有 claim 时先校验一次（Host 对 main 的成功校验会消费 claim）。
+          //
+          // observer 路径是**两阶段**：Host 在 image-route 阶段只签发 claim + 暂存 durable refs，
+          // 不会启动 child。客户端必须先 validate（只验证不消费），再 observer-commit
+          // （Host 复核当前路由后才真正 admission 并消费 claim）。因此旧宿主（没有 claim 的
+          // observer 响应）无法安全提交，必须 fail-closed 而不是退回旧行为。
+          const routeClaim = typeof payload.routeClaim === "string" ? payload.routeClaim : "";
+          /** 调用一次 Host 的 claim 复核；失败时抛出可诊断错误（不返回成功）。 */
+          const assertRouteClaim = async (action) => {
+            const checked = await rpcRequest({
+              action, sessionId: session.sessionId, routeClaim,
+            }, { signal });
+            let body;
+            try { body = await checked.json(); } catch { body = null; }
+            if (!checked.ok || body?.ok !== true) {
+              throw new Error(body?.error?.message
+                ?? "模型路由在图片提交期间发生变化，已放弃本次图片提交；请重新发送");
+            }
+          };
+          // Observer commit 成功但后续 root prompt 失败/取消时的补偿：commit 响应里的
+          // childId/cleanupToken 已在上面登记，这里只需要构造 content。
+          let content;
+          if (payload.target === "main") {
+            if (routeClaim.length > 0) await assertRouteClaim("image-route-validate");
+            const images = Array.isArray(payload.images) ? payload.images : [];
+            if (images.length !== encoded.length || !images.every(isPngRouteImage)) {
+              throw new Error("Host 必须返回与提交数量一致的真实 PNG 图片");
+            }
+            content = [
+              ...images.map((image) => ({ type: "image", mediaType: image.mediaType, data: image.data, name: image.name })),
+              ...(text === "" ? [] : [{ type: "text", text }]),
+            ];
+          } else if (payload.target === "observer") {
+            if (routeClaim.length === 0) {
+              // 旧 Host 的 observer 响应没有 claim：它会立刻启动 Observer，因此无法保证
+              // "能力判定模型 == 实际 prompt 模型"，也无法在提交失败时避免孤儿 child。
+              throw new Error("Host 不支持安全的 Observer 图片提交，请升级插件/Host 后重试");
+            }
+            await assertRouteClaim("image-route-validate");
+            // 第二阶段：Host 复核当前路由 → Observer admission → 一次性消费 claim。
+            // 失败（路由变化/claim 失效/重复提交/取消）时 Host 不会启动 child，或尽力中断它。
+            const committed = await rpcRequest({
+              action: "image-route-observer-commit", sessionId: session.sessionId, routeClaim,
+            }, { signal });
+            let commitBody;
+            try { commitBody = await committed.json(); } catch { commitBody = null; }
+            if (!committed.ok || commitBody?.ok !== true) {
+              throw new Error(commitBody?.error?.message
+                ?? "Observer 图片提交未完成，已放弃本次提交；请重新发送");
+            }
+            // commit 成功即存在真实 child：登记清理 finalizer（成功 observed 时会撤销）。
+            const childId = typeof commitBody.childId === "string" ? commitBody.childId : "";
+            const cleanupToken = typeof commitBody.cleanupToken === "string" ? commitBody.cleanupToken : "";
+            if (childId.length > 0 && cleanupToken.length > 0) {
+              const finalizer = () => cancelObserverChild();
+              observerCleanup = { sessionId: session.sessionId, childId, cleanupToken, finalizer };
+              state.observerFinalizers.add(finalizer);
+            }
+            // Observer 只收到图片本身并只做视觉分析（自动入口不传用户文字）；根会话提交文字
+            // 通知，让原生 retirement 释放浏览器草稿，同时明确告诉主代理：原始用户任务仍在
+            // 自己手里，视觉报告会作为上下文反馈回来（由 DSH 的 child 反馈通道送达），不要
+            // 把这次提交当成任务已完成。
+            const notice = "用户图片已交由 Observer 做纯视觉分析（仅描述图片内容、可见文字、布局、状态与异常；未向 Observer 传递任何用户文字）。Observer 的视觉报告会作为主代理上下文反馈回本会话；请保留用户的原始任务并继续处理，收到视觉报告后再综合，不要把本次提交当作任务已完成。";
+            content = [{ type: "text", text: text === "" ? notice : text + "\n" + notice }];
+          } else {
+            throw new Error("Host 返回了未知的图片路由目标");
+          }
+          const result = await session.prompt(content, mode, signal, submission.requestId);
+          if (!result?.ok) {
+            // prompt 未被接受：尽力中断刚创建的 Observer child，避免孤儿反馈。
+            cancelObserverChild();
+            return { kind: "error" };
+          }
+          if ((await retirement).reason !== "observed") {
+            cancelObserverChild();
+            return { kind: "error" };
+          }
+          // 成功 observed：Observer child 已由 DSH 正常收口，撤销 finalizer 并**释放**
+          // Host 侧 cleanup token（release 只释放凭据、绝不 interrupt）。不释放会让 token
+          // 一直占到 TTL，连续成功提交填满容量后新的 Observer commit 会被拒绝。
+          releaseObserverChild();
+          return { kind: "success" };
+        } catch (error) {
+          // 抛错/取消路径同样尽力中断 Observer child，但保留原始错误语义。
+          try { cancelObserverChild(); } catch { /* 尽力而为 */ }
+          submission.abandon();
+          throw error;
+        }
+      };
+      const cleanup = () => {
+        if (!state.active) return;
+        state.active = false;
+        // 卸载时先尽力中断仍在等待 root prompt 的 Observer child，再恢复原生 sendSession。
+        for (const finalizer of [...state.observerFinalizers]) {
+          state.observerFinalizers.delete(finalizer);
+          try { finalizer(); } catch { /* 尽力而为 */ }
+        }
+        if (states.get(conversation) !== state) return;
+        states.delete(conversation);
+        // state 是本次安装的稳定所有权标记；恢复时不比较每次读取都会变化的代理函数。
+        conversation.sendSession = original;
+      };
+      state.cleanup = cleanup;
+      states.set(conversation, state);
+      conversation.sendSession = wrapped;
+      return cleanup;
+    }
+
+
+
+    /**
+     * keyed conversation renderer 只接管 system-prompt，并将原始文本作为 React children 保持完整显示。
+     */
+    function FullSystemPromptNode(props) {
+      const [open, setOpen] = react.useState(false);
+      const text = props?.node?.data?.text;
+      if (typeof text !== "string") return null;
+      return react.createElement(
+        primitives.DisclosureRow,
+        {
+          // 0.1.7-alpha.2 起图标后缀编码的是描边粗细（Regular=1px），渲染尺寸只由 size prop 承载，
+          // 因此旧 `*16` 后缀名一律改为 `*Regular`，并保持原有的显式 size。
+          icon: react.createElement(primitives.IconBrowseOutlineRegular, { size: 14 }),
+          title: "系统提示词",
+          open,
+          expandable: true,
+          expandOnRowClick: true,
+          onToggle: () => setOpen((value) => !value),
+          className: "deg_full_system_prompt_root",
+          chevronClassName: "deg_full_system_prompt_chevron",
+        },
+        react.createElement(
+          "div",
+          { className: "deg_full_system_prompt_body" },
+          react.createElement("pre", { className: "deg_full_system_prompt" }, text),
+        ),
+      );
+    }
+
+    // ── 设置页导航行的品牌图标（DOM 适配）──────────────────────────────────────
+    /**
+     * DEG 在宿主 settings.section ledger 里的条目 id，同时也是导航行显示的 label
+     * （注册时的 label 固定回投射成这个 id）。设置页导航图标适配靠它定位目标行，因此提升到
+     * 模块作用域：与 apply 内的注册共用同一个来源，不出现第二份字面量。
+     */
+    const DEG_SETTINGS_SECTION_ID = "dsh-expert-group";
+    /** 适配标记：按钮 / 宿主原生 svg / DEG 自有 svg 各一个（同时被 CSS 选择器使用）。 */
+    const DEG_SETTINGS_NAV_ATTR = "data-deg-settings-nav";
+    const DEG_SETTINGS_NAV_NATIVE_ATTR = "data-deg-settings-nav-native";
+    const DEG_SETTINGS_NAV_ICON_ATTR = "data-deg-settings-nav-icon";
+    /** 设置页导航栏里其它行都是 1.3px 描边的 Medium 图标；宿主未给出描边宽度时按它回落。 */
+    const DEG_SETTINGS_NAV_STROKE_FALLBACK = "1.3";
+
+    /**
+     * 品牌图标路径数据的兜底副本（双人 users 图标，与宿主「智能体团队」入口同源）。
+     *
+     * 运行期优先取 client-expert-group-sidebar.js 导出的 BRAND_ICON_PATHS（唯一一份 artwork，
+     * 侧栏 tab / guide 图标与这里共用），只有侧栏 IIFE 缺失（契约外直接加载 client.js、被裁剪的
+     * 装配产物）时才用这份逐字节同值的字面量，保证设置页图标不因缺模块而消失。
+     * 两处一致性由 test/expert-group-sidebar-contract.test.mjs 断言。
+     */
+    const DEG_SETTINGS_NAV_ICON_FALLBACK_PATHS = Object.freeze([
+      "M6 8.25C7.51878 8.25 8.75 7.01878 8.75 5.5C8.75 3.98122 7.51878 2.75 6 2.75C4.48122 2.75 3.25 3.98122 3.25 5.5C3.25 7.01878 4.48122 8.25 6 8.25Z",
+      "M1 14.5C1 11.5 3.5 10.25 6 10.25C8.5 10.25 11 11.5 11 14.5",
+      "M10.5 2.9C11.65 3.35 12.45 4.35 12.45 5.5C12.45 6.65 11.65 7.65 10.5 8.1",
+      "M12.4 10.6C13.9 11.3 15 12.6 15 14.5",
+    ]);
+    const DEG_SETTINGS_NAV_ICON_PATHS = (() => {
+      const shared = expertGroupSidebar?.BRAND_ICON_PATHS;
+      if (Array.isArray(shared) && shared.length > 0 && shared.every((item) => typeof item === "string")) return shared;
+      return DEG_SETTINGS_NAV_ICON_FALLBACK_PATHS;
+    })();
+
+    /**
+     * 这个元素是不是 DEG 在设置面板里的导航行？
+     *
+     * 只认「可见文本严格等于 DEG 注册的 label，且含 svg 子元素」的节点：
+     * - 文本取自 textContent.trim()（label 是按钮内 span 的文本，真实 DOM 的 textContent 会
+     *   把后代文本拼起来），严格相等因此能排除 "dsh-expert-group-status" 之类的近似行；
+     * - svg 的存在保证「有图标可换」——没有图标的行不动，避免给非目标行插图标；
+     * - 绝不使用宿主 CSS module 的哈希类名（构建产物一变就失配）。
+     *
+     * 任何读取失败（节点代理抛错、querySelector 不可用）都按「不是目标行」处理。
+     */
+    function isDegSettingsNavRow(element) {
+      if (element === null || typeof element !== "object") return false;
+      try {
+        if (typeof element.textContent !== "string" || element.textContent.trim() !== DEG_SETTINGS_SECTION_ID) return false;
+        if (typeof element.querySelector !== "function") return false;
+        const native = element.querySelector("svg");
+        return native !== null && native !== void 0;
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * 构造 DEG 自有的品牌 svg（与侧栏图标同一组 4 条 path）。
+     *
+     * 描边宽度沿用宿主原图标的值（宿主 Medium 图标为 1.3px），缺失时回落到同一数值：
+     * 换掉图标后视觉重量必须与同一导航栏里其它行一致，不能变成明显更细或更粗的一行。
+     */
+    function createDegSettingsNavIcon(doc, strokeWidth) {
+      const svg = doc.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute(DEG_SETTINGS_NAV_ICON_ATTR, "");
+      svg.setAttribute("width", "16");
+      svg.setAttribute("height", "16");
+      svg.setAttribute("viewBox", "0 0 16 16");
+      svg.setAttribute("fill", "none");
+      svg.setAttribute("stroke", "currentColor");
+      svg.setAttribute("stroke-width", strokeWidth);
+      svg.setAttribute("aria-hidden", "true");
+      for (const d of DEG_SETTINGS_NAV_ICON_PATHS) {
+        const path = doc.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", d);
+        path.setAttribute("stroke", "currentColor");
+        path.setAttribute("fill", "none");
+        svg.appendChild(path);
+      }
+      return svg;
+    }
+
+    /**
+     * 设置页导航行的品牌图标适配（宿主设置面板由 DSH 渲染，导航行图标来自 SettingsRoot 里按
+     * section id 硬编码的 navIcon(id)，未知 id 回退齿轮；`settings.section` 注册只投影
+     * id/order/label，插件无法用注册字段声明图标，因此只能在客户端做 DOM 适配）。
+     *
+     * 做法与边界：
+     * 1. 定位：`[role="dialog"]` 内的按钮里，可见文本严格等于 "dsh-expert-group" 且含 svg 的那一行；
+     * 2. **不替换**宿主 svg 的内容，只给它加标记交给 CSS 隐藏——React 重新渲染该行时会按 fiber
+     *    位置回写自己那些 path 节点，改写宿主 svg 的内部结构会被下一次提交覆盖回去；
+     * 3. 自造 svg 插到按钮第一个子节点之前：按钮是 display:flex;gap:8px，图标在最左，
+     *    label 的位置与宿主自己的布局语义都不受影响；
+     * 4. 幂等：sync 会先把行内**所有**非自有 svg 重新标成原生图标（宿主重渲染后标记可能丢失，
+     *    这正是自愈路径），自有图标已在位就只补标记，绝不重复插入；
+     * 5. 健壮性：DOM / observer / createElementNS / 选择器任何一步不可用都静默 no-op——
+     *    设置页图标只是外观，绝不能影响插件入口、设置页或侧边栏本身的功能。
+     *
+     * 成本：observer 观察整个 body 子树（与 SubagentMetadataBridge 同一策略）。每次回调只做
+     * 一次 `[role="dialog"]` 查询；设置面板关闭时该查询直接返回空集合，因此普通会话的 DOM
+     * 变更不产生可见开销。
+     *
+     * @returns {() => void} disposer：断开 observer 并清掉全部标记与自有 svg。
+     */
+    function installDegSettingsNavIcon() {
+      const doc = typeof document !== "undefined" ? document : null;
+      const root = doc?.body ?? doc?.documentElement ?? null;
+      if (doc === null || root === null || typeof doc.querySelectorAll !== "function") return () => {};
+      let observer = null;
+      let disposed = false;
+
+      /** 单个候选行的适配（幂等 + 自愈，见上面的第 2/4 条）。 */
+      const syncRow = (row) => {
+        if (typeof row.querySelectorAll !== "function" || typeof row.setAttribute !== "function") return;
+        const nativeSvgs = [];
+        let ownIcon = null;
+        for (const svg of row.querySelectorAll("svg")) {
+          if (typeof svg.getAttribute !== "function") continue;
+          if (svg.getAttribute(DEG_SETTINGS_NAV_ICON_ATTR) !== null) ownIcon = svg;
+          else nativeSvgs.push(svg);
+        }
+        if (ownIcon === null) {
+          // 首次适配：缺少 SVG 构造/插入能力（极旧的替身 DOM）时整行保持原样。
+          if (typeof doc.createElementNS !== "function" || typeof row.insertBefore !== "function") return;
+          const native = nativeSvgs[0];
+          const inherited = native === undefined ? null : native.getAttribute("stroke-width");
+          const strokeWidth = typeof inherited === "string" && inherited.trim() !== ""
+            ? inherited
+            : DEG_SETTINGS_NAV_STROKE_FALLBACK;
+          ownIcon = createDegSettingsNavIcon(doc, strokeWidth);
+          // 插到第一个子节点之前：图标列在最左，label 与宿主后续插入的节点位置不变。
+          row.insertBefore(ownIcon, row.firstChild ?? null);
+        }
+        for (const svg of nativeSvgs) svg.setAttribute(DEG_SETTINGS_NAV_NATIVE_ATTR, "");
+        row.setAttribute(DEG_SETTINGS_NAV_ATTR, "");
+      };
+
+      /** 幂等同步：命中一行的条件是「label 严格相等 + 含 svg」，已适配的行只补标记。 */
+      const sync = () => {
+        if (disposed) return;
+        try {
+          for (const dialog of doc.querySelectorAll('[role="dialog"]')) {
+            if (typeof dialog?.querySelectorAll !== "function") continue;
+            for (const row of dialog.querySelectorAll("button")) {
+              if (isDegSettingsNavRow(row) !== true) continue;
+              syncRow(row);
+            }
+          }
+        } catch {
+          // 选择器或宿主节点代理抛错：保持 no-op，下一次 observer 回调再试，绝不外泄异常。
+        }
+      };
+
+      /** dispose 清理：全量清掉标记与自有 svg；宿主重渲染后已断开的节点同样安全跳过。 */
+      const cleanup = () => {
+        try {
+          for (const node of doc.querySelectorAll("[" + DEG_SETTINGS_NAV_ATTR + "]")) node.removeAttribute(DEG_SETTINGS_NAV_ATTR);
+          for (const node of doc.querySelectorAll("[" + DEG_SETTINGS_NAV_NATIVE_ATTR + "]")) node.removeAttribute(DEG_SETTINGS_NAV_NATIVE_ATTR);
+          for (const node of doc.querySelectorAll("[" + DEG_SETTINGS_NAV_ICON_ATTR + "]")) {
+            // 移除自己插入的节点；节点已游离时 remove() 是安全的空操作。
+            if (typeof node.remove === "function") node.remove();
+          }
+        } catch {
+          // 清理失败不能阻断卸载（标记属性本身无害，下次挂载会重新适配）。
+        }
+      };
+
+      sync();
+      const Observer = doc?.defaultView?.MutationObserver
+        ?? (typeof globalThis !== "undefined" ? globalThis.MutationObserver : void 0);
+      if (typeof Observer === "function") {
+        try {
+          observer = new Observer(() => { sync(); });
+          observer.observe(root, { childList: true, subtree: true });
+        } catch {
+          // observer 装不上（宿主替身/权限异常）：保留已经完成的一次性适配，不再跟进重渲染。
+          observer = null;
+        }
+      }
+      return () => {
+        if (disposed) return;
+        disposed = true;
+        try {
+          observer?.disconnect();
+        } catch {
+          // 断开失败不阻断清理。
+        }
+        observer = null;
+        cleanup();
+      };
+    }
+
+    // ── 插件主体：注册设置页与状态/元数据桥（通知由 Host 投递，客户端不挂载通知组件）。
+    function apply(ctx) {
+      ctx.effect(() => installImageSubmissionRoute(ctx), "dsh-expert-group: image submission route");
+      // 设置页导航行的图标由宿主按 section id 硬编码（未知 id 回退齿轮），插件侧只能做 DOM 适配。
+      ctx.effect(() => installDegSettingsNavIcon(), "dsh-expert-group: settings nav brand icon");
+      ctx.effect(() => installNativeStatusBridge(ctx), "dsh-expert-group: native status bridge");
+      const slots = ctx.slots;
+      // 原生 system-prompt renderer 会通过 boundedText 截断；该 keyed renderer 只替换显示层，注册生命周期由 slots.inject 绑定到插件上下文。
+      slots.inject("conversation.chat.node", () => slots.register({
+        name: "conversation.chat.node",
+        key: "system-prompt",
+        priority: -1,
+      }, FullSystemPromptNode));
+      /**
+       * 设置表单服务的安全解析（0.1.7-alpha.2 契约）。
+       *
+       * 唯一来源是 `ctx.configForms`（已删除的 `settingsScope` 不再存在，不做任何回退）：
+       * 宿主没提供该服务、或服务代理拒答时返回 null，调用方据此走「不可用」降级，
+       * 绝不让整条客户端入口失败（插件仍需注册设置页、侧边栏与通知桥）。
+       */
+      const resolveConfigForms = () => {
+        try {
+          const service = typeof ctx?.get === "function" ? ctx.get("configForms") : ctx?.configForms;
+          return service !== undefined && service !== null ? service : null;
+        } catch {
+          // 未声明服务读取即抛错（Cordis 门控）：按宿主没有该服务处理。
+          return null;
+        }
+      };
+      const configForms = resolveConfigForms();
+      /**
+       * 取本插件 profile 条目的配置表单；条目 id 由 bundle 补丁固定为 `dsh-expert-group`。
+       *
+       * 表单由宿主（settings 提供者）持有，DEG 只读取与订阅，绝不销毁、也绝不调用它的
+       * set/unset/mutate。服务缺失或 `get` 抛错时返回一个**不可用替身**：快照形状与真实表单
+       * 完全一致（status: unavailable），设置页因此显示可读的不可用提示而不是崩溃。
+       */
+      const SETTINGS_ENTRY_ID = DEG_SETTINGS_SECTION_ID;
+      const UNAVAILABLE_SETTINGS_SNAPSHOT = Object.freeze({
+        status: "unavailable",
+        value: undefined,
+        base: undefined,
+        user: undefined,
+        revision: undefined,
+        writable: false,
+        mode: "memory",
+      });
+      const settingsForm = (() => {
+        if (configForms === null || typeof configForms.get !== "function") {
+          return {
+            getSnapshot: () => UNAVAILABLE_SETTINGS_SNAPSHOT,
+            subscribe: () => () => {},
+          };
+        }
+        try {
+          const form = configForms.get(SETTINGS_ENTRY_ID);
+          if (form !== null && form !== undefined
+            && typeof form.getSnapshot === "function" && typeof form.subscribe === "function") return form;
+        } catch { /* 服务代理拒答或条目读取失败：按不可用降级。 */ }
+        return {
+          getSnapshot: () => UNAVAILABLE_SETTINGS_SNAPSHOT,
+          subscribe: () => () => {},
+        };
+      })();
+      const modelCatalog = createSettingsModelCatalog(ctx);
+      // 「模型配置」区域的数据流与宿主面适配层：唯一纯函数实现位于 client-model-config.js
+      // （装配期先于本 descriptor 执行的 IIFE），这里只做公开 API 接线。
+      // describe 面唯一来源是 configForms.describe()；服务缺失时传 null，该区域降级为只读提示。
+      const modelConfigHost = createModelConfigHost(ctx, configForms);
+      // 独立设置页由插件注册到 Host 的 settings.section ledger，导航和生命周期仍由设置 Shell 管理。
+      slots.inject("settings.section", () => slots.register({
+        name: "settings.section",
+        id: SETTINGS_ENTRY_ID,
+        order: 25,
+        label: () => SETTINGS_ENTRY_ID,
+        inject: () => ({ settingsForm, modelCatalog, modelConfigHost, ctx }),
+      }, DshExpertGroupSettings));
+
+
+
+      // shell.overlay 只保留原生子代理行元数据；
+      // fan-out 的可见控制面迁入 Expert Group，避免固定浮层与右侧任务树重复。
+      // 通知不再占用 overlay：**系统通知（Windows 右下角 Toast）是唯一通知界面**，由 Host 侧
+      // 负责投递；客户端既不渲染页面内卡片，也不创建浏览器 Notification，更不轮询通知快照，
+      // 因此这里没有任何通知组件，也不再声明 inject（设置表单只服务设置页）。
+      // 注册账本（同一 slot、同一个 descriptor id）保持不变。
+      slots.inject("shell.overlay", () => slots.register({
+        name: "shell.overlay",
+        id: "dsh-expert-group-overlay",
+        order: 0,
+      }, (props) => react.createElement(
+        react.Fragment,
+        null,
+        react.createElement(SubagentMetadataBridge, { ...props, ctx }),
+      )));
+
+      if (typeof expertGroupSidebar?.installExpertGroupSidebar === "function") {
+        /**
+         * settings 的「任务管理」开关控制 Expert Group 是否注册到侧边栏。
+         *
+         * - 缺字段/读取失败一律按开启处理：默认必须是历史行为（插件注册自己的侧边栏页面，
+         *   DSH 或 dsh-better-sidebar 的默认侧栏保持不变）；
+         * - 关闭时调用当前 install 返回的 disposer 释放已有注册（不回退、不改动 better-sidebar
+         *   的 tabsEnabled 偏好，也不新增 DSH 本体注册）；
+         * - install 返回的 disposer 不可复用，重新开启必须重新 install；
+         * - 插件销毁时取消 settings 订阅并释放当前 disposer。
+         */
+        const sidebarDeps = {
+          react,
+          primitives,
+          requestPluginRpc,
+          resolveRootSessionId: expertGroupRootSessionIdOf,
+          sessions: ctx.sessions,
+          slots: ctx.slots,
+          // 浏览器 confirm 是同步 API，Panel 以 Promise/boolean 双兼容方式消费。
+          confirm: (message) => typeof globalThis.confirm === "function" && globalThis.confirm(message) === true,
+        };
+        const readTaskManagementEnabled = () => {
+          try {
+            const snapshot = typeof settingsForm?.getSnapshot === "function" ? settingsForm.getSnapshot() : void 0;
+            return snapshot?.value?.taskManagementEnabled !== false;
+          } catch {
+            // 读取配置表单异常（服务缺失/未就绪 store）不能导致侧边栏消失：按默认开启处理。
+            return true;
+          }
+        };
+        ctx.effect(() => {
+          let disposer = null;
+          const install = () => {
+            if (disposer !== null) return;
+            if (readTaskManagementEnabled() !== true) return;
+            const release = expertGroupSidebar.installExpertGroupSidebar(ctx, {
+              ...sidebarDeps,
+              taskManagementEnabled: true,
+            });
+            disposer = typeof release === "function" ? release : null;
+          };
+          const uninstall = () => {
+            const release = disposer;
+            disposer = null;
+            if (release === null) return;
+            try {
+              release();
+            } catch {
+              // 释放失败不能阻断后续重新安装，也不能让 settings 订阅清理失败。
+            }
+          };
+          const sync = () => {
+            if (readTaskManagementEnabled()) install();
+            else uninstall();
+          };
+          // 初始化先同步读一次快照：缺字段/开启时必须在同步栈内完成注册，与历史行为一致。
+          sync();
+          let unsubscribe = () => {};
+          if (typeof settingsForm?.subscribe === "function") {
+            try {
+              const release = settingsForm.subscribe(() => {
+                try {
+                  sync();
+                } catch {
+                  // 通知回调抛错不得污染配置表单；保持当前注册状态。
+                }
+              });
+              if (typeof release === "function") unsubscribe = release;
+            } catch {
+              // 订阅不可用时保持首次快照决定的注册状态。
+            }
+          }
+          return () => {
+            try {
+              unsubscribe();
+            } catch {
+              // 取消订阅失败不影响释放侧边栏注册。
+            }
+            unsubscribe = () => {};
+            uninstall();
+          };
+        }, "dsh-expert-group-sidebar");
+      }
+    }
+
+    exports.normalizeSettingsModelGroups = normalizeSettingsModelGroups;
+    exports.normalizeSettingsDraft = normalizeSettingsDraft;
+    exports.countUnicodeGraphemes = countUnicodeGraphemes;
+    exports.validatePromptText = validatePromptText;
+    exports.normalizePromptOverrides = normalizePromptOverrides;
+    exports.normalizeRolePromptProjection = normalizeRolePromptProjection;
+    exports.unifiedProviderOf = unifiedProviderOf;
+    exports.migrateSettingsSelection = migrateSettingsSelection;
+    exports.syncSettingsDefaultsProvider = syncSettingsDefaultsProvider;
+    exports.migrateSettingsDefaults = migrateSettingsDefaults;
+    exports.commitSettingsCandidate = commitSettingsCandidate;
+    exports.formatSubagentMetadata = formatSubagentMetadata;
+    exports.normalizeSubagentMetadata = normalizeSubagentMetadata;
+    exports.collectSubagentCatalog = collectSubagentCatalog;
+    exports.requestSubagentMetadata = requestSubagentMetadata;
+    exports.findNativeSubagentTrees = findNativeSubagentTrees;
+    exports.findNativeSubagentTreeItems = findNativeSubagentTreeItems;
+    exports.findNativeSubagentRowParts = findNativeSubagentRowParts;
+    exports.applySubagentMetadata = applySubagentMetadata;
+    exports.removeSubagentMetadata = removeSubagentMetadata;
+    exports.findNativeConversationScope = findNativeConversationScope;
+    /**
+     * 原生运行状态投影的公开面（与 shared.js 的同名导出语义同步）：
+     * - NATIVE_RUNNING_STATUS_PREFIX / replaceNativeStatusPrefix：只替换宿主文案里的运行前缀，
+     *   逗号、用时与末尾省略号仍来自宿主原文；
+     * - resolveRunningStatusText：当前会话 running + 角色已知时的前缀文案（不带省略号）；
+     * - createNativeTextRewriter：单个字段前缀重写器的保存/替换/恢复语义；
+     * - findNativeStatusTextNode：当前会话的可见主文本节点（RC1 返回 data-shimmer 非装饰子树
+     *   的真实可见 Text，legacy 形态返回各自的可见 Text），与 shared.js 的选择语义一致；
+     * - installNativeStatusBridge：把上面这些接进 DSH 原生运行行的 observer 生命周期。
+     * 测试跨这些公开 seam 验证行为，不读取生产源码文本。
+     */
+    exports.NATIVE_RUNNING_STATUS_PREFIX = NATIVE_RUNNING_STATUS_PREFIX;
+    exports.replaceNativeStatusPrefix = replaceNativeStatusPrefix;
+    exports.resolveRunningStatusText = resolveRunningStatusText;
+    exports.createNativeTextRewriter = createNativeTextRewriter;
+    exports.findNativeStatusTextNode = findNativeStatusTextNode;
+    exports.installNativeStatusBridge = installNativeStatusBridge;
+    exports.normalizeFanoutTask = normalizeFanoutTask;
+    exports.mergeFanoutEvent = mergeFanoutEvent;
+    exports.fanoutTaskLabel = fanoutTaskLabel;
+    exports.fanoutStatusLabel = fanoutStatusLabel;
+    exports.fanoutCanCancelShard = fanoutCanCancelShard;
+    exports.fanoutCanRetryShard = fanoutCanRetryShard;
+    exports.fanoutCanCancelParent = fanoutCanCancelParent;
+    exports.normalizeFanoutListResponse = normalizeFanoutListResponse;
+    exports.createClientFreshnessBoundary = createClientFreshnessBoundary;
+    exports.normalizePluginRpcResult = normalizePluginRpcResult;
+    exports.requestPluginRpc = requestPluginRpc;
+    exports.expertGroupModel = expertGroupModel;
+    exports.expertGroupSidebar = expertGroupSidebar;
+    /**
+     * 「模型配置」区域的纯数据流实现（provider 目录装配、草稿/路径操作、七档
+     * reasoningEfforts 映射、继承与恢复默认、revision 冲突与角色联动守卫）。
+     *
+     * 唯一实现位于 client-model-config.js（装配期先于本 descriptor 执行的 IIFE）；
+     * 共享实现未装载时保持 undefined，设置页随即跳过整个区域，不影响角色配置。
+     */
+    exports.modelConfig = globalThis[Symbol.for("dsh-expert-group/client-model-config")];
+    /**
+     * 用公开 API 装配「模型配置」宿主面（remote.llm / remote.credentials / remote.settings，
+     * 以及 configForms.describe()）。导出给设置页与测试共用同一实现，不复制数据流。
+     */
+    exports.createModelConfigHost = createModelConfigHost;
+    exports.MODEL_REASONING_EFFORTS = Object.freeze([
+      "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    ]);
+    // 只读能力矩阵与诊断面：设置页、维护者与测试共用同一份纯函数实现。
+    exports.describeExpertGroupClientCapabilities = describeExpertGroupClientCapabilities;
+    exports.describeExpertGroupDiagnostics = describeExpertGroupDiagnostics;
+    /**
+     * 设置页导航行品牌图标（DOM 适配）的公开面：
+     * - DEG_SETTINGS_NAV_ICON_PATHS / DEG_SETTINGS_NAV_ICON_FALLBACK_PATHS：artwork 常量，
+     *   测试据此断言与 client-expert-group-sidebar.js 的 BRAND_ICON_PATHS 同值；
+     * - isDegSettingsNavRow：导航行的匹配纯逻辑（label 严格相等 + 含 svg）；
+     * - installDegSettingsNavIcon：observer 生命周期，apply 用 ctx.effect 绑定它。
+     */
+    exports.DEG_SETTINGS_NAV_ICON_PATHS = DEG_SETTINGS_NAV_ICON_PATHS;
+    exports.DEG_SETTINGS_NAV_ICON_FALLBACK_PATHS = DEG_SETTINGS_NAV_ICON_FALLBACK_PATHS;
+    exports.isDegSettingsNavRow = isDegSettingsNavRow;
+    exports.installDegSettingsNavIcon = installDegSettingsNavIcon;
+    exports.apply = apply;
+    exports.inject = [
+      "slots", "sessions", "configForms", "remote", "remote.session", "remote.llm", "remote.credentials", "remote.settings", "conversation", "connection",
+      // 「模型配置」区域使用公开的 settings schema 服务（rehydrate/validate/nodeAtPath）；
+      // 未安装时该区域降级为"不本地校验"，仍由正式 settings API 做 schema 校验。
+      "settingsSchema",
+    ];
+    return module.exports;
+  }
+});

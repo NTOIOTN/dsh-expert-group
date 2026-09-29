@@ -1,0 +1,12 @@
+# 本仓库只跟踪「插件本体」：README + package.json 的 files 发布白名单内的源码与脚本。
+#
+# 完整的忽略规则（默认拒绝 + 逐项放行）放在 .git/info/exclude，而不是这里。原因：
+# 本目录同时被两个仓库使用——本目录自身（只跟踪插件本体，待推送）与上一级
+# F:\01 AI\01dsh-expert-group（只跟踪 test/、.scratch/ 等开发面，不推送）。
+# .gitignore 会被两个仓库同时读到，一旦写成"默认拒绝"，上一级仓库就看不见新增的
+# 测试文件；放进 info/exclude 只对本仓库生效，两个仓库因此互不干扰。
+#
+# 将本仓库 clone 到别处后如需相同的忽略行为，把 .git/info/exclude 的内容复制过去即可。
+
+# release-gate 测试断言本行必须存在（见 test/release-gate.test.mjs），勿删
+*.tgz
