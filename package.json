@@ -5,7 +5,7 @@
   "type": "module",
   "main": "./index.js",
   "bin": {
-    "prompt-inspector": "./bin/prompt-inspector.mjs"
+    "prompt-inspector": "bin/prompt-inspector.mjs"
   },
   "exports": {
     ".": "./index.js",
@@ -134,7 +134,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dimensionli95-ship-it/dsh-expert-group.git"
+    "url": "git+https://github.com/dimensionli95-ship-it/dsh-expert-group.git"
   },
   "optionalDependencies": {
     "sharp": "^0.35.4"
