@@ -42,9 +42,16 @@ fail-closed，并标记为 `status: "incomplete"`；绝不伪造 paused ref 或�
 - 子代理的 `reasoningEffort` 通过子代理 `agent/request` waterfall 注入，绕开 `dsh-tool-subagent`
   `AgentOptions` 尚未公开该字段的限制。
 
-## 安装
+## 安装与平台分工
 
-本插件发布到 npm 公共源，按包名安装：
+本插件发布到 npm 公共源，按包名安装。**CLI/web 与桌面版是两套管理面，命令不通用**：
+
+| 目标 | 安装入口 | 生效方式 |
+| --- | --- | --- |
+| **CLI / `dsh web`** | `dsh plugin --profile <profile> add dsh-expert-group` | 重启 DSH Web |
+| **桌面版（Electron 客户端）** | GUI「插件 → 添加插件」，或桌面版自带的 `dsh` CLI（见下） | 重启桌面版 |
+
+### CLI / `dsh web`
 
 ```powershell
 dsh plugin --profile web add dsh-expert-group
@@ -53,6 +60,37 @@ dsh plugin --profile web add dsh-expert-group
 安装会把本包写入 `$DSH_HOME\profiles\web` 的依赖并加入 profile 的 bundle 层；**重启 DSH Web** 后生效（已运行的进程不会热加载新的 Host 行）。
 
 要求：DSH Web 可运行（`dsh web`）、Node.js ≥ 22、PATH 上有 `pnpm`。**本插件不内置任何角色默认模型**——安装后需先在「设置 → dsh-expert-group」为各角色选择模型并保存。
+
+### 桌面版（Electron 客户端）
+
+桌面版的 profile 是 `desktop`，由 Electron 应用独占管理；**不要用 npm 全局的 `dsh` 去操作它**，否则会被 CLI 直接拒绝：
+
+```text
+error: profile "desktop" is managed exclusively by the Electron application
+```
+
+**方式 A（推荐，与版本无关）**：打开桌面版 → **插件** 页 → **添加插件** → 输入 `dsh-expert-group`（界面提示原文：「输入插件的包名、GitHub 仓库地址或本地目录路径。」）→ 安装完成后提示「更改将在下次启动生效」→ **重启桌面版**。
+
+**方式 B（桌面版自带 CLI，仅新版本可用）**：桌面版从 **`0.2.0-rc.2`** 起随发行包提供 `resources\runtime\cli\bin\dsh.cmd`（在 `0.2.0-rc.1` 上该文件不存在，只能用方式 A 或方式 C）。用它对 `desktop` profile 执行 pnpm 风格的依赖操作：
+
+```powershell
+& '<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd' plugin --profile desktop add dsh-expert-group
+& '<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd' plugin --profile desktop list
+# 卸载：把 add 换成 remove
+```
+
+**方式 C（手工维护 profile 文件）**：在 `$DSH_HOME\profiles\desktop\package.json` 的 `dependencies` 加一项、`dsh.profile.bundles` 追加包名，并让 `node_modules\dsh-expert-group` 能解析到实际目录（pnpm 安装或 junction）。三处齐全才生效。
+
+> 桌面版 CLI 的边界：`plugin` 子命令对 `desktop` 开放（只做依赖管理），但 `--dump-config` 之类的**组合/启动**命令仍会被拒——`error: profile "desktop" is managed exclusively by the Electron application`。
+
+**验证安装结果**：
+
+```powershell
+$d = "$env:DSH_HOME\profiles\desktop"
+$pkg = Get-Content "$d\package.json" -Raw | ConvertFrom-Json
+$pkg.dsh.profile.bundles -contains 'dsh-expert-group'   # 应为 True
+(Get-ChildItem "$d\node_modules\dsh-expert-group\host" -File).Count   # 应为 14
+```
 
 **可选图像增强**：`sharp` 是 `optionalDependencies`（约 30 MB 原生二进制），用于把 JPEG / WebP / GIF 转码为 PNG；拉取失败或未安装都不影响插件加载，仅会拒绝非 PNG 图片的转码，其余功能全部正常。
 
