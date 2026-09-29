@@ -1501,6 +1501,41 @@
   }
 
   /**
+   * 面板级读面（面板内的 tab/pane 观察与组成判定）共用的「当前 session 面板」解析入口。
+   *
+   * 第一判据与 rightbarPanelForSession 完全一致：面板自带 data-sidebar-right-session、与当前
+   * session 完全相等、且全局唯一时才可用；零个（面板还没挂载 / 不属于这一页）或多个（归属不明确）
+   * 都返回 null，调用方一律 fail-closed——绝不按 DOM 顺序取第一个面板，那正是跨 session 误命中的根因。
+   *
+   * 唯一的兼容分支是**旧宿主形状**：data-sidebar-right-session 出现之前的面板没有归属标记，
+   * 此时 DOM 里读不到任何带标记的面板。只有这种「整轮都没有归属标记」的形状才退回 querySelector
+   * 的旧读法，而且要求面板至多一个（多于一个＝归属不可能证明，直接 fail-closed）。只要出现过任何
+   * 一个带标记的面板（现代宿主），这个分支整体失效：当前 session 自己的面板没挂载时保持 null，
+   * 绝不拿别的 session 的面板顶替。
+   */
+  function rightbarPanelForSessionCompat(doc, sessionId) {
+    const panel = rightbarPanelForSession(doc, sessionId);
+    if (panel !== null) return panel;
+    if (doc === null || doc === undefined || typeof doc.querySelectorAll !== "function") return null;
+    let nodes = null;
+    try { nodes = Array.from(doc.querySelectorAll(RIGHTBAR_PANEL_SELECTOR)); } catch { return null; }
+    // 归属标记一旦存在就不再兼容：多个面板、或任一面板带标记，都只能按精确归属判定。
+    if (nodes.length > 1) return null;
+    for (const node of nodes) {
+      if (attributeOf(node, RIGHTBAR_PANEL_SESSION_ATTRIBUTE) !== null) return null;
+    }
+    if (nodes.length === 1) return nodes[0];
+    // 旧替身/旧宿主的读面形状：面板选择器只能通过 querySelector 命中。这里同样要求命中节点
+    // 没有归属标记——带了标记说明它是别的 session 的面板，不能拿来顶替。
+    if (typeof doc.querySelector !== "function") return null;
+    let single = null;
+    try { single = doc.querySelector(RIGHTBAR_PANEL_SELECTOR) ?? null; } catch { return null; }
+    if (single === null || single === undefined) return null;
+    if (attributeOf(single, RIGHTBAR_PANEL_SESSION_ATTRIBUTE) !== null) return null;
+    return single;
+  }
+
+  /**
    * 读取 split 容器的直接 dock 列。
    *
    * 只有 split 的**直接子节点**里 `data-dockkit-host="dock"` 且带非空 `data-dockkit-column`
@@ -2551,8 +2586,10 @@
       const presentSidebarTabIds = () => {
         const doc = globalThis.document;
         if (!doc || typeof doc.querySelector !== "function") return null;
-        let panel = null;
-        try { panel = doc.querySelector(RIGHTBAR_PANEL_SELECTOR); } catch { return null; }
+        // 只读当前 session 自己的面板：零个匹配（还没挂载 / 不属于这一页）或归属不明确时返回 null，
+        // 调用方保持现状；绝不退回 DOM 第一个面板——别的会话残留的面板会把它的 tab 当成
+        // 本会话的缺失证据，从而误判「用户收回了 tab」。
+        const panel = rightbarPanelForSessionCompat(doc, sidebarSessionId);
         if (panel === null || panel === undefined) return null;
         if (typeof panel.querySelectorAll !== "function") return null;
         let nodes = null;
@@ -2617,8 +2654,11 @@
       const paneIdContainingTab = (tabId) => {
         const doc = globalThis.document;
         if (doc === null || doc === undefined || typeof doc.querySelector !== "function") return null;
-        let panel = null;
-        try { panel = doc.querySelector(RIGHTBAR_PANEL_SELECTOR); } catch { return null; }
+        // 与 existingSubagentPaneId 同源：只认当前 session 面板里的 data-dockkit-pane 标记。
+        // 面板解析不出来（读面缺失或归属不明确）时返回 null，split 提交证据继续 fail-closed，
+        // 绝不把别的 session 的 paneId 当成「目标资源已经落到本次 split 的 pane」的证据。
+        const panel = rightbarPanelForSessionCompat(doc, sidebarSessionId);
+        if (panel === null || panel === undefined) return null;
         const paneIds = paneIdsContainingTabs(panel, new Set([tabId]));
         return paneIds.size === 1 ? [...paneIds][0] : null;
       };
@@ -2679,8 +2719,11 @@
       const existingSubagentPaneId = () => {
         const doc = globalThis.document;
         if (!doc || typeof doc.querySelector !== "function") return null;
-        let panel;
-        try { panel = doc.querySelector(RIGHTBAR_PANEL_SELECTOR); } catch { return null; }
+        // 归属边界：pane 只能从**当前 session 自己的面板**里复用。同一次 install 里 DOM 可能同时
+        // 残留多个 session 的面板（React 重挂载窗口），querySelector 的首个命中无法证明归属；
+        // 解析不出来时保持 null，让打开流程决定是先 split 还是走旧宿主兼容分支——绝不把别的
+        // session 的 paneId 传给 openResource（那会让资源落到别人的右栏布局上）。
+        const panel = rightbarPanelForSessionCompat(doc, sidebarSessionId);
         if (panel === null || panel === undefined || typeof panel.querySelectorAll !== "function") return null;
         const expertPaneIds = expertGroupPaneIds(panel);
         // 没有任何证据证明哪个 pane 是 Expert Group 时，不能把最右 pane 猜成安全目标；
@@ -4400,12 +4443,40 @@
       rightbarWidthSurfaceSessionId = sessionId;
     };
     /**
-     * 首次从 Expert Group-only pane 创建子代理 pane 的全局事务。
-     * 同一可见右栏 surface 只能有一个事务，避免两个行尾箭头各自 split 出竞争 pane。
+     * 首次从 Expert Group-only pane 创建子代理 pane 的**按会话隔离**事务表：sessionId → 事务。
+     *
+     * 归属与并发边界：
+     * - busy 只对本会话成立：同一 session 的第二次 split 仍被防重入（绝不产生竞争 pane/重复 tab），
+     *   但别的 session 的在途事务不再阻塞本会话——用全局单例记这件事时，A 未收口的在途事务会让
+     *   切到 B 之后的行尾箭头直接拿到 busy（用户看到的是「点了没反应」）。
+     * - token / deadline / commit / cancel 全部按 token 反查**自己那一条**：迟到的 observer 回调、
+     *   deadline 回调或取消请求只能收口它自己的事务，既不结算也不回滚别的会话。
+     * - 会话切换、无可见 surface 与 dispose 只逐条取消表里的事务（各自清理自己的 transient 记账），
+     *   宿主那份全局宽度的归属仍由当前 surface 的同步链路决定，绝不由旧事务的迟到回调改写。
      */
-    let rightbarSplitTransaction = null;
+    const rightbarSplitTransactions = new Map();
+    /** 按 token 反查仍然在途的事务；已被 commit/cancel 收口的 token 一律返回 null（迟到回调的安全边界）。 */
+    const transactionOf = (token) => {
+      if (token === null || token === undefined) return null;
+      for (const transaction of rightbarSplitTransactions.values()) {
+        if (transaction.token === token) return transaction;
+      }
+      return null;
+    };
+    /** 从表里移除自己那一条（按 identity 比对，绝不误删同会话后来居上的新事务）。 */
+    const releaseSidebarSplitTransaction = (transaction) => {
+      if (rightbarSplitTransactions.get(transaction.sessionId) === transaction) {
+        rightbarSplitTransactions.delete(transaction.sessionId);
+      }
+    };
+    /** 逐条收口全部在途事务（无可见 surface / dispose）：每条只清理自己所属 session 的 transient 记账。 */
+    const cancelAllSidebarSplits = (reason) => {
+      for (const transaction of [...rightbarSplitTransactions.values()]) {
+        try { cancelSidebarSplit(transaction.token, { reason }); } catch { /* 单条收口失败不能阻断其余事务与 disposer。 */ }
+      }
+    };
     /** 分栏事务自己的 deadline 句柄，不能借用 panel 的 opening 记录或 observer 生命周期。 */
-    const clearSidebarSplitDeadline = (transaction = rightbarSplitTransaction) => {
+    const clearSidebarSplitDeadline = (transaction) => {
       if (transaction === null || transaction === undefined) return;
       const timer = transaction.deadlineTimer;
       transaction.deadlineTimer = null;
@@ -4798,14 +4869,27 @@
      * - 已知是 Expert Group 的 tabId（含 DockKit 生成的 kind+计数器形态）永远不是「其它页」。
      * 只有「明确属于当前会话、且 kind 不是 Expert Group」的节点才返回 "other"。
      *
+     * 面板归属同样按 session 精确解析（rightbarPanelForSession）：DOM 里可能同时残留多个 session
+     * 的面板（React 重挂载窗口），querySelector 的首个命中不能证明归属，读它的 tab 节点就会把别的
+     * 会话的页算成本会话的组成。零个/多个匹配、或现代宿主里当前面板缺归属标记都返回 null
+     * （＝这一面在本轮读不到），绝不退回全局第一个面板。
+     *
      * sessionId 省略（传 null）时不做任何归属判定：调用方只用来探测 DOM 读面本身是否可用
-     * （见 compositionReadFacesUnavailable），因此这里只会返回非 null 的保守结论。
+     * （见 compositionReadFacesUnavailable），因此这里保留旧的兼容读法（querySelector 的命中），
+     * 只回答「DOM 读面在不在」，它的返回值也不会被当成任何会话的组成证据。
      */
     const readRightbarDomComposition = (sessionId = null) => {
       const doc = globalThis.document;
       if (!doc || typeof doc.querySelector !== "function") return null;
       let panel = null;
-      try { panel = doc.querySelector(RIGHTBAR_PANEL_SELECTOR); } catch { return null; }
+      if (typeof sessionId === "string" && sessionId !== "") {
+        // 实际 session 判定：只读这个会话自己的面板。
+        panel = rightbarPanelForSession(doc, sessionId);
+        if (panel === null) return null;
+      } else {
+        // 探测读面能力（无归属判定）。
+        try { panel = doc.querySelector(RIGHTBAR_PANEL_SELECTOR); } catch { return null; }
+      }
       if (panel === null || panel === undefined || typeof panel.querySelectorAll !== "function") return null;
       let nodes;
       try { nodes = Array.from(panel.querySelectorAll(RIGHTBAR_TAB_SELECTOR)); } catch { return null; }
@@ -5206,7 +5290,8 @@
       // mode / prepared / active 全部按 sessionId 读取：root-a 的 other / split-pending 绝不是
       // root-b 的现状，不能阻止 root-b 的首次预置。
       const otherPagePresent = hasOtherRightbarPage(current);
-      const splitPending = rightbarSplitTransaction !== null && rightbarSplitTransaction.sessionId === current;
+      // 只按**本会话**自己的在途事务判定：别的 session 的 split-pending 与 root-b 的首次预置无关。
+      const splitPending = rightbarSplitTransactions.has(current);
       const expertPageCanOwnWidth = splitPending !== true
         && widthModeOf(current) !== "other" && otherPagePresent !== true;
       const widthSurfaceChanged = rightbarWidthSurfaceSessionId !== current;
@@ -5300,9 +5385,9 @@
       try { requestSplitTrackSync(); } catch { /* 配比只是布局微调，绝不影响宽度与手柄的判定。 */ }
       const current = currentSurfaceSessionId();
       if (current === null) {
-        if (rightbarSplitTransaction !== null) {
-          try { cancelSidebarSplit(rightbarSplitTransaction.token, { reason: "session-missing" }); } catch { /* 统一回滚失败由后续同步重试。 */ }
-        }
+        // 没有任何可见 surface：所有在途事务都不可能再提交，逐条收口（每条只清理自己所属会话的
+        // transient 记账）；统一回滚失败由后续同步重试。
+        cancelAllSidebarSplits("session-missing");
         // 没有可见 surface：归属会话的 transient 记账一并失效（它描述的是「宿主那份宽度属于
         // 该会话」时的状态，不能留给下一个会话当现状）。per-session 的目标值不受影响，该会话
         // 下次被激活时会按自己的目标重估。
@@ -5310,16 +5395,19 @@
         rightbarDragLock.setLocked(false);
         return;
       }
-      if (rightbarSplitTransaction !== null) {
-        if (rightbarSplitTransaction.sessionId === current) {
-          // split → openTabs/DOM 提交期间保持 50% 且不锁手柄；guide-only 不足以结算。
-          rightbarDragLock.setLocked(false);
-          return;
-        }
-        // 可见 surface 已切到**另一会话**：只收口旧事务本身（deadline + 它自己的 transient 记账），
-        // 绝不回滚宽度、绝不改写当前会话的 active/prepared/mode，也不按旧会话去锁手柄——宿主那份
-        // 全局宽度交给下面这轮针对 current 的同步自行判定 20%/50%。
-        try { cancelSidebarSplit(rightbarSplitTransaction.token, { reason: "session-switched" }); } catch { /* 后续同步仍会重估。 */ }
+      // 可见 surface 已切到**另一会话**：别会话的在途事务（可能有多个）已经不可能由用户继续完成，
+      // 只收口它们本身（deadline + 各自的 transient 记账）——绝不回滚宽度、绝不改写当前会话的
+      // active/prepared/mode，也不按旧会话去锁手柄；宿主那份全局宽度交给下面这轮针对 current 的
+      // 同步自行判定 20%/50%。本会话自己的事务不进这个循环，因此不会被别的会话的同步收口。
+      for (const [sessionId, transaction] of [...rightbarSplitTransactions]) {
+        if (sessionId === current) continue;
+        try { cancelSidebarSplit(transaction.token, { reason: "session-switched" }); } catch { /* 后续同步仍会重估。 */ }
+      }
+      if (rightbarSplitTransactions.has(current)) {
+        // split → openTabs/DOM 提交期间保持 50% 且不锁手柄；guide-only 不足以结算。
+        // 只对本会话成立：别的会话的在途事务不阻塞本会话的宽度/手柄判定。
+        rightbarDragLock.setLocked(false);
+        return;
       }
       const activeEvidence = activeTabEvidenceOf(current);
       let evidence = rightbarCompositionEvidenceOf(current, activeEvidence);
@@ -5449,10 +5537,13 @@
      * 事务本身（paneId 回执、preferNewPane:false、提交证据、deadline、取消回滚）逐字不变。
      */
     const beginSidebarSplit = (details) => {
-      if (disposed || rightbarSplitTransaction !== null) return { busy: true };
+      if (disposed) return { busy: true };
       const input = details !== null && typeof details === "object" ? details : {};
       const sessionId = text(input.sessionId, null);
       if (sessionId === null || currentSurfaceSessionId() !== sessionId) return null;
+      // 防重入只针对**同一个 session**：本会话已有在途事务时拒绝第二次 split，绝不产生竞争 pane；
+      // 别的 session 的在途事务与本次请求无关，不得把点击挡成 busy（一个卡住的会话不再冻结全部会话）。
+      if (rightbarSplitTransactions.has(sessionId)) return { busy: true };
       // split 只允许从已确认的 Expert Group-only composition 开始。active() 缺失、当前
       // 已是其它页或 openTabs/DOM 给出其它 pane 证据时都 fail-closed，避免把新 pane
       // 叠到一个已经可调的用户布局上；唯一例外是上面那个窄口径的 active-only 兼容分支。
@@ -5464,7 +5555,7 @@
       const prepared = applyRightbarWidth(sessionId, OTHER_RIGHTBAR_WIDTH_RATIO, true);
       if (prepared !== true) return null;
       const token = {};
-      rightbarSplitTransaction = {
+      const transaction = {
         token,
         sessionId,
         rootSessionId: text(input.rootSessionId, null),
@@ -5478,12 +5569,16 @@
         previousActive: isWidthActive(sessionId),
         deadlineTimer: null,
       };
+      // 先入表再写宽度：deadline / commit / cancel 都按这张表反查，表里没有的事务一律不再被结算。
+      rightbarSplitTransactions.set(sessionId, transaction);
       // 归属已由写入路径接管（applyRightbarWidth → claimRightbarWidthOwnership）。
       clearRightbarWidthMarks(sessionId);
       setWidthMode(sessionId, "split-pending");
       try { rightbarDragLock.setLocked(false); } catch { /* 临时解锁失败不阻断公开 split；同步会继续收口。 */ }
       try {
-        rightbarSplitTransaction.deadlineTimer = globalThis.setTimeout(() => {
+        transaction.deadlineTimer = globalThis.setTimeout(() => {
+          // 迟到的 deadline 只收口**仍然在途的自己那一条**：已被 commit/cancel 收口的 token 查不到
+          // 事务，什么都不做，绝不误伤同会话后来居上的新事务或别的会话。
           if (transactionOf(token) !== null) {
             try { cancelSidebarSplit(token, { reason: "deadline" }); } catch { /* deadline 仍须保持有界。 */ }
           }
@@ -5495,12 +5590,6 @@
       }
       return { token };
     };
-
-    const transactionOf = (token) => (
-      rightbarSplitTransaction !== null && rightbarSplitTransaction.token === token
-        ? rightbarSplitTransaction
-        : null
-    );
 
     const markSidebarSplitPane = (token, paneId) => {
       const transaction = transactionOf(token);
@@ -5525,7 +5614,17 @@
         || text(observed.paneId, null) !== transaction.paneId
         || text(observed.tabId, null) === null) return false;
       clearSidebarSplitDeadline(transaction);
-      rightbarSplitTransaction = null;
+      releaseSidebarSplitTransaction(transaction);
+      // 迟到提交边界：只有事务所属会话**仍是当前可见 surface** 时，才允许把宿主那份全局宽度
+      // 的归属迁移到它名下。用户已经切到别的会话时只收口本事务自己的 transient 记账——
+      // 绝不动当前会话的宽度归属、模式、手柄，否则一个后台面板的迟到 observer 回调就会
+      // 把用户眼前的会话改回旧会话的布局。
+      let current = null;
+      try { current = currentSurfaceSessionId(); } catch { current = null; }
+      if (current !== transaction.sessionId) {
+        clearRightbarWidthMarks(transaction.sessionId);
+        return true;
+      }
       // 提交后宿主那份宽度归本会话的 other 组成所有（本轮没有写宽度，因此显式接管归属）。
       claimRightbarWidthOwnership(transaction.sessionId);
       clearRightbarWidthMarks(transaction.sessionId);
@@ -5538,7 +5637,8 @@
       const transaction = transactionOf(token);
       if (transaction === null) return false;
       clearSidebarSplitDeadline(transaction);
-      rightbarSplitTransaction = null;
+      // 只移除自己那一条：同会话后来居上的新事务、以及别的会话的在途事务都不受影响。
+      releaseSidebarSplitTransaction(transaction);
       const current = currentSurfaceSessionId();
       if (current !== transaction.sessionId) {
         if (current === null) {
@@ -5687,10 +5787,8 @@
       if (disposed) return;
       // 先置位再取消事务：cancel/observer 可能同步重入同步入口，必须让它们看到已销毁状态。
       disposed = true;
-      if (rightbarSplitTransaction !== null) {
-        const pendingToken = rightbarSplitTransaction.token;
-        try { cancelSidebarSplit(pendingToken, { reason: "dispose" }); } catch { /* 事务收口失败不能阻断其余 disposer。 */ }
-      }
+      // 逐条收口：每条事务只清理自己所属会话的 transient 记账与 deadline，互不干扰。
+      cancelAllSidebarSplits("dispose");
       // 先清掉未执行的所有 deferred 任务（展开 + 补偿打开重试）：卸载后插件不得再碰宿主
       // layout，也不留下泄漏的 timer。
       cancelAllRightbarExpands();
