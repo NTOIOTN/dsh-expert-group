@@ -2,10 +2,11 @@
 
 > settings 命名空间 `dsh-expert-group` 保存全局 provider、`defaults` 和通知偏好；会话覆盖与子代理快照属于插件自己的 `dsh_expert_group` storage domain。
 
-一个可安装到 DSH（DeepSeek Harness）的外部 **dual-face Cordis bundle**，借鉴
-上游开源多代理专家项目的设计思路，
+一个可安装到 DSH（DeepSeek Harness）的外部 **dual-face Cordis bundle**，其专家分工、
+按角色路由模型与思考深度、后台并行委派纪律等设计思路借鉴自开源项目 **oh-my-opencode-slim**
+（https://github.com/alvinunreal/oh-my-opencode-slim ，MIT），
 把「按角色区分模型与思考深度」的专家子代理能力引入 DSH，并在 Web 界面的“dsh-expert-group”设置页维护全局模型、思考深度与通知偏好。
-同时移植上游的主代理 orchestrator：根会话负责拆解、委派、整合和验证，专家子代理保持叶子 worker 约束。
+同时把 oh-my-opencode-slim 的主代理 orchestrator 设计移植过来：根会话负责拆解、委派、整合和验证，专家子代理保持叶子 worker 约束。
 
 本包**不修改** `@deepseek-ai/dsh` 的任何核心源码，也不修改 shipped agent preset。能力全部通过
 现有 Host 服务与客户端 Slot 注册；**最低宿主契约**是下面这些声明在 `inject` 里的服务：
