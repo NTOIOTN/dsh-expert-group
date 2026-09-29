@@ -974,6 +974,72 @@ window.__ModuleLoader__.load({
     }
 
 
+    /** 文档中所有原生 conversation scope（含 root 自身）：多 scope 并存时的最小遍历单位。 */
+    function collectNativeConversationScopes(root) {
+      const scopes = [];
+      if (root?.matches?.("[data-conversation-scroll]")) scopes.push(root);
+      for (const scope of Array.from(root?.querySelectorAll?.("[data-conversation-scroll]") ?? [])) {
+        if (!scopes.includes(scope)) scopes.push(scope);
+      }
+      return scopes;
+    }
+
+    /**
+     * 一个 scope 的会话身份：scope 自身与 RC1 content 外层的全部会话属性必须一致地指向
+     * 同一个会话；缺失（0 个值）或冲突（多个不同值）都不提供身份。
+     *
+     * 这是多 scope（主视图 + 右侧 sidebar.chat）并存的归属依据：每个 scope 自己证明自己
+     * 属于哪个会话，插件不需要、也不允许再依赖"单个主视图会话"去猜侧栏目标。
+     */
+    function nativeScopeSessionId(scope) {
+      const values = new Set(nativeStatusScopeIds(scope));
+      if (values.size !== 1) return void 0;
+      for (const value of values) return value;
+      return void 0;
+    }
+
+    /** legacy 状态节点（没有 conversation scope）的会话身份：同样要求祖先链上唯一。 */
+    function nativeStatusNodeSessionId(node) {
+      const values = new Set(nativeStatusSessionValues(node, void 0));
+      if (values.size !== 1) return void 0;
+      for (const value of values) return value;
+      return void 0;
+    }
+
+    /**
+     * 收集当前文档里所有"身份可验证"的原生状态目标所属的会话 id（每个会话 id 对应一条
+     * 独立 lane）。判定规则与写入规则同源，因此 lane 候选本身就 fail-closed：
+     * - 有 conversation scope 时逐个 scope 取唯一会话身份；缺失/冲突的 scope 不产生 lane；
+     * - 没有 scope（legacy 形态）时按状态节点自身的唯一会话属性归并；冲突节点被忽略。
+     * 真实会话是否存在、是否 running、身份是什么，仍由调用方按 session snapshot 与 RPC 决定。
+     */
+    function collectNativeStatusSessionIds(root) {
+      const ids = new Set();
+      const scopes = collectNativeConversationScopes(root);
+      if (scopes.length > 0) {
+        for (const scope of scopes) {
+          const sessionId = nativeScopeSessionId(scope);
+          if (sessionId !== void 0) ids.add(sessionId);
+        }
+        return ids;
+      }
+      const statuses = [];
+      if (root?.matches?.('[role="status"]')) statuses.push(root);
+      for (const status of Array.from(root?.querySelectorAll?.('[role="status"]') ?? [])) {
+        if (!statuses.includes(status)) statuses.push(status);
+      }
+      for (const status of statuses) {
+        if (status?.getAttribute?.("aria-live") !== "polite") continue;
+        const sessionId = nativeStatusNodeSessionId(status);
+        if (sessionId !== void 0) ids.add(sessionId);
+      }
+      for (const button of Array.from(root?.querySelectorAll?.("button[data-turn-process]") ?? [])) {
+        const sessionId = nativeStatusNodeSessionId(button);
+        if (sessionId !== void 0) ids.add(sessionId);
+      }
+      return ids;
+    }
+
     /**
      * 解析当前会话的原生运行状态**全字段**目标（纯 DOM 选择，不写入；与 shared.js 同名实现同步）：
      * - RC1：返回 { visibleText, shimmerAttributes, announcements } 三项完整字段；
@@ -985,11 +1051,7 @@ window.__ModuleLoader__.load({
      * 任何冲突、歧义或缺少证据的情况都返回 undefined，让调用方保持宿主原文。
      */
     function resolveNativeStatusTargets(root, sessionId) {
-      const scopes = [];
-      if (root?.matches?.("[data-conversation-scroll]")) scopes.push(root);
-      for (const scope of Array.from(root?.querySelectorAll?.("[data-conversation-scroll]") ?? [])) {
-        if (!scopes.includes(scope)) scopes.push(scope);
-      }
+      const scopes = collectNativeConversationScopes(root);
 
       if (scopes.length === 0) {
         const textNode = findNativeTurnStatusTextNode(root, sessionId, true);
@@ -1818,8 +1880,17 @@ window.__ModuleLoader__.load({
     /**
      * 安装 DSH 宿主原生运行状态桥。插件只观察并替换宿主已经渲染的主文本节点，
      * 不创建自己的状态行，不写入 class/style/aria，也不触碰宿主的鲸鱼动画和计时器。
-     * session list 负责当前会话与 running 快照，RPC 负责 root/child 身份确认；两者
-     * 都不可用时按 fail-closed 处理，保留 DSH 原生文案。
+     *
+     * 多 scope 语义：主视图与右侧 sidebar.chat 会同时渲染同构的 conversation scope，
+     * 各自绑定自己的 session。因此桥不再只挑"一个当前会话"，而是为文档中每个身份可验证的
+     * 原生状态目标建立一条独立 lane（按 sessionId 归并）：
+     * - lane 归属来自 scope 自己的会话证据（scope 自身 + [data-conversation-content] 外层），
+     *   缺失证据、属性冲突或多个 scope 争抢同一会话时由解析器 fail-closed；
+     * - 每条 lane 用自己的 session 快照（running / 插件 marker）与自己的 RPC 身份
+     *   （kind / role）决定文案，异步请求带 per-lane serial + AbortController：
+     *   旧响应、被取消的响应和其他会话的响应都不能写进本 lane；
+     * - 会话离开快照、停止运行或插件卸载时，只恢复该 lane 覆盖过的字段，
+     *   其他 lane（例如仍在运行的主视图）保持自己的角色文案。
      */
     function installNativeStatusBridge(ctx) {
       const doc = typeof document !== "undefined" ? document : null;
@@ -1829,82 +1900,105 @@ window.__ModuleLoader__.load({
 
       let disposed = false;
       let sessionList = {};
-      let currentSessionId;
-      let sessionEntry;
-      let childSession = false;
-      let markedRole;
-      let identityKey = null;
-      let rpcRoleState = { sessionId: void 0, kind: "pending", role: void 0 };
-      let requestSerial = 0;
-      let controller = null;
       let observer = null;
+      /** sessionId -> lane：每个会话拥有自己的重写器、身份缓存与在途请求。 */
+      const lanes = new Map();
 
-      // RC1 行有三个独立字段（可见 Text、data-shimmer-text、隐藏 announcement），
-      // legacy 形态只有一个可见 Text；同一个行级重写器覆盖两种形态。
-      const rewriter = createNativeStatusRowRewriter({
-        resolveTargets: () => resolveNativeStatusTargets(root, currentSessionId),
+      /**
+       * 建立一条会话 lane。lane 只改写自己会话的目标：row rewriter 决定"改哪几个字段"，
+       * lane 决定"这个会话现在是什么身份、该显示什么文案"。
+       */
+      const createLane = (sessionId) => ({
+        sessionId,
+        rewriter: createNativeStatusRowRewriter({
+          resolveTargets: () => resolveNativeStatusTargets(root, sessionId),
+        }),
+        identityKey: null,
+        rpcState: { sessionId: void 0, kind: "pending", role: void 0 },
+        requestSerial: 0,
+        controller: null,
       });
-      const render = () => {
+
+      /** 快照里该会话的最新条目：异步响应回来时要看最新 running，而不是发起请求时的快照。 */
+      const currentEntryOf = (sessionId) => sessionEntryOf(sessionList, sessionId);
+
+      /**
+       * 用本 lane 自己的快照与 RPC 身份决定文案。身份态只在 rpcState.sessionId 等于本 lane
+       * 会话时生效，因此任何跨会话残留都退化成 pending（fail-closed），不会借用别人的角色。
+       */
+      const renderLane = (lane, entry) => {
         if (disposed) return;
         const statusText = resolveRunningStatusText({
-          sessionId: currentSessionId,
-          currentSessionId,
-          running: sessionEntry?.running,
-          session: sessionEntry,
-          kind: rpcRoleState.sessionId === currentSessionId ? rpcRoleState.kind : "pending",
-          role: rpcRoleState.sessionId === currentSessionId ? rpcRoleState.role : void 0,
+          sessionId: lane.sessionId,
+          currentSessionId: lane.sessionId,
+          running: entry?.running,
+          session: entry,
+          kind: lane.rpcState.sessionId === lane.sessionId ? lane.rpcState.kind : "pending",
+          role: lane.rpcState.sessionId === lane.sessionId ? lane.rpcState.role : void 0,
         });
-        rewriter.apply(statusText);
+        lane.rewriter.apply(statusText);
       };
 
-      const refreshIdentity = () => {
-        const nextKey = [currentSessionId ?? "", childSession ? "child" : "root", markedRole ?? ""].join("\u0000");
-        if (nextKey === identityKey) {
-          render();
+      /**
+       * 同步一条 lane 的身份并立即渲染一次。身份键必须同时包含**运行状态**：
+       * - 空闲时挂载的 lane 没有发过身份查询，会话真正开始生成时必须走一次转换去查询，
+       *   否则会一直停留在"没有身份"的 pending 分支，永远保留宿主原文；
+       * - 运行 → 停止也必须走同一条转换路径：中止在途请求并按 serial 让迟到响应失效，
+       *   随后同一会话重新运行时可以再次查询（不复用停止前的缓存或在途状态）。
+       * 只有身份形状与运行状态都没变时才提前返回，避免重复请求（例如宿主重渲染）。
+       */
+      const refreshLane = (lane, entry) => {
+        const markedRole = normalizeStatusRole(entry?.[STATUS_ROLE_MARKER] ?? entry?.metadata?.[STATUS_ROLE_MARKER]);
+        const childSession = isPluginChildSession(entry);
+        const nextKey = [lane.sessionId, childSession ? "child" : "root", markedRole ?? "", entry?.running === true ? "running" : "idle"].join("\u0000");
+        if (nextKey === lane.identityKey) {
+          renderLane(lane, entry);
           return;
         }
-        identityKey = nextKey;
-        requestSerial += 1;
-        controller?.abort();
-        controller = null;
-        rpcRoleState = {
-          sessionId: currentSessionId,
-          kind: markedRole !== void 0 ? "child" : "pending",
-          role: markedRole,
-        };
-        render();
-        if (typeof currentSessionId !== "string" || currentSessionId.length === 0) return;
-        const requestSessionId = currentSessionId;
-        const requestToken = requestSerial;
-        controller = typeof AbortController === "function" ? new AbortController() : null;
+        lane.identityKey = nextKey;
+        lane.requestSerial += 1;
+        lane.controller?.abort();
+        lane.controller = null;
+        lane.rpcState = { sessionId: lane.sessionId, kind: markedRole !== void 0 ? "child" : "pending", role: markedRole };
+        renderLane(lane, entry);
+        // 非运行态不需要身份确认：不为后台/已停止会话发无谓请求。
+        if (entry?.running !== true) return;
+        const requestToken = lane.requestSerial;
+        lane.controller = typeof AbortController === "function" ? new AbortController() : null;
         (async () => {
           try {
             const response = await requestPluginRpc(ctx.connection, {
-              action: "get", sessionId: requestSessionId, childHint: childSession,
-            }, controller === null ? {} : { signal: controller.signal });
-            if (disposed || requestToken !== requestSerial) return;
+              action: "get", sessionId: lane.sessionId, childHint: childSession,
+            }, lane.controller === null ? {} : { signal: lane.controller.signal });
+            // stale / 跨会话守卫：serial、lane 归属或插件生命周期任一变化都不得写 DOM。
+            if (disposed || requestToken !== lane.requestSerial || lanes.get(lane.sessionId) !== lane) return;
             if (!response?.ok) {
-              rpcRoleState = { sessionId: requestSessionId, kind: markedRole !== void 0 ? "child" : "unknown", role: markedRole };
-              render();
+              lane.rpcState = { sessionId: lane.sessionId, kind: markedRole !== void 0 ? "child" : "unknown", role: markedRole };
+              renderLane(lane, currentEntryOf(lane.sessionId));
               return;
             }
             const json = await response.json();
-            if (disposed || requestToken !== requestSerial) return;
-            const identity = resolveStatusIdentity({ sessionId: requestSessionId, responseSessionId: requestSessionId, response: json });
+            if (disposed || requestToken !== lane.requestSerial || lanes.get(lane.sessionId) !== lane) return;
+            const identity = resolveStatusIdentity({ sessionId: lane.sessionId, responseSessionId: lane.sessionId, response: json });
             if (identity === null) return;
             const markerFallbackKind = markedRole !== void 0 && identity.kind === "unknown" ? "child" : identity.kind;
-            rpcRoleState = {
-              sessionId: requestSessionId,
-              kind: markerFallbackKind,
-              role: identity.role ?? markedRole,
-            };
-            render();
+            lane.rpcState = { sessionId: lane.sessionId, kind: markerFallbackKind, role: identity.role ?? markedRole };
+            renderLane(lane, currentEntryOf(lane.sessionId));
           } catch (error) {
-            if (disposed || requestToken !== requestSerial || error?.name === "AbortError") return;
-            rpcRoleState = { sessionId: requestSessionId, kind: markedRole !== void 0 ? "child" : "unknown", role: markedRole };
-            render();
+            if (disposed || requestToken !== lane.requestSerial || lanes.get(lane.sessionId) !== lane || error?.name === "AbortError") return;
+            lane.rpcState = { sessionId: lane.sessionId, kind: markedRole !== void 0 ? "child" : "unknown", role: markedRole };
+            renderLane(lane, currentEntryOf(lane.sessionId));
           }
         })();
+      };
+
+      /** 丢弃一条 lane：取消在途请求并恢复它覆盖过的字段（只恢复插件确实写过的值）。 */
+      const dropLane = (lane) => {
+        lane.requestSerial += 1;
+        lane.controller?.abort();
+        lane.controller = null;
+        lane.rewriter.restore();
+        lanes.delete(lane.sessionId);
       };
 
       const sync = () => {
@@ -1914,11 +2008,25 @@ window.__ModuleLoader__.load({
         } catch {
           sessionList = {};
         }
-        currentSessionId = currentSessionIdOf(sessionList);
-        sessionEntry = sessionEntryOf(sessionList, currentSessionId);
-        childSession = isPluginChildSession(sessionEntry);
-        markedRole = normalizeStatusRole(sessionEntry?.[STATUS_ROLE_MARKER] ?? sessionEntry?.metadata?.[STATUS_ROLE_MARKER]);
-        refreshIdentity();
+        // DOM 决定候选会话：每个有唯一会话证据的 scope/状态行对应自己的 lane，
+        // 因此主视图与侧栏各自绑定自己的 session，不再依赖"当前主视图会话"。
+        const candidates = collectNativeStatusSessionIds(root);
+        const candidateIds = new Set(candidates);
+        for (const sessionId of candidates) {
+          const entry = currentEntryOf(sessionId);
+          // 快照里没有这个会话（例如其他会话的历史 DOM）时不建立 lane，保持宿主原文。
+          if (entry === void 0) continue;
+          const lane = lanes.get(sessionId) ?? createLane(sessionId);
+          lanes.set(sessionId, lane);
+          refreshLane(lane, entry);
+        }
+        // 会话从快照移除，或其 DOM scope 整体卸载时，都释放 lane 与旧节点引用；
+        // scope 重建后会建立新 lane 并重新确认身份，避免 detached DOM 被长期保留。
+        for (const lane of [...lanes.values()]) {
+          if (currentEntryOf(lane.sessionId) === void 0 || !candidateIds.has(lane.sessionId)) {
+            dropLane(lane);
+          }
+        }
       };
 
       let unsubscribe = () => {};
@@ -1934,7 +2042,9 @@ window.__ModuleLoader__.load({
         ?? (typeof globalThis !== "undefined" ? globalThis.MutationObserver : void 0);
       if (typeof Observer === "function") {
         try {
-          observer = new Observer(() => render());
+          // DOM 变化同样走完整 sync：宿主可能先建行、后建 scope，只重渲染会漏掉刚出现的
+          // lane；同一身份不会重复发 RPC（identityKey 未变时只做一次幂等渲染）。
+          observer = new Observer(() => sync());
           observer.observe(root, { childList: true, subtree: true, characterData: true });
         } catch {
           observer = null;
@@ -1943,13 +2053,11 @@ window.__ModuleLoader__.load({
       return () => {
         if (disposed) return;
         disposed = true;
-        requestSerial += 1;
-        controller?.abort();
-        controller = null;
         try { unsubscribe(); } catch {}
         try { observer?.disconnect(); } catch {}
         observer = null;
-        rewriter.restore();
+        // 卸载必须让每条 lane 都恢复宿主原文，并取消全部在途身份请求。
+        for (const lane of [...lanes.values()]) dropLane(lane);
       };
     }
 
