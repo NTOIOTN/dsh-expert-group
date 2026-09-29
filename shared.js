@@ -20,7 +20,7 @@ export const ROLES = listRoles().filter((role) => role.optional !== true).map((r
 export const OPTIONAL_ROLES = listOptionalRoles().map((role) => role.id);
 
 /**
- * 注意：v0.2.4 起不再内置任何角色默认模型——新安装后所有角色为空，
+ * 注意：插件不再内置任何角色默认模型——新安装后所有角色为空，
  * 由用户在侧边栏从「设置 → 模型」已配置的模型中自行选择，并通过
  * 「保存」（全局持久）或「应用」（仅当前会话）提交。
  */

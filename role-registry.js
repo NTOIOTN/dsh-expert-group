@@ -5,7 +5,7 @@
  * - 记录覆盖角色 id、显示名（label）、职责（description）、可选性（optional）、
  *   只读性（readOnly）、默认配置（defaultSelection）与工具名（toolName）。
  * - 只读性必须显式声明：缺失或非法一律 fail-closed 抛错，绝不把未声明角色当可写。
- * - v0.2.4 起不内置角色模型默认值，defaultSelection 固定为 null；非 null 视为注册数据错误。
+ * - 不内置角色模型默认值，defaultSelection 固定为 null；非 null 视为注册数据错误。
  * - 返回的记录与数组全部冻结；调用方修改不会污染注册表内部状态。
  * - 本模块无任何 import，纯数据 + 纯函数，可被 Host、shared 与双面 bundle 复用。
  */
@@ -71,7 +71,7 @@ function normalizeRecord(input) {
   if (input.defaultSelection !== null) {
     throw new RoleRegistryError(
       "INVALID_ROLE_RECORD",
-      "角色记录 defaultSelection 必须为 null（v0.2.4 起不内置角色模型默认值）",
+      "角色记录 defaultSelection 必须为 null（插件不内置角色模型默认值）",
       { role: id, field: "defaultSelection" },
     );
   }

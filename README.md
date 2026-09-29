@@ -34,12 +34,26 @@ fail-closed，并标记为 `status: "incomplete"`；绝不伪造 paused ref 或�
   主代理不得把 Harness 外层 `subagent_<role>`、PTC 的 `run_code` 或通用 subagent 入口当作插件委派替代。
 - 每个专家委派始终是可继续（continuable）子代理：默认后台运行立即返回子代理 id；
   `run_in_background: false` 仅为兼容输入，与省略或 `true` 一样采用非阻塞 admission，不等待最终结果（异常/空返回仍按「自动恢复」处理）。
-- **无内置默认模型（v0.2.4 起）**：新安装后所有角色均为空，需在“dsh-expert-group”设置页从 DSH
+- **无内置默认模型**：新安装后所有角色均为空，需在“dsh-expert-group”设置页从 DSH
   已配置的模型中自行选择并保存；未配置模型的角色在调用时会给出明确提示。
 - 模型与思考深度通过 `llm.listProviders/listModels` + `resolveCallConfig` 校验，只接受设置中已添加的模型。
-- **动态 settings 保存能力**：插件不在模块加载期 import `@deepseek-ai/dsh-settings`，package 也不声明该 peer，因此默认安装不会额外下载 settings 包。目标运行时为 `0.2.0-rc.1`；插件通过宿主 settings 服务的 describe/update/mutate 面读写 profile 条目，并由 DEG 自有的 settings-commit 端点完成语义校验与 revision 冲突检测（0.1.7 起宿主不再提供 owner validate 钩子）。
+- **动态 settings 保存能力**：插件不在模块加载期 import `@deepseek-ai/dsh-settings`，package 也不声明该 peer，因此默认安装不会额外下载 settings 包。目标运行时为 `0.2.0-rc.1`；插件通过宿主 settings 服务的 describe/update/mutate 面读写 profile 条目，并由 DEG 自有的 settings-commit 端点完成语义校验与 revision 冲突检测（宿主不再提供 owner validate 钩子）。
 - 子代理的 `reasoningEffort` 通过子代理 `agent/request` waterfall 注入，绕开 `dsh-tool-subagent`
   `AgentOptions` 尚未公开该字段的限制。
+
+## 安装
+
+本插件发布到 npm 公共源，按包名安装：
+
+```powershell
+dsh plugin --profile web add dsh-expert-group
+```
+
+安装会把本包写入 `$DSH_HOME\profiles\web` 的依赖并加入 profile 的 bundle 层；**重启 DSH Web** 后生效（已运行的进程不会热加载新的 Host 行）。
+
+要求：DSH Web 可运行（`dsh web`）、Node.js ≥ 22、PATH 上有 `pnpm`。**本插件不内置任何角色默认模型**——安装后需先在「设置 → dsh-expert-group」为各角色选择模型并保存。
+
+**可选图像增强**：`sharp` 是 `optionalDependencies`（约 30 MB 原生二进制），用于把 JPEG / WebP / GIF 转码为 PNG；拉取失败或未安装都不影响插件加载，仅会拒绝非 PNG 图片的转码，其余功能全部正常。
 
 ## 界面总览
 
@@ -317,7 +331,6 @@ Expert Group 是 DEG 注册在右侧栏的任务视图：它把**当前会话所
 | `>>` | 在右侧栏**打开**这一行的子代理会话 | 琥珀（`state-warning-primary`，缺 token 时 `#f59e0b`） | `title` / `aria-label` 为 `在侧边栏打开 <任务名>`；具备 toggle 能力时 `aria-pressed=false`、`data-open=false` |
 | `<<` | **关闭**这一行已在右栏打开的会话 | 青色（`state-business-primary`，缺 token 时 `#22d3ee`） | `aria-label` 为 `在侧边栏关闭 <任务名>`；`aria-pressed=true`、`data-open=true` |
 
-![`>>` 未打开](docs/assets/sidebar/06-arrow-open-detail.png) ![`<<` 已打开](docs/assets/sidebar/07-arrow-close-detail.png)
 
 **`>>`（打开）**
 
@@ -339,217 +352,3 @@ Expert Group 是 DEG 注册在右侧栏的任务视图：它把**当前会话所
 - 首次形成两个 pane 后：Expert Group 占右栏 40%（视口约 20%），子代理 pane 占右栏 60%（视口约 30%）；最后一个被跟踪的 pane 关闭后恢复约 20% 的默认宽度。
 
 **能力缺失时的降级**：宿主没有 `sidebarRight.openResource` 时箭头不渲染、其余行内容完整；缺少关闭确认能力时保留静态 `>>`；整条侧栏接缝不可用时 DEG 只注册页面，不猜测打开状态。
-
-### 实现与边界（细节）
-
-- Expert Group 只展示当前会话所属根会话的任务树：主代理固定为根节点，普通专家按派发顺序展示，fan-out 分片按父任务聚合并去重。
-- 每个实际代理固定显示三行：任务名称；`Role · provider · model · reasoning effort`；`标题 · 可继续｜一次性 · 正在运行｜当前未运行` 状态摘要（根节点只保留标题与活动）。任务名称的完整派发 description 可悬停查看；缺失元数据使用稳定占位。
-- 点击任务名称或内容切换到对应 DSH 会话；点击 chevron 只控制折叠。空闲、ready、成功或取消默认折叠，运行、等待、失败、超时或中断默认展开；用户手动状态按根会话保存在 `sessionStorage`，后续状态变化不会覆盖。
-- 普通专家任务标题后的 `>>` 仅在 `sidebarRight.openResource` 可用时显示；宿主提供 `close`、左向箭头图标，并至少提供 `active()` 或公开 `openTabs` inventory 后，插件按当前 Session 与精确 `contentId` 确认 tabId，打开态显示青色 `<<`，关闭只使用已确认的 tab id。插件优先调用公开 `split()` 取得 paneId，再让子代理资源成为该 pane 的首个内容 tab；旧宿主没有 `split()` 时才退回 `preferNewPane: true`。首次确认打开的 pane 时右栏扩到约 50%；多个 pane 保持扩宽，首次形成两个 pane 后 Expert Group 占右栏 40%（视口约 20%），子代理占右栏 60%（视口约 30%），最后一个被跟踪 pane 关闭后恢复约 20% 默认宽度。active 暂时指向其它 tab 或 Expert Group surface 重挂载时，插件优先读取 `openTabs` 并订阅其提交通知，按当前任务树恢复已打开 tab，避免用户重复点击。宿主缺少上述确认能力时保留静态 `>>`。外部关闭通过宿主右栏的停靠/浮动渲染标记做最佳努力观察；这些 DOM 标记不是 `sidebarRight` service 的存在性公开契约，面板切换、焦点变化、DOM 能力缺失或过渡态不会被猜测为关闭。浮动层没有 tabId 时以 `subagentchat` body 和打开时标题做正向匹配，标题被宿主改写或与其他浮动 tab 重名时只能保守保持或复位。
-- fan-out 的取消与重试操作位于聚合分支内：重试直接执行，取消分片或整个父任务前需要确认；分片经历历史失败但最新一次尝试成功时按成功展示。
-- 未安装 `dsh-better-sidebar` 时，DEG 只注册 DSH 原生右侧栏页面，并为每个根会话首次自动打开；安装后只向 `ctx.betterSidebar` 注册独立 `expert-group` 页面。用户在 better-sidebar 中禁用该页后，DEG 不自动打开，也不回退注册重复的原生页面。
-- **任务管理开关**（设置页复选框，默认勾选）：控制 DEG 是否把 Expert Group 注册到侧边栏。关闭并保存后客户端会调用当前 install 返回的 disposer 释放已有注册，因此 `dsh` 原生侧栏与 `dsh-better-sidebar` 的默认侧栏保持不变；重新开启并保存后重新注册（旧 disposer 不可复用）。该开关不改动 better-sidebar 的 `tabsEnabled` 偏好，也不新增任何 DSH 本体注册；旧设置文档缺少该字段时按开启处理。
-
-## Web 状态提示
-
-- 插件复用 DSH 原生左下角运行状态行：当前根会话运行时将原生“深度求索中”替换为 `Orchestrator running`，专家子代理替换为对应角色的 `Explorer running` 等；前面的宿主动画、用时和其余文案保持不变，`running` 后不追加省略号，非运行或未知角色时保留原文。
-- 通知全部自动产生，没有模型可调用的通知工具：Host 在权威终态和已知的用户等待操作成立后直接调用 Windows 系统 Toast；通知不依赖 renderer 是否可见或聚焦，因此 DSH 在后台、其他应用在前台时仍由 Windows 在桌面右下角显示。客户端不创建浏览器 `Notification`，也不渲染应用内通知卡片；用户关闭通知开关时 Host 不发送。系统通知身份与失败边界见 docs/adr/0003-notification-coordination.md 与 docs/adr/0005-windows-system-notifications.md；这些提示不提供模型配置入口。
-
-## 宿主能力与运行时诊断
-
-插件用一份**只读**能力矩阵与运行时诊断回答"当前宿主到底支持什么、任务为什么排队/卡住"。
-它不写入任何状态、不触发任何注册、不新增第三方依赖，也不引入定时器或轮询。
-
-### 能力矩阵（capability matrix）
-
-| 能力 | 依赖类型 | 可用 | 降级 / 缺失时的行为 |
-| --- | --- | --- | --- |
-| `goals` | 可选兼容服务（`ctx.get`） | 有 `get`/`pause`/`resume` | 缺失或缺方法时只禁用 goal handoff，fail-closed，插件主体照常加载 |
-| `storageDomain` | 运行期硬依赖 | 绑定 ready | 未就绪时写入显式失败，不创建 domain 表 |
-| Connection RPC | 可选能力 | `transport: "handle"` | `route`（插件自持同名前缀路由，`status: "degraded"`）；无法建立通道时 `status: "fail-closed"`，legacy route 一并拒绝并返回 503 |
-| legacy RPC route | 兼容路径 | Connection 缺失时 | 行为与历史一致（`status: "legacy"`） |
-| `attachments` | 可选能力 | 已注入 | 缺失时只禁用图片规范化，文本能力保留 |
-| `sessionQuery` | 可选能力 | 已注入 | 缺失时只禁用冷会话精确读取 |
-| better-sidebar 页面 | 可选 UI 能力 | 存在 `openTab` | 缺失时只注册 DSH 原生右侧栏，**不回退成第二种注册**；禁用该页也不自动打开 |
-| 原生右侧栏 | 可选 UI 能力 | 公开 `openTab`（含会话作用域） | 只有旧 `openTabIn` 时标记 `degraded`（旧 openTabIn 兼容路径） |
-| 公开 `openTab` 接缝 | 可选 UI 能力 | better-sidebar 或原生右栏任一提供 | 两者都只有旧 `openTabIn` 时整条接缝标记 `degraded`；完全没有时 `absent`（不重复注册） |
-| `layout` 动作 | 可选 UI 能力 | `openRightbar` | 只有 `panels.setRightbar` 时标记 `degraded`；两者都缺失时只跳过右栏展开，页面仍可打开 |
-| Windows 系统通知 | 可选 Host 能力 | Windows Host + 固定路径下的 PowerShell 5.1 + DSH AUMID 可用 | Host 只启动 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`（SystemRoot 缺失、探测失败或文件不存在时给出固定 reason `powershell-unavailable` 并且**不 spawn**，绝不回退 PATH）执行固定的 WinRT Toast 脚本；AUMID 从**当前用户与所有用户**开始菜单里 TargetPath 与 `process.execPath` 匹配的 `.lnk` 读取（两个根聚合：单个根缺失/不可读只跳过它）。没有匹配的快捷方式/AUMID、系统策略禁用或进程失败时同样以固定 reason 结构化失败，不降级为应用内通知 |
-
-### 诊断入口
-
-1. **只读 RPC**：`POST { action: "meta" }` 的响应新增两个字段。
-   - `capabilities`：`{ version, host: { goals, connectionRpc, storageDomain, attachments, sessionQuery, ... } }`，
-     每项是 `{ required, status, degradation }`（Connection 额外带 `probe`/`transport`/`failure`）。
-     `status` 取值固定为 `available` / `degraded` / `absent` / `unknown`（客户端归一化后）。
-   - `diagnostics`：`{ version, generatedAt, children, fanout, recovery, settings, storage, lineage, handoff, notifications, rpc }`，
-     至少包含活动 child 数量、每角色有效并发上限与解析来源、fan-out 队列（排队/运行分片、进行中父任务）、
-     恢复重建与上下文数量、pending settings 写入与提交 guard 数量、storage generation、
-     goal handoff 记录数、`notifications`（`roots` / `hasAgentQuery` / `disposed`，以及同级的
-     `notifications.systemToast`：`status` / `version` / `platform` / `aumidResolved` / `aumidReason` /
-     `inflight` / `queued` / `sent` / `failed` / `dropped` / `lastReason`——全部是固定枚举与非负计数），
-     以及**最近 RPC 错误类别**（结构化 code + 次数 + 时间戳）。
-2. **只读诊断面**：通知诊断分两层——`notifications` 报告 Host 通知状态机（已登记根会话、是否有
-   agent 查询、是否已释放），同级的 `notifications.systemToast` 报告 Windows 系统 Toast 适配器的
-   可用性与计数：`status`（`available`/`absent`）、`version`、`platform`（`windows`/`unsupported`）、
-   `aumidResolved` 与 `aumidReason`（是否已从与 `process.execPath` 匹配的快捷方式派生出系统通知身份）、
-   `inflight`/`queued`/`sent`/`failed`/`dropped` 计数与 `lastReason`。
-   不再报告 renderer Notification 权限、页面内卡片计数或前台抑制计数。诊断面始终只读：
-   不主动发送 Toast、不请求权限、不把通知正文、命令行、AUMID 或任何路径写入日志与诊断——
-   `aumidReason`/`lastReason` 只可能是固定 token（`ok`、`unsupported`、`shortcut-read-failed`、
-   `no-matching-shortcut`、`shortcut-missing-aumid`、`powershell-unavailable`、`spawn-error`、
-   `process-exit`、`timeout`、`queue-full`、`disposed`），其余未知取值一律归一为 null；
-   设置页只渲染白名单内命名的行（例如"已登记通知根会话"），RPC 载荷里的其它字段不进入界面。
-
-### 敏感性边界
-
-诊断与能力矩阵**不含 prompt、原始请求体、token、Cookie、authorization 或任何完整路径**，
-也不含会话 / agent / child 标识与任务负载：只有固定状态枚举、非负整数计数、固定类别的
-结构化错误 code 和固定长度的降级标记。客户端渲染前还会按白名单二次过滤——宿主或中间层
-返回的额外字段（例如自由文本降级说明、非法角色名、越界计数）一律丢弃或归一，
-不会进入界面。RPC 错误类别最多保留 8 条，报告大小不随任务或历史增长。
-
-## 安装 / 升级
-
-> **dsh 桌面版（Electron 客户端）不适用本节。** 桌面版 profile 由应用独占管理，指向 `desktop` 的 `dsh` / `dsh plugin` 命令会被直接拒绝；桌面端的安装方式见 [桌面版安装说明.md](桌面版安装说明.md)。
-
-在 PowerShell 中执行（脚本会清理同名旧安装副本后完成安装）：
-
-```powershell
-& ".\install.ps1"
-```
-
-### 直接使用 `dsh plugin`
-
-新增插件使用 `add`，`install` 只用于恢复 profile 依赖，不是新增插件的入口。`--profile web` 必须显式指定：
-
-```powershell
-# 本地开发目录：以绝对路径安装，后续修改直接作用于该目录
-dsh plugin --profile web add "F:\path\to\dsh-expert-group"
-
-# 本地 tarball：推荐用于分发或在另一台电脑安装
-dsh plugin --profile web add "C:\path\to\dsh-expert-group-0.1.1.tgz"
-
-# 发布到 npm 后：按包名安装
-dsh plugin --profile web add dsh-expert-group
-```
-
-安装 bundle 后需要重启 DSH Web；可以用下面的命令确认 profile 已登记该 bundle：
-
-```powershell
-dsh --profile web --dump-config
-```
-
-**全局安装**：脚本会把本包复制到全局插件位置 `$DSH_HOME\profiles\packages\dsh-expert-group`
-（必须位于 `profiles` 目录树内，才能命中 `$DSH_HOME\profiles\node_modules` 的平坦依赖回退），
-再通过 `dsh plugin add` 链接安装。安装完成后与运行 `install.ps1` 的原始目录**完全解耦**——
-删除源码/工程目录不影响插件运行。
-
-**安装面 = `files` 白名单**：`install.ps1` 按 `package.json` 的 `files` 字段逐项复制，
-只安装运行时面（`index.js`、`host/`、客户端模块、`scripts/`、`bin/`、`README.md` 等）；
-测试目录、`test-support/`、`bench/`、开发草稿（`.scratch/`）与构建产物 tgz **不会**进入用户
-profiles。白名单为空、缺失或包含越界路径（绝对路径 / `..`）时安装脚本直接报错中止，
-绝不回退到整目录复制。卸载仍按整目录删除（安装副本是完整包目录，整删是正确逆操作，
-也能清掉旧版整目录复制可能遗留的开发面残留）。
-
-等价的手动步骤：
-
-```powershell
-# 1. 若已有安装副本，先移除
-dsh plugin --profile web remove dsh-expert-group
-# 2. 按 package.json 的 files 白名单把发布面复制到全局插件位置
-#    （install.ps1 -DryRun 可先查看完整复制清单，不产生任何写入）
-$files = (Get-Content ".\package.json" -Raw | ConvertFrom-Json).files + "package.json"
-New-Item "$env:DSH_HOME\profiles\packages\dsh-expert-group" -ItemType Directory -Force | Out-Null
-foreach ($item in $files) { Copy-Item ".\$item" "$env:DSH_HOME\profiles\packages\dsh-expert-group\" -Recurse -Force }
-# 3. 通过 dsh 的 pnpm 转发器安装并加入 bundle 层
-dsh plugin --profile web add "$env:DSH_HOME\profiles\packages\dsh-expert-group"
-```
-
-安装只会更新 `$DSH_HOME\profiles\web` 的 `package.json` 依赖并把本包加入 `dsh.profile.bundles`
-第三个 bundle 层；不改动任何内置 preset，也不修改 `@deepseek-ai/dsh` 安装目录。
-
-## 打包与分发（安装到其他电脑）
-
-```powershell
-# prepack 会自动生成唯一 classic client bundle，再生成 npm tarball
-npm pack --pack-destination .
-# 产出：dsh-expert-group-0.1.1.tgz（内容由 `package.json` 的 `files` 清单决定，可直接分发）
-```
-
-在目标电脑上二选一：
-
-```powershell
-# 方式 A（推荐，全局持久）：解压 tgz（tar -xzf dsh-expert-group-0.1.1.tgz）得到 package 目录，
-# 进入该目录运行 install.ps1 即可
-& ".\package\install.ps1"
-
-# 方式 B（快速）：直接把 tgz 交给 dsh 的 pnpm 转发器安装
-dsh plugin --profile web add "C:\path\to\dsh-expert-group-0.1.1.tgz"
-```
-
-目标电脑要求：已安装 DSH（web profile，`dsh web` 可运行）、Node ≥ 22、PowerShell；使用的 provider/model
-（`blankapi`/`deepseek-official` 等）需先在该机的“设置 → 模型”中配置，再到“dsh-expert-group”设置页为角色选择。
-
-## 验证与生效
-
-```powershell
-dsh --profile web --dump-config
-```
-
-确认输出包含 `id: dsh-expert-group` 的 Host 行。静态 bundle 的 Host 行与客户端清单都需要**重启 DSH Web**
-后生效（当前已运行的 `127.0.0.1:3080` 进程不会热加载新 Host 行）。重启后刷新页面：
-
-- 打开设置中的“dsh-expert-group”页面，选择 provider、各角色模型和思考深度，并保存通知偏好；
-- DSH 原生左下角状态行显示当前根会话或专家子代理的运行状态；
-- 未安装 better-sidebar 时，右侧栏自动打开 `expert group`；安装后在 better-sidebar 中显示并自动打开独立页面；
-- 新启动的专家子代理使用设置页中已保存的模型与思考深度。
-
-修改生效规则：Host 侧（`index.js`、`shared.js`、`cordis.patch.yml`、`package.json`）需要**重启 DSH Web**
-才会重新加载；客户端源文件（`client-expert-group-*.js`、`client-model-config.js` 与 `client.js`）必须先经 `npm run build` 生成
-`client-bundle.js`。重新安装副本后浏览器 Ctrl+F5 强刷即可加载新客户端 bundle，无需再次重启服务。
-
-## 卸载
-
-```powershell
-# 在任意 dsh-expert-group 包目录（或全局安装位置）运行
-& ".\uninstall.ps1"
-# 或手动：
-dsh plugin --profile web remove dsh-expert-group
-Remove-Item "$env:DSH_HOME\profiles\packages\dsh-expert-group" -Recurse -Force -ErrorAction SilentlyContinue
-```
-
-## 限制与注意
-
-- 覆盖只影响**之后新启动**的子代理；已存在的子代理不变。
-- **安全限制：专家模型 RPC 仅允许 loopback Web URL**（`127.0.0.1` / `localhost` / `[::1]`，且端口必须等于
-  当前 `webServer` 实际监听端口）。同源 RPC 严格校验 `Origin` 必须等于 `http(s)://Host`、仅接受 `POST` +
-  `application/json`、请求体上限 16KB，并拒绝非 loopback 主机头以阻止 DNS rebinding；它只读写插件自己的
-  `dsh-expert-group` settings 命名空间的 `defaults` 与 `dsh_expert_group` storage domain 的运行数据，不暴露密钥或完整 settings 文档。若把 DSH Web 暴露到非 loopback 地址，
-  专家模型 RPC 会返回 403，需改回 loopback 访问。
-- 视觉代理 observer 的裸 Config 默认关闭；当前安装 bundle 由 `cordis.patch.yml` 把 `enableObserver` 显式设为 `true`。启用后请确保所选 provider/model 支持图像输入；要改变安装 bundle 的默认值，修改该字段并重启。
-- 只读角色的 `toolFilter.deny` 默认拒绝 `write/edit/bash/pwsh` 及再委派工具；deny 列表会在子代理
-  启动时按「当前组合里实际可见的工具」动态过滤（Windows 上不存在的 `bash` 会被自动跳过），避免
-  `tools.restrict` 因未知工具名报错。如确需调整只读角色可用的工具，可修改 `shared.js` 中的
-  `READONLY_DENY`，修改后需要重启 DSH Web 生效。
-
-## Prompt Inspector 与分块 sidecar
-
-Prompt Inspector 是本地导出文件的展示/审计工具：它只读取 `session.jsonl`，不会修改 DSH 本体，也不会修改原始 `session.jsonl`，不会把长 prompt 写回单个超长 JSONL 行。完整主代理 system prompt 与所有子代理 persona 会按 UTF-8 安全分块保存。
-
-### CLI
-
-在插件目录或已安装的包目录运行：
-
-```powershell
-node bin/prompt-inspector.mjs <session.jsonl-or-directory> [--out <dir>] [--max-bytes <n>]
-```
-
-输入可以是一个 `session.jsonl` 或包含多个 `session.jsonl` 的目录（递归扫描）。未指定 `--out` 时，输入文件或目录均输出到同级的 `<输入名>.dsh-prompt-sidecar`，避免输出目录落入输入树。`--max-bytes` 默认 1800，必须不小于 prompt 中任一 UTF-8 code point；grapheme cluster 超过预算时按 code point 安全回退。命令成功只打印文件数、记录数、分块数、输出目录和校验状态，不打印完整 prompt；输入不存在、JSONL 损坏或输出不可写时返回非零退出码。
-
-### sidecar 目录
-
-- `manifest.json`：格式为 `dsh-prompt-sidecar-v1`，保存来源文件、session/agent tree、记录行号和非敏感模型诊断元数据，以及字符数、UTF-8 字节数、SHA-256、chunkCount 和相对 chunk 路径。
-- `records/<稳定 record id>/<六位序号>.txt`：每块是独立 UTF-8 文本文件，record id 为 hash，不使用未经校验的 label/path；默认块上限 1800 字节。
-
-`verifyPromptSidecar()` 可读取 manifest 并校验 chunk 顺序、连续 offset、UTF-8、长度和 SHA-256；修改 manifest 或 chunk 后校验失败。manifest 不保存 token、cookie、authorization、加密内容或完整 raw event。默认行为原样保存完整 prompt；本工具不提供静默裁剪或默认脱敏。
