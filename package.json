@@ -132,6 +132,10 @@
     "release": "node scripts/sync-dsh-version.mjs && pnpm run build && pnpm run test && pnpm run release-gate"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dimensionli95-ship-it/dsh-expert-group.git"
+  },
   "optionalDependencies": {
     "sharp": "^0.35.4"
   }
