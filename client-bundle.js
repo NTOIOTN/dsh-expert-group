@@ -9454,7 +9454,22 @@ window.__ModuleLoader__.load({
      * nativeStatusSessionBoundary 取；没有 scope marker 时扫描 root 并强制要求祖先会话证据。
      * 任何冲突、歧义或缺少证据的情况都返回 undefined，让调用方保持宿主原文。
      */
-    function resolveNativeStatusTargets(root, sessionId) {
+    function resolveNativeStatusScopeTargets(scope, sessionId) {
+      const requireSessionEvidence = nativeStatusScopeIds(scope).includes(String(sessionId));
+      const sessionBoundary = nativeStatusSessionBoundary(scope);
+      const parts = findNativeRunningRowParts(scope, sessionId, requireSessionEvidence, sessionBoundary);
+      if (parts !== void 0) {
+        return {
+          visibleText: parts.visibleText,
+          shimmerAttributes: parts.shimmerTextNodes,
+          announcements: parts.announcementTexts,
+        };
+      }
+      const textNode = findNativeTurnStatusTextNode(scope, sessionId, requireSessionEvidence, sessionBoundary);
+      return textNode === void 0 ? void 0 : { visibleText: textNode, shimmerAttributes: [], announcements: [] };
+    }
+
+    function resolveNativeStatusTargets(root, sessionId, includeSameSessionScopes = false) {
       const scopes = collectNativeConversationScopes(root);
 
       if (scopes.length === 0) {
@@ -9466,6 +9481,18 @@ window.__ModuleLoader__.load({
         ? []
         : scopes.filter((scope) => nativeStatusScopeIds(scope).includes(String(sessionId)));
       const tagged = scopes.filter((scope) => nativeStatusScopeIds(scope).length > 0);
+      if (includeSameSessionScopes && exact.length > 1) {
+        const resolved = exact
+          .filter((scope) => nativeScopeSessionId(scope) === String(sessionId))
+          .map((scope) => resolveNativeStatusScopeTargets(scope, sessionId))
+          .filter((targets) => targets !== void 0);
+        if (resolved.length === 0) return void 0;
+        return {
+          visibleTexts: resolved.map((targets) => targets.visibleText).filter((node) => node != null),
+          shimmerAttributes: resolved.flatMap((targets) => targets.shimmerAttributes),
+          announcements: resolved.flatMap((targets) => targets.announcements),
+        };
+      }
       let candidates = [];
       if (exact.length === 1) {
         candidates = exact;
@@ -9480,19 +9507,7 @@ window.__ModuleLoader__.load({
       }
       if (candidates.length !== 1) return void 0;
 
-      const scope = candidates[0];
-      const requireSessionEvidence = nativeStatusScopeIds(scope).includes(String(sessionId));
-      const sessionBoundary = nativeStatusSessionBoundary(scope);
-      const parts = findNativeRunningRowParts(scope, sessionId, requireSessionEvidence, sessionBoundary);
-      if (parts !== void 0) {
-        return {
-          visibleText: parts.visibleText,
-          shimmerAttributes: parts.shimmerTextNodes,
-          announcements: parts.announcementTexts,
-        };
-      }
-      const textNode = findNativeTurnStatusTextNode(scope, sessionId, requireSessionEvidence, sessionBoundary);
-      return textNode === void 0 ? void 0 : { visibleText: textNode, shimmerAttributes: [], announcements: [] };
+      return resolveNativeStatusScopeTargets(candidates[0], sessionId);
     }
 
     /**
@@ -9610,6 +9625,9 @@ window.__ModuleLoader__.load({
     function nativeStatusFieldDescriptors(targets) {
       const fields = [];
       if (targets?.visibleText != null) fields.push({ node: targets.visibleText, attribute: void 0 });
+      for (const node of targets?.visibleTexts ?? []) {
+        if (node != null) fields.push({ node, attribute: void 0 });
+      }
       for (const node of targets?.shimmerAttributes ?? []) {
         if (node != null) fields.push({ node, attribute: "data-shimmer-text" });
       }
@@ -10288,8 +10306,8 @@ window.__ModuleLoader__.load({
      * 多 scope 语义：主视图与右侧 sidebar.chat 会同时渲染同构的 conversation scope，
      * 各自绑定自己的 session。因此桥不再只挑"一个当前会话"，而是为文档中每个身份可验证的
      * 原生状态目标建立一条独立 lane（按 sessionId 归并）：
-     * - lane 归属来自 scope 自己的会话证据（scope 自身 + [data-conversation-content] 外层），
-     *   缺失证据、属性冲突或多个 scope 争抢同一会话时由解析器 fail-closed；
+     * - lane 归属来自 scope 自己的会话证据（scope 自身 + [data-conversation-content] 外层）；
+     *   多个 scope 若都唯一证明属于同一会话则共享 lane 并一起更新，缺失或冲突证据仍 fail-closed；
      * - 每条 lane 用自己的 session 快照（running / 插件 marker）与自己的 RPC 身份
      *   （kind / role）决定文案，异步请求带 per-lane serial + AbortController：
      *   旧响应、被取消的响应和其他会话的响应都不能写进本 lane；
@@ -10315,7 +10333,7 @@ window.__ModuleLoader__.load({
       const createLane = (sessionId) => ({
         sessionId,
         rewriter: createNativeStatusRowRewriter({
-          resolveTargets: () => resolveNativeStatusTargets(root, sessionId),
+          resolveTargets: () => resolveNativeStatusTargets(root, sessionId, true),
         }),
         identityKey: null,
         rpcState: { sessionId: void 0, kind: "pending", role: void 0 },
