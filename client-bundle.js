@@ -349,9 +349,12 @@
   }
 
   function defaultExpanded(node) {
-    // 根节点是任务树入口，始终保持可见；其余节点才按语义状态决定默认折叠。
+    // 根节点是任务树入口，默认展开；空闲分组也默认展示成员。
     if (isObject(node) && node.kind === "root") return true;
     if (isObject(node) && node.kind === "idle-group") return true;
+    // fan-out 始终默认展示子代理，不因完成或取消自动收起；
+    // 这里只改变缺省值，createExpansionStore 仍优先保留用户手动折叠的选择。
+    if (isObject(node) && node.kind === "fanout") return true;
     const status = normalizeStatus(isObject(node) ? (node.status ?? node.taskStatus) : undefined);
     return !DEFAULT_COLLAPSED_STATUSES.has(status);
   }
