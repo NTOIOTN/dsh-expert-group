@@ -23,40 +23,40 @@ export const ORCHESTRATOR_ROLES = Object.freeze(listRoles().map((entry) => entry
  */
 const ROLE_LANES = {
   explorer: [
-    "- Lane: fast, read-only codebase reconnaissance",
-    "- Capabilities: locate files, symbols, and patterns, then return compressed factual context",
-    "- Delegate when: the scope is broad or uncertain, or independent searches can run in parallel",
-    "- Do not delegate when: you already know the exact path and need its contents",
+    "- Lane: read-only codebase reconnaissance that returns verifiable facts",
+    "- Capabilities: find unknown entry points and collect symbols, callers, patterns, or tests across directories, then return file locations with each fact and separate facts from inferences",
+    "- Delegate when: locating facts takes repeated search you would otherwise perform yourself, or several searches can run in parallel; state the question and the scope to cover, not a complete solution",
+    "- Do not delegate when: the needed fact is a single lookup at a known location, or the exact contents are already in working context",
   ],
   librarian: [
-    "- Lane: read-only external documentation and library research",
-    "- Capabilities: verify current APIs, official examples, version-specific behavior, and upstream fixes",
-    "- Delegate when: a library API or current external fact materially affects the implementation",
-    "- Do not delegate when: the answer is stable, local, or already established in the conversation",
+    "- Lane: read-only external documentation and upstream evidence",
+    "- Capabilities: verify current APIs, version-specific behavior, official docs, and upstream fixes, then cite sources and versions",
+    "- Delegate when: an external fact material to the work is not established locally or in this conversation; give the open question and the decision it feeds, not the full design",
+    "- Do not delegate when: the answer is already established in the conversation or the fact is stable and local",
   ],
   oracle: [
     "- Lane: read-only architecture, risk, debugging strategy, and code review",
-    "- Capabilities: assess tradeoffs, persistent failures, security, scalability, and simplification opportunities",
-    "- Delegate when: the decision is high-risk or the root cause remains unclear after ordinary diagnosis",
-    "- Do not delegate when: the change is routine and the correct approach is already clear",
+    "- Capabilities: give architecture judgment, weigh tradeoffs, and assess security, scalability, and simplification",
+    "- Delegate when: the earliest architecture, high-risk, or difficult-debugging judgment can steer the work, on a user-asked code review, or after a large or high-risk implementation; the question need not be resolved first, and a user-requested review keeps this trigger even when the change itself looks routine",
+    "- Do not delegate when: a change is routine and the correct approach is already clear but none of the triggers above applies; a user-requested review or the other triggers above win over this routine exclusion",
   ],
   designer: [
     "- Lane: UI/UX and visual implementation",
-    "- Capabilities: own layout, hierarchy, spacing, responsive behavior, accessibility, and interaction quality",
-    "- Delegate when: users see the result and visual or interaction polish matters",
-    "- Do not delegate when: the work is headless logic with no visual decision",
+    "- Capabilities: own layout, interaction, hierarchy, spacing, responsive behavior, and accessibility quality",
+    "- Delegate when: layout, interaction, hierarchy, responsive behavior, or accessibility involves a design choice, or users see the result and visual polish matters; give the constraints, not the finished design",
+    "- Do not delegate when: the work is headless logic with no visual decision, or the task is a small copy or token change with an already-fixed design",
   ],
   fixer: [
-    "- Lane: bounded implementation and test completion",
-    "- Capabilities: execute a clear scoped change across files and report validation results",
-    "- Delegate when: implementation is non-trivial, multi-file, mechanical, or benefits from parallel ownership",
-    "- Do not delegate when: the action is one small, isolated, low-risk edit or requires unresolved design judgment",
+    "- Lane: implementation of an agreed approach and test completion",
+    "- Capabilities: implement, repeat mechanical edits, migrate, and complete tests from a decided direction, including one large single-file change, then report validation evidence",
+    "- Delegate when: an agreed approach is already fixed and the implementation labor is time-consuming, repeatable, or mechanical, including one large single-file change",
+    "- Do not delegate when: requirements, public behavior, or architecture constraints still need decisions, or the task needs root permission, user confirmation, or further delegation",
   ],
   observer: [
-    "- Lane: read-only image, screenshot, chart, diagram, and PDF analysis",
-    "- Capabilities: inspect visual files with read_image and return structured observations",
-    "- Delegate when: understanding visual content is required; always include the full workspace file path",
-    "- Do not delegate when: plain text inspection is sufficient",
+    "- Lane: read-only visual fact analysis for attached images",
+    "- Capabilities: analyze a Host-owned durable image attachment (screenshot, chart, or diagram) and return structured visual facts; PDF pages only when a legal image form already presents them",
+    "- Delegate when: the visual facts of a real durable image attachment are needed, only when the current image-routing policy permits; only a Host-created durable attachment is valid input and never accept a client-supplied path. Automatic image routing uses its fixed visual task without user text or the general task-context template",
+    "- Do not delegate when: plain text inspection is sufficient, or there is no real durable image attachment",
   ],
 };
 
@@ -65,6 +65,7 @@ const FANOUT_DESCRIPTION = [
   "- Generic same-role fan-out: submit one role with an ordered shards array.",
   "- Each shard is an independent child attempt with bounded per-role concurrency, wait-all aggregation, cancellation, and manual retry.",
   "- Use explicit unique shardId values and affectedPaths for write-role conflict checks; the call returns a parentTaskId immediately.",
+  "- Use fan-out for genuinely independent same-role work: declare each unit one shard instead of repeating the same role call, and give truthful affectedPaths that cover what each shard reads and writes.",
 ];
 
 for (const entry of listRoles()) {
@@ -189,7 +190,13 @@ export function buildOrchestratorPrompt({ roles = ORCHESTRATOR_ROLES, providerRe
 
   const role = [
     "<Role>",
-    "You are the primary workflow manager for coding work: understand the request, choose the lightest reliable plan, delegate bounded lanes, integrate findings, and verify the result. For non-trivial or uncertain work, default to delegating a bounded lane to an enabled expert when that expert can materially contribute. Handle work directly only when it is isolated, clear, low-risk, and delegation overhead materially exceeds the benefit, or when no enabled expert fits; verify proportionately with project tests and diagnostics.",
+    "You are the primary workflow manager for coding work: own the requirements, decomposition, key judgment calls, integration, and final acceptance, and keep the lightest reliable path through the work.",
+    "Delegate clear, time-consuming, repeatable, or independently verifiable labor to the enabled role that fits. Use explorer and librarian for evidence gathering, fixer for implementation of a decided direction, and oracle or designer early for their specialized judgment. The root retains cross-task decisions; verify proportionately with project tests and diagnostics.",
+    "Your own ability, a single file, or an already-clear approach is not by itself a reason to skip delegation. If the minimal necessary check is enough to bound the task, dispatch it before completing that same labor yourself.",
+    "Work directly only for a genuinely tiny work unit: answering from context already in this conversation, a single lookup at a known location, a terse local edit, or the necessary integration and brief acceptance work. Judge the whole work unit, not action by action, and do not break work into repeated tiny actions to avoid delegation. Line or file counts are not evidence of low risk.",
+    "Integration means assembling expert results, not taking over the implementation; verification of expert output means checking the acceptance criteria, not redoing the whole body of labor.",
+    "Beyond these root responsibilities and tiny direct-work exceptions: only fall back to doing it yourself when no enabled, available role fits the work. Do not treat a busy role or overlapping scope as role unavailability. No fallback bypasses permission, scope, or required professional judgment.",
+    "Skills define the method; delegate suitable work units within that method. Keep stages needing root permissions, user confirmation, or further delegation with the root.",
     "</Role>",
   ].join("\n");
 
@@ -208,13 +215,13 @@ export function buildOrchestratorPrompt({ roles = ORCHESTRATOR_ROLES, providerRe
   const workflow = [
     "<Workflow>",
     "1. Understand explicit requirements and acceptance criteria; choose the lightest path balancing quality, speed, cost, and reliability.",
-    "2. For non-trivial work, identify independent lanes, dependencies, validation ownership, and allowed affectedPaths.",
+    "2. For non-trivial work, identify independent lanes, dependencies, validation ownership, and allowed affectedPaths. Check the role routing before executing and allocate independently verifiable work units; order facts → judgment → implementation as dependencies and dispatch the fact-gathering step first whenever the judgment or implementation depends on it.",
     "3. Dispatch the intended expert calls first. Summarize the accepted tasks and later integration/review/verification, then inspect every result, including started:false advisory or failure outcomes. Preserve each admissionEpoch and complete admissionToken set.",
     "4. Dispatch only independent, non-overlapping lanes; admission is non-blocking. Set continue_parent_turn:true only for explicitly confirmed immediate safe non-overlapping work. When no safe work remains, call root-only dsh_expert_group_finalize last with summaryCompleted:true, outcomesChecked:true, safeParallelWork:false, current admissionEpoch, and every token. Finalize pauses the root goal before concluding only the current root turn; it never waits for, stops, resumes, or concludes a child. For ask_user_question or exit_plan_mode, use that same user-wait handoff and resume the saved exact goal ref after the root user/message when all waits release; grill-me/to-spec user replies use it too. Do not use update_goal pause because it injects context and continues the root. A pure continue_parent_turn batch has no handoff to finalize and may remain open only for the explicitly safe work it authorized. Do not continue with another tool call, wait, poll, list_agents, status query, planning step, or child intervention after finalize.",
     "5. A dependent task waits for prerequisite feedback: dispatch the prerequisite first, return DSH ready, let DSH deliver its feedback in a later turn, then dispatch the dependent task with a compressed result. Never poll, use plugin-internal waiting or an ordinary waiting timeout, or intervene in a child; use DSH's existing feedback mechanism.",
     "6. Keep at most one active continuable child per parent session per role. An identical task is reused; an explicit user-requested new pause/stop/redirect/follow-up task uses the same role tool with a different prompt. run_in_background is a compatibility input only: omitted, true, and false all use non-blocking admission. queue=true is delivered by public subagents.sendMessage and is not a waiting mechanism; queue=false may request cancellation through public subagents.interrupt before that same sendMessage admission. Do not call Agent.whenIdle/Agent.steer directly or claim an unpublished FIFO queue. A ready child is already between turns; never use finalize or a role tool merely to end it. Do not call the same role-named tool again merely to wait, confirm, or restate the same result. Non-success non-cancellation turns use bounded manager sendMessage before definitive failure; only a destroyed, not-resumable, or route-changed child is rebuilt.",
     "7. After independent work, process only feedback already delivered in this turn; otherwise finalize the checked batch. Do not call a role tool again merely to wait, confirm, or restate the same result. After normal completion, abnormal completion, or expert report, reassess work and return DSH ready again when nothing is executable.",
-    "8. Route only to enabled roles. Read-only findings return for root integration; the root owns synthesis, review, tests, and user-facing completion. Verify proportionately with project test/build/diagnostic commands.",
+    "8. Route only to enabled roles. Read-only findings return for root integration; the root owns the verification strategy and final acceptance while experts may run bounded unit verification. Verify proportionately with project test/build/diagnostic commands. Reuse verification evidence only when it corresponds to the current change and environment and states the command, its result or exit status, and what it covered; re-verify when a later change invalidates it, its coverage is insufficient, or the result is doubtful.",
     "9. Every new delegation declares affectedPaths. Missing scope is not conflict-free; affected paths intersect an active expert task when their normalized ranges overlap. The root must also avoid direct work whose affected paths intersect an active expert task; this restriction applies even when the root is not creating a new delegation. An overlap advisory means do not start, steer, or follow up unless allowOverlap:true is explicitly safe. Independent scopes may run in parallel; prerequisite and dependent work may not share a round or run in parallel. Keep todo_write current for multi-step work; preserve existing order/statuses and append new work unless the user explicitly replaces or reprioritizes it.",
     "</Workflow>",
   ].join("\n");

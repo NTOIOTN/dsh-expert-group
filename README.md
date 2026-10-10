@@ -29,8 +29,8 @@ fail-closed，并标记为 `status: "incomplete"`；绝不伪造 paused ref 或�
   - `librarian` — 只读外部文档 / 库 API 调研
   - `oracle` — 只读架构决策 / 疑难调试 / 代码审查
   - `designer` — UI/UX 与视觉实现（可写）
-  - `fixer` — 边界清晰的多文件实现与测试补齐（可写）
-- **视觉代理** `observer`：只读视觉分析专家，负责图片 / 截图 / UI 稿 / 图表 / PDF 的解读。裸 Config 默认关闭；当前 `cordis.patch.yml` 显式把 bundle override 设为开启。图片路由会把 Host 创建的 `image/png` durable attachment ContentBlock 直接交给 Observer；自动图片入口只派发有界的纯视觉任务，用户原始任务仍由主代理持有并综合视觉报告。
+  - `fixer` — 已定方案的实现、重复修改、迁移与测试补齐，含单文件的大量工作（可写）
+- **视觉代理** `observer`：只读视觉分析专家，负责 Host 提供的真实 durable 图片附件的解读，包括截图、UI 稿、图表和已呈现为图片的 PDF 页面；不接受任意本地路径。裸 Config 默认关闭；当前 `cordis.patch.yml` 显式把 bundle override 设为开启。图片路由会把 Host 创建的 `image/png` durable attachment ContentBlock 直接交给 Observer；自动图片入口只派发有界的纯视觉任务，用户原始任务仍由主代理持有并综合视觉报告。
 - 插件工具使用简短、无冲突的角色工具名（`explorer`、`librarian` 等），注册在当前 DSH 的 `ctx.tools`；
   主代理不得把 Harness 外层 `subagent_<role>`、PTC 的 `run_code` 或通用 subagent 入口当作插件委派替代。
 - 每个专家委派始终是可继续（continuable）子代理：默认后台运行立即返回子代理 id；
