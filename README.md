@@ -45,11 +45,13 @@ fail-closed，并标记为 `status: "incomplete"`；绝不伪造 paused ref 或�
 ## 安装与平台分工
 
 本插件发布到 npm 公共源，按包名安装。**CLI/web 与桌面版是两套管理面，命令不通用**：
+CLI/web 的完整流程见 [安装说明.txt](安装说明.txt) 与 [install.ps1](install.ps1)（脚本只处理 web profile）；
+桌面版见 [桌面版安装说明.md](桌面版安装说明.md)（构建、打包、备份、隔离试装、正式装载与验收都在那里）。
 
 | 目标 | 安装入口 | 生效方式 |
 | --- | --- | --- |
 | **CLI / `dsh web`** | `dsh plugin --profile <profile> add dsh-expert-group` | 重启 DSH Web |
-| **桌面版（Electron 客户端）** | GUI「插件 → 添加插件」，或桌面版自带的 `dsh` CLI（见下） | 重启桌面版 |
+| **桌面版（Electron 客户端）** | 桌面版**应用自带**的 `dsh.cmd`（`plugin --profile desktop`，见下），或 GUI「插件 → 添加插件」 | 重启桌面版 |
 
 ### CLI / `dsh web`
 
@@ -63,34 +65,61 @@ dsh plugin --profile web add dsh-expert-group
 
 ### 桌面版（Electron 客户端）
 
-桌面版的 profile 是 `desktop`，由 Electron 应用独占管理；**不要用 npm 全局的 `dsh` 去操作它**，否则会被 CLI 直接拒绝：
+桌面版的 profile 是 `desktop`，由 Electron 应用管理；**不要用 PATH 上的 npm 全局 `dsh` 去操作它**：
+启动器里的开关 `manageDesktopProfile` **只作用于 `plugin` 子命令**，
+boot / `--dump-config` 路径是无条件拒绝的——**应用自带 CLI（rc.2）同样拒**：
 
 ```text
 error: profile "desktop" is managed exclusively by the Electron application
 ```
 
-**方式 A（推荐，与版本无关）**：打开桌面版 → **插件** 页 → **添加插件** → 输入 `dsh-expert-group`（界面提示原文：「输入插件的包名、GitHub 仓库地址或本地目录路径。」）→ 安装完成后提示「更改将在下次启动生效」→ **重启桌面版**。
+三条可用入口：
 
-**方式 B（桌面版自带 CLI，仅新版本可用）**：桌面版从 **`0.2.0-rc.2`** 起随发行包提供 `resources\runtime\cli\bin\dsh.cmd`（在 `0.2.0-rc.1` 上该文件不存在，只能用方式 A 或方式 C）。用它对 `desktop` profile 执行 pnpm 风格的依赖操作：
-
-```powershell
-& '<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd' plugin --profile desktop add dsh-expert-group
-& '<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd' plugin --profile desktop list
-# 卸载：把 add 换成 remove
-```
-
-**方式 C（手工维护 profile 文件）**：在 `$DSH_HOME\profiles\desktop\package.json` 的 `dependencies` 加一项、`dsh.profile.bundles` 追加包名，并让 `node_modules\dsh-expert-group` 能解析到实际目录（pnpm 安装或 junction）。三处齐全才生效。
-
-> 桌面版 CLI 的边界：`plugin` 子命令对 `desktop` 开放（只做依赖管理），但 `--dump-config` 之类的**组合/启动**命令仍会被拒——`error: profile "desktop" is managed exclusively by the Electron application`。
-
-**验证安装结果**：
+| 入口 | 适用场景 | 说明 |
+| --- | --- | --- |
+| **应用自带 CLI** | 安装 / 升级 / 卸载的默认路径 | `0.2.0-rc.2` 起发行包带 `resources\runtime\cli\bin\dsh.cmd`（`0.2.0-rc.1` 上不存在）；只有它放行 `plugin --profile desktop` |
+| **GUI「插件 → 添加插件」** | 图形化安装 | 与版本无关；**按 spec 检查同名**——包名 / 本地目录形式的 spec 命中已安装依赖时提示「该插件已安装。如需升级，请卸载后重新安装」，**tgz spec 的实际行为本轮未验证**；也不提供版本豁免入口 |
+| **手工维护 profile 文件** | 无 CLI、无 GUI 的兜底 | 手工建 junction / 复制副本**不是默认升级方式**，会绕过 pnpm 的锁与 integrity 校验 |
 
 ```powershell
-$d = "$env:DSH_HOME\profiles\desktop"
-$pkg = Get-Content "$d\package.json" -Raw | ConvertFrom-Json
-$pkg.dsh.profile.bundles -contains 'dsh-expert-group'   # 应为 True
-(Get-ChildItem "$d\node_modules\dsh-expert-group\host" -File).Count   # 应为 14
+$cli = Join-Path '<DSH 安装目录>' 'resources\runtime\cli\bin\dsh.cmd'    # 应用自带 CLI
+$tgz = '<候选包 tgz 的绝对路径>'                               # 也接受包名 / 本地目录绝对路径
+
+& $cli plugin --profile desktop add $tgz
+if ($LASTEXITCODE -ne 0) { throw "add 失败（exit=$LASTEXITCODE），先查落盘状态再决定回滚" }
+
+& $cli plugin --profile desktop list
+if ($LASTEXITCODE -ne 0) { throw "list 失败（exit=$LASTEXITCODE）" }
+
+# 卸载：把 add 换成 remove；版本豁免：version-exemptions / allow-version / revoke-version
 ```
+
+**生效与验收：命令执行者是主代理，最后一步重启由用户完成。** 构建 → 打包 → 备份 → 隔离试装 → 正式 CLI 安装
+→ 校验的完整流程（含前置检查与失败处理）见 **[桌面版安装说明.md](桌面版安装说明.md) 第 4 节**；
+版本兼容门禁与豁免见第 6 节。
+
+> 在线（桌面版运行中）安装属于受控测试：CLI 只检查 profile 是否初始化（提示 `... then fully quit it before
+> running dsh plugin --profile desktop.`），**没有进程硬拦截**，因此可能出现内存里旧模块 + 磁盘上新模块混用。
+> **磁盘安装成功 ≠ 内存生效、更 ≠ 功能验收**——真正验收要等用户重启后按该文档第 8 节读证据。
+
+**验证安装登记与目标文件**（直接检查目标 profile，真实目录、Junction 和 pnpm 链接均适用）：
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$home_dsh = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+$d = Join-Path $home_dsh 'profiles\desktop'
+$pkg = Get-Content -LiteralPath (Join-Path $d 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if (-not $pkg.dependencies.'dsh-expert-group' -or 'dsh-expert-group' -notin @($pkg.dsh.profile.bundles)) {
+  throw '目标 profile 未完整登记 DEG 依赖与 bundle'
+}
+$installedManifest = Join-Path $d 'node_modules\dsh-expert-group\package.json'
+if (-not (Test-Path -LiteralPath $installedManifest -PathType Leaf)) { throw '目标 profile 中没有 DEG 包清单' }
+$installed = Get-Content -LiteralPath $installedManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($installed.name -ne 'dsh-expert-group') { throw '目标包名不符' }
+[pscustomobject]@{ Path = $installedManifest; Name = $installed.name; Version = $installed.version }
+```
+
+这只是快速检查；同版本替换还须按详细指南比对实际文件与候选 tgz 的哈希，不能只看版本号。
 
 **可选图像增强**：`sharp` 是 `optionalDependencies`（约 30 MB 原生二进制），用于把 JPEG / WebP / GIF 转码为 PNG；拉取失败或未安装都不影响插件加载，仅会拒绝非 PNG 图片的转码，其余功能全部正常。
 
