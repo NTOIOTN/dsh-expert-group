@@ -46,7 +46,7 @@ fail-closed，并标记为 `status: "incomplete"`；绝不伪造 paused ref 或�
 
 本插件发布到 npm 公共源，按包名安装。**CLI/web 与桌面版是两套管理面，命令不通用**：
 CLI/web 的完整流程见 [安装说明.txt](安装说明.txt) 与 [install.ps1](install.ps1)（脚本只处理 web profile）；
-桌面版见 [桌面版安装说明.md](桌面版安装说明.md)（构建、打包、备份、隔离试装、正式装载与验收都在那里）。
+桌面版见 [桌面版安装说明.md](桌面版安装说明.md)（构建 → 测试 → 打包 → 备份 → 安装 → 校验的快速部署流程）。
 
 | 目标 | 安装入口 | 生效方式 |
 | --- | --- | --- |
@@ -94,9 +94,8 @@ if ($LASTEXITCODE -ne 0) { throw "list 失败（exit=$LASTEXITCODE）" }
 # 卸载：把 add 换成 remove；版本豁免：version-exemptions / allow-version / revoke-version
 ```
 
-**生效与验收：命令执行者是主代理，最后一步重启由用户完成。** 构建 → 打包 → 备份 → 隔离试装 → 正式 CLI 安装
-→ 校验的完整流程（含前置检查与失败处理）见 **[桌面版安装说明.md](桌面版安装说明.md) 第 4 节**；
-版本兼容门禁与豁免见第 6 节。
+**生效与验收：命令执行者是主代理，最后一步重启由用户完成。** 构建 → 测试 → 打包 → 备份 → 安装
+→ 校验的完整流程（含判据与回滚）见 **[桌面版安装说明.md](桌面版安装说明.md)**。
 
 > 在线（桌面版运行中）安装属于受控测试：CLI 只检查 profile 是否初始化（提示 `... then fully quit it before
 > running dsh plugin --profile desktop.`），**没有进程硬拦截**，因此可能出现内存里旧模块 + 磁盘上新模块混用。

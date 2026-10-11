@@ -654,8 +654,16 @@ export function sameDurableSessionId(left, right, childId) {
   }
 }
 
-/** 从 DSH GoalView 提取可用于 CAS 的精确引用；无效视图不进入 handoff。 */
-function goalRefOf(goal) {
+/**
+ * 从 DSH GoalView 提取可用于 CAS 的精确引用；无效视图不进入 handoff。
+ *
+ * 导出给组合根复用（index.js 需要把「外部暂停的 exact ref」交给托管登记），
+ * 避免两处各写一份 shape 校验而漂移；非法输入返回 undefined。
+ *
+ * @param {unknown} goal - GoalView 或 {id,revision} 形状。
+ * @returns {{id:string,revision:number}|undefined} 可用于 CAS 的精确引用。
+ */
+export function goalRefOf(goal) {
   try {
     if (goal === null || typeof goal !== "object") return void 0;
     if (typeof goal.id !== "string" || goal.id.length === 0 || !Number.isSafeInteger(goal.revision) || goal.revision <= 0) return void 0;
@@ -666,8 +674,29 @@ function goalRefOf(goal) {
 }
 
 /**
- * 严格解析 GoalView：合法但 disarmed 的目标是 none；字段缺失/非法或 armed
- * 与非 active phase 组合都必须视为 malformed，不能借机放行。
+ * 严格解析 GoalView，返回**五态**：
+ *
+ * - `none`：GoalService.get 返回 undefined，确实没有任何 durable goal；
+ * - `armed`：active + armed，本插件可以（也必须）自己执行 pause；
+ * - `paused`：paused + disarmed，目标已经被**别人**暂停（用户手动 pause、上一代
+ *   实例留下的 durable pause、其他插件）。它和无 goal 一样「不需要再 pause」，但
+ *   语义完全不同：它不是本插件建立的等待，只有拿到归属证据的调用方才可以托管；
+ * - `inactive`：blocked/complete/active + disarmed。这是一个**合法**的「当前没有
+ *   需要本插件维护的 pause barrier」状态——目标已经不再由 goal-round 驱动（用户
+ *   /goal block、任务 complete、用户主动 disarm），既不能 pause 也没有可 resume
+ *   的等待。它与 `none` 的差别只在「目标是否存在」，对收口语义完全等价；调用方
+ *   必须照常清理本批次 admission 并如实报告 paused:false，**绝不能**把它当成
+ *   真实 pause 失败（那会让 root turn 永久无法收口），也**绝不能**当成
+ *   paused-external（那会为不属于本插件的暂停建立可 resume 的托管记录）；
+ * - `invalid`：字段缺失/非法（非法 phase/activation 组合、缺 id/revision）。
+ *
+ * 为什么必须把 `paused` 从 `none` 里拆出来：调用方过去只能看到「undefined = 不需要
+ * 等待」，于是无法区分「没有目标所以无所谓」和「目标已被暂停但我不拥有它」，
+ * 前者可以照常收口，后者一旦被当成一样处理就会留下一个永远没人 resume 的 paused
+ * goal。拆开后调用方必须显式决定如何处置，禁止再把两者折叠。
+ *
+ * @param {unknown} goal - GoalService.get 的返回视图。
+ * @returns {{kind:"none"}|{kind:"armed",ref:object}|{kind:"paused",ref:object}|{kind:"inactive",ref:object}|{kind:"invalid"}}
  */
 function goalViewState(goal) {
   // GoalService.get 的 undefined 才表示没有目标；null 是损坏的 GoalView。
@@ -680,11 +709,18 @@ function goalViewState(goal) {
     if (ref === void 0
       || !["active", "paused", "blocked", "complete"].includes(phase)
       || !["armed", "disarmed"].includes(activation)
-      || (activation === "armed" && phase !== "active")
-       || (activation === "disarmed" && !["paused", "blocked", "complete"].includes(phase))) {
+      // armed 只与非 active 冲突；disarmed 与全部四种 phase 都是合法组合
+      // （active+disarmed = 目标已不再由 goal-round 驱动，属于 inactive）。
+      || (activation === "armed" && phase !== "active")) {
       return { kind: "invalid" };
     }
-    return activation === "armed" ? { kind: "armed", ref } : { kind: "none", ref };
+    if (activation === "armed") return { kind: "armed", ref };
+    if (phase === "paused") return { kind: "paused", ref };
+    // blocked/complete/active + disarmed 都是**合法**的「当前没有需要本插件维护的 pause
+    // barrier」状态：目标已不再由 goal-round 驱动，既不能 pause 也没有可 resume 的等待。
+    // 必须与 invalid 分开：调用方要照常清理本批次 admission 并如实报告 paused:false，
+    // 而不是把合法状态当成真实失败（那会让 root turn 永久无法收口）。
+    return { kind: "inactive", ref };
   } catch {
     return { kind: "invalid" };
   }
@@ -768,8 +804,27 @@ function reportHandoffError(onError, error) {
 /**
  * 在暂停成功后保存 handoff；失败路径必须删除 provisional record，绝不留下可误 resume 的 ref。
  * pause 返回的 revision 才是后续 resume 的 CAS 基准，不能复用 pause 前的 armed ref。
+ *
+ * 问题 2（异步 get outer 窗口内的 re-pause）：既有 record 处于「异步 get 校验窗口」时，本次
+ * re-pause 只是 outer operation 的一个子步骤 —— 窗口尚未收口，本次新 reason 也还没有登记。
+ * 调用方用 options.pausingOwner 显式声明这个归属（owner = outer operation 对象）：此时只提交
+ * pause 返回的精确 ref，state 必须保持 "pausing"、operation 必须原样留给 outer 收口。
+ * 否则 release 会在「ref 已换成新 revision」与「新 reason 已登记」这两个 Promise reaction
+ * 之间看到 paused + 新 ref + 只有旧原因已释放，从而提前 resume 新 ref 并删掉 record，随后
+ * 新 reason 登记失败（handoff 被静默丢掉，而 proof 仍谎报 paused 成功）。
+ *
+ * owner 身份 CAS 不匹配时退回普通收口语义，绝不误保留别的调用方的 operation。普通新 record、
+ * 非 outer 的既有 record re-pause、rePauseExistingHandoff 都不传该选项，行为完全不变。
+ *
+ * @param {Map} pending - root id -> handoff record。
+ * @param {string} key - record 在 pending 里的 key。
+ * @param {object} record - 本次操作归属的 handoff record。
+ * @param {unknown} paused - pause 返回的 GoalView。
+ * @param {(error:unknown)=>void} [onError] - 异常记录回调。
+ * @param {{pausingOwner?:unknown}} [options] - outer 窗口归属（见上）。
+ * @returns {boolean} 是否成功提交。
  */
-function commitPausedGoal(pending, key, record, paused, onError) {
+function commitPausedGoal(pending, key, record, paused, onError, options) {
   if (pending.get(key) !== record) return false;
   let phase;
   let activation;
@@ -790,6 +845,13 @@ function commitPausedGoal(pending, key, record, paused, onError) {
     return false;
   }
   record.ref = ref;
+  // outer 窗口内的 re-pause：只提交精确 ref。state 与 operation 由 finishPausingOperation
+  // 在同一同步收口里独占处理（那时 commitHeldReason 已登记完本次新 reason）。
+  const pausingOwner = options?.pausingOwner;
+  if (pausingOwner !== void 0 && record.operation === pausingOwner) {
+    delete record.beforeRef;
+    return true;
+  }
   record.state = "paused";
   delete record.operation;
   delete record.beforeRef;
@@ -808,34 +870,18 @@ function failGoalPause(pending, key, record, onError, error) {
 }
 
 /**
- * 在后台结论或用户等待前真实暂停 armed durable goal。
- * pending 以 root session id 为 key；同一 root 的 child/user 原因只追加到同一记录，
- * 因此多个并发反馈共享一次 pause。为兼容 remote adapter，此函数按服务返回值保留
- * 同步 boolean 或 Promise<boolean>；调用方必须在 concludeTurn 前等待 Promise。
- * @param {object} goals - 可选 GoalService（需 get/pause）。
- * @param {object} agent - exact root Agent。
- * @param {Map} pending - root id -> handoff record。
- * @param {{kind:string,id?:string,admissionId?:string}} reason - child/user/fanout 等待原因。
+ * 读取并校验 GoalService 的 get/pause 入口（pauseGoalWithProof 与同步 guard 共用）。
+ *
+ * 三种结果必须严格区分，调用方不能把它们折叠：
+ * - undefined：没有注入 GoalService（null/undefined）——中性结果，不是失败；
+ * - false：存在但不完整 / getter 抛错——真实失败，必须 fail closed；
+ * - {goals,getGoal,pauseGoal}：已解析的同步可调用入口。
+ *
+ * @param {unknown} goals - 注入的 GoalService。
  * @param {(error:unknown)=>void} [onError] - 异常记录回调。
- * @returns {boolean|Promise<boolean>} pause 是否真正成功并登记 handoff。
+ * @returns {undefined|false|{goals:object,getGoal:Function,pauseGoal:Function}}
  */
-export function pauseGoalForHandoff(goals, agent, pending, reason, onError) {
-  const key = handoffAgentKey(agent);
-  const reasonKey = handoffReasonKey(reason);
-  if (key === void 0 || reasonKey === void 0 || !(pending instanceof Map)) return false;
-  const current = pending.get(key);
-  if (current !== void 0) {
-    // session id 不能替代对象身份；同 id 的迟到/伪造 Agent 不得接管 root handoff。
-    if (current.agent !== agent || !(current.reasons instanceof Map)) return false;
-    if (!current.reasons.has(reasonKey)) current.reasons.set(reasonKey, false);
-    // 正在等待 remote pause 时，新原因复用同一 operation；pause 成功后统一保存 exact ref。
-    if (current.state === "pausing" || current.state === "resuming") {
-      // resuming 期间登记新 reason，但不能把 active goal 当作已暂停；
-      // caller 必须阻止 conclude，resume 完成后由 release helper 重新 pause。
-      return current.operation ?? false;
-    }
-    return goalRefOf(current.ref) === void 0 ? false : true;
-  }
+function readGoalService(goals, onError) {
   if (goals === void 0 || goals === null) return void 0;
   let getGoal;
   let pauseGoal;
@@ -850,41 +896,452 @@ export function pauseGoalForHandoff(goals, agent, pending, reason, onError) {
     reportHandoffError(onError, new Error("goal service must provide get and pause methods"));
     return false;
   }
+  return { goals, getGoal, pauseGoal };
+}
+
+/**
+ * 暂停目标并返回**可区分的证明结果**（pauseGoalForHandoff 的精确版本）。
+ *
+ * 为什么需要它：pauseGoalForHandoff 为兼容既有调用方，只返回 boolean|undefined；
+ * 而同步/异步调用方要正确收口，必须区分三种「没有执行 pause」的原因：
+ *
+ * - `undefined`：没有 durable goal（GoalService.get 返回 undefined）。既不失败也
+ *   不需要等待，调用方可以照常继续；
+ * - `false`：真实失败（get/pause/CAS 异常、非法视图、缺少方法、缺少精确身份）；
+ * - `{outcome:"paused-external", ref}`：目标**已经** paused+disarmed —— 它确实存在
+ *   且不需要再 pause，但**不是**本插件建立的暂停。调用方必须拿自己的归属证据
+ *   （同一 live root/generation 下 exact pending child admission 等）来决定是否托管；
+ *   绝不能把它当成「pause 成功」计入回执，也绝不能在无证据时擅自 resume。
+ *
+ * 另外两类「不需要等待」的合法视图同样折叠成 undefined，且**绝不**算失败：
+ * blocked/complete/active+disarmed 表示目标已不再由 goal-round 驱动（没有需要本插件
+ * 维护的 pause barrier），与「目标不存在」对收口语义等价；只有真正 malformed 的
+ * GoalView（非法 phase/activation 组合、缺 id/revision）才返回 false。
+ *
+ * 三个成功/中性结果：
+ * - `{outcome:"paused", ref}`：本次真实执行了 pause，ref 是 pause 之后的 exact CAS 基准；
+ * - `{outcome:"held", ref}`：本 root 已有 record 且处于已暂停/等待释放状态，
+ *   本次只是追加等待原因（幂等路径），ref 是该 record 的 exact CAS 基准；
+ * - `{outcome:"paused-external", ref}`：见上。
+ *
+ * 已有 record 的 reason 登记顺序（问题 2 状态污染）：state="pausing"/"resuming" 的在飞
+ * operation 会把新原因纳入同一次结算，因此立即登记；state="paused" 时必须先完成 live
+ * GoalView 的读取与 exact id/revision 校验，**只有校验成功之后**才登记本次新原因。任何
+ * 拒绝路径（get 抛错 / thenable rejection / 视图换代 / malformed / active re-pause 失败）
+ * 都不会登记，因此绝不会在既有 record 上留下一个本次调用新增且永远无人释放的 reason。
+ * 这里只描述「本次新原因不会被登记」；失败路径对既有 record 的其它影响（是否删除、state
+ * 如何收口）由各自的收口函数决定，本函数不额外承诺。
+ *
+ * 已有 record 的异步 get 校验窗口（问题 2 get pending 竞态）：GoalService.get 返回
+ * thenable 时，本函数在**同一同步调用栈内**把既有 record 标成 state="pausing"，并把
+ * record.operation 设为一个覆盖**完整**「get → live 视图校验 → 必要 re-pause proof」的
+ * 可等待信号：
+ * - releaseGoalHandoff 的 pausing 分支严格要求该信号 === true 才继续释放，因此 get 未
+ *   落地期间的 release 只会记账并等待，绝不会凭 get 之前的旧 revision 提前 resume
+ *   （提前 resume 会删掉 record，迟到的 re-pause proof 再无归属，远端留下无人托管的
+ *   paused goal）；
+ * - get 落地为 active+armed 时，后续 resume 必须使用 re-pause 返回的**新 revision**；
+ * - get 落地为与 record.ref 逐字段一致的 paused/disarmed 时，本次只是验证：收口时会把
+ *   record 从临时的 pausing 还原为 paused 并清掉该验证窗口的 operation，避免 record
+ *   永久停在 pausing。
+ *
+ * @param {object} goals - 可选 GoalService（需 get/pause）。
+ * @param {object} agent - exact root Agent。
+ * @param {Map} pending - root id -> handoff record。
+ * @param {{kind:string,id?:string,admissionId?:string,attempt?:number}} reason - 等待原因。
+ * @param {(error:unknown)=>void} [onError] - 异常记录回调。
+ * @returns {undefined|false|{outcome:"paused"|"held"|"paused-external",ref:object}|Promise<undefined|false|object>}
+ */
+export function pauseGoalWithProof(goals, agent, pending, reason, onError) {
+  const key = handoffAgentKey(agent);
+  const reasonKey = handoffReasonKey(reason);
+  if (key === void 0 || reasonKey === void 0 || !(pending instanceof Map)) return false;
+  const service = readGoalService(goals, onError);
+  if (service === false) return false;
+  // 没有 GoalService 是中性结果（既不能 pause 也没有可托管对象）；已有 record 时同样
+  // 不能凭空报告 held —— 没有服务就无法证明目标仍被暂停。
+  if (service === void 0) return void 0;
+  const { getGoal, pauseGoal } = service;
 
   // 先挂 provisional record，避免 remote get/pause 未返回期间第二个 child/user 原因重复发 pause。
   const record = { agent, reasons: new Map([[reasonKey, false]]), state: "pausing", operation: void 0, beforeRef: void 0 };
-  pending.set(key, record);
-  const pauseCurrent = (goal) => {
+  // pause 在飞时的「落地信号」promise 暂存在局部变量里，**不直接写 record.operation**：
+  // 外层统一在 pauseCurrent 返回后再落盘，既避免自引用（record.operation 的 then 里再读
+  // record.operation），也保证 releaseGoalHandoff 看到的一定是 signal 而不是 proof 对象。
+  let pendingOperation;
+  // 正处于「异步 get 校验窗口」的 record 集合（窗口内已挂上覆盖 get + re-pause 的 outer
+  // operation）。用集合而不是布尔标志：不同 root 的并发调用可能同时处于窗口内，共享一个
+  // 布尔会让先完成的一方复位掉另一方仍然需要的状态。
+  // 窗口内 pauseCurrent 不得改写 record.operation —— 那个字段归 outer 信号所有；被内层
+  // 落地信号覆盖后，已经拿到 outer 信号的 release 会重新读到 record.operation，拿到一个
+  // 与它自己等待的 promise 不同的值，从而放弃释放（记录永远停在 paused）。
+  const outerOperationRecords = new WeakSet();
+  /**
+   * 对一次 live GoalView 执行「读视图 → 必要时真实 pause」的完整判定。
+   *
+   * @param {unknown} goal - GoalService.get 的返回视图。
+   * @param {object} target - 本次操作归属的 record（新建时是 provisional record，
+   *   held 校验时是既有 record）；所有失败/成功收口都只写这一个对象。
+     *   注意：既有 record 处于异步 get 校验窗口内时（outerOperationRecords），异步
+   *   re-pause 的落地信号只回传给外层 outer 信号，不写进 record.operation。
+   * @param {string} targetKey - target 在 pending 里的 key（与调用方 key 相同）。
+   */
+  const pauseCurrent = (goal, target, targetKey) => {
     // 同步 guard 拒绝 thenable 后会撤销 provisional record；remote get 迟到时不得
     // 再继续调用 pause，否则会在用户等待开始后才改变 goal。
-    if (pending.get(key) !== record) return false;
+    if (pending.get(targetKey) !== target) return false;
     const state = goalViewState(goal);
-    if (state.kind === "none") {
-      if (pending.get(key) === record) pending.delete(key);
+    if (state.kind === "none" || state.kind === "inactive") {
+      // 没有 durable goal，或目标处于合法的「无 barrier」态（blocked/complete/
+      // active+disarmed）：既没有 pause 可执行，也没有任何需要维护的等待。
+      // 必须与 invalid 分开——把它当成失败会让调用方永久无法收口。
+      if (pending.get(targetKey) === target) pending.delete(targetKey);
       return void 0;
     }
+    if (state.kind === "paused") {
+      // 目标已被外部暂停：没有 pause 可执行，也绝不留 provisional record。
+      // 把 exact ref 交给调用方，由它用自己的归属证据决定是否托管。
+      if (pending.get(targetKey) === target) pending.delete(targetKey);
+      return { outcome: "paused-external", ref: state.ref };
+    }
     if (state.kind !== "armed") {
-      return failGoalPause(pending, key, record, onError, new Error("goal get returned a malformed GoalView"));
+      return failGoalPause(pending, targetKey, target, onError, new Error("goal get returned a malformed GoalView"));
     }
     const beforePauseRef = state.ref;
-    record.beforeRef = beforePauseRef;
+    target.beforeRef = beforePauseRef;
     let paused;
     try {
       paused = pauseGoal.call(goals, agent, beforePauseRef);
     } catch (error) {
-      return failGoalPause(pending, key, record, onError, error);
+      return failGoalPause(pending, targetKey, target, onError, error);
     }
+    // pause 成功时归一成带 exact ref 的 proof；「是否已落地」的信号由外层投影到
+    // record.operation（见 pendingOperation），绝不能把 proof 对象当成已落地信号——
+    // releaseGoalHandoff 的 pausing 分支只认严格 === true。
+    const commitPaused = (view) => {
+      // 问题 2：既有 record 处于异步 get 校验窗口（outerOperationRecords）时，本次 re-pause 的
+      // proof 只是 outer operation 的子步骤，窗口还没收口、本次新 reason 也还没登记。把当前
+      // operation 作为 owner 交给 commitPausedGoal：它只提交精确 ref，state/operation 留给
+      // outer 收口，release 在「ref 已提交」与「新 reason 已登记」之间仍看到 pausing + 可等待
+      // 信号。归属判定用 per-record 的 WeakSet（而不是共享布尔），不同 root 的并发窗口互不干扰。
+      const pausingOwner = target !== record && outerOperationRecords.has(target) ? target.operation : void 0;
+      const proof = commitPausedGoal(pending, targetKey, target, view, onError, { pausingOwner });
+      return proof === true ? { outcome: "paused", ref: target.ref } : proof;
+    };
     if (isThenable(paused)) {
-      const operation = Promise.resolve(paused).then(
-        (view) => commitPausedGoal(pending, key, record, view, onError),
-        (error) => failGoalPause(pending, key, record, onError, error),
+      // Promise 链已完成 proof 的归一（视角与失败语义都在这里定稿）。
+      const proof = Promise.resolve(paused).then(
+        (view) => commitPaused(view),
+        (error) => failGoalPause(pending, targetKey, target, onError, error),
       );
-      record.operation = operation;
-      return operation;
+      // 落地信号：proof 归一后的布尔投影（true=已落地），绝不能把 proof 对象本身
+      // 当成已落地信号——releaseGoalHandoff 的 pausing 分支只认严格 === true。
+      const operation = proof.then(pauseOperationSettled);
+      if (target === record) {
+        // 新建 record：沿用外层统一落盘的既有语义（pendingOperation 在 pauseCurrent
+        // 返回后才赋给 record.operation），避免 record.operation 的 then 里自引用。
+        pendingOperation = operation;
+      } else if (pending.get(targetKey) === target) {
+        // 既有 record 的异步 re-pause（问题 2）：必须在**同一同步调用栈内**把目标
+        // 标成在飞并暴露 operation，否则这次调用返回后：
+        // - releaseGoalHandoff 的 pausing 分支看不到可等待的 operation，会立刻返回
+        //   false（既不 resume 也不等待），旧原因释放意图被静默丢弃；
+        // - 并发登记看到 state 仍是 "paused"，会绕过复用路径再次调用 pause，
+        //   或在 proof 落地前凭旧 ref 提前 resume。
+        // 只写 state/operation，不改 ref；ref 仍由 commitPausedGoal 在 proof 落地后
+        // 用 pause 返回的精确视图更新（CAS 基准不变）。
+        target.state = "pausing";
+        if (outerOperationRecords.has(target)) {
+          // outer 校验窗口内 record.operation 由外层 outer 信号独占（见 outerOperationRecords），
+          // 这里只把**内层**落地信号回传给外层，让 outer 信号继续等 re-pause 真正落地。
+          // 否则 outer 信号只等 get（proof 一 resolve 就判 true），release 会在 re-pause
+          // 落地前提前 resume，CAS 仍用旧 revision，迟到的 pause proof 再无处登记归属。
+          pendingOperation = operation;
+        } else {
+          target.operation = operation;
+        }
+      }
+      return proof;
     }
-    return commitPausedGoal(pending, key, record, paused, onError);
+    return commitPaused(paused);
   };
 
+  /**
+   * 收口「既有 record 的异步 get 校验窗口」结束时的 record 状态（问题 2 get pending 竞态）。
+   *
+   * 背景：既有 paused record 走异步 GoalService.get 时，本次调用在**同一同步栈**把 record
+   * 标成 `state="pausing"` 并挂上覆盖「get → resolveHeldRecord → 必要 re-pause proof」的
+   * 完整 outer operation（见下面 thenable 分支）。这样 releaseGoalHandoff 的 pausing 分支
+   * 才会等待完整 proof，而不会在 get 未落地、record.ref 仍是旧 revision 时提前 resume
+   * （提前 resume 会删掉 record，迟到的 re-pause proof 再无处登记，远端留下无人托管的
+   * paused goal）。
+   *
+   * 收口必须区分「本次真的 pause 了」与「本次只是验证」：
+   * - `{outcome:"paused"}`：commitPausedGoal 已在 preserve 模式下提交了 pause 之后的精确
+   *   ref，但刻意保持 state="pausing" 与 outer operation（见 commitPausedGoal 的
+   *   pausingOwner）。本次新 reason 已由更早的 commitHeldReason Promise reaction 登记，
+   *   因此**这里**才是唯一同步收口点：对 record + outer operation 做双重身份 CAS 后把
+   *   state 置为 paused 并清掉 outer operation。若在这里之前就把 record 改成 paused，
+   *   release 会在「新 ref 已提交」与「新 reason 已登记」之间看到 paused + 新 ref +
+   *   只有旧原因已释放，从而提前 resume 新 ref 并删掉 record（新 reason 登记失败，
+   *   handoff 被静默丢掉，而 proof 仍谎报 paused 成功）；
+   * - `{outcome:"held"}`：get 落地为与 record.ref **逐字段一致**的 paused/disarmed，
+   *   本次只是验证、没有调用 pause。此时必须把 record 从 pausing 恢复为 paused 并清掉
+   *   只属于这次验证的 operation，否则该 record 会永久停在 pausing：
+   *   pauseGoalForHandoff 的复用分支只接受 state === "paused"，后续 release 的 pausing
+   *   分支又会拿一个已经 settle 的 operation 反复等待，record 永远无法被正常释放。
+   *   恢复后若窗口内已经记录了释放意图（全部原因都已释放），必须立刻补发，
+   *   否则这次 barrier 没有任何人再负责收口。
+   *
+   * 幂等与身份边界：只有**仍是同一 record 且 operation 仍是本次 outer operation** 时才
+   * 回退。若期间已有别的流程接管（并发 re-pause 换了 operation、record 被换代/删除、
+   * 失败路径已清空），一律不动 —— 那些路径各自有自己的收口责任人。
+   *
+   * @param {unknown} proof - resolveHeld 的最终结果（可能是 thenable 的 proof）。
+   * @param {object} target - 本次操作归属的 record。
+   * @param {string} targetKey - target 在 pending 里的 key。
+   * @param {Promise<unknown>} outerOperation - 本次完整 in-flight 信号的 promise 身份。
+   * @param {string} previousState - 进入本次校验窗口前 record 的 state。
+   * @returns {boolean} 本次 pause 是否已落地（release 的 pausing 分支只认严格 true）。
+   *   held 同样返回 true：它是本次调用成立的证明，且 record 已还原成 paused + 原 ref，
+   *   窗口内等待的 release 可以安全地继续递归收口。
+   */
+  const finishPausingOperation = (proof, target, targetKey, outerOperation, previousState) => {
+    if (proof?.outcome === "paused") {
+      // 本次真实发起过 pause：精确 ref 已由 commitPausedGoal 提交（outer 窗口内是 preserve
+      // 模式：state 仍是 "pausing"、operation 仍是本次 outer 信号）。本次新 reason 已由更早的
+      // commitHeldReason Promise reaction 登记（outer 信号建立在 proof 归一链之后），因此
+      // **这里**才是把 record 从 pausing 收口成 paused 的唯一同步边界：先对 record 与
+      // operation 做双重身份 CAS，再改 state 并清掉只属于本次窗口的 outer operation。
+      // CAS 不匹配说明已有别的流程接管（record 换代/删除、operation 换了 owner），一律不动 ——
+      // 那些路径各自有自己的收口责任人，绝不能被这里清掉新 owner 的 operation。
+      if (pending.get(targetKey) === target && target.operation === outerOperation) {
+        target.state = "paused";
+        delete target.operation;
+      }
+      // 窗口收口：本次准入记账已完成使命（新原因已登记、早到的释放意图已消费成 true），
+      // 必须清掉，否则陈旧记账会在下一次进入窗口时被误认成「本次尚未登记的预期原因」。
+      clearPendingAdmission(target, outerOperation);
+      return true;
+    }
+    // 验证型 held：本次只做验证、没有 pause，必须把 record 从临时的 pausing 还原回
+    // 调用前的 paused，并清掉只属于这次验证的 operation（仍属同一 record + 同一
+    // outer 窗口时才操作）。
+    if (proof?.outcome === "held"
+      && pending.get(targetKey) === target
+      && target.operation === outerOperation) {
+      target.state = previousState;
+      delete target.operation;
+      // 窗口收口：本次准入记账已完成使命（新原因已登记、早到的释放意图已消费成 true），
+      // 必须清掉，否则陈旧记账会在下一次进入窗口时被误认成「本次尚未登记的预期原因」。
+      clearPendingAdmission(target, outerOperation);
+      // 先消费属于本次验证窗口的释放意图：若窗口内**全部**原因都已释放，这里就是唯一
+      // 还没人负责的边界，必须立刻补发，否则 barrier 永远停在 paused。
+      const stagedReleaseKeys = target.pendingReleaseReasons instanceof Map
+        ? [...target.pendingReleaseReasons.keys()]
+        : [];
+      if (stagedReleaseKeys.length > 0) {
+        replayPendingRelease(goals, pending, targetKey, target, onError);
+      }
+      // 窗口已结束：本窗口的记账只服务于 pausing 期间的递归收口，必须清掉，否则这些陈旧
+      // 的 reason 对象会在**下一次**进入 pausing 窗口时被 replay 误用（把已经释放过的旧
+      // 原因当成新意图补发）。只删本窗口记录过的键，保留 replay 期间新登记的意图。
+      if (target.pendingReleaseReasons instanceof Map) {
+        for (const stagedKey of stagedReleaseKeys) target.pendingReleaseReasons.delete(stagedKey);
+        if (target.pendingReleaseReasons.size === 0) delete target.pendingReleaseReasons;
+      }
+      // held 是本次调用成立的证明：reason 已由 commitHeldReason 登记，信号报告「已落地」，
+      // 让窗口内等待的 release 继续递归收口（此时 record 已恢复 paused + 原 ref）。
+      return true;
+    }
+    // 其余结果（false / undefined / paused-external / malformed）：
+    // - 既有语义要求「异步 get 的 rejection 只记录错误、不删除也不替换既有 record」，
+    //   因此这里必须把本窗口临时改成 pausing 的 state **还原**成调用前的值，否则 record
+    //   会永久停在 pausing（后续 release 会一直等一个已经 settle 的假信号，返回 waiting）；
+    // - 真正需要删除 record 的失败路径（failGoalPause）已经自己删掉了记录，下面的身份
+    //   校验会失败，这里什么都不做，保持它们的 fail-closed 语义。
+    if (pending.get(targetKey) === target && target.operation === outerOperation) {
+      target.state = previousState;
+      delete target.operation;
+    }
+    return false;
+  };
+
+  /**
+   * 复用既有 record 前重读 live GoalView 的校验（问题 2：held 分支不得凭内存谎报）。
+   *
+   * 内存 record 不是权威：目标可能在两次登记之间被**外部**恢复成 active+armed
+   * （用户 /goal resume、别的插件、同 id 的另一个 root），此时 record.state 仍是
+   * "paused"、ref 也仍然形状合法，仅凭它返回 held 会让 finalize 谎报 paused:true。
+   * 因此这里按 live 视图分派：
+   * - paused + disarmed 且 id/revision 与 record 完全一致：归属仍然成立 → held；
+   * - armed + active：目标已被恢复，必须重新真实 pause（沿用 pauseCurrent 的
+   *   CAS/失败收口），绝不返回 held；
+   * - none / inactive：目标已不存在或不再需要 barrier → 清掉陈旧 record 并返回
+   *   无 barrier 结果；
+   * - 视图被别的 goal 替换 / invalid：按真实失败收口（fail closed）。
+   */
+  const resolveHeldRecord = (goal, target, targetKey) => {
+    if (pending.get(targetKey) !== target) return false;
+    const state = goalViewState(goal);
+    if (state.kind === "armed") return pauseCurrent(goal, target, targetKey);
+    if (state.kind === "paused") {
+      const ref = goalRefOf(target.ref);
+      if (ref !== void 0 && state.ref.id === ref.id && state.ref.revision === ref.revision) {
+        return { outcome: "held", ref };
+      }
+      // 视图已前进（revision 变化）或被换成另一个 goal：无法证明这个 pause 仍是
+      // 我们的等待，必须 fail closed，绝不返回可被 finalize 当作 barrier 的 held。
+      return failGoalPause(pending, targetKey, target, onError, new Error("goal handoff record no longer matches the live paused GoalView"));
+    }
+    if (state.kind === "none" || state.kind === "inactive") {
+      if (pending.get(targetKey) === target) pending.delete(targetKey);
+      return void 0;
+    }
+    return failGoalPause(pending, targetKey, target, onError, new Error("goal get returned a malformed GoalView"));
+  };
+
+  const current = pending.get(key);
+  if (current !== void 0) {
+    // session id 不能替代对象身份；同 id 的迟到/伪造 Agent 不得接管 root handoff。
+    if (current.agent !== agent || !(current.reasons instanceof Map)) return false;
+    // 正在等待 remote pause 时，新原因复用同一 operation；pause 成功后统一保存 exact ref。
+    if (current.state === "pausing" || current.state === "resuming") {
+      // 在飞 operation 会把新原因纳入同一次 pause/re-pause 的结算，因此这里可以立即登记：
+      // 该 reason 的释放边界就是这次 operation 落地后由 release helper 消费。
+      registerHandoffReason(pending, key, current, reasonKey);
+      // resuming 期间登记新 reason，但不能把 active goal 当作已暂停；
+      // caller 必须阻止 conclude，resume 完成后由 release helper 重新 pause。
+      return current.operation ?? false;
+    }
+    // 已有记录：只有 pause 结果确定（paused）才算「已暂停并持有」；
+    // resuming 之外的异常状态（failed 等）由调用方的既有 fail-closed 处理。
+    if (current.state !== "paused" || goalRefOf(current.ref) === void 0) return false;
+    // 复用记录前必须重读 live GoalView（见 resolveHeldRecord）。
+    //
+    // 顺序不可颠倒（问题 2 状态污染）：本次原因**只能在 live 校验成功之后**才写入既有
+    // record。异步 GoalService 的 get rejection、thenable rejection、视图换代 / 被换成
+    // 另一个 goal、malformed 视图都会走到 failGoalPause，而那些路径从来不是本次原因的
+    // 释放边界——先写 reason 就会留下一个永远无人释放的原因，把 record 永久卡在 paused
+    // （全部真实原因释放后 release 只得到 waiting）。这里同样不做「失败回滚」：回滚在
+    // 并发调用方（同 reason 或另一个新 reason 同时登记）下会误删别人的等待原因。
+    const commitHeldReason = (proof, pendingOperation) => {
+      // 异步 re-pause 的 proof 是 thenable：成功判定必须延后到**最终的非 Promise 结果**。
+      // 直接把 Promise 对象当成成功 proof 会在 pause 尚未落地时提前登记本次 reason，
+      // 而 release 可以立刻用旧的 current.ref 提前 resume（删掉 record），迟到的 pause
+      // proof 再成功时 commitPausedGoal 已找不到 record → 新 pause 的归属被丢掉。
+      if (isThenable(proof)) {
+        return Promise.resolve(proof).then(
+          (settled) => commitHeldReason(settled, pendingOperation),
+          (error) => {
+            reportHandoffError(onError, error);
+            return false;
+          },
+        );
+      }
+      // 只有确实落到「已持有」或「本次真实重新 pause」的成功结果才登记原因；
+      // false / undefined / paused-external 都不得登记（它们没有本次的释放边界）。
+      if (proof !== false && proof !== void 0 && proof?.outcome !== "paused-external") {
+        registerHandoffReason(pending, key, current, reasonKey);
+        // P2 迟到 release：窗口内可能已经到达过针对本次新原因的释放意图（那时它尚未登记，
+        // 由 releaseGoalHandoff 暂存）。登记成功且窗口身份仍匹配时必须立刻把它消费成 true，
+        // 否则这次释放会被静默吞掉，「全部原因已释放」再也没有人消费 → goal 永久 paused。
+        // 失败/换代时 registerHandoffReason 不会登记，这里的身份校验也必然不成立（no-op）。
+        consumePendingAdmissionRelease(pending, key, current, reasonKey);
+      }
+      return proof;
+    };
+    const resolveHeld = (goal) => commitHeldReason(resolveHeldRecord(goal, current, key));
+    let goal;
+    try {
+      goal = getGoal.call(goals, agent);
+    } catch (error) {
+      return failGoalPause(pending, key, current, onError, error);
+    }
+    if (isThenable(goal)) {
+      // 异步 GoalService：校验只能延后到视图落地，落地后必须复查记录身份
+      // （期间可能已被 release/re-pause 换代）。rejection 只记录并返回 false，
+      // 本次原因不会被登记（因此不会污染既有 record 的 reason 集合）；它同样不删除、
+      // 不替换调用前已有的 record，只把本窗口临时改成的 state 还原回去。
+      //
+      // 关键（问题 2 get pending 竞态）：必须在**同一同步调用栈内**把既有 record 标成
+      // 在飞，并把一个覆盖「get → resolveHeldRecord → 必要 re-pause proof」的完整
+      // operation 挂到 record.operation 上。否则 get 未落地期间 record 仍是
+      // state="paused" + 旧 ref：
+      // - releaseGoalHandoff 的 pausing 分支看不到 operation，会立刻走 resume 分支，
+      //   用 **get 之前的旧 revision** 做 CAS（远端此刻可能已是新 revision 的 armed，
+      //   或 CAS 侥幸成功后删掉 record），迟到的 re-pause proof 再无处登记归属 ——
+      //   远端最终留下一个无人托管的 paused goal；
+      // - 并发登记看到 state 仍是 paused，会绕过复用路径再次 pause。
+      // 因此这里只改 state/operation（不动 ref）：ref 仍由 commitPausedGoal 在 pause
+      // 真正落地后用返回视图的精确 revision 更新。
+      // 记住进入校验窗口前的 state：验证型 held（视图与 record.ref 逐字段一致）没有
+      // 真正 pause，收口时必须把 record 还原成它，而不是永久留在临时的 pausing。
+      const previousState = current.state;
+      current.state = "pausing";
+      // P2 迟到 release：本次新原因要到 commitHeldReason 才登记，而 releaseGoalHandoff 的
+      // 早退条件是 reasons.has(reasonKey)。若不记账，窗口内到达的、针对**本次新原因**的
+      // release 会被直接丢弃，随后该原因被登记成 false 却再无人释放 → goal 永久 paused。
+      // 下面挂上 outer operation 后立刻登记准入意图，由 releaseGoalHandoff 精确识别
+      // 「本次尚未登记的预期原因」并暂存释放意图。未知原因绝不入账（fail closed）。
+      // 校验链只建一次：get 落地后先 resolveHeld（含 re-pause 的同步发起与归一），
+      // 再在**同一个回调内**收口 record 状态并做布尔投影。若把收口放到第二条 then 链
+      // 上，get 落地时会执行两次校验（重复 pause），且对外 proof 会比 outer 信号早一个
+      // 微任务 resolve —— 调用方 await 到 held 时 record 还停在临时的 pausing。
+      const proof = Promise.resolve(goal).then(resolveHeld, (error) => {
+        reportHandoffError(onError, error);
+        return false;
+      });
+      // outer operation 覆盖「get → resolveHeldRecord → 必要 re-pause proof」全过程：
+      // pauseCurrent 命中 armed 分支时会把内层 re-pause 落地信号写到 pendingOperation
+      // （见 pauseCurrent 的既有 record 分支），这里必须继续等它落地。
+      //
+      // 这里刻意**不**声明同名局部变量：pauseCurrent 把内层落地信号写到外层
+      // pendingOperation，声明局部变量会遮蔽它，导致 outer 信号退化成只等 get（丢掉
+      // re-pause proof），release 又会在 pause 落地前提前 resume。显式清空只是消除
+      // 本函数内其它路径可能残留的旧值（并发调用共用同一作用域）。
+      pendingOperation = void 0;
+      outerOperationRecords.add(current);
+      // outer operation 与对外 proof 共用同一条归一链：proof 一 resolve，record 状态
+      // 就已经收口（held 还原成 paused、re-pause 清掉内层残留信号），调用方 await 到
+      // 结果时不需要再等额外的微任务。
+      const operation = Promise.resolve(proof).then(
+        (settled) => {
+          // 校验（含 re-pause 的同步发起）已同步完成，退出窗口。
+          outerOperationRecords.delete(current);
+          // finishPausingOperation 直接返回严格的布尔落地信号（releaseGoalHandoff 的
+          // pausing 分支只认 === true），不能把 proof 对象透传出去。
+          return finishPausingOperation(settled, current, key, operation, previousState);
+        },
+        (error) => {
+          // get 的 rejection 分支只记录并返回 false，**不改动** record 身份（既有语义）。
+          // 这里只把本窗口临时改成 pausing 的 state 还原，避免后续 release 一直等一个
+          // 永远不会落地的信号（record 已删除/换代时什么都不做）。
+          outerOperationRecords.delete(current);
+          if (pending.get(key) === current && current.operation === operation) current.state = previousState;
+          // 失败路径同样必须清掉准入记账：本次原因永远不会被登记，陈旧的准入意图会在下一次
+          // 进入窗口时把另一个原因误认成「本次尚未登记的预期原因」。
+          clearPendingAdmission(current, operation);
+          reportHandoffError(onError, error);
+          return false;
+        },
+      );
+      // 先落盘 outer operation，再执行 resolveHeld（Promise 回调最早在下一微任务运行），
+      // 因此 release 在 get 未落地时一定看到的是可等待的完整信号。
+      current.operation = operation;
+      // 准入记账必须在**同一同步调用栈内**落盘：get 未落地期间到达的 release 只能靠它
+      // 识别出「这是本次尚未登记的预期原因」，否则会被 releaseGoalHandoff 的
+      // reasons.has 早退直接丢弃（这正是 P2 缺陷）。
+      armPendingAdmission(current, operation, reasonKey);
+      // 对外仍返回**原始 proof** 的结果（held/paused/false/undefined 语义不变），只是把它
+      // 接到同一条归一链之后，保证调用方拿到结果时 record 状态已经收口。第二个 handler
+      // 保证状态收口自身的异常不会改变对外契约（proof 永不 reject，对外也不 reject）。
+      return operation.then(() => proof, () => proof);
+    }
+    return resolveHeld(goal);
+  }
+
+  pending.set(key, record);
   let goal;
   try {
     goal = getGoal.call(goals, agent);
@@ -892,14 +1349,110 @@ export function pauseGoalForHandoff(goals, agent, pending, reason, onError) {
     return failGoalPause(pending, key, record, onError, error);
   }
   if (isThenable(goal)) {
-    const operation = Promise.resolve(goal).then(
-      (view) => pauseCurrent(view),
+    // 两步分离：对外的 proof 原样透传，record.operation 保存「pause 是否已落地」的布尔
+    // 信号。releaseGoalHandoff 的 pausing 分支用严格 === true 决定是否继续释放，直接
+    // 保存 proof 对象会让它把已落地的 pause 判成未落地 → 永远不 resume。
+    const proof = Promise.resolve(goal).then(
+      (view) => pauseCurrent(view, record, key),
       (error) => failGoalPause(pending, key, record, onError, error),
     );
-    record.operation = operation;
-    return operation;
+    record.operation = pendingOperation ?? proof.then(pauseOperationSettled);
+    return proof;
   }
-  return pauseCurrent(goal);
+  const inlineProof = pauseCurrent(goal, record, key);
+  record.operation = pendingOperation ?? pauseOperationSettled(inlineProof);
+  return inlineProof;
+}
+
+/**
+ * 在后台结论或用户等待前真实暂停 armed durable goal（兼容入口，返回 boolean|undefined）。
+ *
+ * 本函数是 pauseGoalWithProof 的**保守投影**，为既有调用方保持历史语义：
+ * - `true`：本次真实执行了 pause（或在既有 record 上追加了新原因）；
+ * - `false`：真实失败（get/pause/CAS 异常、非法视图、缺失方法/身份）；
+ * - `undefined`：没有 durable goal —— 目标不存在，或目标**已经** paused/disarmed。
+ *
+ * 三者都「不需要再 pause」，但目标已 paused 与完全没有目标必须能被区分：
+ * 前者只是本插件还没有归属，后者根本不存在可托管对象。若调用方需要在回执里如实
+ * 区分（不能谎报 pause 成功、或要按归属证据托管外部暂停），必须改用 pauseGoalWithProof。
+ *
+ * pending 以 root session id 为 key；同一 root 的 child/user 原因只追加到同一记录，
+ * 因此多个并发反馈共享一次 pause。为兼容 remote adapter，此函数按服务返回值保留
+ * 同步 boolean 或 Promise<boolean>；调用方必须在 concludeTurn 前等待 Promise。
+ *
+ * @param {object} goals - 可选 GoalService（需 get/pause）。
+ * @param {object} agent - exact root Agent。
+ * @param {Map} pending - root id -> handoff record。
+ * @param {{kind:string,id?:string,admissionId?:string,attempt?:number}} reason - child/user/fanout 等待原因。
+ * @param {(error:unknown)=>void} [onError] - 异常记录回调。
+ * @returns {boolean|undefined|Promise<boolean|undefined>} pause 是否真正成功并登记 handoff。
+ */
+export function pauseGoalForHandoff(goals, agent, pending, reason, onError) {
+  const proof = pauseGoalWithProof(goals, agent, pending, reason, onError);
+  // 同步结果直接投影。
+  if (!isThenable(proof)) return projectPauseProof(proof);
+  // 异步结果：**必须等待原始 proof**再投影。若对 Promise 直接投影，投影值只在返回值上
+  // 生效，而 record.operation 仍是原始 proof —— releaseGoalHandoff 的 pausing 分支
+  // 只认「严格 === true」来决定是否继续释放，拿到 proof 对象就再也不会触发 resume
+  // （异步 GoalService 下 goal 永久 paused）。
+  return Promise.resolve(proof).then(projectPauseProof, (error) => {
+    reportHandoffError(onError, error);
+    return false;
+  });
+}
+
+/**
+ * 把 pause 的证明结果折叠成**是否未落地**的判定值：
+ * - 原始 proof（`{outcome:"paused"|"held",ref}`）已经落地 → true；
+ * - `paused-external` 没有本插件发起的 pause，不构成「落地」→ undefined；
+ * - false / undefined 原样保留。
+ * 任何**非对象**结果原样返回（历史 boolean 语义），因此判断只需要看对象分支。
+ *
+ * @param {unknown} proof - pauseGoalWithProof 的结果或 record.operation 的旧值。
+ * @returns {unknown} 供 record.operation 保存的落地信号或原值。
+ */
+function pauseOperationSettled(proof) {
+  if (proof === null || typeof proof !== "object") return proof;
+  return proof.outcome === "paused-external" ? void 0 : true;
+}
+
+/**
+ * 把 pauseGoalWithProof 的精确证明投影成历史 boolean|undefined 契约。
+ * @param {unknown} value - proof 结果。
+ * @returns {boolean|undefined} true=真实 pause；undefined=不需要再 pause。
+ */
+function projectPauseProof(value) {
+  if (value === void 0 || value === false) return value;
+  // 已 paused/disarmed：目标存在但没有执行 pause，历史语义折叠为 undefined，
+  // 精确语义（含 exact ref）保留在 pauseGoalWithProof。
+  if (value?.outcome === "paused-external") return void 0;
+  return true;
+}
+
+/**
+ * 在**校验成功之后**把本次等待原因登记到既有 handoff record（问题 2 状态污染修复）。
+ *
+ * 为什么必须单独抽出来、且只能在成功路径调用：reason 是 release 的唯一凭据——record 上
+ * 多出一个永远无人释放的 reason，全部真实原因释放后 releaseGoalHandoff 会一直判为
+ * waiting，goal 永久停在 paused。因此任何「先写 reason、后异步校验」的顺序都是缺陷：
+ * 异步 GoalService.get 的 rejection / 视图换代 / malformed 都会让校验失败，而失败方
+ * 从不拥有这个 reason 的释放边界。
+ *
+ * 边界：
+ * - 只在 record 身份仍然一致（pending.get(key) === record）且仍是同一 reasons Map 时登记；
+ * - 幂等：已有同名 reason 时不重写、也不删除其他调用方登记的等待原因；
+ * - 本函数**不修改** record 的 state/ref/operation，也不参与任何回滚——失败路径根本不登记。
+ *
+ * @param {Map} pending - root id -> handoff record。
+ * @param {string} key - record 的 map key。
+ * @param {object} record - 调用前已存在的 handoff record。
+ * @param {string} reasonKey - handoffReasonKey 编码出的稳定键。
+ * @returns {boolean} 是否已登记（false = 记录已被换代/删除，本次原因未登记）。
+ */
+function registerHandoffReason(pending, key, record, reasonKey) {
+  if (pending.get(key) !== record || !(record.reasons instanceof Map)) return false;
+  if (!record.reasons.has(reasonKey)) record.reasons.set(reasonKey, false);
+  return true;
 }
 
 /**
@@ -910,35 +1463,74 @@ export function pauseGoalForHandoff(goals, agent, pending, reason, onError) {
  * 供 DSH 同步 tools.guard 使用的 handoff 入口。正式 GoalService 是同步服务，
  * 因此真实用户等待会在 guard 返回前完成 pause；若注入了不兼容的 thenable 服务，
  * guard 不拒绝工具调用，也不保存 ref，更不会假装能在同步 guard 中 await。
+ *
+ * 返回值与 pauseGoalWithProof 同源，便于调用方区分「无目标」与「目标已被外部暂停」：
+ * - true：本次真实 pause 成功并登记（或在既有记录上追加了新原因）；
+ * - `{outcome:"held",ref}`：既有记录已是 paused，本次只追加原因；
+ * - `{outcome:"paused-external",ref}`：目标已 paused+disarmed，本次没有执行 pause；
+ * - undefined：没有 durable goal，或目标处于合法的「无 barrier」态
+ *   （blocked/complete/active+disarmed，见 goalViewState 的 inactive）；
+ * - false：真实失败（get/pause/CAS 异常、非法视图、缺失方法/身份、不兼容 thenable、
+ *   既有记录与 live GoalView 不再匹配）。
+ *
+ * 复用既有记录时必须**先验证后登记**：只有 live GoalView 精确证明仍是同一 goal 的同一
+ * paused revision，本次原因才会写进既有 record；任何拒绝路径都不得改动调用前的 record。
+ *
+ * @returns {boolean|undefined|{outcome:string,ref:object}} 是否放行、暂停证明或失败。
  */
 export function pauseGoalForHandoffSync(goals, agent, pending, reason, onError) {
   const key = handoffAgentKey(agent);
   const reasonKey = handoffReasonKey(reason);
   if (key === void 0 || reasonKey === void 0 || !(pending instanceof Map)) return false;
+  // 只有 null/undefined 表示没有 GoalService；存在但不完整的 service 必须拒绝。
+  const service = readGoalService(goals, onError);
+  if (service === false) return false;
   const previous = pending.get(key);
   if (previous !== void 0) {
     if (previous.agent !== agent || !(previous.reasons instanceof Map)) return false;
     // 已有异步 pause 未完成时，同步 tools.guard 无法安全开始用户等待；
     // 更不能留下一个永远不会由同步调用方释放的 user reason。
     if (previous.state === "pausing" || previous.state === "resuming" || goalRefOf(previous.ref) === void 0) return false;
+    // 复用既有记录前必须重读 live GoalView：内存 record 可能在两次调用之间被外部
+    // resume（active+armed），仅凭 record.state === "paused" 返回 true 会让同步 guard
+    // 放行一个并不存在的 barrier。同步路径无法 await，也无法安全地替外部改动补一次
+    // pause（guard 的语义是「返回前必须已经暂停」），因此视图不匹配时一律保守拒绝。
+    if (service === void 0) return false;
+    let heldGoal;
+    try { heldGoal = service.getGoal.call(service.goals, agent); } catch (error) {
+      reportHandoffError(onError, error);
+      return false;
+    }
+    if (isThenable(heldGoal)) {
+      consumeRejectedThenable(heldGoal);
+      reportHandoffError(onError, new Error("synchronous goal handoff guard cannot await a thenable GoalService"));
+      return false;
+    }
+    const heldState = goalViewState(heldGoal);
+    // 只有 live 视图精确证明「仍是同一个 goal、同一 revision 的 paused+disarmed」时，
+    // 本次等待才算被 barrier 覆盖；paused 形状但 id/revision 已前进（视图换代）同样拒绝。
+    if (heldState.kind !== "paused") {
+      reportHandoffError(onError, new Error("goal handoff record no longer matches the live GoalView"));
+      return false;
+    }
+    const ref = goalRefOf(previous.ref);
+    if (heldState.ref.id !== ref.id || heldState.ref.revision !== ref.revision) {
+      reportHandoffError(onError, new Error("goal handoff record no longer matches the live paused GoalView"));
+      return false;
+    }
+    // 全部验证通过后才登记本次原因（问题 2 的状态污染修复）。
+    //
+    // 顺序不可颠倒：上面任一拒绝路径（record 身份不符、在飞 pausing/resuming、缺少
+    // GoalService、get 抛错、不兼容 thenable、live 视图已不是同一 paused revision）
+    // 都在返回 false 之前退出，因此绝不会给**调用前已有的** record 新增 reason。否则
+    // 目标已被外部恢复时，这个永远不会有人 release 的 user reason 会留在旧 record 上
+    // 污染它的生命周期（后续 release 按错误的 reason 集合走错状态）。
+    // 已有同名 reason 时保持幂等：不重写、也不删除调用方自己登记的等待原因。
     if (!previous.reasons.has(reasonKey)) previous.reasons.set(reasonKey, false);
     return true;
   }
-  // 只有 null/undefined 表示没有 GoalService；存在但不完整的 service 必须拒绝。
-  if (goals === void 0 || goals === null) return void 0;
-  let getGoal;
-  let pauseGoal;
-  try {
-    getGoal = goals.get;
-    pauseGoal = goals.pause;
-  } catch (error) {
-    reportHandoffError(onError, error);
-    return false;
-  }
-  if (typeof getGoal !== "function" || typeof pauseGoal !== "function") {
-    reportHandoffError(onError, new Error("goal service must provide get and pause methods"));
-    return false;
-  }
+  if (service === void 0) return void 0;
+  const { getGoal, pauseGoal } = service;
   let goal;
   try { goal = getGoal.call(goals, agent); } catch (error) {
     reportHandoffError(onError, error);
@@ -950,7 +1542,12 @@ export function pauseGoalForHandoffSync(goals, agent, pending, reason, onError) 
     return false;
   }
   const state = goalViewState(goal);
-  if (state.kind === "none") return void 0;
+  // 没有 durable goal，或目标处于合法的「无 barrier」态（blocked/complete/
+  // active+disarmed）：两者都不需要用户等待屏障，也都绝不能登记记录。
+  if (state.kind === "none" || state.kind === "inactive") return void 0;
+  // 已 paused/disarmed：没有 pause 可执行，也绝不登记记录——把 exact ref 交给
+  // 调用方，由它按自己的归属证据决定是否托管（与 pauseGoalWithProof 同一语义）。
+  if (state.kind === "paused") return { outcome: "paused-external", ref: state.ref };
   if (state.kind !== "armed") {
     reportHandoffError(onError, new Error("goal get returned a malformed GoalView"));
     return false;
@@ -969,7 +1566,7 @@ export function pauseGoalForHandoffSync(goals, agent, pending, reason, onError) 
     return false;
   }
   record.beforeRef = beforePauseRef;
-  return commitPausedGoal(pending, key, record, paused, onError);
+  return commitPausedGoal(pending, key, record, paused, onError) ? true : false;
 }
 
 export const disarmGoalForHandoff = pauseGoalForHandoff;
@@ -1010,6 +1607,14 @@ export function adoptablePausedGoalRef(goal) {
  * 语义与 pauseGoalForHandoff 的「已有 record」分支一致：record 存在时只追加 reason；
  * 不存在时以 state="paused" 建立记录，后续 releaseGoalHandoff 用该 ref 做 CAS resume。
  *
+ * 已有 record 的三种状态必须分开处理（问题 2 状态污染）：
+ * - state="pausing"/"resuming"：在飞 operation 会把新 reason 纳入同一次结算，因此只登记
+ *   reason 并返回 true（ref 不参与判定，也不覆盖在飞记录的 ref）；
+ * - state="paused"：传入的 ref 必须与 record.ref 的 id 与 revision **逐字段一致**才登记，
+ *   否则返回 false 且**不新增任何 reason**——不一致意味着目标已被外部 resume 后又被别人
+ *   pause（或视图换了 goal），本次证据无法证明归属，登记进去的 reason 永远无人释放；
+ * - 其余状态（failed 等）：沿用「record.ref 形状合法才登记」的既有保守判定。
+ *
  * @param {object} agent - exact root Agent。
  * @param {Map} pending - root id -> handoff record。
  * @param {{kind:string,id?:string,attempt?:number}} reason - 等待原因。
@@ -1031,8 +1636,15 @@ export function registerPausedGoalHandoff(agent, pending, reason, ref) {
       if (!current.reasons.has(reasonKey)) current.reasons.set(reasonKey, false);
       return true;
     }
-    if (!current.reasons.has(reasonKey)) current.reasons.set(reasonKey, false);
-    return goalRefOf(current.ref) !== void 0;
+    // state="paused" 的既有记录：传入的 stableRef 必须与 record.ref 的 id/revision **完全一致**
+    // 才能算「同一份仍在持有的暂停」（问题 2 状态污染）。不一致说明目标已被外部 resume 后
+    // 又（被用户或别人）pause 过，或视图被换成另一个 goal：本次证据无法证明归属，必须
+    // fail closed —— 在**任何写入之前**返回 false，绝不把本次 reason 挂到既有 record 上
+    // （否则它永远等不到释放，release 会一直判 waiting，goal 永久停在 paused）。
+    const heldRef = goalRefOf(current.ref);
+    if (heldRef === void 0 || heldRef.id !== stableRef.id || heldRef.revision !== stableRef.revision) return false;
+    registerHandoffReason(pending, key, current, reasonKey);
+    return true;
   }
   pending.set(key, { agent, reasons: new Map([[reasonKey, false]]), state: "paused", ref: stableRef });
   return true;
@@ -1215,6 +1827,96 @@ function recordPendingRelease(current, reasonKey, reason) {
 }
 
 /**
+ * 登记「既有 record 的异步 get/re-pause 校验窗口」里的新原因准入（P2 迟到 release）。
+ *
+ * 为什么需要：既有 paused record 走异步 GoalService.get 时，本次新原因**只有在校验成功
+ * 之后**才会被登记（见 commitHeldReason / registerHandoffReason）。因此窗口内到达的、针对
+ * **本次新原因**的 release 会在 releaseGoalHandoff 的 `reasons.has(reasonKey)` 早退处被
+ * 直接丢弃；等 commitHeldReason 把该原因登记成 false 后，「全部原因已释放」这一事实再也
+ * 没有人消费 —— goal 永久停在 paused。这里把准入意图与「谁在等它」显式记账，release 才能
+ * 识别出「这是本次尚未登记的预期原因」并暂存释放意图。
+ *
+ * 身份绑定（三者缺一不可，任何不匹配都必须 fail closed）：
+ * - record：记账只写本次调用拿到的 record 对象，且所有消费点都复查 pending.get(key) === record；
+ * - operation：窗口的 outer operation 身份。只有 record.operation 仍是同一个 operation 时，
+ *   release 才认这是「同一个在飞窗口」；换代/被别的流程接管后旧 operation 不得再入账；
+ * - reasonKey：只对**本次尚未登记**的单个原因有效。未知原因（reasonKey 不匹配）绝不入账，
+ *   否则会凭空造出一个永远无人释放的等待原因。
+ *
+ * 只保存键，不保存 reason 对象：暂存的释放意图由 reasons 自己承载（登记时置 true），
+ * 因此这里不需要原始 reason 对象，也不会把 pendingAdmission 直接塞进 reasons。
+ *
+ * @param {object} record - 本次操作归属的 handoff record（必须已存在）。
+ * @param {unknown} operation - 本次校验窗口的 outer operation 身份。
+ * @param {string} reasonKey - 本次调用即将登记的新原因键。
+ */
+function armPendingAdmission(record, operation, reasonKey) {
+  if (record === null || typeof record !== "object") return;
+  if (!(record.reasons instanceof Map)) return;
+  record.pendingAdmission = { operation, reasonKey };
+}
+
+/**
+ * 校验一条「尚未登记的预期原因」的释放意图是否属于当前在飞的准入窗口。
+ *
+ * 全部条件同时成立才返回 true（fail closed）：
+ * - record 身份一致且仍是同一 reasons Map；
+ * - record.pendingAdmission 存在，且 operation 与 reasonKey 与本次调用逐字段一致；
+ * - record.operation 仍是同一个 operation（窗口没有被别的流程接管/换代）；
+ * - 该 reasonKey 确实**尚未**登记（已登记的原因走 releaseGoalHandoff 的正常分支）。
+ *
+ * @param {Map} pending - root id -> handoff record。
+ * @param {string} key - record 的 map key。
+ * @param {object} record - 本次操作归属的 handoff record。
+ * @param {string} reasonKey - 本次 release 的原因键。
+ * @returns {boolean} 是否属于本次在飞准入窗口的预期原因。
+ */
+function isPendingAdmissionRelease(pending, key, record, reasonKey) {
+  if (pending.get(key) !== record) return false;
+  if (!(record.reasons instanceof Map)) return false;
+  const admission = record.pendingAdmission;
+  if (admission === null || typeof admission !== "object") return false;
+  if (admission.reasonKey !== reasonKey) return false;
+  if (admission.operation === void 0 || record.operation !== admission.operation) return false;
+  return !record.reasons.has(reasonKey);
+}
+
+/**
+ * 把已到达的 release 意图消费成「该原因已释放」（P2 迟到 release）。
+ *
+ * 只在本次登记成功、且窗口身份仍然匹配时调用：此时 reasons 里该原因刚刚被登记为 false，
+ * 早到的释放意图必须立刻置 true，否则「全部原因已释放」会随着窗口收口被静默吞掉。
+ *
+ * @param {Map} pending - root id -> handoff record。
+ * @param {string} key - record 的 map key。
+ * @param {object} record - 本次操作归属的 handoff record。
+ * @param {string} reasonKey - 本次 release 的原因键。
+ * @returns {boolean} 是否消费了早到的释放意图。
+ */
+function consumePendingAdmissionRelease(pending, key, record, reasonKey) {
+  if (!isPendingAdmissionRelease(pending, key, record, reasonKey)) return false;
+  record.reasons.set(reasonKey, true);
+  return true;
+}
+
+/**
+ * 清理本次校验窗口的准入记账（P2 迟到 release）。
+ *
+ * 只在 record 与 operation **双重身份**仍匹配时清理：窗口已收口、失败、被并发流程接管或
+ * record 被删除/换代时，绝不清掉别的 owner 的准入记账。
+ *
+ * @param {object} record - 本次操作归属的 handoff record。
+ * @param {unknown} operation - 本次校验窗口的 outer operation 身份。
+ */
+function clearPendingAdmission(record, operation) {
+  if (record === null || typeof record !== "object") return;
+  const admission = record.pendingAdmission;
+  if (admission === null || typeof admission !== "object") return;
+  if (admission.operation !== operation) return;
+  delete record.pendingAdmission;
+}
+
+/**
  * 竞争窗口结束后的补齐释放（P2）。
  *
  * 调用点：`accept()` 判定 resume 期间新增了 reason → re-pause 完成后立即调用。此时若
@@ -1268,7 +1970,36 @@ export function releaseGoalHandoff(goals, pending, agentOrId, reason, onError, o
   if (key === void 0 || reasonKey === void 0) return false;
   const current = pending.get(key);
   if (current === void 0 || (typeof agentOrId !== "string" && current.agent !== agentOrId)) return false;
-  if (!(current.reasons instanceof Map) || !current.reasons.has(reasonKey)) return false;
+  if (!(current.reasons instanceof Map)) return false;
+  if (!current.reasons.has(reasonKey)) {
+    // P2 迟到 release：既有 record 的异步 get/re-pause 校验窗口内，本次新原因尚未登记
+    // （登记在更晚的 commitHeldReason）。这里只认**本次在飞准入窗口**登记过的那个预期原因：
+    // record 身份、outer operation 身份、reasonKey 与「尚未登记」四项同时匹配才成立，
+    // 未知 reason 一律 fail closed，绝不凭空入账。命中时只把「该原因已释放」暂存到 reasons，
+    // 真正的结算必须回到下面的正常门控里做（见下一段注释）。
+    if (isPendingAdmissionRelease(pending, key, current, reasonKey)) {
+      // 先落盘释放意图：窗口内的 commitHeldReason 会用 registerHandoffReason 登记该原因，
+      // 而 registerHandoffReason 对已存在的键幂等（不会把它改回 false），因此这次释放不会被
+      // 后续登记覆盖掉。
+      current.reasons.set(reasonKey, true);
+      // P2（本次修复）：窗口的 outer operation 落地**只证明 get（必要时的 re-pause）已完成**，
+      // 它的 true 里不含任何 resume 语义。旧实现直接返回 current.operation，于是
+      // releaseGoalHandoffState 把「pause 已落地」当成「resume 成功」→ 谎报 "resumed"，
+      // 上层据此提前 settle，而其他仍未释放的 reason 与仍然 paused 的 goal 被永久遗留。
+      //
+      // 因此这里只等本次窗口收口（保持 exact record/operation/reason 绑定与 true 标记不变），
+      // 然后**递归**调用同一门控：由正常分支重新读取全部 reasons，只有真的 resume 成功
+      // （或 record 已以 resumed 终态收口）才返回 true，否则如实地返回 waiting/failed。
+      // operation 不可等待（异常形态：已被别的流程清掉/非 promise）时 fail closed。
+      if (!isThenable(current.operation)) return false;
+      return Promise.resolve(current.operation).then(
+        () => releaseGoalHandoff(goals, pending, agentOrId, reason, onError, onResume),
+        // 窗口自身 reject 时不得继续释放（既不 resume 也不谎报成功）。
+        () => false,
+      );
+    }
+    return false;
+  }
 
   if (current.state === "resuming") {
     // 新 admission 可能已经在 resume in-flight 期间加入；它必须等待同一个
@@ -1790,9 +2521,33 @@ function validStringValue(value) {
 export const TASK_TTL_DEFAULT_MS = 10 * 60 * 1000;
 
 /**
+ * 读取任务记忆条目记录的时刻。旧版本把值直接存成时间戳，新版本存
+ * { childId, routeKey, at }；两种格式都要能读出时间，避免升级后旧条目被误判过期。
+ * @param {unknown} record - scope.tasks 的值。
+ * @returns {number} 记住时刻；非法输入返回 0（视为最旧）。
+ */
+function taskRecordAt(record) {
+  if (typeof record === "number" && Number.isFinite(record)) return record;
+  return Number.isFinite(record?.at) ? record.at : 0;
+}
+
+/**
+ * 读取任务记忆条目绑定的 childId（旧格式没有绑定）。
+ * @param {unknown} record - scope.tasks 的值。
+ * @returns {string|undefined} 非空 childId；无绑定返回 undefined。
+ */
+function taskRecordChildId(record) {
+  return typeof record?.childId === "string" && record.childId.length > 0 ? record.childId : void 0;
+}
+
+/**
  * 创建轻量委派跟踪器：按 scope（父代理 + 角色）做 FIFO 串行临界区、
- * 记录当前可复用 child 与其 route（provider/model/reasoningEffort 组合）、
- * 以及最近任务的 LRU 记忆（默认上限 32 条）。纯内存、无依赖、可单测。
+ * 记录最近新建/恢复的 child 与其 route（provider/model/reasoningEffort 组合）、
+ * 以及「任务 key → 它自己的 child」绑定表与 LRU 记忆（默认上限 32 条）。
+ *
+ * 多 child 语义：同一 parent+role 下不同任务各自拥有独立 child，相同任务复用
+ * 它原来那个 child；因此按任务定位必须走 getTaskChild，而不是 getChild。
+ * 纯内存、无依赖、可单测。
  * @param {object} [options] - 可选配置：
  *   - taskLimit: 任务记忆 LRU 上限（默认 32）；
  *   - taskTtlMs: 任务指纹有效期（毫秒，默认 TASK_TTL_DEFAULT_MS，10 分钟）；
@@ -1807,7 +2562,13 @@ export function createDelegationTracker(options = {}) {
   const taskTtlMs = Number.isFinite(options?.taskTtlMs) && options.taskTtlMs > 0 ? options.taskTtlMs : TASK_TTL_DEFAULT_MS;
   // 时钟注入：默认真实时间；测试传 now() 伪造时钟即可验证过期行为。
   const now = typeof options?.now === "function" ? options.now : () => Date.now();
-  /** scope -> { childId, routeKey, tasks: Map(key -> 记住时刻, 插入序=LRU), queue: Promise 链 } */
+  /**
+   * scope -> { childId, routeKey, tasks: Map(key -> { childId, routeKey, at }, 插入序=LRU), queue: Promise 链 }
+   *
+   * scope.childId 只表示「本 scope 最近一次新建/恢复的 child」，用于诊断、快照恢复
+   * 与 route 变更判定，**不再**表示「本 scope 唯一的可复用 child」：同一 parent+role
+   * 下允许多个独立 child 并存，每个任务 key 通过 tasks 表绑定到它自己的 child。
+   */
   const scopes = new Map();
   /** parentId -> Promise：只保护范围预检和登记这个短临界区，不串行专家实际执行。 */
   const parentQueues = new Map();
@@ -2086,20 +2847,86 @@ export function createDelegationTracker(options = {}) {
       return activeTasksForParent(parentId).map(copyActiveTask);
     },
 
-    /** 读取 scope 当前可复用 child；无记录返回 undefined。 */
+    /**
+     * 读取本 scope 最近一次新建/恢复的 child（诊断、route 判定与快照恢复用）。
+     * **不是**「本 scope 唯一 child」：独立任务可能同时存在多个 child，按任务
+     * 定位必须使用 getTaskChild / listChildIds。
+     */
     getChild(scope) {
       const entry = scopes.get(scope);
       if (entry === void 0 || entry.childId === void 0) return void 0;
       return { childId: entry.childId, routeKey: entry.routeKey };
     },
 
-    /** 记录 scope 的当前 child 与其 route；child 或 route 变化时清空任务记录。 */
+    /**
+     * 记录 scope 最近一次新建/恢复的 child 与其 route。
+     *
+     * 任务记忆的清理规则（多 child 语义）：只删除「属于被替换 child」或「route 与
+     * 新 route 不同」的任务标记——同一 route 下并存的其他独立 child 仍必须能被
+     * 相同 prompt 复用，因此普通的新建 child **不得**清空整张任务表。
+     */
     setChild(scope, { childId, routeKey }) {
       const entry = entryOf(scope);
-      if (entry.childId !== childId || entry.routeKey !== routeKey) entry.tasks.clear();
+      const sameRoute = entry.routeKey === routeKey;
+      const replacedChildId = entry.childId;
+      if (replacedChildId !== childId || !sameRoute) {
+        for (const [taskKey, record] of [...entry.tasks]) {
+          const owner = taskRecordChildId(record);
+          const ownerRoute = typeof record?.routeKey === "string" ? record.routeKey : void 0;
+          // 保留条件一：仍绑定到本 route 上某个具体 child —— 同 route 下并存的其他
+          // 独立 child（以及被替换 child 自己的任务）都必须能被相同 prompt 复用。
+          if (owner !== void 0 && ownerRoute === routeKey) continue;
+          // 保留条件二：同 route 且绑定信息不完整（旧格式/旧写入点）—— route 没有变化，
+          // 旧语义的任务去重仍然成立。
+          if (sameRoute && ownerRoute === void 0) continue;
+          // 其余情况（route 已变、或记录指向别的不再可验证的 child）一律清理。
+          entry.tasks.delete(taskKey);
+        }
+      }
       entry.childId = childId;
       entry.routeKey = routeKey;
       return entry;
+    },
+
+    /**
+     * 读取某任务 key 当前绑定的 child；无绑定、已过期或格式非法时返回 undefined。
+     * 相同 prompt（归一化后同一 key）据此复用**它自己的** child，而不是本 scope
+     * 最近一次新建的 child。
+     */
+    getTaskChild(scope, taskKey) {
+      const entry = scopes.get(scope);
+      if (entry === void 0) return void 0;
+      const record = entry.tasks.get(taskKey);
+      if (record === void 0) return void 0;
+      if (now() - taskRecordAt(record) >= taskTtlMs) {
+        entry.tasks.delete(taskKey);
+        return void 0;
+      }
+      const childId = taskRecordChildId(record);
+      if (childId === void 0) return void 0;
+      return {
+        childId,
+        routeKey: typeof record?.routeKey === "string" ? record.routeKey : void 0,
+      };
+    },
+
+    /** 列出本 scope 记录到的全部 child（诊断/多 child 展示；去重且保持记忆顺序）。 */
+    listChildIds(scope) {
+      const entry = scopes.get(scope);
+      if (entry === void 0) return [];
+      const ids = [];
+      const seen = new Set();
+      if (typeof entry.childId === "string" && entry.childId.length > 0) {
+        ids.push(entry.childId);
+        seen.add(entry.childId);
+      }
+      for (const record of entry.tasks.values()) {
+        const childId = taskRecordChildId(record);
+        if (childId === void 0 || seen.has(childId)) continue;
+        seen.add(childId);
+        ids.push(childId);
+      }
+      return ids;
     },
 
     /** 清除 scope 的 child 记录（可指定 childId：不匹配时不动）；返回是否清除。 */
@@ -2111,26 +2938,42 @@ export function createDelegationTracker(options = {}) {
       return true;
     },
 
-    /** 该 scope 是否已记录过这个（归一化后的）任务 key；过期记录惰性删除。 */
+    /**
+     * 该 scope 是否已记录过这个（归一化后的）任务 key；过期记录惰性删除。
+     * 任务被记住但没有 child 绑定时同样返回 true（旧格式记录/旧语义）。
+     */
     hasTask(scope, taskKey) {
       const entry = scopes.get(scope);
       if (entry === void 0) return false;
-      const at = entry.tasks.get(taskKey);
-      if (at === void 0) return false;
+      const record = entry.tasks.get(taskKey);
+      if (record === void 0) return false;
       // 超过 TTL 的记录视为过期：删除并返回 false，相同 prompt 到期后可再次复用
       // （例如用户修复问题后重试同一任务，不再被永久判为重复）。
-      if (now() - at >= taskTtlMs) {
+      if (now() - taskRecordAt(record) >= taskTtlMs) {
         entry.tasks.delete(taskKey);
         return false;
       }
       return true;
     },
 
-    /** 记住任务 key（LRU：重复记忆刷新位置；超上限淘汰最旧）。值记录记住时刻供 TTL 判断。 */
-    rememberTask(scope, taskKey) {
+    /**
+     * 记住任务 key（LRU：重复记忆刷新位置；超上限淘汰最旧）。值记录记住时刻、
+     * 本任务绑定的 child 与 route，供 TTL 判断、相同 prompt 复用与 route 变更清理。
+     * childId/routeKey 缺省时只记时间（沿用旧的 scope 级去重语义）。
+     */
+    rememberTask(scope, taskKey, { childId, routeKey } = {}) {
       const entry = entryOf(scope);
+      const previous = entry.tasks.get(taskKey);
+      const binding = { at: now() };
+      // 未显式给出 child/route 时保留既有绑定（重复记忆只刷新时间，不丢归属）。
+      const boundChildId = typeof childId === "string" && childId.length > 0 ? childId : taskRecordChildId(previous);
+      if (boundChildId !== void 0) binding.childId = boundChildId;
+      const boundRouteKey = typeof routeKey === "string" && routeKey.length > 0
+        ? routeKey
+        : (typeof previous?.routeKey === "string" ? previous.routeKey : void 0);
+      if (boundRouteKey !== void 0) binding.routeKey = boundRouteKey;
       if (entry.tasks.has(taskKey)) entry.tasks.delete(taskKey);
-      entry.tasks.set(taskKey, now());
+      entry.tasks.set(taskKey, binding);
       while (entry.tasks.size > taskLimit) {
         const oldest = entry.tasks.keys().next().value;
         entry.tasks.delete(oldest);

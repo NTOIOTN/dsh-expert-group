@@ -30,7 +30,7 @@ import {
   createRequestRetryState, resetRequestRetryState, markRequestRetryEvent,
   isTransientRequestFailure, recoveryDelayForCount, requestRetryPolicyCoversFailure,
   appendRecoveryRetryCount, buildRecoveryMessage, classifyTurnOutcome, lastTurnErrorMessage,
-  pauseGoalForHandoff, pauseGoalForHandoffSync, registerPausedGoalHandoff,
+  pauseGoalForHandoff, pauseGoalForHandoffSync, pauseGoalWithProof, registerPausedGoalHandoff, goalRefOf,
   releaseGoalHandoff, releaseGoalHandoffState, fanoutHandoffReasonKey,
   clearGoalHandoff, adoptablePausedGoalRef,
   subagentFeedbackChildId, createAdmissionBatchCoordinator, createHandoffAdmissionCohort,
@@ -2269,6 +2269,28 @@ export default {
       // 同步 guard 必须在返回前完成 pause；无 armed goal 返回 undefined 放行，
       // get/pause/CAS/thenable 失败返回明确拒绝，不能把失败伪装成 allow。
       const paused = pauseGoalForHandoffSync(goals, agent, goalHandoffs, { kind: "user" }, (error) => logGoalHandoffError("pause", error));
+      // 目标已被**外部**（用户手动 /goal pause、上一代实例）暂停时，本次没有执行 pause，
+      // 但视图给出的 exact ref 就是「用户等待期间目标保持 paused」的唯一 CAS 基准。
+      // 不登记的话，用户回答后 releaseRootGoalHandoff 找不到任何 record，goal 会永久
+      // 停在 paused（只能靠用户再次手动 resume）——这正是问题 2 的 user-wait 残留。
+      //
+      // 归属门控：只接受形状完整、可用于 CAS 的 exact ref（goalRefOf），并用
+      // registerPausedGoalHandoff 建立 state="paused" 的 record；没有证据（形状非法 /
+      // 登记被身份校验拒绝）时绝不登记，也绝不 resume 任何无法证明归属的外部暂停。
+      if (paused !== false && paused !== void 0 && paused !== true && paused?.outcome === "paused-external") {
+        const externalRef = goalRefOf(paused.ref);
+        if (externalRef !== void 0) {
+          const reason = { kind: "user" };
+          if (registerPausedGoalHandoff(agent, goalHandoffs, reason, externalRef)) {
+            const record = goalHandoffs.get(agent.id);
+            if (record?.agent === agent) {
+              // 托管语义：ref 是外部暂停留下的 CAS 基准，不是本插件 pause 的结果
+              // （与 adoptExternalPausedGoalForChild 同一标记）。
+              record.armedBefore = false;
+            }
+          }
+        }
+      }
       if (paused !== false) {
         // 统一登记点：root 用户等待只有这一处写入，因此通知也接在这里，避免出现第二份登记。
         const previousWait = pendingUserWaits.get(agent);
@@ -2285,6 +2307,54 @@ export default {
       }
       return paused === false ? "Cannot start user wait because the durable root goal could not be paused." : void 0;
     }
+    /**
+     * 把「目标已被外部暂停 + exact pending child admission」登记为本插件的托管等待。
+     *
+     * 触发条件（缺一不可）：
+     * 1. 目标当前视图是 paused + disarmed（外部/用户暂停，本插件没有执行过 pause）；
+     * 2. 调用方拿的是**同一 live root 下 exact 的** pending admission（由
+     *    pendingHandoffAdmissionFor + host.handoff.contains 校验），也就是确实存在
+     *    一个会在结束时反馈的 child —— 这正是「用户手动暂停后不再恢复」的根因：
+     *    以前没有任何 record，child 完成时父 feedback 根本找不到释放边界。
+     *
+     * 登记后记录以当前视图的 exact ref 作为 CAS 基准（`armedBefore:false` 明确标记
+     * 这不是我们的 pause），child 全部释放后由 releaseGoalHandoff 用该 ref resume，
+     * goal 回到 active —— 与「主代理等待子代理后自动恢复」的期望语义一致。
+     *
+     * 边界：没有 admission 证据时**绝不登记**（外部暂停必须保持 paused）；登记失败
+     * 时返回 false，调用方按 fail-closed 收口。
+     *
+     * @param {object} agent - exact live root Agent。
+     * @param {{id:string,revision:number}} ref - 当前 paused 视图的 exact ref。
+     * @param {object} admission - exact pending handoff admission。
+     * @param {string|undefined} admissionId - admission token。
+     * @returns {boolean} 是否登记成功。
+     */
+    function adoptExternalPausedGoalForChild(agent, ref, admission, admissionId) {
+      if (!isLiveRootAgent(agent) || admission === void 0) return false;
+      const reason = { kind: "child", id: admission.childId, ...(admissionId === void 0 ? {} : { admissionId }) };
+      if (!registerPausedGoalHandoff(agent, goalHandoffs, reason, ref)) return false;
+      const record = goalHandoffs.get(agent.id);
+      if (record?.agent !== agent) return false;
+      // 托管语义：ref 是外部暂停留下的 CAS 基准，不是本插件 pause 的结果。
+      record.armedBefore = false;
+      return true;
+    }
+
+    /**
+     * 为 exact child admission 建立 goal 等待屏障。
+     *
+     * @param {object} agent - exact live root Agent。
+     * @param {string} childId - durable child id。
+     * @param {object} [admission] - 调用方已持有的 exact pending admission（可选）。
+     * @returns {"paused"|"held"|"paused-external"|"none"|"failed"} 归一后的 pause 结果：
+     *   - "paused"：本次真实 pause 成功，record 已持有，可以 conclude；
+     *   - "held"：既有 record 已暂停，本次只追加原因，可以 conclude；
+     *   - "paused-external"：目标本来已 paused+disarmed 且已按 exact admission 登记托管，
+     *     可以 conclude（若登记失败则返回 "failed"）；
+     *   - "none"：没有 durable goal，调用方**不得**把它报告成 paused；
+     *   - "failed"：真实失败 / admission 已失效 / thenable 服务，必须 fail-closed。
+     */
     function pauseRootGoalForChild(agent, childId, admission) {
       if (goalHandoffStopping || !isLiveRootAgent(agent) || typeof childId !== "string" || childId.length === 0) return false;
       const pendingAdmission = pendingHandoffAdmissionFor(agent, childId, admission);
@@ -2304,9 +2374,12 @@ export default {
       // `paused` 由下方所有分支的闭包读取：先声明、在 pause 调用之后赋值，
       // settlePaused 只在赋值完成后调用（顺序见函数末尾）。
       let paused;
-      // 没有 armed goal/GoalService 时允许 conclude；真实 pause/get/CAS 失败返回 false，
-      // 并把当前 root 的暂存终态以 allowRecovery=false 收口。
-      const permission = () => failed ? false : void 0;
+      // 目标被外部（用户/上一代实例）暂停时，shared helper 返回的 exact ref：
+      // 只有它能作为「托管 + 后续 CAS resume」的基准；未托管前绝不使用它。
+      let pausedExternalRef;
+      // 放行语义完全由 pauseOutcomeOf 的归一结果决定（见 settlePaused）：
+      // 只有 "paused"/"paused-external"（且已完成托管登记）允许 conclude；
+      // "none" 表示没有 durable goal，照常继续；"failed" 一律 fail-closed。
       /**
        * 安全地把 pause 返回值接到回调上（同步结果 / Promise 双路径）。
        *
@@ -2325,10 +2398,36 @@ export default {
         settled = true;
         return callback(value);
       };
+      /**
+       * 把 shared helper 的返回值归一成四种可判定形态（本函数的唯一返回契约）：
+       * - "paused"：本次真实执行了 pause（兼容 boolean true 与 {outcome:"paused"}）；
+       * - "held"：本 root 已有 paused record，本次只是追加等待原因（幂等路径）；
+       * - "paused-external"：目标本来就已经 paused+disarmed，本次没有执行 pause，
+       *   必须带 exact admission 登记托管后才能放行，否则只能 fail-closed；
+       * - "none"：没有 durable goal（undefined 的既有语义）；
+       * - "failed"：false 与任何非法形状，一律按失败处理——**尤其是 undefined 绝不能
+       *   再被当成 pause 成功**（这正是过去 paused 与 no-goal 混同、finalize 谎报
+       *   paused:true 的根因）。
+       */
+      const pauseOutcomeOf = (value) => {
+        // 错误回调（shared helper 的 onError）已经把本次判定为失败时，无论返回值
+        // 形状如何都不得再放行——损坏 adapter 可能同时「报告错误」并返回看似成功的值。
+        if (failed) return "failed";
+        if (value === true) return "paused";
+        if (value === void 0) return "none";
+        const outcome = value?.outcome;
+        if (outcome === "paused" || outcome === "held") return outcome;
+        if (outcome === "paused-external") {
+          // 只接受形状完整、可用于 CAS 的 exact ref；否则退回 fail-closed。
+          pausedExternalRef = goalRefOf(value.ref);
+          return pausedExternalRef === void 0 ? "failed" : "paused-external";
+        }
+        return "failed";
+      };
       const settlePaused = (onValue, onFailure) => {
         let promise;
         try {
-          if (!isThenable(paused)) return settleOnce(onValue, permission());
+          if (!isThenable(paused)) return settleOnce(onValue, pauseOutcomeOf(paused));
           promise = Promise.resolve(paused);
         } catch (error) {
           return settleOnce(onFailure, error);
@@ -2343,11 +2442,11 @@ export default {
           return settleOnce(onFailure, error);
         }
       };
-      /** pause 失败收口：记 failed、warn，然后走 fail-closed 的 finish(false)。 */
+      /** pause 失败收口：记 failed、warn，然后走 fail-closed 的 finish("failed")。 */
       const failPause = (error) => {
         failed = true;
         logGoalHandoffError("pause", error);
-        return finish(false);
+        return finish("failed");
       };
       const finishResuming = () => {
         if (!isLiveRootAgent(agent)) return false;
@@ -2362,8 +2461,19 @@ export default {
         // failed 分支由 releaseRootGoalHandoff 的 exact admission 收口处理。
         return false;
       };
-      const finish = (permissionResult) => {
-        const pauseFailed = failed || permissionResult === false;
+      /**
+       * pause 结果的最终收口。
+       *
+       * @param {string} pauseResult - pauseOutcomeOf 的归一结果：
+       *   "paused"（本次真实 pause / 既有记录已持有）、"paused-external"（目标本来
+       *   就已暂停）、"none"（没有 durable goal）、"failed"（真实失败）。
+       * @returns {"paused"|"held"|"paused-external"|"none"|"failed"} 与入参同域：
+       *   "failed" / 外部暂停但无归属证据 表示调用方必须保留当前 root turn（批次保持开放）；
+       *   "none" 表示没有 durable goal：没有 barrier 需要维护，调用方照常可用但必须
+       *   如实报告 paused:false，绝不把它算作「已暂停」；
+       *   "paused" / "held" / 已登记托管 表示已建立 barrier，调用方可以 conclude。
+       */
+      const finish = (pauseResult) => {
         if (!isLiveRootAgent(agent)) {
           clearGoalHandoff(goalHandoffs, agent);
           clearPendingHandoffAdmissions(agent);
@@ -2371,24 +2481,44 @@ export default {
           settlePendingChildTurnEnds(agent, false);
           return false;
         }
+        if (pauseResult === "failed") {
+          // 真实 pause/get/CAS 失败时**不得**清除 pending admission，也不得把暂存终态按
+          // 失败结算：那会让 turn-stopping 兜底再也看不到这个 admission。armed goal 既没被
+          // 暂停（goal-round 继续驱动下一步），又失去了唯一的自动补救路径，模型只能反复
+          // 「需要等待」直到用户手动暂停。因此只记 warn 并 fail-closed 返回该 outcome，
+          // 让调用方保留 root turn，后续 turn 的兜底仍能用**同一 exact admission**重试。
+          logGoalHandoffError("pause", new Error("goal handoff pause failed for the exact root admission; keeping admission for retry"));
+          return pauseResult;
+        }
+        if (pauseResult === "none") {
+          // 没有 durable goal：本次**没有执行过 pause**，也谈不上失败——目标不存在时
+          // 没有任何 barrier 需要维护。如实返回 "none"（调用方据此报告 paused:false），
+          // 同时按既有「无 armed goal」语义释放这个 admission 与它的暂存终态，避免留下
+          // 一个没有释放边界、也永远不会再被 pause 的僵尸 admission。
+          removePendingHandoffAdmission(pendingAdmission);
+          settlePendingChildTurnEnds(agent, true, pendingAdmission);
+          return pauseResult;
+        }
         const handoff = goalHandoffs.get(agent.id);
-        const hasHandoff = handoff?.agent === agent && hasChildGoalHandoff(agent, childId, admissionId);
+        // 外部暂停（paused+disarmed）且存在 exact pending admission：登记托管记录，
+        // 使 child 完成后父 feedback 有可释放的等待原因（否则 goal 永久 paused）。
+        const adopted = pauseResult === "paused-external"
+          && adoptExternalPausedGoalForChild(agent, pausedExternalRef, pendingAdmission, admissionId);
+        if (pauseResult === "paused-external" && !adopted) {
+          // 没有归属证据（无 exact admission / 登记失败）：外部暂停必须保持 paused。
+          // 本 admission 不再需要 goal barrier，按原语义释放暂存终态并 fail-closed 返回
+          // false（绝不报告 paused，也绝不用 concludeTurn 伪装等待成功）。
+          removePendingHandoffAdmission(pendingAdmission);
+          settlePendingChildTurnEnds(agent, true, pendingAdmission);
+          return "failed";
+        }
+        const hasHandoff = adopted || (handoff?.agent === agent && hasChildGoalHandoff(agent, childId, admissionId));
         if (pendingAdmission !== void 0) {
           pendingAdmission.pauseDone = true;
           handoffAdmissionCohort.markPauseDone(pendingAdmission);
         }
         const feedbackSeen = pendingAdmission?.feedbackSeen === true;
-        if (pauseFailed) {
-          // pause/get/CAS 失败时 fail closed：只清理当前 exact root，不再次自动恢复。
-          // 同一 root 的 admission 共享一次 pause；该共享操作失败时所有已登记
-          // admission 都必须 fail closed，避免任一后续 finish 误放行自动恢复。
-          const pendingEntries = host.handoff.filter((item) => item.parent === agent);
-          // 共享 pause 失败只记录 exact admission token；裸 child key 会压制
-          // 同 child 的后续正常 admission，不能与 token fallback 同时写入。
-          rememberFailedHandoffChildren(agent, pendingEntries);
-          clearPendingHandoffAdmissions(agent);
-          settlePendingChildTurnEnds(agent, false);
-        } else if (hasHandoff) {
+        if (hasHandoff) {
           if (pendingAdmission !== void 0 && feedbackSeen) pendingAdmission.feedbackSeen = true;
           tryReleaseReadyChildHandoffs(agent);
         } else {
@@ -2396,13 +2526,15 @@ export default {
           // 没有 armed goal 时释放该 admission 的暂存终态，正常继续恢复链。
           settlePendingChildTurnEnds(agent, true, pendingAdmission);
         }
-        return permissionResult;
+        // finish 的返回值就是 pauseRootGoalForChild 的返回值（调用方 await 它，并用
+        // 归一契约判断是否放行），因此必须原样透传 outcome，不能折叠成 boolean。
+        return pauseResult;
       };
       // resuming 判定必须读取 pause 调用**之后**的记录状态（与既有语义一致）：
       // pause 可能新建记录，也必须在 resuming 记录上登记新 reason。
       let resumingRecord;
       try {
-        paused = pauseGoalForHandoff(goals, agent, goalHandoffs, { kind: "child", id: childId, ...(admissionId === void 0 ? {} : { admissionId }) }, (error) => {
+        paused = pauseGoalWithProof(goals, agent, goalHandoffs, { kind: "child", id: childId, ...(admissionId === void 0 ? {} : { admissionId }) }, (error) => {
           failed = true;
           logGoalHandoffError("pause", error);
         });
@@ -2463,6 +2595,16 @@ export default {
           message: "no open admission batch",
         };
       }
+      // 已关闭批次上的「无 admission」调用（epoch 0 + 空 token 集）是幂等 no-admission，
+      // 不是 stale：模型在没有调用任何 role 工具时被要求用这个凭据收口，重复调用必须与
+      // 首次调用（没有开放批次时的 no-admission）得到同一个结论，否则同一语义会随
+      // 「本 root 是否曾经开过批次」漂移。这个判定必须早于 epoch 比较——0 永远不等于
+      // 任何真实 epoch，放在后面会被 stale 分支抢先。**非零** epoch 仍然按
+      // stale-admission-epoch 拒绝（那是真的过期凭据），exact closed epoch 仍然是
+      // already-finalized，两者语义都不回归。
+      if (batch.closed === true && epoch === 0 && tokens.length === 0) {
+        return { kind: "noop", ...base, reason: "no-admission" };
+      }
       if (batch.epoch !== epoch) {
         return {
           kind: "rejected",
@@ -2504,10 +2646,27 @@ export default {
         batch.closed = true;
         return { kind: "noop", ...base, reason: "no-accepted-admission" };
       }
+      // 三阶段收口：① 校验（上面全部 return）+ 逐 admission pause；② 真实 pause 结果
+      // 决定批次是否收口；③ concludeTurn。三个阶段的结论必须分开表达，任何一步都不得
+      // 用另一步的结果掩盖（尤其是「没有执行 pause」绝不能被报告成 paused:true）。
+      //
+      // 计数器与 barrier 结论必须声明在 try **之外**：阶段 ③ 的 concludeTurn 是 DSH 注入
+      // 的真实副作用，可能抛错。若它们声明在 try 内，catch 就只能退回 base（paused:false），
+      // 于是「pause 已真实成功、handoff record 仍 held」这一既成事实会被错误地抹掉，模型
+      // 既不知道 barrier 已经建立，也无从判断后续该等什么。
+      let pausedCount = 0;
+      let heldCount = 0;
+      let externalCount = 0;
+      // 两个「没有 barrier」的原因必须分开统计，否则无法区分「已收口」与「没有目标」：
+      // - releasedCount：admission 已被其他路径释放/清理，本来就不需要再 pause；
+      // - noGoalCount：当前根本没有 durable goal，属于可用性路径（不是失败）。
+      let releasedCount = 0;
+      let noGoalCount = 0;
+      // 本次批次是否真的建立了等待 barrier（见下方 barrierEstablished 的赋值点）。
+      // catch 只读取它，不重新推断——重入与异常路径都不允许改写已成立的事实。
+      let barrierEstablished = false;
       batch.finalizing = true;
       try {
-        let pausedCount = 0;
-        let skippedCount = 0;
         for (const entry of acceptedEntries) {
           if (!host.lineage.isLiveGeneration(parent, rootToken)) {
             batch.closed = true;
@@ -2520,42 +2679,100 @@ export default {
           // 真实 pause/get/CAS 失败）。
           const admission = entry.outcome.handoffAdmission;
           if (host.handoff.contains(admission) !== true || admission.parent !== parent) {
-            skippedCount += 1;
+            releasedCount += 1;
             continue;
           }
-          const paused = await pauseRootGoalForChild(parent, entry.outcome.subagentId, admission);
-          if (paused === false) {
-            batch.closed = true;
-            return { kind: "rejected", ...base, acceptedCount: acceptedEntries.length, reason: "goal-pause-failed" };
+          const pausedOutcome = await pauseRootGoalForChild(parent, entry.outcome.subagentId, admission);
+          if (pausedOutcome === "paused") {
+            pausedCount += 1;
+            continue;
           }
-          pausedCount += 1;
+          if (pausedOutcome === "held") {
+            heldCount += 1;
+            continue;
+          }
+          if (pausedOutcome === "paused-external") {
+            // 目标已被外部（用户/上一代实例）暂停，且存在同一 live root/generation 下的
+            // exact pending child admission：已登记托管，child 全部完成后由 feedback 释放。
+            // 这里**没有**执行 pause，因此绝不能计入 pausedCount（否则「pause 次数」会失真）；
+            // 但托管登记本身**就是**本插件建立的等待 barrier：record 已 held、release 边界
+            // 由父 feedback 决定，因此它必须计入 barrier 统计（见下方 barrierEstablished）。
+            externalCount += 1;
+            continue;
+          }
+          if (pausedOutcome === "none") {
+            // 没有 durable goal：没有可暂停的目标，也就**不能谎报 paused:true**。
+            // 但它不是失败——既有契约要求这种情况保持可用（照常 conclude 当前 turn），
+            // 因此这里只如实记录「没有执行过 pause」，由后续阶段正常收口。
+            noGoalCount += 1;
+            continue;
+          }
+          // 真实 pause/get/CAS 失败：**不关闭批次**，也不清理 admission —— 那是模型重试
+          // finalize 与 turn-stopping 兜底补 pause 的唯一依据。fail-closed 只体现在返回值。
+          return {
+            kind: "rejected",
+            ...base,
+            acceptedCount: acceptedEntries.length,
+            reason: "goal-pause-failed",
+            message: "durable goal pause failed for an exact admission; the batch stays open for retry",
+          };
         }
-        if (pausedCount === 0) {
+        if (pausedCount === 0 && heldCount === 0 && externalCount === 0 && noGoalCount === 0) {
           // 全部 accepted admission 都已被其他路径收口/释放：按 no-accepted-admission
           // 的 noop 语义关闭本 epoch（不 conclude：没有留下任何需要 barrier 的等待）。
           batch.closed = true;
           return { kind: "noop", ...base, acceptedCount: acceptedEntries.length, reason: "admissions-already-released" };
         }
+        // paused 表示「本插件已经建立了等待 barrier」，而不是「本次调用过几次 pause」：
+        // - pausedCount：本次真实执行了 pause（或在既有 record 上补了精确 CAS 基准）；
+        // - heldCount：本 root 已有处于 paused/等待释放状态的 record，本次只是追加原因；
+        // - externalCount：目标本来就被外部暂停，插件按 exact admission 归属证据**已登记
+        //   托管**——record 已 held，父 feedback 到达时会真实 resume 一次，barrier 成立。
+        // 只有 no-goal（没有可等待对象）、未托管的外部暂停（已 fail-closed 返回 failed，
+        // 走不到这里）、以及纯 released admission（noop 分支）才不是 barrier。
+        // 赋值给 try 外的 barrierEstablished，供阶段 ③ 异常时如实回执。
+        barrierEstablished = pausedCount + heldCount + externalCount > 0;
+        // 阶段 ③：pause 已经确定成功（goal 处于 paused/托管态，record 保留），但 concludeTurn
+        // 不可用时不得把它伪装成成功：关掉本 epoch 防重复 pause，同时如实报告
+        // paused:true / concluded:false，让模型知道 barrier 已建立但 turn 没有结束。
         if (typeof exec?.concludeTurn !== "function") {
           batch.closed = true;
-          return { kind: "rejected", ...base, acceptedCount: acceptedEntries.length, reason: "conclude-turn-unavailable" };
+          return {
+            kind: "rejected",
+            ...base,
+            acceptedCount: acceptedEntries.length,
+            paused: barrierEstablished,
+            concluded: false,
+            reason: "conclude-turn-unavailable",
+            message: "goal pause succeeded and the handoff record is held, but concludeTurn is unavailable",
+          };
         }
         batch.closed = true;
+        const reason = releasedCount > 0 ? "finalized-with-released-admissions"
+          : (externalCount > 0 ? "finalized-with-external-pause" : "finalized");
         exec.concludeTurn();
         return {
           kind: "finalized",
           ...base,
           acceptedCount: acceptedEntries.length,
-          paused: pausedCount > 0,
+          // 没有建立任何 barrier 时如实为 false；既有的 finalized/accept 语义不受影响。
+          paused: barrierEstablished,
           concluded: true,
-          reason: skippedCount > 0 ? "finalized-with-released-admissions" : "finalized",
+          reason,
         };
       } catch (error) {
+        // 阶段 ③（concludeTurn）真实抛错：turn 没有结束，因此绝不能报告 finalized/concluded。
+        // 但 pause 已经在阶段 ② 落地、handoff record 仍 held，这个既成事实也不能因为收尾
+        // 失败而被抹掉——如实回报 paused（仅当本次批次真的建立了 barrier）与 concluded:false，
+        // 并保留既有 message。批次沿用既有防重入语义关闭（否则同一 epoch 会反复重试 conclude，
+        // 而 barrier 已经建立，重复 pause 只会制造噪声），后续释放边界仍是父 feedback。
         batch.closed = true;
         return {
           kind: "rejected",
           ...base,
           acceptedCount: acceptedEntries.length,
+          paused: barrierEstablished,
+          concluded: false,
           reason: "finalization-failed",
           message: error instanceof Error ? error.message : String(error),
         };
@@ -2818,6 +3035,10 @@ export default {
       if (goalHandoffStopping || !isRootAgentIdentity(parent) || !isLiveRootAgent(parent)) return;
       if (typeof goals?.get !== "function" || typeof goals?.pause !== "function") return;
       const ledger = automaticHandoffScope(parent, payload?.turn);
+      // 触发通道 1（问题 2）：root turn 即将关闭时，已在运行但还没有 goal 屏障的 fan-out 任务
+      // 必须在这里补建等待原因。否则本 turn 结束后 root 变 idle，armed goal 会立刻驱动下一轮
+      // <goal_round>，与「等 fan-out 结果」冲突。补建只读当前 GoalService，因此可重入、可合并。
+      reconcileUnbarrieredFanoutHandoffs();
       const candidates = pendingRootAutomaticAdmissions(parent).filter((item) => !ledger.tokens.has(item.token));
       if (candidates.length === 0) {
         // 没有未收口的 role admission：只需确认在飞的异步 pause 早于 turn 关闭落地。
@@ -2834,11 +3055,14 @@ export default {
         if (goalHandoffStopping || !isLiveRootAgent(parent)) return;
         // 复用 finalize 的 exact admission 入口：reason 键（child:id:token）与后续
         // feedback 释放路径完全一致，成功时同时标记 cohort pauseDone，release 才可能发生。
-        const paused = await pauseRootGoalForChild(parent, candidate.childId, candidate.admission);
-        // 首个失败即停止本轮：pause 失败会走 fail-closed 清理并摘除该 root 的**全部**
-        // admission，后续 candidate 都变成 stale 对象（再 pause 只会退化成裸 child:<id>
-        // reason）。已记账的 token 保持记账，同一 turn 不重放；这里是防 stale，不是抛错。
-        if (paused === false) break;
+        const pauseOutcome = await pauseRootGoalForChild(parent, candidate.childId, candidate.admission);
+        // 首个失败即停止本轮（不抛错）：pauseRootGoalForChild 的归一契约里
+        // "paused"/"held"/"paused-external" 都表示 exact admission 已有归属/托管；
+        // "none" 表示没有 durable goal（无需继续）；其余（"failed"）停止本轮，
+        // 已记账的 token 保持记账，同一 turn 不重放。
+        // 注意：失败路径**不再**摘除 admission（那会让本兜底自己失去补救依据），
+        // 因此下一 turn 的 turn-stopping 仍可用同一 exact admission 重试。
+        if (pauseOutcome === "failed" || pauseOutcome === "none") break;
       }
     }
 
@@ -3928,6 +4152,35 @@ export default {
       return true;
     }
 
+    /**
+     * root 代际退休时释放它持有的 fan-out handoff 登记。
+     *
+     * 为什么必须做：登记记录的归属凭据是注册当时捕获的 exact Agent 对象。旧代际退休后
+     * 它的分片会随 agent/disposed 一起收敛，**不会再产生 task_settled**；若记录仍留在表里
+     * 并保持 pending/active，补建路径就可能（在极端的同 id replacement 场景下）被误导。
+     * 这里统一标记 released：既不凭空 resume，也让后续 reconcile 只能在「新代际确实拥有
+     * 该任务」时按新代次重新登记，绝不继承旧代际的等待原因。
+     *
+     * @param {object} previous - 正在退休的 exact root Agent。
+     */
+    function releaseFanoutHandoffRecordsForRetiredRoot(previous) {
+      let evidenceDropped = false;
+      for (const [parentTaskId, record] of [...fanoutHandoffRecords]) {
+        if (record?.agent !== previous) continue;
+        if (record.state !== "released") record.state = "released";
+        fanoutHandoffRecords.delete(parentTaskId);
+        // 归属证据必须与该 root 的登记一起摘除：这些任务不会再 settle，releaseFanoutGoalHandoff
+        // 永远不会为它们调用 forgetFanoutPauseEvidence，于是「本插件为该任务暂停过 goal」
+        // 的证据会永久留在快照里，让后续冷恢复误认归属。
+        // 必须传入 previous（exact 退休对象）：证据以 root.id 为键，同 id 的 replacement
+        // root 可能已为**同一个** parentTaskId 建立新证据；只按 id 删除会让旧代次的迟到
+        // dispose 抹掉新代次的证据（归属证明丢失 → goal 永久 paused）。owner 不同的 entry
+        // 一律拒绝删除（见 forgetFanoutPauseEvidence）。
+        if (forgetFanoutPauseEvidence(previous.id, parentTaskId, previous)) evidenceDropped = true;
+      }
+      if (evidenceDropped) flushFanoutGoalHandoffEvidence();
+    }
+
     function retireRootGeneration(previous) {
       if (!isRootAgentIdentity(previous) || typeof previous.id !== "string") return;
       const previousGeneration = rootGenerationRegistry.generationOf(previous.id);
@@ -3941,6 +4194,9 @@ export default {
       const previousToken = host.lineage.tokenOf(previous);
       if (previousToken !== void 0) previousToken.active = false;
       clearGoalHandoff(goalHandoffs, previous);
+      // 旧代际的分片不会再产生 task_settled：必须同时摘除它持有的 fan-out 登记，
+      // 否则那些「永远等不到释放」的 reason 会把 durable goal 永久钉在 paused。
+      releaseFanoutHandoffRecordsForRetiredRoot(previous);
       pendingChildTurnEnds.delete(previous);
       failedHandoffChildren.delete(previous);
       clearPendingHandoffAdmissions(previous);
@@ -4158,6 +4414,11 @@ export default {
         rootGenerationRegistry.retire(agent.id, agent);
       }
       if (agent !== void 0) clearGoalHandoff(goalHandoffs, agent);
+      // 与 retireRootGeneration 同一语义：root dispose 后它的分片不会再产生
+      // task_settled，登记的 fan-out 等待原因永远等不到释放。必须同时摘除这些记录，
+      // 否则它们会以「未释放」状态把同 id 新代际的 retry/重新提交幂等短路掉，使新任务
+      // 拿不到 goal 屏障（旧代际的登记绝不能被新代际继承）。
+      if (rootDisposed) releaseFanoutHandoffRecordsForRetiredRoot(agent);
       if (typeof agent?.id === "string") {
         const current = childActivationStates.get(agent.id);
         // 只释放当前对象；旧 Activation 的迟到 disposed 不得删除新对象。
@@ -4729,8 +4990,13 @@ export default {
     function forgetTaskIfCurrentChild(record, taskKey) {
       if (record === null || typeof record !== "object") return false;
       const scope = delegationScopeKey(record.parentId, record.role);
-      const current = delegationTracker.getChild(scope);
-      if (!shouldForgetTask(current?.childId, record.childId)) return false;
+      // 多 child 语义：归属判定优先看「这个任务 key 绑定的 child」，而不是「本 scope
+      // 最近一个 child」——同 route 下并存的独立 child 各自持有自己的任务指纹，较早
+      // child 的确定失败同样必须能 forget 它自己的任务（否则相同 prompt 会被永久
+      // 判为 reused 并等一个永远不会结算的 turn）。
+      const bound = delegationTracker.getTaskChild(scope, taskKey);
+      const owner = bound !== void 0 ? bound.childId : delegationTracker.getChild(scope)?.childId;
+      if (!shouldForgetTask(owner, record.childId)) return false;
       return delegationTracker.forgetTask(scope, taskKey);
     }
 
@@ -5013,7 +5279,12 @@ export default {
       let messageId;
       const scope = delegationScopeKey(record.parentId, record.role);
       const current = delegationTracker.getChild(scope);
-      const routeChanged = current !== void 0 && (current.childId !== record.childId || (record.routeKey !== void 0 && current.routeKey !== record.routeKey));
+      // 多 child 语义：scope.current 只是「本 scope 最近一次新建/恢复的 child」，它可能
+      // 是另一个独立任务的 child。同一个 route 下另一个 child 的自动恢复**不是**route
+      // 变更，必须继续向 record 自己的 child 投递恢复消息；只有 route 真的变了（或记录
+      // 没有 route 信息、只能退回 child 身份比较的旧记录）才走重建。
+      const routeChanged = current !== void 0
+        && (record.routeKey !== void 0 ? current.routeKey !== record.routeKey : current.childId !== record.childId);
       try {
         if (shouldRebuildRecoveryChild(void 0, { routeChanged })) {
           // route 改变时不再向旧 child sendMessage，直接以保存的原 route 重建。
@@ -5240,6 +5511,11 @@ export default {
             // 不能被旧代际 user/message 误当作本次等待的用户回答。
             clearRootUserWait(liveAgent, session);
             releaseRootGoalHandoff(liveAgent, { kind: "user" });
+            // 触发通道 2（问题 2）：真实用户输入开启新的 root run，也正是 durable goal 被
+            // 创建或恢复成 active+armed 的边界。此刻必须重新读一次 GoalService，为「提交时
+            // 还没有 goal」的 fan-out 任务补建等待原因，否则整个 turn 内 root 都会在 armed
+            // goal 上抢跑。判定完全基于当前事实，重复触发是幂等的。
+            reconcileUnbarrieredFanoutHandoffs();
             // 真实用户输入开启新的 root run：只有这里会重置"本 run 至多一次"的终止
             // 通知资格。subagent-settled/agent-message 等注入消息不进入该分支，
             // 因此子代理结算回唤出的续接 turn 仍然属于同一 run，不会重复提示。
@@ -5624,7 +5900,15 @@ export default {
      *   时才说明「自我们暂停之后没有任何人改动过这个 goal」；一旦被 edit/resume/pause
      *   过（revision 前进），归属就无法证明，必须 fail-closed 保持 paused；
      * - tasks：本插件为该 root 的哪些父任务暂停过 goal（含每次登记时的 reason 键与代次），
-     *   用于确认「这个父任务确实由本插件登记过」，也便于诊断。
+     *   用于确认「这个父任务确实由本插件登记过」，也便于诊断；
+     * - agent（**内存字段，永不持久化**）：建立这条证据的 exact root Agent **对象**。
+     *   为什么必须有它：证据表以 root.id 字符串为键，而同 id 的 replacement root（R2）
+     *   可以合法地为同一个 parentTaskId 建立自己的证据。只按 id 记账时，旧代次（R1）的
+     *   迟到清理/迟到登记就会以「同 id」的名义删掉或覆盖 R2 的证据，让后续的
+     *   adopt/release 归属证明凭空丢失（goal 永久停在 paused，或反过来被提前 resume）。
+     *   对象身份无法被同 id 伪造，因此 owner 只认 exact 对象；冷恢复（证据来自快照）时
+     *   该字段为空，由第一个为它登记证据的 live root 绑定（见 rememberFanoutPauseEvidence）。
+     *   持久化投影（fanoutPauseEvidenceSnapshot）只投影 goalId/revision/tasks，绝不写入本字段。
      *
      * 证据只在两个时刻变化（登记成功 / 释放完成），因此显式 flush 的频率与 fanout 任务
      * 数量同阶，不构成写放大。持久化位置是既有 fanout snapshot 负载（键 goalHandoffs），
@@ -5653,7 +5937,14 @@ export default {
      * shared.accept() 重新暂停）会推进 revision，因此每次调用都重新读取，保证证据与
      * 真实 pause 对齐，而不是留下过期 revision 让冷恢复 fail-closed。
      *
-     * @returns {boolean} 是否成功记录（record 不存在/不是 paused/ref 非法时为 false）。
+     * 代际边界（与 forgetFanoutPauseEvidence 成对）：entry 已绑定**另一个** exact owner
+     * 时本函数 fail-closed —— 绝不覆盖新代次的证据。否则同 id 的旧代次（R1）的迟到
+     * settle 会用自己那份过期 ref 覆盖 R2 的 {goalId, revision} 并塞进 R1 的任务，
+     * 让 R2 的证据匹配（fanoutPauseEvidenceMatches 要求 revision 完全相等）永久失败。
+     * 冷恢复 entry 没有内存 owner（快照里没有对象），因此由**第一个**为它登记证据的
+     * live root 绑定；此后的同对象调用（re-pause 刷新 revision、托管后重登记）都合法。
+     *
+     * @returns {boolean} 是否成功记录（record 不存在/不是 paused/ref 非法/owner 不同为 false）。
      */
     function rememberFanoutPauseEvidence(agent, parentTaskId, attempt) {
       const handoff = goalHandoffs.get(agent?.id);
@@ -5661,6 +5952,9 @@ export default {
       const ref = handoffPausedRef(handoff);
       if (ref === void 0) return false;
       const entry = fanoutPauseEvidence.get(agent.id) ?? { goalId: ref.id, revision: ref.revision, tasks: new Map() };
+      // exact owner 校验：已绑定别的对象（同 id 的另一代）即拒绝，不覆盖、不改 revision。
+      if (entry.agent !== void 0 && entry.agent !== agent) return false;
+      entry.agent = agent;
       entry.goalId = ref.id;
       entry.revision = ref.revision;
       entry.tasks.set(parentTaskId, {
@@ -5671,10 +5965,29 @@ export default {
       return true;
     }
 
-    /** 释放一个父任务对证据的占用；该 root 再无占用时整条证据移除。 */
-    function forgetFanoutPauseEvidence(rootId, parentTaskId) {
+    /**
+     * 释放一个父任务对证据的占用；该 root 再无占用时整条证据移除。
+     *
+     * 代际边界：调用方必须传入**执行这次释放的 exact root Agent**（expectedAgent）。
+     * 证据以 root.id 为键，同 id 的 replacement root（R2）可能已经为同一个
+     * parentTaskId 建立了新证据；只按字符串 id 删除会让旧代次（R1）的迟到清理把 R2
+     * 的证据一并抹掉，使后续 adopt/release 的归属证明丢失（goal 永久停在 paused）。
+     * 因此 entry 已绑定**不同** exact owner 时一律拒绝删除（fail-closed，返回 false）。
+     *
+     * 冷恢复 entry（快照恢复，没有内存 owner）保持既有可用语义：允许删除，因为它的
+     * 归属只能由「当前 live root 的显式释放」来终结（releaseFanoutGoalHandoff /
+     * applyRestoredFanoutRelease 都只由 exact live root 触发），而快照本身无法表达
+     * 代际；expectedAgent 缺省（undefined）同样保持历史行为，供无 owner 语义的调用方使用。
+     *
+     * @param {string} rootId - 证据的 root id 键。
+     * @param {string} parentTaskId - 要释放占用的父任务 id。
+     * @param {object} [expectedAgent] - 执行本次释放的 exact root Agent。
+     * @returns {boolean} 是否确实删掉了一条占用（被 owner 门控拒绝时为 false）。
+     */
+    function forgetFanoutPauseEvidence(rootId, parentTaskId, expectedAgent) {
       const entry = fanoutPauseEvidence.get(rootId);
       if (entry === void 0) return false;
+      if (expectedAgent !== void 0 && entry.agent !== void 0 && entry.agent !== expectedAgent) return false;
       const removed = entry.tasks.delete(parentTaskId);
       if (entry.tasks.size === 0) fanoutPauseEvidence.delete(rootId);
       return removed;
@@ -5767,6 +6080,85 @@ export default {
     }
 
     /**
+     * 一个 fan-out 登记记录是否仍由**exact live root**持有（托管/重建的唯一身份前提）。
+     *
+     * 为什么不能只看 record.ownerId 字符串：同 id 的 replacement root 会让字符串比较通过，
+     * 于是新代际就能替旧代际的任务登记等待原因。这里的三个条件缺一不可：
+     * 1. record.agent 是注册当时捕获的 exact Agent **对象**（对象身份无法被同 id 伪造）；
+     * 2. 它仍是当前 live root（未被销毁/未被同 id 新代际取代）；
+     * 3. fanoutHost.ownsTask 能证明「活动绑定 + 绑定代际 token 仍 live」——与 continuation
+     *    写路径同一套硬条件，不使用 settledParentSessions 之类的寻址索引兜底。
+     *
+     * 记录的三态（pending/active/released）**不**参与身份判定：已释放的记录同样由同一个
+     * exact root 持有，调用方按自己的语义决定「已释放」是跳过还是重新登记（补建路径会重新
+     * 登记，托管路径会 fail-closed）。把它们混在一起判会让补建永远看不到可重新登记的记录。
+     *
+     * @param {object} agent - 候选 root Agent。
+     * @param {string} parentTaskId - fan-out 父任务 id。
+     * @returns {object|undefined} 通过校验的登记记录；无法证明归属时 undefined。
+     */
+    function fanoutHandoffRecordIsOwnedByLiveRoot(agent, parentTaskId) {
+      if (goalHandoffStopping || !isLiveRootAgent(agent)) return void 0;
+      if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return void 0;
+      const record = fanoutHandoffRecords.get(parentTaskId);
+      if (record === void 0 || record.agent !== agent) return void 0;
+      if (typeof fanoutHost?.ownsTask !== "function" || fanoutHost.ownsTask(agent, parentTaskId) !== true) return void 0;
+      return record;
+    }
+
+    /**
+     * fan-out 提交/重试时目标**已被外部暂停**（paused + disarmed）的归属证据门控托管。
+     *
+     * 背景（问题 2）：fanout 提交路径过去只走 pauseGoalForHandoff，它把 paused-external
+     * 折叠成 undefined，于是既不登记 handoff 也没有任何释放边界——任务 settle 后目标永远
+     * 停在 paused。role admission 路径有 adoptExternalPausedGoalForChild，fanout 需要一条
+     * **独立**的等价分支。
+     *
+     * 为什么不能照搬「视图形状即可托管」：光看到 paused+disarmed 完全无法证明这个 pause
+     * 与本次 fan-out 有关（用户手动 pause、其他插件、上一代实例都会产生同样的视图）。
+     * 因此托管前必须同时拿到四类 exact 证据：
+     * 1. exact live root Agent + 其 lineage generation（isLiveRootAgent + ownsTask 的绑定
+     *    token 校验）——同 id replacement / 已销毁 root 一律不成立；
+     * 2. accepted parentTaskId 的真实归属（fanoutHost.ownsTask，活动绑定 + 代际证据）；
+     * 3. 当前登记代次身份：record 必须仍是本进程为该 parentTaskId 建立的那一条
+     *    （attempt 由插件进程级全局序号分配，旧代次的迟到路径无法伪造）；
+     * 4. GoalService 读回的 exact {id, revision} 必须与我们 CAS 基准逐字段一致——
+     *    adoptablePausedGoalRef 已经校验了 paused+disarmed 形状与可用的 id/revision，
+     *    这里再显式对比一次，保证「登记时读到的 ref」就是「后续 release 用来 resume 的 ref」。
+     *
+     * 任一条不成立即 fail-closed：标记记录 released（不留 active 孤儿，后续 reconcile 可
+     * 在目标重新 armed 时重试），**绝不 resume**，也绝不用当前视图的 ref 去猜。
+     *
+     * @param {object} parent - exact live root Agent。
+     * @param {string} parentTaskId - accepted 的 fan-out 父任务 id。
+     * @param {object} record - 本次登记的 record（attempt 身份）。
+     * @param {number} attempt - 本次登记代次。
+     * @param {unknown} ref - pauseGoalWithProof 返回的 exact paused ref。
+     * @returns {boolean} 是否完成托管登记。
+     */
+    function adoptFanoutExternalPause(parent, parentTaskId, record, attempt, ref) {
+      const failClosed = (detail) => {
+        if (record.state !== "released") record.state = "released";
+        ctx.logger.warn("dsh-expert-group: fan-out handoff could not adopt an externally paused goal for "
+          + parentTaskId + " (" + detail + "); keeping goal paused");
+        return false;
+      };
+      // 已被 release 抢先收口（任务在 pause 证明返回前就 settle 了）：不得复活记录。
+      if (record.state === "released") return failClosed("handoff record was already released");
+      const owned = fanoutHandoffRecordIsOwnedByLiveRoot(parent, parentTaskId);
+      if (owned !== record) return failClosed("task ownership is not provable for the exact live root");
+      const pausedRef = adoptablePausedGoalRef({ id: ref?.id, revision: ref?.revision, phase: "paused", activation: "disarmed" });
+      if (pausedRef === void 0) return failClosed("pause proof did not carry an adoptable exact ref");
+      if (pausedRef.id !== ref?.id || pausedRef.revision !== ref?.revision) return failClosed("pause proof ref is not exact");
+      const reason = { kind: "fanout", id: parentTaskId, attempt };
+      if (!registerPausedGoalHandoff(parent, goalHandoffs, reason, pausedRef)) {
+        return failClosed("handoff record could not be registered");
+      }
+      record.state = "active";
+      return true;
+    }
+
+    /**
      * fan-out 提交/重试成功后的 goal 等待原因登记。
      *
      * fanout 的语义是「root 结束 turn，任务在后台按自己的调度推进，整体 settle 后回唤
@@ -5814,10 +6206,10 @@ export default {
       pruneFanoutHandoffRecords();
       const reason = { kind: "fanout", id: parentTaskId, attempt };
       const reasonKey = fanoutHandoffReasonKey(parentTaskId, attempt);
-      const settle = () => {
+      const settle = (proof) => {
         // 判定标准不是 pause 的返回值，而是「reason 是否真的登记进了 live record」：
-        // resuming/pausing 期间 pauseGoalForHandoff 会把新 reason 挂到同一 record 并返回
-        // 在飞 operation，其 resolve 值可能是 false（accept() 的 re-pause 分支返回 false），
+        // resuming/pausing 期间 pause 会把新 reason 挂到同一 record 并返回在飞
+        // operation，其 resolve 值可能是 false（accept() 的 re-pause 分支返回 false），
         // 但那并不表示登记失败——reason 仍在，re-pause 完成后 goal 仍被暂停。
         const handoff = goalHandoffs.get(parent.id);
         const registered = handoff?.agent === parent && handoff.reasons instanceof Map
@@ -5831,29 +6223,45 @@ export default {
         // 已被 release 抢先收口（任务在 pause resolve 之前就 settle 了）：不得复活记录。
         if (record.state === "released") return false;
         record.state = "active";
-        // 只有真正暂停过（state === "paused"）才记录归属证据：这是冷恢复能够区分
-        // 「本插件的 pause」与「外部 paused/disarmed」的唯一依据。
-        if (rememberFanoutPauseEvidence(parent, parentTaskId, attempt)) flushFanoutGoalHandoffEvidence();
+        // 只有真正暂停过（本插件的 pause，含既有 record 上的 held 幂等路径）才记录归属
+        // 证据：这是冷恢复能够区分「本插件的 pause」与「外部 paused/disarmed」的唯一依据。
+        // paused-external 托管路径不是我们执行的 pause，因此这里不会（也不该）留下证据：
+        // 它的 CAS 基准来自调用方读到的 exact paused 视图，不是我们 pause 的产物。
+        // 兼容投影（proof === true，来自 pauseGoalForHandoff 的降级路径）同样算真实 pause。
+        const realPause = proof === true || proof?.outcome === "paused" || proof?.outcome === "held";
+        if (realPause && rememberFanoutPauseEvidence(parent, parentTaskId, attempt)) {
+          flushFanoutGoalHandoffEvidence();
+        }
         return true;
+      };
+      // 统一收口：paused-external 先走归属证据门控的托管分支，其余交给 settle。
+      const finishRegistration = (proof) => {
+        if (proof?.outcome === "paused-external") return adoptFanoutExternalPause(parent, parentTaskId, record, attempt, proof.ref);
+        return settle(proof);
       };
       let paused;
       try {
-        paused = pauseGoalForHandoff(goals, parent, goalHandoffs, reason, (error) => {
+        // 用 pauseGoalWithProof 而不是兼容入口：目标可能已被外部（用户手动 /goal pause）
+        // 暂停，兼容入口会把 paused-external 折叠成 undefined，调用方就无法区分
+        // 「没有 durable goal」与「目标已暂停但不是我们暂停的」。后者必须走归属证据门控的
+        // 托管分支（见 finishRegistration / adoptFanoutExternalPause），否则 fan-out 任务
+        // settle 时根本没有释放边界，durable goal 会永久停在 paused。
+        paused = pauseGoalWithProof(goals, parent, goalHandoffs, reason, (error) => {
           logGoalHandoffError("pause", error);
         });
       } catch (error) {
         logGoalHandoffError("pause", error);
-        return settle();
+        return finishRegistration(void 0);
       }
       if (isThenable(paused)) {
         // remote adapter 的异步 pause 不能阻塞工具返回；结果只影响登记/证据，不影响任务受理。
-        void Promise.resolve(paused).then(settle, (error) => {
+        void Promise.resolve(paused).then(finishRegistration, (error) => {
           logGoalHandoffError("pause", error);
-          settle();
+          finishRegistration(void 0);
         });
         return true;
       }
-      return settle();
+      return finishRegistration(paused);
     }
 
     /**
@@ -5878,7 +6286,8 @@ export default {
       record.state = "released";
       releaseRootGoalHandoff(agent, { kind: "fanout", id: parentTaskId, attempt: record.attempt }, void 0, (handoffState) => {
         if (handoffState === "resumed" || handoffState === "failed" || handoffState === "none") {
-          forgetFanoutPauseEvidence(agent.id, parentTaskId);
+          // 传入本次释放的 exact root：证据若已属于同 id 的另一代，绝不由本次释放删除。
+          forgetFanoutPauseEvidence(agent.id, parentTaskId, agent);
           flushFanoutGoalHandoffEvidence();
           return;
         }
@@ -6078,6 +6487,132 @@ export default {
      * 只处理本进程尚未登记的父任务（records 缺失或已释放），因此重复调用幂等，也不会
      * 覆盖当前活动代次。
      */
+    /**
+     * 为「已在运行、但还没有任何 goal 屏障」的 fan-out 任务补建等待原因（问题 2 的第二半）。
+     *
+     * 竞态：fanout 被 accepted/running 时 root 可能根本没有 durable goal（goals.get 返回
+     * undefined），登记路径按既有语义不建立任何 reason；之后**同一个 live root** 下 goal 才
+     * 被创建或恢复成 active+armed。此时若没有任何触发点重新读一次 GoalService，root 变 idle
+     * 时 goal-round-driver 会立刻注入新的 <goal_round>，与「等 fan-out 结果」冲突——这正是
+     * 现有 reconcile/turn-stopping 漏掉的窗口。
+     *
+     * 触发方式刻意做成「最小、可重入、可合并」：本函数不做任何自己的状态记账，只把当前
+     * 事实（manager 权威任务 + 本进程登记记录 + **动态读到的** GoalService 视图）合起来判定，
+     * 因此可以被 root run 边界事件反复调用而不产生副作用放大。可合并性来自
+     * registerFanoutGoalHandoff 自己的幂等短路（既有非 released 记录直接返回）以及它在任何
+     * await 之前就写入的 provisional 记录——同 tick 的第二次调用不会发出第二次 pause。
+     *
+     * 归属边界（与 item 5 的冷恢复门控同源，但**不复用**持久化证据）：
+     * - 只处理本进程真实登记过的 parentTaskId（没有 record 就不猜、不凭空 pause）；
+     * - record.agent 必须是 exact live root 对象，且 fanoutHost.ownsTask 能证明活动绑定与
+     *   绑定代际 token 仍 live（见 fanoutHandoffRecordIsOwnedByLiveRoot）。**不使用**
+     *   fanoutHost.ownerOf 解析出的持久化 ownerId 当凭据——那只是字符串，同 id 的
+     *   replacement 会让它通过；
+     * - 任务必须是 manager 的**非终态**任务：终态任务不会再有 task_settled，登记原因等于
+     *   把 goal 永久钉在 paused（那是 release 路径的职责）；
+     * - 只有 armed+active 才登记。目标已 paused+disarmed 时**不在这里**托管：那是提交/
+     *   重试时带 exact 证据的 adoptFanoutExternalPause 的职责，兜底路径没有当时的 ref。
+     *
+     * @returns {number} 本次补建屏障的任务数。
+     */
+    function reconcileUnbarrieredFanoutHandoffs() {
+      if (goalHandoffStopping || !fanoutHost) return 0;
+      if (fanoutHandoffRecords.size === 0) return 0;
+      if (typeof goals?.get !== "function") return 0;
+      let reconciled = 0;
+      for (const [parentTaskId, record] of [...fanoutHandoffRecords]) {
+        // 只处理本进程登记过、但还没有活动屏障的记录（pending=在飞、released=上次失败/已释放）。
+        if (record?.state !== "pending" && record?.state !== "released") continue;
+        const agent = record.agent;
+        const owned = fanoutHandoffRecordIsOwnedByLiveRoot(agent, parentTaskId);
+        if (owned === void 0 || owned !== record) continue;
+        // 进入异步读取前的第一次权威任务判定：已终态任务没有释放边界，直接跳过。
+        const task = fanoutHost.getTask(parentTaskId);
+        if (task === null || fanoutTaskIsTerminal(task)) continue;
+        let view;
+        try {
+          view = goals.get(agent);
+        } catch (error) {
+          logGoalHandoffError("get", error);
+          continue;
+        }
+        if (isThenable(view)) {
+          // 动态读取：异步 GoalService 下不能同步判定，等它落地后再走同一条判定。
+          // 注意：回调进入注册前必须**重新复查**任务与归属（见
+          // fanoutRegistrationTaskRecheck）——等待期间任务可能已经 task_settled。
+          void Promise.resolve(view).then((resolved) => {
+            applyUnbarrieredFanoutRegistration(agent, parentTaskId, record, resolved);
+          }, (error) => logGoalHandoffError("get", error));
+          continue;
+        }
+        if (applyUnbarrieredFanoutRegistration(agent, parentTaskId, record, view)) reconciled += 1;
+      }
+      return reconciled;
+    }
+
+    /**
+     * 异步窗口结束、真正进入注册前的**权威任务复查**（问题 2 的 P1 竞态收口）。
+     *
+     * 竞态形态：reconcile 与冷恢复都是「同步判定任务非终态 → await goals.get() → 回调里
+     * 注册」。等待期间任务完全可能已经 task_settled：旧 record 被标记 released 且 release
+     * 已经完成（冷恢复下甚至还没有 record，release 只能走 no-op）。此时回调若继续注册，
+     * 就会为一个**再也不会产生 task_settled** 的任务登记 reason —— goal 永久停在 paused。
+     *
+     * 因此注册前必须重新读一次 manager 的权威任务并逐条复查，任一条不成立即返回 undefined，
+     * 调用方按 released/no-op 收口，绝不重新注册：
+     * 1. **任务仍非终态**：重新调用 fanoutHost.getTask(parentTaskId) 读取当前权威状态，
+     *    绝不复用等待前那次读取的结果，也绝不用伪造的 {status:"pending"} 绕过它；
+     * 2. **登记记录身份未变**：fanoutHandoffRecords.get(parentTaskId) 必须仍是本次判定开始
+     *    时观察到的那个对象（被替换/删除说明这一代次的判定已经失效）；
+     * 3. **归属证据仍成立**：exact live root + fanoutHost.ownsTask 的活动绑定与绑定代际
+     *    token 都仍有效（等待期间 root 可能已被同 id 新代际替换或销毁）。
+     *
+     * @param {object} agent - exact live root Agent。
+     * @param {string} parentTaskId - fan-out 父任务 id。
+     * @param {object|undefined} expectedRecord - 本次判定开始时观察到的登记记录（可为 undefined）。
+     * @returns {object|undefined} 通过复查的权威任务快照；不可注册时 undefined。
+     */
+    function fanoutRegistrationTaskRecheck(agent, parentTaskId, expectedRecord) {
+      if (goalHandoffStopping || !isLiveRootAgent(agent)) return void 0;
+      if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return void 0;
+      if (fanoutHandoffRecords.get(parentTaskId) !== expectedRecord) return void 0;
+      const task = fanoutHost?.getTask(parentTaskId);
+      if (task === null || task === void 0 || fanoutTaskIsTerminal(task)) return void 0;
+      if (typeof fanoutHost?.ownsTask !== "function" || fanoutHost.ownsTask(agent, parentTaskId) !== true) return void 0;
+      return task;
+    }
+
+    /**
+     * 补建屏障的最终判定（同步/异步 GoalService 同源）。
+     *
+     * 只接受 armed+active：目标已 paused+disarmed 说明 pause 已经存在（可能是别人的），
+     * 这里既没有当时的 exact ref，也无法证明归属，必须保持现状让 release/adopt 路径处理。
+     *
+     * P1 竞态：本函数既可能被同步调用（无等待窗口），也可能在 await goals.get() 之后被调用。
+     * 因此进入注册前必须统一走 fanoutRegistrationTaskRecheck 复查权威任务与归属；任务已终态
+     * 时保持 released/no-op，**绝不**为一个不会再产生 task_settled 的任务登记 reason。
+     *
+     * @param {object} agent - exact live root Agent。
+     * @param {string} parentTaskId - fan-out 父任务 id。
+     * @param {object} record - 当前登记记录（代次身份的权威来源）。
+     * @param {unknown} view - GoalService.get 的返回视图。
+     * @returns {boolean} 是否发起了补建登记。
+     */
+    function applyUnbarrieredFanoutRegistration(agent, parentTaskId, record, view) {
+      if (goalHandoffStopping || !isLiveRootAgent(agent)) return false;
+      if (record.state !== "pending" && record.state !== "released") return false;
+      if (view?.phase !== "active" || view?.activation !== "armed") return false;
+      // 异步窗口复查：任务在等待 goals.get() 期间可能已经 task_settled。
+      const task = fanoutRegistrationTaskRecheck(agent, parentTaskId, record);
+      if (task === void 0) return false;
+      // 复用提交路径的登记入口：它自己会校验归属、分配新代次并建立 reason；
+      // 记录已被标记 released 时不会被幂等短路，因此这是一次真实的新代次登记。
+      // 传入**权威任务快照**而不是伪造的 pending 视图：登记入口内部的终态判定必须基于
+      // manager 的真实状态，绝不能被伪造对象绕过。
+      if (record.state === "released") fanoutHandoffRecords.delete(parentTaskId);
+      return registerFanoutGoalHandoff(agent, { accepted: true, parentTaskId, task }) === true;
+    }
+
     function reconcileFanoutGoalHandoffs() {
       if (goalHandoffStopping || !fanoutHost) return 0;
       if (typeof goals?.get !== "function") return 0;
@@ -6103,8 +6638,16 @@ export default {
       return reconciled;
     }
 
-    /** 读一次 goal 视图并按归属证据决定 pending 任务的登记方式（同步/异步同源判定）。 */
+    /**
+     * 读一次 goal 视图并按归属证据决定 pending 任务的登记方式（同步/异步同源判定）。
+     *
+     * P1 竞态：本函数在**同步判定任务非终态之后**才读 goal，异步 GoalService 下存在一个真实
+     * 等待窗口。因此在读取之前先快照当前登记记录对象（expectedRecord），交给
+     * applyRestoredFanoutRegistration 在真正注册前做权威任务复查——等待期间任务可能已经
+     * task_settled（restore 抑制了它的 task_settled，release 只能走 no-op），此时绝不能登记。
+     */
     function registerRestoredFanoutHandoff(agent, parentTaskId) {
+      const expectedRecord = fanoutHandoffRecords.get(parentTaskId);
       let view;
       try {
         view = goals.get(agent);
@@ -6114,11 +6657,11 @@ export default {
       }
       if (isThenable(view)) {
         void Promise.resolve(view).then((resolved) => {
-          applyRestoredFanoutRegistration(agent, parentTaskId, resolved);
+          applyRestoredFanoutRegistration(agent, parentTaskId, resolved, expectedRecord);
         }, (error) => logGoalHandoffError("get", error));
         return true;
       }
-      return applyRestoredFanoutRegistration(agent, parentTaskId, view);
+      return applyRestoredFanoutRegistration(agent, parentTaskId, view, expectedRecord);
     }
 
     /**
@@ -6131,14 +6674,27 @@ export default {
      *
      * 注意：不在这里调用 adoptPausedGoalForHandoff —— 它只按视图形状接管，会把外部
      * pause 当成自己的。证据匹配后直接用已校验的 exact ref 登记。
+     *
+     * P1 竞态：本函数可能在 await goals.get() 之后被调用。armed 分支要执行一次**真实
+     * pause**，因此必须先做权威任务复查——为一个已终态任务 pause 出来的 reason 再也不会被
+     * task_settled 释放，goal 会永久停在 paused。已终态时保持 released/no-op，绝不注册。
+     *
+     * @param {object|undefined} expectedRecord - 读取 goal 之前快照的登记记录（可为 undefined）。
      */
-    function applyRestoredFanoutRegistration(agent, parentTaskId, view) {
+    function applyRestoredFanoutRegistration(agent, parentTaskId, view, expectedRecord) {
       if (goalHandoffStopping || !isLiveRootAgent(agent)) return false;
       const existing = fanoutHandoffRecords.get(parentTaskId);
       if (existing !== void 0 && existing.state !== "released") return true;
+      // 异步窗口复查（P1）：无论下面走 armed 的**真实 pause** 还是 paused 的托管登记，
+      // 都必须先证明任务仍是权威的非终态任务。等待 goals.get() 期间任务可能已经
+      // task_settled（冷恢复下 release 只能走 no-op），此时任何新 reason 都不会再被释放。
+      const task = fanoutRegistrationTaskRecheck(agent, parentTaskId, expectedRecord);
+      if (task === void 0) return false;
       const armed = view?.phase === "active" && view?.activation === "armed";
       if (armed) {
-        return registerFanoutGoalHandoff(agent, { accepted: true, parentTaskId, task: { status: "pending" } });
+        // 传入权威任务快照，而不是伪造的 pending 视图：登记入口内部的终态判定必须基于
+        // manager 的真实状态，绝不能被伪造对象绕过。
+        return registerFanoutGoalHandoff(agent, { accepted: true, parentTaskId, task });
       }
       const pausedRef = adoptablePausedGoalRef(view);
       if (pausedRef === void 0) return false;
@@ -6192,7 +6748,8 @@ export default {
       const pausedRef = adoptablePausedGoalRef(view);
       if (pausedRef === void 0) {
         // 目标不再是「已暂停且未武装」：本插件不再持有任何 pending pause，清掉陈旧证据。
-        if (forgetFanoutPauseEvidence(agent.id, parentTaskId)) flushFanoutGoalHandoffEvidence();
+        // 传入 exact live root：entry 已绑定另一代 owner 时不得由本次清理删除。
+        if (forgetFanoutPauseEvidence(agent.id, parentTaskId, agent)) flushFanoutGoalHandoffEvidence();
         return false;
       }
       if (!fanoutPauseEvidenceMatches(agent.id, parentTaskId, pausedRef, view.id)) {
@@ -6439,30 +6996,314 @@ export default {
       if (ROLE_META[role] === void 0) return;
 
       /**
+       * 校验显式续作句柄（role tool 的 childId）：必须存在、属于当前 root，
+       * 并且是本 scope 记录过的 expert child。
+       *
+       * 只接受显式传入的 childId —— 没有任何输入时绝不把「当前 scope 最近一个
+       * child」当成续作目标，避免不同 prompt 被静默当成旧任务的续作。
+       * @returns {{target:object|undefined, warning:string}} 校验结果。
+       */
+      function resolveContinueTarget({ childId, parent, scope, taskKey, currentRouteKey }) {
+        if (typeof childId !== "string" || childId.length === 0) {
+          return { target: void 0, warning: role + " 续作需要显式 childId" };
+        }
+        if (!trackerChildIdsForScope(scope, taskKey, { parent }).includes(childId)) {
+          return {
+            target: void 0,
+            warning: role + " 续作被拒绝：childId 「" + childId + "」不是本 root(" + parent.id + ") 下该角色的已知专家 child；"
+              + "请使用 role 工具返回的 subagentId，或省略 childId 派发一个新任务",
+          };
+        }
+        const record = recoveryRecords.get(childId);
+        // 记录存在时进一步校验 owner：跨父代理/跨角色的 childId 不得被当作续作目标。
+        if (record !== void 0 && (record.parentId !== parent.id || (record.role !== void 0 && record.role !== role))) {
+          return {
+            target: void 0,
+            warning: role + " 续作被拒绝：childId 「" + childId + "」不属于当前 root 的该角色专家 child",
+          };
+        }
+        const bound = delegationTracker.getTaskChild(scope, taskKey);
+        return {
+          target: {
+            childId,
+            record,
+            routeKey: bound?.childId === childId && typeof bound.routeKey === "string" ? bound.routeKey : currentRouteKey,
+          },
+          warning: "",
+        };
+      }
+
+      /**
+       * 本 scope 已知的 expert child id（最近 child + 任务绑定指向的 child +
+       * 本父代理该角色尚未结算的活动任务指向的 child）。
+       *
+       * 覆盖面刻意完整：显式 childId 的归属校验会拒绝任何不在此集合中的 id，
+       * 因此这里必须包含所有**本 root 该角色**真实创建过的 child，同时绝不包含
+       * 其他父代理、fan-out 或不属于该角色的 child。
+       * @param {string} scope - delegationScopeKey(parentId, role)。
+       * @param {string} [candidateTaskKey] - 可选的归一化任务 key（其绑定 child 也算已知）。
+       * @param {{parent?:object}} [owner] - 可选的 exact root Agent：给出时额外要求 recovery
+       *   record 的 parentAgent 与它一致（同 id 的另一代 root 不得接管该 record）。
+       * @returns {Array<string>} 去重后的 child id 列表。
+       */
+      function trackerChildIdsForScope(scope, candidateTaskKey, owner) {
+        const ids = new Set(delegationTracker.listChildIds(scope));
+        const bound = delegationTracker.getChild(scope);
+        if (bound !== void 0) ids.add(bound.childId);
+        if (typeof candidateTaskKey === "string" && candidateTaskKey.length > 0) {
+          const taskChild = delegationTracker.getTaskChild(scope, candidateTaskKey);
+          if (taskChild !== void 0) ids.add(taskChild.childId);
+        }
+        // 活动任务指向的 child：任务绑定可能已被上限淘汰/结算，但 child 仍属于本 scope。
+        const separator = String(scope ?? "").lastIndexOf("::");
+        const parentId = separator === -1 ? void 0 : String(scope).slice(0, separator);
+        if (parentId === void 0) return [...ids];
+        for (const task of delegationTracker.listActiveTasks(parentId)) {
+          if (task.role !== role) continue;
+          if (typeof task.childId === "string" && task.childId.length > 0) ids.add(task.childId);
+        }
+        // 仍存活的 recovery record 持有的 expert child：task 记忆被 LRU 淘汰、route 切换
+        // 清表、记录重建或活动范围已结算后，receipt 里的 childId 仍必须能被显式续作/取消
+        // 定位；否则 root 只能改派新任务，而旧 child 还在跑（变成无人收口的孤儿任务）。
+        // route 刻意不作为识别过滤条件：record.routeKey 是「创建时那条 route」，切换 route
+        // 之后 receipt 句柄必须继续有效；route 的校验留在投递与恢复路径（续作使用当前
+        // route、恢复按 routeChanged 判定重建），识别阶段只认 root+role 归属与有效性。
+        const parentAgent = owner?.parent;
+        for (const [recordChildId, record] of recoveryRecords) {
+          if (record === null || typeof record !== "object") continue;
+          // 归属：只认本 parent+role 的 record；同 id 的另一代 root generation 不得接管。
+          if (record.parentId !== parentId || record.role !== role) continue;
+          if (parentAgent !== void 0 && record.parentAgent !== void 0 && record.parentAgent !== parentAgent) continue;
+          // 有效性：只有可续接、且确实成功 acceptance 过的专家 child 才是合法目标。
+          if (record.continuable !== true || record.invalidAcceptance === true) continue;
+          // fan-out child 属于另一条恢复链：普通 role 工具绝不显式续作/取消它。
+          if (isFanoutChildId(recordChildId)) continue;
+          ids.add(recordChildId);
+        }
+        return [...ids];
+      }
+
+      /**
+       * childId 是否属于 fan-out 链路：内存 Agent 与持久化 child_models 快照任一侧命中
+       * 即算（与 agent/created 的 fan-out 判定同源），fan-out 目标永不由普通 role 工具续作。
+       */
+      function isFanoutChildId(childId) {
+        return isFanoutAgent(agents.get(childId)) || isFanoutIdentity(source().childModels?.[childId]);
+      }
+
+      /**
+       * 读取显式句柄参数（childId / cancelChildId）。
+       *
+       * 约定：字段**完全缺省**（undefined）才算「没有提供」；只要字段存在，就必须是
+       * 非空且非纯空白的字符串。空串、纯空白与非字符串一律 fail-closed，绝不被当作
+       * 「未提供」而继续普通派发/新建 child —— 那会让 root 以为在续作或取消，实际却
+       * 启动了新任务（线上最危险的静默分叉）。
+       *
+       * 非字符串输入通常已被 DSH 工具入参校验（defineTool → INVALID_ARGS）拦在 handler
+       * 之外；这里保留同一判定作为 handler 边界的第二道防线。合法的非空白字符串**不做
+       * trim**：childId 是 opaque id，精确匹配失败会走 CHILD_NOT_FOUND 的可读拒绝，
+       * 不扩大匹配面。
+       * @returns {{present:boolean, value:string|undefined, invalid:boolean}}
+       */
+      function readExplicitHandle(args, name) {
+        const raw = args === null || typeof args !== "object" ? void 0 : args[name];
+        if (raw === void 0) return { present: false, value: void 0, invalid: false };
+        if (typeof raw !== "string" || raw.trim().length === 0) return { present: true, value: void 0, invalid: true };
+        return { present: true, value: raw, invalid: false };
+      }
+
+      /** 非法句柄的简短类型描述：只报类型/形态，绝不复述可能很长的原始内容。 */
+      function describeHandleValue(value) {
+        if (value === null) return "null";
+        if (typeof value === "string") return value.length === 0 ? "空字符串" : "仅含空白的字符串";
+        return typeof value;
+      }
+
+      /**
+       * 构造「显式句柄在 admission 之前被拒绝」的公开结果。
+       *
+       * 该结果**不携带** admissionEpoch/admissionToken：被拒绝的句柄没有登记新 admission、
+       * 没有创建或投递任何 child，凭据会伪造出「真实 child admission」的假象并让模型把它
+       * 拿去 finalize。因此使用独立 kind `rejected`（输出 schema 中的无凭据变体），与带凭据
+       * 的 advisory/continuable 明确区分；同时保持 fail-closed：绝不 interrupt、绝不派发。
+       */
+      function rejectedHandleResult(reason, code, warning) {
+        return { kind: "rejected", started: false, accepted: false, reason, code, warning };
+      }
+
+      /**
+       * 显式续作：向指定 child 投递本轮 prompt。
+       *
+       * 走既有公开 continuation seam（reuseOrSteer → subagents.sendMessage/interrupt）：
+       * lineage/root generation 校验、message admission 与 disposal 都由 Host 负责。
+       * 语义保留既有边界：
+       * - queue=true 只排队（公开 sendMessage 投递，不请求 cancel）；
+       * - queue=false 允许先请求公开 interrupt（用户显式要求暂停/重定向才由 root 显式续作）；
+       * - 投递失败不得回落到新建 child，只有 NOT_RESUMABLE 才由既有重建路径处理。
+       * @returns {Promise<object>} admission 结果（continuable/reused）。
+       */
+      async function continueExplicitChild({ scope, taskKey, routeKey, request, parent, signal, label, queue, handoffExpected, rootToken, target }) {
+        if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
+        let outcome;
+        try {
+          outcome = await reuseOrSteer({
+            scope,
+            childId: target.childId,
+            taskKey,
+            promptText: request.prompt[0].text,
+            promptContent: request.prompt,
+            parent,
+            signal,
+            queue,
+            handoffExpected,
+            rootToken,
+            explicit: true,
+            continuationRouteKey: routeKey,
+          });
+        } catch (error) {
+          // 容量耗尽必须在这里就带上 DEG 自有稳定 code：后续的 lineage 检查会抛普通
+          // 错误，那会覆盖分类信息，让上层把「容量」误判成泛化 admission 失败。
+          const capacityError = createSubagentCapacityError(error);
+          if (capacityError !== undefined) throw capacityError;
+          throw error;
+        }
+        if (!host.lineage.isLiveGeneration(parent, rootToken)) {
+          const lateRecord = recoveryRecords.get(target.childId);
+          if (lateRecord?.parentAgent === parent) dropRecoveryRecord(target.childId, "root generation retired", lateRecord);
+          throw new Error("root generation is no longer live");
+        }
+        if (outcome !== null) {
+          recovery.rememberContext(recoveryRecords.get(outcome.subagentId), { routeKey, request, label, taskKey });
+          return outcome;
+        }
+        // 显式续作遇到 NOT_RESUMABLE：按既有恢复语义重建一个 continuable child，
+        // 原 child 的 pending recovery 由此接管（与自动恢复的 rebuild 同一路径）。
+        return rebuildExistingChildForContinuation({
+          record: target.record,
+          childId: target.childId,
+          parent,
+          scope,
+          routeKey,
+          request,
+          label,
+          taskKey,
+          rootToken,
+        });
+      }
+
+      /**
+       * 显式续作触发的 child 重建：把原 child 的任务绑定迁移到替代 child。
+       * 只接受仍可验证的 exact record（parent/role/owner 一致），其他情况 fail-closed
+       * 上抛，绝不静默新建一个与旧任务无关的 child。
+       */
+      async function rebuildExistingChildForContinuation({ record, childId, parent, scope, routeKey, request, label, taskKey, rootToken }) {
+        if (record === void 0 || record.parentId !== parent.id || record.role !== role) {
+          throw new Error(role + " 续作失败：child " + childId + " 已不可恢复且缺少可验证的恢复记录");
+        }
+        const durableSession = record.agent?.session ?? record.session;
+        if (durableSession === void 0) {
+          // 既没有 durable Session 也没有 live Activation 时，Host 无法冷恢复同一任务链，
+          // 重建出的 child 只会拿到「本轮 follow-up 文本」而丢掉原任务上下文；此时明确
+          // 失败并请 root 改派新任务，绝不静默把旧任务替换成一个内容不完整的 child。
+          throw new Error(role + " 续作失败：child " + childId + " 已不可恢复且缺少 durable Session，请作为新任务重新派发");
+        }
+        let rebuiltChildId;
+        let messageId;
+        try {
+          ({ childId: rebuiltChildId, messageId } = await subagents.startContinuable({
+            provider: "spawn",
+            label,
+            request,
+            signal: void 0,
+          }));
+        } catch (error) {
+          const capacityError = createSubagentCapacityError(error);
+          if (capacityError !== undefined) throw capacityError;
+          throw error;
+        }
+        if (!host.lineage.isLiveGeneration(parent, rootToken)) {
+          const lateRecord = recoveryRecords.get(rebuiltChildId);
+          if (lateRecord?.parentAgent === parent) dropRecoveryRecord(rebuiltChildId, "root generation retired", lateRecord);
+          throw new Error("root generation is no longer live");
+        }
+        if (typeof rebuiltChildId !== "string" || rebuiltChildId.length === 0
+          || typeof messageId !== "string" || messageId.length === 0) {
+          throw new Error("startContinuable returned an invalid acceptance");
+        }
+        // 旧 child 的未接受 recovery 由此被替代；旧 Agent 的迟到事件按 id 自然忽略。
+        supersedePendingRecoveryOps(record);
+        const replacement = ensureRecoveryRecord(rebuiltChildId, parent.id, role, parent, void 0, true);
+        delegationTracker.setChild(scope, { childId: rebuiltChildId, routeKey });
+        delegationTracker.rememberTask(scope, taskKey, { childId: rebuiltChildId, routeKey });
+        delegationTracker.rebindActiveTasks({
+          parentId: parent.id,
+          role,
+          oldChildId: childId,
+          newChildId: rebuiltChildId,
+          messageId,
+          taskKeys: [taskKey],
+        });
+        replacement.tasks.set(taskKey, { messageId, childId: rebuiltChildId });
+        evictOldestEntries(replacement.tasks, TASK_BINDING_LIMIT);
+        delete replacement.invalidAcceptance;
+        recovery.rememberContext(replacement, { routeKey, request, label, taskKey });
+        persistChildDispatch(rebuiltChildId, replacement, request, label, messageId);
+        return { kind: "continuable", subagentId: rebuiltChildId, messageId };
+      }
+
+      /**
+       * 显式取消（role tool 的 cancelChildId）：按 childId 精确定位，只请求该 child
+       * 的取消，不派发新任务、不投递消息。
+       *
+       * 严格边界：不接受「按 parent+role 猜目标」，因此同 scope 的其他独立 child
+       * 不会被误取消。使用公开 subagents.interrupt(childId, { kind: "ancestor", agent })。
+       */
+      async function cancelExplicitChild({ childId, parent, scope }) {
+        const resolved = resolveContinueTarget({ childId, parent, scope, taskKey: "" });
+        if (resolved.target === void 0) return { ok: false, warning: resolved.warning };
+        if (typeof subagents?.interrupt !== "function") {
+          return { ok: false, warning: role + " 取消失败：当前 Host 未提供公开 subagents.interrupt" };
+        }
+        await subagents.interrupt(childId, { kind: "ancestor", agent: parent });
+        return { ok: true, childId };
+      }
+      /**
        * 复用或投递到既有 child；判定为需要新建时返回 null。
-       * 复用（reused）时不发送任何新 prompt；排队（queued）时返回同一 childId。
-       * steer 只在 NOT_RESUMABLE（child 已不可恢复）时走新建分支；容量耗尽抛可读提示
-       * （不重建：撞上限时重建必然再失败），其他错误（UNAUTHORIZED/DRAINING 等）
-       * 必须原样上抛，不能吞掉。
-       * B3/S1-D：排队成功后写任务绑定 record.tasks（taskKey -> { messageId,
+       * 复用（reused）时不发送任何新 prompt；续作（queued）时返回同一 childId。
+       *
+       * 调用边界（多 child 语义）：本函数只处理**已经确定目标 child** 的两种情形——
+       * 归一化后完全相同的任务复用其原 child，或 root 显式给出 childId 的续作
+       * （explicit=true）。不同 prompt 的普通派发不再走到这里，而是新建独立 child，
+       * 因此本函数不会因为没有 childId 就把新任务静默当成旧任务的续作。
+       * NOT_RESUMABLE 走新建分支；容量耗尽抛可读提示（不重建：撞上限时重建必然
+       * 再失败），其他错误（UNAUTHORIZED/DRAINING 等）必须原样上抛，不能吞掉。
+       * B3/S1-D：投递成功后写任务绑定 record.tasks（taskKey -> { messageId,
        * childId }）；reused 分支返回原绑定（含 messageId），供任务终态关联原 turn
        * 的最终结果或命中成功缓存。binding 在 admission **之前**以
        * pendingMessage:true 预登记（消息 id 未知），admission 返回后回填
        * messageId 并清标记——claimed 补绑可覆盖回调晚于认领事件的竞态。
        */
-      async function reuseOrSteer({ scope, childId, taskKey, promptText, promptContent, parent, signal, activityId, queue = false, handoffExpected = false, rootToken }) {
+      async function reuseOrSteer({ scope, childId, taskKey, promptText, promptContent, parent, signal, activityId, queue = false, handoffExpected = false, rootToken, explicit = false, continuationRouteKey }) {
          if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
         if (delegationTracker.hasTask(scope, taskKey)) {
-          // 归一化后完全相同的任务已记录：不发送新 prompt，直接复用同一 child。
+          // 归一化后完全相同的任务已记录：默认不发送新 prompt，直接复用同一 child。
           if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
           const record = recoveryRecords.get(childId);
           if (record?.invalidAcceptance === true) return null;
           const binding = record?.tasks?.get(taskKey);
-          if (binding !== void 0) {
-            return { kind: "continuable", subagentId: binding.childId, reused: true, messageId: binding.messageId };
+          // 显式续作（root 给出 childId）必须真的把本轮 prompt 投递给**那个** child：
+          // 该 child 上没有本任务绑定、或绑定指向别的 child 时都不能静默「复用」——
+          // 否则回执的 subagentId/messageId 与请求矛盾，root 以为已投递却发给了别的 child。
+          // 只有「绑定正好就是这个 child」才复用；不带 childId 的普通重复派发保持旧语义
+          // （复用其绑定 child；没有绑定时返回无 messageId 的 reused）。
+          const boundHere = binding !== void 0 && binding.childId === childId;
+          if (explicit !== true || boundHere) {
+            if (binding !== void 0) {
+              return { kind: "continuable", subagentId: binding.childId, reused: true, messageId: binding.messageId };
+            }
+            // 没有任务绑定（旧版记录/记录已被上限淘汰）：保持旧行为，无 messageId。
+            return { kind: "continuable", subagentId: childId, reused: true };
           }
-          // 没有任务绑定（旧版记录/记录已被上限淘汰）：保持旧行为，无 messageId。
-          return { kind: "continuable", subagentId: childId, reused: true };
         }
 
         if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
@@ -6487,9 +7328,9 @@ export default {
             content: Array.isArray(promptContent) ? promptContent : [{ type: "text", text: promptText }],
             signal,
             rootToken,
-            // queue=true 是公开 sendMessage continuation；其余新任务才会请求 interrupt，
-            // 但两种路径最终都由同一公开 sendMessage 完成 admission。
-            interrupt: queue !== true,
+            // 只有「显式续作且未要求排队」才允许先请求公开 interrupt（用户显式要求
+            // 暂停/重定向）。普通新任务永远不会走到这里；即使走到也不得取消既有 child。
+            interrupt: explicit === true && queue !== true,
             queue: queue === true,
           });
           if (typeof messageId !== "string" || messageId.length === 0) throw new Error("existing child admission returned an invalid messageId");
@@ -6535,8 +7376,10 @@ export default {
         // messageId 已返回即新任务 admission 边界：此后才允许取代旧 recovery。
         // 先 supersede 再重写当前 binding，避免旧 op 恰好拥有相同 taskKey 时把
         // 刚接受的新消息标成 superseded；accepted recovery op 会被 helper 跳过。
+        // 取代与任务记忆都只针对本次续作的目标 child：其他独立 child 的 recovery
+        // 和任务绑定不受影响（多 child 语义）。
         supersedePendingRecoveryOps(record);
-        delegationTracker.rememberTask(scope, taskKey);
+        delegationTracker.rememberTask(scope, taskKey, { childId, routeKey: continuationRouteKey });
         record.tasks.set(taskKey, { messageId, childId });
         evictOldestEntries(record.tasks, TASK_BINDING_LIMIT);
         if (activityId !== void 0) delegationTracker.bindActiveTask(activityId, childId, messageId);
@@ -6545,36 +7388,40 @@ export default {
 
       /**
        * scope 临界区内执行后台委派（唯一入口，保证同父同角色串行）：
-       * 1. 内存中有同 route 的既有 child：
-       *    - 任务 key 已记录（归一化后完全相同的任务）→ 复用，不排队；
-       *    - 否则 steer 排队到既有 child 并记录任务 key；
-       *    - steer 抛 NOT_RESUMABLE → 落到新建分支。
+       * 判定顺序（多 child 语义）：
+       * 0. root 显式给出 childId → 只向该 child 续作（找不到目标由上层 advisory 拒绝）；
+       * 1. 任务 key 已绑定到本 scope 的某个 child（归一化后完全相同的任务）→ 复用它，
+       *    不新建、不投递；绑定的不是最近 child 时同样按绑定续作；
+       *    ⚠ 没有该任务绑定时**不再**投向「最近一个 child」——不同 prompt 必须新建独立
+       *    child，绝不隐式 steer；
        * 2. 内存无 child：尝试从持久化 childModels 恢复同 parentId+role+route 的
-       *    continuable child（重启恢复；旧记录无标记时忽略），恢复后走统一投递分支。
-       * 3. 新建 child（route 已变 / 恢复失败 / NOT_RESUMABLE）：setChild 会清空
-       *    旧 route 的任务记录，再记住本次任务 key。
+       *    continuable child（重启恢复；旧记录无标记时忽略），恢复后走统一投递分支；
+       * 3. 其余情况（不同 prompt / route 已变 / 恢复失败 / NOT_RESUMABLE）→ 新建独立
+       *    child，并记录「本任务 key -> 新 child」绑定；新建不再清空同 route 其他 child
+       *    的任务记忆，也不再取代它们的 recovery。
        */
-      async function delegateBackground({ scope, taskKey, routeKey, request, parent, signal, label, queue = false, activityId, handoffExpected = false, rootToken }) {
+      async function delegateBackground({ scope, taskKey, routeKey, request, parent, signal, label, queue = false, activityId, handoffExpected = false, rootToken, explicitChildId, continuationChildId }) {
         if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
+        // 只有「指向既有 child 的路径」才允许取代该 child 未接受的 recovery；
+        // 新建独立 child 必须保留其他 child 的自愈链（多 child 语义）。
+        const explicitContinue = explicitChildId !== void 0 || continuationChildId !== void 0;
         const current = delegationTracker.getChild(scope);
         // 记录可能被替换的旧 child；只有新 child 的 startContinuable 返回
         // accepted messageId 后，才会对其未接受 recovery 做 supersede。
-        let retiredChildId = current?.childId;
+        // 显式续作/相同任务复用不新建 child，因此不会取代任何其他 child 的 recovery。
+        let retiredChildId = explicitChildId ?? continuationChildId ?? current?.childId;
         let retiredRecord = retiredChildId === void 0 ? void 0 : recoveryRecords.get(retiredChildId);
-        if (current !== void 0 && current.routeKey === routeKey) {
-          const reused = await reuseOrSteer({ scope, childId: current.childId, taskKey, promptText: request.prompt[0].text, promptContent: request.prompt, parent, signal, queue, activityId, handoffExpected, rootToken });
-          if (reused !== null) {
-            if (!host.lineage.isLiveGeneration(parent, rootToken)) {
-              if (activityId !== void 0) delegationTracker.releaseActiveTask(activityId);
-              const lateRecord = recoveryRecords.get(reused.subagentId);
-              if (lateRecord?.parentAgent === parent) dropRecoveryRecord(reused.subagentId, "root generation retired", lateRecord);
-              throw new Error("root generation is no longer live");
-            }
-            const reusedRecord = recoveryRecords.get(reused.subagentId);
-            recovery.rememberContext(reusedRecord, { routeKey, request, label, taskKey });
-            if (reused.reused !== true) persistChildDispatch(reused.subagentId, reusedRecord, request, label, reused.messageId);
-            return reused;
-          }
+        if (explicitChildId !== void 0) {
+          // root 显式指定 childId：续作只发给该 child，绝不落到新建分支。
+          const continued = await continueExplicitChild({ scope, taskKey, routeKey, request, parent, signal, label, queue, handoffExpected, rootToken, target: { childId: explicitChildId, record: retiredRecord, routeKey } });
+          if (continued !== null) return continued;
+        } else if (continuationChildId !== void 0) {
+          // 相同 prompt 复用它自己的 child（可能是同 scope 下更早的独立 child，也可能
+          // 就是最近一个 child）：两种情况都必须先解析出那个 child，绝不新建。
+          const boundRecord = recoveryRecords.get(continuationChildId);
+          const boundRouteKey = delegationTracker.getTaskChild(scope, taskKey)?.routeKey ?? routeKey;
+          const reusedEarlier = await continueExplicitChild({ scope, taskKey, routeKey: boundRouteKey, request, parent, signal, label, queue, handoffExpected, rootToken, target: { childId: continuationChildId, record: boundRecord, routeKey: boundRouteKey } });
+          if (reusedEarlier !== null) return reusedEarlier;
         } else if (current === void 0) {
           // 重启后内存为空：从持久化快照按 parentId+role+route 恢复可复用 child。
           const restored = restoreChildFromSnapshot(parent.id, role, routeKey);
@@ -6584,7 +7431,7 @@ export default {
             // 只恢复 child 与 route，不恢复任务记录：重启后无法确认旧任务是否已执行，
             // 相同任务也走 steer 排队（明确告知父代理），而不是静默复用。
             delegationTracker.setChild(scope, { childId: restored, routeKey });
-            const reused = await reuseOrSteer({ scope, childId: restored, taskKey, promptText: request.prompt[0].text, promptContent: request.prompt, parent, signal, queue, activityId, handoffExpected, rootToken });
+            const reused = await reuseOrSteer({ scope, childId: restored, taskKey, promptText: request.prompt[0].text, promptContent: request.prompt, parent, signal, queue, activityId, handoffExpected, rootToken, continuationRouteKey: routeKey });
             if (reused !== null) {
               if (!host.lineage.isLiveGeneration(parent, rootToken)) {
                 if (activityId !== void 0) delegationTracker.releaseActiveTask(activityId);
@@ -6616,12 +7463,22 @@ export default {
         pendingCreations.push(pendingCreation);
         let acceptedChildId;
         try {
-          const { childId, messageId } = await subagents.startContinuable({
-            provider: "spawn",
-            label,
-            request,
-            signal,
-          });
+          let childId;
+          let messageId;
+          try {
+            ({ childId, messageId } = await subagents.startContinuable({
+              provider: "spawn",
+              label,
+              request,
+              signal,
+            }));
+          } catch (error) {
+            // 容量耗尽在 admission 边界就翻译成 DEG 自有可读错误：后续清理/回滚错误
+            // 一旦覆盖原始 code，上层就无法再归入「可重试的容量」而是泛化失败。
+            const capacityError = createSubagentCapacityError(error);
+            if (capacityError !== undefined) throw capacityError;
+            throw error;
+          }
           acceptedChildId = childId;
           if (typeof childId !== "string" || childId.length === 0 || typeof messageId !== "string" || messageId.length === 0) throw new Error("startContinuable returned an invalid acceptance");
           if (!host.lineage.isLiveGeneration(parent, rootToken)) {
@@ -6634,15 +7491,18 @@ export default {
             throw new Error("root generation is no longer live");
           }
           if (pendingHandoffAdmission !== void 0) bindPendingHandoffAdmission(pendingHandoffAdmission, childId, messageId);
-          // 新 child 的 startContinuable 已返回 accepted messageId；此刻才取代
-          // 旧 route/不可恢复 child 尚未 acceptance 的 recovery。若创建失败，
-          // 会直接走 catch，旧 recovery 保持不变。
-          if (retiredChildId !== void 0 && retiredChildId !== childId) {
+          // 多 child 边界：不同任务的独立 child 并存，因此**只有显式指定/复用同一
+          // child 的路径**才取代该 child 未 acceptance 的 recovery。新建独立 child
+          // 绝不 supersede 其他 child 的 recovery（否则会打断那个 child 的自愈链）。
+          // 复用/续作路径由 reuseOrSteer / continueExplicitChild 自己完成取代。
+          if (explicitContinue === true && retiredChildId !== void 0 && retiredChildId !== childId) {
             supersedePendingRecoveryOps(retiredRecord ?? recoveryRecords.get(retiredChildId));
           }
           delegationTracker.setChild(scope, { childId, routeKey });
           if (activityId !== void 0) delegationTracker.bindActiveTask(activityId, childId, messageId);
-          delegationTracker.rememberTask(scope, taskKey);
+          // 任务记忆必须带上它自己的 child：相同 prompt 之后复用的是这个 child，
+          // 而不是本 scope 最近一次新建的 child。
+          delegationTracker.rememberTask(scope, taskKey, { childId, routeKey });
           // P3 防御：agent/created 应已消费预登记项；异常路径（未命中）时清理
           // 残留，防止下次同 scope 新建误匹配旧 taskKey。
           const staleIdx = pendingCreations.indexOf(pendingCreation);
@@ -6707,15 +7567,29 @@ export default {
       /**
        * 在同父代理的短临界区内完成范围预检和活动登记，再释放该锁执行实际
        * start/sendMessage。这样不同角色的独立任务仍并行，但相交范围无法
-       * 同时穿过空登记表。已知同 route 的重复任务沿用既有复用语义，不再登记
-       * 第二个活动项；admission 失败会立即释放本次预登记。
+       * 同时穿过空登记表。同一任务（或显式 childId 续作）沿用既有复用/续作语义，
+       * 不再登记第二个活动项；**不同任务**则各自登记独立活动项并新建独立 child，
+       * 因此多个独立 child 的范围冲突仍由 affectedPaths 预检覆盖。
+       * admission 失败会立即释放本次预登记。
        */
-      async function delegateWithScopeAdmission({ scope, taskKey, routeKey, request, parent, signal, label, queue = false, affectedPaths, allowOverlap = false, handoffExpected = false, rootToken }) {
+      async function delegateWithScopeAdmission({ scope, taskKey, routeKey, request, parent, signal, label, queue = false, affectedPaths, allowOverlap = false, handoffExpected = false, rootToken, explicitChildId }) {
         if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
         const current = delegationTracker.getChild(scope);
-        const knownDuplicate = current !== void 0 && current.routeKey === routeKey && delegationTracker.hasTask(scope, taskKey);
+        // 显式 childId 在上层已经校验过归属，因此它天然是「已存在目标」；其余情况
+        // 只有「同一归一化任务仍绑定到本 scope 的 child」才算重复任务。绑定指向的
+        // child 已从本 scope 退出（重建/清理过）时按新任务处理，避免对消失的 child
+        // 反复返回无法续作的 advisory。
+        const bound = delegationTracker.getTaskChild(scope, taskKey);
+        const boundIsLive = bound !== void 0 && trackerChildIdsForScope(scope, taskKey, { parent }).includes(bound.childId);
+        const knownDuplicate = explicitChildId !== void 0
+          || (boundIsLive && bound.routeKey === routeKey);
         if (knownDuplicate) {
-          return delegateBackground({ scope, taskKey, routeKey, request, parent, signal, label, queue, handoffExpected, rootToken });
+          return delegateBackground({
+            scope, taskKey, routeKey, request, parent, signal, label, queue, handoffExpected, rootToken,
+            explicitChildId,
+            // 相同任务一律按「它自己绑定的 child」续作（可能就是最近 child）。
+            continuationChildId: explicitChildId === void 0 && boundIsLive ? bound.childId : void 0,
+          });
         }
         const admission = await delegationTracker.serializeParent(parent.id, () => {
           if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
@@ -6741,7 +7615,7 @@ export default {
         }
         try {
           const outcome = await delegateBackground({
-            scope, taskKey, routeKey, request, parent, signal, label, queue, activityId: admission.activityId, handoffExpected, rootToken,
+            scope, taskKey, routeKey, request, parent, signal, label, queue, activityId: admission.activityId, handoffExpected, rootToken, explicitChildId,
           });
           if (!host.lineage.isLiveGeneration(parent, rootToken)) {
             delegationTracker.releaseActiveTask(admission.activityId);
@@ -6904,7 +7778,15 @@ export default {
           queue: {
             type: "boolean",
             default: false,
-            description: "Set queue=true only for an explicit user-requested follow-up task to queue an ordinary next step; false is the default for admission or pause/stop/redirect. This is not a waiting mechanism; DSH delivers feedback later.",
+            description: "Only meaningful together with childId (an explicit continuation): queue=true delivers the follow-up through the public subagents.sendMessage path and never requests a cancel; queue=false may first request a public interrupt for an explicit pause/redirect. Without childId the value is ignored because a different prompt always starts an independent child. This is not a waiting mechanism; DSH delivers feedback later.",
+          },
+          childId: {
+            type: "string",
+            description: "Optional explicit continuation handle: the subagentId returned by an earlier role-tool admission. When set, this prompt is delivered to exactly that child. Omit it to dispatch a brand-new independent task: a different prompt never continues or redirects an existing child on its own.",
+          },
+          cancelChildId: {
+            type: "string",
+            description: "Optional explicit cancel handle: request cancellation of exactly this child (public subagents.interrupt) without dispatching a task or sending any message. Takes precedence over childId. Cancelling is always addressed by an exact childId; this tool never guesses a target from the parent session and role, so other independent children stay running.",
           },
         },
         output: {
@@ -6958,17 +7840,56 @@ export default {
                   message: { type: "string", required: true },
                 },
               },
+              {
+                // 显式句柄（childId / cancelChildId）在 admission 之前被拒绝：没有登记新
+                // admission、没有创建或投递任何 child，因此**不带** admissionEpoch/
+                // admissionToken。用独立 kind 与带凭据的 advisory/continuable 明确区分：
+                // 伪造凭据会让模型把它当成真实 child admission 并拿去 finalize。
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  kind: { type: "string", required: true, const: "rejected" },
+                  started: { type: "boolean", required: true, const: false },
+                  accepted: { type: "boolean", required: true, const: false },
+                  reason: { type: "string", required: true },
+                  code: { type: "string", required: true },
+                  warning: { type: "string", required: true },
+                },
+              },
+              {
+                // 显式取消（cancelChildId）的结果：只报告按 childId 定位的取消请求，
+                // 既不是新 admission 也不是失败，因此保持独立变体。
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  kind: { type: "string", required: true, const: "cancelled" },
+                  started: { type: "boolean", required: true, const: false },
+                  accepted: { type: "boolean", required: true, const: true },
+                  cancelled: { type: "boolean", required: true, const: true },
+                  childId: { type: "string", required: true },
+                },
+              },
             ],
           },
           render(_args, value) {
             // admissionEpoch/admissionToken 是 root-only finalize 收口必需的公开凭据，必须
             // 出现在模型可见的 render 文本里：epoch 是模块级单调计数器（跨会话累计、重启
-            // 归零），模型既无法从其他工具返回中读到、也无法推断；schema 三个变体都把它们
-            // 标注为 required，但只渲染人性化文案会让模型只能靠猜 token 反复调用 finalize
+            // 归零），模型既无法从其他工具返回中读到、也无法推断；schema 的 continuable/
+            // advisory/failure 三个变体都把它们标注为 required，但只渲染人性化文案会让模型
+            // 只能靠猜 token 反复调用 finalize
             // （线上实测：连续 5 次匹配失败）。这里统一追加，保持单行紧凑文本。
-            const admission = ` (admissionEpoch: ${value.admissionEpoch}, admissionToken: "${value.admissionToken}")`;
+            // 取消结果不携带 admission 凭据（它不进 admission 批次），因此只在凭据
+            // 确实存在时追加后缀；其余变体保持既有文案与凭据位置不变。
+            const admission = Number.isSafeInteger(value.admissionEpoch)
+              ? ' (admissionEpoch: ' + value.admissionEpoch + ', admissionToken: "' + value.admissionToken + '")'
+              : "";
             if (value.kind === "advisory") return [{ type: "text", text: value.warning + admission }];
+            // 显式句柄在 admission 之前被拒绝：没有 admission 凭据可渲染，只报可读原因。
+            if (value.kind === "rejected") return [{ type: "text", text: value.warning }];
             if (value.kind === "failure") return [{ type: "text", text: `${role} admission failed: ${value.message}${admission}` }];
+            // 取消是按 childId 定位的独立动作：文案必须点名被取消的 child，避免模型
+            // 以为这是对「当前角色」的批量操作。
+            if (value.kind === "cancelled") return [{ type: "text", text: `cancelled ${role} subagent ${value.childId}: cancel requested for the exact childId${admission}` }];
             const notice = typeof value.scopeWarning === "string" && value.scopeWarning.length > 0
               ? [{ type: "text", text: value.scopeWarning }]
               : [];
@@ -6995,6 +7916,48 @@ export default {
           // role-named expert tools，也必须在执行边界被拒绝，避免再次自我委派或绕过父代理编排。
           if (parent.session?.header?.parentSession !== void 0) {
             throw new Error(`${role} is root-only; child agents are leaf workers and must report to their parent`);
+          }
+          // 显式句柄（cancelChildId / childId）的输入边界：字段只要**存在**就必须是合法的
+          // 非空、非纯空白字符串。空串/纯空白/非字符串一律 fail-closed，绝不被当作「未提供」
+          // 而继续普通派发或新建 child。校验发生在 beginRootAdmission 之前：被拒绝的句柄不
+          // 登记任何 admission、不产生凭据、也绝不 interrupt 或派发（见 rejectedHandleResult）。
+          const cancelHandle = readExplicitHandle(args, "cancelChildId");
+          if (cancelHandle.invalid === true) {
+            return rejectedHandleResult(
+              "invalid-child-id",
+              "INVALID_CANCEL_CHILD_ID",
+              role + " 取消被拒绝：cancelChildId 必须是非空字符串（收到 " + describeHandleValue(args?.cancelChildId)
+                + "）；本次调用没有取消任何 child、也没有派发任何任务。要取消请传入此前回执里的 subagentId，"
+                + "或者完全省略 cancelChildId",
+            );
+          }
+          const continueHandle = readExplicitHandle(args, "childId");
+          if (continueHandle.invalid === true) {
+            return rejectedHandleResult(
+              "invalid-child-id",
+              "INVALID_CHILD_ID",
+              role + " 续作被拒绝：childId 必须是非空字符串（收到 " + describeHandleValue(args?.childId)
+                + "）；本条 prompt 没有派发。要续作请传入此前回执里的 subagentId，或完全省略 childId 派发新任务",
+            );
+          }
+          // 显式取消（cancelChildId）优先于续作 childId，并且在 beginRootAdmission **之前**
+          // 处理：它只按 childId 精确定位并请求取消，不派发任务、不投递消息、不登记新
+          // admission，因此既不产生 finalize 需要收口的 token，也不会把 root 的当前
+          // admission 批次留成未结算状态。缺少前置条件时 fail-closed。
+          // 未知/越权目标返回无凭据的 rejected：它同样没有登记 admission，用带凭据的
+          // advisory 会伪造出「已为这个 child 开了一批要 finalize 的 admission」的假象。
+          if (cancelHandle.present === true) {
+            if (!spawnProviderReady()) {
+              throw new Error(`subagent provider "spawn" is not available (missing depthLimit/toolFilter/persona/prepareContinuable); the ${role} expert tool cannot cancel a child`);
+            }
+            const cancelled = await cancelExplicitChild({
+              childId: cancelHandle.value,
+              parent,
+              scope: delegationScopeKey(parent.id, role),
+            });
+            return cancelled.ok === true
+              ? { kind: "cancelled", started: false, accepted: true, cancelled: true, childId: cancelled.childId }
+              : rejectedHandleResult("child-not-found", "CHILD_NOT_FOUND", cancelled.warning);
           }
           const admissionTicket = beginRootAdmission(parent);
           let failurePhase = "provider";
@@ -7105,6 +8068,27 @@ export default {
           // run_in_background 只保留为兼容输入；省略、true、false 都统一走
           // 非阻塞 admission。是否结束当前 root turn 只由 continue_parent_turn 决定。
           const handoffExpected = args.continue_parent_turn !== true;
+          // 显式续作句柄：只接受本 root 该角色已登记的 childId。校验失败直接返回
+          // advisory，绝不回落到「当前 scope 最近 child」或新建 child。
+          // 续作句柄的存在性/合法性已在上面的 pre-admission 边界判定：这里 present 即
+          // 一定是合法的非空字符串，非法形态永远不会走到这一步（不会静默变成新建）。
+          const continueRequested = continueHandle.present === true;
+          const resolvedContinue = continueRequested
+            ? resolveContinueTarget({ childId: continueHandle.value, parent, scope, taskKey, currentRouteKey: routeKey })
+            : { target: void 0, warning: "" };
+          if (continueRequested && resolvedContinue.target === void 0) {
+            const warning = resolvedContinue.warning;
+            return {
+              kind: "advisory",
+              started: false,
+              accepted: false,
+              reason: "child-not-found",
+              code: "CHILD_NOT_FOUND",
+              warning,
+              admissionEpoch: admissionTicket.epoch,
+              admissionToken: admissionTicket.token,
+            };
+          }
 
           // 所有输入形态都只等待 scope/admission、必要的 child 投递和 Goal pause CAS，
           // 绝不等待 child 的最终文本、turn/end、自动恢复或 feedback。
@@ -7113,6 +8097,7 @@ export default {
               scope, taskKey, routeKey, request, parent, signal: exec.signal, label: args.description,
               queue: args.queue === true, affectedPaths: args.affectedPaths, allowOverlap: args.allowOverlap === true,
               handoffExpected, rootToken,
+              explicitChildId: resolvedContinue.target?.childId,
             })
           ).then((outcome) => {
             // role tool 只返回 admission 结果；goal handoff 与 root turn 收口由显式 finalize 处理。

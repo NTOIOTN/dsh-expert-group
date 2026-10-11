@@ -18,9 +18,11 @@ import { listRoles, requireRole } from "./role-registry.js";
 export const ROLE_TOOL_ADMISSION_CONTRACT = [
   " 调用专家工具派发任务时，prompt 必须统一使用中文，第一句必须是“你是 XXX 子代理。”且作为第一行；任务正文必须自包含，写明 workspace 路径、允许范围和预期验证。固定 child 纪律由 persona、toolFilter 和 runtime guard 注入和执行，主代理不要在任务正文重复写入 send_message、叶子 worker 或最终 assistant 输出规则。",
   " 非阻塞 admission 会创建或复用一个 durable continuable child，并返回 childId、admissionEpoch 和 admissionToken；run_in_background 仅为兼容输入，省略、true、false 都不会等待 child 的最终输出或反馈。",
+  " 普通 role 语义不是「每个 parent 每个 role 只有一个活动 child」：归一化后完全相同的任务复用**它自己**那个 child（reused，不新建、不投递）；不同任务各自新建独立 child，同一个 parent+role 下可以并存多个 child。不同 prompt 绝不会被自动当成旧 child 的续作或 steer，也不会取消旧 child。",
+  " 续作必须显式指定 childId（此前回执里的 subagentId）：带 childId 时本轮 prompt 只投递给该 child；不带 childId 时一律按新任务派发。childId 必须是当前 root 该角色已知的专家 child，否则返回 CHILD_NOT_FOUND advisory 而不派发。childId 与 cancelChildId 只要出现就必须是非空且非纯空白的字符串：空串、纯空白或非字符串一律 fail-closed 返回 rejected（code 为 INVALID_CHILD_ID / INVALID_CANCEL_CHILD_ID），既不派发也不新建 child。取消同样必须用 cancelChildId 显式定位单个 child（公开 subagents.interrupt），绝不按 parent+role 猜目标，因此不会误取消同 scope 的其他独立 child；未知或不属于本 root 该角色的目标返回无 admission 凭据的 rejected（CHILD_NOT_FOUND），既不会登记 admission 也不会 interrupt。",
   "只有设置 continue_parent_turn:true 前检查 affectedPaths 并明确确认任务独立且范围不重叠；否则必须检查每个结果，并使用准确 epoch 和完整 token 集调用 root-only dsh_expert_group_finalize。",
-  "role 调用不会结束 root，DSH 会在稍后交付 feedback；queue=true 通过公开的 subagents.sendMessage 接口投递 continuation，不能把它当作等待机制。",
-  "role 工具仅允许 root 使用，child 是叶子 worker；重复任务复用现有 child。queue=true continuation 以及 cold 或不可用 child 使用公开的 manager sendMessage；queue=false 可以先用公开的 interrupt 请求取消，再使用同一 sendMessage 接口。RC1 sendMessage 可以在运行 child 的最近边界 steer；不要直接调用 Agent.whenIdle/Agent.steer，也不要声称存在未公开的 FIFO 队列。非成功任务最多自动重试 5 次，之后才判定为最终失败。",
+  "role 调用不会结束 root，DSH 会在稍后交付 feedback；queue=true 只在带 childId 的显式续作下生效（经公开的 subagents.sendMessage 投递，只排队不请求取消），不能把它当作等待机制。",
+  "role 工具仅允许 root 使用，child 是叶子 worker。显式续作使用公开的 manager sendMessage；带 childId 且 queue=false 可以先经公开的 interrupt 请求取消再投递同一 sendMessage。RC1 sendMessage 可以在运行 child 的最近边界 steer；不要直接调用 Agent.whenIdle/Agent.steer，也不要声称存在未公开的 FIFO 队列。非成功任务最多自动重试 5 次，之后才判定为最终失败。",
 ].join("");
 
 /**

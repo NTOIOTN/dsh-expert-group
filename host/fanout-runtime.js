@@ -439,6 +439,34 @@ export function createFanoutRuntimeModule({
       if (closed || typeof parentTaskId !== "string" || parentTaskId.length === 0) return null;
       return resolvedOwner(parentTaskId);
     },
+    /**
+     * 「该 exact live root 能否证明自己拥有这个父任务」的只读判定。
+     *
+     * 为什么需要它：goal handoff 的 barrier 只能由**任务真正归属的那一代 root**建立，
+     * 否则同 id 的 replacement 或已销毁 root 就能替别人登记等待原因，让一个不会再产生
+     * task_settled 的任务把 durable goal 永久钉在 paused。
+     *
+     * 授权条件与 continuation 写路径**同一套硬条件**（activeBindingReplayEvidence），
+     * 绝不接受单纯的字符串 parent id，也不使用 settledParentSessions 兜底：
+     * 1. 活动绑定存在且 ownerId 精确等于调用方 id；
+     * 2. 绑定的 exact parent Agent 就是调用方对象（同 id replacement 不是该对象）；
+     * 3. 绑定当时的 generation token 仍是调用方的 live generation；
+     * 4. 任务非终态 —— 终态任务不会再产生 task_settled，登记原因等于永久 paused。
+     *
+     * 只读：不改变任何状态、不注册任何凭据，返回 false 表示无法证明归属（fail-closed）。
+     *
+     * @param {object} parent - 调用方 exact root Agent。
+     * @param {string} parentTaskId - fan-out 父任务 id。
+     * @returns {boolean} 是否可证明归属。
+     */
+    ownsTask(parent, parentTaskId) {
+      if (closed) return false;
+      if (parent === null || typeof parent !== "object" || typeof parent.id !== "string") return false;
+      if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return false;
+      const task = runtime.manager.getTask(parentTaskId);
+      if (task === null || managerTaskIsTerminal(task)) return false;
+      return activeBindingReplayEvidence(parent, parentTaskId) !== null;
+    },
     getEvents: (options) => (closed
       ? { events: [], nextSequence: Number.isSafeInteger(options?.after) && options.after >= 0 ? options.after : 0 }
       : runtime.getEvents(options)),
