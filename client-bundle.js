@@ -1352,49 +1352,103 @@
   }
 
   /**
-   * 读取一个 dock 列自己的 tab 条容器（`data-dockkit-strip-tabs`）。
+   * 读一个 dock host 的 DOM 布尔 `hidden`。
    *
-   * 真实 DockKit 把 tab 芯片挂在**列内 strip-tabs 的后代**上，不是列/pane 的直接子节点，因此
-   * 必须先找到 strip 容器再取后代 tab。列的内容区里嵌着的另一个 dock 也有自己的 strip，
-   * 靠 withinSameDockScope 排除（父链上跨过 host/split 的 strip 不算当前列）。
-   * 返回 null 表示读面不可用；返回空数组表示这一列没有任何自己的 tab 条（调用方 fail-closed）。
+   * 真实 DockLayout（app.asar 里 US 组件渲染 host 的那一处）写的是 React 的 `hidden: !w`，
+   * 其中 w = 「这个 host 的 tab 就是它所属 pane 的 activeTabId」：同一 pane 只有**一个** host
+   * 不带 hidden，其余 host 全部带 hidden。hidden 是 HTMLElement 的布尔 IDL 属性，因此这里只认
+   * 真正的布尔值；属性读面缺失、抛错或返回非布尔（替身没实现、宿主换了渲染方式）一律返回 null，
+   * 调用方按「读不出来」fail-closed，绝不把 undefined 当成「可见」。
    */
-  function cellStripNodesOf(cell) {
-    if (cell === null || cell === undefined || typeof cell.querySelectorAll !== "function") return null;
-    let nodes = null;
-    try { nodes = Array.from(cell.querySelectorAll(RIGHTBAR_STRIP_TABS_SELECTOR)); } catch { return null; }
-    const strips = [];
-    for (const node of nodes) {
-      const scoped = withinSameDockScope(node, cell, [RIGHTBAR_DOCK_HOST_ATTRIBUTE, RIGHTBAR_SPLIT_ATTRIBUTE]);
-      if (scoped === null) return null;
-      if (scoped === true) strips.push(node);
-    }
-    return strips;
+  function hostHiddenStateOf(host) {
+    try {
+      const value = host?.hidden;
+      return typeof value === "boolean" ? value : null;
+    } catch { return null; }
   }
 
   /**
-   * 读取一列自己的 tabId 集合。
+   * 读取一个 dock **逻辑列**（= 同一 data-dockkit-column 下的全部 host）的**唯一活跃 tab 条**。
    *
-   * 只认「这一列自己的 strip-tabs」及其后代 tab 芯片：strip 内部更深一层的 strip 同样属于嵌套
-   * dock，不算当前列。未知或空 tabId、一列没有任何自己的 tab、读面抛错都让整列读不出来，
-   * 调用方据此 fail-closed，绝不把「读不到」当成空列。
+   * 真实 DockLayout 对**每个 tab** 渲染一个 div[data-dockkit-host="dock"]，同一 pane 的多个 tab
+   * 共享同一个 data-dockkit-column；而 tab 条本身**只挂在活跃 tab 的那个 host 上**：
+   *   hidden: !w                            ← 非活跃 host 带 DOM hidden
+   *   children: [ w && <TabStrip …/>, … ]   ← 非活跃 host 连 strip 都不渲染
+   * 活跃 host 的那条 strip 里列出的是**该 pane 的全部 tab**（TabStrip 渲染 pane.tabs），所以只要
+   * 取到唯一活跃 strip，这一逻辑列的 tab 组成就是完整的——多开一个子代理 tab 只会多出一个
+   * hidden 的空 host，绝不能让整列因此变成「读不出来」而退回宿主的 1:1。
+   *
+   * 判定（任一条不成立即整列 fail-closed，绝不猜）：
+   * - 每个 host 的 hidden 必须是可读的布尔值；
+   * - hidden === true 且该 host 没有自己的 strip → 真实非活跃 host，跳过；
+   * - hidden === false 且**恰好一条**自己的 strip → 活跃 host，收集这条 strip；
+   * - 可见 host 没有 strip、hidden host 却带着自己的 strip、querySelectorAll 或父链读面抛错
+   *   → 结构不是本插件认识的那一种，fail-closed；
+   * - 一个逻辑列出现多个活跃 strip host，或整列一个活跃 strip 都没有 → fail-closed。
+   *
+   * 列内容区里嵌着的另一个 dock 也有自己的 strip，靠 withinSameDockScope 排除（父链上跨过
+   * host/split 的 strip 不算本列）。返回 null 表示读不出来；可读时返回**恰好一条** strip 的数组。
    */
-  function cellTabIdsOf(cell) {
-    const ids = new Set();
-    const strips = cellStripNodesOf(cell);
-    if (strips === null || strips.length === 0) return { ids, readable: false };
-    for (const strip of strips) {
-      if (typeof strip.querySelectorAll !== "function") return { ids, readable: false };
-      let tabNodes = null;
-      try { tabNodes = Array.from(strip.querySelectorAll(RIGHTBAR_TAB_SELECTOR)); } catch { return { ids, readable: false }; }
-      for (const node of tabNodes) {
-        const scoped = withinSameDockScope(node, strip, [RIGHTBAR_STRIP_TABS_ATTRIBUTE]);
-        if (scoped === null) return { ids, readable: false };
-        if (scoped !== true) continue;
-        const tabId = text(attributeOf(node, RIGHTBAR_TAB_ID_ATTRIBUTE), null);
-        if (tabId === null) return { ids, readable: false };
-        ids.add(tabId);
+  function cellStripNodesOf(column) {
+    const hosts = column?.hosts ?? null;
+    if (!Array.isArray(hosts) || hosts.length === 0) return null;
+    let activeStrip = null;
+    let activeCount = 0;
+    for (const host of hosts) {
+      if (host === null || host === undefined || typeof host.querySelectorAll !== "function") return null;
+      const hidden = hostHiddenStateOf(host);
+      if (hidden === null) return null;
+      let nodes = null;
+      try { nodes = Array.from(host.querySelectorAll(RIGHTBAR_STRIP_TABS_SELECTOR)); } catch { return null; }
+      const owned = [];
+      for (const node of nodes) {
+        const scoped = withinSameDockScope(node, host, [RIGHTBAR_DOCK_HOST_ATTRIBUTE, RIGHTBAR_SPLIT_ATTRIBUTE]);
+        if (scoped === null) return null;
+        if (scoped === true) owned.push(node);
       }
+      if (hidden === true) {
+        // 真实非活跃 host 完全没有 strip；它若带着自己的 tab 条，说明结构不是这一种，fail-closed。
+        if (owned.length !== 0) return null;
+        continue;
+      }
+      // 可见 host 必须恰好有一条自己的 tab 条：零条（tab 条没渲染出来）或多条都无法证明组成。
+      if (owned.length !== 1) return null;
+      activeCount += 1;
+      if (activeCount > 1) return null;
+      activeStrip = owned[0];
+    }
+    // 整列必须恰好一个活跃 host：整列全 hidden（一条 strip 都没有）同样读不出组成。
+    if (activeCount !== 1 || activeStrip === null) return null;
+    return [activeStrip];
+  }
+
+  /**
+   * 读取一个逻辑列自己的 tabId 集合。
+   *
+   * 只认**唯一活跃 strip** 里的 tab 芯片（strip 内部更深一层的 strip 属于嵌套 dock，不算本列）。
+   * 读面抛错、活跃 strip 不是恰好一条、strip 里没有任何 tab、未知或空 tabId 都让整列读不出来，
+   * 调用方据此 fail-closed，绝不把「读不到」当成空列。
+   *
+   * 同一条 strip 里出现重复 tabId 同样是结构异常（一个 tab 不可能在同一个 tablist 里出现两次）：
+   * 这里绝不能用 Set 静默吞掉重复，否则「读面不完整」会被误判成正常组成。
+   */
+  function cellTabIdsOf(column) {
+    const ids = new Set();
+    const strips = cellStripNodesOf(column);
+    // 读面契约：可读时恰好一条活跃 strip；null 或长度不为 1 都表示这一列读不出来。
+    if (strips === null || strips.length !== 1) return { ids, readable: false };
+    const strip = strips[0];
+    if (typeof strip.querySelectorAll !== "function") return { ids, readable: false };
+    let tabNodes = null;
+    try { tabNodes = Array.from(strip.querySelectorAll(RIGHTBAR_TAB_SELECTOR)); } catch { return { ids, readable: false }; }
+    for (const node of tabNodes) {
+      const scoped = withinSameDockScope(node, strip, [RIGHTBAR_STRIP_TABS_ATTRIBUTE]);
+      if (scoped === null) return { ids, readable: false };
+      if (scoped !== true) continue;
+      const tabId = text(attributeOf(node, RIGHTBAR_TAB_ID_ATTRIBUTE), null);
+      if (tabId === null) return { ids, readable: false };
+      if (ids.has(tabId)) return { ids, readable: false };
+      ids.add(tabId);
     }
     if (ids.size === 0) return { ids, readable: false };
     return { ids, readable: true };
@@ -1539,26 +1593,34 @@
   }
 
   /**
-   * 读取 split 容器的直接 dock 列。
+   * 读取 split 容器的直接 dock 列，并按列号归并成**逻辑列**。
    *
    * 只有 split 的**直接子节点**里 `data-dockkit-host="dock"` 且带非空 `data-dockkit-column`
    * 的才是真实列：浮动 host（data-dockkit-host="floating"）、resize 手柄、嵌套 split 的子列
-   * 都不算列。列号缺失/重复一律整轮 fail-closed——拿不到唯一列号的节点不能被当成一列。
+   * 都不算列。列号缺失（读不出来或空串）一律整轮 fail-closed——拿不到列号的节点不能被当成一列。
+   *
+   * 真实 DockLayout 是「**每个 tab 一个 host**」：同一个 pane 的多个 tab 各有自己的
+   * div[data-dockkit-host="dock"]，它们共享同一个 data-dockkit-column（只有活跃 tab 的那个 host
+   * 不带 hidden、也只有它渲染 tab 条）。因此同列多个 host 是**合法**结构，这里按列号归并成
+   * { column, hosts }：hosts 保留 DOM 顺序，顺序本身没有语义（组成判定只看活跃 strip 里的
+   * tab 集合），列号到 host 的归属仍然是精确的。
    */
   function dockCellsOf(split) {
     const cells = [];
     let children = null;
     try { children = split?.children ?? null; } catch { children = null; }
     if (children === null || children === undefined) return { cells, readable: false };
-    const columns = new Set();
+    const byColumn = new Map();
     for (const child of Array.from(children)) {
       if (child === null || typeof child.getAttribute !== "function") return { cells, readable: false };
       if (attributeOf(child, RIGHTBAR_DOCK_HOST_ATTRIBUTE) !== RIGHTBAR_DOCK_HOST_VALUE) continue;
       const column = text(attributeOf(child, RIGHTBAR_PANE_COLUMN_ATTRIBUTE), null);
-      if (column === null || columns.has(column)) return { cells, readable: false };
-      columns.add(column);
-      cells.push({ cell: child, column });
+      if (column === null) return { cells, readable: false };
+      const merged = byColumn.get(column);
+      if (merged === undefined) byColumn.set(column, { column, hosts: [child] });
+      else merged.hosts.push(child);
     }
+    for (const entry of byColumn.values()) cells.push(entry);
     return { cells, readable: true };
   }
 
@@ -1566,16 +1628,22 @@
    * 判断一个 split 容器是不是「列 0 = Expert Group、列 1 = 当前 session 的另一个已知页」。
    *
    * fail-closed 的边界（任一条不成立就 false，插件一个字节都不写）：
-   * - 直接 dock 列不是**恰好两列**，或列号不是 0/1（三列、缺列、未知列号都没有可证明的 40:60）；
-   * - 任一列读不出自己的 strip-tabs / tabId（空列、未知 tabId、读面抛错）；
+   * - 归并后的逻辑列不是**恰好两列**，或列号不是精确的 0/1（三列、缺列、未知列号都没有可证明的 40:60）；
+   * - 任一逻辑列读不出自己的活跃 strip / tabId（整列没有活跃 strip、多个活跃 strip、
+   *   可见 host 没有 strip、hidden host 却带 strip、hidden 状态不可读、未知 tabId、读面抛错）；
    * - 列 0 里混进非 Expert Group 页，或列 1 里出现 Expert Group 页；
-   * - 同一个 tabId 同时出现在两列（重复归属），或出现本会话 inventory 里没有的 tab（未知归属）。
+   * - 同一个 tabId 同时出现在两列，或同一条 strip 里重复出现（重复归属），
+   *   或出现本会话 inventory 里没有的 tab（未知归属）。
+   *
+   * 同列多个 host（真实「每个 tab 一个 host」形态）本身合法：判定用的是归并后的逻辑列与它唯一的
+   * 活跃 strip（该 strip 列出整个 pane 的 tab），因此多个子代理 tab 与单个子代理 tab 得到完全
+   * 相同的 40:60 结论。
    */
   function splitOwnsExpertPair(split, tabSets) {
     if (tabSets === null || tabSets === undefined || typeof tabSets !== "object") return false;
     const breakdown = dockCellsOf(split);
     if (breakdown.readable !== true || breakdown.cells.length !== 2) return false;
-    const byColumn = new Map(breakdown.cells.map((entry) => [entry.column, entry.cell]));
+    const byColumn = new Map(breakdown.cells.map((entry) => [entry.column, entry]));
     if (!byColumn.has("0") || !byColumn.has("1")) return false;
     const expertTabs = cellTabIdsOf(byColumn.get("0"));
     const otherTabs = cellTabIdsOf(byColumn.get("1"));
