@@ -27,6 +27,34 @@
   const RIGHTBAR_WIDTH_RATIO = 0.2;
   const OTHER_RIGHTBAR_WIDTH_RATIO = 0.5;
   /**
+   * 「宿主里那份右栏宽度是否仍是插件写的」的匹配容差（px）。
+   *
+   * 面板的实际渲染宽度会被浏览器做子像素取整与布局舍入，不可能与插件写入的整数 target 逐字节
+   * 相等；1px 足以覆盖这类规范化，又远小于任何一次真实用户拖拽（拖拽是数十像素量级），因此
+   * 不会把「用户已经改过宽度」误判成「还是插件那份值」。
+   */
+  const RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX = 1;
+  /**
+   * 同一个「未收敛的宽度 mismatch」允许的**恢复写入**上限（次）。
+   *
+   * 背景：宿主可能持续 clamp（请求 640，只渲染 320），或 React 延迟若干帧才把新宽度提交到 DOM。
+   * 这两种情况下「面板实际渲染宽度 != 插件 target」会一直是真，而它同时又是「宿主夺回了那份 px」
+   * 的证据；若每条同步路径（面板 observer / 2.5 秒轮询 / sessions 通知）都据此 force 重写，
+   * 就会与宿主的 clamp 无限拉锯：layout store 被同一个值反复改写、宿主反复重渲染（用户看到抖动）。
+   *
+   * 因此用一份 per-session 状态跟踪同一个恢复事件（session、**当前视口下预期**的 target、
+   * 观测到的实际宽度），同一个未收敛 mismatch 最多执行 2 次恢复写入：一次立即恢复 + 一次重试，
+   * 足以覆盖「宿主延迟一帧才提交」这类真实时序；再多就只是拉锯。上限**不能**被正常轮询自行重置——
+   * 只有观测到实际宽度已经等于 target（收敛）、**预期 target 真的改变**、所有权周期变化或 dispose
+   * 时才清除状态。
+   *
+   * 事件同一性里的 target 必须是**按当前视口算出来的预期值**，而不是「上次成功写入的值」：宿主持续
+   * clamp 时，视口从 3200 挪到 3201 / 3202，20% 取整后仍是同一个 640，那份 px 依然代表 20%——
+   * 这不是新的一次 mismatch，绝不能因此重新获得预算；只有窗口真正最大化（3200 → 4000，预期
+   * 640 → 800）才是一次新事件。否则用户轻微拖动窗口边缘就能无限重写，正是本预算要挡住的形状。
+   */
+  const RIGHTBAR_WIDTH_RECOVERY_MAX_ATTEMPTS = 2;
+  /**
    * DEG 的品牌图标 artwork：与宿主「智能体团队」入口同源的双人（users）图标。
    *
    * 4 条 path 逐字节取自宿主 primitives 的 IconUsersOutlineRegular（16×16 网格、1px 描边：
@@ -131,6 +159,20 @@
   const SIDEBAR_SPLIT_TRANSACTION_TIMEOUT_MS = 15000;
   /** RAF 被后台节流时的短 fallback；只负责放行一次 split 尝试，不改变事务提交 deadline。 */
   const SIDEBAR_SPLIT_LAYOUT_WAIT_FALLBACK_MS = 250;
+  /**
+   * 「分栏配比暂不可读」时的短延迟重试参数。
+   *
+   * 场景：DSH 重启后宿主从持久化布局恢复右栏分栏，第二列的 tab 条 / inventory 归属会**比
+   * split 容器晚若干帧**才提交。此时既不能证明组成仍成立，也不能证明组成已失效；旧实现把
+   * 「读不出来」直接当成「组成失效」立刻交还宿主，用户看到 40/60 → 50/50 的闪回。
+   *
+   * 因此这类「暂不可读」只在**已经写进过目标配比**之后进入 pending：保持当前样式并安排一次
+   * 短延迟重试（去重：同一时刻最多一个待执行重试），读面恢复后由重试或任何一次既有同步自动
+   * 重新落回目标配比。重试预算用尽仍读不出来时按「组成确实失效」交还宿主——预算有界，绝不
+   * 无限重排定时器，也不会把 0.4/0.6 无限期留在真实的单列结构上。
+   */
+  const SIDEBAR_SPLIT_PENDING_RETRY_DELAY_MS = 400;
+  const SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS = 4;
   /** 侧栏打开状态的复合键分隔符：会话 id、rootSessionId 与资源地址都是单行文本，NUL 不会出现在其中。 */
   const SIDEBAR_TAB_KEY_SEPARATOR = "\u0000";
 
@@ -141,6 +183,120 @@
   function text(value, fallback) {
     if (typeof value !== "string" || value.trim() === "") return fallback;
     return value.trim();
+  }
+
+  /**
+   * 读取当前视口宽度（px）；读不到（没有 window、非有限数、非正数）时返回 null。
+   *
+   * 右栏宽度是**视口比例**（Expert Group 页 20%、其它右侧分页 50%），但写进宿主 layout store 的
+   * 是像素值；因此「换算」与「视口是否变了」必须共用这一个读面，绝不能在两处各读一次
+   * （那会让比例换算与变化检测读到不同的视口）。读不到时返回 null，调用方一律放弃写入，
+   * 保留宿主当前值，绝不猜一个宽度。
+   */
+  function viewportWidthOf() {
+    let value = null;
+    try { value = globalThis.window?.innerWidth ?? globalThis.innerWidth; } catch { value = null; }
+    const width = Number(value);
+    return Number.isFinite(width) && width > 0 ? width : null;
+  }
+
+  /**
+   * 元素查询的三种结果。**必须区分「没命中」与「读面有歧义」**，两者对调用方的含义完全不同：
+   *
+   * - `missing`：这个选择器在当前 DOM 里确实一个都没命中。它表示「当前宿主版本没有这个读法」，
+   *   调用方可以继续尝试其它选择器；
+   * - `unique`：恰好命中一个元素，可以当作证据使用；
+   * - `ambiguous`：命中多个（读面有歧义，例如新旧 frame 同时残留），或查询本身抛错 / 读面不可用
+   *   （无 document、没有 querySelectorAll、代理抛错）。它**不是**「这个读法不存在」，因此绝不允许
+   *   被别的选择器「兜底」掩盖掉——把多命中降级成 missing 会让旧节点的唯一候选冒充当前 AppFrame。
+   */
+  const ELEMENT_QUERY_MISSING = "missing";
+  const ELEMENT_QUERY_UNIQUE = "unique";
+  const ELEMENT_QUERY_AMBIGUOUS = "ambiguous";
+
+  /**
+   * 查询一个选择器，返回 `{ status, element }`（element 只在 unique 时非 null）。
+   *
+   * 只返回这三种状态，任何异常都归一为 `ambiguous`（读不出来 ≠ 读到了空），绝不抛给调用方，
+   * 也绝不按 DOM 顺序取第一个命中：第一个命中无法证明它就是目标元素。
+   */
+  function elementQueryOf(doc, selector) {
+    let nodes = null;
+    try {
+      if (doc === null || doc === undefined || typeof doc.querySelectorAll !== "function") {
+        return { status: ELEMENT_QUERY_AMBIGUOUS, element: null };
+      }
+      nodes = Array.from(doc.querySelectorAll(selector));
+    } catch {
+      return { status: ELEMENT_QUERY_AMBIGUOUS, element: null };
+    }
+    if (nodes.length === 0) return { status: ELEMENT_QUERY_MISSING, element: null };
+    if (nodes.length > 1) return { status: ELEMENT_QUERY_AMBIGUOUS, element: null };
+    return { status: ELEMENT_QUERY_UNIQUE, element: nodes[0] };
+  }
+
+  /**
+   * 解析当前宿主的 AppFrame 根元素；无法**唯一**定位时返回 null。
+   *
+   * 只用宿主公开的 DOM 标记，与本文件既有的 AppFrame 读法（rightbarTransitionTargets）一致：
+   * 1. 主读法 [data-shell-overlay]：覆盖层是 AppFrame 的**直接子节点**，其 parentElement 即 AppFrame；
+   * 2. 兜底 [data-rightbar-collapsed] / [data-rightbar-instant]：AppFrame 自己的公开状态属性
+   *    （旧宿主可能没有覆盖层）。
+   *
+   * 歧义传播规则（本函数的 fail-closed 边界）：
+   * - 任何一个选择器**多命中或查询异常** → 立刻返回 null，不再看后面的读法：此时读面已经不可信，
+   *   让另一个选择器的唯一候选去「兜底」等于用旧 frame 冒充当前 AppFrame；
+   * - 只有真正 `missing`（零命中）才继续尝试下一个选择器；
+   * - 候选元素去重后必须**恰好一个**：零个表示定位不到 AppFrame，多个不同元素表示读面有歧义
+   *   （比如新旧 frame 同时残留），两者都返回 null——调用方按「读不到」处理，绝不挑一个猜。
+   */
+  function appFrameElementOf(doc) {
+    const candidates = [];
+    const push = (element) => {
+      if (element === null || element === undefined || element.nodeType !== 1) return;
+      if (candidates.includes(element) === false) candidates.push(element);
+    };
+    const overlay = elementQueryOf(doc, "[data-shell-overlay]");
+    if (overlay.status === ELEMENT_QUERY_AMBIGUOUS) return null;
+    if (overlay.status === ELEMENT_QUERY_UNIQUE) {
+      let parent = null;
+      try { parent = overlay.element.parentElement ?? null; } catch { parent = null; }
+      push(parent);
+    }
+    for (const selector of ["[data-rightbar-collapsed]", "[data-rightbar-instant]"]) {
+      const state = elementQueryOf(doc, selector);
+      if (state.status === ELEMENT_QUERY_AMBIGUOUS) return null;
+      if (state.status === ELEMENT_QUERY_UNIQUE) push(state.element);
+    }
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  /**
+   * 读取当前宿主 AppFrame 的宽度（px）；定位不到、尺寸非法时返回 null。
+   *
+   * 为什么不能拿 window.innerWidth 顶替：宿主 LayoutController 维护的 layout store 里那份
+   * viewportWidth 是用 **AppFrame 根元素的 getBoundingClientRect().width** 更新的，它是右栏宽度
+   * 上限 clamp 的参照系，并不恒等于 window.innerWidth（页面缩放、滚动条、外层留白、嵌入形态都会
+   * 让两者不等）。把 innerWidth 写进宿主那个权威槽位等于换了一个量去改宿主的判据：frame 比 window
+   * 窄时反而抬高上限，写出宿主自己永远不会写的宽度。
+   *
+   * fail-closed 边界（绝不猜测宿主尺寸）：
+   * - AppFrame 定位不到或归属有歧义（见 appFrameElementOf）→ null；
+   * - 解析结果就是 document.body / document.documentElement → null：它们是「整个文档」，
+   *   不是 AppFrame，宽度语义完全不同，绝不拿它们顶替；
+   * - 没有 getBoundingClientRect、矩形读不出来、宽度不是有限正数 → null。
+   */
+  function hostAppFrameWidthOf() {
+    try {
+      const doc = globalThis.document;
+      const frame = appFrameElementOf(doc);
+      if (frame === null) return null;
+      if (frame === doc?.body || frame === doc?.documentElement) return null;
+      const rect = typeof frame.getBoundingClientRect === "function" ? frame.getBoundingClientRect() : null;
+      if (rect === null || typeof rect !== "object") return null;
+      const width = Number(rect.width);
+      return Number.isFinite(width) && width > 0 ? width : null;
+    } catch { return null; }
   }
 
   /**
@@ -1231,23 +1387,122 @@
   }
 
   /**
-   * 在面板里找出**唯一**可解析的分栏容器。
+   * 一个逻辑列的「暂不可读」判定（与 cellStripNodesOf 同一套读面，但区分失败原因）。
    *
-   * 面板内部可能同时存在多个 split（列的内容区里嵌着的另一个 dock 也有自己的 split），但只有
-   * 满足 splitOwnsExpertPair 的那一个才是本插件的目标：零个表示还没分栏或形态不认识，多个表示
-   * 归属不明确——两种情况都返回 null（调用方 fail-closed，绝不挑第一个猜测）。
+   * 返回 "readable" | "unavailable" | "foreign"：
+   * - "readable"：恰好一条活跃 tab 条且 tab 组成可读——这一列有完整组成，轮不到 pending 分支；
+   * - "unavailable"：整列只有 hidden host（tab 条还没渲染出来）。这是重启恢复窗口里第二列的
+   *   典型形状，只有这种形状才允许 pending；
+   * - "foreign"：可见 host 没有 tab 条、非活跃 host 却带着自己的 tab 条、一个逻辑列出现多个活跃
+   *   strip host、hidden 状态不可读、host 列表为空、读面抛错。这些都不是「还没读完」而是
+   *   「结构不是本插件认识的那一种」，必须按原有 fail-closed 语义交还宿主。
    */
-  function resolveSplitContainer(panel, tabSets) {
-    if (panel === null || panel === undefined || typeof panel.querySelectorAll !== "function") return null;
+  function cellPendingStateOf(column) {
+    const hosts = column?.hosts ?? null;
+    if (!Array.isArray(hosts) || hosts.length === 0) return "foreign";
+    let activeStrip = null;
+    let activeCount = 0;
+    for (const host of hosts) {
+      if (host === null || host === undefined || typeof host.querySelectorAll !== "function") return "foreign";
+      const hidden = hostHiddenStateOf(host);
+      if (hidden === null) return "foreign";
+      let nodes = null;
+      try { nodes = Array.from(host.querySelectorAll(RIGHTBAR_STRIP_TABS_SELECTOR)); } catch { return "foreign"; }
+      const owned = [];
+      for (const node of nodes) {
+        const scoped = withinSameDockScope(node, host, [RIGHTBAR_DOCK_HOST_ATTRIBUTE, RIGHTBAR_SPLIT_ATTRIBUTE]);
+        if (scoped === null) return "foreign";
+        if (scoped === true) owned.push(node);
+      }
+      if (hidden === true) {
+        // 真实非活跃 host 完全没有 strip；带了自己的 tab 条说明结构不是这一种。
+        if (owned.length !== 0) return "foreign";
+        continue;
+      }
+      if (owned.length !== 1) return "foreign";
+      activeCount += 1;
+      if (activeCount > 1) return "foreign";
+      activeStrip = owned[0];
+    }
+    if (activeCount !== 1 || activeStrip === null) return "unavailable";
+    return cellTabIdsOf(column).readable === true ? "readable" : "foreign";
+  }
+
+  /**
+   * 区分「两列但第二列内容暂不可读」与「组成明确不再是目标」。
+   *
+   * 为什么需要它：重启恢复（宿主从持久化布局恢复右栏）时，split 容器往往比列内的 tab 条 /
+   * inventory 归属早几帧出现。这段窗口里 splitOwnsExpertPair 会返回 false，但 false 同时
+   * 覆盖了两种完全不同的现实：
+   * - **暂不可读**（本函数返回 "unavailable"）：结构上仍是两列，列 0 明确是本会话的
+   *   Expert Group 页，只有列 1 整列还没有活跃 tab 条（tab 条比 split 容器晚若干帧提交）。
+   *   此时组成只是「还没读完」，插件应当保持已写下的配比并短延迟重试，绝不闪回宿主默认值；
+   * - **明确非目标 / 单列**（返回 "foreign"）：列数不是精确的 0/1 两列、列 0 不是 Expert Group
+   *   页、列 0 的 tab 无法归属、或两列里混进重复/未知归属。这些都没有可证明的 40:60，必须
+   *   按原有 fail-closed 语义交还宿主。
+   *
+   * 归属判定与 splitOwnsExpertPair 完全同源（同一份 tabSets、同一条唯一活跃 strip 读法），
+   * 因此这里**不引入任何新的宽松证据**：pending 只在「目标那一侧已经被证明」时才成立，
+   * 首次接管（从未写过目标配比）也绝不会因为列 1 读不出来就去猜页面归属。
+   */
+  function splitPairPendingOf(split, tabSets) {
+    if (tabSets === null || tabSets === undefined || typeof tabSets !== "object") return "foreign";
+    const breakdown = dockCellsOf(split);
+    if (breakdown.readable !== true || breakdown.cells.length !== 2) return "foreign";
+    const byColumn = new Map(breakdown.cells.map((entry) => [entry.column, entry]));
+    if (!byColumn.has("0") || !byColumn.has("1")) return "foreign";
+    // 列 0 必须是可读且明确属于本会话的 Expert Group 页：读不出来就没有「已确认的目标」。
+    const expertTabs = cellTabIdsOf(byColumn.get("0"));
+    if (expertTabs.readable !== true || expertTabs.ids.size === 0) return "foreign";
+    for (const tabId of expertTabs.ids) {
+      if (tabSets.known.has(tabId) !== true) return "foreign";
+      if (tabSets.expert.has(tabId) !== true) return "foreign";
+    }
+    // 列 1 只有「整列还没有活跃 tab 条」这一种形状算暂不可读；其余（组成读得出来、可见 host
+    // 没有 strip、一个逻辑列多个活跃 strip、hidden 不可读等）都是「明确不是目标」，交回严格判定。
+    return cellPendingStateOf(byColumn.get("1")) === "unavailable" ? "unavailable" : "foreign";
+  }
+
+  /**
+   * 在面板里按给定判据挑出**唯一**的分栏容器。
+   *
+   * 面板内部可能同时存在多个 split（列的内容区里嵌着的另一个 dock 也有自己的 split），因此
+   * 判据命中多个时一律视为归属不明确并返回 null（调用方 fail-closed，绝不挑第一个猜测）；
+   * 返回数组的形态让调用方可以自行决定「零个 / 一个 / 多个」的处理方式（见下面的两个包装）。
+   */
+  function uniqueSplitBy(panel, matches) {
+    if (panel === null || panel === undefined || typeof panel.querySelectorAll !== "function") return [];
     let nodes = null;
-    try { nodes = Array.from(panel.querySelectorAll(RIGHTBAR_SPLIT_SELECTOR)); } catch { return null; }
-    let resolved = null;
+    try { nodes = Array.from(panel.querySelectorAll(RIGHTBAR_SPLIT_SELECTOR)); } catch { return []; }
+    const resolved = [];
     for (const node of nodes) {
-      if (splitOwnsExpertPair(node, tabSets) !== true) continue;
-      if (resolved !== null) return null;
-      resolved = node;
+      if (matches(node) !== true) continue;
+      resolved.push(node);
+      if (resolved.length > 1) break;
     }
     return resolved;
+  }
+
+  /**
+   * 在面板里找出**唯一**可解析的分栏容器。
+   *
+   * 只有满足 splitOwnsExpertPair 的那一个才是本插件的目标：零个表示还没分栏或形态不认识，
+   * 多个表示归属不明确——两种情况都返回 null（调用方 fail-closed）。
+   */
+  function resolveSplitContainer(panel, tabSets) {
+    const resolved = uniqueSplitBy(panel, (node) => splitOwnsExpertPair(node, tabSets) === true);
+    return resolved.length === 1 ? resolved[0] : null;
+  }
+
+  /**
+   * 找出面板里**唯一**的「暂不可读 pending」分栏容器（见 splitPairPendingOf 的说明）。
+   *
+   * 零个表示这一轮没有任何可保持目标配比的两列结构，多个表示归属不明确——调用方据此走
+   * 原有的交还宿主分支，绝不挑第一个猜测。返回数组（而不是元素或 null），因为「零个」与
+   * 「多个」在这里都必须与「恰好一个」区分开。
+   */
+  function splitPairPendingContainers(panel, tabSets) {
+    return uniqueSplitBy(panel, (node) => splitPairPendingOf(node, tabSets) === "unavailable");
   }
 
   /**
@@ -1459,6 +1714,33 @@
     let hostCapture = null;
     /** dispose 之后所有同步（含已经排队的迟到回调）一律短路，绝不再碰宿主样式。 */
     let disposed = false;
+    /**
+     * 「暂不可读」pending 的记账（**只在已经写进过目标配比之后**才可能成立）。
+     *
+     * 语义：容器上当前就是插件写下的目标配比，但这一轮读面读不出「列 1 是本会话的另一个已知页」，
+     * 也没有任何证据说明组成真的失效了（结构仍是两列、列 0 仍是 Expert Group 页）。
+     * 此时用 applyRatio 维持/修复目标配比，并安排一次短延迟重试去重新求值——这正是重启恢复
+     * 窗口里避免 target → host default 闪回的机制。
+     *
+     * attempts 的语义是「**实际执行过的** pending retry timer 轮数」：只有 schedulePendingRetry
+     * 的回调真正跑起来才自增，外部同步（sessions 广播 / observer / 轮询）只读取它、绝不修改，
+     * 因此同一个 400ms 等待期内的任意多次通知都不会提前耗尽预算。
+     */
+    let pending = null;
+    /** 去重用的待执行重试定时器句柄：同一时刻最多一个，重复同步绝不堆积。 */
+    let pendingRetryTimer = null;
+    /**
+     * 最近一次同步传入的**真实读面函数**（install 收尾接线的 splitTrackReader.readTarget）。
+     *
+     * 重试 timer 必须用它重新读一遍当前 document / session / panel / split / inventory 状态，
+     * 绝不能把上一轮那个 "pending" 结论原样回放：回放的话 timer 自己永远看不到「读面已经恢复」，
+     * 收敛就只能依赖外部的 sessions / observer 通知，而重启恢复窗口里恰恰没有这些通知——
+     * 结果是重试预算被白白烧完，配比反而被交还给宿主默认值（闪回）。
+     *
+     * 读面本身是纯函数式的现读（不依赖 this，也不缓存 DOM），因此这里只保存函数引用即可，
+     * 每次调用都会重新求值。读面为 null（install 收尾前）时 pending 不可能被建立。
+     */
+    let lastReader = null;
 
     /** 读一条内联值与优先级；任何能力缺失/抛错都返回 null，由调用方按「读不到」处理。 */
     const readInline = (style, name, readerName) => {
@@ -1574,16 +1856,91 @@
       } catch { /* 还原失败只影响外观，后续同步仍按同一规则重试。 */ }
     };
 
+    /** 取消待执行的重试（去重的唯一出口）：dispose、容器更换、状态离开 pending 时都必须调用。 */
+    const cancelPendingRetry = () => {
+      if (pendingRetryTimer === null) return;
+      const timer = pendingRetryTimer;
+      pendingRetryTimer = null;
+      try {
+        // 句柄由所在环境的 setTimeout 生成，必须用同一环境的 clearTimeout 释放。
+        globalThis.clearTimeout?.(timer);
+      } catch { /* 取消失败不能阻止其它所有权释放。 */ }
+    };
+
+    /** 结束 pending：清掉容器身份、重试预算与待执行定时器（三个字段必须一起复位，绝不留半状态）。 */
+    const clearPending = () => {
+      pending = null;
+      cancelPendingRetry();
+    };
+
+    /**
+     * 为「暂不可读」安排一次短延迟重试。
+     *
+     * 三条硬约束（对应契约里的「有界、去重、可取消」）：
+     * - 去重：pendingRetryTimer 非空就直接返回，重复同步（面板 observer / 2.5 秒轮询 / 宿主广播）
+     *   绝不堆积定时器；
+     * - 有界：**实际执行过的 timer 轮数**达到上限后不再重排，按「组成确实失效」交还宿主样式；
+     * - 可取消：dispose、容器更换、状态离开 pending 时都会 cancelPendingRetry。
+     *
+     * 预算的记账点只有一个：**这个回调真正开始执行的那一刻**。外部同步（sessions 广播 /
+     * observer / 轮询）无论触发多少次都不消耗预算——它们只是在同一个 400ms 等待期内重复求值，
+     * 若也去自增 attempts，真实 timer 一轮都没跑预算就被烧完，重启恢复窗口会提前闪回宿主比例。
+     *
+     * 回调里先出队，把这一轮计入预算，再用**真实读面**重新求值一次（sync(lastReader)）：
+     * 若读面已经恢复，sync 会走正常路径重新落到目标配比并立即清空 pending；若仍是 pending，
+     * sync 会在预算内重排下一个 timer，预算耗尽时则 clearPending + restore（有界收敛）。
+     * 没有可用调度器时只是「这一轮不重试」，任何一次既有同步仍会重新求值，绝不影响页面其它行为。
+     */
+    const schedulePendingRetry = (container) => {
+      if (disposed || pendingRetryTimer !== null) return;
+      try {
+        pendingRetryTimer = globalThis.setTimeout(() => {
+          pendingRetryTimer = null;
+          if (disposed) return;
+          // 迟到 timer：容器/状态已经变过（session 切换、容器重挂载、已收敛），一律不再动作。
+          if (pending === null || pending.container !== container) return;
+          const entry = pending;
+          // 读面函数缺失时不做任何猜测性写入：这一轮什么都不做，等下一次真实同步。
+          if (typeof lastReader !== "function") return;
+          // 这一轮 timer 确实执行了 → 只有这里消耗一轮预算（外部同步绝不走这条路径）。
+          pending = { container, attempts: entry.attempts + 1 };
+          sync(lastReader);
+          // sync 自己会在「仍是 pending 且预算未耗尽」时重排。这里只兜底它提前返回的情况
+          // （例如 document 读面不可用）：pending 还在、预算还有、却没有 timer，必须补一个，
+          // 否则有界重试会静默中断；attempts 已经自增，因此补排也必然有界。
+          if (pending !== null && pending.container === container
+            && pendingRetryTimer === null
+            && pending.attempts < SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS) {
+            schedulePendingRetry(container);
+          }
+        }, SIDEBAR_SPLIT_PENDING_RETRY_DELAY_MS);
+      } catch {
+        // 没有可用调度器：放弃这一轮重试（pending 保留，下一次同步会重新求值）。
+        pendingRetryTimer = null;
+      }
+    };
+
     /**
      * 按当前右栏 DOM 组成重估一次列宽配比。
      *
      * 读面全部由调用方以参数交进来（readTarget 每次现读 session / panel / split 容器）：
      * 这里**不引用** install 体内的任何后置 const（那是 TDZ 陷阱的来源），所有输入都是显式依赖，
      * 调用点必须自己保证它们就绪。
-     * 返回 true 表示这一轮之后配比确实落在容器上（含幂等命中），false 表示已还原/让位/未写入。
+     *
+     * readTarget 返回 { status, container }：
+     * - status 缺省 / "target"：组成可证明，按 applyRatio 施加目标配比；
+     * - status "pending"：**已经写过目标配比**、但这一轮读不出列 1 的组成（重启恢复窗口）——
+     *   继续用 applyRatio 维持/修复目标配比并短延迟重试，绝不闪回宿主默认值，也绝不覆盖外部值；
+     * - 其余（null、单列、明确非目标）：交还宿主样式。
+     *
+     * 返回 true 表示这一轮之后插件仍持有 pending 或配比确实落在容器上（含幂等命中），
+     * false 表示已还原 / 让位 / 未写入。调用方（requestSplitTrackSync 的各入口）不使用这个布尔值，
+     * 它只服务于重试回调的兜底重排。
      */
     const sync = (readTarget) => {
       if (disposed) return false;
+      // 记住本次的真实读面：pending 重试 timer 必须用它重新现读状态，而不是回放上一轮结论。
+      if (typeof readTarget === "function") lastReader = readTarget;
       // document 读面不可用：连「有没有分栏容器」都无法证明，保持现状（绝不猜测性还原）。
       let doc = null;
       try { doc = globalThis.document ?? null; } catch { doc = null; }
@@ -1595,19 +1952,57 @@
       // （那些调用点只包了「失败不影响宿主」的兜底，异常外溢会让后面的宽度/手柄逻辑一起被跳过）。
       try { target = typeof readTarget === "function" ? readTarget(doc) : null; } catch { target = null; }
       if (target === null || target.container === null || target.container === undefined) {
+        clearPending();
         restore();
         return false;
       }
-      // 容器换了（宿主重挂载 / 切到另一条 surface）：先交还旧容器，再接管新容器。
+      // 容器换了（宿主重挂载 / 切到另一条 surface）：先作废上一轮的 pending 记账，再交还旧容器。
+      if (pending !== null && pending.container !== target.container) clearPending();
       if (applied !== null && applied.container !== target.container) restore();
+      // 「暂不可读」只在**已经写过目标配比**之后才成立：没有 applied 就没有需要保持的样式，
+      // 首次接管必须继续走原有 fail-closed 语义——绝不因为列 1 读不出来就去猜页面归属，
+      // 也绝不凭空列或缺失 inventory 把未知页面当成目标（这条边界不能放松）。
+      if (target.status === "pending" && applied !== null && applied.container === target.container) {
+        // attempts 只统计**实际执行过的 pending retry timer 轮数**（由 schedulePendingRetry 的
+        // 回调自增）。外部同步——sessions 广播、面板 observer、2.5 秒轮询——无论在同一等待期内
+        // 触发多少次，都既不消耗预算也不重置预算，只维持 pending 并保证最多一个 timer。
+        const attempts = pending !== null && pending.container === target.container ? pending.attempts : 0;
+        if (attempts < SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS) {
+          // 暂不可读期间同样要维持配比，不能只「保持当前样式」：宿主可能在这段窗口里重渲染回
+          // 它自己的等分形态（甚至清掉内联声明），那样错误比例会一直留在屏幕上，直到预算耗尽
+          // 也回不到 40/60。这里复用与「组成可证明」时**完全相同**的 applyRatio：
+          // - 目标值 / 宿主自己的等分 / 宿主清空内联声明 → 保持或修复回目标配比；
+          // - 外部刻意写下的非等分值 → 由 shouldApply 让位，绝不覆盖（不引入第二套写入规则）。
+          applyRatio(target.container);
+          // 首次进入 pending 才建立记账（attempts 从 0 起）；已存在时原样保留已消耗的预算，
+          // 绝不因外部同步累加（那会让预算在 timer 一轮都没跑时就被烧完）或重置。
+          if (pending === null) pending = { container: target.container, attempts: 0 };
+          schedulePendingRetry(target.container);
+          // 保持 pending：组成还没恢复，继续有界重试（applyRatio 让位时也不改写外部值）。
+          return true;
+        }
+        // 预算已经被**实际 timer 轮次**耗尽仍读不出来：按「组成确实失效」交还宿主样式并停止重排。
+        clearPending();
+        restore();
+        return false;
+      }
+      // 组成可证明：清空 pending 记账后按目标配比重新求值（读面恢复时这一步会清掉重试预算）。
+      clearPending();
+      // 「暂不可读」但还没有可保持的样式：这一轮什么都不写（不是目标，也不猜测），
+      // 由后续同步在组成可证明时再施加。
+      if (target.status === "pending") return false;
       return applyRatio(target.container);
     };
 
     return {
       sync,
-      /** 卸载收尾：还原内联声明并置位 disposed，之后任何迟到同步都不再写入。 */
+      /**
+       * 卸载收尾：取消待执行的重试、还原内联声明并置位 disposed，之后任何迟到同步都不再写入。
+       * 定时器必须在这里释放——卸载后插件不得再碰宿主样式，也不留下泄漏的 timer。
+       */
       dispose() {
         disposed = true;
+        clearPending();
         restore();
       },
     };
@@ -4008,6 +4403,14 @@
      */
     const rightbarWidths = new Map();
     /**
+     * sessionId → 上次成功写入宽度时所用的**视口宽度**（px）。
+     *
+     * 与 rightbarWidths 同为 per-session 的目标值记账（同样只在 install 生命周期内有效、
+     * dispose 一并清空），但记的是「那份像素值是按哪个视口算出来的」。窗口最大化 / 全屏后
+     * 视口变化，这份记账就是常驻同步路径发现「必须重算」的判据（见 rightbarWidthViewportChanged）。
+     */
+    const rightbarWidthViewports = new Map();
+    /**
      * 最近一次成功写入宽度的 surface 会话：宿主那份全局宽度当前归谁。
      *
      * 宿主 setRightbar 写的是全局 layout store；因此 session A → B → A 的每次 surface 切换都必须
@@ -4032,6 +4435,58 @@
     const rightbarWidthPreparedSessions = new Set();
     /** 最近一次被公开 active() 证明确实处于 Expert Group 页、且宽度已经落到宿主的会话集合。 */
     const rightbarWidthActiveSessions = new Set();
+    /**
+     * 同一个「未收敛的宽度 mismatch」的恢复写入记账：sessionId → { target, actualWidth, attempts }。
+     *
+     * 只记**恢复边沿**（宿主夺回了那份 px）的写入，不记首次接管 / 从其它分页返回 Expert Group /
+     * 分栏事务的 50% 与收口 20% 这些正常写入；因此它既不会挡住正常写入，也不会让正常轮询把预算
+     * 重置（见 RIGHTBAR_WIDTH_RECOVERY_MAX_ATTEMPTS）。
+     *
+     * 事件同一性由 (target, 观测到的实际宽度) 决定，其中 target 是**按当前视口算出来的预期值**
+     * （不是「上次成功写入的值」，见 recoverRightbarWidth）：
+     * - 没有记账、预期 target 变了、或观测到的实际宽度变了 → 新的一次 mismatch 事件，重新获得完整预算；
+     * - 三者都相同 → 同一个未收敛事件，预算用尽后一律拒绝写入。
+     *
+     * 「预期 target 变了」必须用当前视口重算：宿主持续 clamp 时视口挪一两个像素、20% 取整后仍是同一个
+     * px，那不是新事件；只有窗口真正最大化到取整结果改变才是一次新事件。
+     */
+    const rightbarWidthRecoveries = new Map();
+    /** 清除某个会话的恢复写入记账（收敛 / 所有权周期变化 / dispose 共用）。 */
+    const clearRightbarWidthRecovery = (sessionId) => {
+      if (sessionId === null || sessionId === undefined) return;
+      rightbarWidthRecoveries.delete(sessionId);
+    };
+    /**
+     * 恢复边沿的**有界预算**判定：返回 true 表示这一次「宿主夺回了宽度」的恢复写入允许执行。
+     *
+     * 只在恢复边沿调用（统一入口是 recoverRightbarWidth：recomputeOwnedWidth 的 hostReclaimed 分支
+     * 与 confirmed 分支的同一判据），因此首次接管、从其它分页返回、分栏事务的 50% / 收口 20% 等
+     * 正常写入完全不受影响。
+     *
+     * target 参数必须是**按当前视口算出来的预期值**（`Math.round(视口宽度 × 比例)`），不能传「上次
+     * 成功写入的值」：宿主持续 clamp 时，视口 3200 → 3201 → 3202 的预期值都是 640，用预期值做事件
+     * 同一性，这些视口变化才会被正确地归入同一个未收敛事件、不再重新获得预算。
+     *
+     * 预算在**调用时**消耗（而不是写入成功后）：写入本身几乎不会失败，而「尝试过就计数」能保证
+     * 即使宿主每次都把写入吞掉，也不会出现无限重试——这正是本预算要挡住的形状。
+     */
+    const allowRightbarRecoveryWrite = (sessionId, target, actualWidth) => {
+      if (sessionId === null || sessionId === undefined) return false;
+      if (typeof target !== "number" || Number.isFinite(target) !== true) return false;
+      if (typeof actualWidth !== "number" || Number.isFinite(actualWidth) !== true) return false;
+      const recorded = rightbarWidthRecoveries.get(sessionId);
+      const sameEvent = recorded !== undefined
+        && recorded.target === target
+        && Math.abs(recorded.actualWidth - actualWidth) <= RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX;
+      if (sameEvent !== true) {
+        // 新的一次 mismatch 事件（首次观测 / target 变了 / 观测到的实际宽度变了）。
+        rightbarWidthRecoveries.set(sessionId, { target, actualWidth, attempts: 1 });
+        return true;
+      }
+      if (recorded.attempts >= RIGHTBAR_WIDTH_RECOVERY_MAX_ATTEMPTS) return false;
+      recorded.attempts += 1;
+      return true;
+    };
     /** 读取某个会话当前的宽度模式；没有已确认模式时返回 null。 */
     const widthModeOf = (sessionId) => (sessionId === null || sessionId === undefined
       ? null
@@ -4039,8 +4494,17 @@
     /** 写入（mode 非空）或清除（mode 为 null）某个会话的宽度模式。 */
     const setWidthMode = (sessionId, mode) => {
       if (sessionId === null || sessionId === undefined) return;
-      if (mode === null || mode === undefined) rightbarWidthModes.delete(sessionId);
-      else rightbarWidthModes.set(sessionId, mode);
+      const previous = rightbarWidthModes.get(sessionId) ?? null;
+      const next = mode === null || mode === undefined ? null : mode;
+      if (next === null) rightbarWidthModes.delete(sessionId);
+      else rightbarWidthModes.set(sessionId, next);
+      // 模式（= 宽度所有权周期）**发生变化**时，恢复事件记账随之失效：新周期里的第一次 mismatch
+      // 是新事件，重新获得完整预算。两条刻意收紧的边界：
+      // - 只在**已有非空模式**被换掉（expert ↔ other、或交还成 null）时清除。null → expert 是
+      //   「首次确认这一份 expert 所有权」，恢复记账仍属于同一个周期，不能被重置；
+      // - 无条件清除会让 confirmed 分支每一轮同步都重置预算（它每轮都用同一个值调用本函数），
+      //   正常轮询就能无限重写——正是本预算要挡住的形状。
+      if (previous !== null && previous !== next) clearRightbarWidthRecovery(sessionId);
     };
     /** 某个会话是否刚被 openTargets 预置过宽度（同一同步栈内不重复写）。 */
     const isWidthPrepared = (sessionId) => sessionId !== null && sessionId !== undefined
@@ -4065,6 +4529,8 @@
       setWidthMode(sessionId, null);
       setWidthPrepared(sessionId, false);
       setWidthActive(sessionId, false);
+      // 模式/所有权周期结束时，这个会话的「恢复事件」记账一并失效：下一次 mismatch 是新事件。
+      clearRightbarWidthRecovery(sessionId);
     };
     /**
      * 把宿主那份全局宽度的归属迁移到 sessionId（每次成功写入后调用）。
@@ -4129,36 +4595,273 @@
      * 视口宽度变化导致同一会话的目标 px 变化时会重写一次。
      *
      * 20% 是精确比例：插件不做任何最小值 clamp（宿主 setRightbar 自己有 clamp，它才是权威边界）。
+     *
+     * 写入前会 best-effort 同步宿主自己那份视口缓存：宿主 clamp 用的是 AppFrame 根元素宽度，
+     * 冷启动时它可能还停在旧值，会把目标宽度夹小（2560 视口写 1280，宿主按 1280 缓存夹成 896），
+     * 而插件的记账已认为「这个视口写过」，偏差不会自愈。同步值只取**能唯一、可靠读到的 AppFrame
+     * 宽度**（见 hostAppFrameWidthOf），绝不拿 window.innerWidth 顶替；读不到就完全跳过同步。
+     * 目标像素值仍按 window.innerWidth 的比例换算，本次已读取的同一个视口宽度贯穿始终。
+     *
      * 兼容：layout 服务缺失、服务代理读属性抛错、setRightbar 不是函数或调用抛错时一律返回 false
      * 且**不记账**——写入失败不算应用，后续通知仍可重试，宿主自己的默认宽度继续生效。
+     * 可选的视口同步 action 缺失、读属性抛错或调用抛错都不阻断既有 setRightbar 路径。
      */
     const applyRightbarWidth = (sessionId, ratio = RIGHTBAR_WIDTH_RATIO, force = false) => {
       if (sessionId === null || sessionId === undefined) return false;
       // 视口宽度读不到（无 DOM 环境）就没有可换算的比例：放弃写入，保留宿主当前值。
-      const viewportWidth = Number(globalThis.window?.innerWidth ?? globalThis.innerWidth);
-      if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) return false;
+      const viewportWidth = viewportWidthOf();
+      if (viewportWidth === null) return false;
       const normalizedRatio = Number(ratio);
       if (!Number.isFinite(normalizedRatio) || normalizedRatio <= 0) return false;
       const target = Math.round(viewportWidth * normalizedRatio);
       if (force !== true && rightbarWidths.get(sessionId) === target) return false;
       const layout = config.layout || optionalService("layout");
-      let setRightbar = null;
-      try {
-        const candidate = layout?.panels?.setRightbar;
-        if (typeof candidate === "function") setRightbar = candidate;
-      } catch { /* Cordis 服务代理对未声明属性会抛错：按「宿主没有这个 action」处理。 */ }
+      // panels 与两个 action 的属性读取必须**逐项独立隔离**：可选的 setViewportWidth 读属性抛错
+      // （Cordis 服务代理对未声明属性就会抛）绝不能把必要的 setRightbar 一起挡掉。
+      let panels = null;
+      try { panels = layout?.panels ?? null; } catch { panels = null; }
+      const setRightbar = methodOf(panels, "setRightbar");
       if (setRightbar === null) return false;
+      const setViewportWidth = methodOf(panels, "setViewportWidth");
+      // 宿主 setRightbar 按 layout store 的 viewportWidth 做上限 clamp，而那份缓存来自 AppFrame 根
+      // 元素宽度（冷启动时可能还停在旧值，把目标宽度夹小）。只有能唯一、可靠读到 AppFrame 宽度时
+      // 才先把它同步给宿主；读不到 AppFrame、尺寸非法时**不同步、不猜测宿主尺寸**，直接走原有写入。
+      const appFrameWidth = hostAppFrameWidthOf();
+      if (appFrameWidth !== null) {
+        try { setViewportWidth?.call(panels, appFrameWidth); } catch { /* 校准不是展示侧栏的前置条件，失败时保留原有写入兼容路径。 */ }
+      }
       try {
         // bound action 是闭包，不依赖 this；仍显式带上接收者，兼容将来改成方法式绑定。
-        setRightbar.call(layout.panels, target);
+        setRightbar.call(panels, target);
       } catch {
         // 调用失败不算写入成功：保持未记账（后续通知仍可重试），宿主当前宽度继续生效。
         return false;
       }
       rightbarWidths.set(sessionId, target);
+      // 连同「这次换算用的视口宽度」一起记账：它才是「宿主那份像素值是否还对应当前视口」的判据，
+      // 也是常驻同步路径发现窗口最大化 / 全屏 / 拖拽后必须重新写入的唯一来源。
+      rightbarWidthViewports.set(sessionId, viewportWidth);
       // 写入成功即接管宿主那份全局宽度：旧会话的 transient 记账随归属一起失效（见 claim 说明）。
       claimRightbarWidthOwnership(sessionId);
       return true;
+    };
+    /**
+     * 某个会话「上次写入宽度时用的视口宽度」是否已经变了（窗口最大化 / 全屏 / 拖拽 / 旋转屏幕）。
+     *
+     * 右栏宽度是视口比例，视口一变，之前写下的像素值就不再代表 20% / 50%：必须按新视口重新
+     * 换算并写入。这是常驻同步路径**唯一**的重新写入判据——同一视口下的重复通知仍然一个字节
+     * 都不写（保留「宿主里那份值可能是用户拖拽结果」的原有去重语义）。
+     *
+     * 没有写过宽度（没有记账）时返回 false：那种情况由「首次接管 / 从其它分页返回」等既有
+     * 分支负责写入，不在这里重复承担。
+     */
+    const rightbarWidthViewportChanged = (sessionId) => {
+      if (sessionId === null || sessionId === undefined) return false;
+      const recorded = rightbarWidthViewports.get(sessionId);
+      if (recorded === undefined) return false;
+      const viewportWidth = viewportWidthOf();
+      if (viewportWidth === null) return false;
+      return recorded !== viewportWidth;
+    };
+    /**
+     * 读当前会话对应右栏面板的**实际渲染宽度**（px）。
+     *
+     * 这是「宿主里那份宽度到底是谁写的」唯一可验证的公开证据：只读
+     * [data-sidebar-right-panel] 与 getBoundingClientRect()，不注册 class、不读任何私有状态。
+     *
+     * 一律 fail-closed（返回 null）：面板归属无法精确解析（零个 / 多个 / 缺
+     * data-sidebar-right-session）、没有 getBoundingClientRect、矩形读不出来、宽度不是有限正数
+     * （null / 0 / NaN / 负值 / 非数字）——这些都不构成「宽度等于某个值」的证据，调用方必须保留
+     * 宿主当前值，等后续可验证的同步。
+     */
+    const readRightbarPanelWidth = (sessionId) => {
+      if (typeof sessionId !== "string" || sessionId === "") return null;
+      let panel = null;
+      try { panel = rightbarPanelForSession(globalThis.document, sessionId); } catch { return null; }
+      if (panel === null || panel === undefined) return null;
+      let rect = null;
+      try {
+        rect = typeof panel.getBoundingClientRect === "function" ? panel.getBoundingClientRect() : null;
+      } catch { return null; }
+      if (rect === null || typeof rect !== "object") return null;
+      let width = null;
+      try { width = Number(rect.width); } catch { return null; }
+      if (Number.isFinite(width) !== true || width <= 0) return null;
+      return width;
+    };
+    /**
+     * 宿主里那份右栏宽度是否**仍是插件上一次成功写入的 target**（见 rightbarWidths）。
+     *
+     * 为什么需要它：other 模式的宽度是**可调**的，用户在其它右侧分页上拖出的宽度由宿主持有。
+     * 只有「面板实际渲染宽度 == 插件上次写的 px」才能证明宿主里那份值仍是插件写的（或用户恰好
+     * 拖回了同一个值，等价于没有改动），此时按模式重算视口才不会覆盖用户的拖拽结果。
+     *
+     * 任何一环读不出来（没有上次 target / 面板宽度读不到 / 宽度对不上）都返回 false：宁可这一次
+     * 不重算，也绝不猜测写入——宿主当前值原样保留，后续 confirmed / other 分支仍会按证据重估。
+     */
+    const hostWidthMatchesPluginTarget = (sessionId) => {
+      const ownership = rightbarOwnershipOf(sessionId);
+      return ownership !== null && ownership.matches === true;
+    };
+    /**
+     * 一次性读出「宿主那份宽度 vs 插件 target」的**所有权观测**；读不出来时返回 null（fail-closed）。
+     *
+     * 返回 { target, actualWidth, matches, differs }：
+     * - matches：面板实际渲染宽度仍等于插件上次写入的 target（所有权仍在插件手里）；
+     * - differs：面板实际渲染宽度明确不等于 target（宿主夺回了那份 px）。
+     *
+     * 为什么合成一个函数：同一轮同步里既要判 matches 又要判 differs，还会消费恢复预算，分开调用会
+     * 把同一份 DOM 证据读两遍（readRightbarPanelWidth → getBoundingClientRect 会触发布局）。
+     * 任何一环读不出来（没有 target / 面板定位不到 / 宽度不是有限正数）一律返回 null——读不出来就
+     * 不构成任何证据，调用方必须原样保留宿主当前值。
+     */
+    const rightbarOwnershipOf = (sessionId) => {
+      const target = rightbarWidths.get(sessionId);
+      if (typeof target !== "number" || Number.isFinite(target) !== true) return null;
+      const actualWidth = readRightbarPanelWidth(sessionId);
+      if (actualWidth === null) return null;
+      const delta = Math.abs(actualWidth - target);
+      return {
+        target,
+        actualWidth,
+        matches: delta <= RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX,
+        differs: delta > RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX,
+      };
+    };
+    /**
+     * 消费一次「所有权观测」：观测到收敛（实际宽度 == target）就清掉恢复事件记账。
+     *
+     * 这正是「状态清除」的唯一判据：宿主终于把 target 提交到 DOM 上之后，下一次 mismatch 必须是
+     * **新的一次恢复事件**（重新获得完整预算），而不是被上一次已经用尽的预算永久挡住。
+     * 读不出观测（null）时什么都不做——没有证据就不清除，保持原有记账。
+     */
+    const settleRightbarRecovery = (sessionId, ownership) => {
+      if (ownership !== null && ownership.matches === true) clearRightbarWidthRecovery(sessionId);
+    };
+    /**
+     * 恢复 / 视口重写的**统一入口**：所有「实际宽度明确偏离当前视口预期 target」的写入都走这里。
+     *
+     * 为什么必须统一：恢复写入的判据散落在两条分支上（confirmed 分支与 recomputeOwnedWidth 的
+     * unknown 分支）时，只要其中一条把「视口变化」当成**独立**边沿、不消费预算，宿主持续 clamp 的
+     * 场景就能被无限绕过——视口从 3200 挪到 3201 / 3202，20% 取整后仍是同一个 target 640，
+     * 每一次视口变化都变成「一次新的恢复事件」，用户轻微拖动窗口边缘就会与宿主的 clamp 无限拉锯。
+     * 因此两条分支共用这一份判定（per-session，按预期 target + 观测到的实际宽度记账）。
+     *
+     * 三条口径：
+     * - **没有公开 DOM 证据（ownership 为 null：面板定位不到，或 getBoundingClientRect().width
+     *   不是有限正数）就是不写**：恢复 / 视口重算入口一律 fail-closed，一个字节都不写，既不消费
+     *   mismatch 预算，也绝不新建 / 重置一次 mismatch 事件。右栏宽度是宿主 layout store 里的**全局**
+     *   偏好，插件只在能证明「这份 px 现在是谁的」时才允许改写它；读面不可用期间没有任何证据说明
+     *   面板宽度偏离了 target，写下去就是无据改写宿主状态（而且是每次视口变化 / 通知 / 轮询都写的
+     *   无界改写）。宿主那份值原样保留，等后续**可验证**的同步（readRightbarPanelWidth 恢复可读）——
+     *   这条收紧只作用于恢复 / 视口重算入口，首次接管、从其它分页返回、分栏事务收口等正常写入
+     *   语义完全不受影响；
+     * - 实际宽度已经等于**当前视口下预期**的 target：这不是 mismatch，只是视口记账需要更新（例如
+     *   宿主已经自己落到了正确宽度），正常写一次即可，不消费预算；
+     * - 实际宽度明确偏离预期 target：同一个 (预期 target, 实际宽度) 的写入共用 per-session 预算，
+     *   用尽后一律拒绝；预期 target 真正改变（窗口最大化导致取整结果变化）时是一次**新事件**，
+     *   重新获得完整预算。
+     *
+     * 调用方负责「该不该尝试写入」的边沿判定（视口变化 / 宿主夺回宽度 / 模式证据），这里只负责
+     * 「这次写入允不允许」：不读任何私有状态、不新增轮询或定时器。
+     */
+    const recoverRightbarWidth = (sessionId, ratio, ownership) => {
+      if (sessionId === null || sessionId === undefined) return false;
+      // 没有任何公开 DOM 证据：直接 fail-closed。这里刻意不调用 applyRightbarWidth（更不带 force），
+      // 因此既不会写宿主宽度，也不会触碰恢复预算记账（不新建、不重置、不消费）。
+      if (ownership === null || ownership === undefined) return false;
+      // 预期 target 必须与 applyRightbarWidth 用同一套换算（同一视口宽度 × 同一比例、同样取整），
+      // 否则事件同一性会把「同一份预期值」判成两次不同事件。
+      const viewportWidth = viewportWidthOf();
+      if (viewportWidth === null) return false;
+      const expectedTarget = Math.round(viewportWidth * ratio);
+      if (Math.abs(ownership.actualWidth - expectedTarget) <= RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX) {
+        // 实际宽度已经等于预期 target：只是视口记账需要更新，不属于 mismatch，不消费预算。
+        return applyRightbarWidth(sessionId, ratio, true) === true;
+      }
+      if (allowRightbarRecoveryWrite(sessionId, expectedTarget, ownership.actualWidth) !== true) return false;
+      return applyRightbarWidth(sessionId, ratio, true) === true;
+    };
+    /**
+     * 组成证据为 unknown 时，按**本会话已经证明过的宽度模式**重算「视口变化 / 宿主夺回宽度」。
+     *
+     * 两条触发边沿（都只作用于 expert 模式，见下面的 other 分支说明）：
+     * 1. 视口宽度变了（窗口最大化 / 全屏 / 拖拽窗口边缘）：那份 px 不再代表原来的比例；
+     * 2. **宿主夺回了那份 px**（面板实际渲染宽度 != 插件上次写入的 target）：DSH 重启后宿主从
+     *    持久化布局恢复它自己那份旧值的时序正是「视口没变但那份值已经不是插件的」，
+     *    只按视口判据永远等不到重算（见 rightbarOwnershipOf 的 differs）。
+     *
+     * 为什么「面板宽度 != 插件 target」就足以证明宿主夺回了所有权（只在 expert 模式消费）：
+     * Expert Group 页的手柄由插件锁住（rightbarDragLock），用户在这一页**拖不动**右栏；而 20%
+     * 又是插件独占的固定比例，不存在「用户在该页自定义宽度」的语义。因此这一页上面板宽度偏离
+     * target 只有两种可能：宿主自己重渲染回了它那份持久化值，或用户恰好拖到了同一个值（等价于
+     * 没有改动）。两种情形都应当把 20% 写回去——但**必须有界**（见 recoverRightbarWidth）。
+     *
+     * 为什么 unknown 仍然可以重算：组成读面（inventory / DOM）回答的是「当前右栏里有哪些页」，
+     * 而这里消费的是本会话**自己**的宽度记账——它记的是「宿主那份 px 是按哪个比例、哪个视口
+     * 写下去的」，与组成读面无关。视口一变（窗口最大化 / 全屏 / 拖拽窗口边缘），那份 px 就不再
+     * 代表原来的比例（实测：1600 视口写 320，最大化到 3200 后仍是 320，而正确值是 640），因此
+     * 必须按同一比例重算；否则读面暂不可用的宿主会一直停在过期宽度上。
+     *
+     * fail-closed 边界（绝不放松）：
+     * - 没有任何模式证据（mode 为空且 prepared/active 都没有）时返回 false，一个字节都不写；
+     *   组成读面不可用时**绝不臆测** 20% 或 50%，也绝不把 unknown 当成 confirmed；
+     * - **没有宽度 DOM 证据（面板宽度读不出来）时同样一个字节都不写**：expert 模式虽然不要求
+     *   「面板宽度仍等于插件 target」（那是 other 的可调保护），但**要求这条读面本身可用**——
+     *   ownership 为 null 时 recoverRightbarWidth 直接 fail-closed，既不写宽度也不动恢复预算
+     *   （见该函数第一条口径）。模式证据只回答「该写哪个比例」，不构成「可以无据改写宿主全局
+     *   宽度」的证据；
+     * - **other 模式额外要求宿主宽度所有权**：other 的 50% 是可调状态，用户可以在该页手动拖宽，
+     *   仅凭「模式是 other」就重算会覆盖用户的拖拽结果。因此只有 hostWidthMatchesPluginTarget
+     *   证明宿主里那份 px 仍是插件上次写的 target 时才重算；读不到或对不上一律不写（见该函数说明）。
+     *   expert 模式不受此限制：20% 是插件**独占**的固定比例，不存在「用户在该页拖宽」的语义；
+     * - **other 模式只认视口变化这一条边沿**：宿主夺回宽度在 other 模式里正是「用户拖过一次」
+     *   的典型形状，据此重算会覆盖用户的拖拽结果，因此那一模式绝不消费 hostReclaimed；
+     *   other 的视口重算还额外要求 hostWidthMatchesPluginTarget（实际宽度仍等于插件上次的 target），
+     *   这条真实用户拖拽保护不受本预算逻辑影响，绝不放宽；
+     * - expert 模式去重：视口没变、且宿主那份值仍等于插件 target 时什么都不做；
+     * - 写入失败由 applyRightbarWidth 自己保证不记账，后续通知仍可重试；
+     * - 手柄锁与组合归属语义完全不变：本函数不碰 rightbarDragLock，也不改写任何 transient 记账
+     *   （prepared / active 保持原样，因此下一次视口变化仍然有据可依）。
+     */
+    const recomputeOwnedWidth = (sessionId) => {
+      if (sessionId === null || sessionId === undefined) return false;
+      const viewportChanged = rightbarWidthViewportChanged(sessionId) === true;
+      // expert 模式下还有第二条触发边沿：宿主已经夺回那份 px（面板宽度不再等于插件 target）。
+      // DSH 重启后宿主恢复持久化旧值的时序正是「视口没变但那份值已经不是插件的」，只按视口判据
+      // 永远等不到重算。一次面板读数同时给出 matches / differs 两份结论（见 rightbarOwnershipOf）。
+      const ownership = rightbarOwnershipOf(sessionId);
+      // 收敛（实际宽度 == target）即清除恢复事件记账：下一次 mismatch 必须是新事件。
+      settleRightbarRecovery(sessionId, ownership);
+      const hostReclaimed = ownership !== null && ownership.differs === true;
+      if (viewportChanged !== true && hostReclaimed !== true) return false;
+      const mode = widthModeOf(sessionId);
+      // 只有已确认的模式才给出比例：expert = 20%，other = 50%。split-pending 不会走到这里
+      // （在途事务在 rightbarDragSyncImpl 里更早 return，收口时也必然被改写成 expert/other/null），
+      // 万一出现也一律不猜。
+      let ratio = null;
+      if (mode === "expert") {
+        // 20% 是插件独占的固定比例：视口变化与「宿主夺回宽度」两条边沿都必须重算。
+        ratio = RIGHTBAR_WIDTH_RATIO;
+      } else if (mode === "other") {
+        // other 是可调模式，**只认视口变化这一条边沿**：
+        // - 宿主夺回宽度（面板宽度 != 插件 target）在 other 模式里恰恰是「用户拖过一次」的
+        //   典型形状，绝不能据此重算，否则会把用户的拖拽结果覆盖成 50%；
+        // - 视口变化本身也必须先证明所有权（面板宽度仍等于插件 target）才允许重算；
+        // 读不到面板宽度时所有权不成立 → 一个字节都不写，用户的宽度原样保留。
+        if (viewportChanged !== true) return false;
+        if (ownership === null || ownership.matches !== true) return false;
+        ratio = OTHER_RIGHTBAR_WIDTH_RATIO;
+      } else if (mode === null && (isWidthPrepared(sessionId) || isWidthActive(sessionId))) {
+        // prepared / active 只由**成功的 20% 写入**置位（openTargets 预置，或 confirmed 分支 /
+        // 事务收口时按 20% 恢复成功），因此它们证明的模式就是 expert；这里绝不据此推断 50%。
+        ratio = RIGHTBAR_WIDTH_RATIO;
+      }
+      if (ratio === null) return false;
+      // 写入判据与 confirmed 分支**共用**同一份有界预算（见 recoverRightbarWidth）：视口变化本身不再
+      // 自动等于「可以再写一次」——取整后仍是同一个 target 的视口变化不是新的 mismatch 事件，
+      // 否则宿主持续 clamp 时轻微拖动窗口边缘就能无限重写。
+      return recoverRightbarWidth(sessionId, ratio, ownership) === true;
     };
     /**
      * 自动展开右侧栏：按 surface 会话隔离 + 异步延迟执行。
@@ -5055,7 +5758,13 @@
         // （isActiveOnlySplitCompatible），那个例外必须单独判定，绝不与这里共用 fail-open。
         evidence = "confirmed";
       }
-      if (evidence === "unknown") return;
+      if (evidence === "unknown") {
+        // 组成不可判定 → 绝不改手柄锁、也绝不臆测模式（fail-closed 语义不变）；但本会话
+        // **已经接管过**的宽度模式与组成读面无关，视口变了（或宿主重启后夺回了那份 px）就必须按
+        // 同一比例重算，否则窗口最大化后宿主会一直保留旧视口下的 px 偏好（见 recomputeOwnedWidth）。
+        recomputeOwnedWidth(current);
+        return;
+      }
       if (evidence === "confirmed") {
         // openTargets 已在同一同步栈为这个 surface 成功预置过 20% 时，只消费 prepared 标记；
         // 否则这是从其它可调分页重新进入 Expert Group，必须强制恢复 20%。只有宽度已经成功
@@ -5067,6 +5776,33 @@
         if (!widthReady) {
           // 归属由写入路径接管（applyRightbarWidth → claimRightbarWidthOwnership）。
           widthReady = applyRightbarWidth(current, RIGHTBAR_WIDTH_RATIO, true);
+        } else {
+          const viewportChanged = rightbarWidthViewportChanged(current) === true;
+          // 一次面板读数同时给出 matches / differs 两份结论（见 rightbarOwnershipOf）。
+          const ownership = rightbarOwnershipOf(current);
+          // 收敛（实际宽度 == target）即清除恢复事件记账：下一次 mismatch 必须是新事件。
+          settleRightbarRecovery(current, ownership);
+          const hostReclaimed = ownership !== null && ownership.differs === true;
+          if (viewportChanged || hostReclaimed) {
+            // 两条重新写入边沿，缺一不可：
+            // 1. 窗口最大化 / 全屏 / 拖拽改变了视口：20% 是**视口比例**，必须按新视口重新换算并写入，
+            //    否则右栏会一直停在最大化之前那份旧像素宽度上（1600 写 320，3200 仍是 320）；
+            // 2. **宿主夺回了那份 px**：DSH 重启后宿主从持久化布局恢复它自己那份旧值，而这份恢复
+            //    晚于插件的首次写入（视口一直没变）。Expert Group 页的手柄被插件锁住、20% 又是插件
+            //    独占比例，因此「面板宽度不再等于插件 target」就是宿主夺回所有权的可验证证据，必须
+            //    把 20% 重新写回去，否则用户看到的是「重启后右栏从 640 缩到 320」。
+            // 两条判据都为假时一个字节都不写：同一视口的重复通知仍然保持原有去重语义。
+            //
+            // 写入许可与 recomputeOwnedWidth（unknown 分支）**共用**同一份有界预算：视口变化不再是
+            // 绕过预算的独立边沿——取整后仍是同一个 target 的视口变化（3200 → 3201 → 3202 都是 640）
+            // 不是新的一次 mismatch 事件；只有预期 target 真的改变才重新获得预算。宿主持续 clamp 或
+            // React 延迟提交时「实际宽度 != target」会一直为真，否则就会与宿主的 clamp 无限拉锯。
+            //
+            // 这条边沿同样要过证据关：面板宽度读不出来（ownership 为 null）时 recoverRightbarWidth
+            // 直接 fail-closed——即使视口真的变了，这里也一个字节都不写（读面不可用期间没有任何证据
+            // 说明面板宽度偏离了 target，写下去就是无据改写宿主那份**全局**宽度偏好）。
+            recoverRightbarWidth(current, RIGHTBAR_WIDTH_RATIO, ownership);
+          }
         }
         setWidthPrepared(current, false);
         setWidthActive(current, widthReady);
@@ -5083,10 +5819,19 @@
       // 第一次确认任一 pane 存在其它页时把总右栏预置到 50%；随后只交还手柄，用户拖动出的
       // 宽度由宿主持有。重复通知不会重写 50%（只按当前会话的 other 模式去重），宽度桥接失败
       // 则保持模式未提交，便于以后重试。
-      if (widthModeOf(current) !== "other") {
+      const otherModeMissing = widthModeOf(current) !== "other";
+      // 「首次确认其它页」这条边沿无条件预置 50%；视口变化触发的重算则**必须先证明宿主宽度所有权**
+      // （面板实际宽度仍等于插件上次写入的 target）。50% 是可调状态，用户在其它右侧分页上拖出的
+      // 宽度由宿主持有，仅凭「视口变了」就重算会直接覆盖用户的拖拽结果——这与 unknown 分支里的
+      // 同一判据（见 recomputeOwnedWidth）保持完全一致的口径。
+      const otherNeedsRecompute = otherModeMissing
+        || (rightbarWidthViewportChanged(current) && hostWidthMatchesPluginTarget(current));
+      if (otherNeedsRecompute) {
+        // 写入失败时只在「首次确认其它页」这条边沿把模式置回未提交，视口重算失败不得抹掉
+        // 已经确认的 other 模式。
         if (applyRightbarWidth(current, OTHER_RIGHTBAR_WIDTH_RATIO, true)) {
           setWidthMode(current, "other");
-        } else {
+        } else if (otherModeMissing) {
           setWidthMode(current, null);
         }
       }
@@ -5390,6 +6135,49 @@
       }
       openTargets();
     }
+    /**
+     * 视口尺寸变化（窗口最大化 / 全屏 / 拖拽窗口边缘 / 旋转屏幕）后重新换算右栏宽度。
+     *
+     * 右栏宽度是**视口比例**（Expert Group 页 20%、其它右侧分页 50%），但写进宿主 layout store
+     * 的是像素值。没有这条边沿，窗口最大化后宿主会一直沿用最大化之前那份旧像素宽度，比例不再
+     * 成立（1600 视口写 320，最大化到 3200 后仍是 320，而正确值是 640）。
+     *
+     * 四条约束：
+     * - 只读公开的 window 事件，且全程按**可选 API** 处理：没有 window、没有 addEventListener、
+     *   代理读取抛错时静默降级为「只靠既有 observer + 2.5 秒轮询兜底」——那条链路同样会靠
+     *   视口记账发现变化并补写（见 rightbarWidthViewportChanged），因此老宿主不会失效；
+     * - **add 与 remove 必须同时存在**才注册：宿主只有 addEventListener 时（旧 WebView、被冻结
+     *   的事件面），注册会成功而 dispose 的注销永远失败，那次 install 的闭包就被永久留在宿主
+     *   window 上——每装一次泄漏一个，卸载后仍会被 resize 事件唤醒。这种宿主整条放弃快路径，
+     *   同样退回上面那条 observer + 2.5 秒轮询兜底，功能不缺失；
+     * - 监听在 install 注册、dispose 移除（走统一的 disposers），绝不在宿主上留下长期监听；
+     * - 高频 resize 只在**视口宽度真的变了**时才请求同步：同一宽度的连发事件直接短路，既不做
+     *   无谓的组成读面求值，也让行为保持确定性（同步栈内立即生效，不需要推进任何定时器）。
+     */
+    let lastObservedViewportWidth = viewportWidthOf();
+    const onViewportResize = () => {
+      if (disposed) return;
+      const viewportWidth = viewportWidthOf();
+      if (viewportWidth === null) return;
+      if (lastObservedViewportWidth === viewportWidth) return;
+      lastObservedViewportWidth = viewportWidth;
+      // 复用既有的宽度/手柄/配比同步链路：不新开一条并行路径，也不直接在这里写宽度。
+      requestRightbarDragSync();
+    };
+    try {
+      const viewportTarget = globalThis.window ?? null;
+      // 注册条件必须**同时**要求 add 与 remove：宿主只有 addEventListener 时注册会成功、
+      // dispose 的注销却永远失败，闭包被永久留在宿主 window 上（每次安装泄漏一个，且卸载后
+      // 仍会被 resize 事件唤醒）。宁可少一条快路径，也绝不在宿主上留下摘不掉的监听——
+      // 缺少任一 API 时完全依赖既有的 observer + 2.5 秒轮询兜底，它们同样按视口记账补写。
+      if (typeof viewportTarget?.addEventListener === "function"
+        && typeof viewportTarget?.removeEventListener === "function") {
+        viewportTarget.addEventListener("resize", onViewportResize);
+        disposers.push(() => {
+          try { viewportTarget.removeEventListener("resize", onViewportResize); } catch { /* 注销抛错的宿主只能放弃这条监听。 */ }
+        });
+      }
+    } catch { /* 没有 window 或代理读取抛错：只靠既有 observer 与 2.5 秒轮询兜底。 */ }
     // 到这里 install 函数体里的全部读面（readSurfaceOpenTabs / currentSurfaceSessionId /
     // rightbarDragSyncImpl）都已初始化完成：接线配比读面，后续每一轮同步都能安全求值。
     // 刻意排在 install 函数体的**最后**：任何一次同步（包括下面这次立即求值）都要等这些读面
@@ -5399,8 +6187,16 @@
       /**
        * 读当前 surface 那条 surface 的分栏容器：session → panel → split 三级读面都必须精确唯一。
        *
-       * 任一级证据不完整就返回 null（调用方交还宿主样式）：会话读不出来、inventory 不可用、
-       * 没有属于本会话的 panel、panel 归属有歧义、或面板里的列组成不成立。
+       * 返回 { status, container }：
+       * - "target"：组成可证明，容器就是本次要施加配比的那一个；
+       * - "pending"：结构上仍是两列、列 0 明确是本会话的 Expert Group 页，但列 1 的内容这一轮
+       *   读不出来（重启恢复窗口：tab 条 / inventory 归属还没提交）。容器照常返回，调用方据此
+       *   保持已写下的配比并短延迟重试——这正是「不闪回宿主默认值」的唯一来源；
+       * - null：会话读不出来、inventory 不可用、没有属于本会话的 panel、panel 归属有歧义、
+       *   或组成明确不是目标（单列 / 三列 / Expert Group 消失 / 归属冲突）。调用方交还宿主样式。
+       *
+       * fail-closed 边界不因 pending 放松：pending 只在列 0 的目标身份**已被证明**时才可能返回，
+       * 任何未知归属、重复或混合列都仍然走 null（明确非目标），绝不靠猜测进入 pending。
        */
       readTarget(doc) {
         let sessionId = null;
@@ -5413,8 +6209,12 @@
         const panel = rightbarPanelForSession(doc, sessionId);
         if (panel === null) return null;
         const container = resolveSplitContainer(panel, tabSets);
-        if (container === null) return null;
-        return { container };
+        if (container !== null) return { status: "target", container };
+        // 两列结构仍在、列 0 仍是 Expert Group 页，只有列 1 的内容读不出来：暂不可读。
+        // 单列 / 三列 / 混合列 / 重复列号等形状在这里都拿不到 "unavailable"，一律交还宿主。
+        const candidates = splitPairPendingContainers(panel, tabSets);
+        if (candidates.length === 1) return { status: "pending", container: candidates[0] };
+        return null;
       },
     };
     // install 收尾立即求值一次：中段那一轮 openTargets 触发的同步当时读面还是 null（已跳过），
@@ -5444,10 +6244,14 @@
       // 宿主原本的值与优先级，并置位 disposed（此后的迟到同步一律不再写入）。
       splitTrackRatio.dispose();
       rightbarWidths.clear();
+      // 视口记账与 rightbarWidths 同属本次安装的目标值状态，一并清空（resize 监听已由 disposers 移除）。
+      rightbarWidthViewports.clear();
       // per-session 的 transient 记账（模式 / 预置 / 已确认活跃）同样只属于本次安装生命周期。
       rightbarWidthModes.clear();
       rightbarWidthPreparedSessions.clear();
       rightbarWidthActiveSessions.clear();
+      // 恢复事件记账（target / 观测到的实际宽度 / 已用预算）同样只属于本次安装生命周期。
+      rightbarWidthRecoveries.clear();
       for (let index = disposers.length - 1; index >= 0; index -= 1) {
         try { disposers[index](); } catch { /* 一个 disposer 失败不能阻止其它所有权释放。 */ }
       }
