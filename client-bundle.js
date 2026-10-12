@@ -12648,6 +12648,7 @@ window.__ModuleLoader__.load({
       const [conflict, setConflict] = react.useState(false);
       const [expandedRows, setExpandedRows] = react.useState(() => new Set());
       const [fetchState, setFetchState] = react.useState(null);
+      const [candidateQuery, setCandidateQuery] = react.useState("");
       const [keyDraft, setKeyDraft] = react.useState("");
       // createCardSession 是可变会话；版本号把会话草稿变化桥接到 React 渲染。
       const [, setDraftRevision] = react.useState(0);
@@ -12735,6 +12736,7 @@ window.__ModuleLoader__.load({
         session.cancel();
         setExpandedRows(new Set());
         setFetchState(null);
+        setCandidateQuery("");
         setError(null);
         setSaved(false);
         setConflict(false);
@@ -12799,8 +12801,13 @@ window.__ModuleLoader__.load({
         }
       };
       const fetchModels = async () => {
+        // 手动意图必须在 await 之前同步置位：正在途中的自动探测回调据此放弃写草稿，
+        // 否则自动结果可能晚于这次点击返回，把完整目录直接写进草稿绕过用户选择。
+        discoveryIntent.manualIntent = true;
         setSaving(true);
         setError(null);
+        setFetchState(null);
+        setCandidateQuery("");
         try {
           const draft = session.draft;
           const baseURL = typeof draft.baseURL === "string" && draft.baseURL.length > 0 ? draft.baseURL : undefined;
@@ -12820,17 +12827,90 @@ window.__ModuleLoader__.load({
             setFetchState({ error: "该端点没有返回任何模型", candidates: null });
             return;
           }
-          setFetchState({ error: null, candidates: answer.models.map((model) => ({ ...model, picked: false })) });
+          // 手动候选到达后先清掉"自动 fallback 写入且用户没改过"的行：这次手动发现
+          // 取得候选选择权，自动填充的目录不得继续留在草稿里绕过用户勾选。
+          // 用户在自动行上做过的修改（行内容已与快照不同）与其它手工行一律保留。
+          const pruned = pruneUneditedAutoFallbackRows();
+          if (pruned !== null) {
+            session.edit((draft) => ({ ...draft, models: pruned }));
+            setDraftRevision((value) => value + 1);
+            setSaved(false);
+          }
+          // known 按清理后的草稿计算：被清掉的自动行不再算"已存在"，手动候选里同 id 的条目
+          // 因此会作为可勾选候选出现，而不是被当成已有行静默跳过。
+          const known = new Set(session.modelRows
+            .map((model) => (typeof model.id === "string" ? model.id.trim() : ""))
+            .filter((id) => id.length > 0));
+          setFetchState({
+            error: null,
+            candidates: answer.models.map((model) => ({
+              ...model,
+              // 手动发现的候选默认只勾选"草稿里还没有"的模型；自动 fallback 已先写入的行
+              // 在手动发现命中后（除非用户改过）已被上面清掉，因此这里会重新作为候选出现，
+              // 由用户显式勾选决定是否保留，而不是被自动目录静默带入。
+              picked: typeof model.id === "string" && model.id.trim().length > 0
+                && !known.has(model.id.trim()),
+            })),
+          });
         } finally {
           setSaving(false);
         }
       };
+      /**
+       * 自动 fallback 探测与手动「获取模型」之间的共享意图状态。
+       *
+       * 挂在稳定的 `session` 依赖的 useMemo 上：卡片重渲染不会重建它，因此晚到的自动探测
+       * 回调看到的是**同一次**手动意图，而不是快照里的旧值。两个字段各司其职：
+       * - `manualIntent`：用户点过「获取模型」就置位。自动探测晚于点击返回时必须放弃，
+       *   绝不能把完整目录直接写进草稿（否则用户还没选模型就被隐式写入了目录）。
+       * - `autoFallback`：最近一次自动探测写进草稿的行快照。手动候选到达后据此只清掉
+       *   "仍与该快照完全相同"的未编辑行，用户在自动 fallback 上做过的修改一律保留。
+       */
+      const discoveryIntent = react.useMemo(() => ({ manualIntent: false, autoFallback: null }), [session]);
+      /** 记录自动 fallback 快照（同一批自动行只记一次，供之后的手动探测做"未编辑"判定）。 */
+      const noteAutoFallback = (models) => {
+        if (discoveryIntent.autoFallback !== null) return;
+        discoveryIntent.autoFallback = Array.isArray(models) ? models.map((model) => ({ ...model })) : [];
+      };
+      /** 草稿行是否与自动 fallback 快照里同 id 的行逐字段相同（即"未编辑的自动填充行"）。 */
+      const isUneditedAutoFallbackRow = (row) => {
+        const snapshot = discoveryIntent.autoFallback;
+        if (!Array.isArray(snapshot) || !config.isPlainObject(row)) return false;
+        const id = typeof row.id === "string" ? row.id.trim() : "";
+        if (id.length === 0) return false;
+        return snapshot.some((entry) => {
+          if (!config.isPlainObject(entry)) return false;
+          const entryId = typeof entry.id === "string" ? entry.id.trim() : "";
+          return entryId === id && config.jsonEqual(entry, row);
+        });
+      };
+      /**
+       * 手动候选到达后清理草稿：只移除仍与自动 fallback 快照完全相同的未编辑行。
+       * 返回新行数组；没有任何行被移除时返回 null，调用方据此跳过无谓的草稿改写。
+       */
+      const pruneUneditedAutoFallbackRows = () => {
+        const snapshot = discoveryIntent.autoFallback;
+        if (!Array.isArray(snapshot) || snapshot.length === 0) return null;
+        const rows = session.modelRows;
+        const kept = rows.filter((row) => !isUneditedAutoFallbackRow(row));
+        return kept.length === rows.length ? null : kept;
+      };
       react.useEffect(() => {
         if (!open || row.declared === true || namespace?.ns === "llm-deepseek") return undefined;
         let active = true;
+        // 每一轮自动探测都重置快照：新的自动结果必须重新记录，否则手动清理会拿旧快照做判定。
+        discoveryIntent.autoFallback = null;
+        // 手动意图只屏蔽"当前打开周期"：走到这里说明已通过守卫、确定要发起一次全新的自动探测，
+        // 所以清掉上一周期遗留的手动标记，卡片折叠后再展开才能恢复自动目录增强。
+        // 同一打开周期内晚于手动点击返回的自动请求，仍会观察到 true 并放弃写草稿。
+        discoveryIntent.manualIntent = false;
         void host.operations.discoverModels(namespace.ns, { provider: row.provider }).then((answer) => {
+          // 手动意图优先：用户已经点过「获取模型」时，这次自动结果不得写入草稿，
+          // 由手动候选的选择流程独占草稿的模型目录。
+          if (discoveryIntent.manualIntent) return;
           if (!active || answer.kind !== "found" || answer.models.length === 0 || session.modelRows.length > 0) return;
           session.setFallbackModels(answer.models);
+          noteAutoFallback(session.modelRows);
           setDraftRevision((value) => value + 1);
         }).catch(() => {
           // 自动目录探测是增强能力，失败时保留 settings 中的模型与手工编辑入口。
@@ -12838,14 +12918,49 @@ window.__ModuleLoader__.load({
         return () => { active = false; };
       }, [host, namespace?.ns, open, row.declared, row.provider, session]);
 
+      const toggleCandidate = (id) => {
+        setFetchState((previous) => previous === null || !Array.isArray(previous.candidates)
+          ? previous
+          : {
+            ...previous,
+            candidates: previous.candidates.map((candidate) => candidate.id === id
+              ? { ...candidate, picked: candidate.picked !== true }
+              : candidate),
+          });
+      };
+      /**
+       * 弹窗「全选/取消全选」的唯一实现（弹窗按钮文案也走同一个纯函数判定）。
+       *
+       * - 可见项已全选 → 清空**全部**选择（含被搜索隐藏的候选），与 DSH 模型页一致；
+       * - 否则只把可见项追加为已选，隐藏候选保留原选择。
+       */
+      const toggleVisibleCandidates = (ids) => {
+        const wanted = new Set(Array.isArray(ids) ? ids : []);
+        setFetchState((previous) => {
+          if (previous === null || !Array.isArray(previous.candidates)) return previous;
+          if (clearsAllCandidateSelection(previous.candidates, wanted)) {
+            return { ...previous, candidates: previous.candidates.map((candidate) => ({ ...candidate, picked: false })) };
+          }
+          return {
+            ...previous,
+            candidates: previous.candidates.map((candidate) => wanted.has(candidate.id)
+              ? { ...candidate, picked: true }
+              : candidate),
+          };
+        });
+      };
+      const closeModelPicker = () => {
+        setFetchState(null);
+        setCandidateQuery("");
+      };
       const adoptPicked = () => {
-        const candidates = fetchState?.candidates ?? [];
-        const picked = candidates.filter((candidate) => candidate.picked === true);
+        const picked = (fetchState?.candidates ?? []).filter((candidate) => candidate.picked === true);
+        if (picked.length === 0) return;
         edit((draft) => ({
           ...draft,
-          models: config.adoptModels(session.modelRows, picked.length > 0 ? picked : candidates),
+          models: config.adoptModels(session.modelRows, picked),
         }));
-        setFetchState(null);
+        closeModelPicker();
       };
 
       if (!config.providerEditable(row, namespace)) return null;
@@ -12865,13 +12980,13 @@ window.__ModuleLoader__.load({
                  style: { background: "var(--dsw-alias-state-success-primary,#22c55e)" },
               })
               : null,
-            react.createElement("span", { className: "deg_mc_card_actions" }, removeAction,
+            react.createElement("span", { className: "deg_mc_card_actions" },
               react.createElement("button", {
                 type: "button",
                 className: "deg_btn",
                 "aria-label": card.displayName + " 编辑",
                 onClick: () => { setOpen(true); setError(null); setSaved(false); setConflict(false); },
-              }, "编辑"))),
+              }, "编辑"), removeAction)),
           row.error === undefined ? null : react.createElement("p", { className: "deg_mc_error", role: "alert" }, row.error));
       }
 
@@ -12975,44 +13090,12 @@ window.__ModuleLoader__.load({
             onClick: () => edit((draft) => ({ ...draft, models: config.removeModelRow(session.modelRows, model.index) })),
           }, "✕")), advancedSectionOf(model)));
 
-      const candidates = fetchState?.candidates ?? null;
-      const fetchList = candidates === null
-        ? null
-        : react.createElement("div", null,
-          react.createElement("p", { className: "deg_mc_hint" }, "勾选要采纳的模型（已存在的行不会被覆盖）："),
-          react.createElement("ul", { className: "deg_mc_fetch_list" },
-            candidates.map((candidate) => react.createElement("li", {
-              key: candidate.id,
-              className: "deg_mc_fetch_item",
-            }, react.createElement("label", { className: "deg_mc_effort" },
-              react.createElement("input", {
-                type: "checkbox",
-                checked: candidate.picked === true,
-                disabled,
-                "data-deg-candidate": candidate.id,
-                onChange: () => setFetchState((previous) => ({
-                  ...previous,
-                  candidates: previous.candidates.map((entry) => (entry.id === candidate.id
-                    ? { ...entry, picked: entry.picked !== true }
-                    : entry)),
-                })),
-              }),
-              react.createElement("span", null, candidate.id))))),
-          react.createElement("div", { className: "deg_mc_conflict_actions" },
-            react.createElement("button", { type: "button", className: "deg_btn deg_btn_primary", disabled, onClick: adoptPicked }, "采纳所选"),
-            react.createElement("button", { type: "button", className: "deg_btn", disabled, onClick: () => setFetchState(null) }, "取消")));
+
 
       return react.createElement("li", { className: "deg_mc_card", "data-deg-provider": row.provider },
         react.createElement("div", { className: "deg_mc_card_head" },
           react.createElement("span", { className: "deg_mc_card_name" }, card.displayName),
-          card.provider === card.displayName ? null : react.createElement("span", { className: "deg_mc_card_route" }, card.provider),
-          react.createElement("span", { className: "deg_mc_card_actions" }, removeAction,
-            react.createElement("button", {
-              type: "button",
-              className: "deg_btn",
-              disabled: saving,
-              onClick: () => { setOpen(false); cancel(); },
-            }, "收起"))),
+          card.provider === card.displayName ? null : react.createElement("span", { className: "deg_mc_card_route" }, card.provider)),
         row.error === undefined ? null : react.createElement("p", { className: "deg_mc_error", role: "alert" }, row.error),
         react.createElement("label", { className: "deg_mc_field" },
           react.createElement("span", { className: "deg_mc_field_label" }, "API Key"),
@@ -13106,8 +13189,8 @@ window.__ModuleLoader__.load({
           }, "添加模型"),
           fetchState?.error === null || fetchState?.error === undefined
             ? null
-            : react.createElement("p", { className: "deg_mc_error", role: "alert" }, fetchState.error),
-          fetchList),
+            : react.createElement("p", { className: "deg_mc_error", role: "alert" }, fetchState.error)
+          ),
         error === null ? null : react.createElement("p", { className: "deg_mc_error", role: "alert", "data-deg-card-error": row.provider }, error),
         conflict
           ? react.createElement("div", { className: "deg_mc_conflict" },
@@ -13125,23 +13208,118 @@ window.__ModuleLoader__.load({
           : null,
         react.createElement("div", { className: "deg_mc_card_footer" },
           react.createElement("span", { className: "deg_mc_status deg_settings_status", role: "status" }, saved ? "已保存" : ""),
-          react.createElement("button", { type: "button", className: "deg_btn", disabled: saving, onClick: cancel }, "取消"),
+          react.createElement("button", { type: "button", className: "deg_btn", disabled: saving, onClick: () => { setOpen(false); cancel(); } }, "取消"),
           react.createElement("button", {
             type: "button",
             className: "deg_btn deg_btn_primary",
             disabled,
             "data-deg-apply": row.provider,
             onClick: () => { void apply(); },
-          }, saving ? "应用中…" : "应用")));
+          }, saving ? "应用中…" : "应用")),
+        fetchState !== null && Array.isArray(fetchState.candidates)
+          ? react.createElement(ModelDiscoveryDialog, {
+            candidates: fetchState.candidates,
+            query: candidateQuery,
+            onQueryChange: setCandidateQuery,
+            onToggle: toggleCandidate,
+            onToggleVisible: toggleVisibleCandidates,
+            onClose: closeModelPicker,
+            onAdopt: adoptPicked,
+          })
+          : null);
     }
+    /**
+     * 弹窗标题 id 的自增序号。
+     *
+     * 同一个设置页可以同时挂载多个候选弹窗（例如两张 provider 卡片各自探测），
+     * 每个实例的 `aria-labelledby` 必须指向**自己**的标题；共用一个字面量 id 会让
+     * 后挂载的弹窗把无障碍名称解析到别人的标题上。
+     *
+     * 用模块级计数器 + 组件内惰性初始化，而不是 `react.useId`：本插件的 react 面
+     * 在嵌入宿主与测试替身里都可能缺少 `useId`，计数器只依赖 useState/useRef 这类
+     * 一直存在的 API。
+     */
+    let modelDiscoveryTitleSeq = 0;
+
+    /**
+     * 弹窗焦点环的候选控件：只保留真正可聚焦（启用且可见）的对话框控件。
+     *
+     * 判定只用声明式属性，不做布局测量（offsetParent 之类在嵌入宿主里不可靠）：
+     * - `disabled` / `aria-disabled="true"` 的控件浏览器会忽略 focus 调用；
+     * - `hidden` / `aria-hidden="true"` 的控件不参与 Tab 顺序。
+     * 两者都必须从焦点环里剔除——否则 handler 先 preventDefault 再 focus 一个被忽略的
+     * 元素，焦点会原地卡死或漏到背景页面。
+     *
+     * @param {unknown} scope 弹窗根节点（任何提供 querySelectorAll 的元素）
+     * @returns {Array<{focus?: Function}>} 按 DOM 顺序排列的可聚焦控件
+     */
+    function focusableDialogControls(scope) {
+      const nodes = Array.from(scope?.querySelectorAll?.("[data-deg-dialog-action]") ?? []);
+      return nodes.filter((node) => {
+        if (node === null || typeof node !== "object") return false;
+        if (node.disabled === true) return false;
+        if (node.hidden === true) return false;
+        if (typeof node.getAttribute !== "function") return true;
+        if (node.getAttribute("aria-disabled") === "true") return false;
+        if (node.getAttribute("aria-hidden") === "true") return false;
+        return true;
+      });
+    }
+
+    /**
+     * 候选弹窗「全选/取消全选」的纯函数语义（与 DSH 模型页的可见项切换一致）。
+     *
+     * 关键边界（不是"只动可见项"那么简单）：
+     * - 当前可见候选**已全部勾选**时，切换等价于清空**全部**选择（含被搜索隐藏的候选）；
+     * - 否则只把当前可见候选**追加**为已选，隐藏候选保留原有选择。
+     *
+     * 弹窗按钮文案与父卡片的实际改写都取自这一个判定，避免两处各自推断出不同语义。
+     *
+     * @param {Array<{id?: unknown, picked?: unknown}>} candidates 全部候选
+     * @param {Set<unknown>} visibleIds 当前可见候选 id
+     * @returns {boolean} true 表示"清空全部选择"，false 表示"只追加可见项"
+     */
+    function clearsAllCandidateSelection(candidates, visibleIds) {
+      const list = Array.isArray(candidates) ? candidates : [];
+      const wanted = visibleIds instanceof Set ? visibleIds : new Set();
+      const visible = list.filter((candidate) => wanted.has(candidate?.id));
+      return visible.length > 0 && visible.every((candidate) => candidate.picked === true);
+    }
+
     /**
      * 自定义 provider 的可用模型选择弹窗：候选只进入当前草稿，不在探测成功时自动写 settings。
      *
      * 交互与 DSH 原生模型页保持一致：搜索当前候选、当前结果全选/取消全选、逐项勾选，
      * 最后由“添加所选”调用父卡片的 adoptModels 合并。弹窗关闭不会丢弃卡片里已有模型。
+     *
+     * 模态契约（与 DSH 内置 picker 的 Modal/useModalLayer 对齐）：
+     * - 关闭按钮、点击遮罩、Escape 三条路径都只**关闭**弹窗（走 onClose），不改草稿、不采纳；
+     * - 弹窗内 Tab / Shift+Tab 只在**真正可聚焦**（启用且可见）的控件之间循环，不把焦点
+     *   漏到背景页面，也不会把焦点交给 disabled 的「添加所选」或空结果时的「全选」；
+     * - 关闭（卸载）后把焦点还给打开弹窗前的那个元素；
+     * - 标题 id 每个实例唯一，多个弹窗同时挂载时各自指向自己的标题。
+     *
+     * 焦点相关调用全部做能力探测：嵌入宿主（或测试替身）没有 document/focus 时静默跳过，
+     * 绝不因为焦点不可用而让弹窗不可关闭。
      */
     function ModelDiscoveryDialog({ candidates, query, onQueryChange, onToggle, onToggleVisible, onClose, onAdopt }) {
       const source = Array.isArray(candidates) ? candidates : [];
+      // 标题 id 每个实例唯一（惰性初始化只在首次渲染执行一次），dialog 的 aria-labelledby
+      // 因此始终指向本实例自己的 h3。
+      const [titleId] = react.useState(() => {
+        modelDiscoveryTitleSeq += 1;
+        return "deg-model-discovery-title-" + String(modelDiscoveryTitleSeq);
+      });
+      const dialogRef = react.useRef(null);
+      // 打开前的焦点归属：只在挂载时读一次，卸载时原样还回去。
+      const restoreTargetRef = react.useRef(typeof document === "undefined" ? null : document.activeElement ?? null);
+      react.useEffect(() => () => {
+        // 关闭（卸载）时恢复先前焦点；元素可能已从页面移除，因此 focus 缺失时直接跳过。
+        const target = restoreTargetRef.current;
+        try {
+          if (target !== null && typeof target?.focus === "function") target.focus();
+        } catch { /* 焦点不可用时保持弹窗关闭语义，不抛出。 */ }
+      }, []);
       const normalizedQuery = typeof query === "string" ? query.trim().toLowerCase() : "";
       const visible = normalizedQuery.length === 0
         ? source
@@ -13150,7 +13328,32 @@ window.__ModuleLoader__.load({
           const name = typeof candidate?.name === "string" ? candidate.name : "";
           return id.toLowerCase().includes(normalizedQuery) || name.toLowerCase().includes(normalizedQuery);
         });
-      const allVisiblePicked = visible.length > 0 && visible.every((candidate) => candidate.picked === true);
+      const visibleIds = new Set(visible.map((candidate) => candidate?.id));
+      // 按钮文案与父卡片的改写必须同源：这里只用纯函数判定"这次切换是否清空全部选择"。
+      const clearsAll = clearsAllCandidateSelection(source, visibleIds);
+      const pickedCount = source.filter((candidate) => candidate.picked === true).length;
+      const handleKeyDown = (event) => {
+        if (event?.key === "Escape") {
+          // 关闭是模态层的独占语义：阻止默认行为并停止冒泡，避免外层再处理同一个 Escape。
+          event.preventDefault?.();
+          event.stopPropagation?.();
+          onClose();
+          return;
+        }
+        if (event?.key !== "Tab") return;
+        // 焦点环：与提示词弹窗同一套 data 标记与循环算法（首尾相接，Shift+Tab 反向），
+        // 但候选集只取**真正可聚焦**的控件：disabled 的「添加所选」与无结果时的「全选」
+        // 必须跳过，否则 preventDefault 之后 focus 一个被浏览器忽略的元素会让焦点卡死。
+        const controls = focusableDialogControls(dialogRef.current);
+        // 没有任何可聚焦控件时不拦截 Tab：宁可让焦点按浏览器默认行为走，也不把焦点锁死。
+        if (controls.length === 0) return;
+        const current = controls.indexOf(typeof document === "undefined" ? null : document.activeElement);
+        const nextIndex = event.shiftKey
+          ? (current <= 0 ? controls.length - 1 : current - 1)
+          : (current >= controls.length - 1 ? 0 : current + 1);
+        event.preventDefault?.();
+        try { controls[nextIndex]?.focus?.(); } catch { /* 无 DOM 焦点时保持可点击控件。 */ }
+      };
       const list = visible.length === 0
         ? react.createElement("p", { className: "deg_mc_candidate_empty", role: "status" }, "没有匹配的模型")
         : react.createElement("ul", { className: "deg_mc_candidate_list" }, visible.map((candidate) => (
@@ -13160,23 +13363,34 @@ window.__ModuleLoader__.load({
                 type: "checkbox",
                 checked: candidate.picked === true,
                 "data-deg-create-candidate": candidate.id,
+                "data-deg-dialog-action": "candidate",
                 "aria-label": "选择模型 " + candidate.id,
                 onChange: () => onToggle(candidate.id),
               }),
               react.createElement("span", { className: "deg_mc_candidate_id" }, candidate.id))))));
-      return react.createElement("div", { className: "deg_mc_modal_backdrop" },
+      return react.createElement("div", {
+        className: "deg_mc_modal_backdrop",
+        // 点遮罩只关闭：候选状态与草稿都不受影响（采纳只能由“添加所选”触发）。
+        onClick: () => onClose(),
+      },
         react.createElement("div", {
           className: "deg_mc_modal",
           role: "dialog",
           "aria-modal": "true",
-          "aria-labelledby": "deg-model-discovery-title",
+          "aria-labelledby": titleId,
+          ref: dialogRef,
+          onKeyDown: handleKeyDown,
+          // 点弹窗内部不应冒泡到遮罩，避免误关。
+          onClick: (event) => event?.stopPropagation?.(),
         },
           react.createElement("div", { className: "deg_mc_modal_header" },
-            react.createElement("h3", { className: "deg_mc_modal_title", id: "deg-model-discovery-title" }, "选择要添加的模型"),
+            react.createElement("h3", { className: "deg_mc_modal_title", id: titleId }, "选择要添加的模型"),
             react.createElement("button", {
               type: "button",
               className: "deg_mc_modal_close",
               "aria-label": "关闭",
+              "data-deg-dialog-action": "close",
+              autoFocus: true,
               onClick: onClose,
             }, "×")),
           react.createElement("p", { className: "deg_mc_modal_description" }, "以下是模型提供方的可用模型，勾选要添加的模型。"),
@@ -13187,18 +13401,31 @@ window.__ModuleLoader__.load({
               value: query,
               placeholder: "搜索模型",
               "aria-label": "搜索模型",
+              "data-deg-dialog-action": "search",
               onChange: (event) => onQueryChange(event.target.value),
             }),
             react.createElement("button", {
               type: "button",
               className: "deg_btn",
               disabled: visible.length === 0,
+              "data-deg-dialog-action": "toggle-visible",
               onClick: () => onToggleVisible(visible.map((candidate) => candidate.id)),
-            }, allVisiblePicked ? "取消全选" : "全选")),
+            }, clearsAll ? "取消全选" : "全选")),
           list,
           react.createElement("div", { className: "deg_mc_modal_footer" },
-            react.createElement("button", { type: "button", className: "deg_btn", onClick: onClose }, "取消"),
-            react.createElement("button", { type: "button", className: "deg_btn deg_btn_primary", onClick: onAdopt }, "添加所选"))));
+            react.createElement("button", {
+              type: "button",
+              className: "deg_btn",
+              "data-deg-dialog-action": "cancel",
+              onClick: onClose,
+            }, "取消"),
+            react.createElement("button", {
+              type: "button",
+              className: "deg_btn deg_btn_primary",
+              disabled: pickedCount === 0,
+              "data-deg-dialog-action": "adopt",
+              onClick: onAdopt,
+            }, "添加所选"))));
     }
 
     /**
@@ -13244,7 +13471,11 @@ window.__ModuleLoader__.load({
       const disabled = card.readOnly || saving;
       // 已提交后只允许重试 API Key：route 与凭据引用已经落盘，继续编辑会导致
       // "旧 profile + 新 route 的凭据"错配。其余字段与模型编辑统一禁用。
-      const profileDisabled = card.profileLocked || saving;
+      //
+      // fetching 一并锁定 profile：候选是用**点击那一刻**的 endpoint 参数探测出来的，
+      // 请求在途时改 Base URL / 协议 / 模型行（或收起卡片丢弃草稿），就会让旧参数的
+      // 结果被采纳进新配置。已有 provider 卡片用 saving 覆盖同一段窗口，这里保持同语义。
+      const profileDisabled = card.profileLocked || saving || fetching;
       // 只同步已占用 route 词表；revision 由状态机一次性固定（rebase 内部只在 undefined 时初始化）。
       react.useEffect(() => {
         draft.rebase({
@@ -13333,16 +13564,23 @@ window.__ModuleLoader__.load({
                : candidate),
            });
        };
+       /**
+        * 弹窗「全选/取消全选」的唯一实现（弹窗按钮文案也走同一个纯函数判定）。
+        *
+        * - 可见项已全选 → 清空**全部**选择（含被搜索隐藏的候选），与 DSH 模型页一致；
+        * - 否则只把可见项追加为已选，隐藏候选保留原选择。
+        */
        const toggleVisibleCandidates = (ids) => {
          const wanted = new Set(Array.isArray(ids) ? ids : []);
          setFetchState((previous) => {
            if (previous === null || !Array.isArray(previous.candidates)) return previous;
-           const visible = previous.candidates.filter((candidate) => wanted.has(candidate.id));
-           const allPicked = visible.length > 0 && visible.every((candidate) => candidate.picked === true);
+           if (clearsAllCandidateSelection(previous.candidates, wanted)) {
+             return { ...previous, candidates: previous.candidates.map((candidate) => ({ ...candidate, picked: false })) };
+           }
            return {
              ...previous,
              candidates: previous.candidates.map((candidate) => wanted.has(candidate.id)
-               ? { ...candidate, picked: !allPicked }
+               ? { ...candidate, picked: true }
                : candidate),
            };
          });
@@ -13647,7 +13885,9 @@ window.__ModuleLoader__.load({
           react.createElement("button", {
             type: "button",
             className: "deg_btn",
-            disabled: saving,
+            // 发现请求在途时同样禁止取消：取消会丢弃草稿并收起卡片，而响应仍会回来，
+            // 与 profile 锁定一起构成"在途期间不改变 endpoint 与草稿归属"的同一条边界。
+            disabled: saving || fetching,
             "data-deg-create-cancel": "true",
             onClick: () => { onClose(draft.settingsCommitted); },
           }, "取消"),
