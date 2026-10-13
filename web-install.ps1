@@ -1,11 +1,11 @@
 ﻿# 安装 dsh-expert-group 到 DSH 的全局插件位置（$DSH_HOME\profiles\packages\dsh-expert-group），
 # 与工程/源码目录完全解耦：删除本脚本所在的原始目录后插件仍可正常运行。
-# 支持从解压后的包目录直接运行：powershell -ExecutionPolicy Bypass -File .\install.ps1
+# 支持从解压后的包目录直接运行：powershell -ExecutionPolicy Bypass -File .\web-install.ps1
 # 同时清理同名旧安装位置（profiles\web\packages\*）。
 # 复制面 = package.json 的 files 白名单：test/、test-support/、bench/、.scratch/ 等
 # 开发内容与构建产物 tgz 不会进入用户目录。
 # 维护用干跑模式（不做任何写入，仅供发布门禁/人工核对安装清单）：
-#   powershell -ExecutionPolicy Bypass -File .\install.ps1 -DryRun [-DryRunListPath <文件>]
+#   powershell -ExecutionPolicy Bypass -File .\web-install.ps1 -DryRun [-DryRunListPath <文件>]
 param(
   # 干跑模式：只解析并输出安装白名单，不做任何写入、不构建 bundle、不调用 dsh CLI。
   # 发布门禁测试用它核对「实际安装清单 == package.json 的 files 白名单」。

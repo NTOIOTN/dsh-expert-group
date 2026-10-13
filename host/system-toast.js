@@ -192,7 +192,7 @@ export function buildToastXml({ title, taskName, body } = {}) {
 /**
  * 默认提示音路径：以本模块文件位置解析包内 assets/notification-whoosh.wav。
  *
- * 用 import.meta.url 而不是 __dirname/cwd：模块被 install.ps1 复制到
+ * 用 import.meta.url 而不是 __dirname/cwd：模块被 web-install.ps1 复制到
  * profiles\packages\dsh-expert-group 后依然指向同一份随包发布的资源。
  * 返回值只用于 stdin JSON，绝不进入命令行、日志、诊断或脚本文本。
  */

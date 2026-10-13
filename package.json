@@ -65,8 +65,9 @@
     "README.md",
     "THIRD_PARTY_NOTICES.md",
     "LICENSE",
-    "install.ps1",
-    "uninstall.ps1"
+    "web-install.ps1",
+    "web-uninstall.ps1",
+    "desktop-uninstall.ps1"
   ],
   "dsh": {
     "bundle": {

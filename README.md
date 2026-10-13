@@ -45,13 +45,15 @@ fail-closed，并标记为 `status: "incomplete"`；绝不伪造 paused ref 或�
 ## 安装与平台分工
 
 本插件发布到 npm 公共源，按包名安装。**CLI/web 与桌面版是两套管理面，命令不通用**：
-CLI/web 的完整流程见 [安装说明.txt](安装说明.txt) 与 [install.ps1](install.ps1)（脚本只处理 web profile）；
+CLI/web 的完整流程见 [安装说明.txt](安装说明.txt) 与 [web-install.ps1](web-install.ps1) / [web-uninstall.ps1](web-uninstall.ps1)（这两个脚本只处理 web profile）；
 桌面版见 [桌面版安装说明.md](桌面版安装说明.md)（构建 → 测试 → 打包 → 备份 → 安装 → 校验的快速部署流程）。
 
-| 目标 | 安装入口 | 生效方式 |
-| --- | --- | --- |
-| **CLI / `dsh web`** | `dsh plugin --profile <profile> add dsh-expert-group` | 重启 DSH Web |
-| **桌面版（Electron 客户端）** | 桌面版**应用自带**的 `dsh.cmd`（`plugin --profile desktop`，见下），或 GUI「插件 → 添加插件」 | 重启桌面版 |
+| 目标 | 安装入口 | 卸载入口 | 生效方式 |
+| --- | --- | --- | --- |
+| **CLI / `dsh web`** | `dsh plugin --profile web add dsh-expert-group` | `web-uninstall.ps1`（等价于 `dsh plugin --profile web remove dsh-expert-group`） | 重启 DSH Web |
+| **桌面版（Electron 客户端）** | 桌面版**应用自带**的 `dsh.cmd`（`plugin --profile desktop`，见下），或 GUI「插件 → 添加插件」 | `desktop-uninstall.ps1`（内部调用应用自带 CLI，见下） | 重启桌面版 |
+
+两个卸载脚本各自只处理自己的 profile，**不可混用**：`web-uninstall.ps1` 操作 `profiles\web`，`desktop-uninstall.ps1` 操作 `profiles\desktop`。
 
 ### CLI / `dsh web`
 
@@ -91,7 +93,8 @@ if ($LASTEXITCODE -ne 0) { throw "add 失败（exit=$LASTEXITCODE），先查落
 & $cli plugin --profile desktop list
 if ($LASTEXITCODE -ne 0) { throw "list 失败（exit=$LASTEXITCODE）" }
 
-# 卸载：把 add 换成 remove；版本豁免：version-exemptions / allow-version / revoke-version
+# 卸载：可直接运行仓库根的 .\desktop-uninstall.ps1（内部就是下面的 remove）；
+#       手工执行等价于把 add 换成 remove；版本豁免：version-exemptions / allow-version / revoke-version
 ```
 
 **生效与验收：命令执行者是主代理，最后一步重启由用户完成。** 构建 → 测试 → 打包 → 备份 → 安装
@@ -99,7 +102,7 @@ if ($LASTEXITCODE -ne 0) { throw "list 失败（exit=$LASTEXITCODE）" }
 
 > 在线（桌面版运行中）安装属于受控测试：CLI 只检查 profile 是否初始化（提示 `... then fully quit it before
 > running dsh plugin --profile desktop.`），**没有进程硬拦截**，因此可能出现内存里旧模块 + 磁盘上新模块混用。
-> **磁盘安装成功 ≠ 内存生效、更 ≠ 功能验收**——真正验收要等用户重启后按该文档第 8 节读证据。
+> **磁盘安装成功 ≠ 内存生效、更 ≠ 功能验收**——真正验收要等用户重启后按该文档第 8 节读证据（卸载见该文档第 7 节）。
 
 **验证安装登记与目标文件**（直接检查目标 profile，真实目录、Junction 和 pnpm 链接均适用）：
 
