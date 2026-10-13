@@ -46,7 +46,7 @@ fail-closed，并标记为 `status: "incomplete"`；绝不伪造 paused ref 或�
 
 本插件发布到 npm 公共源，按包名安装。**CLI/web 与桌面版是两套管理面，命令不通用**：
 CLI/web 的完整流程见 [安装说明.txt](安装说明.txt) 与 [web-install.ps1](web-install.ps1) / [web-uninstall.ps1](web-uninstall.ps1)（这两个脚本只处理 web profile）；
-桌面版见 [桌面版安装说明.md](桌面版安装说明.md)（构建 → 测试 → 打包 → 备份 → 安装 → 校验的快速部署流程）。
+桌面版见 [desktop-install.ps1](desktop-install.ps1)（构建 → 测试 → 打包 → 备份 → 安装 → 校验的快速部署流程，脚本头部注释即流程说明）。
 
 | 目标 | 安装入口 | 卸载入口 | 生效方式 |
 | --- | --- | --- | --- |
@@ -98,11 +98,11 @@ if ($LASTEXITCODE -ne 0) { throw "list 失败（exit=$LASTEXITCODE）" }
 ```
 
 **生效与验收：命令执行者是主代理，最后一步重启由用户完成。** 构建 → 测试 → 打包 → 备份 → 安装
-→ 校验的完整流程（含判据与回滚）见 **[桌面版安装说明.md](桌面版安装说明.md)**。
+→ 校验的完整流程（含判据与回滚）见 **[desktop-install.ps1](desktop-install.ps1)**（流程与判据在脚本头部注释与各阶段日志中）。
 
 > 在线（桌面版运行中）安装属于受控测试：CLI 只检查 profile 是否初始化（提示 `... then fully quit it before
 > running dsh plugin --profile desktop.`），**没有进程硬拦截**，因此可能出现内存里旧模块 + 磁盘上新模块混用。
-> **磁盘安装成功 ≠ 内存生效、更 ≠ 功能验收**——真正验收要等用户重启后按该文档第 8 节读证据（卸载见该文档第 7 节）。
+> **磁盘安装成功 ≠ 内存生效、更 ≠ 功能验收**——真正验收要等用户重启后读证据（卸载入口见 [desktop-uninstall.ps1](desktop-uninstall.ps1)）。
 
 **验证安装登记与目标文件**（直接检查目标 profile，真实目录、Junction 和 pnpm 链接均适用）：
 

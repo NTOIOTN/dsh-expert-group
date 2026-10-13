@@ -4,7 +4,7 @@
 #   pwsh -NoProfile -ExecutionPolicy Bypass -File .\desktop-install.ps1
 #   pwsh -NoProfile -ExecutionPolicy Bypass -File .\desktop-install.ps1 -DshInstallDirectory 'D:\deepseek-harness'
 #
-# 阶段（严格按「桌面版安装说明.md」的顺序）：预检 -> build -> test -> 持久目录打包 ->
+# 阶段（顺序即下方执行顺序）：预检 -> build -> test -> 持久目录打包 ->
 # 解包/发布面检查 -> 安装前完整备份 -> CLI add -> CLI list -> 安装后 profile 与逐文件 SHA256 校验。
 # 每个阶段的输出都落盘到 $packDir\logs\，任一命令失败立即中止并保留全部产物。
 #
@@ -15,7 +15,7 @@
 #   - 打包目录与备份目录都带唯一时间戳，不覆盖、不清理历史目录（旧包是回滚材料）。
 #
 # 已知基线失败白名单（逐项证据吻合，不使用数量阈值，也不接受弱证据）：
-#   「桌面版安装说明.md」第 53-60 行记载：完整测试当前有且仅有两条既有断言失败，与部署无关。
+#   完整测试当前有且仅有两条既有断言失败，与部署无关（本仓库当前实测基线，非外部文档转述）。
 #   白名单条目必须同时吻合下列全部字段才算通过（任一项不符即中止）：
 #     标题、failureType、name、code、operator、expected、actual，
 #     以及 error 文本（精确相等或逐片段包含），
@@ -117,7 +117,7 @@ $packDir = Join-Path $packRoot "pack-$stamp"
 $backupDir = Join-Path $packRoot "cli-install-$stamp"
 $logDir = Join-Path $packDir "logs"
 
-# 发布面泄漏目录（与「桌面版安装说明.md」第 86 行的判据一致）。
+# 发布面泄漏目录（开发面目录混进发布包即视为泄漏）。
 $leakPattern = "\\(test|bench|\.scratch|docs)\\"
 # desktop profile 的管理文件：逐个记录存在性与 SHA256，安装前后都要比对。
 $mgmtFiles = @(
