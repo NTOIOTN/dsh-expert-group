@@ -989,6 +989,21 @@
       ".deg_expert_group_state_dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor}",
       ".deg_expert_group_state_dot[data-state=running]{color:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary))}",
       ".deg_expert_group_state_dot[data-state=ready]{color:var(--dsw-alias-state-success-primary)}",
+      // 固定 30px 批量控件紧跟标题文字；不占独立 grid 尾列，也不使用自动外边距推向行尾。
+      // 标题自身 min-width:0 + 单行省略，窄宽度下只收缩文字，箭头与批量控件保持固定占位。
+      ".deg_expert_group_trailing{display:flex;flex:0 0 30px;align-items:center;justify-content:center;width:30px;height:20px;min-width:30px}",
+      ".deg_expert_group_task_line_trailing{justify-content:flex-start}",
+      ".deg_expert_group_idle_title_line{display:flex;align-items:center;min-width:0;gap:2px}",
+      ".deg_expert_group_idle_title_line>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
+      // 批量关闭按钮：与单会话箭头同尺寸（30×20）与同色系（主题 business/info，缺 token 退回 cyan），
+      // 形状是同一枚「两个左尖括号」图标。pending 期间 disabled + aria-busy，绝不重复发出关闭序列。
+      ".deg_expert_group_sidebar_batch_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;flex:0 0 30px;width:30px;height:20px;margin:0;padding:0;border:0;border-radius:5px;background:transparent;cursor:pointer;color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
+      ".deg_expert_group_sidebar_batch_action:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
+      ".deg_expert_group_sidebar_batch_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+      ".deg_expert_group_sidebar_batch_action:disabled{opacity:.45;cursor:wait}",
+      // 「零」占位：inventory 已知为空时的非交互蓝色实心圆（直径 12px）。它只占位：
+      // 没有 button / hover / tabindex，不进入键盘与可访问性交互面。
+      ".deg_expert_group_sidebar_batch_zero{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary,#22d3ee))}",
       // 树线锚点固定在每一级父行的 20px 状态列中心，避免依赖窗口测量。
       ".deg_expert_group_children{position:relative;min-width:0;margin:0;padding:0;--deg-parent-row-height:60px}",
       ".deg_expert_group_children>.deg_expert_group_node,.deg_expert_group_children>.deg_expert_group_fanout,.deg_expert_group_children>.deg_expert_group_idle_group{--deg-tree-anchor:14px;position:relative}",
@@ -1002,7 +1017,11 @@
       // 空闲分组没有隐式首项 spacer；折叠、展开和空列表都保持直接相邻。
       ".deg_expert_group_idle_group{position:relative;min-width:0;padding-left:16px;--deg-tree-anchor:14px}",
       ".deg_expert_group_idle_group>.deg_expert_group_children{margin:0;padding:0;--deg-parent-row-height:28px}",
-      ".deg_expert_group_idle_group>.deg_expert_group_row.deg_expert_group_idle_header{height:28px;min-height:28px;padding:4px 0}",
+      // 空闲分组标题行同样是 grid：状态列 + chevron 列 + 可收缩标题列 + 批量 trailing slot。
+      // 第四列用 auto（与 .deg_expert_group_fanout_header 的 actions 列同款）：slot 存在时按它自己的
+      // 30px 宽占位，slot 为空（没有批量能力）时该列宽度为 0——标题宽度因此与改动前逐像素一致，
+      // 绝不会因为「能力缺失」而平白被压掉 30px。空 idleChildren 时该 slot 承载不可交互的零圆点。
+      ".deg_expert_group_idle_group>.deg_expert_group_row.deg_expert_group_idle_header{display:grid;grid-template-columns:20px 20px minmax(0,1fr);align-items:center;height:28px;min-height:28px;padding:4px 0}",
       ".deg_expert_group_idle_group>.deg_expert_group_row{margin:0}",
       ".deg_expert_group_fanout{position:relative;margin-top:0;padding-left:16px}",
       ".deg_expert_group_fanout_header{display:grid;grid-template-columns:20px 20px minmax(0,1fr) auto;align-items:center;min-width:0;min-height:28px;gap:4px}",
@@ -2309,6 +2328,33 @@
       /** 侧栏箭头动作的同 key 在途集合（打开/关闭共用一把锁）：重复点击只允许一次动作穿过。 */
       const sidebarTabPendingRef = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };
       /**
+       * 批量关闭动作的聚合锁，按 (sidebar session, root) 组合键隔离（主代理行 / 空闲分组标题行共用同一把）。
+       *
+       * 一次点击会顺序 await 多个 close(tabId)：整段序列在途期间必须拒绝第二次点击，否则双击会
+       * 让同一个 tabId 被关闭两次（第二次必然抛错），也会让两次序列交错发出关闭请求。
+       *
+       * 锁键必须含 root + sidebar session，而不是一个组件级 boolean：宿主 close 返回的 Promise
+       * 可能长时间不 settle，而用户完全可以在它挂起期间切换 root。单一 boolean 会让旧 root 的
+       * 在途序列把**新 root** 的批量按钮一并置成 disabled —— 一次与它无关的切换被旧锁阻塞，
+       * 且旧序列一旦永不 settle 就永久阻塞。集合里只保留仍在途的 scope，结算时精确删除自己那一项。
+       */
+      const sidebarBatchPendingRef = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };
+      /**
+       * 批量关闭锁的复合键：当前 sidebar session + 当前 root。
+       *
+       * 两者缺一不可：同一个 root 的 root/child surface 各有自己的右栏，不同 root 更是完全独立的
+       * surface；只有完全相同的两者才共享同一把锁（同一 scope 内 running/idle 两个批量入口互斥）。
+       */
+      const sidebarBatchScopeKey = (sessionId, rootId) => String(sessionId) + SIDEBAR_TAB_KEY_SEPARATOR + String(rootId);
+      /**
+       * 最近一次同步算出的「批量候选 tabId 签名」。
+       *
+       * 主代理行与空闲分组标题行的批量控件/零圆点由渲染期现读的 openTabs inventory 决定，
+       * 因此 inventory 变化必须触发一次重渲染——但 2.5 秒轮询在没有变化时绝不能再 bump，
+       * 否则空闲时会变成定时重渲染。这里只在签名真的变化时 bump（见 syncSidebarTabs）。
+       */
+      const sidebarBatchSignatureRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      /**
        * 最近一次渲染的右栏 tab 同步器（每次渲染同步写入，写法与 refreshRef 一致）。
        *
        * 挂载 effect 只在 sessionId/rootSessionId 变化时重建，而 observer / 轮询 / 可见性回调必须在
@@ -2871,6 +2917,149 @@
          for (const child of children) add(child, rootSessionId);
          return addresses;
        };
+      /**
+       * 当前 root 专家树里的「运行中」资源地址（普通专家、嵌套专家与最新 fan-out 分片）。
+       *
+       * 与 renderThreeLines 使用**同一个**规范地址 helper（subagentAddressOfChild + subagentChatAddress），
+       * 因此批量候选与单会话箭头指向的是同一个 contentId，绝不存在第二套地址推导。
+       *
+       * 纳入条件只有一条：runtimeStatusOfNode(...) === "running"（与行内圆点、第三行摘要同源）。
+       * ready/unknown 一律不纳入——未知状态绝不混进「可以关闭」的集合，空闲专家由空闲分组单独负责。
+       *
+       * parent 证据缺失或非法时 fail-closed：subagentAddressOfChild 会返回 null，该节点直接跳过，
+       * 绝不用猜测的 parent 补出一个地址（猜出来的地址可能关掉另一个会话的 tab）。
+       */
+      const sidebarExpertResourceAddresses = (node, parentId, addresses) => {
+        const source = object(node);
+        const kind = text(source.kind, null);
+        if (kind === "fanout") {
+          const shards = Array.isArray(source.shards) ? source.shards : [];
+          for (const shard of shards) {
+            const shardSource = object(shard);
+            // 只认最新 attempt 的 childId：旧 attempt 的子会话不再由这一行代表，也不是可导航目标。
+            const childId = text(shardSource.childId, null);
+            if (childId === null) continue;
+            if (runtimeStatusOfNode(shardSource, parentId, childId) !== "running") continue;
+            const address = subagentChatAddress(subagentAddressOfChild(childId, parentId, {
+              ...shardSource,
+              kind: "expert",
+            }));
+            if (address !== null) addresses.add(address);
+          }
+          return;
+        }
+        if (kind !== "expert") return;
+        const childId = text(source.sessionId, text(source.childId, null));
+        if (childId !== null && runtimeStatusOfNode(source, parentId, childId) === "running") {
+          const address = subagentChatAddress(subagentAddressOfChild(childId, parentId, source));
+          if (address !== null) addresses.add(address);
+        }
+        // 嵌套专家：parent 就是它的宿主专家会话；宿主缺失时内层地址推导 fail-closed。
+        if (Array.isArray(source.children)) {
+          for (const child of source.children) sidebarExpertResourceAddresses(child, childId, addresses);
+        }
+      };
+
+      /** 当前快照的 root 直接子节点（快照缺失时为空数组）。 */
+      const sidebarRootChildren = () => (Array.isArray(snapshot?.root?.children) ? snapshot.root.children : []);
+
+      /**
+       * 空闲分组的成员判定（ready 直接专家）——渲染与同步期共用这一份定义，
+       * 避免两处各推导一次而产生第二事实源。
+       */
+      const sidebarIdleChildren = () => sidebarRootChildren()
+        .filter((node) => node.kind === "expert" && runtimeStatusOfNode(node, rootSessionId, text(node.sessionId, null)) === "ready");
+
+      /**
+       * 当前 root 专家树里「运行中」的资源地址集合（主代理行批量关闭的唯一候选来源）。
+       * 与空闲分组互斥：这里只遍历 root.children 中的专家/fan-out 节点，空闲成员不参与。
+       */
+      const runningSidebarResourceAddresses = () => {
+        const addresses = new Set();
+        for (const child of sidebarRootChildren()) sidebarExpertResourceAddresses(child, rootSessionId, addresses);
+        return addresses;
+      };
+
+      /**
+       * 空闲分组（ready 直接专家）的资源地址集合；成员判定严格复用当前 idleChildren，绝不重新推导。
+       */
+      const idleSidebarResourceAddresses = (nodes) => {
+        const addresses = new Set();
+        for (const node of Array.isArray(nodes) ? nodes : []) {
+          const source = object(node);
+          const childId = text(source.sessionId, text(source.childId, null));
+          if (childId === null) continue;
+          const address = subagentChatAddress(subagentAddressOfChild(childId, rootSessionId, source));
+          if (address !== null) addresses.add(address);
+        }
+        return addresses;
+      };
+
+      /**
+       * 一次批量动作的候选集合：当前 openTabs inventory ∩ 给定的规范地址集合。
+       *
+       * 匹配条件缺一不可（全部来自公开只读 inventory 的字段）：
+       * - candidate.sessionId === 当前 sidebar session：绝不操作别的 surface 的 tab；
+       * - kind === "subagentchat"：同 session 下别的 kind 不是本插件的资源；
+       * - tabId 与 contentId 都非空：缺任何一个都无法精确关闭，也就没有可关闭的候选；
+       * - contentId 精确等于集合中的地址：同一个 kind 下也可能是另一个子代理的地址。
+       *
+       * 结果按 tabId 去重：宿主 inventory 理论上可能有重复记录，重复 tabId 只能关一次。
+       */
+      const sidebarBatchCandidates = (addresses, inventory) => {
+        const seen = new Set();
+        const candidates = [];
+        for (const entry of inventory) {
+          // 单条损坏记录（getter 抛错、非对象、缺字段）只跳过这一条：其余可关闭的 tab 照旧成候选。
+          let candidate = null;
+          try {
+            candidate = object(entry);
+            if (text(candidate.sessionId, null) !== sidebarSessionId) continue;
+            if (text(candidate.kind, null) !== SUBAGENT_CHAT_KIND) continue;
+            const tabId = text(candidate.tabId, null);
+            if (tabId === null) continue;
+            const contentId = text(candidate.contentId, null);
+            if (contentId === null || addresses.has(contentId) !== true) continue;
+            if (seen.has(tabId) === true) continue;
+            seen.add(tabId);
+            candidates.push(tabId);
+          } catch { continue; }
+        }
+        return candidates;
+      };
+
+      /**
+       * 两类标题行的批量状态（渲染期纯读，一次渲染只算一次）。
+       *
+       * 四态语义严格区分「未知」「零」「有候选但关不掉」：
+       * - inventory 读不出来（旧宿主 / 读面抛错 / 非数组）→ kind "none"：不渲染零圆点、也不渲染按钮；
+       * - inventory 已知是数组且候选数为 0 → kind "zero"：非交互蓝色实心圆占位（需要左箭头图标可用）。
+       *   零状态只由「候选集合为空」决定，**不依赖 close 能力**：本行确实没有可关闭的会话时，
+       *   蓝点表达的就是这个事实，与宿主能否关闭无关；
+       * - 候选数 > 0 且 close 能力可用 → kind "close"：可点击的双左尖括号批量关闭按钮；
+       * - 候选数 > 0 但 close 不可用 → kind "none"：既不能误报「零」（inventory 里明明有本行的
+       *   打开会话），也绝不渲染一个点了不会关的假按钮，这一行整个不出现行尾控件。
+       *
+       * 判定的顺序有实质意义：必须先算候选再看 close 能力。反过来（先看 close）会把「有候选但
+       * 关不掉」误判成「零」，那正是蓝点最不该出现的场合。
+       */
+      const sidebarBatchStateFor = (addresses) => {
+        const inventory = readSidebarOpenTabs();
+        if (inventory === null) return { kind: "none", candidates: [] };
+        const candidates = sidebarBatchCandidates(addresses, inventory);
+        if (candidates.length === 0) return { kind: "zero", candidates: [] };
+        if (closeSidebarResource === null) return { kind: "none", candidates: [] };
+        return { kind: "close", candidates };
+      };
+
+      /**
+       * 两行批量状态的合并签名：只在候选集合真的变化时触发一次重渲染（空闲轮询绝不空转重渲染）。
+       * 两行必须一起进签名——只跟踪主代理行会让空闲分组的手动开/关 tab 迟迟不被反映。
+       */
+      const sidebarBatchSignatureOf = (runningState, idleState) => {
+        const part = (state) => (state.kind === "close" ? "close:" + state.candidates.join(",") : state.kind);
+        return part(runningState) + "|" + part(idleState);
+      };
 
       /**
        * 等宿主完成一次布局提交，再读取 DockLayout 的可分栏判定。
@@ -2970,6 +3159,21 @@
         // 右栏拖拽手柄锁复用这条既有生命周期（挂载 / body 子树变更 / 2.5 秒轮询 / 可见性变化）：
         // 活跃 tab 一变就重估，绝不为它单独再挂一个长期 observer。请求失败只影响这一次重估。
         try { requestRightbarDragSync?.(); } catch { /* 手柄锁只是体验优化，绝不影响面板。 */ }
+        /**
+         * 标题行批量控件/零圆点由渲染期现读的 openTabs inventory 决定，因此这里必须在**任何提前 return
+         * 之前**比较一次候选签名：records 为空时旧实现会直接返回，inventory 变化就再也不会被反映，
+         * 用户手动打开的 tab（没有本插件的打开记录）也会永远看不到可关闭的批量按钮。
+         *
+         * 只有签名真的变化才 bump：2.5 秒轮询在没有变化时绝不产生重渲染。
+         */
+        const batchSignatureNow = sidebarBatchSignatureOf(
+          sidebarBatchStateFor(runningSidebarResourceAddresses()),
+          sidebarBatchStateFor(idleSidebarResourceAddresses(sidebarIdleChildren())),
+        );
+        if (sidebarBatchSignatureRef.current !== batchSignatureNow) {
+          sidebarBatchSignatureRef.current = batchSignatureNow;
+          bump((value) => value + 1);
+        }
         const records = sidebarTabRecordsRef.current;
         const openings = sidebarTabOpeningRef.current;
          const now = Date.now();
@@ -2995,6 +3199,9 @@
          // 先完成精确 split 提交，再执行关闭同步；guide-only 或错误 pane 仍继续等待。
          tryCommitSidebarSplit();
          // 先完成打开记录，再执行关闭同步；同 pane 回落不再被转换成独立浮窗。
+         // 这里保留「没有打开记录就直接返回」的既有短路（它保证空闲时不会发生任何 DOM 查询）；
+         // 批量控件的聚合状态更新已经在**这个短路之前**完成，因此 records 为空时 inventory 的变化
+         // 照旧能被反映，而用户手动打开的 tab 也不再依赖本插件的打开记录。
          if (records.size === 0) return;
         const present = presentSidebarTabIds();
         if (present === null) return;
@@ -3255,6 +3462,126 @@
       };
 
       /**
+       * 批量关闭的唯一入口（主代理行 = 当前 root 的运行中专家/最新分片；空闲分组标题行 = ready 空闲成员）。
+       *
+       * 与单会话箭头共用的三条并发与生命周期边界：
+       * 1) 聚合锁覆盖整段 await 序列：双击/连击只允许第一次穿过，pending 期间按钮 disabled + aria-busy；
+       *    锁按 (sidebar session, root) 组合键隔离，只拒绝**同一个 surface** 的重复点击——别的
+       *    root/session 的批量按钮保持可用，绝不被一个与它无关的在途序列（甚至永不 settle 的
+       *    宿主 Promise）阻塞；
+       * 2) 候选集合在**点击那一刻**从同一个 inventory 快照固定下来（渲染期算好、随点击闭包传入），
+       *    后续再点同一个按钮也不会把新出现的 tab 混进这一轮；
+       * 3) 每次 await 前后都校验 mountedRef / currentRootRef / currentSidebarSessionRef：root 或
+       *    sidebar session 切换、组件卸载后立即停止后续关闭，绝不让旧点击继续操作新 surface。
+       *
+       * 单项失败严格隔离：close 同步抛错或返回 rejected Promise 只跳过这一项并继续其余项，
+       * 也绝不把失败项标成已关闭——关闭记录一律交给宿主 inventory 与既有同步器确认（这里不删记录）。
+       */
+      const handleSidebarBatchClose = async (candidates) => {
+        if (mountedRef.current !== true
+          || currentRootRef.current !== rootSessionId
+          || currentSidebarSessionRef.current !== sidebarSessionId) return;
+        if (closeSidebarResource === null) return;
+        if (Array.isArray(candidates) !== true || candidates.length === 0) return;
+        // 锁只覆盖「这一个 surface」：同一个 scope 的重复点击被拦下，别的 root/session 的批量按钮
+        // 完全不受影响（它的键不在集合里）。
+        const scopeKey = sidebarBatchScopeKey(sidebarSessionId, rootSessionId);
+        const pendingScopes = sidebarBatchPendingRef.current;
+        if (pendingScopes.has(scopeKey) === true) return;
+        pendingScopes.add(scopeKey);
+        // 立刻进入 pending 态：按钮 disabled + aria-busy，第二次点击在 has 检查处被拦下。
+        bump((value) => value + 1);
+        try {
+          for (const tabId of candidates) {
+            // await 之前：root/session 切换或卸载即停止后续关闭。
+            if (mountedRef.current !== true
+              || currentRootRef.current !== rootSessionId
+              || currentSidebarSessionRef.current !== sidebarSessionId) return;
+            try {
+              // 单项 await：同步抛错与 rejected Promise 都在这里被隔离，序列继续。
+              await closeSidebarResource.call(sidebarRight, tabId);
+            } catch { /* 单项失败只影响这一项：失败项绝不被标成已关闭，也不改写任何记录。 */ }
+            // await 之后：surface 已切换时不再继续（已经发出的那一次关闭照旧由宿主结算）。
+            if (mountedRef.current !== true
+              || currentRootRef.current !== rootSessionId
+              || currentSidebarSessionRef.current !== sidebarSessionId) return;
+          }
+        } finally {
+          // 只释放自己那一个 scope：旧序列的收尾绝不改写别的 root/session 的锁。
+          pendingScopes.delete(scopeKey);
+          // 重渲染与同步只服务**自己这一轮渲染**的 surface：root/session 已经切换时它们会去操作
+          // 新 surface（旧 scope 的 bump 会让新 root 白白重渲染、旧闭包的 sync 会去同步旧 root）。
+          // 回到同一个 root/session（键相同）时仍照常收尾，按钮不会因为缺少重渲染而停在 disabled。
+          if (mountedRef.current === true
+            && currentRootRef.current === rootSessionId
+            && currentSidebarSessionRef.current === sidebarSessionId) {
+            bump((value) => value + 1);
+            // 关闭序列结束后推进一次同步：候选集合与签名都按宿主 inventory 重新读取，
+            // 真正被宿主关掉的 tab 由既有同步器（present/active/浮窗标题证据）结算，插件不抢先删记录。
+            syncSidebarTabs();
+          }
+        }
+      };
+
+      /**
+       * 标题行批量控件（主代理行与空闲分组标题行共用）。
+       *
+       * 三态渲染：
+       * - 候选 > 0 且 close 可用：与单会话箭头同款的双左尖括号按钮（30×20），
+       *   aria-label/title 说明会关闭几个 tab，type=button，preventDefault + stopPropagation 必须同时存在；
+       * - inventory 已知且候选为 0：非交互蓝色实心圆（12px）占位，没有 button / hover / tabindex；
+       * - inventory 不可读，或候选 > 0 但 close 不可用：什么都不渲染（未知态绝不假报「零」，
+       *   「关不掉」也绝不退化成「零」）。
+       *
+       * 这里**不看 openResource**：批量关闭只读取公开 inventory 并调用 close()，不需要打开任何资源。
+       * 以打开能力当门槛会让「宿主能关不能开」（或注入面只给了 close）的右栏整行失去控件。
+       * 唯一的渲染能力门槛是左尖括号图标：缺它时连零占位也不渲染。
+       *
+       * 绝不使用 aria-pressed：这是批量命令，不是 toggle 状态。
+       */
+      const renderSidebarBatchSlot = (addresses, label) => {
+        const state = sidebarBatchStateFor(addresses);
+        if (state.kind === "none") return null;
+        if (state.kind === "zero") {
+          // 左箭头图标缺失时连零占位也不渲染：没有可用的批量按钮能力就不该出现「本行有批量入口」的暗示。
+          if (typeof primitives?.IconChevronLeftOutlineRegular !== "function") return null;
+          return react.createElement("div", { className: "deg_expert_group_trailing" },
+            react.createElement("span", {
+              className: "deg_expert_group_sidebar_batch_zero",
+              "data-zero": "true",
+              "aria-hidden": "true",
+            }));
+        }
+        if (typeof primitives?.IconChevronLeftOutlineRegular !== "function") return null;
+        const count = state.candidates.length;
+        const accessibleName = "在侧边栏关闭 " + count + " 个" + label;
+        // 只看**当前** scope 的锁：别的 root/session 的在途序列绝不影响这一行的按钮状态。
+        const pending = sidebarBatchPendingRef.current.has(sidebarBatchScopeKey(sidebarSessionId, rootSessionId));
+        return react.createElement("div", { className: "deg_expert_group_trailing" },
+          react.createElement("button", {
+            type: "button",
+            className: "deg_expert_group_sidebar_batch_action",
+            title: accessibleName,
+            "aria-label": accessibleName,
+            "aria-busy": pending || undefined,
+            disabled: pending,
+            onClick: (event) => {
+              event?.preventDefault?.();
+              event?.stopPropagation?.();
+              // 候选集合固定为这次渲染算出的那一份：点击后 inventory 再变也不影响本轮。
+              return handleSidebarBatchClose(state.candidates);
+            },
+            onKeyDown: (event) => { event?.stopPropagation?.(); },
+          }, react.createElement("span", {
+            className: "deg_expert_group_double_arrow",
+            "data-direction": "close",
+            "aria-hidden": "true",
+          },
+          makeIcon(primitives, "IconChevronLeftOutlineRegular", { size: 20, className: "deg_expert_group_double_arrow_icon", "aria-hidden": true }),
+          makeIcon(primitives, "IconChevronLeftOutlineRegular", { size: 20, className: "deg_expert_group_double_arrow_icon", "aria-hidden": true }))));
+      };
+
+      /**
        * 标题后「在右侧栏打开 / 关闭」箭头按钮：与 DSH 原生子代理行同款箭头图标。
        *
        * 渲染条件缺一不可：宿主提供 `sidebarRight.openResource`、地址可解析、具名右箭头图标可用。
@@ -3383,10 +3710,19 @@
         const metadata = metadataOf(source);
         const taskClassName = "deg_expert_group_line deg_expert_group_task"
           + (oneLine ? "" : " deg_expert_group_shard_task");
+        const trailing = options.trailing === undefined ? null : options.trailing;
+        const taskChildren = [
+          react.createElement("div", { className: taskClassName, title: fullName, onClick: onNavigate, ...navigateProps }, fullName),
+          renderSidebarOpenAction(address, fullName),
+        ];
+        if (trailing !== null) taskChildren.push(trailing);
+        const taskLine = react.createElement("div", {
+          className: "deg_expert_group_task_line" + (trailing === null ? "" : " deg_expert_group_task_line_trailing"),
+        }, ...taskChildren);
+        // 主代理批量控件作为标题行的相邻 flex 项，标题收缩省略时控件仍固定在标题末尾。
+        // 其它专家 / 分片 / 空闲成员不传 trailing，单会话箭头结构保持不变。
         return react.createElement("div", { className: "deg_expert_group_row_main", "data-kind": source.kind || "expert", "data-expanded": true },
-          react.createElement("div", { className: "deg_expert_group_task_line" },
-            react.createElement("div", { className: taskClassName, title: fullName, onClick: onNavigate, ...navigateProps }, fullName),
-            renderSidebarOpenAction(address, fullName)),
+          taskLine,
           react.createElement("div", { className: "deg_expert_group_meta", title: metadata }, metadata),
           react.createElement("div", { className: "deg_expert_group_line deg_expert_group_content", title: summary, onClick: onNavigate, ...summaryProps }, summary));
       };
@@ -3419,16 +3755,24 @@
        * 空闲分组是容器而非代理：它的圆点直接用规范值 ready（绿色静态圆点），
        * 分组内成员各自按官方目录证据决定 running/ready。
        */
-      const renderIdleGroup = (nodes) => {
-        if (!Array.isArray(nodes) || nodes.length === 0) return null;
-        const group = { kind: "idle-group", id: rootSessionId + "__idle__", taskName: "空闲子代理", status: "idle", children: nodes };
+      const renderIdleGroup = (nodes, trailing) => {
+        // 空列表同样要渲染：snapshot 已经加载（调用方只在有快照时调用）时「空闲子代理（0）」与零圆点
+        // 是用户看得到的零状态；加载中 / 没有快照时调用方根本不会走到这里，绝不伪造零。
+        const members = Array.isArray(nodes) ? nodes : [];
+        const group = { kind: "idle-group", id: rootSessionId + "__idle__", taskName: "空闲子代理", status: "idle", children: members };
         const open = expand(group);
+        const idleTitleChildren = [
+          react.createElement("div", { className: "deg_expert_group_line deg_expert_group_task" }, "空闲子代理（" + members.length + "）"),
+        ];
+        // 空闲分组的批量候选只来自当前 idleChildren（ready 直接专家）；active 成员保留。
+        // slot 与计数标题同属第三列的 inline flex，标题按可用宽度省略，slot 不会被推到行尾。
+        if (trailing !== undefined && trailing !== null) idleTitleChildren.push(trailing);
         return react.createElement("div", { className: "deg_expert_group_idle_group", "data-expanded": open },
           react.createElement("div", { className: "deg_expert_group_row deg_expert_group_idle_header", "data-status": "ready", "data-expanded": open },
             statusIcon(react, primitives, "ready"),
             renderChevron(group, open),
-            react.createElement("div", { className: "deg_expert_group_line deg_expert_group_task" }, "空闲子代理（" + nodes.length + "）")),
-          open ? react.createElement("div", { className: "deg_expert_group_children deg_expert_group_idle_children" }, nodes.map((node, index) => renderExpert(node, index, rootSessionId))) : null);
+            react.createElement("div", { className: "deg_expert_group_idle_title_line" }, ...idleTitleChildren)),
+          open ? react.createElement("div", { className: "deg_expert_group_children deg_expert_group_idle_children" }, members.map((node, index) => renderExpert(node, index, rootSessionId))) : null);
       };
 
       const pendingSet = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };
@@ -3556,8 +3900,13 @@
       // 默认折叠依据展示层的 running/ready，而不是 Host 内部的旧任务 status。
       // 这样 status=unknown 但官方目录 activity=inactive 的专家也会进入空闲分组；
       // fan-out 仍只在自己的取消/重试逻辑中读取 statusOf(task)。
-      const idleChildren = children.filter((node) => node.kind === "expert" && runtimeStatusOfNode(node, rootSessionId, text(node.sessionId, null)) === "ready");
+      const idleChildren = sidebarIdleChildren();
       const visibleChildren = children.filter((node) => !idleChildren.includes(node));
+      // 两行标题后的批量 slot 内容：主代理行只覆盖运行中的普通专家/最新分片，空闲标题行只覆盖
+      // idleChildren。两者都只在渲染期纯读 openTabs inventory 与 close 能力（inventory 读不出来、
+      // 或候选存在但 close 缺失时返回 null，不渲染任何东西）；打开能力不参与这里的判定。
+      const rootBatchSlot = renderSidebarBatchSlot(runningSidebarResourceAddresses(), "运行中的子代理");
+      const idleBatchSlot = renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren), "空闲子代理");
       const root = snapshot?.root;
       const rootOpen = root === null ? true : expand(root);
       const body = viewState.loading && snapshot === null
@@ -3566,10 +3915,10 @@
           ? react.createElement("div", { className: "deg_expert_group_empty" }, "暂无 Expert Group 任务")
           : react.createElement("div", { className: "deg_expert_group_tree" },
             react.createElement("div", { className: "deg_expert_group_node deg_expert_group_node_root", "data-root": "true" },
-              react.createElement("div", { className: "deg_expert_group_row", "data-status": runtimeStatusOf(root, null), "data-expanded": true }, statusIcon(react, primitives, runtimeStatusOf(root, null)), renderChevron(root, rootOpen), react.createElement("div", null, renderThreeLines(root, { sessionId: root.sessionId, parentId: null, expanded: true }))),
+              react.createElement("div", { className: "deg_expert_group_row", "data-status": runtimeStatusOf(root, null), "data-expanded": true }, statusIcon(react, primitives, runtimeStatusOf(root, null)), renderChevron(root, rootOpen), react.createElement("div", null, renderThreeLines(root, { sessionId: root.sessionId, parentId: null, expanded: true, trailing: rootBatchSlot }))),
               rootOpen ? react.createElement("div", { className: "deg_expert_group_children" }, [
                 ...visibleChildren.map((node, index) => node.kind === "fanout" ? renderFanout(node, index) : renderExpert(node, index, rootSessionId)),
-                renderIdleGroup(idleChildren),
+                renderIdleGroup(idleChildren, idleBatchSlot),
               ]) : null));
       return react.createElement("section", { className: "deg_expert_group", "data-version": version, "aria-label": "Expert Group" },
         react.createElement("header", { className: "deg_expert_group_header" },
