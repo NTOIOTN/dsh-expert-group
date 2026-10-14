@@ -1,6 +1,6 @@
 {
   "name": "dsh-expert-group",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH 专家子代理、Expert Group 任务侧边栏与设置页（双面 bundle）",
   "type": "module",
   "main": "./index.js",

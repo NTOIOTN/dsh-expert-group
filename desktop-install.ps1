@@ -1830,7 +1830,7 @@ if ($backupTreeSourceFiles -gt 0) {
 #   │
 #   │   dependencies:
 #   ├── @deepseek-ai/dsh-browser-use@0.2.0-rc.2
-#   ├── dsh-expert-group@0.1.1
+#   ├── dsh-expert-group@0.1.2
 #   └── dshmarket@1.66.11
 #
 #   3 packages
