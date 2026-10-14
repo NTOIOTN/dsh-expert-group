@@ -12461,7 +12461,7 @@ window.__ModuleLoader__.load({
       { id: "pendingSettingsWrites", label: "在途 settings 写入", path: ["settings", "pendingWrites"], kind: "count" },
       { id: "settingsGeneration", label: "模型目录代次", path: ["settings", "generation"], kind: "count" },
       { id: "storageGeneration", label: "storage generation", path: ["storage", "generation"], kind: "count" },
-      { id: "handoffPending", label: "goal handoff 记录", path: ["handoff", "pending"], kind: "count" },
+      { id: "handoffPending", label: "pending admission", path: ["handoff", "pending"], kind: "count" },
       { id: "notificationRoots", label: "已登记通知根会话", path: ["notifications", "roots"], kind: "count" },
       { id: "fanoutRestorePending", label: "fan-out 待恢复", path: ["fanout", "restorePending"], kind: "flag" },
       { id: "storageStatus", label: "storage 状态", path: ["storage", "status"], kind: "token" },
@@ -12469,7 +12469,7 @@ window.__ModuleLoader__.load({
 
     /** 宿主能力矩阵到客户端展示面的映射（状态语义统一为 available/degraded/absent/unknown）。 */
     const HOST_CAPABILITY_FIELDS = Object.freeze([
-      { key: "goals", id: "host.goals", label: "Goal handoff（宿主 goals）" },
+      { key: "rootTurnWait", id: "host.rootTurnWait", label: "Root turn 等待（session-activity）" },
       { key: "connectionRpc", id: "host.connectionRpc", label: "Connection RPC 通道" },
       { key: "storageDomain", id: "host.storageDomain", label: "storage domain 绑定" },
       { key: "attachments", id: "host.attachments", label: "附件/图片规范化" },
@@ -12480,7 +12480,7 @@ window.__ModuleLoader__.load({
     function hostCapabilityStatusOf(status) {
       if (status === "available" || status === "ready") return "available";
       if (status === "incomplete" || status === "degraded" || status === "fail-closed" || status === "legacy" || status === "partial") return "degraded";
-      if (status === "absent" || status === "missing" || status === "none") return "absent";
+      if (status === "absent" || status === "missing" || status === "none" || status === "unavailable") return "absent";
       return "unknown";
     }
 

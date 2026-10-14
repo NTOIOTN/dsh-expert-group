@@ -442,9 +442,9 @@ export function createFanoutRuntimeModule({
     /**
      * 「该 exact live root 能否证明自己拥有这个父任务」的只读判定。
      *
-     * 为什么需要它：goal handoff 的 barrier 只能由**任务真正归属的那一代 root**建立，
-     * 否则同 id 的 replacement 或已销毁 root 就能替别人登记等待原因，让一个不会再产生
-     * task_settled 的任务把 durable goal 永久钉在 paused。
+     * 为什么需要它：root turn 等待只能由**任务真正归属的那一代 root**建立，
+     * 否则同 id 的 replacement 或已销毁 root 就能替别人登记等待工作，让一个不会再产生
+     * task_settled 的任务把 root 永久钉在等待中。
      *
      * 授权条件与 continuation 写路径**同一套硬条件**（activeBindingReplayEvidence），
      * 绝不接受单纯的字符串 parent id，也不使用 settledParentSessions 兜底：
@@ -517,7 +517,7 @@ export function createFanoutRuntimeModule({
           const currentTask = runtime.manager.getTask(parentTaskId);
           const recorded = currentTask?.continuationRequests?.[replayRequestId];
           if (recorded !== undefined && recorded !== null && typeof recorded.result === "object") {
-            // 重放不触发任何 goal handoff 重新登记（index.js 按 duplicate 标记跳过）。
+            // 重放不触发任何等待工作重新登记（index.js 按 duplicate 标记跳过）。
             return { ...recorded.result, duplicate: true, ...(currentTask === null ? {} : { task: currentTask }) };
           }
         }
@@ -761,13 +761,12 @@ export function createFanoutRuntimeModule({
       ...(typeof runtime?.manager?.budget === "function" ? { budget: runtime.manager.budget() } : {}),
     }),
     /**
-     * 显式落盘一次当前快照（C7 归属证据变化后由宿主调用）。
+     * 显式落盘一次当前快照（由宿主在需要立刻持久化时调用）。
      *
-     * 为什么需要显式入口：goal handoff 归属证据（插件自己暂停过哪个 goal、暂停时的
-     * exact revision、覆盖哪些父任务）不在 manager 的状态机里，manager 的状态变化
-     * 不会触发它落盘。证据只在两个时刻变化（pause 建立 / release 完成），因此这里的
-     * 显式 flush 不会被高频调用；它复用既有 persist 旁路（合并、退避、健康记录、
-     * generation 校验都不复制）。
+     * 为什么需要显式入口：manager 的状态机只覆盖任务本身，宿主侧的登记（例如 fan-out
+     * 等待代次）变化不会触发它落盘。这类变化频率与任务数量同阶，因此这里的显式 flush
+     * 不会被高频调用；它复用既有 persist 旁路（合并、退避、健康记录、generation 校验
+     * 都不复制）。
      *
      * 关闭后返回 false：卸载路径不得再发起新的 domain 写入。
      * @returns {Promise<boolean>} 是否成功落盘。

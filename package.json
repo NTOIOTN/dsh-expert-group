@@ -40,6 +40,7 @@
     "host/fanout-runtime.js",
     "host/handoff.js",
     "host/lineage.js",
+    "host/turn-wait.js",
     "host/notifications.js",
     "host/rpc-transport.js",
     "host/settings-source.js",

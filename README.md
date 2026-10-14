@@ -12,11 +12,32 @@
 现有 Host 服务与客户端 Slot 注册；**最低宿主契约**是下面这些声明在 `inject` 里的服务：
 `tools`、`subagents`、`systemPrompt`、`llm`、`agents`、`settings`、`webServer`。
 
-其中 **goals 是可选兼容服务**：插件通过 `ctx.get("goals")` 读取，不把它声明为 `inject` 依赖。
-宿主缺少该服务时，插件主体、专家派发与其他工具仍正常加载，只有依赖真实 `pause` / `resume`
-的 **goal handoff** 不可用；能力矩阵标记 `required: false`、`status: "absent"` 和
-`degradation: "goal-handoff-disabled"`。服务存在但缺少 `get` / `pause` / `resume` 时同样
-fail-closed，并标记为 `status: "incomplete"`；绝不伪造 paused ref 或假装能 resume。
+其中 **goals 是可选只读投影源**：插件通过 `ctx.get("goals")` 读取，不把它声明为 `inject` 依赖，
+且**只用于侧边栏的目标阶段展示**。插件不调用 `goals.pause` / `goals.resume`，等待语义完全由
+「保持 root 当前 turn 打开」实现（见下）。宿主缺少该服务时，插件主体、专家派发与其他工具仍正常
+加载，只是目标阶段投影为空。
+
+等待判定需要一条**能证明**「该 root 没有 running 后代」的 root-scoped 查询，分两档：
+- **权威**：`subagents.listDescendants(rootSessionId)`——递归后代枚举，每行带
+  `activity: "running" | "inactive"`；整条 listing reject、出现不可读分支
+  （`kind: "diagnostic"`）或结构非法都按 unknown 处理。**只有**它「干净且完整」地回答
+  才能证明静止，这也是等待唯一的释放依据；
+- **降级**：公开 `workspace/session-activity` waterfall。它是**非专属**扩展点，
+  **只能报告 activity，不能证明 quiet**，两个原因都必须处理：
+  - 宿主 subagent provider 在空闲时是原样透传最内层返回值，因此「没有 provider」与
+    「provider 报告空」在返回值上同形；插件用模块唯一的 sentinel 兜底，sentinel 命中一律
+    unknown；
+  - 即使拿到的是**非 sentinel 的新数组**，也无法识别贡献者：任意第三方 listener 都能返回
+    一个全新的空数组（既不 spread 最内层值，也不检查 subagent 血缘），它与「provider
+    明确报告没有 running 后代」同形但**不可信**。因此**任何空数组**（含 fresh `[]`）
+    都不是静止证明。
+  该档唯一可用的明确结论是**正向**的「确有 `kind: "subagent"` 的 running 后代」，
+  它只用于继续等待。
+
+两档都不可用时能力矩阵标记 `required: false`、`status: "unavailable"` 和
+`degradation: "root-turn-wait-descendant-query-unavailable"`；只有 waterfall 时标记
+`status: "degraded"` 和 `root-turn-wait-descendant-listing-unavailable`。任何 unknown
+一律 fail-closed（继续等待，绝不把「查不到」当成「没有人跑」）。
 
 图片规范化额外使用可选公开 `ctx.attachments` 服务，冷会话精确读取使用可选 `ctx.sessionQuery`；
 两者缺失时只禁用受影响能力（`image-normalization-disabled` / `cold-session-read-disabled`），
@@ -240,7 +261,7 @@ DEG 没有模型可调用的通知工具，也不在会话标题栏或右侧栏�
 | 弹窗停留时间（下拉） | `5s` | `5s / 10s / 30s / 60s / 5min / 10min / 永久` | `dsh-expert-group.notificationHoldMs` |
 | 通知音量（滑杆 + 数字框） | `100` | `0 – 100`，步进 `1` | `dsh-expert-group.notificationVolume` |
 
-- 「通知弹窗」关闭后 Host **完全不发送通知**，也不补发；它只影响投递，不影响任务快照、goal handoff 或恢复语义。
+- 「通知弹窗」关闭后 Host **完全不发送通知**，也不补发；它只影响投递，不影响任务快照、root turn 等待或恢复语义。
 - 音量 `100` 表示不做任何衰减，只受 Windows 主音量影响；滑杆与数字框同值双向绑定。
 - 三项都是延迟保存：改完要点页脚「保存」；非法值会回落到默认（停留时间 → `5s`，音量 → `100`）。
 
@@ -422,3 +443,34 @@ Expert Group 是 DEG 注册在右侧栏的任务视图：它把**当前会话所
 - 首次形成两个 pane 后：Expert Group 占右栏 40%（视口约 20%），子代理 pane 占右栏 60%（视口约 30%）；最后一个被跟踪的 pane 关闭后恢复约 20% 的默认宽度。
 
 **能力缺失时的降级**：宿主没有 `sidebarRight.openResource` 时箭头不渲染、其余行内容完整；缺少关闭确认能力时保留静态 `>>`；整条侧栏接缝不可用时 DEG 只注册页面，不猜测打开状态。
+
+## 只读能力矩阵与运行时诊断
+
+Host RPC 的 `meta` 动作返回两份**只读投影**（设置页诊断块与客户端归一化都消费它们）：
+
+- `capabilities`：宿主服务可达性与固定降级标记，带 schema 版本 `version`。
+  每个能力条目只允许固定字段（`required` / `status` / `degradation` / `methods` / `probe` /
+  `transport` / `failure` / `binding`），不含任何自由文本。
+  - 硬依赖（`tools` / `subagents` / `agents` / `settings` / `webServer` / `systemPrompt` / `llm`）
+    在 `inject` 中声明，缺失时插件不加载；
+  - `rootTurnWait` 是可选宿主 seam：权威档是 `subagents.listDescendants`（**唯一**能证明
+    「该 root 没有 running 后代」的 seam，且必须干净且完整），降级档是公开的
+    `workspace/session-activity` waterfall（只能报告 activity，不能证明 quiet）。
+    只有 waterfall 时为 `degraded` + `root-turn-wait-descendant-listing-unavailable`；
+    两档都没有时为 `unavailable` + `root-turn-wait-descendant-query-unavailable`，
+    此时等待一律 fail-closed（继续等待）；
+  - `connectionRpc` / `storageDomain` / `attachments` / `sessionQuery` 各自报告
+    `available` / `degraded` / `absent` / `unknown`，缺失时只禁用对应能力。
+- `diagnostics`：children / fanout / recovery / settings / storage / handoff / notifications /
+  rpc 的**计数与固定 token**，同样带 `version`。
+
+敏感性边界：两份投影不含 prompt、原始请求体、token、Cookie、authorization、文件路径、
+会话/child 标识或错误消息正文；能力状态与降级说明都从固定枚举取值，任何超出字符面的输入
+在归一化时被丢弃。客户端遇到未知 `version` 时整体忽略该块，绝不猜测字段含义。
+
+系统通知（Windows Toast）的诊断字段与固定 token 同样在这一份 `diagnostics` 里：
+`notifications.systemToast` 报告 `status` / `version` / `platform` / `aumidResolved` /
+`aumidReason` / `inflight` / `queued` / `sent` / `failed` / `dropped` / `lastReason`；
+解释器不可用时 `status` 为 `absent` 且固定 `reason` 为 `powershell-unavailable`，
+AUMID 解析失败的固定 token 为 `shortcut-read-failed`。这些字段只报状态与计数，不含命令行、
+路径或通知正文。
