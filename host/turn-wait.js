@@ -349,6 +349,29 @@ export function createRootTurnWaitRegistry(options = {}) {
   }
 
   /**
+   * 取消当前 root 的所有 waiter，但保留未结算工作与监听。
+   *
+   * 用户插话只应打断上一轮 root 的等待，让新一轮消息立即进入处理；专家 child
+   * 仍可能运行，admission 也必须继续保留，后续 turn 才能再次等待同一批工作。
+   *
+   * @param {object} agent - exact root Agent。
+   * @param {string} reason - 取消原因码。
+   * @returns {boolean} 是否至少取消了一个 waiter。
+   */
+  function cancelWaiters(agent, reason = "cancelled") {
+    const record = records.get(agent);
+    if (record === void 0 || record.destroyed === true || record.waiters.size === 0) return false;
+    settleWaiters(record, false, reason);
+    // 让已经在飞的查询失效；它的迟到结果只能复位内部状态，不能重新收口旧 waiter。
+    if (record.checking) {
+      record.activeQueryId = ++record.querySequence;
+      record.checking = false;
+      record.recheck = false;
+    }
+    return true;
+  }
+
+  /**
    * 等待该 root 静止。**永不超时**：只有精确结算 + root-scoped 明确空闲、
    * 或 retire/dispose 才会收口。
    *
@@ -452,6 +475,7 @@ export function createRootTurnWaitRegistry(options = {}) {
     track,
     settle,
     invalidate,
+    cancelWaiters,
     engage,
     isEngaged,
     wait,

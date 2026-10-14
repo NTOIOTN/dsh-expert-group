@@ -8,41 +8,6 @@
 把「按角色区分模型与思考深度」的专家子代理能力引入 DSH，并在 Web 界面的“dsh-expert-group”设置页维护全局模型、思考深度与通知偏好。
 同时把 oh-my-opencode-slim 的主代理 orchestrator 设计移植过来：根会话负责拆解、委派、整合和验证，专家子代理保持叶子 worker 约束。
 
-本包**不修改** `@deepseek-ai/dsh` 的任何核心源码，也不修改 shipped agent preset。能力全部通过
-现有 Host 服务与客户端 Slot 注册；**最低宿主契约**是下面这些声明在 `inject` 里的服务：
-`tools`、`subagents`、`systemPrompt`、`llm`、`agents`、`settings`、`webServer`。
-
-其中 **goals 是可选只读投影源**：插件通过 `ctx.get("goals")` 读取，不把它声明为 `inject` 依赖，
-且**只用于侧边栏的目标阶段展示**。插件不调用 `goals.pause` / `goals.resume`，等待语义完全由
-「保持 root 当前 turn 打开」实现（见下）。宿主缺少该服务时，插件主体、专家派发与其他工具仍正常
-加载，只是目标阶段投影为空。
-
-等待判定需要一条**能证明**「该 root 没有 running 后代」的 root-scoped 查询，分两档：
-- **权威**：`subagents.listDescendants(rootSessionId)`——递归后代枚举，每行带
-  `activity: "running" | "inactive"`；整条 listing reject、出现不可读分支
-  （`kind: "diagnostic"`）或结构非法都按 unknown 处理。**只有**它「干净且完整」地回答
-  才能证明静止，这也是等待唯一的释放依据；
-- **降级**：公开 `workspace/session-activity` waterfall。它是**非专属**扩展点，
-  **只能报告 activity，不能证明 quiet**，两个原因都必须处理：
-  - 宿主 subagent provider 在空闲时是原样透传最内层返回值，因此「没有 provider」与
-    「provider 报告空」在返回值上同形；插件用模块唯一的 sentinel 兜底，sentinel 命中一律
-    unknown；
-  - 即使拿到的是**非 sentinel 的新数组**，也无法识别贡献者：任意第三方 listener 都能返回
-    一个全新的空数组（既不 spread 最内层值，也不检查 subagent 血缘），它与「provider
-    明确报告没有 running 后代」同形但**不可信**。因此**任何空数组**（含 fresh `[]`）
-    都不是静止证明。
-  该档唯一可用的明确结论是**正向**的「确有 `kind: "subagent"` 的 running 后代」，
-  它只用于继续等待。
-
-两档都不可用时能力矩阵标记 `required: false`、`status: "unavailable"` 和
-`degradation: "root-turn-wait-descendant-query-unavailable"`；只有 waterfall 时标记
-`status: "degraded"` 和 `root-turn-wait-descendant-listing-unavailable`。任何 unknown
-一律 fail-closed（继续等待，绝不把「查不到」当成「没有人跑」）。
-
-图片规范化额外使用可选公开 `ctx.attachments` 服务，冷会话精确读取使用可选 `ctx.sessionQuery`；
-两者缺失时只禁用受影响能力（`image-normalization-disabled` / `cold-session-read-disabled`），
-文本专家能力仍可加载。
-
 ## 能力
 
 - 5 个专家子代理工具（默认启用）：
@@ -65,86 +30,31 @@
 
 ## 安装与平台分工
 
-本插件发布到 npm 公共源，按包名安装。**CLI/web 与桌面版是两套管理面，命令不通用**：
-CLI/web 的完整流程见 [安装说明.txt](安装说明.txt) 与 [web-install.ps1](web-install.ps1) / [web-uninstall.ps1](web-uninstall.ps1)（这两个脚本只处理 web profile）；
-桌面版见 [desktop-install.ps1](desktop-install.ps1)（构建 → 测试 → 打包 → 备份 → 安装 → 校验的快速部署流程，脚本头部注释即流程说明）。
-
-| 目标 | 安装入口 | 卸载入口 | 生效方式 |
-| --- | --- | --- | --- |
-| **CLI / `dsh web`** | `dsh plugin --profile web add dsh-expert-group` | `web-uninstall.ps1`（等价于 `dsh plugin --profile web remove dsh-expert-group`） | 重启 DSH Web |
-| **桌面版（Electron 客户端）** | 桌面版**应用自带**的 `dsh.cmd`（`plugin --profile desktop`，见下），或 GUI「插件 → 添加插件」 | `desktop-uninstall.ps1`（内部调用应用自带 CLI，见下） | 重启桌面版 |
-
-两个卸载脚本各自只处理自己的 profile，**不可混用**：`web-uninstall.ps1` 操作 `profiles\web`，`desktop-uninstall.ps1` 操作 `profiles\desktop`。
+本插件发布到 npm 公共源，按包名通过官方 `dsh plugin` CLI 安装；`--profile` 为必填参数。
 
 ### CLI / `dsh web`
+
+前置条件：DSH Web 可正常运行（`dsh web`）、Node.js ≥ 22，且 PATH 上有 `pnpm`。
 
 ```powershell
 dsh plugin --profile web add dsh-expert-group
 ```
 
-安装会把本包写入 `$DSH_HOME\profiles\web` 的依赖并加入 profile 的 bundle 层；**重启 DSH Web** 后生效（已运行的进程不会热加载新的 Host 行）。
-
-要求：DSH Web 可运行（`dsh web`）、Node.js ≥ 22、PATH 上有 `pnpm`。**本插件不内置任何角色默认模型**——安装后需先在「设置 → dsh-expert-group」为各角色选择模型并保存。
+安装后重启 `dsh web` 使插件生效。
 
 ### 桌面版（Electron 客户端）
 
-桌面版的 profile 是 `desktop`，由 Electron 应用管理；**不要用 PATH 上的 npm 全局 `dsh` 去操作它**：
-启动器里的开关 `manageDesktopProfile` **只作用于 `plugin` 子命令**，
-boot / `--dump-config` 路径是无条件拒绝的——**应用自带 CLI（rc.2）同样拒**：
+**npm 安装后位于 PATH 上的 `dsh` CLI 不能管理 `desktop` profile；必须使用 Desktop 自带 CLI。**
 
-```text
-error: profile "desktop" is managed exclusively by the Electron application
-```
-
-三条可用入口：
-
-| 入口 | 适用场景 | 说明 |
-| --- | --- | --- |
-| **应用自带 CLI** | 安装 / 升级 / 卸载的默认路径 | `0.2.0-rc.2` 起发行包带 `resources\runtime\cli\bin\dsh.cmd`（`0.2.0-rc.1` 上不存在）；只有它放行 `plugin --profile desktop` |
-| **GUI「插件 → 添加插件」** | 图形化安装 | 与版本无关；**按 spec 检查同名**——包名 / 本地目录形式的 spec 命中已安装依赖时提示「该插件已安装。如需升级，请卸载后重新安装」，**tgz spec 的实际行为本轮未验证**；也不提供版本豁免入口 |
-| **手工维护 profile 文件** | 无 CLI、无 GUI 的兜底 | 手工建 junction / 复制副本**不是默认升级方式**，会绕过 pnpm 的锁与 integrity 校验 |
+先打开 Desktop 完成初始化，再完全退出 Desktop。使用安装目录中的 `resources\runtime\cli\bin\dsh.cmd` 执行 `dsh plugin --profile desktop add dsh-expert-group`：
 
 ```powershell
-$cli = Join-Path '<DSH 安装目录>' 'resources\runtime\cli\bin\dsh.cmd'    # 应用自带 CLI
-$tgz = '<候选包 tgz 的绝对路径>'                               # 也接受包名 / 本地目录绝对路径
-
-& $cli plugin --profile desktop add $tgz
-if ($LASTEXITCODE -ne 0) { throw "add 失败（exit=$LASTEXITCODE），先查落盘状态再决定回滚" }
-
-& $cli plugin --profile desktop list
-if ($LASTEXITCODE -ne 0) { throw "list 失败（exit=$LASTEXITCODE）" }
-
-# 卸载：可直接运行仓库根的 .\desktop-uninstall.ps1（内部就是下面的 remove）；
-#       手工执行等价于把 add 换成 remove；版本豁免：version-exemptions / allow-version / revoke-version
+& '<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd' plugin --profile desktop add dsh-expert-group
 ```
 
-**生效与验收：命令执行者是主代理，最后一步重启由用户完成。** 构建 → 测试 → 打包 → 备份 → 安装
-→ 校验的完整流程（含判据与回滚）见 **[desktop-install.ps1](desktop-install.ps1)**（流程与判据在脚本头部注释与各阶段日志中）。
+安装后重新打开 Desktop 使插件生效。
 
-> 在线（桌面版运行中）安装属于受控测试：CLI 只检查 profile 是否初始化（提示 `... then fully quit it before
-> running dsh plugin --profile desktop.`），**没有进程硬拦截**，因此可能出现内存里旧模块 + 磁盘上新模块混用。
-> **磁盘安装成功 ≠ 内存生效、更 ≠ 功能验收**——真正验收要等用户重启后读证据（卸载入口见 [desktop-uninstall.ps1](desktop-uninstall.ps1)）。
-
-**验证安装登记与目标文件**（直接检查目标 profile，真实目录、Junction 和 pnpm 链接均适用）：
-
-```powershell
-$ErrorActionPreference = 'Stop'
-$home_dsh = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
-$d = Join-Path $home_dsh 'profiles\desktop'
-$pkg = Get-Content -LiteralPath (Join-Path $d 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-if (-not $pkg.dependencies.'dsh-expert-group' -or 'dsh-expert-group' -notin @($pkg.dsh.profile.bundles)) {
-  throw '目标 profile 未完整登记 DEG 依赖与 bundle'
-}
-$installedManifest = Join-Path $d 'node_modules\dsh-expert-group\package.json'
-if (-not (Test-Path -LiteralPath $installedManifest -PathType Leaf)) { throw '目标 profile 中没有 DEG 包清单' }
-$installed = Get-Content -LiteralPath $installedManifest -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($installed.name -ne 'dsh-expert-group') { throw '目标包名不符' }
-[pscustomobject]@{ Path = $installedManifest; Name = $installed.name; Version = $installed.version }
-```
-
-这只是快速检查；同版本替换还须按详细指南比对实际文件与候选 tgz 的哈希，不能只看版本号。
-
-**可选图像增强**：`sharp` 是 `optionalDependencies`（约 30 MB 原生二进制），用于把 JPEG / WebP / GIF 转码为 PNG；拉取失败或未安装都不影响插件加载，仅会拒绝非 PNG 图片的转码，其余功能全部正常。
+本插件不内置角色默认模型。安装后先在 DSH「设置 → 模型」配置模型，再到「设置 → dsh-expert-group」为各角色选择模型并保存。
 
 ## 界面总览
 

@@ -31,7 +31,7 @@ import {
   isTransientRequestFailure, recoveryDelayForCount, requestRetryPolicyCoversFailure,
   appendRecoveryRetryCount, buildRecoveryMessage, classifyTurnOutcome, lastTurnErrorMessage,
   subagentFeedbackChildId, createAdmissionBatchCoordinator, createHandoffAdmissionCohort,
-  rootStructuredPathGuard,
+  rootStructuredPathGuard, snapshotRunningRootDescendants,
   messageIdsOfTurnWithClaimed, shouldAutoRecover, turnHasNonEmptyText,
   createDelegationTracker, delegationScopeKey, delegationTaskKey,
   createRecoveryOp, clearRecoveryOpTimer, scheduleRecoveryOpTimer, findRecoveryOpByMessage, recoveryOpPendingForTurn, recoveryOpIsPending,
@@ -1384,12 +1384,44 @@ export default {
      * @param {string} rootId - exact root session id。
      * @returns {Promise<{known:boolean,running:object[],runningIds?:Set<string>,reason:string}>}
      */
+    /**
+     * runtime agents.list() 的严格 fallback。它只在权威 listDescendants seam 不可用时
+     * 使用，并沿用 shared.js 的完整血缘/状态校验；空数组只有在校验明确成功时才是
+     * known:true，缺失父链、重复 id 或未知状态仍保持 fail-closed。
+     */
+    function snapshotRootTurnDescendantsFromRuntimeAgents(rootId) {
+      let list;
+      try {
+        list = agents?.list;
+      } catch {
+        return void 0;
+      }
+      if (typeof list !== "function") return void 0;
+      const snapshot = snapshotRunningRootDescendants(() => list.call(agents), rootId);
+      return snapshot.known === true
+        ? {
+          known: true,
+          running: snapshot.runningDescendants,
+          // 复用既有 child settlement 回退：严格 runtime 快照不仅要告诉等待门控
+          // 是否阻塞，还要提供 exact child id 集，才能在缺失完成通知时结算 admission。
+          runningIds: new Set(snapshot.runningDescendants.map((agent) => agent.id)),
+          ...(snapshot.reason === void 0 ? {} : { reason: snapshot.reason }),
+        }
+        : {
+          known: false,
+          running: [],
+          reason: snapshot.reason ?? "runtime-descendant-query-unknown",
+        };
+    }
+
     async function snapshotRootTurnDescendants(rootId) {
       if (typeof rootId !== "string" || rootId.length === 0) {
         return { known: false, running: [], reason: "root-id-unknown" };
       }
       const listed = await snapshotRootTurnDescendantsFromListing(rootId);
       if (listed !== void 0) return listed;
+      const runtime = snapshotRootTurnDescendantsFromRuntimeAgents(rootId);
+      if (runtime !== void 0) return runtime;
       return snapshotRootTurnDescendantsFromActivity(rootId);
     }
 
@@ -1588,6 +1620,15 @@ export default {
       onKnownSnapshot: (agent, snapshot) => settleFinishedChildTurnWaits(agent, snapshot),
       onError: (error) => logTurnWaitError("check", error),
     });
+
+    /**
+     * 真实用户输入会打断当前 root 的等待，但不退休 root 记录，也不清除专家工作。
+     * 这样新消息能立即进入下一轮，旧 admission 仍由后续 turn 负责收口。
+     */
+    function cancelRootTurnWaitForUserInput(agent, reason = "user-message") {
+      if (!isRootAgentIdentity(agent) || !isLiveRootAgent(agent)) return false;
+      return rootTurnWaits.cancelWaiters(agent, reason);
+    }
 
     /**
      * 释放一个已收到终态 feedback 但没有成功关联到 turn/messageId 的活动范围。
@@ -2878,7 +2919,7 @@ export default {
         if (waitOutcome.released !== true) {
           // signal-aborted 只取消本次 waiter，批次与已登记工作仍可由同一凭据重试。
           // root 退休、代际替换或插件卸载等生命周期取消仍按原语义关闭批次。
-          if (waitOutcome.reason !== "signal-aborted") batch.closed = true;
+          if (waitOutcome.reason !== "signal-aborted" && waitOutcome.reason !== "user-message") batch.closed = true;
           return {
             kind: "rejected",
             ...base,
@@ -5400,6 +5441,9 @@ export default {
     // 只留一条按 child 去重的可诊断 warn；消息本身仍作为普通注入消息留在父 inbox
     // （不伪造交接，也不改变正文）。
     ctx.on("agent/inbox/inserted", ({ agent, message }) => {
+      // inbox/inserted 是 core 唤醒 root 前的同步边界；先取消旧 waiter，避免用户新消息
+      // 被仍在等待专家的旧 finalize 阻塞。只识别真实 user source，不触碰 child feedback。
+      if (message?.source?.kind === "user") cancelRootTurnWaitForUserInput(agent);
       if (message?.source?.kind === "subagent-report") {
         const relayChildId = message.source.senderSessionId;
         warnLegacyRelayFailClosed(typeof relayChildId === "string" ? relayChildId : void 0);
@@ -5450,6 +5494,12 @@ export default {
     // 终止快照的唯一提交点。microtask 避开 Session.append 发布重入，并在执行前校验
     // exact root Agent/Session/generation 身份。
     ctx.on("session/event", (session, event) => {
+      // 某些宿主只发布 session/event 而不经过 inbox/inserted；在进入 microtask 前同步
+      // 取消 root waiter，保证 user/message 与 ask_user_question 的 role=user 都能打断旧 turn。
+      const immediateAgent = typeof session?.id === "string" ? agents.get(session.id) : void 0;
+      const isUserInput = (event?.type === "user/message" && event.data?.source?.kind === "user")
+        || (event?.type === "tool/result" && event.data?.message?.role === "user");
+      if (isUserInput && immediateAgent?.session === session) cancelRootTurnWaitForUserInput(immediateAgent);
       queueMicrotask(() => {
         try {
         if (typeof session?.id !== "string") return;

@@ -75,6 +75,7 @@ function createWaitHost({
   descendantListing = "subagent",
   descendantRowTransform,
   sessionActivityTransport = true,
+  rootChildren,
   withGoals = true,
 } = {}) {
   const children = [];
@@ -84,6 +85,7 @@ function createWaitHost({
     descendantListing,
     descendantRowTransform,
     sessionActivityTransport,
+    ...(rootChildren === undefined ? {} : { rootChildren }),
     settings: {
       value: { provider: "mock", defaults: { explorer: { provider: "mock", model: "mock" } } },
     },
@@ -1421,4 +1423,59 @@ test("retire 后重新等待：建立全新记录并重新订阅监听", async (
   await flushAsyncWork(2);
   assert.equal(reengaged.status, "resolved");
   assert.equal(reengaged.value.released, true);
+});
+
+test("agents.list fallback：权威 listing 与 session activity 都不可用时仍按严格血缘收口", async () => {
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({
+    goalProbe: probe,
+    descendantListing: "missing",
+    sessionActivity: "missing",
+    sessionActivityTransport: false,
+    rootChildren: () => [root, ...children.map((entry) => entry.child)],
+  });
+  const outcome = await startAdmission(host, root, "runtime list fallback", ["docs/runtime-list.md"]);
+  const pending = track(finalize(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending", "running child 必须继续阻塞 root");
+
+  endChildTurn(host, children[0]);
+  host.setAgentStatus(children[0].child, "idle");
+  insertNotice(host, root, children[0], "fb-runtime-list-fallback");
+  await flushAsyncWork(20);
+
+  assert.equal(pending.status, "resolved");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("用户插话：同步取消旧 waiter 但保留 admission，后续 finalize 仍可收口", async () => {
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe });
+  const outcome = await startAdmission(host, root, "user interruption", ["docs/user-interruption.md"]);
+  const pending = track(finalize(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  host.emit("agent/inbox/inserted", {
+    agent: root,
+    message: { id: "user-interruption-1", source: { kind: "user" } },
+  });
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "resolved");
+  assert.equal(pending.value.kind, "rejected");
+  assert.equal(pending.value.reason, "root-wait-cancelled");
+  assert.match(pending.value.message, /user-message/);
+
+  const retry = track(finalize(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(retry.status, "pending", "用户插话不得关闭原 admission batch");
+
+  endChildTurn(host, children[0]);
+  host.setAgentStatus(children[0].child, "idle");
+  insertNotice(host, root, children[0], "fb-user-interruption");
+  await flushAsyncWork(20);
+  assert.equal(retry.status, "resolved");
+  assert.equal(retry.value.kind, "finalized");
+  assertNoGoalCalls(probe);
 });
