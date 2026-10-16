@@ -449,6 +449,8 @@
   // ACTIVE_STATUSES / RETRY_STATUSES 只服务于 fan-out 管理语义（取消/重试判定），不是展示状态词表。
   const ACTIVE_STATUSES = new Set(["queued", "waiting", "running"]);
   const RETRY_STATUSES = new Set(["failed", "timed_out", "interrupted"]);
+  // 父任务的规范终态表示全部分片已结算，且不会把未知/展示态误判为空闲。
+  const FANOUT_SETTLED_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
   const STYLE_ID = "dsh-expert-group/expert-group-sidebar";
   /**
    * Expert Group 页的右侧栏宽度：**恒为视口宽度的 20%**（1600px 视口 ⇒ 320px）。
@@ -1416,6 +1418,7 @@
       ".deg_expert_group_task:hover,.deg_expert_group_content:hover{text-decoration:underline}",
       ".deg_expert_group_content{grid-area:3 / 1;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));cursor:pointer}",
       ".deg_expert_group_chevron{width:20px;height:20px;padding:0;align-self:start}",
+      ".deg_expert_group_fanout_header>.deg_expert_group_chevron{align-self:center}",
       ".deg_expert_group_chevron_placeholder{display:inline-block;width:20px;height:20px}",
       ".deg_expert_group_status_icon{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;color:var(--dsw-alias-label-secondary)}",
       // 兜底圆点：官方 primitives.StateDot 缺失时才使用，静态、无动画。
@@ -3397,11 +3400,15 @@
       const sidebarRootChildren = () => (Array.isArray(snapshot?.root?.children) ? snapshot.root.children : []);
 
       /**
-       * 空闲分组的成员判定（ready 直接专家）——渲染与同步期共用这一份定义，
-       * 避免两处各推导一次而产生第二事实源。
+       * 空闲分组收纳 ready 直接专家和已结算的 fan-out 父任务。
+       * 父任务必须命中 manager 终态，不能仅凭子会话暂时未运行或未知状态提前移动。
        */
       const sidebarIdleChildren = () => sidebarRootChildren()
-        .filter((node) => node.kind === "expert" && runtimeStatusOfNode(node, rootSessionId, text(node.sessionId, null)) === "ready");
+        .filter((node) => {
+          if (node.kind === "fanout") return FANOUT_SETTLED_STATUSES.has(statusOf(node));
+          return node.kind === "expert"
+            && runtimeStatusOfNode(node, rootSessionId, text(node.sessionId, null)) === "ready";
+        });
 
       /**
        * 当前 root 专家树里「运行中」的资源地址集合（主代理行批量关闭的唯一候选来源）。
@@ -3414,12 +3421,26 @@
       };
 
       /**
-       * 空闲分组（ready 直接专家）的资源地址集合；成员判定严格复用当前 idleChildren，绝不重新推导。
+       * 空闲分组的资源地址集合；成员判定严格复用当前 idleChildren。
+       * fan-out 父任务代表其最新 attempt 的分片会话，只收录当前未运行的会话地址。
        */
       const idleSidebarResourceAddresses = (nodes) => {
         const addresses = new Set();
         for (const node of Array.isArray(nodes) ? nodes : []) {
           const source = object(node);
+          if (source.kind === "fanout") {
+            for (const shard of Array.isArray(source.shards) ? source.shards : []) {
+              const shardSource = object(shard);
+              const shardChildId = text(shardSource.childId, null);
+              if (shardChildId === null || runtimeStatusOfNode(shardSource, rootSessionId, shardChildId) !== "ready") continue;
+              const shardAddress = subagentChatAddress(subagentAddressOfChild(shardChildId, rootSessionId, {
+                ...shardSource,
+                kind: "expert",
+              }));
+              if (shardAddress !== null) addresses.add(shardAddress);
+            }
+            continue;
+          }
           const childId = text(source.sessionId, text(source.childId, null));
           if (childId === null) continue;
           const address = subagentChatAddress(subagentAddressOfChild(childId, rootSessionId, source));
@@ -3895,7 +3916,7 @@
       };
 
       /**
-       * 批量关闭的唯一入口（主代理行 = 当前 root 的运行中专家/最新分片；空闲分组标题行 = ready 空闲成员）。
+       * 批量关闭的唯一入口（主代理行 = 当前 root 的运行中专家/分片；空闲分组标题行 = ready 专家/已结算 fan-out 的空闲分片）。
        *
        * 与单会话箭头共用的三条并发与生命周期边界：
        * 1) 聚合锁覆盖整段 await 序列：双击/连击只允许第一次穿过，pending 期间按钮 disabled + aria-busy；
@@ -4197,7 +4218,7 @@
         const idleTitleChildren = [
           react.createElement("div", { className: "deg_expert_group_line deg_expert_group_task" }, "空闲子代理（" + members.length + "）"),
         ];
-        // 空闲分组的批量候选只来自当前 idleChildren（ready 直接专家）；active 成员保留。
+        // 空闲分组的批量候选只来自当前 idleChildren；运行中的专家或分片会被排除。
         // slot 与计数标题同属第三列的 inline flex，标题按可用宽度省略，slot 不会被推到行尾。
         if (trailing !== undefined && trailing !== null) idleTitleChildren.push(trailing);
         return react.createElement("div", { className: "deg_expert_group_idle_group", "data-expanded": open },
@@ -4205,7 +4226,7 @@
             statusIcon(react, primitives, "ready"),
             renderChevron(group, open),
             react.createElement("div", { className: "deg_expert_group_idle_title_line" }, ...idleTitleChildren)),
-          open ? react.createElement("div", { className: "deg_expert_group_children deg_expert_group_idle_children" }, members.map((node, index) => renderExpert(node, index, rootSessionId))) : null);
+          open ? react.createElement("div", { className: "deg_expert_group_children deg_expert_group_idle_children" }, members.map((node, index) => node.kind === "fanout" ? renderFanout(node, index) : renderExpert(node, index, rootSessionId))) : null);
       };
 
       const pendingSet = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };
@@ -4330,9 +4351,8 @@
       };
 
       const children = Array.isArray(snapshot?.root?.children) ? snapshot.root.children : [];
-      // 默认折叠依据展示层的 running/ready，而不是 Host 内部的旧任务 status。
-      // 这样 status=unknown 但官方目录 activity=inactive 的专家也会进入空闲分组；
-      // fan-out 仍只在自己的取消/重试逻辑中读取 statusOf(task)。
+      // 普通专家按实际运行状态分组，fan-out 父任务则按 manager 的聚合终态进入空闲组。
+      // fan-out 展示与取消/重试仍使用各自的 manager 状态，不受分组位置影响。
       const idleChildren = sidebarIdleChildren();
       const visibleChildren = children.filter((node) => !idleChildren.includes(node));
       // 两行标题后的批量 slot 内容：主代理行只覆盖运行中的普通专家/最新分片，空闲标题行只覆盖

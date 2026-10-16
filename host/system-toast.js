@@ -192,8 +192,9 @@ export function buildToastXml({ title, taskName, body } = {}) {
 /**
  * 默认提示音路径：以本模块文件位置解析包内 assets/notification-whoosh.wav。
  *
- * 用 import.meta.url 而不是 __dirname/cwd：模块被 web-install.ps1 复制到
- * profiles\packages\dsh-expert-group 后依然指向同一份随包发布的资源。
+ * 用 import.meta.url 而不是 __dirname/cwd：assets/ 随 package.json 的 files 白名单发布，
+ * 安装副本（web 的 profiles\packages\dsh-expert-group、desktop 的 profile node_modules）
+ * 无论落在哪里，都按模块路径解析到同一份随包发布的资源。
  * 返回值只用于 stdin JSON，绝不进入命令行、日志、诊断或脚本文本。
  */
 export function defaultNotificationAudioPath() {
