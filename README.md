@@ -28,33 +28,23 @@
 - 子代理的 `reasoningEffort` 通过子代理 `agent/request` waterfall 注入，绕开 `dsh-tool-subagent`
   `AgentOptions` 尚未公开该字段的限制。
 
-## 安装与平台分工
+## 安装
 
-本插件发布到 npm 公共源，按包名通过官方 `dsh plugin` CLI 安装；`--profile` 为必填参数。
-
-### CLI / `dsh web`
-
-前置条件：DSH Web 可正常运行（`dsh web`）、Node.js ≥ 22，且 PATH 上有 `pnpm`。
+本插件发布到 npm 公共源，用 DSH 官方 `dsh plugin` CLI 按包名安装（`--profile` 为必填参数，一般填 `web`）：
 
 ```powershell
 dsh plugin --profile web add dsh-expert-group
 ```
 
-安装后重启 `dsh web` 使插件生效。
+前置条件：DSH Web 可正常运行（`dsh web`）、Node.js ≥ 22，且 PATH 上有 `pnpm`。安装后重启 `dsh web` 使插件生效。
 
-### 桌面版（Electron 客户端）
-
-**npm 安装后位于 PATH 上的 `dsh` CLI 不能管理 `desktop` profile；必须使用 Desktop 自带 CLI。**
-
-先打开 Desktop 完成初始化，再完全退出 Desktop。使用安装目录中的 `resources\runtime\cli\bin\dsh.cmd` 执行 `dsh plugin --profile desktop add dsh-expert-group`：
+桌面版（Electron 客户端）的 `desktop` profile 由客户端独占管理，PATH 上的 `dsh` CLI 改不动它：先打开 Desktop 完成初始化再完全退出，用安装目录自带的 CLI 执行同一命令。
 
 ```powershell
 & '<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd' plugin --profile desktop add dsh-expert-group
 ```
 
-安装后重新打开 Desktop 使插件生效。
-
-本插件不内置角色默认模型。安装后先在 DSH「设置 → 模型」配置模型，再到「设置 → dsh-expert-group」为各角色选择模型并保存。
+安装后重新打开 Desktop 使插件生效。本插件不内置角色默认模型：先在 DSH「设置 → 模型」配置模型，再到「设置 → dsh-expert-group」为各角色选择模型并保存。
 
 ## 界面总览
 
@@ -351,44 +341,3 @@ Expert Group 是 DEG 注册在右侧栏的任务视图：它把**当前会话所
 - 首次从「只有 Expert Group」的单 pane 分栏时，打开事务会先临时把右栏写到约 50%，目标 tab 确认落到返回的 pane 后保留 50% 的可调模式；分栏失败则恢复原来的 20% 锁定宽度。
 - 日常在已有子代理 pane 里打开 / 关闭 tab 不改宽度。
 - 首次形成两个 pane 后：Expert Group 占右栏 40%（视口约 20%），子代理 pane 占右栏 60%（视口约 30%）；最后一个被跟踪的 pane 关闭后恢复约 20% 的默认宽度。
-
-**能力缺失时的降级**：宿主没有 `sidebarRight.openResource` 时箭头不渲染、其余行内容完整；缺少关闭确认能力时保留静态 `>>`；整条侧栏接缝不可用时 DEG 只注册页面，不猜测打开状态。
-
-## 只读能力矩阵与运行时诊断
-
-Host RPC 的 `meta` 动作返回两份**只读投影**（设置页诊断块与客户端归一化都消费它们）：
-
-- `capabilities`：宿主服务可达性与固定降级标记，带 schema 版本 `version`。
-  每个能力条目只允许固定字段（`required` / `status` / `degradation` / `methods` / `probe` /
-  `transport` / `failure` / `binding`），不含任何自由文本。
-  - 硬依赖（`tools` / `subagents` / `agents` / `settings` / `webServer` / `systemPrompt` / `llm`）
-    在 `inject` 中声明，缺失时插件不加载；
-  - `rootTurnWait` 是可选宿主 seam，诊断按**可证明静止的能力**分四档：
-    1. `available` / degradation `null` —— `subagents.listDescendants` 的干净完整 catalog
-       **加上**同一份可调用的 `agents.list()` runtime 快照：运行判定只认 rc.2 的
-       `Agent.status`，并据此验证 live 后代已被 catalog 完整覆盖（完整 catalog + runtime
-       交叉校验）；
-    2. `degraded` + `root-turn-wait-runtime-agent-listing-unavailable` —— 只有 listing、
-       缺 runtime 快照：catalog 只表达 session residency，等待实际 fail-closed；
-    3. `degraded` + `root-turn-wait-descendant-listing-unavailable` —— 缺完整 catalog，但
-       仍有可证明的查询路径：**strict runtime-only fallback**（`agents.list()` + 严格
-       血缘/身份/状态校验，仍能证明 idle child 已收口）或只有公开的
-       `workspace/session-activity` waterfall（只能报告 activity，**只能提供正向 running
-       证据**，不能证明 quiet）；
-    4. `unavailable` + `root-turn-wait-descendant-query-unavailable` —— 三者都不可用，
-       等待一律 fail-closed（继续等待）；
-  - `connectionRpc` / `storageDomain` / `attachments` / `sessionQuery` 各自报告
-    `available` / `degraded` / `absent` / `unknown`，缺失时只禁用对应能力。
-- `diagnostics`：children / fanout / recovery / settings / storage / handoff / notifications /
-  rpc 的**计数与固定 token**，同样带 `version`。
-
-敏感性边界：两份投影不含 prompt、原始请求体、token、Cookie、authorization、文件路径、
-会话/child 标识或错误消息正文；能力状态与降级说明都从固定枚举取值，任何超出字符面的输入
-在归一化时被丢弃。客户端遇到未知 `version` 时整体忽略该块，绝不猜测字段含义。
-
-系统通知（Windows Toast）的诊断字段与固定 token 同样在这一份 `diagnostics` 里：
-`notifications.systemToast` 报告 `status` / `version` / `platform` / `aumidResolved` /
-`aumidReason` / `inflight` / `queued` / `sent` / `failed` / `dropped` / `lastReason`；
-解释器不可用时 `status` 为 `absent` 且固定 `reason` 为 `powershell-unavailable`，
-AUMID 解析失败的固定 token 为 `shortcut-read-failed`。这些字段只报状态与计数，不含命令行、
-路径或通知正文。
