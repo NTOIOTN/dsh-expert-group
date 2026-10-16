@@ -9796,7 +9796,8 @@ window.__ModuleLoader__.load({
       ".deg_mc_effort input{width:14px;height:14px;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
       ".deg_mc_input_types{display:flex;flex-wrap:wrap;gap:10px}" +
       ".deg_mc_hint{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}" +
-      ".deg_mc_error{font-size:12px;line-height:18px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));white-space:pre-wrap}" +
+      // 删除确认弹窗内的失败文本与卡片错误共用同一条规则（同一个错误视觉，不新增样式规则）。
+      ".deg_mc_error,.deg_remove_confirm_error{font-size:12px;line-height:18px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));white-space:pre-wrap}" +
       ".deg_mc_card_footer{display:flex;align-items:center;gap:8px;padding-top:2px}" +
       ".deg_mc_card_footer .deg_mc_status{margin-right:auto}" +
       ".deg_mc_card_footer .deg_btn{flex:0 0 auto;min-width:76px}" +
@@ -12079,18 +12080,35 @@ window.__ModuleLoader__.load({
 
     function createSettingsModelCatalog(ctx) {
       let state = { groups: [], status: "idle", error: null };
+      // 目录刷新协调：同一时刻最多一个在途请求（单飞），在途期间到达的刷新事件只记账
+      // 一个尾随刷新（queued），由在途请求收尾时启动。这样一串宿主事件（新增 provider 后
+      // 立即删除会同时触发目录、文档与凭据事件）只会合并成"一个在途 + 一个最新"两次请求，
+      // 而不是每个事件各发一次、互相把对方判成过期。
       let inflight = null;
+      let queued = false;
+      // 销毁标记：cleanup 第一步就置位，之后任何入口都不得再发起远端目录调用。
+      // 只依赖 freshness.dispose() 不够：在途请求的收尾路径（.finally）按 promise 身份
+      // 判断"收尾责任"，销毁时若仍持有 inflight / queued 账本，它会把排队中的尾随刷新
+      // 真的发出去——插件已经销毁，却仍触发一次远端目录 RPC。
+      let disposed = false;
       const freshness = createClientFreshnessBoundary();
       const listeners = new Set();
       const publish = (next) => {
         state = next;
         for (const listener of listeners) listener();
       };
-      const load = () => {
-        if (inflight !== null) return inflight;
+      /**
+       * 启动一次目录请求。只有"当前没有在途请求"时才会被调用（load / refresh / 尾随刷新），
+       * 因此这里不需要再做并发判断。
+       */
+      const startRequest = () => {
+        // 销毁后绝不发起远端调用（也不改写状态）：正常路径由 cleanup 清账本拦住尾随刷新，
+        // 这里再兜一层，覆盖 connection/reset 处理器等销毁后才到达的迟到入口。
+        if (disposed) return Promise.resolve();
         const requestToken = freshness.beginRequest("catalog", "settings");
+        // 保留上一次已知目录：加载中只换状态，不清空下拉已经能用的选项。
         publish({ ...state, status: "loading", error: null });
-        inflight = Promise.resolve().then(() => ctx.remote.session.modelCatalog()).then((response) => {
+        const promise = Promise.resolve().then(() => ctx.remote.session.modelCatalog()).then((response) => {
           const catalog = response?.ok === true ? response.value : response;
           if (!catalog || !Array.isArray(catalog.groups)) throw new Error("模型目录不可用");
           const normalizedGroups = normalizeSettingsModelGroups(catalog.groups);
@@ -12099,20 +12117,58 @@ window.__ModuleLoader__.load({
             groups: normalizedGroups,
             requestToken,
           });
+          // 过期响应（期间又来了刷新事件）由 freshness 拒绝：旧目录绝不覆盖新目录，
+          // 也绝不把角色下拉提前解锁。
           if (accepted.accepted) publish({ groups: normalizedGroups, status: "ready", error: null });
         }).catch((cause) => {
           if (freshness.isCurrent(requestToken)) {
             publish({ ...state, status: "error", error: cause instanceof Error ? cause.message : String(cause) });
           }
         }).finally(() => {
-          if (freshness.isCurrent(requestToken)) inflight = null;
+          // 用 promise 身份而不是 freshness 令牌判断收尾责任：在途期间到达的刷新事件会
+          // 刻意作废本请求的令牌（见 refresh），那时令牌已不再"当前"，但释放 inflight 与
+          // 启动尾随刷新的责任仍然在本请求，否则 store 会永久停在 loading。
+          if (inflight !== promise) return;
+          inflight = null;
+          if (!queued) return;
+          queued = false;
+          startRequest();
         });
-        return inflight;
+        inflight = promise;
+        return promise;
+      };
+      /**
+       * 幂等读取：已有在途请求时复用它，不再并发第二次。
+       * 销毁后返回一个已完成的 Promise：调用方（设置页挂载 effect）不会被悬挂的等待卡住，
+       * 但 store 不会因此向远端发请求。
+       */
+      const load = () => {
+        if (disposed) return Promise.resolve();
+        if (inflight !== null) return inflight;
+        return startRequest();
       };
       const refresh = (clear) => {
-        inflight = null;
-        if (clear) publish({ groups: [], status: "idle", error: null });
-        void load();
+        // 销毁后刷新事件没有任何意义（监听已摘除）；迟到的 connection/reset 也必须被丢弃，
+        // 否则会在插件销毁后启动一次远端目录调用。
+        if (disposed) return;
+        // connection/reset 的 clear 语义：在途请求属于旧连接，它的结算与响应都不可再用，
+        // 因此放弃它（收尾里的身份检查会让它的 finally 变成空操作，startRequest 的新令牌
+        // 也会让它的迟到响应被拒绝）并立刻重新读取——绝不等待一个可能永远不会结算的旧请求。
+        if (clear) {
+          inflight = null;
+          queued = false;
+          publish({ groups: [], status: "idle", error: null });
+          startRequest();
+          return;
+        }
+        if (inflight !== null) {
+          // 单飞：在途期间的刷新事件合并为一个尾随刷新，并立刻作废在途请求的令牌：
+          // 它的响应属于旧目录，必须由 client-freshness 拒绝，不能覆盖即将到来的最新目录。
+          if (!queued) freshness.beginRequest("catalog", "settings");
+          queued = true;
+          return;
+        }
+        startRequest();
       };
       const subscribe = (listener) => {
         listeners.add(listener);
@@ -12125,6 +12181,15 @@ window.__ModuleLoader__.load({
       }
       ctx.on("connection/reset", () => refresh(true));
       ctx.effect(() => () => {
+        // 顺序是语义的一部分：
+        // ① 先置销毁标记，封锁所有入口（load / refresh / startRequest / 尾随刷新）；
+        disposed = true;
+        // ② 清掉逻辑账本：在途请求的 .finally 用 promise 身份判断收尾责任，账本清空后
+        //    它只会直接返回，不会再把 queued 的尾随刷新发出去；
+        inflight = null;
+        queued = false;
+        // ③ 最后才摘监听并 dispose freshness：在途请求的迟到响应仍会被 freshness
+        //    拒绝（dispose 后 isCurrent 恒为 false），绝不覆盖目录或把角色下拉解锁。
         for (const stop of eventStops) if (typeof stop === "function") stop();
         freshness.dispose();
       }, "dsh-expert-group: settings catalog events");
@@ -13041,7 +13106,10 @@ window.__ModuleLoader__.load({
            className: "deg_btn deg_mc_delete_btn",
            disabled: saving || card.readOnly,
            "aria-label": card.displayName + " 删除",
-           onClick: () => { void onRemove(); },
+           // 事件的 `currentTarget`（真实按钮）只在**同步派发期间**有效，因此原样交给父区域：
+           // 删除成功后要按"点击那一刻的焦点归属 + 点击时捕获的区域作用域"决定是否把焦点还回
+           // DEG 区域内的稳定控件（详见 REMOVE_FOCUS_TARGET_SELECTORS 上方的边界说明）。
+           onClick: (event) => { void onRemove(event); },
          }, "删除")
          : null;
 
@@ -13589,6 +13657,15 @@ window.__ModuleLoader__.load({
      * 一直存在的 API。
      */
     let modelDiscoveryTitleSeq = 0;
+
+    /**
+     * 删除确认弹窗的身份序号。
+     *
+     * 一次确认从"待确认"到"进行中"、失败回退、成功关闭会经历多次状态更新；每次都按这个
+     * 序号配对当前弹窗，**绝不**用一个会被自身更新换掉的旧对象引用来做身份比较——那样
+     * 失败回退与成功关闭都会静默失效（弹窗永远停在"删除中…"），并发的后来者也会被误伤。
+     */
+    let removeConfirmSeq = 0;
 
     /**
      * 弹窗焦点环的候选控件：只保留真正可聚焦（启用且可见）的对话框控件。
@@ -14260,6 +14337,271 @@ window.__ModuleLoader__.load({
            : null));
     }
 
+    // ── 删除 provider 之后的「区域内」焦点归还 ─────────────────────────────────
+    //
+    // 用户报告：在设置页删除一张 provider 卡片后，键盘焦点落回页面根，紧随其后的 DSH
+    // 主输入框光标也随之消失。修复的边界是**只把焦点还给 DEG 区域内的稳定控件**。
+    //
+    // 这些边界是修复的一部分，不是实现细节：
+    // - DEG **绝不**访问、也绝不 focus 宿主的任何控件（尤其是 DSH 主输入框）：那是宿主
+    //   自己的焦点管理，插件越界只会制造新的抢焦点问题；
+    // - 只有四个条件同时成立才尝试一次自己的恢复：
+    //   ① 点击删除按钮那一刻焦点就在这个按钮上（这次交互确实来自 DEG 卡片），且这次读取
+    //      **成功**——读面抛错只是"归属未知"，未知不得 arm；
+    //   ② 用户接受了原生 confirm；
+    //   ③ settings 里的 provider 配置删除成功（凭据阶段与写入阶段的失败都不算）；
+    //   ④ 删除成功后的目录/视图刷新**整个加载事务**已经结算：`await load()` 等到的不只是
+    //      自己那一轮，还包括在同一轮里被合并进来的所有尾随重跑。早一步恢复，随后的尾随
+    //      React 更新就会把焦点又打回根节点（这正是本波修掉的时序缺陷）。
+    //   于是"确认取消""角色联动守卫拦截""凭据删除失败""settings 写入失败"四条路径都不
+    //   恢复焦点，与既有语义完全一致；
+    // - 异步窗口（凭据 / settings / 刷新都可能长时间 pending）里在 document 捕获阶段观察
+    //   pointerdown / keydown / focusin：任何用户或宿主动作把意图移走（例如用户点回 DSH
+    //   输入框继续打字）都会把本次恢复标记为 abandoned，收尾时不再抢焦点；
+    // - 恢复目标只在**点击时捕获的作用域**内查询（`trigger.closest(".deg_mc_section")`），
+    //   绝不 document 全局查询：宿主输入框不可能被这里选中；
+    // - 作用域或目标缺失、DOM 读面失败、目标已断开、hidden/disabled/aria-disabled、没有
+    //   渲染矩形时静默跳过（并继续尝试下一个候选）：焦点问题绝不影响删除结果（删除已经
+    //   写盘，不能因为焦点读面异常而变成失败）。
+
+    /** 恢复目标优先级：「添加提供方」入口优先，回退到稳定的折叠区标题。 */
+    const REMOVE_FOCUS_TARGET_SELECTORS = Object.freeze([
+      '[data-deg-add-provider="true"]',
+      '[data-deg-model-config-toggle="true"]',
+    ]);
+
+    /** 运行期 document；没有 DOM（Node、裁剪过的宿主替身）时返回 null。 */
+    function removeFocusDocument() {
+      return typeof document === "undefined" ? null : (document ?? null);
+    }
+
+    /**
+     * 读取当前持有焦点的元素。
+     *
+     * 读面的**三个状态必须分开表达**，只有中间那一种是"成功"：
+     * - `activeElement` 明确返回 **null**：这是**已知的空焦点**（浏览器在没有焦点、或焦点
+     *   落到 body / 页面根时给出的就是 null）。`ok === true`，收尾按"焦点仍停在原处"继续；
+     * - 属性**不存在**，或 getter 返回 **undefined**：读面没有给出答案，是**未知**，
+     *   `ok === false`。这**不是**空焦点：宿主替身 / 被裁剪的宿主压根没有这个读面时，
+     *   `undefined` 只说明"读不到"；
+     * - getter **抛错**：同样是未知，`ok === false`。
+     *
+     * 后两种曾被 `documentStub.activeElement ?? null` 折叠成"成功读到 null"：同一次删除流程
+     * 里点击那一刻读到真实删除按钮、收尾时读面退化成 undefined 的非标准宿主，因此会在收尾
+     * 把**未知**当成**已知的空焦点**，把焦点抢回 DEG 区域——正是"插件越过自己边界动焦点"
+     * 那类事故。所以这里不能再做 nullish 合并，只有显式 null 才允许收尾继续。
+     * 同一次删除里点击那一刻的读取失败也必须阻止 arm，否则一条无法证明归属的流程会在收尾
+     * 时把焦点搬走。因此这里返回读结果对象，失败用 `ok === false` 显式表达，调用方各自决定跳过。
+     */
+    function readFocusedElement(documentStub) {
+      if (documentStub === null || documentStub === undefined) return { ok: false, element: null };
+      try {
+        // 用 `in` 走**原型链**探测"这个宿主到底有没有焦点读面"：真实 document 的
+        // activeElement 是 Document.prototype 上的继承访问器，任何 own-property 限定
+        // （hasOwnProperty / 只认数据属性）都会把真实 DOM 判成"没有读面"，让整条恢复路径
+        // 静默失效。Proxy / 被裁剪的宿主连 `in` 都可能抛错：那属于"读面归属未知"，
+        // 与"读面存在但没有答案"同样按失败处理（宁可不恢复，也不猜）。
+        if (!("activeElement" in documentStub)) return { ok: false, element: null };
+        const element = documentStub.activeElement;
+        // 读面给出 undefined = 没有答案（未知），绝不能当作空焦点。
+        if (element === undefined) return { ok: false, element: null };
+        return { ok: true, element };
+      } catch {
+        return { ok: false, element: null };
+      }
+    }
+
+    /**
+     * 捕获作用域：删除按钮所在的 DEG 区域。
+     *
+     * 必须在**点击时**捕获而不是收尾时再算：删除成功的刷新会给所有卡片换 key，原按钮
+     * 届时已从页面摘除，它的祖先链随之断开，事后再 closest 只会得到 null。
+     */
+    function closestRemoveFocusScope(trigger) {
+      if (trigger === null || typeof trigger.closest !== "function") return null;
+      try {
+        return trigger.closest(".deg_mc_section") ?? null;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * 布局可见性的保守判定：读得到就读，读不到就不猜。
+     *
+     * 这里**不能**再用 `hasOwnProperty("offsetParent")`：真实浏览器里 offsetParent 定义在
+     * `HTMLElement.prototype` 上，own property 探测恒为 false——这条判定在真实 DOM 上从未
+     * 生效过；而换成 `offsetParent !== null` 又会把 fixed 定位元素（offsetParent 本来就是
+     * null）误杀。两个真实可用的读面都按"有读面才判定"处理：
+     * - `checkVisibility({ visibilityProperty: true })`：一次覆盖 display:none、visibility 与
+     *   content-visibility。options 必须显式给出：`checkVisibility()` 的默认语义**只**看元素
+     *   是否渲染，被 CSS `visibility: hidden` 藏起来的控件仍然参与排版、仍然会被判为可见，
+     *   恢复焦点就会交给一个用户看不见的控件。宿主实现若不认识 options 而抛错，异常会被
+     *   下面的 catch 吞掉并退到 getClientRects，不会连累删除结果；
+     * - `getClientRects()`：零渲染矩形（未排版 / display:none）说明元素没有盒子，
+     *   而 fixed 定位元素同样有渲染矩形，因此合法目标不会被误杀。
+     * 无布局引擎的替身/宿主两个读面都读不到时保持"不做无根据的判定"，避免整体误杀恢复能力。
+     */
+    function isLaidOutRemoveFocusTarget(element) {
+      if (typeof element.checkVisibility === "function") {
+        try {
+          // 必须带 options：默认调用不看 CSS visibility 属性（见上方边界说明）。
+          if (element.checkVisibility({ visibilityProperty: true }) === false) return false;
+        } catch { /* 读面抛错：交给下一个读面，不做无根据的判定。 */ }
+      }
+      if (typeof element.getClientRects === "function") {
+        try {
+          const rects = element.getClientRects();
+          // DOMRectList 与数组都有 length；读面给出非列表值时同样不做无根据的判定。
+          if (rects !== null && rects !== undefined && typeof rects.length === "number" && rects.length === 0) return false;
+        } catch { /* 同上。 */ }
+      }
+      return true;
+    }
+
+    /**
+     * 目标可用性的保守判定：断开、隐藏、disabled、aria-disabled 或没有渲染矩形一律不可用。
+     */
+    function isUsableRemoveFocusTarget(element) {
+      if (element === null || typeof element !== "object") return false;
+      // focus() 缺失（裁剪过的元素替身）时不尝试：恢复焦点绝不允许抛错。
+      if (typeof element.focus !== "function") return false;
+      // isConnected 在真实 DOM 上恒为布尔；读面缺失时按"不可用"处理，宁可不恢复也不猜。
+      if (element.isConnected !== true) return false;
+      if (element.hidden === true) return false;
+      if (element.disabled === true) return false;
+      const ariaDisabled = typeof element.getAttribute === "function"
+        ? element.getAttribute("aria-disabled")
+        : element["aria-disabled"];
+      if (ariaDisabled === "true" || ariaDisabled === true) return false;
+      if (!isLaidOutRemoveFocusTarget(element)) return false;
+      return true;
+    }
+
+    /** 在作用域内按优先级挑一个恢复目标；一个都不可用时返回 null。 */
+    function pickRemoveFocusTarget(scope) {
+      if (scope === null || typeof scope.querySelector !== "function") return null;
+      for (const selector of REMOVE_FOCUS_TARGET_SELECTORS) {
+        let candidate = null;
+        try {
+          candidate = scope.querySelector(selector);
+        } catch {
+          candidate = null;
+        }
+        if (isUsableRemoveFocusTarget(candidate)) return candidate;
+      }
+      return null;
+    }
+
+    /**
+     * 一次删除期间的"焦点意图"观察器。
+     *
+     * document 捕获阶段的 pointerdown / keydown / focusin 任一命中即把本次恢复标记为
+     * abandoned（用户或宿主已经把意图移到别处）。`dispose()` 幂等：调用方必须在提前返回、
+     * 异常与成功路径上都调用它，ModelConfigSection 卸载时还会再兜一次——删除流程里有多个
+     * await，远端 Promise 可能长时间不结算，全局监听绝不能留在页面上。
+     */
+    function observeRemoveFocusIntent(documentStub) {
+      const events = ["pointerdown", "keydown", "focusin"];
+      const registered = [];
+      let abandoned = false;
+      let disposed = false;
+      const markAbandoned = () => { abandoned = true; };
+      if (documentStub !== null && typeof documentStub.addEventListener === "function") {
+        for (const type of events) {
+          try {
+            // capture=true：即使宿主在冒泡阶段 stopPropagation，也必须看到这次操作。
+            documentStub.addEventListener(type, markAbandoned, true);
+            registered.push(type);
+          } catch { /* 登记失败：少观察一类事件，不影响删除语义。 */ }
+        }
+      }
+      return {
+        isAbandoned: () => abandoned,
+        dispose() {
+          if (disposed) return;
+          disposed = true;
+          if (documentStub === null || typeof documentStub.removeEventListener !== "function") return;
+          for (const type of registered) {
+            try {
+              documentStub.removeEventListener(type, markAbandoned, true);
+            } catch { /* 摘监听失败：监听随页面销毁一起消失，不影响删除结果。 */ }
+          }
+          registered.length = 0;
+        },
+      };
+    }
+
+    /**
+     * 在途焦点意图观察器的账本（每个删除流程各拥有自己那一条）。
+     *
+     * 为什么必须由组件持有而不是各流程自己记：删除流程里有多个 await，远端 Promise 可能
+     * 长时间不结算，捕获监听绝不能留在页面上，所以卸载时必须有一个统一的兜底口。
+     *
+     * 三条不变量：
+     * ① 集合在**首个渲染期**（useRef 初始化）就建立，绝不等到 passive effect 才赋值——
+     *    真实 React 的 passive effect 在提交之后异步执行，删除流程完全可能在它之前就登记，
+     *    那样的登记会落进 null 而永远无人清理（等价于把捕获监听永久留在 document 上）；
+     * ② 重叠的删除各自只移除自己那一条（`delete` 按对象身份，与顺序无关），单槽位账本
+     *    会在双击删除时漏掉先发起的那条；
+     * ③ 卸载即 `close()`：关闭后到达的登记**当场自我清理**，绝不允许再出现无人认领的监听。
+     *    因此 `delete`/`close` 与 `dispose` 一样必须幂等。
+     */
+    function createRemoveFocusObservationLedger() {
+      const observations = new Set();
+      let closed = false;
+      return {
+        add(observation) {
+          if (observation === null || observation === undefined) return;
+          if (closed) {
+            // 账本已随卸载关闭：这条登记没有任何人去摘它，只能当场清理。
+            observation.dispose();
+            return;
+          }
+          observations.add(observation);
+        },
+        /** 某次流程自己认领的观察器收尾：与卸载兜底摘的是同一条，dispose 幂等。 */
+        delete(observation) {
+          observations.delete(observation);
+        },
+        close() {
+          if (closed) return;
+          closed = true;
+          for (const observation of observations) observation.dispose();
+          observations.clear();
+        },
+      };
+    }
+
+    /**
+     * 成功路径的收尾：先摘观察器，再按优先级还一次焦点。
+     *
+     * 前置条件缺一不可——作用域仍在页面上、意图没被移走、焦点仍停在原处（原按钮 / body /
+     * 空）。任何读面缺失或 focus() 抛错都只让这次恢复静默跳过：删除已经写盘，焦点问题
+     * 绝不允许改变删除结果。
+     */
+    function restoreRemoveFocus({ documentStub, trigger, scope, observation }) {
+      // 整段包在 try 里：焦点读面/写面（activeElement、getAttribute、focus）在任何宿主
+      // 实现上都可能抛错，而删除已经写盘——焦点问题绝不允许改变删除结果。
+      try {
+        if (documentStub === null || trigger === null || scope === null) return;
+        if (observation?.isAbandoned?.() === true) return;
+        // 区域必须仍挂在页面上：整块设置页被卸载或替换时不再恢复任何焦点。
+        if (scope.isConnected !== true) return;
+        // 收尾这一次读取失败 = 当前焦点归属**未知**：安全跳过，绝不猜测。
+        const focusRead = readFocusedElement(documentStub);
+        if (focusRead.ok !== true) return;
+        const active = focusRead.element;
+        const body = documentStub.body ?? null;
+        // 只有焦点仍"停在原处"（原按钮 / body / 已知的空焦点）才恢复：用户已经点/切到
+        // 别处（例如 DSH 输入框）时绝不抢回来。
+        if (active !== null && active !== trigger && active !== body) return;
+        const target = pickRemoveFocusTarget(scope);
+        if (target === null) return;
+        target.focus();
+      } catch { /* 焦点不可用时保持删除结果不变。 */ }
+    }
+
     /**
      * 折叠的「模型配置」区域。
      *
@@ -14274,6 +14616,15 @@ window.__ModuleLoader__.load({
       const [adding, setAdding] = react.useState(false);
       const [addChoice, setAddChoice] = react.useState("");
       const [settingsError, setSettingsError] = react.useState(null);
+      /**
+       * 删除确认状态（DEG 自渲染的非阻塞弹窗，见 openRemoveConfirm / removeConfirmDialog）。
+       *
+       * 为什么不是原生 confirm：同步 `globalThis.confirm()` 会阻塞浏览器事件循环，弹窗存续
+       * 期间页面脚本、遮罩与宿主（DSH 会话输入框）的输入处理全部停摆，用户看到的就是
+       * "设置页与 DSH 会话输入框随后都不可用，重启才恢复"。DEG 因此自己渲染确认层，
+       * 任何阶段都不再调用同步原生 confirm。
+       */
+      const [removeIntent, setRemoveIntent] = react.useState(null);
       // 宿主替身/host 对象自身不触发渲染，因此每次重新读取宿主视图时手动推进一个版本号，
       // 让 provider 卡片拿到最新的 user 层与 revision（而不是首次渲染时的那一份）。
       const [viewRevision, setViewRevision] = react.useState(0);
@@ -14389,7 +14740,13 @@ window.__ModuleLoader__.load({
       //
       // 并发用一个"尾随重跑"标记收口：正在加载时到来的请求不会并发跑两次，但一定会在
       // 当前这轮结束后再跑一轮，因此调用方（例如取消半完成创建的卡片）拿到的始终是新视图。
-      const loadStateRef = react.useRef({ running: false, again: false });
+      //
+      // 事务语义（删除后的焦点归还依赖它）：`running` 期间到达的每一次调用都返回**同一个**
+      // 覆盖「当前轮 + 所有 again 尾随重跑」的 Promise。删除流程 `await load()` 因此会一直
+      // 等到最后一轮结算，焦点恢复不会落在尾随轮次的 React 更新之前（那会把焦点又打回根节点）。
+      // 少返回一次这个 Promise（例如直接 `return Promise.resolve()`）就等于把"刷新完成"提前
+      // 宣布，这正是本波要修掉的时序缺陷。
+      const loadStateRef = react.useRef({ running: false, again: false, promise: null });
       const runLoad = react.useCallback(async () => {
         setDirectory((previous) => ({ ...previous, status: "loading", error: null }));
         setSettingsError(null);
@@ -14409,21 +14766,36 @@ window.__ModuleLoader__.load({
         }
       }, [config, host]);
 
-      const load = react.useCallback(async () => {
+      const load = react.useCallback(() => {
         const state = loadStateRef.current;
         if (state.running) {
+          // 加入同一个事务：只置尾随标记（多个并发调用合并成**一个**尾随轮次），并把当前
+          // 事务的 Promise 原样交回调用方——它覆盖到最后一次尾随重跑为止。
           state.again = true;
-          return;
+          return state.promise;
         }
         state.running = true;
-        try {
-          do {
+        const transaction = (async () => {
+          try {
+            do {
+              state.again = false;
+              await runLoad();
+            } while (state.again);
+          } finally {
+            // 任何出口（正常结束、runLoad 抛错）都必须同时清掉两个账本字段：
+            // running 卡住会让后续调用永远只置一遍 again，promise 不清空则会让新调用拿到
+            // 一个已经结算（甚至已经拒绝）的旧 Promise——两者都会变成静默的永久挂起。
+            // 从"循环条件不成立"到这里的整段是同步的，因此不存在"刚好在收尾期间置 again
+            // 却被丢弃"的窗口：那个窗口之外的新调用一定会开启一个新事务。
+            state.running = false;
             state.again = false;
-            await runLoad();
-          } while (state.again);
-        } finally {
-          state.running = false;
-        }
+            state.promise = null;
+          }
+        })();
+        // 赋值发生在事务体的第一个 await 之前（事务体只能在 await 之后进入 finally），
+        // 因此 running 为真时 promise 一定已就绪。
+        state.promise = transaction;
+        return transaction;
       }, [runLoad]);
 
       react.useEffect(() => {
@@ -14431,36 +14803,173 @@ window.__ModuleLoader__.load({
         void load();
       }, [open, load, hostInvalidation]);
 
+      // 删除后的焦点归还：在途观察器由账本统一记账（见 createRemoveFocusObservationLedger）。
+      //
+      // 账本在**渲染期**建立（useRef 初始化 + 惰性赋值），不放在 passive effect 里：真实
+      // React 的 passive effect 在提交之后才异步执行，删除流程可能在那之前就登记，那条登记
+      // 会落进 null 而永远无人清理。卸载时统一 close()——删除流程里有多个 await，远端
+      // Promise 可能长时间不结算，捕获监听绝不能留在页面上（常规路径仍由
+      // confirmRemoveProvider 的 finally 自己收尾，这里是额外的一层兜底）。
+      const removeFocusObservations = react.useRef(null);
+      if (removeFocusObservations.current === null) {
+        removeFocusObservations.current = createRemoveFocusObservationLedger();
+      }
+      // 确认弹窗的根节点：Tab 焦点环只在这个子树里取控件（绝不用 document 全局查询）。
+      const removeDialogRef = react.useRef(null);
+      react.useEffect(() => () => {
+        removeFocusObservations.current?.close();
+      }, []);
+
+      react.useEffect(() => {
+        // 区域折叠（body 不再渲染）时清掉**待确认**状态：快照里挂着的是此刻已经不在页面上的
+        // 删除按钮，重新展开时不得把它当成仍然有效的待确认操作弹出来。
+        // 两个边界：
+        // - 只在**折叠**方向清理，展开方向什么都不做（否则"折叠期间结算成失败"的状态会在
+        //   重新展开的那一刻被自己抹掉）；
+        // - **running 绝不清**：异步删除（凭据 / 写入 / 刷新）仍在继续，清掉它只会让进行中、
+        //   失败与重试的可见入口永久消失——用户可以折叠，但这次删除的结果必须找得回来。
+        if (open) return;
+        setRemoveIntent((previous) => (previous !== null && previous.phase === "confirming" ? null : previous));
+      }, [open]);
+
       const editableRows = directory.rows.filter((row) => config.providerEditable(row, host.namespaceView(row.settingsNs)));
       const configured = providerSections.configured.map((entry) => entry.row);
       const addable = providerSections.addable.map((entry) => entry.row);
-      const removeProvider = async (row) => {
-        const namespace = host.namespaceView(row.settingsNs);
+      /**
+       * 点击卡片「删除」：**只**捕获这次交互的上下文并打开 DEG 自渲染的确认弹窗。
+       *
+       * 这一阶段绝不能有任何远端副作用：确认前的凭据删除、settings 写入与目录刷新都必须为 0。
+       * 也绝不能再调用同步原生 `confirm()`：它阻塞浏览器事件循环，弹窗存续期间页面脚本、
+       * 遮罩与宿主（DSH 会话输入框）的输入处理全部停摆——这正是"删除后设置页与会话输入框
+       * 都不可用、重启才恢复"的事故面。
+       *
+       * trigger / scope / ownsFocus 必须在**点击那一刻**捕获：删除成功的刷新会给卡片换 key，
+       * 原按钮届时已从页面摘除，事后再算只能得到 null。
+       */
+      const openRemoveConfirm = (row, event) => {
         const label = typeof row.displayName === "string" && row.displayName.length > 0 ? row.displayName : row.provider;
-        if (typeof globalThis.confirm === "function" && !globalThis.confirm(`确定删除 provider「${label}」及其配置吗？`)) return;
-        const affected = config.rolesAffectedByChange(roleDefaults, { provider: row.provider, removeProvider: true });
-        if (affected.length > 0) {
-          setSettingsError(config.reasoningGuardMessage(["（整个 provider）"], affected, roleLabelOf));
-          return;
-        }
-        const credentialRef = config.credentialRefOf(row, namespace);
-        if (host.operations.credentialState(credentialRef)?.configured === true) {
-          const removed = await host.operations.removeKey(credentialRef);
-          if (removed !== null) {
-            setSettingsError(removed);
+        // `currentTarget` 只在同步派发期间有效：在这里读一次并存进确认状态。
+        const trigger = event?.currentTarget ?? null;
+        const documentStub = removeFocusDocument();
+        // ① 只有"点击删除按钮那一刻焦点确实在这个按钮上"才登记恢复意图：否则这次交互的
+        //    焦点不属于 DEG 卡片（宿主替身没有真实 DOM 焦点），绝不猜测、绝不抢焦点。
+        //    读面失败（ok=false）时焦点归属**未知**，同样不得 arm：一条无法证明归属的流程
+        //    在收尾时把焦点搬走，恰恰是"插件越过自己边界动焦点"的那类事故。
+        const triggerFocusRead = readFocusedElement(documentStub);
+        const ownsFocus = trigger !== null
+          && triggerFocusRead.ok === true
+          && triggerFocusRead.element === trigger;
+        // 作用域必须在点击时捕获（见 closestRemoveFocusScope 的说明）。
+        const scope = ownsFocus ? closestRemoveFocusScope(trigger) : null;
+        removeConfirmSeq += 1;
+        setRemoveIntent({ token: removeConfirmSeq, row, label, trigger, scope, ownsFocus, phase: "confirming", error: null });
+      };
+
+      /**
+       * 取消确认：只关弹窗，并把焦点还给**仍可用**的已捕获删除按钮，或同一 DEG 区域内的
+       * 安全回退目标。
+       *
+       * 取消路径不得读取当前 `document.activeElement` 去另找一个恢复目标：那是"把全局焦点
+       * 当恢复目标"的错误做法，正好会把焦点交给宿主输入框。按钮与作用域都来自打开弹窗那一刻
+       * 的快照，因此这条路径在结构上不可能触及 DEG 之外的控件。
+       */
+      const cancelRemoveConfirm = () => {
+        const intent = removeIntent;
+        // 进行中一律拒绝取消：此刻凭据与 settings 可能已经写盘，"取消"在语义上已经不存在，
+        // 关掉弹窗只会把进行中 / 失败 / 重试的可见入口一起卸载，而异步删除仍在继续。
+        // 遮罩、Escape 与「取消」按钮三条入口共用这一个守卫，任何一条都不得绕过它。
+        if (intent !== null && intent.phase === "running") return;
+        setRemoveIntent(null);
+        if (intent === null || intent.ownsFocus !== true) return;
+        try {
+          // 删除按钮仍在页面上且可用 → 优先还给它（按 Escape / 取消后的直觉位置）。
+          if (isUsableRemoveFocusTarget(intent.trigger)) {
+            intent.trigger.focus();
             return;
           }
+          // 按钮已不可用（断开 / 隐藏 / 禁用）→ 只在点击时捕获的 DEG 区域内找安全回退目标。
+          if (intent.scope !== null && intent.scope.isConnected === true) {
+            const target = pickRemoveFocusTarget(intent.scope);
+            if (target !== null) target.focus();
+          }
+        } catch { /* 焦点不可用不影响"取消"语义：弹窗已经关掉。 */ }
+      };
+
+      /**
+       * 用户点击弹窗「删除」：**从这里**才开始真正的删除链路。
+       *
+       * 顺序与错误语义与既有实现完全一致：角色联动守卫 → 凭据删除 → settings unset →
+       * 完整 load 事务（含并发合并进来的尾随轮次）→ 区域内焦点恢复策略。唯一变化是它由 DEG
+       * 自己的弹窗按钮触发，因此不再有同步原生 confirm 阻塞事件循环。
+       *
+       * 失败（守卫拦截 / 凭据失败 / 写入失败 / 异常）保留弹窗：错误同时留在弹窗内（role=alert）
+       * 与区域级错误里，用户可以直接取消或重试；失败路径不做任何焦点恢复，也绝不把删除
+       * 结果伪装成成功。删除进行中（phase === "running"）按钮禁用，防止重复提交。
+       */
+      const confirmRemoveProvider = async () => {
+        const intent = removeIntent;
+        if (intent === null || intent.phase !== "confirming") return;
+        const { row, trigger, scope, ownsFocus } = intent;
+        // 立刻转 running：此刻凭据与 settings 可能已经写盘，关掉弹窗只会掩盖真实结果，
+        // 因此按钮禁用、取消/Escape 不再受理（见 removeConfirmDialog 的键位处理）。
+        // 所有后续更新都按 token 配对：同一次确认换了对象也认得自己，后来者则不受影响。
+        setRemoveIntent((previous) => (previous !== null && previous.token === intent.token
+          ? { ...previous, phase: "running", error: null }
+          : previous));
+        const documentStub = removeFocusDocument();
+        // ② 确认之后、任何 await 之前登记观察器：异步窗口里用户/宿主的任何操作都可能把
+        //    意图移走，收尾时据 abandoned 决定是否还焦点。
+        const observation = ownsFocus && scope !== null ? observeRemoveFocusIntent(documentStub) : null;
+        if (observation !== null) removeFocusObservations.current?.add(observation);
+        // 失败出口：区域级错误保持既有语义，同时在弹窗内可见（身份比较，绝不动后来者）。
+        const fail = (message) => {
+          setSettingsError(message);
+          setRemoveIntent((previous) => (previous !== null && previous.token === intent.token
+            ? { ...previous, phase: "confirming", error: message }
+            : previous));
+        };
+        try {
+          const affected = config.rolesAffectedByChange(roleDefaults, { provider: row.provider, removeProvider: true });
+          if (affected.length > 0) {
+            fail(config.reasoningGuardMessage(["（整个 provider）"], affected, roleLabelOf));
+            return;
+          }
+          const namespace = host.namespaceView(row.settingsNs);
+          const credentialRef = config.credentialRefOf(row, namespace);
+          if (host.operations.credentialState(credentialRef)?.configured === true) {
+            const removed = await host.operations.removeKey(credentialRef);
+            if (removed !== null) {
+              fail(removed);
+              return;
+            }
+          }
+          const written = await host.writeNamespace({
+            ns: row.settingsNs,
+            ops: [{ op: "unset", path: [...row.settingsPath] }],
+            expectedRevision: namespace?.revision,
+          });
+          if (!written.ok) {
+            fail(written.message);
+            return;
+          }
+          // ③ + ④ 写入成功，且**整个加载事务**（当前轮 + 所有尾随重跑）已经结算：先摘观察器
+          //    （自己的 focus 不该被自己记成"意图移走"），再按优先级把焦点还回区域内
+          //    （目标不可用时静默跳过）。`await load()` 拿到的是共享事务的 Promise，
+          //    不是"立刻结算的空壳"——见 loadStateRef 上方的时序说明。
+          await load();
+          observation?.dispose();
+          // 成功：先关掉自己这一轮弹窗（按 token 配对：并发的后来者不受影响），再恢复焦点。
+          setRemoveIntent((previous) => (previous !== null && previous.token === intent.token ? null : previous));
+          restoreRemoveFocus({ documentStub, trigger, scope, observation });
+        } catch (cause) {
+          // 任何读面/写面抛错都必须可见，而不是静默变成一次"看起来成功"的删除。
+          fail(cause instanceof Error ? cause.message : String(cause));
+        } finally {
+          // 所有出口（守卫拦截、凭据失败、写入失败、异常、成功）都在这里摘掉观察器；
+          // 摘监听本身幂等，卸载兜底再摘一次也不会重复移除。
+          observation?.dispose();
+          removeFocusObservations.current?.delete(observation);
         }
-        const written = await host.writeNamespace({
-          ns: row.settingsNs,
-          ops: [{ op: "unset", path: [...row.settingsPath] }],
-          expectedRevision: namespace?.revision,
-        });
-        if (!written.ok) {
-          setSettingsError(written.message);
-          return;
-        }
-        await load();
       };
 
       const body = section.open ? react.createElement("div", { className: "deg_mc_body", id: section.disclosure.bodyId },
@@ -14480,7 +14989,9 @@ window.__ModuleLoader__.load({
             host,
             roleLabels: { defaults: roleDefaults, labelOf: roleLabelOf },
             onSaved: () => { void load(); },
-            onRemove: () => removeProvider(row),
+            // 事件原样透传：openRemoveConfirm 只读取同步有效的 `currentTarget`（删除按钮本身），
+            // 打开 DEG 自己的确认弹窗——确认之前不删凭据、不写 settings、不刷目录。
+            onRemove: (event) => openRemoveConfirm(row, event),
           }))),
         react.createElement("div", { className: "deg_mc_add" },
           adding
@@ -14570,9 +15081,90 @@ window.__ModuleLoader__.load({
         }, directory.status === "loading" ? "读取中…" : "重新读取 provider 目录"))
         : null;
 
+      /**
+       * 删除确认弹窗：复用提示词弹窗的 `deg_prompt_dialog_backdrop` / `deg_prompt_dialog`
+       * 样式与 `data-deg-dialog-action` / focusableDialogControls 的键位模式，但**非阻塞**：
+       * 渲染在 React 树里，事件循环照常运转。
+       *
+       * 边界（每条都是修复的一部分）：
+       * - 只显示 provider 名称与「确认 / 取消」两个操作；
+       * - 打开后焦点落在「取消」（破坏性动作绝不能是默认焦点）；
+       * - 取消、Escape、点击遮罩**本身**三条路径都只关弹窗：不删凭据、不写 settings、不刷目录；
+       * - Tab / Shift+Tab 只在弹窗内**真正可聚焦**的控件之间循环，不漏到背景页面；
+       * - 删除进行中（phase === "running"）按钮禁用、Escape 与 Tab 都不再受理：此刻写盘可能
+       *   已经发生，关掉弹窗只会掩盖真实结果；
+       * - 失败时弹窗保留，错误在弹窗内以 role=alert 可见，用户可以取消或重试。
+       */
+      const removeConfirmDialog = removeIntent === null ? null : react.createElement("div", {
+        className: "deg_prompt_dialog_backdrop",
+        // 点遮罩本身只取消（弹窗内部的点击在下面 stopPropagation，不会误触发）；
+        // 删除进行中由 cancelRemoveConfirm 自己的守卫拒绝——这里绝不另写一套 phase 判断，
+        // 三条关闭入口（遮罩 / Escape / 取消按钮）必须共用同一个守卫。
+        onClick: () => cancelRemoveConfirm(),
+      },
+        react.createElement("div", {
+          className: "deg_prompt_dialog",
+          role: "dialog",
+          "aria-modal": "true",
+          "aria-label": "删除 provider 确认",
+          ref: removeDialogRef,
+          onClick: (event) => event?.stopPropagation?.(),
+          onKeyDown: (event) => {
+            // 删除进行中：不再受理取消与焦点环，避免用户以为"取消掉了"而实际已经写盘。
+            if (removeIntent.phase === "running") return;
+            if (event?.key === "Escape") {
+              // 独占模态语义：阻止默认行为并停止冒泡，避免外层再处理同一个 Escape。
+              event.preventDefault?.();
+              event.stopPropagation?.();
+              cancelRemoveConfirm();
+              return;
+            }
+            if (event?.key !== "Tab") return;
+            // 与候选弹窗同一套焦点环：只取真正可聚焦（启用且可见）的控件，disabled 的
+            // 「删除 / 取消」不能被 preventDefault 之后 focus 一个被忽略的元素而卡死焦点。
+            const controls = focusableDialogControls(removeDialogRef.current ?? event?.currentTarget ?? null);
+            // 没有任何可聚焦控件时不拦截 Tab：宁可让浏览器默认行为走，也不把焦点锁死。
+            if (controls.length === 0) return;
+            const current = controls.indexOf(typeof document === "undefined" ? null : document.activeElement);
+            const nextIndex = event.shiftKey
+              ? (current <= 0 ? controls.length - 1 : current - 1)
+              : (current >= controls.length - 1 ? 0 : current + 1);
+            event.preventDefault?.();
+            try { controls[nextIndex]?.focus?.(); } catch { /* 无 DOM 焦点时保持可点击按钮。 */ }
+          },
+        },
+          react.createElement("h3", null, "删除 provider"),
+          react.createElement("p", null, "确定删除 provider「" + removeIntent.label + "」及其配置吗？"),
+          removeIntent.error === null ? null : react.createElement("p", {
+            className: "deg_remove_confirm_error",
+            role: "alert",
+            "aria-live": "assertive",
+          }, removeIntent.error),
+          react.createElement("div", { className: "deg_prompt_dialog_actions" },
+            react.createElement("button", {
+              type: "button",
+              className: "deg_btn",
+              "data-deg-dialog-action": "cancel",
+              "data-deg-remove-cancel": "true",
+              // 打开弹窗后焦点落在「取消」：破坏性动作不抢默认焦点。
+              autoFocus: true,
+              disabled: removeIntent.phase === "running",
+              onClick: () => cancelRemoveConfirm(),
+            }, "取消"),
+            react.createElement("button", {
+              type: "button",
+              className: "deg_btn deg_btn_primary",
+              "data-deg-dialog-action": "confirm",
+              "data-deg-remove-confirm": "true",
+              disabled: removeIntent.phase === "running",
+              onClick: () => { void confirmRemoveProvider(); },
+            }, removeIntent.phase === "running" ? "删除中…" : "删除"))));
+
       return react.createElement("div", { className: "deg_mc_section" },
         react.createElement(ModelConfigDisclosure, { section, onToggle: () => setOpen((value) => !value) }),
-        body);
+        body,
+        // 折叠时删除按钮已不在页面上，弹窗一并不渲染（确认状态由 open 的 effect 清掉）。
+        open ? removeConfirmDialog : null);
     }
 
     /**
@@ -14805,13 +15397,27 @@ window.__ModuleLoader__.load({
 
       const groups = Array.isArray(directoryState.groups) ? directoryState.groups : [];
       const providerGroups = groups.filter((group) => group && typeof group.id === "string");
+      /**
+       * 目录可用性：`status === "ready"`，或**已有成功目录缓存**（groups 非空）。
+       *
+       * 角色的选择与保存只依赖目录**内容**，不依赖"此刻有没有在途刷新"：
+       * - `startRequest` 每次只把 status 推到 loading、**刻意保留**上一次已知目录（见
+       *   createSettingsModelCatalog 的注释），最新一次请求失败也只把 status 推到 error；
+       *   这两种状态下下拉里的选项仍然完整可用，若按 status 硬门控就会出现"用户看得见选项
+       *   却选不了、更保存不了"的死锁——"新增 provider 后立即删除"的刷新突发正是这个时序；
+       * - 首次挂载还没有过任何成功目录（groups 为空）时仍然禁用：没有目录就没有合法选项；
+       * - `connection/reset` 的 clear 语义会**立刻清空** groups（refresh(true)），清空期间
+       *   同样必须禁用，直到新连接上的目录返回。缓存可用的判定因此只看"有没有目录"，
+       *   绝不能用"曾经 ready 过"这类会跨 reset 残留的记忆。
+       */
+      const catalogAvailable = directoryState.status === "ready" || groups.length > 0;
       // 统一选择器只反映当前展示角色的共同 provider；混合状态使用空值映射到“无”。
       const unifiedProvider = unifiedProviderOf(draft.defaults, roles, draft.provider);
 
       const save = async ({ retry = false } = {}) => {
         const promptOnlySave = selectedPromptRole !== null && promptTouchedRoles.length > 0;
         if (!hasUnsavedChanges || saving || settingsSnapshot.writable !== true
-          || (!promptOnlySave && directoryState.status !== "ready")) return false;
+          || (!promptOnlySave && !catalogAvailable)) return false;
         const source = normalizeSettingsDraft(settingsSnapshot.value, roles);
         // 编辑器只修改提示词时必须以当前完整 snapshot 为候选基底：首次 CAS 会因旧 revision
         // 冲突而失败；明确重试时才以最新 snapshot + 用户实际提示词字段提交，绝不重放旧模型/通知。
@@ -14820,10 +15426,12 @@ window.__ModuleLoader__.load({
         const draftProviderIntent = promptOnlySave ? sourceProvider : (typeof draft.provider === "string" ? draft.provider : "");
         const draftProvider = unifiedProviderOf(normalizedDraft.defaults, roles, draftProviderIntent);
         const defaultsChanged = !settingsDraftEqual(normalizedDraft.defaults, source.defaults);
-        const catalogReady = directoryState.status === "ready";
         // provider 的模型变化由 defaults 差异或用户明确改变统一选择器决定；通知字段单独保存时
         // draftProviderIntent 与 sourceProvider 相同，因此不会把旧顶层 provider 强行写回行级配置。
-        const modelChanged = !promptOnlySave && catalogReady && (defaultsChanged || draftProviderIntent !== sourceProvider);
+        // 目录门控与下拉同源（catalogAvailable）：缓存在手时用户从缓存里选出的 provider+model
+        // 是合法候选，必须能随这次保存一起提交，否则就成了"能选不能存"；反之没有任何目录时
+        // 这里仍然不写，绝不凭空写入一个无法校验的 provider。
+        const modelChanged = !promptOnlySave && catalogAvailable && (defaultsChanged || draftProviderIntent !== sourceProvider);
 
         // 提示词是完整 settings 候选中的一个全局映射。只有被编辑过的角色才会从草稿
         // 覆盖 source；恢复默认通过删除对应键表达，避免把默认文本固化成冗余覆盖。
@@ -15247,6 +15855,12 @@ window.__ModuleLoader__.load({
         react.createElement("span", { className: "deg_settings_table_head" }, "供应商"),
         react.createElement("span", { className: "deg_settings_table_head" }, "模型选择"),
         react.createElement("span", { className: "deg_settings_table_head" }, "思考深度"));
+      // 行级三个下拉的**目录门控**统一走 catalogAvailable（ready 或已有缓存目录）：
+      // 刷新中的 loading、以及最新一次刷新失败后的 error，都只代表"内容可能不是最新"，
+      // 只要缓存目录还在，里面的 provider/model/思考深度就仍然是用户可选的合法值；
+      // 而首次挂载（还没有任何成功目录）与 connection/reset 清空目录之后 groups 为空，
+      // catalogAvailable 为 false，三个下拉和保存按钮一并禁用。
+      // 业务禁用条件（saving / roleEnabled / 没有 provider、model、reasoning）保持不变。
       const rows = PROMPT_ROLE_IDS.map((role) => {
         const roleEnabled = roles.includes(role);
         const selection = draft.defaults[role] ?? null;
@@ -15350,7 +15964,7 @@ window.__ModuleLoader__.load({
               className: "deg_settings_provider_select",
               "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + " 供应商",
               value: rowProvider,
-              disabled: saving || directoryState.status !== "ready" || !roleEnabled,
+              disabled: saving || !catalogAvailable || !roleEnabled,
               onChange: updateProvider,
             }, providerOptions)),
           react.createElement("div", { className: "deg_settings_table_cell" },
@@ -15358,7 +15972,7 @@ window.__ModuleLoader__.load({
               className: "deg_settings_model_select",
               "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + " 模型选择",
               value: selection?.model ?? "",
-              disabled: saving || directoryState.status !== "ready" || !roleEnabled || !rowProvider || rowProviderGroup === undefined,
+              disabled: saving || !catalogAvailable || !roleEnabled || !rowProvider || rowProviderGroup === undefined,
               onChange: updateModel,
             }, modelOptions)),
           react.createElement("div", { className: "deg_settings_table_cell" },
@@ -15366,7 +15980,7 @@ window.__ModuleLoader__.load({
               className: "deg_settings_effort_select",
               "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + " 思考深度",
               value: selection?.reasoningEffort ?? "",
-              disabled: saving || directoryState.status !== "ready" || !roleEnabled || reasoning === undefined || !selection?.model,
+              disabled: saving || !catalogAvailable || !roleEnabled || reasoning === undefined || !selection?.model,
               onChange: updateReasoning,
             }, effortOptions)));
       });
@@ -15420,7 +16034,7 @@ window.__ModuleLoader__.load({
             react.createElement("select", {
               id: "deg-settings-provider",
               value: unifiedProvider,
-              disabled: saving || directoryState.status !== "ready",
+              disabled: saving || !catalogAvailable,
               onChange: (event) => editDraft((previous) => {
                 const provider = event.target.value;
                 if (!provider) {
@@ -15484,7 +16098,7 @@ window.__ModuleLoader__.load({
         react.createElement("div", { className: "deg_settings_footer" },
           react.createElement("span", { className: "deg_settings_status", role: "status" }, saved ? "已保存" : hasUnsavedChanges ? "有未保存的修改" : ""),
           react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving, onClick: discard }, "放弃修改"),
-          react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving || directoryState.status !== "ready" || settingsSnapshot.writable !== true, onClick: save }, saving ? "保存中…" : "保存")));
+          react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving || !catalogAvailable || settingsSnapshot.writable !== true, onClick: save }, saving ? "保存中…" : "保存")));
     }
     /**
      * 浏览器 FileReader 的等价字节编码：File.arrayBuffer() 取得原始字节，btoa()
