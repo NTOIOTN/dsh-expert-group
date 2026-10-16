@@ -31,7 +31,7 @@ import {
   isTransientRequestFailure, recoveryDelayForCount, requestRetryPolicyCoversFailure,
   appendRecoveryRetryCount, buildRecoveryMessage, classifyTurnOutcome, lastTurnErrorMessage,
   subagentFeedbackChildId, createAdmissionBatchCoordinator, createHandoffAdmissionCohort,
-  rootStructuredPathGuard, snapshotRunningRootDescendants,
+  rootStructuredPathGuard, snapshotRunningRootDescendants, collectRuntimeRootDescendants,
   messageIdsOfTurnWithClaimed, shouldAutoRecover, turnHasNonEmptyText,
   createDelegationTracker, delegationScopeKey, delegationTaskKey,
   createRecoveryOp, clearRecoveryOpTimer, scheduleRecoveryOpTimer, findRecoveryOpByMessage, recoveryOpPendingForTurn, recoveryOpIsPending,
@@ -1055,6 +1055,23 @@ export default {
     // pending admission 由 host/handoff 持有；下列调用为兼容投影。
     // Host admission 复用共享 helper 的 token/turn-group 状态；数组只作为本地 owner 索引。
     const handoffAdmissionCohort = createHandoffAdmissionCohort();
+    /**
+     * C：session/event 的**插件内部单调接收序号**。
+     *
+     * 宿主可以在同一个同步批次里连续发布多条 session/event（先 child turn/end、后
+     * agent/inbox/spliced，或相反）。插件对这两类事件的处理都在 queueMicrotask 之后，
+     * 因此「处理时刻看到的状态」不能代表「接收顺序」：notice 先发布、turn/end 随后发布时，
+     * notice 的处理微任务可能已经看到 turnEnded=true，从而错误消费未来的终态证据。
+     *
+     * 唯一可靠的顺序权威是**同步回调第一次进入时的序号**：它随宿主发布顺序单调递增，
+     * 与 event.seq 无关（不同 Session 的 seq 不可比较，seq 仍只作为 delivery 去重身份）。
+     * 序号只是进程内小整数，不持久化、不进入任何快照或日志。
+     */
+    let sessionEventReceiptSeq = 0;
+    function nextSessionEventReceipt() {
+      sessionEventReceiptSeq += 1;
+      return sessionEventReceiptSeq;
+    }
     // resume/CAS 失败只禁止对应 exact root 的自动恢复，不能影响同 id 的新 root。
     const failedHandoffChildren = createHandoffFailureRegistry();
     // WeakSet 不持有 root；迟到 microtask 仍可按 exact 对象识别已销毁代际。
@@ -1385,6 +1402,12 @@ export default {
      * @returns {Promise<{known:boolean,running:object[],runningIds?:Set<string>,reason:string}>}
      */
     /**
+     * rc.2 的 Agent.status 只有 `idle` / `running`：只有 `idle` 表示「当前未运行」。
+     * `ready` 等历史/非法状态一律走 shared.js 的「状态非法」分支 → `known:false`。
+     */
+    const TURN_WAIT_RUNTIME_STATUS_OPTIONS = Object.freeze({ idleStatuses: ["idle"] });
+
+    /**
      * runtime agents.list() 的严格 fallback。它只在权威 listDescendants seam 不可用时
      * 使用，并沿用 shared.js 的完整血缘/状态校验；空数组只有在校验明确成功时才是
      * known:true，缺失父链、重复 id 或未知状态仍保持 fail-closed。
@@ -1397,7 +1420,7 @@ export default {
         return void 0;
       }
       if (typeof list !== "function") return void 0;
-      const snapshot = snapshotRunningRootDescendants(() => list.call(agents), rootId);
+      const snapshot = snapshotRunningRootDescendants(() => list.call(agents), rootId, TURN_WAIT_RUNTIME_STATUS_OPTIONS);
       return snapshot.known === true
         ? {
           known: true,
@@ -1470,6 +1493,40 @@ export default {
      * @returns {Promise<object|undefined>} 明确回答；seam 不可用时返回 undefined
      *   让调用方回退到 waterfall。
      */
+    /**
+     * 读取 runtime 侧的后代索引（rc.2 严格状态：只有 idle 表示「当前未运行」）。
+     *
+     * - `agents.list()` 可用：返回同一份 exact runtime 快照里被 shared.js 严格校验过的
+     *   后代索引（id → { parentSession, status, node }），逐行 status 判定与 live 后代
+     *   覆盖校验都用它；
+     * - 该 seam 缺失：`available:false`。此时**无法**用逐行 `agents.get()` 之类的方式补出
+     *   等价事实（既拿不到同一份快照，也无法验证 runtime live descendants 是否被 catalog
+     *   完整覆盖），调用方必须 fail-closed。真实 rc.2 宿主始终提供 `agents.list()`。
+     *
+     * @returns {{available:boolean, known?:boolean, reason?:string, descendants?:Map<string,object>}}
+     */
+    function readTurnWaitRuntimeDescendants(rootId) {
+      let list;
+      try {
+        list = agents?.list;
+      } catch {
+        return { available: false };
+      }
+      if (typeof list !== "function") return { available: false };
+      let snapshot;
+      try {
+        snapshot = list.call(agents);
+      } catch (error) {
+        // 列表查询失败：未知，绝不当作「没有 running 后代」。
+        logTurnWaitError("runtime-descendant-query", error);
+        return { available: true, known: false, reason: "runtime-descendant-query-unknown" };
+      }
+      const collected = collectRuntimeRootDescendants(snapshot, rootId, TURN_WAIT_RUNTIME_STATUS_OPTIONS);
+      return collected.known === true
+        ? { available: true, known: true, descendants: collected.descendants }
+        : { available: true, known: false, reason: collected.reason ?? "runtime-descendant-identity-unknown" };
+    }
+
     async function snapshotRootTurnDescendantsFromListing(rootId) {
       let listing;
       try {
@@ -1490,8 +1547,8 @@ export default {
       if (!Array.isArray(rows)) {
         return { known: false, running: [], reason: "descendant-listing-malformed" };
       }
-      const running = [];
-      const runningIds = new Set();
+      // ① 行级公开契约校验 + catalog 树自洽性（重复 id、parentId/depth 链）。
+      const catalog = new Map();
       for (const row of rows) {
         if (row === null || typeof row !== "object" || Array.isArray(row)) {
           return { known: false, running: [], reason: "descendant-listing-malformed" };
@@ -1505,13 +1562,84 @@ export default {
           return { known: false, running: [], reason: "descendant-listing-malformed" };
         }
         // child 行的公开契约校验（含 mode 枚举）：任一必填字段不成立 ⟹ 整次 listing
-        // 都不可信，绝不能拿其中某行的 activity:"inactive" 当静止证据。
+        // 都不可信，绝不能拿其中某行的 activity 当静止/运行证据。
         if (!isContractChildRow(row)) {
           return { known: false, running: [], reason: "descendant-listing-malformed" };
         }
+        // 同一 child id 出现两次：无法区分代际，整次 listing 不可信。
+        if (catalog.has(row.id)) {
+          return { known: false, running: [], reason: "descendant-listing-duplicate-id" };
+        }
+        catalog.set(row.id, row);
+      }
+      for (const row of catalog.values()) {
+        if (row.parentId === rootId) {
+          if (row.depth !== 1) {
+            return { known: false, running: [], reason: "descendant-listing-lineage-conflict" };
+          }
+          continue;
+        }
+        const parent = catalog.get(row.parentId);
+        // 父级不在本次 listing 里（catalog 不完整）或 depth 与父级不衔接：血缘冲突 → 未知。
+        if (parent === void 0 || parent.depth + 1 !== row.depth) {
+          return { known: false, running: [], reason: "descendant-listing-lineage-conflict" };
+        }
+      }
+      // ② 运行判定交叉校验：同一份 exact runtime 快照（rc.2 严格状态）。
+      // runtime 必须提供**完整**的 agents.list() 快照：listing 只证明 residency，运行判定与
+      // 「live 后代是否被 catalog 完整覆盖」都只能用同一份 exact runtime 快照验证。缺该 seam
+      // 时不存在安全的兼容回退（逐行 agents.get() 拿不到同一份快照、也做不了覆盖校验）⇒ 未知。
+      const runtime = readTurnWaitRuntimeDescendants(rootId);
+      if (runtime.available !== true || runtime.known !== true) {
+        return {
+          known: false,
+          running: [],
+          reason: runtime.available === true
+            ? (runtime.reason ?? "runtime-descendant-identity-unknown")
+            : "runtime-agent-listing-unavailable",
+        };
+      }
+      const running = [];
+      const runningIds = new Set();
+      for (const row of catalog.values()) {
+        const live = runtime.descendants.get(row.id);
         if (row.activity === "running") {
-          running.push({ id: row.id });
-          runningIds.add(row.id);
+          // 声称驻留：运行判定只认同一份 runtime 快照里的 rc.2 `Agent.status`。
+          if (live === void 0) {
+            return { known: false, running: [], reason: "descendant-listing-runtime-agent-missing" };
+          }
+          // catalog 血缘必须与 runtime 的直接父会话一致（任一侧缺失同样按冲突处理）。
+          if (live.parentSession !== row.parentId) {
+            return { known: false, running: [], reason: "descendant-listing-lineage-conflict" };
+          }
+          if (live.status === "running") {
+            running.push({ id: row.id });
+            runningIds.add(row.id);
+            continue;
+          }
+          if (live.status === "idle") continue;
+          // 缺失 / `ready` / 非字符串等非法状态：既不能当成空闲，也不能当成运行 ⇒ 未知。
+          return { known: false, running: [], reason: "descendant-listing-runtime-status-invalid" };
+        }
+        // 自报非驻留（activity:"inactive"）：上游语义是 `sessions.get(id) === undefined`，
+        // 即「没有 live Session」——这种 durable 历史行是**合法**的，按「当前未运行」接受。
+        // 但只要 runtime 里存在任何 exact live Agent（idle 或 running），residency 就自相矛盾
+        // ⇒ 未知（绝不提前放行）。
+        if (live !== void 0) {
+          return { known: false, running: [], reason: "descendant-listing-activity-conflict" };
+        }
+      }
+      // ③ runtime 里仍 live 的后代必须被 catalog 完整覆盖、必须自报驻留，且血缘一致。
+      for (const [id, live] of runtime.descendants) {
+        const row = catalog.get(id);
+        if (row === void 0) {
+          return { known: false, running: [], reason: "descendant-listing-missing-live-descendant" };
+        }
+        if (row.activity !== "running") {
+          return { known: false, running: [], reason: "descendant-listing-activity-conflict" };
+        }
+        if (row.parentId !== live.parentSession) {
+          return { known: false, running: [], reason: "descendant-listing-lineage-conflict" };
         }
       }
       return {
@@ -1801,7 +1929,7 @@ export default {
         && item.childId === childId,
       );
     }
-    function admissionForTurn(record, session, event) {
+    function admissionForTurn(record, session, event, receipt = void 0) {
       const turn = event?.data?.turn;
       if (!Number.isSafeInteger(turn) || record?.session !== session) return void 0;
       const events = Array.isArray(session.events) ? session.events : [];
@@ -1845,6 +1973,7 @@ export default {
         entry.turnEnded = true;
         entry.turn = turn;
         entry.activation = record.agent;
+        recordTurnEndEvidence(entry, { session, activation: record.agent, turn, event, receipt });
       }
       // feedback 可能在 turn/end microtask 之前到达；先记录 exact activation，
       // 再在本 turn 的全部 entry 标记 turnEnded 后一次性标记所有已结束 groups。
@@ -1979,9 +2108,13 @@ export default {
      *   完全跳过消费与排队）；unproven 表示没有稳定 message.id 或账本已饱和，调用方只能
      *   使用保守路径。
      */
-    function claimFeedbackIdentity(record, feedbackMessageId) {
+    function claimFeedbackIdentity(record, feedbackMessageId, deliveryId) {
       const wasSaturated = record.feedbackIdentityLedger?.saturated === true;
-      const identity = feedbackIdentityLedger(record).claim(feedbackMessageId);
+      // session.id + event.seq 只是本次宿主 delivery 的去重身份，不能冒充 admission id。
+      const identityKey = feedbackMessageId !== void 0
+        ? feedbackMessageId
+        : (typeof deliveryId === "string" && deliveryId.length > 0 ? deliveryId : void 0);
+      const identity = feedbackIdentityLedger(record).claim(identityKey);
       if (record.feedbackIdentityLedger.saturated === true && wasSaturated !== true) {
         ctx.logger.warn("dsh-expert-group: feedback identity ledger saturated for child " + record.childId
           + "; further unproven settlements take the conservative queue path");
@@ -2004,6 +2137,149 @@ export default {
         if (item.activation !== void 0 && item.activation !== activation) continue;
         if (item.failed === true || item.feedbackSeen === true) continue;
         if (typeof item.token === "string" && item.token.length > 0) tokens.add(item.token);
+      }
+      return tokens;
+    }
+
+    /**
+     * C：source-less Host 完成通知的**同步接收边界快照**。
+     *
+     * 为什么需要它：通知与 child turn/end 都可能走 session/event 并被延迟到 microtask，
+     * 消费时刻重建的快照可能包含「在本通知之后才到达的终态证据」。因此快照必须在
+     * **同步入口**（第一次进入 session/event 回调时）固化：
+     * - agent/session：接收时的 exact root Agent 与 Session 对象；
+     * - childId/activation/record：接收时该 child 的 exact 恢复记录与 Activation；
+     * - tokens：接收时刻仍未被消费的 admission token 快照（覆盖上界）；
+     * - receipt：本条 session/event 的单调接收序号；
+     * - deliveryId：session.id + event.seq 组成的纯 delivery 身份（只用于去重）。
+     *
+     * 后续异步消费只能**收紧**：token 只能取该快照的子集、activation/session/record 必须
+     * 不变、且对应 turn/end 的接收序号必须严格小于本通知的序号。
+     */
+    function captureSourceLessNoticeReceipt(agent, session, message, deliveryId, receipt) {
+      if (message === null || typeof message !== "object" || message.source !== void 0) return void 0;
+      if (typeof deliveryId !== "string" || deliveryId.length === 0) return void 0;
+      if (!Number.isSafeInteger(receipt) || !isLiveRootAgent(agent) || agent.session !== session) return void 0;
+      const childId = subagentFeedbackChildId(message, { allowSourceLess: true });
+      if (childId === void 0) return void 0;
+      const record = recoveryRecords.get(childId);
+      if (record?.parentAgent !== agent || !isCurrentRecoveryFeedbackIdentity(agent, record, childId)) return void 0;
+      return {
+        agent,
+        session,
+        childId,
+        record,
+        activation: record.agent,
+        tokens: arrivalHandoffTokens(agent, childId, record.agent),
+        receipt,
+        deliveryId,
+      };
+    }
+
+    /**
+     * 事件级接收边界快照：只对「当前 live root 的 next-step spliced 注入」建立，返回与
+     * `inserted` 数组同下标对齐的 receipt 列表（不匹配的项为 undefined）。
+     */
+    function captureSourceLessNoticeReceipts(agent, session, event, receipt) {
+      if (event?.type !== "agent/inbox/spliced" || event.data?.target !== "next-step") return void 0;
+      if (!Array.isArray(event.data?.inserted)) return void 0;
+      if (!isLiveRootAgent(agent) || agent.session !== session) return void 0;
+      const deliveryId = Number.isSafeInteger(event.seq)
+        ? "session-event:" + session.id + ":" + String(event.seq) : void 0;
+      if (deliveryId === void 0) return void 0;
+      const receipts = [];
+      for (const inserted of event.data.inserted) {
+        const message = inserted?.message !== undefined ? inserted.message : inserted;
+        receipts.push(captureSourceLessNoticeReceipt(agent, session, message, deliveryId, receipt));
+      }
+      return receipts.some((item) => item !== void 0) ? receipts : void 0;
+    }
+
+    /** C：同步快照在消费时刻是否仍然成立（只允许收紧：activation/session/record 必须不变）。 */
+    function sourceLessNoticeReceiptIsCurrent(agent, childId, record, receipt, deliveryId) {
+      if (receipt === null || typeof receipt !== "object") return false;
+      if (receipt.agent !== agent || receipt.session !== agent.session) return false;
+      if (receipt.childId !== childId || receipt.record !== record) return false;
+      // 快照必须属于**当前这条 delivery**：同一 child 上的其他通知不能借用它的到达位置。
+      if (receipt.deliveryId !== deliveryId) return false;
+      // activation 换代（replacement / cold resume）后旧快照表达的是旧代际事实，必须整体失效。
+      if (receipt.activation !== record.agent) return false;
+      if (!Number.isSafeInteger(receipt.receipt) || !(receipt.tokens instanceof Set)) return false;
+      return true;
+    }
+
+    /**
+     * C：记录 entry 当前终态证据的**首次接收顺序**与 exact 身份。
+     *
+     * 为什么同一终态只保留首次 receipt：宿主可能在同一同步批次里重投递同一条 turn/end
+     * （重放/重入，携带的是同一个 event 对象）。若每次都覆盖 receipt，重投递会把 receipt
+     * 推到合法通知之后，使这条**身份已被 claim** 的合法通知被错误拒绝，且没有新事件能救回
+     * → finalize 永久等待（Oracle P2）。
+     *
+     * 身份判定 = 同一 exact Session 对象 + 同一 exact child Activation + 同一 turn + 同一
+     * 终态证据（同一 event 对象，或在既有 event.seq 契约下同一 seq）。任一维度不同都表示
+     * **新终态**（不同 turn / 不同 terminal event / 换代），必须重置到新 receipt——绝不跨
+     * turn 取全局最早序号，也绝不复用旧终态给未来通知错配。
+     *
+     * 附属身份只占 entry 上的**一个槽位**，随 entry 同生命周期；迁移/replacement 时清除，
+     * 不建立任何历史列表。
+     *
+     * @returns {number|undefined} 该 entry 当前生效的接收序号。
+     */
+    function recordTurnEndEvidence(entry, { session, activation, turn, event, receipt }) {
+      const previous = entry.turnEndEvidence;
+      const sameEvidence = previous !== void 0
+        && previous.session === session
+        && previous.activation === activation
+        && previous.turn === turn
+        && (previous.event === event
+          || (Number.isSafeInteger(previous.seq) && Number.isSafeInteger(event?.seq)
+            && previous.seq === event.seq));
+      // 同一终态的重投递：保留首次 receipt，不推进、不重置。
+      if (sameEvidence) return previous.receipt;
+      if (!Number.isSafeInteger(receipt)) {
+        delete entry.turnEndEvidence;
+        return void 0;
+      }
+      entry.turnEndEvidence = {
+        session,
+        activation,
+        turn,
+        event,
+        seq: Number.isSafeInteger(event?.seq) ? event.seq : void 0,
+        receipt,
+      };
+      return receipt;
+    }
+
+    /**
+     * C：source-less notice 允许消费的 token 集合 =
+     * 同步接收快照 ∩ 「exact turn/end 的接收顺序严格更早」。
+     *
+     * 任一条件不成立都不消费、不排队（fail-closed，等真正的结算）：
+     * - 通知之后才登记的 token 不在快照里；
+     * - 通知之后才发布的 turn/end（同一同步批次里的「notice 先、turn/end 后」）序号更大，
+     *   因而属于**未来证据**，本条通知无权消费；
+     * - 终态证据的 receipt 是「该 exact 终态（同一 Session/activation/turn/evidence）**首次**
+     *   被接收」的序号（见 recordTurnEndEvidence）：同一终态的重投递不会把它推迟，不同
+     *   turn/terminal 或换代后的新终态则各自重置——因此这里比较的永远是**当前终态**的首次
+     *   到达位置，既不会漏掉合法通知，也不会让未来终态借用旧序号。
+     */
+    function sourceLessNoticeEligibleTokens(agent, childId, record, receipt) {
+      const tokens = new Set();
+      for (const token of receipt.tokens) {
+        const item = host.handoff.find((entry) => entry.parent === agent
+          && entry.childId === childId
+          && entry.token === token);
+        if (item === void 0 || item.failed === true || item.feedbackSeen === true) continue;
+        if (item.activation !== void 0 && item.activation !== record.agent) continue;
+        // 终态证据必须属于当前 exact Session/activation，且其接收顺序严格早于本通知。
+        // 不同 turn/terminal 或换代后的新终态各有自己的 receipt，绝不复用最早值。
+        const evidence = item.turnEndEvidence;
+        if (evidence === void 0 || evidence.session !== record.session
+          || evidence.activation !== record.agent) continue;
+        if (!Number.isSafeInteger(evidence.receipt) || evidence.receipt >= receipt.receipt) continue;
+        tokens.add(token);
       }
       return tokens;
     }
@@ -2107,15 +2383,26 @@ export default {
       return marker;
     }
 
-    function markPendingHandoffFeedback(agent, childId, message) {
+    function markPendingHandoffFeedback(agent, childId, message, deliveryId, sourceLessHostNotice = false, receipt = void 0) {
       if (!isLiveRootAgent(agent) || typeof childId !== "string" || childId.length === 0) return void 0;
       const record = recoveryRecords.get(childId);
       if (!isCurrentRecoveryFeedbackIdentity(agent, record, childId)) return void 0;
       const feedbackMessageId = typeof message?.id === "string" && message.id.length > 0 ? message.id : void 0;
-      const identity = claimFeedbackIdentity(record, feedbackMessageId);
+      const identity = claimFeedbackIdentity(record, feedbackMessageId, deliveryId);
       // 同 id 副本：不消费、不排队。调用方（inbox/inserted microtask）随后仍会走一次
       // 「已就绪 admission 的精确结算」检查，但副本不会让任何 token 就绪，因此是安全空操作。
       if (identity.duplicate) return void 0;
+      // B（Oracle 复现）：source-less Host notice 与 unproven 身份的组合必须 fail-closed。
+      // unproven = 账本已饱和（或没有稳定身份），此时协议层无法区分「旧副本」与「下一轮真实
+      // 结算」。下面的通用无身份分支会按「到达时仍有未结束 admission」把通知排队成 wildcard
+      // marker，让这条无法证明属于本轮的通知在**未来** turn/end 消费 future entry，从而凭空
+      // 结算 work 并提前放行 root。因此在认领身份之后、任何 admission/marker 操作之前直接
+      // 拒绝：不消费、不排队、不写账本（结构化通知仍各自按既有语义处理）。
+      if (sourceLessHostNotice && identity.unproven) return void 0;
+      // C：source-less notice 必须携带**同步接收边界**快照（exact activation/session/record
+      // 与接收序号）。快照缺失或已失效时同样 fail-closed：绝不能退化成「消费时刻重建快照」
+      // 的通配消费，那会把晚到的终态证据算进本条通知的覆盖范围。
+      if (sourceLessHostNotice && !sourceLessNoticeReceiptIsCurrent(agent, childId, record, receipt, deliveryId)) return void 0;
       const admissionId = feedbackAdmissionId(message);
       const candidates = host.handoff.filter((item) =>
         item.parent === agent
@@ -2131,7 +2418,8 @@ export default {
       // 这也覆盖 A2 的「首次消费并清理后再次到达」形态：那时没有未消费 admission，
       // 迟到的无身份副本不会重新进入 wildcard union 路径。
       if (entry === void 0) return void 0;
-      // 到达快照：本时刻仍未消费的 token（wildcard 覆盖上界，A2）。
+      // 到达快照限制 wildcard 的覆盖上界；shared cohort 仅匹配已结束 turn，
+      // 且 activation snapshot 不会把晚到通知之后新增的 token 纳入消费范围。
       const arrivalTokens = arrivalHandoffTokens(agent, childId, record.agent);
       // 无 id 保守策略（item 1）：账本绑定 exact activation，换代即重置。
       const ledger = settlementDeliveryLedger(record, record.agent);
@@ -2171,6 +2459,10 @@ export default {
       // settlement 由 createUserMessage 铸 UUID，因此线上路径始终有稳定身份。
       if (identity.unproven) {
         if (ledger.idlessConsumed === true) return entry;
+        // 走到这里的只剩普通无 id delivery（inbox/inserted 或没有稳定身份的结算）。
+        // source-less Host notice 的 unproven 组合已在上面直接拒绝（它无法证明属于本轮，
+        // 不能进入任何 future 队列）。普通 no-id delivery 保持旧的保守规则：必须先观察到
+        // 未结束 admission，再延迟到该 turn/end 边界消费。
         if (!hasUnendedHandoffAdmission(agent, childId, record.agent)) return entry;
         // 记账点选在「进入投递管线」而不是「真正消费」：即使该 marker 最终没有消费任何
         // token（例如 turn 从未结束），后续无 id delivery 仍无法证明自己是新结算，
@@ -2188,8 +2480,18 @@ export default {
       // 已结束 group 可精确消费（restrict = 到达快照，只覆盖到达时已存在的 token）；
       // 尚未建立 group 时先排队，等 turn/end 绑定全部 messageId 后再标记整组，
       // 不能把多个不同 turn 粗暴合并。
-      const sharedGroup = handoffAdmissionCohort.markFeedback(agent, childId, void 0, record.agent, arrivalTokens);
+      // C：source-less notice 的候选上界还必须叠加「exact turn/end 的接收顺序更早」这一
+      // 条件（同步快照 ∩ 接收顺序）。其他 delivery 保持原样：到达时刻重建的 token 快照。
+      const wildcardTokens = sourceLessHostNotice
+        ? sourceLessNoticeEligibleTokens(agent, childId, record, receipt)
+        : arrivalTokens;
+      const sharedGroup = handoffAdmissionCohort.markFeedback(agent, childId, void 0, record.agent, wildcardTokens);
       if (sharedGroup !== void 0) {
+        // A（Oracle 复现）：这里**不再镜像**标记 entry.feedbackSeen。handoff entry 与 cohort
+        // entry 是同一个对象，sharedGroup 已经把「真正 ended 且命中 restrict 的项」标记完毕；
+        // 如果再按 candidates 首项标记一次，就会把一个尚未结束的 future entry 提前标成
+        // 「已收到反馈」，使它在本轮 turn/end 之后无需任何通知就被准确结算（提前放行）。
+        //
         // 本次消费已经把该 activation 当前全部「到达快照内已结束」的候选标记完毕。
         // 同 activation 的 wildcard marker 再被后续 turn/end 消费只会用**重建的快照**
         // 覆盖当时新登记的 token（提前 release 的直接成因），因此按身份精确摘除：
@@ -2202,6 +2504,9 @@ export default {
           && (feedbackMessageId === void 0 || item.messageId === void 0 || item.messageId === feedbackMessageId));
         return entry;
       }
+      // source-less Host notice 到达早于匹配 turn/end 时不能排队为未来通配证据；
+      // 它只能消费 arrival snapshot 中已经结束的当前 activation cohort。
+      if (sourceLessHostNotice) return entry;
       // 不绑定某一个 turn：marker 记录到达快照，turn/end 消费时以此为候选上界，
       // 因此 T1/T2 等多个已结束 turn 各自按自己的结算消费，future token 不受影响。
       queuePendingHandoffFeedback(record, {
@@ -2718,6 +3023,9 @@ export default {
           entry.feedbackSeen = false;
           entry.feedbackExact = false;
           entry.releaseQueued = false;
+          // C：replacement 迁移后旧代际的终态身份与接收顺序不再成立；新 child 的首个终态
+          // 必须重新登记（receipt 与其附属 exact 身份同生命周期，随迁移一起清除）。
+          delete entry.turnEndEvidence;
           // replacement child 开启新的 turn 归属判断；不能沿用旧 activation 已记录的
           // terminal/recoverable 结果，否则新 child 的首次终态会被提前返回跳过。
           entry.terminalActivityOutcome = void 0;
@@ -2810,22 +3118,30 @@ export default {
     }
 
     /**
-     * root-only 显式收口：登记调用方明确列出的、已经返回结果的 admission，然后等待
-     * 这些工作真正结束。
+     * root-only 显式收口：登记调用方明确列出的、已经返回结果的 admission，然后**立即**
+     * 返回非终态 waiting 回执（两阶段语义）。
      *
-     * 用户确认的 A 方案语义：
      * 1. 校验阶段与旧实现完全一致（token 集完整性、outcome 已 settle、
-     *    continue_parent_turn / safeParallelWork 等拒绝条件）；
-     * 2. 把每个 accepted admission 登记进**唯一的** root turn 等待登记表；
-     * 3. 等待该 root 精确关联的工作全部结束——**不设任何超时**（子代理可能运行数小时）。
-     *    释放条件见 host/turn-wait.js：无未结算工作 + root-scoped 查询明确无 running
-     *    后代；unknown / 查询失败一律继续等待；
-     * 4. 等待成立后正常返回，工具 execute 的 Promise 收口，root turn 随之结束。
+     *    continue_parent_turn / safeParallelWork 等拒绝条件、root generation）；
+     * 2. 把每个 accepted admission **一次性**登记进唯一的 root turn 等待登记表，并把批次
+     *    标为 pending-close（保存 exact admission 凭据）；
+     * 3. **立即**返回 `{kind:"waiting", admissionEpoch, acceptedCount, reason:"experts-running"}`。
+     *    工具调用绝不在 run_code 内等待专家结束，也绝不使用 `exec.signal` 等待——PTC 的
+     *    600000ms 墙钟因此不再能截断收口；
+     * 4. 继续等待由 root turn 的 `agent/turn-stopping` serial 边界承担（见
+     *    awaitRootTurnWaitFallback）：它用**本次 root turn 的 signal** 等待同一张账本，
+     *    释放条件仍是 host/turn-wait.js 的 fail-closed 静止判定（无未结算工作 + root-scoped
+     *    查询明确无 running 后代；unknown / 查询失败一律继续等待，**不设任何超时**）；
+     * 5. 等待明确释放后，插件以同步 `Agent.steer` 向同一 run 的下一 step 投递**一次**
+     *    DEG 来源的终态结论，然后一次性关闭批次。
      *
-     * 与旧实现的两个关键差异：
-     * - **不再调用 exec.concludeTurn()**：turn 由宿主在工具返回后自然关闭，插件不再
-     *   主动结束它；保持 turn 打开本身就是"阻止 goal round 推进"的手段；
-     * - **不再暂停/恢复任何 goal**：不再有 paused/concluded 之类的回执字段。
+     * 与旧实现的关键差异：
+     * - **不再在工具调用内等待**：waiting 是非终态回执，终态结论通过后续模型 step 交付；
+     * - **不再调用 exec.concludeTurn()**：turn 由宿主在工具返回后自然关闭；
+     * - **不再暂停/恢复任何 goal**：不再有 paused/concluded 之类的回执字段；
+     * - 相同批次的重复合法 finalize 返回**稳定** waiting（不重复登记、不关闭、不投递）；
+     *   回执里的 acceptedCount 报告该批次当前的完整 accepted 集（含 pending-close 期间
+     *   新接受的 admission）。
      */
     async function finalizeRootAdmissionBatch(parent, exec, args, rootToken) {
       const epoch = args?.admissionEpoch;
@@ -2905,46 +3221,263 @@ export default {
         batch.closed = true;
         return { kind: "noop", ...base, reason: "no-accepted-admission" };
       }
-      // 两阶段收口：① 登记等待工作（同步、无副作用）；② 等待静止（**不设超时**）。
-      // 登记必须在任何 await 之前完成，否则「登记前到达的 child 完成通知」会找不到
-      // 工作项而变成空操作。
+      // 同一批次的重复**合法** finalize（同样的 epoch 与完整 token 集）必须得到稳定的
+      // waiting：既不重复登记 work，也不重复关闭或投递。这项判定放在全部校验之后，因此
+      // 错误/陈旧凭据仍会按上面的分支立即 rejected。
+      if (batch.pendingClose !== void 0) {
+        return {
+          kind: "waiting",
+          ...base,
+          // 批次仍开放时可能有 pending-close 期间新接受的 admission；回执报告批次当前的
+          // 完整 accepted 集（初始那次回执是已返回的快照，不追写）。
+          acceptedCount: pendingCloseAcceptedCount(parent),
+          reason: "experts-running",
+        };
+      }
+      // 两阶段收口：① 登记等待工作并标记 pending-close（同步、无任何 await）；
+      // ② 立即返回非终态 waiting。登记必须在返回前完成，否则「登记前到达的 child 完成
+      // 通知」会找不到工作项而变成空操作；而工具调用本身绝不等待。
       batch.finalizing = true;
       try {
         if (!host.lineage.isLiveGeneration(parent, rootToken)) {
           batch.closed = true;
           return { kind: "rejected", ...base, acceptedCount: acceptedEntries.length, reason: "root-generation-retired" };
         }
-        const registered = registerRootTurnWaitWork(parent, acceptedEntries);
-        const waitOutcome = await rootTurnWaits.wait(parent, exec?.signal);
-        if (waitOutcome.released !== true) {
-          // signal-aborted 只取消本次 waiter，批次与已登记工作仍可由同一凭据重试。
-          // root 退休、代际替换或插件卸载等生命周期取消仍按原语义关闭批次。
-          if (waitOutcome.reason !== "signal-aborted" && waitOutcome.reason !== "user-message") batch.closed = true;
-          return {
-            kind: "rejected",
-            ...base,
-            acceptedCount: acceptedEntries.length,
-            reason: "root-wait-cancelled",
-            message: "root turn wait was cancelled (" + waitOutcome.reason + ")",
-          };
-        }
-        batch.closed = true;
+        registerRootTurnWaitWork(parent, acceptedEntries);
+        // pending-close 保存 exact admission 对象：等待账本的记录会在一次静止收口后被
+        // 销毁（此时 isEngaged() 为 false），后续 turn-stopping 只能靠这份凭据重新登记
+        // 尚未结算的 work —— 它绝不重新登记已结算项（登记键会永远等不到结算）。
+        //
+        // 这里**不**缓存 acceptedCount：批次在收口前始终开放（pending-close 期间新接受的
+        // admission 会被原地追加进 admissions），任何数量都必须在使用点现算（见
+        // pendingCloseAcceptedCount），否则旧快照会漏掉新工作。
+        batch.pendingClose = {
+          admissionEpoch: epoch,
+          admissions: acceptedEntries.map((entry) => entry.outcome.handoffAdmission),
+        };
         return {
-          kind: "finalized",
+          kind: "waiting",
           ...base,
           acceptedCount: acceptedEntries.length,
-          reason: "finalized",
+          reason: "experts-running",
         };
       } finally {
         batch.finalizing = false;
       }
     }
 
+    /**
+     * 取 pending-close 批次的**同步快照**（未关闭、且确实登记过收口）。
+     *
+     * 只返回已保存的状态对象本身：它由 finalize 一次性写入，之后只能**原地**追加
+     * pending-close 期间新接受的 exact admission（见 notePendingCloseAdmission），绝不
+     * 重建或拷贝——拷贝会让投递前的身份校验失去意义。
+     *
+     * @returns {object|undefined} pending-close 状态；无待收口批次时为 undefined。
+     */
+    function pendingCloseBatchFor(parent) {
+      const batch = rootAdmissionBatches.get(parent);
+      if (batch === void 0 || batch.closed === true || batch.pendingClose === void 0) return void 0;
+      return batch.pendingClose;
+    }
+
+    /**
+     * 取开放批次里**当前**已接受的 exact 工作（活视图，不是冻结快照）。
+     *
+     * why 必须是活视图：pending-close 是**批次级** latch，批次在收口前始终开放——用户插话
+     * 后的后续 root turn 仍会通过 beginRootAdmission 把新的 role admission 加进**同一个**
+     * epoch。冻结在 finalize 时刻的 admission 列表会漏掉这些新工作：重新等待会少等一项，
+     * 收口结论的 acceptedCount 也会停在旧值。
+     *
+     * 判定与 finalizeRootAdmissionBatch 的 acceptedEntries 完全一致：reused /
+     * continueParentTurn 不产生「未结算工作」（它们留下的运行中 child 由 root-scoped
+     * 后代查询负责挡住）。
+     *
+     * @param {object} parent - exact root Agent。
+     * @returns {{token:string, admission:object, released:boolean}[]} 已接受工作；
+     *   `released` 为 true 表示该 admission 已离开 host.handoff（已结算 / 已释放）。
+     */
+    function acceptedBatchWorks(parent) {
+      const batch = rootAdmissionBatches.get(parent);
+      if (batch === void 0) return [];
+      const works = [];
+      for (const entry of batch.entries.values()) {
+        const outcome = entry?.outcome;
+        if (entry?.settled !== true || outcome === void 0) continue;
+        if (outcome.kind !== "continuable" || outcome.reused === true || outcome.continueParentTurn === true) continue;
+        const admission = outcome.handoffAdmission;
+        if (admission === void 0 || admission.parent !== parent) continue;
+        const token = typeof admission.token === "string" && admission.token.length > 0 ? admission.token : void 0;
+        if (token === void 0) continue;
+        works.push({ token, admission, released: host.handoff.contains(admission) !== true });
+      }
+      return works;
+    }
+
+    /**
+     * 批次当前**完整 accepted 集**的规模。
+     *
+     * 收口结论与重复的 waiting 回执都用它现算：pending-close 期间新接受的 admission 也是
+     * 这个批次的一部分，回放 finalize 时刻的旧快照会让模型看到与实际收口集合不符的数量。
+     * 初始那次 waiting 回执是已返回的快照，不做追写。
+     */
+    function pendingCloseAcceptedCount(parent) {
+      return acceptedBatchWorks(parent).length;
+    }
+
+    /**
+     * 把 pending-close 期间**新接受**的 role admission 立即归入同一次收口的 exact work 集。
+     *
+     * why 需要这个写入口：该批次的收口等待可能正在飞（被打断的 turn 之后，模型在新 step
+     * 里又拉起一个专家）。只依赖 turn-stopping 起点的一次性重新登记时，这段等待里新接受
+     * 的工作就不在等待账本上，静止判定只剩「查不到 running 后代」这条启发式依据——一旦新
+     * child 恰好不在 running 列表里（例如它已经结束 turn、精确结算尚未到达），批次就会在
+     * exact work 未释放时提前收口并投递终态结论。
+     *
+     * 登记键必须与精确结算用的键完全一致（admission 自己的 token）；已经离开 host.handoff
+     * 的凭据绝不登记，否则会留下一个永远等不到结算的键，让 root 永久悬挂。
+     *
+     * @param {object} parent - exact root Agent。
+     * @param {object} admission - 新接受的 exact handoff admission。
+     * @returns {boolean} 是否成功进入等待账本（诊断用；判定不依赖它）。
+     */
+    function notePendingCloseAdmission(parent, admission) {
+      const pendingClose = pendingCloseBatchFor(parent);
+      if (pendingClose === void 0 || admission === void 0 || admission.parent !== parent) return false;
+      if (host.handoff.contains(admission) !== true) return false;
+      const token = typeof admission.token === "string" && admission.token.length > 0 ? admission.token : void 0;
+      if (token === void 0) return false;
+      // 归入 exact work 集：只把同一个 exact admission 对象追加进快照数组，绝不重建该对象
+      // ——deliverRootFinalizationConclusion 依赖 pendingClose 的对象身份做重复投递复查。
+      if (!pendingClose.admissions.includes(admission)) pendingClose.admissions.push(admission);
+      const tracked = rootTurnWaits.track(parent, { kind: "admission", token }) !== void 0;
+      // 与 finalize / turn-stopping 的登记路径一致：登记成功即「等待屏障已建立」，
+      // cohort 才会把该 admission 判定为可精确结算。
+      if (tracked) handoffAdmissionCohort.markPauseDone(admission);
+      return tracked;
+    }
+
+    /**
+     * 依据 pending-close 保存的 exact admission 信息**以及开放批次当前的已接受工作活视图**，
+     * 重新登记**尚未结算**的 work 并把该 root engage 进同一张等待账本。
+     *
+     * 为什么必须能「重新登记」：等待账本的一条记录在一次静止收口后立即销毁，此后
+     * `track`/`settle` 都找不到它，`isEngaged()` 也为 false。若只依赖账本现状，
+     * pending-close 批次就会在「child 先静止、turn-stopping 后到」的合法时序里既收不了口、
+     * 也投递不了结论（登记键必须与精确结算用的键完全一致，因此这里用 admission 自己的
+     * token，而不是 batch/ticket token）。
+     *
+     * 只登记仍在 handoff 里的 admission：已结算/已释放的凭据再登记会得到一个永远等不到
+     * 结算的键，让 root 永久悬挂（fail-closed 的另一面）。
+     *
+     * @returns {number} 本次成功登记的 work 数（诊断用；判定不依赖它）。
+     */
+    function reengagePendingCloseWorks(parent, pendingClose) {
+      // 并集：① finalize 快照里保存的 exact admission；② 开放批次当前的已接受工作活视图
+      // （含 pending-close 期间新接受的 admission——它们必须被本次等待一并覆盖）。
+      const candidates = [
+        ...pendingClose.admissions,
+        ...acceptedBatchWorks(parent).map((work) => work.admission),
+      ];
+      const seen = new Set();
+      let tracked = 0;
+      for (const admission of candidates) {
+        if (admission === void 0 || admission.parent !== parent) continue;
+        if (host.handoff.contains(admission) !== true) continue;
+        const token = typeof admission.token === "string" && admission.token.length > 0 ? admission.token : void 0;
+        if (token === void 0 || seen.has(token)) continue;
+        seen.add(token);
+        if (rootTurnWaits.track(parent, { kind: "admission", token }) !== void 0) {
+          handoffAdmissionCohort.markPauseDone(admission);
+          tracked += 1;
+        }
+      }
+      // 即使没有可登记的工作（reused/continue 批次或已全部结算），也必须 engage：静止
+      // 判定要由同一状态机给出**明确**结论，而不是「从未参与」这种无法证明的默认。
+      rootTurnWaits.engage(parent);
+      return tracked;
+    }
+
+    /**
+     * 构造一次收口结论的模型可见正文。
+     *
+     * 只表达「收口已完成 + admissionEpoch + acceptedCount」这三项**插件自己拥有**的事实：
+     * 专家的具体结果由 DSH 的结算通知各自提供，插件消息不复制、不改写任何专家收尾文本，
+     * 也刻意不与 Host 自动完成通知的固定前缀同形（避免被当作 child settlement）。
+     */
+    function rootFinalizationConclusionText(admissionEpoch, acceptedCount) {
+      return "Expert group finalization: the expert batch you finalized is finalized"
+        + " (admissionEpoch " + admissionEpoch
+        + ", acceptedCount " + acceptedCount + ")."
+        + " Every expert task accepted in that batch has actually finished;"
+        + " each expert's own closing output arrived separately as a subagent settlement message,"
+        + " which this notice deliberately does not repeat."
+        + " Do not call dsh_expert_group_finalize again for this batch and do not poll for status;"
+        + " continue the task from here.";
+    }
+
+    /**
+     * 一次性投递某批次的终态收口结论，并关闭该批次。
+     *
+     * 前置条件（缺一不可，全部在**同一同步临界区**内复查）：
+     * 1. 该 exact 批次仍是同一个、仍未关闭、且 pendingClose 仍是本次持有的那个对象
+     *    （重复 turn-stopping / 竞态下不会二次投递）；
+     * 2. 本次 waiter 的 signal 未被取消（取消不是专家完成）；
+     * 3. exact root Agent 仍是当前 live root，且 generation token 仍 live（root 退休、
+     *    代际替换或插件卸载期间绝不由旧 root 投递）；
+     * 4. runtime 提供 rc.2 的公开 `Agent.steer`。**不**降级为 `inject`：inject 不保证
+     *    唤醒后续模型 step，静默降级会让模型永远收不到收口结论；此处保留 pending-close，
+     *    留给具备该能力的 runtime 或后续 turn（只记一次告警，不刷日志）。
+     *
+     * @returns {boolean} 是否完成投递并关闭。
+     */
+    function deliverRootFinalizationConclusion(parent, pendingClose, signal) {
+      const batch = rootAdmissionBatches.get(parent);
+      if (batch === void 0 || batch.closed === true || batch.pendingClose !== pendingClose) return false;
+      if (signal?.aborted === true) return false;
+      if (!isLiveRootAgent(parent)) return false;
+      const rootToken = host.lineage.tokenFor(parent);
+      if (!host.lineage.isLiveGeneration(parent, rootToken)) return false;
+      if (typeof parent?.steer !== "function") {
+        if (batch.steerUnavailableLogged !== true) {
+          batch.steerUnavailableLogged = true;
+          ctx.logger.warn("dsh-expert-group: root Agent.steer is unavailable; the finalization conclusion was not delivered");
+        }
+        return false;
+      }
+      // 收口时刻的完整 accepted 集：pending-close 期间新接受的 admission 也在其中，
+      // 因此这里必须**现算**，而不是回放 finalize 时的快照值。判定与身份复查处于同一
+      // 同步临界区，结论里的数量与真正被释放的 exact work 集一致。
+      const acceptedCount = pendingCloseAcceptedCount(parent);
+      let message;
+      try {
+        message = createUserMessage({
+          content: [{ type: "text", text: rootFinalizationConclusionText(pendingClose.admissionEpoch, acceptedCount) }],
+          source: { kind: PRODUCER_SOURCE_KIND },
+        });
+      } catch (error) {
+        ctx.logger.warn("dsh-expert-group: root finalization message construction failed: "
+          + (error instanceof Error ? error.name : "Error"));
+        return false;
+      }
+      try {
+        parent.steer(message);
+      } catch (error) {
+        // 投递失败保持 pending-close：结论还没有进入模型上下文，批次不能算收口完成。
+        ctx.logger.warn("dsh-expert-group: root finalization steer failed: "
+          + (error instanceof Error ? error.name : "Error"));
+        return false;
+      }
+      batch.closed = true;
+      batch.pendingClose = void 0;
+      return true;
+    }
+
 
 
     ctx.effect(() => tools.register(defineTool({
       name: "dsh_expert_group_finalize",
-      description: "Finalize the current root turn only after every role-tool admission result named by admissionTokens has returned, the root agent has completed its summary and integration/review/verification check, and no safe non-overlapping parallel work remains. This root-only action then waits until every expert child it accepted has actually finished, keeping the root turn open meanwhile; it never waits with a timeout, because an expert may run for hours. Do not call it while safe parallel work remains; a pure continue_parent_turn batch has no accepted admission to finalize, while a later ordinary admission may finalize the complete checked token set.",
+      description: "Finalize the current root turn only after every role-tool admission result named by admissionTokens has returned, the root agent has completed its summary and integration/review/verification check, and no safe non-overlapping parallel work remains. This root-only action validates that batch against the open admission epoch, registers every accepted expert task on the root turn wait ledger, and returns immediately with a non-terminal waiting receipt carrying admissionEpoch and acceptedCount: it never waits inside the tool call, because the root turn lifecycle keeps waiting at the agent/turn-stopping boundary on that same ledger, with no timeout, as an expert may legitimately run for hours. A waiting receipt means the wait is registered, not that any expert finished; it is not an asynchronous task handle and there is no status to poll. Do not call finalize again for that batch and do not poll for status: once every accepted task has actually finished, the plugin closes the batch and steers one DEG-sourced finalization message into your next step automatically. Do not call it while safe parallel work remains; a pure continue_parent_turn batch has no accepted admission to finalize, while a later ordinary admission may finalize the complete checked token set.",
       parameters: {
         admissionEpoch: {
           type: "number",
@@ -2978,7 +3511,8 @@ export default {
           type: "object",
           additionalProperties: false,
           properties: {
-            kind: { type: "string", required: true, enum: ["finalized", "noop", "rejected"] },
+            // waiting 是登记完成但非终态；收口结论只通过后续 root 上下文消息表达。
+            kind: { type: "string", required: true, enum: ["waiting", "noop", "rejected"] },
             admissionEpoch: { type: "number", required: true },
             acceptedCount: { type: "number", required: true },
             reason: { type: "string", required: true },
@@ -2988,7 +3522,16 @@ export default {
         render(_args, value) {
           // render 必须带上 message，否则 rejected 的 self-diagnosis 文案在模型可见的
           // 工具输出里被丢弃（reason 是机器码，message 才是可执行提示）。
-          return [{ type: "text", text: "root finalization: " + value.reason + (value.message ? " — " + value.message : "") }];
+          const base = "root finalization: " + value.reason + (value.message ? " — " + value.message : "");
+          // waiting 是非终态回执：模型必须看到「等待已登记、不要重试、不要轮询」，
+          // 否则会把 waiting 误当成最终结论，或者反复调用 finalize。
+          if (value.kind === "waiting") {
+            return [{ type: "text", text: base
+              + " — waiting registered for " + value.acceptedCount + " accepted expert task(s) in admissionEpoch "
+              + value.admissionEpoch
+              + "; do not call finalize again and do not poll for status" }];
+          }
+          return [{ type: "text", text: base }];
         },
       },
       isConcurrencySafe: () => false,
@@ -3064,49 +3607,72 @@ export default {
       // finalize 已经在收口（finalizing）或已收口（closed）时一律让路：那是模型必需
       // 路径，等待结论都由它负责，兜底重复介入只会产生竞争。
       if (batch === void 0 || batch.closed === true || batch.finalizing === true) return [];
-      const pending = [];
-      for (const entry of batch.entries.values()) {
-        const outcome = entry?.outcome;
-        if (entry?.settled !== true || outcome === void 0) continue;
-        if (outcome.kind !== "continuable" || outcome.reused === true || outcome.continueParentTurn === true) continue;
-        const admission = outcome.handoffAdmission;
-        if (admission === void 0 || host.handoff.contains(admission) !== true) continue;
-        const token = typeof entry.token === "string" && entry.token.length > 0 ? entry.token : void 0;
-        if (token === void 0) continue;
-        pending.push({ token, admission });
-      }
-      return pending;
+      // 活视图：包含 pending-close 期间新接受的 admission（同一开放批次的 exact work 集）。
+      // 工作键必须与「精确结算」用的键完全一致：结算走 handoff admission 自己的 token
+      // （见 settleAdmissionTurnWait / registerRootTurnWaitWork / acceptedBatchWorks）。
+      // 用 batch/ticket token 登记会得到一个永远不会被结算的键 —— 模型遗漏 finalize 时
+      // 兜底就会永久挂住 turn。
+      return acceptedBatchWorks(parent)
+        .filter((work) => work.released !== true)
+        .map((work) => ({ token: work.token, admission: work.admission }));
     }
 
     /**
      * root turn 即将关闭时的等待兜底（与 finalize 共用**同一个**等待账本/状态机）。
      *
-     * 为什么需要它：`dsh_expert_group_finalize` 仍是模型必需路径（prompt 契约、工具
-     * 描述都不改），但模型可能遗漏它；纯 `continue_parent_turn` 批次与 fan-out 也可能
+     * 为什么需要它：`dsh_expert_group_finalize` 仍是模型必需路径（prompt 契约要求模型
+     * 调用它登记等待），但模型可能遗漏它；纯 `continue_parent_turn` 批次与 fan-out 也可能
      * 在 turn 结束时仍有子代理在跑。此时若直接关闭 turn，root 会变 idle。
      *
-     * 本函数**不**暂停/恢复任何 goal，也不主动结束 turn：它只把「本 turn 已接受、
-     * 但还没被 finalize 登记的 admission」补登记进同一张等待表，然后等同一张表的
-     * 静止判定成立。DSH 的 `agent/turn-stopping` 是 serial 事件且会 await 监听器
-     * 返回的 Promise，因此等待期间 turn 保持打开，其他 agent 事件照常推进。
+     * 本函数**不**暂停/恢复任何 goal，也不主动结束 turn：它把「本 turn 已接受、但还没被
+     * finalize 登记的 admission」补登记进同一张等待表，然后等同一张表的静止判定成立。
+     * DSH 的 `agent/turn-stopping` 是 serial 事件且会 await 监听器返回的 Promise，
+     * 因此等待期间 turn 保持打开，其他 agent 事件照常推进。
      *
-     * 兜底只做「补登记 + 等」：不清理 admission、不写任何终态结论——那些都属于
-     * 正常的 feedback/release 路径。
+     * 对**未 finalize** 的批次只做「补登记 + 等」：不清理 admission、不写任何终态结论——
+     * 那些都属于正常的 feedback/release 路径。
+     *
+     * ## pending-close 批次的接续（两阶段收口的后半段）
+     * finalize 已经登记并返回 waiting 的批次由本函数完成收口：
+     * - **重新登记**：等待账本的记录可能已在一次静止收口后销毁（此时 `isEngaged()` 为
+     *   false、登记集为空），因此这里按 pending-close 保存的 exact admission **以及开放
+     *   批次当前的已接受工作活视图**重新登记尚未结算的 work 并 engage，保证「child 先静止、
+     *   turn-stopping 后到」以及「pending-close 期间又接受了新 admission」都能被本次等待
+     *   完整覆盖；等待在飞期间新接受的 admission 由接受时刻的登记负责（同一个账本）；
+     * - **本 turn 的 signal**：等待使用 `payload.signal`（root turn 生命周期），而不是
+     *   run_code 子执行的 exec.signal；
+     * - **取消不是完成**：等待被取消（用户插话 / abort / root 退休 / 卸载）时批次保持
+     *   pending-close，不关闭、不投递，留给后续 root turn 重建等待；
+     * - **一次性投递**：等待明确 released 且 signal 未取消、exact root/generation 仍 live
+     *   时，才投递一次终态结论并关闭批次。
      *
      * @param {object} parent - exact live root Agent。
-     * @returns {Promise<void>} 静止或等待被取消后收口。
+     * @param {AbortSignal} [signal] - 本次 root turn 的 signal。
+     * @returns {Promise<void>} 静止、收口完成或等待被取消后返回。
      */
     async function awaitRootTurnWaitFallback(parent, signal) {
+      // 同步取一次 pending-close 快照：等待期间批次可能被其它边界关闭或代际退休，
+      // 投递前的身份复查（deliverRootFinalizationConclusion）据此拒绝过期投递。
+      const pendingClose = pendingCloseBatchFor(parent);
       for (const candidate of pendingRootAutomaticAdmissions(parent)) {
-        rootTurnWaits.track(parent, { kind: "admission", token: candidate.token });
+        // candidate 来自当前开放 batch 且仍在 handoff；只有真实 token 成功进入等待账本后，
+        // 才标记其真实 cohort entry 的 pauseDone，绝不为缺失 admission 伪造完成。
+        const tracked = rootTurnWaits.track(parent, { kind: "admission", token: candidate.token });
+        if (tracked !== void 0) handoffAdmissionCohort.markPauseDone(candidate.admission);
       }
-      // 即使没有补登记的工作项，只要该 root 曾经engage过等待体系（例如纯
+      if (pendingClose !== void 0) reengagePendingCloseWorks(parent, pendingClose);
+      // 即使没有补登记的工作项，只要该 root 曾经 engage 过等待体系（例如纯
       // continue_parent_turn 留下的正在运行的 child），也必须让同一状态机判定一次。
       if (!rootTurnWaits.isEngaged(parent)) return;
       const outcome = await rootTurnWaits.wait(parent, signal);
       if (outcome.released !== true) {
+        // 取消（用户插话 / abort / root 退休 / 插件卸载）不是专家完成：pending-close 批次
+        // 保持开放，既不关闭也不投递，后续 root turn 可以重建等待继续收口。
         ctx.logger.warn("dsh-expert-group: root turn wait fallback was cancelled (" + outcome.reason + ")");
+        return;
       }
+      if (pendingClose === void 0) return;
+      deliverRootFinalizationConclusion(parent, pendingClose, signal);
     }
 
     /**
@@ -3117,9 +3683,13 @@ export default {
     ctx.on("agent/turn-stopping", (payload) => {
       const parent = payload?.agent;
       if (turnWaitStopping || !isRootAgentIdentity(parent) || !isLiveRootAgent(parent)) return;
-      // 同步前置判定：既没有进入等待体系、也没有可补登记的 admission 时直接放行——
-      // 绝不为了「形式上返回 Promise」而在每个 turn 边界插入一次多余的异步查询。
-      if (!rootTurnWaits.isEngaged(parent) && pendingRootAutomaticAdmissions(parent).length === 0) return;
+      // 同步前置判定：既没有进入等待体系、也没有可补登记的 admission、也没有待收口的
+      // pending-close 批次时直接放行——绝不为了「形式上返回 Promise」而在每个 turn 边界
+      // 插入一次多余的异步查询。pending-close 必须参与：它的等待账本记录可能已被销毁
+      // （isEngaged() 为 false），只看账本现状会漏掉整条收口链路。
+      if (pendingCloseBatchFor(parent) === void 0
+        && !rootTurnWaits.isEngaged(parent)
+        && pendingRootAutomaticAdmissions(parent).length === 0) return;
       return awaitRootTurnWaitFallback(parent, payload?.signal).catch((error) => {
         ctx.logger.warn("dsh-expert-group: root turn wait fallback failed: " + (error instanceof Error ? error.message : String(error)));
       });
@@ -3355,6 +3925,23 @@ export default {
         sequence: 0,
         closed: false,
         finalizing: false,
+        /**
+         * 两阶段收口的 pending-close 登记（见 finalizeRootAdmissionBatch）。
+         *
+         * finalize 在登记完成后把本批次标为 pending-close：工具立即返回 waiting，等待
+         * 职责移交给 root turn 的 `agent/turn-stopping` serial 边界。这里保存的是
+         * **exact admission 对象**（而不是 token 或 id），因为等待账本的记录会在一次静止
+         * 收口后被销毁，后续 turn 只能靠这份精确凭据重新登记尚未结算的 work；用 id/token
+         * 猜身份会重新登记一个永远不会结算的键。
+         *
+         * `admissions` 是**批次级**闩锁的一部分，而不是冻结的快照：批次在收口前始终开放，
+         * pending-close 期间新接受的 admission 会在接受时刻被追加进来（并同步登记进等待
+         * 账本），因此「重新等待」与「收口结论的 acceptedCount」看到的都是该批次收口
+         * 时刻的完整 accepted 集。
+         */
+        pendingClose: void 0,
+        /** steer 不可用的告警只记一次（不影响批次状态）。 */
+        steerUnavailableLogged: false,
       };
     }
     function beginRootAdmission(parent) {
@@ -3373,6 +3960,9 @@ export default {
         token,
         epoch: batch.epoch,
         entry,
+        // outcome 记录点需要 exact root 才能把「pending-close 期间新接受的 work」写进
+        // 同一批次的等待集（见 recordRootAdmissionOutcome / notePendingCloseAdmission）。
+        parent,
         settle() {
           const settled = ticket.settle();
           if (settled) entry.settled = true;
@@ -3385,6 +3975,15 @@ export default {
       if (admission?.entry === void 0) return;
       admission.entry.outcome = outcome;
       admission.entry.settled = true;
+      // pending-close 批次仍开放时，新接受的 exact work 必须在**接受时刻**就进入
+      // pending-close 的 work 集与等待账本（见 notePendingCloseAdmission）：否则批次级
+      // 闩锁与「该批次的 exact 工作集」会脱节，收口等待可能少等这一项、结论里的
+      // acceptedCount 也会停在旧值。判定与 finalize 的 acceptedEntries 完全一致：
+      // reused / continueParentTurn 不产生未结算工作。
+      if (outcome?.kind === "continuable" && outcome.reused !== true && outcome.continueParentTurn !== true
+        && outcome.handoffAdmission !== void 0) {
+        notePendingCloseAdmission(admission.parent, outcome.handoffAdmission);
+      }
     }
     function roleAdmissionFailure(phase, error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -5440,18 +6039,26 @@ export default {
     // correlation id 之前一律 fail-closed：不撤回、不排队、不消费、不释放 handoff，
     // 只留一条按 child 去重的可诊断 warn；消息本身仍作为普通注入消息留在父 inbox
     // （不伪造交接，也不改变正文）。
-    ctx.on("agent/inbox/inserted", ({ agent, message }) => {
-      // inbox/inserted 是 core 唤醒 root 前的同步边界；先取消旧 waiter，避免用户新消息
-      // 被仍在等待专家的旧 finalize 阻塞。只识别真实 user source，不触碰 child feedback。
-      if (message?.source?.kind === "user") cancelRootTurnWaitForUserInput(agent);
+    /**
+     * 处理一条父 inbox 反馈。agent/inbox/inserted 与 session/event 的
+     * agent/inbox/spliced 都必须进入同一条路径，避免只覆盖测试夹具能合成的事件。
+     * 文本宿主通知仅作为 child 身份线索；后续仍由当前 root、activation、turn/end
+     * 和 cohort 的既有门控决定是否可以结算，绝不凭正文直接释放等待。
+     */
+    function handleInboxFeedback(agent, message, sourceEvent = "agent/inbox/inserted", deliveryId, receipt = void 0) {
+      // inserted 是 core 唤醒 root 前的同步边界；spliced 在 session/event 中已脱离该
+      // 发布栈，因此仍先做相同的 user / recovery 身份检查，再把 handoff 写入 microtask。
+      // spliced 是已进入 next-step 的注入项，不是新的用户输入边界；其中即使带 user
+      // source 也不能被当作 waiter 取消信号。
+      if (message?.source?.kind === "user" && sourceEvent === "agent/inbox/inserted") cancelRootTurnWaitForUserInput(agent);
       if (message?.source?.kind === "subagent-report") {
         const relayChildId = message.source.senderSessionId;
         warnLegacyRelayFailClosed(typeof relayChildId === "string" ? relayChildId : void 0);
         return;
       }
-      // 关键并发边界：core 会在本同步回调之后 wake parent。可恢复链的 settlement
-      // 必须先从 inbox 撤回并保存，不能等 queueMicrotask 后才判断，此时 parent 可能已 claim。
-      const childId = subagentFeedbackChildId(message);
+      const childId = subagentFeedbackChildId(message, {
+        allowSourceLess: sourceEvent === "agent/inbox/spliced" && typeof deliveryId === "string",
+      });
       if (childId !== void 0) {
         const record = recoveryRecords.get(childId);
         if (record?.parentAgent === agent) {
@@ -5459,47 +6066,61 @@ export default {
             if (gateRecoverableHandoffFeedback(agent, record, childId, message)) return;
             // terminal feedback 可能对应一个已完成但未绑定到 turn/messageId 的 child turn。
             // 只有没有待恢复 op 时才释放，避免把可恢复失败的 activity 提前清掉。
-            if (record.pendingRecoveries?.size === 0
+            const sourceLessHostNotice = sourceEvent === "agent/inbox/spliced"
+              && message?.source === void 0 && typeof deliveryId === "string";
+            if (!sourceLessHostNotice && record.pendingRecoveries?.size === 0
               && record.recoveryFeedbackActive !== true
               && (record.gatedRecoveryFeedbacks?.length ?? 0) === 0) {
               releaseActiveExpertScope(agent, { childId, role: record.role });
             }
           } else {
             // 当前 registry/activation 已指向 replacement 时，这是一条无法证明属于
-            // 当前 generation 的旧 notice。不能 remove 它，更不能落入普通 handoff
-            // release 路径把旧 child 的 settlement 交给新任务。
+            // 当前 generation 的旧 notice；不能进入普通 handoff release 路径。
             return;
           }
         }
       }
-      // feedback 的 handoff 状态写入仍延后到发布栈外；agent/message 必须保持 exact 身份。
       queueMicrotask(() => {
         try {
           if (!isLiveRootAgent(agent)) return;
-          const gatedChildId = subagentFeedbackChildId(message);
+          const gatedChildId = subagentFeedbackChildId(message, {
+            allowSourceLess: sourceEvent === "agent/inbox/spliced" && typeof deliveryId === "string",
+          });
           if (gatedChildId === void 0 || wasGatedRecoveryFeedback(agent, gatedChildId, message?.id, message)) return;
           const childId = gatedChildId;
-          markPendingHandoffFeedback(agent, childId, message);
-          // 无论本次 feedback 是否命中 admission，都重新检查一次精确结算：命中时这是
-          // release 边界；未命中（重复副本 / 无身份 / 迟到通知）时它是幂等空操作，
-          // 绝不会结算别的 token。
+          const sourceLessHostNotice = sourceEvent === "agent/inbox/spliced"
+            && message?.source === void 0 && typeof deliveryId === "string";
+          markPendingHandoffFeedback(agent, childId, message, deliveryId, sourceLessHostNotice, receipt);
+          // 命中与否都重跑精确结算；未命中时只是幂等空操作，不会结算其他 token。
           settleFinishedChildTurnWaits(agent);
         } catch (error) {
-          ctx.logger.warn("dsh-expert-group: inbox/inserted handoff handler failed: " + (error instanceof Error ? error.message : String(error)));
+          ctx.logger.warn("dsh-expert-group: " + sourceEvent + " handoff handler failed: " + (error instanceof Error ? error.message : String(error)));
         }
       });
+    }
+
+    ctx.on("agent/inbox/inserted", ({ agent, message }) => {
+      handleInboxFeedback(agent, message);
     });
 
     // 触发通道 2：session/event 的 child turn/end 仍只负责终态结算；root turn/end 才是
     // 终止快照的唯一提交点。microtask 避开 Session.append 发布重入，并在执行前校验
     // exact root Agent/Session/generation 身份。
     ctx.on("session/event", (session, event) => {
+      // C：在**同步入口**取得本次事件的接收序号。它是插件内部唯一的到达顺序权威，
+      // 后续所有 microtask 处理只能使用这个快照（见 nextSessionEventReceipt）。
+      const receipt = nextSessionEventReceipt();
       // 某些宿主只发布 session/event 而不经过 inbox/inserted；在进入 microtask 前同步
       // 取消 root waiter，保证 user/message 与 ask_user_question 的 role=user 都能打断旧 turn。
       const immediateAgent = typeof session?.id === "string" ? agents.get(session.id) : void 0;
       const isUserInput = (event?.type === "user/message" && event.data?.source?.kind === "user")
         || (event?.type === "tool/result" && event.data?.message?.role === "user");
       if (isUserInput && immediateAgent?.session === session) cancelRootTurnWaitForUserInput(immediateAgent);
+      // C：source-less 完成通知的同步接收边界快照（exact root/session、child activation、
+      // 未消费 token 快照、接收序号）。异步消费只允许使用这个快照的交集，且必须满足
+      // 「exact turn/end 接收顺序更早」——后续只能收紧，不能扩大。
+      const noticeReceipts = typeof session?.id === "string"
+        ? captureSourceLessNoticeReceipts(immediateAgent, session, event, receipt) : void 0;
       queueMicrotask(() => {
         try {
         if (typeof session?.id !== "string") return;
@@ -5514,6 +6135,25 @@ export default {
           if (!isCurrentRecoverySessionIdentity(record.parentAgent, record, session)) return;
           // 首个 exact event 建立 session 引用；之后旧 Session 事件不得接管 record。
           bindRecoverySession(record, session);
+        }
+        if (event?.type === "agent/inbox/spliced"
+          && event.data?.target === "next-step"
+          && liveAgent?.session === session
+          && isLiveRootAgent(liveAgent)
+          && Array.isArray(event.data?.inserted)) {
+          // 真实 Host 将自动完成消息作为 root session event 发布，而不是 guaranteed 的
+          // agent/inbox/inserted。只桥接 next-step 的 inserted 消息，并复用同一 exact
+          // feedback 状态机；固定文本本身绝不构成释放条件。
+          // seq 缺失时 source-less 通知必须 fail-closed；它不能借正文冒充 admission。
+          const deliveryId = Number.isSafeInteger(event.seq)
+            ? "session-event:" + session.id + ":" + String(event.seq) : void 0;
+          for (let index = 0; index < event.data.inserted.length; index += 1) {
+            const inserted = event.data.inserted[index];
+            const message = inserted?.message !== undefined ? inserted.message : inserted;
+            // receipt 与 inserted 同下标对齐：同步入口为每条 source-less 注入固化的到达快照。
+            handleInboxFeedback(liveAgent, message, "agent/inbox/spliced", deliveryId, noticeReceipts?.[index]);
+          }
+          return;
         }
         if (event?.type === "step/start" && liveAgent?.session === session && isLiveRootAgent(liveAgent)) {
           // turn/end 之后同一 turn 又开始新 step，说明 listener 通过 steer 续接了本次运行：
@@ -5569,7 +6209,7 @@ export default {
         if (event?.type !== "turn/end" || record === void 0) return;
         if (recoveryRecords.get(session.id) !== record
           || !isCurrentRecoverySessionIdentity(record.parentAgent, record, session)) return;
-        const admission = admissionForTurn(record, session, event);
+        const admission = admissionForTurn(record, session, event, receipt);
         if (admission?.failed === true) {
           // 失败 admission 只结算自己的 turn，不能被同 child 的其他 token 拦截。
           consumeChildTurnEnd(record.parentAgent, record, session, event, admission);
@@ -5962,9 +6602,9 @@ export default {
     function releaseFanoutGoalHandoff(agent, parentTaskId) {
       if (turnWaitStopping) return false;
       const record = fanoutTurnWaitRecords.get(parentTaskId);
-      if (record === void 0 || record.state === "released") return false;
+      // exact Agent 身份必须先于任何状态写入校验；旧代回调不得污染当前记录。
+      if (record === void 0 || record.state === "released" || record.agent !== agent) return false;
       record.state = "released";
-      if (record.agent !== agent) return false;
       return rootTurnWaits.settle(agent, { kind: "fanout", parentTaskId, attempt: record.attempt });
     }
 
@@ -9489,10 +10129,21 @@ export default {
      * 宿主能力矩阵。
      *
      * - rootTurnWait 描述 root turn 等待所依赖的宿主 seam：权威档是
-     *   `subagents.listDescendants`（**唯一**能证明「没有 running 后代」的 seam），
+     *   `subagents.listDescendants` **加上**同一份 exact runtime `agents.list()` 快照
+     *   （catalog 只证明 session residency；运行判定必须用 runtime Agent.status 交叉校验，
+     *   并用 runtime 快照验证 live 后代已被 catalog 完整覆盖——缺任何一半都不能证明静止），
      *   降级档是 `workspace/session-activity` waterfall（只能报告 activity，不能证明
      *   quiet）。两档都无法证明静止时一律继续等待（fail-closed，绝不把未知当成无人
      *   运行）；专家派发与设置页继续可用，降级由 status/degradation 字段显式说明。
+     *   因此投影是四档：
+     *   1. listing + 可调用的 `agents.list()` 都在 → `available` / degradation `null`
+     *      （完整 catalog 与 runtime 交叉校验，可证明静止）；
+     *   2. 只有 listing（缺 runtime 快照，等待实际 fail-closed）→ `degraded` +
+     *      `root-turn-wait-runtime-agent-listing-unavailable`；
+     *   3. 缺完整 catalog，但 `agents.list()` 可调用（strict runtime-only fallback，仍能
+     *      给出可证明的状态）或只有 waterfall（只能提供正向 running 证据）→ `degraded` +
+     *      `root-turn-wait-descendant-listing-unavailable`；
+     *   4. 三者都不可用 → `unavailable` + `root-turn-wait-descendant-query-unavailable`。
      * - Connection RPC 是**可选能力**：缺失时回落 legacy exact route，无法建立通道时
      *   fail-closed（legacy 拒绝并返回 503），状态与失败类别都从固定枚举取值。
      * - storageDomain 是运行期硬依赖；attachments / sessionQuery 是可选能力，缺失时
@@ -9523,6 +10174,19 @@ export default {
       } catch {
         sessionActivityAvailable = false;
       }
+      // 权威静止证明的另一半：**可调用且返回数组**的 agents.list()。只看到 listing 就报
+      // available 会误报——缺 runtime 快照时等待实际 fail-closed（无法校验运行判定与覆盖
+      // 关系）；可调用但返回非数组同样不能当快照用（等待侧对此也 fail-closed）。
+      // 这里只做只读可用性探测：读取属性并在 try 内调用一次，绝不触发注册或写入状态。
+      let runtimeAgentListingAvailable = false;
+      try {
+        const listAgents = agents?.list;
+        if (typeof listAgents === "function") {
+          runtimeAgentListingAvailable = Array.isArray(listAgents.call(agents));
+        }
+      } catch {
+        runtimeAgentListingAvailable = false;
+      }
       const connectionStatus = connectionChannelTransport === "handle"
         ? "available"
         : connectionChannelTransport === "route"
@@ -9544,14 +10208,21 @@ export default {
           // rootTurnWait：可选宿主 seam；缺失时等待判定一律 fail-closed（继续等待）。
           rootTurnWait: {
             required: false,
-            status: descendantListingAvailable
+            status: descendantListingAvailable && runtimeAgentListingAvailable
               ? "available"
-              : sessionActivityAvailable ? "degraded" : "unavailable",
-            degradation: descendantListingAvailable
+              : descendantListingAvailable || runtimeAgentListingAvailable || sessionActivityAvailable
+                ? "degraded"
+                : "unavailable",
+            degradation: descendantListingAvailable && runtimeAgentListingAvailable
               ? null
-              : sessionActivityAvailable
-                ? "root-turn-wait-descendant-listing-unavailable"
-                : "root-turn-wait-descendant-query-unavailable",
+              : descendantListingAvailable
+                // 完整 catalog 在、runtime 快照不可用：等待 fail-closed，诊断必须如实降级。
+                ? "root-turn-wait-runtime-agent-listing-unavailable"
+                : runtimeAgentListingAvailable || sessionActivityAvailable
+                  // 缺完整 catalog，但仍有可证明的查询路径：strict runtime-only fallback
+                  // （agents.list() + 严格血缘/状态校验）或 waterfall-only（只能正向 running）。
+                  ? "root-turn-wait-descendant-listing-unavailable"
+                  : "root-turn-wait-descendant-query-unavailable",
           },
           // Connection RPC：可选能力，缺失时回落 legacy route。
           connectionRpc: {

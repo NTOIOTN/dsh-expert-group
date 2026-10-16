@@ -363,12 +363,20 @@ Host RPC 的 `meta` 动作返回两份**只读投影**（设置页诊断块与�
   `transport` / `failure` / `binding`），不含任何自由文本。
   - 硬依赖（`tools` / `subagents` / `agents` / `settings` / `webServer` / `systemPrompt` / `llm`）
     在 `inject` 中声明，缺失时插件不加载；
-  - `rootTurnWait` 是可选宿主 seam：权威档是 `subagents.listDescendants`（**唯一**能证明
-    「该 root 没有 running 后代」的 seam，且必须干净且完整），降级档是公开的
-    `workspace/session-activity` waterfall（只能报告 activity，不能证明 quiet）。
-    只有 waterfall 时为 `degraded` + `root-turn-wait-descendant-listing-unavailable`；
-    两档都没有时为 `unavailable` + `root-turn-wait-descendant-query-unavailable`，
-    此时等待一律 fail-closed（继续等待）；
+  - `rootTurnWait` 是可选宿主 seam，诊断按**可证明静止的能力**分四档：
+    1. `available` / degradation `null` —— `subagents.listDescendants` 的干净完整 catalog
+       **加上**同一份可调用的 `agents.list()` runtime 快照：运行判定只认 rc.2 的
+       `Agent.status`，并据此验证 live 后代已被 catalog 完整覆盖（完整 catalog + runtime
+       交叉校验）；
+    2. `degraded` + `root-turn-wait-runtime-agent-listing-unavailable` —— 只有 listing、
+       缺 runtime 快照：catalog 只表达 session residency，等待实际 fail-closed；
+    3. `degraded` + `root-turn-wait-descendant-listing-unavailable` —— 缺完整 catalog，但
+       仍有可证明的查询路径：**strict runtime-only fallback**（`agents.list()` + 严格
+       血缘/身份/状态校验，仍能证明 idle child 已收口）或只有公开的
+       `workspace/session-activity` waterfall（只能报告 activity，**只能提供正向 running
+       证据**，不能证明 quiet）；
+    4. `unavailable` + `root-turn-wait-descendant-query-unavailable` —— 三者都不可用，
+       等待一律 fail-closed（继续等待）；
   - `connectionRpc` / `storageDomain` / `attachments` / `sessionQuery` 各自报告
     `available` / `degraded` / `absent` / `unknown`，缺失时只禁用对应能力。
 - `diagnostics`：children / fanout / recovery / settings / storage / handoff / notifications /

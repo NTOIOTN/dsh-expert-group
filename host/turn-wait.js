@@ -124,6 +124,33 @@ export function createRootTurnWaitRegistry(options = {}) {
     }
   }
 
+  // 查询结果未知或仍发现运行中的后代时，使用无期限的退避复查。timer 只服务于
+  // 当前仍有 waiter 的活动记录；记录退休或最后一个 waiter 取消时必须清除它。
+  const RETRY_INITIAL_DELAY = 10;
+  const RETRY_MAX_DELAY = 1000;
+  function clearRetryTimer(record) {
+    if (record.retryTimer === void 0) return;
+    clearTimeout(record.retryTimer);
+    record.retryTimer = void 0;
+  }
+
+  function scheduleRetry(record) {
+    if (disposed || record.destroyed === true || record.released === true
+      || record.waiters.size === 0 || record.retryTimer !== void 0) return;
+    const delay = record.retryDelay;
+    const timer = setTimeout(() => {
+      if (record.retryTimer !== timer) return;
+      record.retryTimer = void 0;
+      if (disposed || record.destroyed === true || record.released === true
+        || record.waiters.size === 0) return;
+      scheduleCheck(record);
+    }, delay);
+    record.retryTimer = timer;
+    // unref 只避免测试/宿主进程因一个永不超时的等待记录被强行保持；进程仍活跃时 timer 正常执行。
+    timer.unref?.();
+    record.retryDelay = Math.min(RETRY_MAX_DELAY, delay * 2);
+  }
+
   /**
    * **唯一**的记录销毁路径：等待者收口、监听解除、登记表移除、exact Agent 强引用清空。
    *
@@ -148,6 +175,7 @@ export function createRootTurnWaitRegistry(options = {}) {
     record.checking = false;
     record.recheck = false;
     record.inSnapshot = false;
+    clearRetryTimer(record);
     releaseListeners(record);
     settleWaiters(record, released === true, reason);
     record.works.clear();
@@ -165,6 +193,8 @@ export function createRootTurnWaitRegistry(options = {}) {
    */
   function scheduleCheck(record) {
     if (disposed || record.destroyed === true || record.released === true) return;
+    // 显式活动事件或新 waiter 优先于退避 timer，避免同一记录并发发起重复查询。
+    clearRetryTimer(record);
     // 正在 onKnownSnapshot 的同步回调里：本次结算由外层判定统一收口，不再嵌套发起查询。
     if (record.inSnapshot === true) return;
     if (record.checking) {
@@ -198,9 +228,9 @@ export function createRootTurnWaitRegistry(options = {}) {
    * 不消费该标志，那次「有新活动，请复查」的意图就被吞掉，等待可能永久悬挂。因此
    * 两条分支都必须消费 `recheck` 并重跑一次查询。
    *
-   * 不自旋的保证：`recheck` 只在**已有查询在飞**时被置位，而置位者只能是事件
+   * 事件驱动的 `recheck` 只在**已有查询在飞**时被置位，而置位者只能是事件
    * （track/settle/invalidate 都会推进 version）或新到达的 waiter。每次 rejection
-   * 最多消费一个 `recheck`，因此「连续 reject 且没有新事件」时第二轮之后不再重跑。
+   * 最多消费一个 `recheck`；没有事件时不会同步自旋，unknown 结果改由退避 timer 异步复查。
    */
   function handleQuerySettled(record, queryId, version, result, error) {
     if (record.activeQueryId !== queryId) return;
@@ -210,10 +240,12 @@ export function createRootTurnWaitRegistry(options = {}) {
 
     if (error !== void 0) {
       report(error);
-      // unknown：继续等待。仅当在飞期间确有复查意图时才重跑，绝不无条件自旋。
+      // 查询失败仍是 unknown：保留 fail-closed，并在有 waiter 时退避重查。
       if (record.recheck === true) {
         record.recheck = false;
         scheduleCheck(record);
+      } else {
+        scheduleRetry(record);
       }
       return;
     }
@@ -229,8 +261,13 @@ export function createRootTurnWaitRegistry(options = {}) {
     const known = result?.known === true;
     const running = known && Array.isArray(result.running) ? result.running : [];
     if (!known) {
-      // 未知（查询失败 / 结构非法 / 状态无法确定）：继续等待，**绝不**当成无人运行。
-      if (record.recheck === true) { record.recheck = false; scheduleCheck(record); }
+      // 未知（结构非法 / 状态无法确定）：继续等待，**绝不**当成无人运行。
+      if (record.recheck === true) {
+        record.recheck = false;
+        scheduleCheck(record);
+      } else {
+        scheduleRetry(record);
+      }
       return;
     }
     // 明确快照：先给调用方一次「完成通知缺失」的回退结算机会。回调只减少未结算工作，
@@ -246,7 +283,14 @@ export function createRootTurnWaitRegistry(options = {}) {
     // child 创建或 fanout retry。
     if (record.works.size > 0 || running.length > 0) {
       // 仍有未结算工作，或确有 running 后代：继续等待。
-      if (record.recheck === true) { record.recheck = false; scheduleCheck(record); }
+      if (record.recheck === true) {
+        record.recheck = false;
+        scheduleCheck(record);
+      } else if (record.works.size === 0 && running.length > 0) {
+        // 登记工作已清空后，后代仍可能静默转为非运行，不能依赖 agent/status/disposed
+        // 事件才能再次观察；工作尚未结算时仍由其精确 settlement 触发复查。
+        scheduleRetry(record);
+      }
       return;
     }
     if (!isLiveRoot(record.agent)) {
@@ -285,6 +329,8 @@ export function createRootTurnWaitRegistry(options = {}) {
       cancelled: false,
       destroyed: false,
       releaseReason: void 0,
+      retryTimer: void 0,
+      retryDelay: RETRY_INITIAL_DELAY,
       unlisten: void 0,
     };
     if (typeof record.rootId !== "string" || record.rootId.length === 0) return void 0;
@@ -362,6 +408,7 @@ export function createRootTurnWaitRegistry(options = {}) {
     const record = records.get(agent);
     if (record === void 0 || record.destroyed === true || record.waiters.size === 0) return false;
     settleWaiters(record, false, reason);
+    clearRetryTimer(record);
     // 让已经在飞的查询失效；它的迟到结果只能复位内部状态，不能重新收口旧 waiter。
     if (record.checking) {
       record.activeQueryId = ++record.querySequence;
@@ -394,6 +441,7 @@ export function createRootTurnWaitRegistry(options = {}) {
         waiter.cleanup?.();
         waiter.cleanup = void 0;
         waiter.resolve({ released: false, reason: "signal-aborted" });
+        if (record.waiters.size === 0) clearRetryTimer(record);
         // 最后一个 waiter 取消后，忽略它启动的在途快照并释放 checking。
         if (record.waiters.size === 0 && record.checking) {
           record.activeQueryId = ++record.querySequence;

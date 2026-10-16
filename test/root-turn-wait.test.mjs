@@ -19,20 +19,29 @@
  * 7. root dispose、generation replacement、unload 清理；
  * 8. 所有场景不调用 goal pause / resume；
  * 9. ask_user_question / exit_plan_mode 的 pending user wait 仍工作且无 goal API；
- * 10. 后代 seam 的 known/unknown 判定：静止证明**只**来自权威 listing 的干净完整
- *     listing；waterfall（`workspace/session-activity`）无论返回 sentinel、全新空数组、
- *     非空但无 subagent 族还是 malformed，都必须继续等待——它是**非专属**扩展点，
- *     任意 listener 都能返回新的空数组，因此只能提供「确有 running 后代」的正向证据；
+ * 10. 后代 seam 的 known/unknown 判定：静止证明**只**来自「权威 listing 的干净完整
+ *     catalog」**加上**「同一份 exact runtime `agents.list()` 快照」——catalog 的
+ *     `activity` 只表达 session residency（idle 的 durable child 仍可能报 running），
+ *     运行判定必须用 runtime `Agent.status`（rc.2 只有 idle/running）交叉校验，并用同一
+ *     份快照验证 live 后代已被 catalog 完整覆盖；waterfall（`workspace/session-activity`）
+ *     无论返回 sentinel、全新空数组、非空但无 subagent 族还是 malformed，都必须继续等待
+ *     ——它是**非专属**扩展点，任意 listener 都能返回新的空数组，因此只能提供「确有
+ *     running 后代」的正向证据；
  * 10c. 权威 listing **行级公开契约**校验：child 行的必填字段（`id`、`mode`、
  *     `activity`、`hasChildren`、`parentId`、`depth`，continuable 行的 `label`）
- *     任一缺失或非法，整次 listing 都视为 unknown——尤其 `mode` 缺失 / 非枚举值时
- *     绝不能凭该行 `activity:"inactive"` 放行等待；
+ *     任一缺失或非法，整次 listing 都视为 unknown；此外重复 id、parentId/depth 冲突、
+ *     runtime 快照缺失/查询失败、live 后代未被 catalog 覆盖或被标 inactive、
+ *     非法 `Agent.status`（含 ready）一律 unknown；
+ * 10d. 合法 durable 非驻留行（`activity:"inactive"` 且 runtime 没有该 Agent）按
+ *     「当前未运行」接受，不得阻塞已结算的 root turn；
  * 11. 同一 root 的第二轮等待（第一批静止后再 continue_parent_turn）；
  * 12. 查询 rejection 必须消费 recheck（不吞复查意图、也不自旋）；
  * 13. retire 后记录对 exact Agent 的强引用被清空、在途快照不得把记录挂回。
  *
- * 第 10–13 条同时覆盖**权威 listing seam**（`subagents.listDescendants`）与
- * **waterfall 回退 seam**（`workspace/session-activity` + 无 provider sentinel）。
+ * 第 10–13 条同时覆盖**权威 listing seam**（`subagents.listDescendants` + exact
+ * `agents.list()` 快照交叉校验）、**runtime fallback**（listing 缺失时，同样需要
+ * `agents.list()`）与 **waterfall 回退 seam**（`workspace/session-activity` + 无 provider
+ * sentinel，只能给正向证据）。
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -60,39 +69,61 @@ function createGoalProbe() {
 }
 
 /**
- * 建立受控 Host：subagents.startContinuable 同步登记 child（含 subagent 血缘与
- * running 状态），使 harness 的两条 seam 都能读到同一份宿主事实：
- * - `subagents.listDescendants`（权威；默认启用，是**唯一**的静止证明来源）；
+ * 建立受控 Host：subagents.startContinuable 同步登记 child（含 subagent 血缘），使 harness
+ * 的两条 seam 都能读到同一份宿主事实：
+ * - `subagents.listDescendants`（权威 catalog seam；提供后代清单与 **session residency**
+ *   的 `activity`，默认启用）；
  * - `workspace/session-activity` waterfall（降级；只能提供正向的 running 证据）。
  *
+ * rc.2 校正：listing 的 `activity` **不**是运行证据（驻留的 idle child 仍报 running），
+ * 运行判定由插件用同一份 exact runtime 快照里的 `Agent.status` 交叉校验（running 阻塞、
+ * idle 当前未运行、ready 等非法状态一律未知）。`rootChildren: "live"` 把 harness 的 live
+ * 注册表接成 `agents.list()` 快照；省略时保持夹具默认「不注入 list」。
+ *
  * @param {Function} [options.descendantRowTransform] 逐行改写权威 listing 的合法 child
- *   行；只用于**显式构造非法输入**（缺 `mode` / `mode` 非法 / 缺其他必填字段），
- *   验证插件按公开契约 fail-closed。默认不传，夹具保持与契约同形。
+ *   行；只用于**显式构造非法输入**（缺 `mode` / `mode` 非法 / 缺其他必填字段）或建模
+ *   catalog 遗漏（返回 `undefined`），验证插件按公开契约 fail-closed。默认不传。
  */
 function createWaitHost({
   goalProbe,
   sessionActivity = "subagent",
   descendantListing = "subagent",
   descendantRowTransform,
+  durableNonResidentRows,
   sessionActivityTransport = true,
-  rootChildren,
+  // 默认 "live"：真实 rc.2 宿主**一定**提供 agents.list()，等待的运行判定必须用同一份
+  // 完整 runtime 快照交叉校验（缺它一律 fail-closed）。`null` 表示宿主没有该 seam，
+  // 用于覆盖「无法验证覆盖关系 ⇒ 继续等待」的下层路径。
+  rootChildren = "live",
   withGoals = true,
+  childIdFactory,
+  steerSeam = false,
 } = {}) {
   const children = [];
+  // 显式续作（childId + queue）需要公开 subagents.sendMessage seam：与真实 Host 一样
+  // 返回新铸的 admission messageId。默认不注入，保持「未配置即抛错」的夹具语义。
+  const steered = [];
   const host = createPluginHost({
     ...(withGoals ? { goals: goalProbe.service } : {}),
     sessionActivity,
     descendantListing,
     descendantRowTransform,
+    ...(durableNonResidentRows === undefined ? {} : { durableNonResidentRows }),
     sessionActivityTransport,
-    ...(rootChildren === undefined ? {} : { rootChildren }),
+    // rootChildren: "live" ⇒ 把 harness 的 live Agent 注册表作为 agents.list() 快照
+    // （真实 rc.2 宿主一定有该 seam）；`null` ⇒ 宿主没有该 seam（覆盖 fail-closed 路径）。
+    ...(rootChildren === null || rootChildren === undefined
+      ? {}
+      : { rootChildren: rootChildren === "live" ? () => host.agents.roots() : rootChildren }),
     settings: {
       value: { provider: "mock", defaults: { explorer: { provider: "mock", model: "mock" } } },
     },
     subagents: {
       async startContinuable({ request }) {
         const index = children.length + 1;
-        const childId = "wait-child-" + index;
+        const childId = typeof childIdFactory === "function"
+          ? childIdFactory(index)
+          : "wait-child-" + index;
         const messageId = "wait-message-" + index;
         const created = host.registerRootAgent(childId, { lifecycle: false });
         created.session.header = { id: childId, parentSession: request.parent.id, origin: "subagent" };
@@ -112,11 +143,22 @@ function createWaitHost({
         host.emit("agent/created", { agent: created });
         return { childId, messageId };
       },
+      ...(steerSeam === true ? {
+        /**
+         * 公开显式续作 seam：把本轮 prompt 投递给既有 child，并返回新铸的 messageId
+         * （与 DSH SubagentService.sendMessage 的 admission 结果同形）。
+         */
+        async sendMessage(parent, childId, content, options) {
+          const messageId = "wait-steer-message-" + (steered.length + 1);
+          steered.push({ parent, childId, content, options, messageId });
+          return messageId;
+        },
+      } : {}),
     },
   });
   host.apply();
   const root = host.registerRootAgent(ROOT_ID);
-  return { host, root, children };
+  return { host, root, children, steered };
 }
 
 /** 把 Promise 的最终状态投影成可断言的值（不 await，保持 pending 可见）。 */
@@ -142,7 +184,13 @@ async function startAdmission(host, root, prompt = "wait probe task", affectedPa
   );
 }
 
-/** 调用真实注册的 finalize 工具；execute 返回的 Promise 就是 root turn 的等待。 */
+/**
+ * 调用真实注册的 finalize 工具。
+ *
+ * 两阶段契约：这个 Promise 现在**立即**以非终态 waiting 回执收口（登记已完成，专家可能
+ * 仍在运行）。真正的等待与投递发生在 root turn 的 `agent/turn-stopping` 边界，见
+ * finalizeLifecycle。
+ */
 function finalize(host, root, outcomes, signal) {
   const list = Array.isArray(outcomes) ? outcomes : [outcomes];
   return host.toolDefinition("dsh_expert_group_finalize").execute({
@@ -154,14 +202,84 @@ function finalize(host, root, outcomes, signal) {
   }, { agent: root, ...(signal === undefined ? {} : { signal }) });
 }
 
-/** 让某个 admission 的 child turn 正常结束（turn/end 边界）。 */
-function endChildTurn(host, entry, turn = 1) {
+/**
+ * 两阶段收口的统一测试入口（保留 track() 的断言形状）。
+ *
+ * finalize 只做校验与登记并立即返回 waiting；继续等待由 root turn 的
+ * `agent/turn-stopping` serial 边界承担（与真实宿主同一顺序：工具返回后 turn 收尾）。
+ * 本 helper 把整条链路投影成一个 thenable，供既有 `track(finalizeLifecycle(...))` 用例
+ * 继续断言「等待是否仍在进行 / 是否已经收口」：
+ *
+ * - resolve 值 `{kind:"finalized", admissionEpoch, acceptedCount, reason:"finalized"}`：
+ *   等待释放，且插件确实为该批次投递了一次性收口消息（epoch / acceptedCount 取自被投递
+ *   消息的公开正文，不读取任何插件私有状态）；
+ * - resolve 值 `{kind:"cancelled"}`：等待被取消（payload.signal abort / root 退休 /
+ *   插件卸载）。取消不是终态收口，因此绝不谎报 finalized，也绝不投递结论；
+ * - finalize 自身被拒绝（校验失败）时原样返回该回执，保持既有 rejected 断言可用。
+ *
+ * 注意：**不**把 finalize 的 `exec.signal` 转发给 turn-stopping——那正是本契约要切断的
+ * 耦合（run_code 子执行结束不得取消 root turn 生命周期等待）；root turn 的 signal 由
+ * 用例显式驱动 `agent/turn-stopping` 时传入。
+ */
+function finalizeLifecycle(host, root, outcomes, signal) {
+  const list = Array.isArray(outcomes) ? outcomes : [outcomes];
+  const deliveredBefore = host.agentSteerMessages(root).length;
+  return (async () => {
+    const receipt = await finalize(host, root, outcomes, signal);
+    if (receipt.kind !== "waiting") return receipt;
+    // finalize 只登记：等待与投递都发生在本次 root turn 的 serial 边界。
+    const stop = stopRootTurn(host, root);
+    if (stop.pending === 0) return { kind: "cancelled", reason: "wait-not-engaged" };
+    await stop.settled;
+    const delivered = host.agentSteerMessages(root).slice(deliveredBefore);
+    if (delivered.length === 0) return { kind: "cancelled", reason: "wait-cancelled" };
+    const text = delivered.map((message) => message.content.map((block) => block.text).join("")).join("\n");
+    const accepted = /acceptedCount (\d+)/.exec(text);
+    const epoch = /admissionEpoch (\d+)/.exec(text);
+    return {
+      kind: "finalized",
+      admissionEpoch: Number(epoch?.[1] ?? list[0]?.admissionEpoch ?? 0),
+      acceptedCount: Number(accepted?.[1] ?? 0),
+      reason: "finalized",
+    };
+  })();
+}
+
+/**
+ * 构造一个 child turn/end 终态事件（同时写入该 turn 的事件日志）。
+ *
+ * 返回的事件对象可被同一同步批次**重投递**多次：真实 Host 的迟到副本携带的正是同一个
+ * event 对象，因此「首次 receipt 保留」的语义必须绑定 exact event 身份。
+ */
+function buildChildTurnEnd(entry, { turn, messageId, reason }) {
   entry.child.session.events = [
     { type: "turn/start", data: { turn } },
-    { type: "user/message", data: { id: entry.messageId, role: "user", content: [], source: { kind: "plugin:dsh-expert-group" } } },
+    { type: "user/message", data: { id: messageId, role: "user", content: [], source: { kind: "plugin:dsh-expert-group" } } },
     { type: "assistant/message", data: { turn, message: { content: [{ type: "text", text: "done" }] } } },
   ];
-  host.emit("session/event", entry.child.session, { type: "turn/end", data: { turn, reason: { kind: "completed" } } });
+  return { type: "turn/end", data: { turn, reason: reason ?? { kind: "completed" } } };
+}
+
+/**
+ * 为同一 child 写入「多个 turn 的完整事件日志」，并返回指定 turn 的终态事件对象。
+ *
+ * 为什么需要它：同一同步批次里先后发布两个不同 turn 的终态时，处理被延迟到 microtask，
+ * 而日志在同步阶段就已推进到更晚的 turn。真实 Host 的 session 日志是**单调追加**的，
+ * 因此每个 turn 自己的输出始终可见；夹具必须同形，否则「该 turn 没有输出」的假象会被
+ * 判成可恢复失败，进而错误打开 recovery gate（那是夹具缺陷，不是插件行为）。
+ */
+function buildChildMultiTurnEnd(entry, { turns, turn }) {
+  entry.child.session.events = turns.flatMap((item) => [
+    { type: "turn/start", data: { turn: item.turn } },
+    { type: "user/message", data: { id: item.messageId, role: "user", content: [], source: { kind: "plugin:dsh-expert-group" } } },
+    { type: "assistant/message", data: { turn: item.turn, message: { content: [{ type: "text", text: "done" }] } } },
+  ]);
+  return { type: "turn/end", data: { turn, reason: { kind: "completed" } } };
+}
+
+/** 让某个 admission 的 child turn 正常结束（turn/end 边界）。 */
+function endChildTurn(host, entry, turn = 1) {
+  host.emit("session/event", entry.child.session, buildChildTurnEnd(entry, { turn, messageId: entry.messageId }));
 }
 
 /** 父 inbox 收到精确关联的 child settlement（exact 完成通知）。 */
@@ -180,13 +298,500 @@ function assertNoGoalCalls(probe) {
   assert.deepEqual(probe.calls, [], "改造后不得调用任何 goal API（含只读 get）");
 }
 
+/** 真实 Host 自动完成通知的固定正文（完整前缀 + canonical child UUID）。 */
+function sourceLessNoticeText(childId) {
+  return "Background subagent " + childId + " finished and will do no further work unless you send it more.";
+}
+
+/**
+ * 发布一条真实形状的 agent/inbox/spliced（target=next-step）自动完成通知。
+ *
+ * 真实 Host 把自动完成消息作为 root Session 的 spliced 事件发布（而不是 guaranteed 的
+ * agent/inbox/inserted），因此「到达顺序」相关的用例必须走这条通道。seq 只在 safe-integer
+ * 时形成 delivery（去重）身份；缺失/非法值必须 fail-closed。
+ *
+ * @param {object} host - 受控 Host。
+ * @param {object} root - exact root Agent。
+ * @param {{childId?:string,seq?:number,source?:object,text?:string,target?:string}} options
+ */
+function emitSplicedNotice(host, root, { childId, seq, source, text, target = "next-step" }) {
+  return host.emit("session/event", root.session, {
+    ...(seq === undefined ? {} : { seq }),
+    type: "agent/inbox/spliced",
+    data: {
+      target,
+      inserted: [{
+        content: [{ type: "text", text: text === undefined ? sourceLessNoticeText(childId) : text }],
+        ...(source === undefined ? {} : { source }),
+      }],
+    },
+  });
+}
+
+/**
+ * 结束指定 messageId 所属的 turn。
+ *
+ * 同一 child 上可以有多个 admission（显式 childId 续作），每个 admission 归属自己那个
+ * turn：turn/end 的消息归属由该 turn 内的 user/message 决定，因此这里显式写事件，而不是
+ * 复用只支持单一 messageId 的 endChildTurn。
+ */
+function endChildTurnForMessage(host, entry, { turn, messageId }) {
+  host.emit("session/event", entry.child.session, buildChildTurnEnd(entry, { turn, messageId }));
+}
+
+/**
+ * 把 child 推到「宿主明确报告当前未运行」的状态。
+ *
+ * rc.2 校正：DSH rc.2 的 `Agent.status` 只有 `idle` / `running`（不存在 `ready`）；
+ * `idle` 表示当前没有在执行。child **不** dispose，会话仍驻留，因此 durable listing 的
+ * 行仍然是 `activity: "running"`——运行判定必须来自 exact `Agent.status`，而不是驻留标记。
+ *
+ * 为什么本组「work 账本精确性」用例必须先把静止证明固定下来：host/turn-wait 的放行条件是
+ * 「没有未结算 work」**且**「宿主明确报告没有正在运行的后代」。child 仍 running 时第二个
+ * 条件恒为假，任何 work 账本口径的错误（提前结算 / 错误消费）都不会改变 Promise 状态，
+ * 因此在那个窗口里没有公开可观察结果（插件不暴露 handoff/cohort/等待账本的只读投影）。
+ * 反过来，一旦静止证明成立，放行与否**只**由 work 账本决定——本组用例在断言窗口内不再改变
+ * child 的任何状态，所以结论不可能来自 idle/fallback 或超时。
+ */
+function quiesceChild(host, entry) {
+  host.setAgentStatus(entry.child, "idle");
+}
+
+test("真实 session/event spliced：唯一晚到 no-id 通知在 child turn 结束后释放 root", async () => {
+  const childId = "123e4567-e89b-12d3-a456-426614174000";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, childIdFactory: () => childId });
+  const outcome = await startAdmission(host, root, "spliced host completion", ["docs/spliced-host.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+  // 真实顺序：admission 后先结束 child turn；唯一通知只在 turn/end 之后到达。
+  endChildTurn(host, children[0]);
+  await flushAsyncWork(5);
+  assert.equal(pending.status, "pending", "turn-end 只有结束 cohort，不能凭空结算 no-id 通知");
+  host.emit("session/event", root.session, {
+    seq: 9001,
+    type: "agent/inbox/spliced",
+    data: { target: "next-step", inserted: [{ content: [
+      { type: "text", text: "Background subagent " + childId + " finished and will do no further work unless you send it more." },
+      { type: "text", text: "\nIts closing message: ignored" },
+    ] }] },
+  });
+  await flushAsyncWork(12);
+  assert.equal(pending.status, "pending", "完成通知不会覆盖 child 仍在运行的事实；必须等 idle 才能收口");
+  // 通知已在 child 仍 running 时到达；若未结算对应 cohort，后续 idle 会成为无法区分的假阳性。
+  // 因此先固定观察 pending，再推进唯一 child 的公开状态到 idle。
+  // work 账本本身是否被这条通知结算，由紧随其后的「late 通知的直接断言」用例在
+  // 「静止证明固定不变」的窗口里单独证明：那里 child 状态全程不变，放行只可能来自本次通知。
+  host.setAgentStatus(children[0].child, "idle");
+  await flushAsyncWork(8);
+  assert.equal(pending.status, "resolved", "唯一晚到 notice 到达并确认 child 静止后必须结算精确 cohort");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("spliced 自动完成身份保持 fail-closed：wrong child、用户消息和相似正文不释放", async () => {
+  const childId = "123e4567-e89b-12d3-a456-426614174001";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, childIdFactory: () => childId });
+  const outcome = await startAdmission(host, root, "spliced identity gates", ["docs/spliced-gates.md"]);
+  // 同正文但显式 user source 只表示用户输入，不得成为 child settlement；此时尚未建立 waiter。
+  host.emit("session/event", root.session, {
+    seq: 6999,
+    type: "agent/inbox/spliced",
+    data: { target: "next-step", inserted: [{
+      content: [{ type: "text", text: "Background subagent " + childId + " finished and will do no further work unless you send it more." }],
+      source: { kind: "user" },
+    }] },
+  });
+  await flushAsyncWork(5);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  host.emit("agent/inbox/inserted", {
+    agent: root,
+    message: { content: [{ type: "text", text: "Background subagent " + childId + " finished and will do no further work unless you send it more." }] },
+  });
+  await flushAsyncWork(5);
+  endChildTurn(host, children[0]);
+  await flushAsyncWork(5);
+  const emit = (message, seq, source) => host.emit("session/event", root.session, {
+    seq,
+    type: "agent/inbox/spliced",
+    data: { target: "next-step", inserted: [{ content: message, ...(source === undefined ? {} : { source }) }] },
+  });
+  emit([{ type: "text", text: "Background subagent 123e4567-e89b-12d3-a456-426614174099 finished and will do no further work unless you send it more." }], 7001);
+  emit([{ type: "text", text: "Background subagent not-a-uuid finished and will do no further work unless you send it more." }], 7002);
+  emit([{ type: "text", text: "Background subagent " + childId + " finished and will do no further work unless you send it more." }]);
+  emit([{ type: "text", text: "Background subagent " + childId + " finished and will do no further work unless you send it more." }], Number.MAX_SAFE_INTEGER + 1);
+  emit([{ type: "text", text: "Background subagent " + childId + " finished and will do no further work unless you send it more." }], 7003, { kind: "user" });
+  emit([{ type: "text", text: "Background subagent " + childId + " finished and will do no further work unless you send it more" }], 7004);
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+  assertNoGoalCalls(probe);
+});
+
+// ── 到达顺序与 work 账本精确性（Oracle 复现缺陷的回归）──────────────────────
+//
+// 本组用例全部走公开 Host fixture seam：真实 session/event 的 agent/inbox/spliced 通知、
+// child session 的 turn/end、agent/status 与公开 finalize 工具。断言对象是唯一的外部结果
+// （finalize Promise 的状态），并把「宿主明确报告无 running 后代」这一条件在断言窗口内
+// 固定不变——因此任何放行都只能来自 work 账本口径的结算（见 quiesceChild 的说明）。
+
+test("同批次 notice 先发布、turn/end 随后发布：不得消费未来终态证据", async () => {
+  const childId = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, childIdFactory: () => childId });
+  const outcome = await startAdmission(host, root, "order notice-first", ["docs/order-notice-first.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+  assert.equal(pending.status, "pending", "turn 尚未结束时静止证明不能放行任何 work");
+
+  // 同一同步批次：先发布 source-less 完成通知，随后才发布 child turn/end。
+  // 通知在接收顺序上早于终态事件，因此它证明不了那个 turn 已完成 → 必须拒绝。
+  emitSplicedNotice(host, root, { childId, seq: 4101 });
+  endChildTurn(host, children[0]);
+  await flushAsyncWork(24);
+  assert.equal(pending.status, "pending",
+    "notice 先于 turn/end 发布时不得消费该终态：它属于「未来证据」，消费会凭空结算 work");
+
+  // 随后一条真正晚到的通知（新 seq，且终态早已到达）必须仍能精确结算本轮 work。
+  // 这同时证明上一步的 pending 不是「管线被卡死」，而是精确边界。
+  emitSplicedNotice(host, root, { childId, seq: 4102 });
+  await flushAsyncWork(20);
+  assert.equal(pending.status, "resolved", "晚到且终态更早的通知必须精确结算对应 work");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("同批次 turn/end 先发布、notice 随后发布：合法顺序必须由通知结算", async () => {
+  const childId = "3f2504e0-4f89-41d3-9a0c-0305e82c3305";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, childIdFactory: () => childId });
+  const outcome = await startAdmission(host, root, "order turn-end-first", ["docs/order-turn-end-first.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+
+  // 同一同步批次：先发布 child turn/end，随后发布 source-less 完成通知。
+  // turn/end 的接收顺序更早，因此这条通知必须结算（过紧的实现会让它永久悬挂）。
+  endChildTurn(host, children[0]);
+  emitSplicedNotice(host, root, { childId, seq: 4201 });
+  await flushAsyncWork(24);
+  assert.equal(pending.status, "resolved",
+    "turn/end 先发布的同一批次里，随后到达的通知必须精确结算本轮 work");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("late 通知的直接断言：child 静止证明固定不变时，通知本身即结算 work 账本", async () => {
+  const childId = "3f2504e0-4f89-41d3-9a0c-0305e82c3304";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, childIdFactory: () => childId });
+  const outcome = await startAdmission(host, root, "late direct", ["docs/late-direct.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+
+  // 静止证明先到位并稳定下来（此后 child 状态全程不变）。
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+  assert.equal(pending.status, "pending");
+
+  // 终态事件先到、通知后到（真实线上的「晚到通知」形状）。
+  endChildTurn(host, children[0]);
+  await flushAsyncWork(12);
+  assert.equal(pending.status, "pending",
+    "turn/end 只有终态事实：在没有通知结算 work 时不得靠静默重查放行");
+
+  emitSplicedNotice(host, root, { childId, seq: 4401 });
+  await flushAsyncWork(20);
+  assert.equal(pending.status, "resolved",
+    "work 账本只能由这条 exact 通知结算；本断言窗口内 child 状态从未改变");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("结构化（带 message.id）通知仍按既有语义结算 work 账本：直接断言", async () => {
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe });
+  const outcome = await startAdmission(host, root, "structured direct", ["docs/structured-direct.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+  endChildTurn(host, children[0]);
+  await flushAsyncWork(12);
+  assert.equal(pending.status, "pending");
+
+  // 结构化通知（subagent-settled + 稳定 message.id）走既有兼容路径：它必须独立结算 work。
+  insertNotice(host, root, children[0], "fb-structured-direct");
+  await flushAsyncWork(20);
+  assert.equal(pending.status, "resolved", "结构化通知的结算语义不得被 source-less 修复改变");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("同一 child/activation：notice 只标记真正结束的 admission，未结束者随后结束也不得被结算", async () => {
+  const childId = "3f2504e0-4f89-41d3-9a0c-0305e82c3302";
+  const probe = createGoalProbe();
+  const { host, root, children, steered } = createWaitHost({
+    goalProbe: probe,
+    childIdFactory: () => childId,
+    steerSeam: true,
+  });
+  const first = await startAdmission(host, root, "A still running turn", ["docs/a-still-running.md"]);
+  assert.equal(first.kind, "continuable");
+  // 显式续作：把第二个 admission 放到**同一个 child/activation** 上（不新建 child）。
+  const second = await startAdmission(host, root, "B finished turn", ["docs/b-finished.md"], {
+    childId,
+    queue: true,
+  });
+  assert.equal(second.kind, "continuable");
+  assert.equal(second.subagentId, childId, "显式续作必须投递给同一个 child");
+  assert.equal(steered.length, 1, "续作必须经公开 sendMessage seam 投递");
+  assert.equal(children.length, 1, "续作不得新建 child");
+  assert.notEqual(second.messageId, first.messageId, "两个 admission 各自持有自己的 messageId");
+
+  const pending = track(finalizeLifecycle(host, root, [first, second]));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+
+  // B（第二个 admission）所在 turn 先结束；A 所在 turn 仍未结束。
+  endChildTurnForMessage(host, children[0], { turn: 2, messageId: second.messageId });
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  // 唯一的通知只证明「B 所在 turn 已完成」：它绝不能顺带把 A 也标成已反馈。
+  emitSplicedNotice(host, root, { childId, seq: 4301 });
+  await flushAsyncWork(14);
+  assert.equal(pending.status, "pending", "A 仍未结束：通知不得结算 A 的 work");
+
+  // A 所在 turn 随后结束，但没有任何新通知：A 必须保持「未收到反馈」。
+  endChildTurnForMessage(host, children[0], { turn: 1, messageId: first.messageId });
+  await flushAsyncWork(20);
+  assert.equal(pending.status, "pending",
+    "A 结束后没有新通知时不得凭错误镜像标记提前结算 A 的 work");
+
+  // 新的合法通知（新 seq、且 A 的终态接收顺序更早）仍然可以精确结算 A。
+  emitSplicedNotice(host, root, { childId, seq: 4302 });
+  await flushAsyncWork(20);
+  assert.equal(pending.status, "resolved");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("跨轮同 seq 重放不得消费未来 entry，新 seq 的下一轮通知仍可结算", async () => {
+  const childId = "3f2504e0-4f89-41d3-9a0c-0305e82c3306";
+  const probe = createGoalProbe();
+  const { host, root, children, steered } = createWaitHost({
+    goalProbe: probe,
+    childIdFactory: () => childId,
+    steerSeam: true,
+  });
+  const first = await startAdmission(host, root, "round one", ["docs/round-one.md"]);
+  const second = await startAdmission(host, root, "round two", ["docs/round-two.md"], { childId, queue: true });
+  assert.equal(steered.length, 1);
+  const pending = track(finalizeLifecycle(host, root, [first, second]));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+
+  // 第一轮：turn 2 结束 + 唯一通知（seq 4501）精确结算第二个 admission。
+  endChildTurnForMessage(host, children[0], { turn: 2, messageId: second.messageId });
+  await flushAsyncWork(10);
+  emitSplicedNotice(host, root, { childId, seq: 4501 });
+  await flushAsyncWork(14);
+  assert.equal(pending.status, "pending", "第一轮的 work 已结算，但第二轮的 work 仍未结算");
+
+  // 第二轮：turn 1 结束；随后重放**同一条 delivery**（同 seq）。它没有新的 delivery 身份，
+  // 绝不能消费这一轮的 entry。
+  endChildTurnForMessage(host, children[0], { turn: 1, messageId: first.messageId });
+  await flushAsyncWork(12);
+  emitSplicedNotice(host, root, { childId, seq: 4501 });
+  await flushAsyncWork(20);
+  assert.equal(pending.status, "pending", "同 seq 重放不得消费未来 entry（delivery 身份只用于去重）");
+
+  // 真正的新一轮通知（新 seq）仍然可以结算。
+  emitSplicedNotice(host, root, { childId, seq: 4502 });
+  await flushAsyncWork(20);
+  assert.equal(pending.status, "resolved");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("身份账本饱和后的 early source-less 通知：不得排队，也不得在未来 turn/end 被消费", async () => {
+  const childId = "3f2504e0-4f89-41d3-9a0c-0305e82c3303";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, childIdFactory: () => childId });
+  const outcome = await startAdmission(host, root, "saturation probe", ["docs/saturation.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+
+  // 用 4096 条互不相同的 delivery 身份灌满该 child 的身份账本（FEEDBACK_DELIVERY_LIMIT）。
+  // 这些通知都在 child turn 结束之前到达，因此不会消费任何 work，也不建立 marker。
+  for (let index = 0; index < 4096; index += 1) emitSplicedNotice(host, root, { childId, seq: 5000 + index });
+  await flushAsyncWork(8);
+  assert.equal(pending.status, "pending", "turn 未结束时任何 early 通知都不得结算 work");
+
+  // 账本饱和后的下一条 early source-less 通知没有任何可证明的身份：必须直接拒绝，
+  // 绝不能退化成 generic 无身份队列（那会在随后的 turn/end 消费未来 entry）。
+  emitSplicedNotice(host, root, { childId, seq: 90000 });
+  await flushAsyncWork(8);
+  assert.equal(pending.status, "pending");
+
+  endChildTurn(host, children[0]);
+  await flushAsyncWork(24);
+  assert.equal(pending.status, "pending",
+    "饱和后的 source-less 通知不得在未来 turn/end 被消费：那会凭空结算 work 并提前放行");
+  assertNoGoalCalls(probe);
+});
+
+test("同一终态 event 对象重投递：保留首次 receipt，合法通知仍精确结算", async () => {
+  const childId = "3f2504e0-4f89-41d3-9a0c-0305e82c3311";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, childIdFactory: () => childId });
+  const outcome = await startAdmission(host, root, "redelivered terminal", ["docs/redelivered-terminal.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+
+  // 同一同步批次、无任何异步间隔：终态 event E → 合法 source-less 通知 → 重投递同一个 E。
+  // 重投递不是新终态，绝不能把 receipt 推到通知之后；否则这条身份已被 claim 的合法通知
+  // 会被永久拒绝，且没有新事件能救回 → finalize 挂住。
+  const terminal = buildChildTurnEnd(children[0], { turn: 1, messageId: children[0].messageId });
+  host.emit("session/event", children[0].child.session, terminal);
+  emitSplicedNotice(host, root, { childId, seq: 4601 });
+  host.emit("session/event", children[0].child.session, terminal);
+  await flushAsyncWork(24);
+  assert.equal(pending.status, "resolved",
+    "同一终态 event 重投递必须保留首次 receipt：晚于通知的序号是重投递，不是新终态证据");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("同一终态以同一 event.seq 重投递（新对象）：按同一终态保留首次 receipt", async () => {
+  const childId = "3f2504e0-4f89-41d3-9a0c-0305e82c3314";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, childIdFactory: () => childId });
+  const outcome = await startAdmission(host, root, "seq identity terminal", ["docs/seq-identity-terminal.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+
+  // 既有 session/event 契约里 seq 是同一 Session 内单调的投递身份：宿主重放同一事件时
+  // 可能重新构造对象但保留 seq。这种形状与「同一个 event 对象」等价，仍属同一终态。
+  buildChildTurnEnd(children[0], { turn: 1, messageId: children[0].messageId });
+  host.emit("session/event", children[0].child.session, {
+    seq: 7001,
+    type: "turn/end",
+    data: { turn: 1, reason: { kind: "completed" } },
+  });
+  emitSplicedNotice(host, root, { childId, seq: 4901 });
+  host.emit("session/event", children[0].child.session, {
+    seq: 7001,
+    type: "turn/end",
+    data: { turn: 1, reason: { kind: "completed" } },
+  });
+  await flushAsyncWork(24);
+  assert.equal(pending.status, "resolved",
+    "同一 seq 的新对象是同一终态：必须保留首次 receipt，合法通知仍要精确结算");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("新终态不得借最早 receipt 消费：不同 event 对象（同一 turn）必须重置", async () => {
+  const childId = "3f2504e0-4f89-41d3-9a0c-0305e82c3312";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, childIdFactory: () => childId });
+  const outcome = await startAdmission(host, root, "new terminal identity", ["docs/new-terminal-identity.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+
+  // 同一批次：终态 event E1 → 通知 → **另一个**终态 event 对象（同一 turn）。
+  // 不同事件身份属于新终态证据，必须重置 receipt：E1 之前/之间的通知无权消费它。
+  const first = buildChildTurnEnd(children[0], { turn: 1, messageId: children[0].messageId });
+  host.emit("session/event", children[0].child.session, first);
+  emitSplicedNotice(host, root, { childId, seq: 4701 });
+  host.emit("session/event", children[0].child.session, {
+    type: "turn/end",
+    data: { turn: 1, reason: { kind: "completed" } },
+  });
+  await flushAsyncWork(24);
+  assert.equal(pending.status, "pending",
+    "新 event 身份是新的终态证据：不得借用最早 receipt 让早于它的通知消费");
+
+  // 真正晚到的新通知仍可精确结算（管线没有被卡死）。
+  emitSplicedNotice(host, root, { childId, seq: 4702 });
+  await flushAsyncWork(20);
+  assert.equal(pending.status, "resolved");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("新终态不得借最早 receipt 消费：同一 entry 的新 turn 必须重置", async () => {
+  const childId = "3f2504e0-4f89-41d3-9a0c-0305e82c3313";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, childIdFactory: () => childId });
+  const outcome = await startAdmission(host, root, "new turn terminal", ["docs/new-turn-terminal.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  quiesceChild(host, children[0]);
+  await flushAsyncWork(8);
+
+  // 同一 entry 先后承载两个 turn 的终态：通知夹在中间。
+  // 新 turn 是**新终态**，绝不能沿用最早 receipt（那会让未来通知错配到更晚的终态）。
+  // 同一同步批次内两个不同 turn 的终态：事件日志必须同时包含两个 turn 的段落
+  // （真实 Host 的日志是单调追加的，microtask 延迟处理时仍能看到各个 turn 自己的输出）。
+  const turns = [{ turn: 1, messageId: children[0].messageId }, { turn: 2, messageId: children[0].messageId }];
+  host.emit("session/event", children[0].child.session, buildChildMultiTurnEnd(children[0], { turns, turn: 1 }));
+  emitSplicedNotice(host, root, { childId, seq: 4801 });
+  host.emit("session/event", children[0].child.session, buildChildMultiTurnEnd(children[0], { turns, turn: 2 }));
+  await flushAsyncWork(24);
+  assert.equal(pending.status, "pending",
+    "同一 entry 的新 turn 必须重置 receipt：不得对同 entry 跨 turn 取全局最早序号");
+
+  emitSplicedNotice(host, root, { childId, seq: 4802 });
+  await flushAsyncWork(20);
+  assert.equal(pending.status, "resolved");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
 // ── 1. 等待不超时且保持 Promise pending ─────────────────────────────────────
 
 test("等待保持 pending：child 仍在运行时 finalize 的 Promise 永不超时收口", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
 
   // 推进大量宏任务/微任务轮次：等待不得因为任何计时/轮询而自行收口。
   await flushAsyncWork(40);
@@ -194,7 +799,8 @@ test("等待保持 pending：child 仍在运行时 finalize 的 Promise 永不�
 
   // 真实完成：turn 结束 + child 停止 + 精确通知。
   endChildTurn(host, children[0]);
-  host.setAgentStatus(children[0].child, "ready");
+  // rc.2：Agent.status 只有 idle/running；idle 表示当前未运行（不再用 ready）。
+  host.setAgentStatus(children[0].child, "idle");
   insertNotice(host, root, children[0], "wait-feedback-1");
   await flushAsyncWork(12);
 
@@ -214,7 +820,7 @@ test("exact notice 释放：turn/end + 精确关联 settlement 让等待收口",
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   endChildTurn(host, children[0]);
@@ -233,7 +839,7 @@ test("重复 / 他 root / 旧代际 notice 不释放正在等待的 root", async
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const other = host.registerRootAgent("root-other");
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
   assert.equal(pending.status, "pending");
 
@@ -280,7 +886,7 @@ test("完成通知缺失时：root-scoped 明确无 running 后代即释放", as
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
   assert.equal(pending.status, "pending");
 
@@ -300,7 +906,7 @@ test("child dispose 后（从 live 注册表消失）也能在无通知时释放
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   endChildTurn(host, children[0]);
@@ -318,9 +924,10 @@ test("后代查询失败（provider 抛错且无权威 listing）时继续等待
     goalProbe: probe,
     sessionActivity: "throw",
     descendantListing: "missing",
+    rootChildren: null,
   });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   endChildTurn(host, children[0]);
@@ -336,15 +943,73 @@ test("后代查询失败（provider 抛错且无权威 listing）时继续等待
   assertNoGoalCalls(probe);
 });
 
+test("后代快照瞬时失败后：没有新事件也必须退避重查并释放", async () => {
+  let calls = 0;
+  const root = { id: "retry-root" };
+  const registry = createRootTurnWaitRegistry({
+    isLiveRoot: () => true,
+    subscribe: () => () => {},
+    snapshotDescendants: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("transient listing failure");
+      return { known: true, running: [], runningIds: new Set() };
+    },
+  });
+
+  // 本用例没有 outstanding work，等待只验证快照失败后的退避复查。
+  const pending = track(registry.wait(root));
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await flushAsyncWork(8);
+
+  assert.ok(calls >= 2, "瞬时查询失败后必须在没有新事件时自动重查");
+  assert.equal(pending.status, "resolved");
+  assert.deepEqual(pending.value, { released: true, reason: "quiescent" });
+  registry.dispose();
+});
+
+test("child 静默结束后：已结算工作不能因缺少 agent/status 事件永久等待", async () => {
+  let childRunning = true;
+  const root = { id: "silent-child-root" };
+  const registry = createRootTurnWaitRegistry({
+    isLiveRoot: () => true,
+    subscribe: () => () => {},
+    snapshotDescendants: async () => {
+      const running = childRunning ? [{ id: "silent-child" }] : [];
+      return { known: true, running, runningIds: new Set(running.map((child) => child.id)) };
+    },
+  });
+  const work = { kind: "admission", token: "silent-child-work" };
+
+  registry.track(root, work);
+  const pending = track(registry.wait(root));
+  await flushAsyncWork(8);
+  assert.equal(pending.status, "pending");
+
+  // 精确完成通知已经结算工作，但宿主暂时仍报告 child running。
+  assert.equal(registry.settle(root, work), true);
+  await flushAsyncWork(8);
+  assert.equal(pending.status, "pending");
+
+  // 模拟 durable child 进入 ready，但宿主没有发出 agent/status/disposed 事件。
+  childRunning = false;
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await flushAsyncWork(8);
+
+  assert.equal(pending.status, "resolved", "没有状态事件也必须通过后代快照重查发现 child 已结束");
+  assert.deepEqual(pending.value, { released: true, reason: "quiescent" });
+  registry.dispose();
+});
+
 test("后代 seam 缺失（无 listing、无 provider）时必须继续等待：无 provider ≠ 明确空", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({
     goalProbe: probe,
     sessionActivity: "missing",
     descendantListing: "missing",
+    rootChildren: null,
   });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   // 工作已经用 exact notice 精确结算、child 也明确不再运行；但**没有任何 seam 能证明**
@@ -361,16 +1026,17 @@ test("权威 listing 明确返回空后代时才释放（provider 存在且明�
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe, descendantListing: "subagent" });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
   assert.equal(pending.status, "pending", "child 仍在运行时不得释放");
 
-  // 权威 seam 现在能明确回答「该 root 没有任何 running 后代」。
+  // 权威 seam 明确回答：catalog 里该 child 仍然驻留（activity=running），
+  // 但 exact Agent.status=idle ⇒ rc.2 判「当前未运行」⇒ 允许放行。
   endChildTurn(host, children[0]);
   host.setAgentStatus(children[0].child, "idle");
   insertNotice(host, root, children[0], "fb-listing-empty");
   await flushAsyncWork(20);
-  assert.equal(pending.status, "resolved", "确有 provider 且明确返回空列表时必须释放");
+  assert.equal(pending.status, "resolved", "驻留行 + Agent.status=idle 必须放行");
   assert.equal(pending.value.kind, "finalized");
   assertNoGoalCalls(probe);
 });
@@ -387,14 +1053,18 @@ test("权威 listing 明确返回空后代时才释放（provider 存在且明�
  * 因此 `mode` 不是可选装饰：它是这条行的生命周期判别字段。真实
  * `listDescendants` 已经把 catalog 里 `mode:"unknown"` 的条目转成
  * `kind:"diagnostic"`，所以 child 行出现**缺失**或**非法** `mode` 只可能说明这份
- * listing 不是公开契约的形状（伪造 / 截断 / 跨版本错配）。这种情况下
- * `activity:"inactive"` **不能**当作静止证据——整次结果按 unknown 处理，等待继续。
+ * listing 不是公开契约的形状（伪造 / 截断 / 跨版本错配）。
+ *
+ * rc.2 补充：契约行成立之后，`activity` 只表达 **session residency**（驻留的 idle child
+ * 仍报 `running`），它**永远不能**单独证明静止；运行判定必须由 exact `Agent.status`
+ * 交叉校验。因此合同不成立、缺少 exact live Agent、状态非法（含 ready）、重复 id、
+ * 血缘或 parentId/depth 冲突、runtime 快照不可用时，整次结果都按 unknown 处理。
  */
-test("权威 listing 的合法 inactive child 行可证明静止（行形状符合公开 contract）", async () => {
+test("权威 listing 的驻留行 + exact Agent.status=idle 才证明静止（行形状符合公开 contract）", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
   assert.equal(pending.status, "pending", "child 仍在运行时不得释放");
 
@@ -411,29 +1081,34 @@ test("权威 listing 的合法 inactive child 行可证明静止（行形状符�
   assert.equal(rows[0].depth, 1, "直接子代的 depth 必须是 1");
   assert.equal(rows[0].activity, "running");
 
-  // child 真正结束：listing 给出一行**合法**的 inactive child——这是可证明的静止。
+  // child 真正结束：行仍然是合法的驻留行（activity=running），静止证据来自 exact Agent.status。
   endChildTurn(host, children[0]);
   host.setAgentStatus(children[0].child, "idle");
   insertNotice(host, root, children[0], "fb-legal-inactive");
   await flushAsyncWork(20);
-  assert.equal(pending.status, "resolved", "合法 inactive child 行由权威 listing 证明静止，必须放行");
+  assert.equal(pending.status, "resolved", "Agent.status=idle 由 rc.2 判「当前未运行」，必须放行");
+  assert.equal(
+    host.listHarnessDescendants(root.id)[0].activity,
+    "running",
+    "会话仍驻留：activity 恒为 running，放行只能来自 Agent.status",
+  );
   assert.equal(pending.value.kind, "finalized");
   assertNoGoalCalls(probe);
 });
 
-test("权威 listing 的 inactive child 行缺少 mode 时不得当作静止（等待继续 pending）", async () => {
+test("权威 listing 的 child 行缺少 mode 时整次 listing 不可信（等待继续 pending）", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({
     goalProbe: probe,
-    // 显式删掉 mode：行的其余字段（含 activity:"inactive"）都「看起来静止」，
-    // 但缺了判别字段的 listing 不是公开契约的形状。
+    // 显式删掉 mode：行的其余字段都合法（且 exact Agent 已 idle），但缺了判别字段的
+    // listing 不是公开契约的形状，整次结果必须按 unknown 处理。
     descendantRowTransform: (row) => {
       const { mode, ...rest } = row;
       return rest;
     },
   });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
   assert.equal(pending.status, "pending");
 
@@ -444,12 +1119,12 @@ test("权威 listing 的 inactive child 行缺少 mode 时不得当作静止（�
   assert.equal(
     pending.status,
     "pending",
-    "mode 缺失的 child 行不是合法契约行：整次 listing 视为 unknown，不得按 inactive child 放行",
+    "mode 缺失的 child 行不是合法契约行：整次 listing 视为 unknown，不得据此放行",
   );
   assertNoGoalCalls(probe);
 });
 
-test("权威 listing 的 inactive child 行 mode 非法时不得当作静止（等待继续 pending）", async () => {
+test("权威 listing 的 child 行 mode 非法时整次 listing 不可信（等待继续 pending）", async () => {
   // "unknown" 是真实 catalog 的第三个取值（listing 必须把它转成 diagnostic 行），
   // "paused" 是任意无关字符串，"" 是空值：三者都不是公开契约的 mode 枚举。
   for (const illegalMode of ["unknown", "paused", ""]) {
@@ -459,7 +1134,7 @@ test("权威 listing 的 inactive child 行 mode 非法时不得当作静止（�
       descendantRowTransform: (row) => ({ ...row, mode: illegalMode }),
     });
     const outcome = await startAdmission(host, root);
-    const pending = track(finalize(host, root, outcome));
+    const pending = track(finalizeLifecycle(host, root, outcome));
     await flushAsyncWork(8);
 
     endChildTurn(host, children[0]);
@@ -490,7 +1165,7 @@ test("权威 listing 的 child 行缺少其他必填字段时同样不得当作�
       descendantRowTransform: transform,
     });
     const outcome = await startAdmission(host, root);
-    const pending = track(finalize(host, root, outcome));
+    const pending = track(finalizeLifecycle(host, root, outcome));
     await flushAsyncWork(8);
 
     endChildTurn(host, children[0]);
@@ -512,9 +1187,11 @@ test("只有 waterfall（无权威 listing）时：provider 原样透传不能�
     goalProbe: probe,
     sessionActivity: "subagent",
     descendantListing: "missing",
+    // 同时没有 agents.list()：否则 runtime fallback 会先给出明确结论，这条 seam 根本不会被走到。
+    rootChildren: null,
   });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   // provider 装载着，但它在「没有 running 后代」时是 `return rest`（原样透传最内层
@@ -549,10 +1226,11 @@ test("waterfall-only：其他 listener 返回的全新空数组不能证明静�
     goalProbe: probe,
     sessionActivity: "subagent",
     descendantListing: "missing",
+    rootChildren: null,
   });
   const stopListener = registerFreshEmptyActivityListener(host);
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
   assert.equal(pending.status, "pending", "child 仍在运行时不得释放");
 
@@ -573,9 +1251,10 @@ test("waterfall-only：确有 running subagent 后代时继续等待（只作正
     goalProbe: probe,
     sessionActivity: "subagent",
     descendantListing: "missing",
+    rootChildren: null,
   });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   // 正向事实：waterfall 明确报出 kind=subagent 的 running 后代。
@@ -601,10 +1280,11 @@ test("waterfall-only：malformed 形状（subagent 族 items 非数组）同样�
     goalProbe: probe,
     sessionActivity: "subagent",
     descendantListing: "missing",
+    rootChildren: null,
   });
   const stopListener = host.context.on("workspace/session-activity", () => [{ kind: "subagent", items: "not-an-array" }]);
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   endChildTurn(host, children[0]);
@@ -621,7 +1301,7 @@ test("权威 listing 优先：waterfall 只给全新空数组时，listing 的�
   const { host, root, children } = createWaitHost({ goalProbe: probe, descendantListing: "subagent" });
   const stopListener = registerFreshEmptyActivityListener(host);
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
   assert.equal(pending.status, "pending", "child 仍在运行时不得释放");
 
@@ -629,7 +1309,11 @@ test("权威 listing 优先：waterfall 只给全新空数组时，listing 的�
   host.setAgentStatus(children[0].child, "idle");
   insertNotice(host, root, children[0], "fb-listing-wins");
   await flushAsyncWork(24);
-  assert.equal(pending.status, "resolved", "权威 listing 的干净完整 listing 是唯一静止证明");
+  assert.equal(
+    pending.status,
+    "resolved",
+    "权威 listing + 同一份 exact runtime snapshot 是唯一可证明的静止来源",
+  );
   assert.equal(pending.value.kind, "finalized");
   stopListener();
   assertNoGoalCalls(probe);
@@ -639,7 +1323,7 @@ test("listing 报出不可读分支（diagnostic）时继续等待", async () =>
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe, descendantListing: "diagnostic" });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   endChildTurn(host, children[0]);
@@ -654,7 +1338,7 @@ test("listing 整条 reject 时继续等待", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe, descendantListing: "throw" });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   endChildTurn(host, children[0]);
@@ -665,11 +1349,11 @@ test("listing 整条 reject 时继续等待", async () => {
   assertNoGoalCalls(probe);
 });
 
-test("能力诊断：权威 listing 缺失即降级，事件服务也缺失才算 unavailable", async () => {
+test("能力诊断：权威 listing 缺失但有可调用的 agents.list() 仍降级，三者全缺才 unavailable", async () => {
   const probe = createGoalProbe();
-  // 只有 waterfall：不能只凭「ctx.waterfall 是函数」就报 available——那只能证明 Cordis
-  // 事件服务在，不能证明有任何 provider 能给出可证明的静止结论。
-  const degraded = createWaitHost({ goalProbe: probe, descendantListing: "missing" });
+  // 只有 waterfall（listing 与 agents.list() 都没有）：不能只凭「ctx.waterfall 是函数」就报
+  // available——那只能证明 Cordis 事件服务在，不能证明有任何 provider 能给出可证明的静止结论。
+  const degraded = createWaitHost({ goalProbe: probe, descendantListing: "missing", rootChildren: null });
   const degradedMeta = await degraded.host.invokeConnection(RPC_ENDPOINT, { action: "meta" });
   assert.equal(degradedMeta.value.capabilities.host.rootTurnWait.status, "degraded");
   assert.equal(
@@ -677,12 +1361,29 @@ test("能力诊断：权威 listing 缺失即降级，事件服务也缺失才�
     "root-turn-wait-descendant-listing-unavailable",
   );
 
-  // 连 Cordis 事件服务都没有：unavailable。
+  // strict runtime-only fallback（listing 缺、agents.list() 可调用、waterfall 也缺）：仍然能给出
+  // 可证明的状态 ⇒ degraded + 同一个 listing-unavailable reason，绝不是 unavailable。
+  const runtimeOnly = createWaitHost({
+    goalProbe: probe,
+    descendantListing: "missing",
+    sessionActivity: "missing",
+    sessionActivityTransport: false,
+    rootChildren: "live",
+  });
+  const runtimeOnlyMeta = await runtimeOnly.host.invokeConnection(RPC_ENDPOINT, { action: "meta" });
+  assert.equal(runtimeOnlyMeta.value.capabilities.host.rootTurnWait.status, "degraded");
+  assert.equal(
+    runtimeOnlyMeta.value.capabilities.host.rootTurnWait.degradation,
+    "root-turn-wait-descendant-listing-unavailable",
+  );
+
+  // listing、agents.list() 与 Cordis 事件服务都没有：unavailable。
   const unavailable = createWaitHost({
     goalProbe: probe,
     descendantListing: "missing",
     sessionActivity: "missing",
     sessionActivityTransport: false,
+    rootChildren: null,
   });
   const unavailableMeta = await unavailable.host.invokeConnection(RPC_ENDPOINT, { action: "meta" });
   assert.equal(unavailableMeta.value.capabilities.host.rootTurnWait.status, "unavailable");
@@ -699,6 +1400,41 @@ test("能力诊断：权威 listing 缺失即降级，事件服务也缺失才�
   assertNoGoalCalls(probe);
 });
 
+test("rc.2：runtime 快照里当前 root 自带字符串 parentSession（root→child→root 环）时必须 fail-closed", async () => {
+  // snapshotRootTurnDescendants() 的 rootId 优先级**不能**绕过 root 自身的身份校验：
+  // 若快照里的当前 root 声称自己有父会话，就只能继续等待（绝不因 lineage 捷径放行）。
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({
+    goalProbe: probe,
+    // 用一份「自称有父会话」的 root 副本替换快照里的 root。
+    rootChildren: () => {
+      const live = host.agents.roots();
+      const [first, ...rest] = live;
+      const cyclic = {
+        id: first.id,
+        status: "idle",
+        session: { header: { ...first.session.header, parentSession: children[0].childId } },
+      };
+      return [cyclic, ...rest];
+    },
+  });
+  const outcome = await startAdmission(host, root, "cyclic root probe", ["docs/rc2-cyclic-root.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending");
+
+  // 本树 child 已结算、catalog 仍是合法驻留行：仍必须等待（root 身份不可解释）。
+  endChildTurn(host, children[0]);
+  host.setAgentStatus(children[0].child, "idle");
+  insertNotice(host, root, children[0], "fb-rc2-cyclic-root");
+  await flushAsyncWork(24);
+  assert.equal(
+    pending.status,
+    "pending",
+    "root 自身的 parentSession 不可解释时必须 fail-closed",
+  );
+  assertNoGoalCalls(probe);
+});
 // ── 5. 多 child / 部分完成不提前释放 ────────────────────────────────────────
 
 test("多 child 部分完成不提前释放：最后一个 admission 结束才收口", async () => {
@@ -710,7 +1446,7 @@ test("多 child 部分完成不提前释放：最后一个 admission 结束才�
   assert.equal(second.kind, "continuable");
   assert.equal(children.length, 2, "两次不同任务必须各自新建 child");
 
-  const pending = track(finalize(host, root, [first, second]));
+  const pending = track(finalizeLifecycle(host, root, [first, second]));
   await flushAsyncWork(8);
   assert.equal(pending.status, "pending");
 
@@ -782,7 +1518,7 @@ test("竞态保护：等待期间新登记的工作让旧静止结论作废", as
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   // 让第一个 child 明确结束（静止判定本应成立）。
@@ -807,63 +1543,68 @@ test("竞态保护：等待期间新登记的工作让旧静止结论作废", as
 
 // ── 7. 生命周期：dispose / 代际替换 / 卸载 ─────────────────────────────────
 
-test("root dispose 取消等待：Promise 以 root-wait-cancelled 收口且清理监听", async () => {
+test("root dispose 取消等待：批次保持未收口、不投递结论，且监听不泄漏", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  // finalize 只登记：等待发生在 root turn 的 serial 边界。
+  const waiting = await finalize(host, root, outcome);
+  assert.equal(waiting.kind, "waiting");
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1);
   await flushAsyncWork(8);
-  assert.equal(pending.status, "pending");
-
   const listenersBefore = host.listenerCount("agent/turn-stopping");
   host.disposeAgent(root);
   await flushAsyncWork(12);
 
-  assert.equal(pending.status, "resolved");
-  assert.equal(pending.value.kind, "rejected");
-  assert.equal(pending.value.reason, "root-wait-cancelled");
-  assert.ok(String(pending.value.message).includes("root-disposed"), "回执必须说明取消原因");
+  // 取消（root 退休）不是专家完成：不投递终态结论，批次也不被标记为 finalized。
+  assert.deepEqual(host.agentSteerMessages(root), [], "root 退休后旧代际绝不投递收口结论");
+  assert.equal(children[0].child.status, "running", "取消等待不得改变专家任务本身的运行事实");
   // 插件级监听器属于插件 fiber，root dispose 不卸载它；这里断言它仍被正确注册（不泄漏额外监听）。
   assert.equal(host.listenerCount("agent/turn-stopping"), listenersBefore);
+  await stop.settled;
   assertNoGoalCalls(probe);
 });
 
-test("插件卸载：等待被取消，且不留下悬空 Promise", async () => {
+test("插件卸载：等待被取消、不投递结论，且不留下悬空 Promise", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const waiting = await finalize(host, root, outcome);
+  assert.equal(waiting.kind, "waiting");
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1);
   await flushAsyncWork(8);
-  assert.equal(pending.status, "pending");
 
   await host.dispose();
-  await flushAsyncWork(12);
-  assert.equal(pending.status, "resolved");
-  assert.equal(pending.value.reason, "root-wait-cancelled");
-  assert.ok(String(pending.value.message).includes("plugin-unloaded"), "卸载必须给出 plugin-unloaded 原因");
+  await stop.settled;
+  assert.deepEqual(host.agentSteerMessages(root), [], "卸载期间不得由旧 root 投递收口结论");
   assertNoGoalCalls(probe);
 });
 
-test("代际替换：旧 root 的等待被取消，新 root 拥有独立等待", async () => {
+test("代际替换：旧 root 的等待被取消且不投递，新 root 拥有独立等待", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const waiting = await finalize(host, root, outcome);
+  assert.equal(waiting.kind, "waiting");
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1);
   await flushAsyncWork(8);
 
   // 同 id 的新代际：旧 root 先 dispose，再登记同 id 的新 root。
   host.disposeAgent(root);
   const replacement = host.registerRootAgent(ROOT_ID);
+  await stop.settled;
   await flushAsyncWork(12);
-  assert.equal(pending.status, "resolved");
-  assert.equal(pending.value.reason, "root-wait-cancelled");
+  assert.deepEqual(host.agentSteerMessages(root), [], "旧代际绝不投递收口结论");
 
   // 旧代际的迟到 notice / 状态变化不得影响新 root（新 root 没有等待）。
   insertNotice(host, root, children[0], "fb-late-generation");
   host.setAgentStatus(children[0].child, "idle");
   await flushAsyncWork(12);
-  assert.equal(pending.status, "resolved");
-  assert.equal(pending.value.reason, "root-wait-cancelled", "旧代际结论不得被迟到事件改写");
+  assert.deepEqual(host.agentSteerMessages(root), [], "旧代际结论不得被迟到事件改写");
+  assert.deepEqual(host.agentSteerMessages(replacement), [], "新代际不得继承旧批次的收口结论");
   assertNoGoalCalls(probe);
 });
 
@@ -907,7 +1648,7 @@ test("没有注入 goals 服务时等待语义完全不变", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe, withGoals: false });
   const outcome = await startAdmission(host, root);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(8);
 
   endChildTurn(host, children[0]);
@@ -957,6 +1698,311 @@ test("finalize 回执契约：开放批次上的过期 epoch 仍被拒绝且无 
   assertNoGoalCalls(probe);
 });
 
+// ── 10a. rc.2：durable listing 的 session residency 与 Agent.status 交叉校验 ────────
+//
+// rc.2 事实（本次校正）：`Agent.status` 只有 `idle` / `running`；
+// `subagents.listDescendants.activity` 表示 **session residency** —— 一个 idle 的 durable
+// continuable child 仍可能被列为 `activity: "running"`。因此运行判定**只**认同一份 exact
+// runtime 快照里的 `Agent.status`：running 继续阻塞，idle 判当前未运行。
+// 下列情况一律未知（继续等待，绝不提前放行）：缺少 exact live Agent、状态非法（含 ready）、
+// 重复 id、runtime/catalog 血缘或 parentId/depth 冲突、runtime 快照查询失败、
+// listing/runtime 对 live 后代互相矛盾（遗漏或标成 inactive）。
+
+test("rc.2：listing 报驻留 activity=running 时，只有 exact Agent.status=idle 才放行 root", async () => {
+  const probe = createGoalProbe();
+  // 显式要求完整 agents.list() 快照（root + child）：本用例必须真的走 exact runtime 路径。
+  const { host, root, children } = createWaitHost({ goalProbe: probe, rootChildren: "live" });
+  const outcome = await startAdmission(host, root, "aborted child probe", ["docs/rc2-aborted-child.md"]);
+  assert.equal(outcome.kind, "continuable");
+  const child = children[0];
+  assert.equal(host.listHarnessDescendants(root.id)[0].activity, "running", "驻留 child 必须报 activity=running");
+  assert.equal(typeof host.agents.list, "function", "本用例必须提供完整 agents.list() 快照");
+  const liveSnapshot = host.agents.list();
+  assert.ok(liveSnapshot.some((agent) => agent.id === root.id), "runtime 快照必须包含 root");
+  assert.ok(liveSnapshot.some((agent) => agent.id === child.childId), "runtime 快照必须包含 exact child");
+
+  // 父级取消：turn/end 的 reason 是结构化 {kind:"aborted", reason:{kind:"parent"}}。
+  host.emit("session/event", child.child.session, buildChildTurnEnd(child, {
+    turn: 1,
+    messageId: child.messageId,
+    reason: { kind: "aborted", reason: { kind: "parent" } },
+  }));
+  // root 收到真实形状的 spliced settled 通知（structured source），随后再经过 turn-stopping 兜底。
+  host.emit("session/event", root.session, {
+    seq: 6101,
+    type: "agent/inbox/spliced",
+    data: {
+      target: "next-step",
+      inserted: [{
+        content: [{ type: "text", text: "child settled" }],
+        source: { kind: "subagent-settled", senderSessionId: child.childId },
+      }],
+    },
+  });
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1, "turn-stopping 兜底必须参与等待");
+  let settled = false;
+  stop.settled.then(() => { settled = true; });
+
+  // Agent 仍 running：精确结算通知已经到达也绝不放行。
+  await flushAsyncWork(30);
+  assert.equal(settled, false, "Agent.status=running 时必须保持 root turn 打开");
+  assert.equal(host.listHarnessDescendants(root.id)[0].activity, "running", "驻留行始终是 activity=running");
+
+  // 只把 exact Agent.status 变成 idle（child 不 dispose、会话仍驻留）⇒ 必须放行。
+  host.setAgentStatus(child.child, "idle");
+  await flushAsyncWork(30);
+  assert.equal(settled, true, "exact Agent.status=idle 是 rc.2 的「当前未运行」证据，必须放行");
+  assert.equal(
+    host.listHarnessDescendants(root.id)[0].activity,
+    "running",
+    "会话仍驻留：activity 仍报 running，放行只能来自 Agent.status",
+  );
+  assertNoGoalCalls(probe);
+});
+
+test("rc.2：listing 存在但没有完整 agents.list() 快照时绝不放行（fail-closed）", async () => {
+  // 同一 lifecycle 形状（aborted/parent turn/end + spliced settled + turn-stopping），但宿主没有
+  // agents.list()：catalog 只能说明 residency，无法验证 status 与「live 后代是否被完整覆盖」，
+  // 因此即使 work 已被精确结算、Agent 已 idle，也必须继续等待。
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe, rootChildren: null });
+  assert.equal(host.agents.list, undefined, "本用例必须没有 agents.list() seam");
+  const outcome = await startAdmission(host, root, "missing runtime snapshot", ["docs/rc2-missing-runtime.md"]);
+  const child = children[0];
+
+  host.emit("session/event", child.child.session, buildChildTurnEnd(child, {
+    turn: 1,
+    messageId: child.messageId,
+    reason: { kind: "aborted", reason: { kind: "parent" } },
+  }));
+  host.emit("session/event", root.session, {
+    seq: 6201,
+    type: "agent/inbox/spliced",
+    data: {
+      target: "next-step",
+      inserted: [{
+        content: [{ type: "text", text: "child settled" }],
+        source: { kind: "subagent-settled", senderSessionId: child.childId },
+      }],
+    },
+  });
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1, "turn-stopping 兜底必须参与等待");
+  let settled = false;
+  stop.settled.then(() => { settled = true; });
+
+  await flushAsyncWork(30);
+  assert.equal(settled, false, "没有 runtime 快照时不得放行");
+  host.setAgentStatus(child.child, "idle");
+  await flushAsyncWork(30);
+  assert.equal(
+    settled,
+    false,
+    "缺少完整 agents.list() 时无法验证运行判定与覆盖关系：必须 fail-closed（继续等待）",
+  );
+  assert.equal(host.listHarnessDescendants(root.id)[0].activity, "running", "catalog 仍报驻留：不能据此放行");
+  assertNoGoalCalls(probe);
+});
+test("rc.2：agents.list() 里的其他 root（origin:\"user\"）及其 running 后代不得阻塞当前 root", async () => {
+  // Oracle 场景的集成保护：同一份 agents.list() 快照里混入另一个**显式** origin:"user" 的
+  // 顶层会话与它的 running subagent child。foreign 祖先可证明该支不属于当前 root，因此当前
+  // root 的等待必须能正常收口（而不是永久 unknown）。
+  const probe = createGoalProbe();
+  const foreignRoot = {
+    id: "foreign-root",
+    status: "running",
+    session: { header: { id: "foreign-root", parentSession: void 0, origin: "user" } },
+  };
+  const foreignChild = {
+    id: "foreign-child",
+    status: "running",
+    session: { header: { id: "foreign-child", parentSession: "foreign-root", origin: "subagent" } },
+  };
+  const { host, root, children } = createWaitHost({
+    goalProbe: probe,
+    rootChildren: () => [...host.agents.roots(), foreignRoot, foreignChild],
+  });
+  const outcome = await startAdmission(host, root, "foreign root probe", ["docs/rc2-foreign-root.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending", "本树 child 仍在运行：必须继续等待");
+  assert.ok(
+    host.agents.list().some((agent) => agent.id === "foreign-child"),
+    "runtime 快照必须确实包含 foreign 会话的后代",
+  );
+
+  endChildTurn(host, children[0]);
+  host.setAgentStatus(children[0].child, "idle");
+  insertNotice(host, root, children[0], "fb-rc2-foreign-root");
+  await flushAsyncWork(24);
+  assert.equal(
+    pending.status,
+    "resolved",
+    "别家 root 的 running 后代不得让当前 root 永久 fail-closed",
+  );
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+test("rc.2：真正 running 的长任务持续等待，驻留行不得当作静止证据", async () => {
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe });
+  const outcome = await startAdmission(host, root, "long running probe", ["docs/rc2-long-running.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+
+  for (let round = 0; round < 3; round += 1) {
+    await flushAsyncWork(20);
+    assert.equal(pending.status, "pending", "Agent 真正 running 时必须持续等待（第 " + (round + 1) + " 轮）");
+    assert.equal(host.listHarnessDescendants(root.id)[0].activity, "running");
+  }
+
+  endChildTurn(host, children[0]);
+  host.setAgentStatus(children[0].child, "idle");
+  insertNotice(host, root, children[0], "fb-rc2-long-running");
+  await flushAsyncWork(24);
+  assert.equal(pending.status, "resolved");
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("rc.2 交叉校验：listing/runtime 缺失、冲突或非法状态时一律 fail-closed", async () => {
+  // 每个场景都让 exact Agent 处于「当前未运行」（idle 或已 dispose），因此**只有**交叉校验
+  // 本身能解释「继续等待」——若放宽任一规则，这些场景都会提前放行。
+  const ghostRow = { id: "durable-ghost", parentId: ROOT_ID, depth: 1, mode: "continuable", label: "explorer", hasChildren: false };
+  const scenarios = [
+    {
+      name: "listing 遗漏仍 live 的后代",
+      options: { rootChildren: "live", descendantRowTransform: () => undefined },
+      expected: "pending",
+      why: "runtime live 后代没有被 catalog 覆盖 ⇒ 覆盖关系无法证明",
+    },
+    {
+      name: "仍 live 的后代被标成 activity=inactive",
+      options: { rootChildren: "live", descendantRowTransform: (row) => ({ ...row, activity: "inactive" }) },
+      expected: "pending",
+      why: "activity 是 residency：live Agent 与 inactive 行互相矛盾",
+    },
+    {
+      name: "listing 存在但没有完整 agents.list() 快照",
+      options: { rootChildren: null },
+      expected: "pending",
+      why: "没有完整 runtime 快照 ⇒ 无法验证运行判定与覆盖关系，必须 fail-closed",
+    },
+    {
+      name: "catalog 出现重复 id（live 行 + durable 行同 id）",
+      options: { durableNonResidentRows: (childrenState) => (childrenState.length === 0 ? [] : [{ ...ghostRow, id: childrenState[0].childId }]) },
+      expected: "pending",
+      why: "重复 id 无法区分代际",
+    },
+    {
+      name: "Agent.status 非法（rc.2 只有 idle/running）",
+      options: {},
+      status: "ready",
+      expected: "pending",
+      why: "显式非法状态不得当成空闲",
+    },
+    {
+      name: "catalog parentId/depth 冲突",
+      options: { descendantRowTransform: (row) => ({ ...row, depth: row.depth + 2 }) },
+      expected: "pending",
+      why: "catalog 深度链自相矛盾",
+    },
+    {
+      name: "runtime 列表查询失败",
+      options: { rootChildren: () => { throw new Error("runtime agent listing down"); } },
+      expected: "pending",
+      why: "查询失败是未知，不是「没有 running 后代」",
+    },
+  ];
+
+  for (const [index, scenario] of scenarios.entries()) {
+    const probe = createGoalProbe();
+    const held = [];
+    const options = { ...scenario.options };
+    if (typeof options.durableNonResidentRows === "function") {
+      const readChildren = options.durableNonResidentRows;
+      options.durableNonResidentRows = () => readChildren(held);
+    }
+    const { host, root, children } = createWaitHost({ goalProbe: probe, ...options });
+    const outcome = await startAdmission(host, root, scenario.name, ["docs/rc2-closed-" + index + ".md"]);
+    const pending = track(finalizeLifecycle(host, root, outcome));
+    await flushAsyncWork(10);
+    assert.equal(pending.status, "pending", scenario.name + "：登记后必须仍在等待");
+    held.push(...children);
+
+    endChildTurn(host, children[0]);
+    if (scenario.status !== undefined) host.setAgentStatus(children[0].child, scenario.status);
+    else host.setAgentStatus(children[0].child, "idle");
+    insertNotice(host, root, children[0], "fb-rc2-closed-" + index);
+    await flushAsyncWork(24);
+    assert.equal(
+      pending.status,
+      scenario.expected,
+      scenario.name + "：" + scenario.why,
+    );
+    assertNoGoalCalls(probe);
+  }
+});
+
+test("rc.2：合法 durable 非驻留行（activity=inactive 且没有 exact live Agent）不阻塞放行", async () => {
+  // 上游实现把 activity 定义为 session residency：`sessions.get(entry.id) === undefined` 的行
+  // 是**合法**的 durable 历史行（会话不驻留 ⇒ 不可能在执行），必须被接受为「不运行」，
+  // 而不是让整份 catalog 变成未知。
+  const probe = createGoalProbe();
+  const ghostRow = { id: "durable-historical", parentId: ROOT_ID, depth: 1, mode: "continuable", label: "explorer", hasChildren: false };
+  const { host, root, children } = createWaitHost({
+    goalProbe: probe,
+    rootChildren: "live",
+    durableNonResidentRows: () => [ghostRow],
+  });
+  const outcome = await startAdmission(host, root, "historical durable row", ["docs/rc2-historical.md"]);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(10);
+  assert.equal(pending.status, "pending", "child 仍在运行：必须继续等待");
+
+  endChildTurn(host, children[0]);
+  // child 被回收：catalog 只剩 durable 非驻留历史行，runtime 已没有该 child。
+  host.disposeAgent(children[0].child);
+  insertNotice(host, root, children[0], "fb-rc2-historical");
+  await flushAsyncWork(24);
+  assert.equal(
+    pending.status,
+    "resolved",
+    "durable 非驻留行（无 exact live Agent）是合法历史行：它不得阻塞 work 已结算的 root turn",
+  );
+  assert.equal(pending.value.kind, "finalized");
+  assertNoGoalCalls(probe);
+});
+
+test("rc.2：listing 不可用时 runtime fallback 严格区分 idle/running（ready 视为未知）", async () => {
+  const expectations = [
+    { status: "idle", expected: "resolved", why: "idle 判当前未运行" },
+    { status: "running", expected: "pending", why: "真正 running 必须继续等待" },
+    { status: "ready", expected: "pending", why: "rc.2 不存在 ready：非法状态一律未知" },
+  ];
+
+  for (const [index, item] of expectations.entries()) {
+    const probe = createGoalProbe();
+    const { host, root, children } = createWaitHost({
+      goalProbe: probe,
+      descendantListing: "missing",
+      sessionActivity: "missing",
+      sessionActivityTransport: false,
+      rootChildren: "live",
+    });
+    const outcome = await startAdmission(host, root, "runtime fallback " + item.status, ["docs/rc2-runtime-" + index + ".md"]);
+    const pending = track(finalizeLifecycle(host, root, outcome));
+    await flushAsyncWork(10);
+
+    endChildTurn(host, children[0]);
+    host.setAgentStatus(children[0].child, item.status);
+    insertNotice(host, root, children[0], "fb-rc2-runtime-" + index);
+    await flushAsyncWork(24);
+    assert.equal(pending.status, item.expected, "Agent.status=" + item.status + "：" + item.why);
+    assertNoGoalCalls(probe);
+  }
+});
+
 // ── 10. agent/turn-stopping 兜底（模型遗漏 finalize / 纯 continue / fanout） ──
 
 /**
@@ -995,28 +2041,22 @@ test("turn-stopping 兜底：纯 continue_parent_turn 留下的 running child �
   assertNoGoalCalls(probe);
 });
 
-test("AbortSignal：finalize 与 turn-stopping 各自取消等待，但保留工作直到 child 真正结束", async () => {
+test("AbortSignal：finalize 不再用 exec.signal 等待；payload.signal 只取消本次 turn 的 waiter", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root, "abort wait probe", ["docs/wait-abort.md"]);
 
+  // ① 预先取消的 exec.signal 不再影响 finalize：工具只做校验与登记，立即返回 waiting。
+  //    这正是本契约要切断的耦合——run_code 子执行结束不得取消 root turn 生命周期等待。
   const finalizeController = new AbortController();
-  const pendingFinalize = track(finalize(host, root, outcome, finalizeController.signal));
-  await flushAsyncWork(8);
-  assert.equal(pendingFinalize.status, "pending");
   finalizeController.abort();
-  await flushAsyncWork(12);
-  assert.equal(pendingFinalize.status, "resolved", "finalize 应以公开 exec.signal 快速收口");
-  assert.equal(pendingFinalize.value.kind, "rejected");
-  assert.equal(pendingFinalize.value.reason, "root-wait-cancelled");
-  assert.match(pendingFinalize.value.message, /signal-aborted/);
+  const abortedReceipt = await finalize(host, root, outcome, finalizeController.signal);
+  assert.equal(abortedReceipt.kind, "waiting", "finalize 不在工具调用内等待，exec.signal 与等待无关");
+  assert.equal(abortedReceipt.reason, "experts-running");
 
-  const retryFinalize = track(finalize(host, root, outcome));
-  await flushAsyncWork(10);
-  assert.equal(retryFinalize.status, "pending", "同一 epoch/token 的 finalize 重试必须继续等待保留的 child 工作");
-
+  // ② 本 turn 的 turn-stopping 等待仍观察到运行中的专家；payload.signal 取消只结束本次 waiter。
   const stopController = new AbortController();
-  const stop = stopRootTurn(host, root, 2, stopController.signal);
+  const stop = stopRootTurn(host, root, 1, stopController.signal);
   let stopSettled = false;
   stop.settled.then(() => { stopSettled = true; });
   await flushAsyncWork(10);
@@ -1024,8 +2064,13 @@ test("AbortSignal：finalize 与 turn-stopping 各自取消等待，但保留工
   stopController.abort();
   await flushAsyncWork(10);
   assert.equal(stopSettled, true, "turn-stopping 应将 payload.signal 传给该 waiter");
+  assert.deepEqual(host.agentSteerMessages(root), [], "被取消的 waiter 绝不投递终态结论");
+  // 取消不关闭批次：同一凭据仍是稳定 waiting，不重复登记。
+  const retryFinalize = await finalize(host, root, outcome);
+  assert.equal(retryFinalize.kind, "waiting");
 
-  const retryStop = stopRootTurn(host, root, 3);
+  // ③ 后续 root turn 接续同一批工作：只有 child 真正静止后才一次性收口。
+  const retryStop = stopRootTurn(host, root, 2);
   let retrySettled = false;
   retryStop.settled.then(() => { retrySettled = true; });
   await flushAsyncWork(10);
@@ -1034,14 +2079,14 @@ test("AbortSignal：finalize 与 turn-stopping 各自取消等待，但保留工
   endChildTurn(host, children[0]);
   insertNotice(host, root, children[0], "fb-abort-retained-work");
   await flushAsyncWork(10);
-  assert.equal(retryFinalize.status, "pending", "turn/end 与反馈结算后，child 仍报告 running 时必须继续等待");
+  assert.equal(retrySettled, false, "turn/end 与反馈结算后，child 仍报告 running 时必须继续等待");
 
   host.setAgentStatus(children[0].child, "idle");
   await flushAsyncWork(20);
   assert.equal(retrySettled, true, "真实 child turn/end + feedback settlement 后静止才让新 waiter 收口");
-  assert.equal(retryFinalize.status, "resolved");
-  assert.equal(retryFinalize.value.kind, "finalized");
-  assert.equal(retryFinalize.value.reason, "finalized");
+  const delivered = host.agentSteerMessages(root);
+  assert.equal(delivered.length, 1, "静止后必须一次性投递终态结论");
+  assert.equal(delivered[0].source.kind, "plugin:dsh-expert-group");
   assertNoGoalCalls(probe);
 });
 
@@ -1060,7 +2105,7 @@ test("turn-stopping 兜底与 finalize 共用同一账本：child 仍在运行�
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const first = await startAdmission(host, root, "stop probe one", ["docs/stop-one.md"]);
-  const pendingFinalize = track(finalize(host, root, first));
+  const pendingFinalize = track(finalizeLifecycle(host, root, first));
   await flushAsyncWork(8);
   assert.equal(pendingFinalize.status, "pending");
 
@@ -1105,7 +2150,7 @@ test("同一 root 第二轮：第一批静止收口后，continue_parent_turn �
 
   // 第一批：普通 accepted admission。
   const first = await startAdmission(host, root, "round one task", ["docs/round-one.md"]);
-  const firstFinalize = track(finalize(host, root, first));
+  const firstFinalize = track(finalizeLifecycle(host, root, first));
   await flushAsyncWork(8);
   assert.equal(firstFinalize.status, "pending");
   endChildTurn(host, children[0]);
@@ -1144,7 +2189,7 @@ test("同一 root 第二轮：第二批的 accepted admission 同样能再次等
   const { host, root, children } = createWaitHost({ goalProbe: probe });
 
   const first = await startAdmission(host, root, "second round one", ["docs/second-round-one.md"]);
-  const firstFinalize = track(finalize(host, root, first));
+  const firstFinalize = track(finalizeLifecycle(host, root, first));
   await flushAsyncWork(8);
   endChildTurn(host, children[0]);
   host.setAgentStatus(children[0].child, "idle");
@@ -1154,7 +2199,7 @@ test("同一 root 第二轮：第二批的 accepted admission 同样能再次等
 
   // 第二批走普通 accepted admission：新的 epoch、新的 token、新的等待记录。
   const second = await startAdmission(host, root, "second round two", ["docs/second-round-two.md"]);
-  const secondFinalize = track(finalize(host, root, second));
+  const secondFinalize = track(finalizeLifecycle(host, root, second));
   await flushAsyncWork(8);
   assert.equal(secondFinalize.status, "pending", "第二批 accepted 必须重新等待");
 
@@ -1435,7 +2480,7 @@ test("agents.list fallback：权威 listing 与 session activity 都不可用时
     rootChildren: () => [root, ...children.map((entry) => entry.child)],
   });
   const outcome = await startAdmission(host, root, "runtime list fallback", ["docs/runtime-list.md"]);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(10);
   assert.equal(pending.status, "pending", "running child 必须继续阻塞 root");
 
@@ -1453,7 +2498,7 @@ test("用户插话：同步取消旧 waiter 但保留 admission，后续 finaliz
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root, "user interruption", ["docs/user-interruption.md"]);
-  const pending = track(finalize(host, root, outcome));
+  const pending = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(10);
   assert.equal(pending.status, "pending");
 
@@ -1463,11 +2508,10 @@ test("用户插话：同步取消旧 waiter 但保留 admission，后续 finaliz
   });
   await flushAsyncWork(10);
   assert.equal(pending.status, "resolved");
-  assert.equal(pending.value.kind, "rejected");
-  assert.equal(pending.value.reason, "root-wait-cancelled");
-  assert.match(pending.value.message, /user-message/);
+  assert.equal(pending.value.kind, "cancelled", "用户插话只取消本次 waiter，不是终态收口");
+  assert.deepEqual(host.agentSteerMessages(root), [], "被取消的 waiter 绝不投递终态结论");
 
-  const retry = track(finalize(host, root, outcome));
+  const retry = track(finalizeLifecycle(host, root, outcome));
   await flushAsyncWork(10);
   assert.equal(retry.status, "pending", "用户插话不得关闭原 admission batch");
 
