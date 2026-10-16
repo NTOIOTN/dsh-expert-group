@@ -24,7 +24,7 @@
 - **无内置默认模型**：新安装后所有角色均为空，需在“dsh-expert-group”设置页从 DSH
   已配置的模型中自行选择并保存；未配置模型的角色在调用时会给出明确提示。
 - 模型与思考深度通过 `llm.listProviders/listModels` + `resolveCallConfig` 校验，只接受设置中已添加的模型。
-- **动态 settings 保存能力**：插件不在模块加载期 import `@deepseek-ai/dsh-settings`，package 也不声明该 peer，因此默认安装不会额外下载 settings 包。目标运行时为 `0.2.0-rc.1`；插件通过宿主 settings 服务的 describe/update/mutate 面读写 profile 条目，并由 DEG 自有的 settings-commit 端点完成语义校验与 revision 冲突检测（宿主不再提供 owner validate 钩子）。
+- **动态 settings 保存能力**：插件不在模块加载期 import `@deepseek-ai/dsh-settings`，package 也不声明该 peer，因此默认安装不会额外下载 settings 包。目标运行时为 `0.2.0-rc.2`；插件通过宿主 settings 服务的 describe/update/mutate 面读写 profile 条目，并由 DEG 自有的 settings-commit 端点完成语义校验与 revision 冲突检测（宿主不再提供 owner validate 钩子）。
 - 子代理的 `reasoningEffort` 通过子代理 `agent/request` waterfall 注入，绕开 `dsh-tool-subagent`
   `AgentOptions` 尚未公开该字段的限制。
 

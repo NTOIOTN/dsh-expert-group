@@ -22,7 +22,7 @@ import { fileURLToPath } from 'url';
  * 默认目标 DSH 版本（本插件唯一支持的宿主版本线）。
  * 宿主升级时只改这一处；发布链与 peer 基线都随它走。
  */
-const DEFAULT_DSH_VERSION = '0.2.0-rc.1';
+const DEFAULT_DSH_VERSION = '0.2.0-rc.2';
 
 /** 仓库根：scripts/ 的父目录；与调用者 cwd 无关。 */
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
