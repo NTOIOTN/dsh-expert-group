@@ -1,7 +1,8 @@
 {
   "name": "dsh-expert-group",
   "version": "0.1.4",
-  "description": "DSH 专家子代理、Expert Group 任务侧边栏与设置页（双面 bundle）",
+  "description": "6个可单独设置模型的专家子代理，侧边栏任务展示，弹窗通知",
+  "icon": "./icon.svg",
   "type": "module",
   "main": "./index.js",
   "bin": {
@@ -62,6 +63,7 @@
     "scripts/assemble-client.mjs",
     "scripts/build.mjs",
     "bin/prompt-inspector.mjs",
+    "icon.svg",
     "cordis.patch.yml",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
