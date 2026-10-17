@@ -601,6 +601,9 @@ const PARENT_MARKER = "__degExpertParent";
  *  不可 steer，恢复时忽略）。 */
 const CONTINUABLE_MARKER = "__degExpertContinuable";
 
+/** 子代理 child.options 上携带 admission 时计算出的完整 deny 清单，供 RC1 runtime guard 使用。 */
+const DENY_MARKER = "__degExpertDeny";
+
 /** 只有同时带插件角色与父会话 marker 的有效专家 child 才安装 report/send_message guard。 */
 const EXPERT_ROLES = new Set(listRoles().map((entry) => entry.id));
 const EXPERT_REPORT_GUARD_REASON = "插件专家 child 不允许调用 report；请在最终 assistant 输出中按五个固定标题交付结果。";
@@ -685,6 +688,51 @@ export function shouldBlockExpertSendMessage(options, execution, identity) {
   return EXPERT_SEND_MESSAGE_GUARD_REASON;
 }
 
+const MAX_EXPERT_DENY_MARKER_ENTRIES = 512;
+
+/**
+ * 解析 child 的完整工具 deny 边界。RC1 不再消费 request.toolFilter，因此新 child
+ * 优先使用 admission marker；没有 marker 的旧恢复记录则按角色静态清单兜底，
+ * 未知角色按只读处理，避免历史数据缺字段时意外扩大权限。
+ *
+ * marker 是 admission 时的可见性快照，但静态策略候选仍要在 runtime guard 中合并：
+ * parent 的工具视图可能在 child 生命周期内变化，不能因当时不可见而漏拦新增可见的
+ * report/delegation/root-only 工具。run_code 是 Code Mode 展示传输，保持既有放行语义。
+ */
+function expertGuardDenyNames(options, identity) {
+  const roleEntry = getRole(identity?.role);
+  const fallback = roleEntry === void 0 || roleEntry.readOnly === true
+    ? READONLY_DENY
+    : [...EXPERT_DELEGATION_DENY, ...ROOT_ONLY_TOOL_DENY];
+  const denyNames = new Set(ensureExpertSendMessageDenied(fallback).filter((name) => name !== "run_code"));
+  const marked = options?.[DENY_MARKER];
+  if (marked === void 0) return denyNames;
+  const policyNames = new Set([
+    ...EXPERT_DELEGATION_DENY,
+    ...ROOT_ONLY_TOOL_DENY,
+    ...READONLY_DENY,
+    "send_message",
+  ]);
+  if (!Array.isArray(marked) || marked.length === 0 || marked.length > MAX_EXPERT_DENY_MARKER_ENTRIES) return void 0;
+  for (const name of marked) {
+    // 动态 MCP 名称由 readonly admission 的 schema 快照产生；其余名称必须属于
+    // DEG 已知策略，避免任意未知字符串伪造“合法 marker”并绕过形状审查。
+    if (typeof name !== "string" || name.length === 0 || name === "run_code"
+      || (!policyNames.has(name) && !isReadonlyDynamicMcpName(name))) return void 0;
+    denyNames.add(name);
+  }
+  return denyNames;
+}
+
+/** deny marker 只在已认证的插件专家 child 上生效，普通 Agent 不受影响。 */
+function shouldBlockExpertDeniedTool(options, execution, identity) {
+  if (!isPluginExpertChildIdentity(identity) || typeof execution?.name !== "string") return void 0;
+  const denyNames = expertGuardDenyNames(options, identity);
+  if (denyNames === void 0) return "插件专家 child deny marker 无效，已拒绝工具调用";
+  if (!denyNames.has(execution.name)) return void 0;
+  return `插件专家 child 禁止调用工具 ${execution.name}`;
+}
+
 /**
  * PTC nested dispatch 会复制外层 execution.agent；全局 guard 因而必须按当前 Agent
  * 的内部登记、marker 与真实 parentSession 做精确 lineage 校验。这里不读取 snapshot，避免把
@@ -756,12 +804,26 @@ export function createRootGenerationRegistry() {
  * setup 执行时读取，不修改 DSH 的 agent.options。
  */
 function installExpertReportGuard(childCtx, readChildModel, resolvedIdentity, childAgent) {
+  // 与全局 guard 保持同一信任边界：身份 marker 不能替代 exact Agent provenance。
+  if (!isRegisteredPluginExpertChild(childAgent)) return () => {};
   // childCtx 只提供该 child 自有的 tools guard；Agent 身份从调用方显式传入，
   // 避免读取未注入的 childCtx.agent 懒 getter。
   const options = childAgent?.options;
+  const persisted = typeof readChildModel === "function" && typeof childAgent?.id === "string"
+    ? readChildModel(childAgent.id)
+    : void 0;
+  // RC1 child 的 agentOptions 不由 Host recovery 持久化；优先使用当前 marker，
+  // cold-resume 则从 DEG 自有 child_models 快照恢复，旧快照继续走静态 fallback。
+  const denyOptions = options?.[DENY_MARKER] !== void 0
+    ? options
+    : persisted?.[DENY_MARKER] !== void 0
+      ? { ...options, [DENY_MARKER]: persisted[DENY_MARKER] }
+      : options;
   const identity = resolvedIdentity ?? resolveExpertReportIdentity(options, childAgent?.id, readChildModel);
   if (!isPluginExpertChildIdentity(identity)) return () => {};
   return childCtx.tools.guard((execution) => {
+    const deniedToolReason = shouldBlockExpertDeniedTool(denyOptions, execution, identity);
+    if (deniedToolReason !== void 0) return deniedToolReason;
     const reportReason = shouldBlockExpertReport(options, execution, identity);
     if (reportReason !== void 0) return reportReason;
     const sendMessageReason = shouldBlockExpertSendMessage(options, execution, identity);
@@ -853,13 +915,17 @@ export const DOMAIN_ROLE_SELECTION = domainZ.object({
 });
 /** session_overrides 的 value 是“角色名 -> selection”字典，不是单个 selection。 */
 export const DOMAIN_SESSION_OVERRIDES = domainZ.record(domainZ.string(), DOMAIN_ROLE_SELECTION);
-const DOMAIN_CHILD_MODEL_RECORD = domainZ.object({
+/** child_models 的公开 schema seam：测试用它验证 domain adapter round-trip 不会 strip deny marker。 */
+export const DOMAIN_CHILD_MODEL_RECORD = domainZ.object({
   provider: domainZ.string(),
   model: domainZ.string(),
   reasoningEffort: domainZ.string().optional(),
   role: domainZ.string().optional(),
   parentId: domainZ.string().optional(),
   continuable: domainZ.boolean().optional(),
+  // RC1 agentOptions 不由 Host recovery 持久化；保存 DEG admission 的完整 deny 边界，
+  // 供 scoped guard 在 cold-resume 时恢复。长度上限与运行期校验保持一致。
+  [DENY_MARKER]: domainZ.array(domainZ.string()).max(MAX_EXPERT_DENY_MARKER_ENTRIES).optional(),
   // 最近一次 accepted dispatch 的短描述用于冷会话侧栏；它不是第二套任务数据库。
   lastDispatch: domainZ.object({
     description: domainZ.string().optional(),
@@ -3197,7 +3263,12 @@ export default {
       if (batch.closed === true) return { kind: "noop", ...base, reason: "already-finalized" };
       if (batch.finalizing === true) return { kind: "rejected", ...base, reason: "finalization-in-progress" };
       const uniqueTokens = [...new Set(tokens)];
-      const expectedTokens = [...batch.entries.keys()];
+      // 必需 token 集 = 真正交给调用方的 admission。被 discardRootAdmission 丢弃的
+      // ticket 从未返回过凭据（未知/越权 childId 的拒绝路径），把它算进必需集只会让
+      // 同一 epoch 之后的合法收口永远 incomplete-admission-token-set。
+      const expectedTokens = [...batch.entries.entries()]
+        .filter(([, entry]) => entry?.discarded !== true)
+        .map(([token]) => token);
       if (uniqueTokens.length !== tokens.length || uniqueTokens.length !== expectedTokens.length
         || expectedTokens.some((token) => !uniqueTokens.includes(token))) {
         return {
@@ -3745,7 +3816,10 @@ export default {
       rootStructuredGuardDisposers.set(agent, ownerCleanup);
     }
     function installExpertReportGuardForAgent(agent, resolvedIdentity) {
-      if (isRootAgentForStructuredGuard(agent)
+      // marker/parent 只是可复制的 metadata；只有 acceptance/created 流程登记过的
+      // exact Agent 才允许安装 scoped guard，避免普通 child 被误伤。
+      if (!isRegisteredPluginExpertChild(agent)
+        || isRootAgentForStructuredGuard(agent)
         || expertReportGuardDisposers.has(agent)
         || typeof agent?.ctx?.tools?.guard !== "function") return;
       // 先在安装函数外确认身份，避免 installExpertReportGuard 返回的 no-op 被当成
@@ -3929,6 +4003,14 @@ export default {
         coordinator: createAdmissionBatchCoordinator(),
         entries: new Map(),
         sequence: 0,
+        /**
+         * 在途 ticket 计数：begin 时 +1、settle 时 -1。
+         *
+         * 只用于判定「本批是否已经只剩被丢弃的 ticket」（见 discardRootAdmission），
+         * 让「只发生过拒绝」的空批次可以被安全撤下；不参与 finalize 的凭据校验，
+         * 也不改变任何已公开的回执语义。
+         */
+        pendingTickets: 0,
         closed: false,
         finalizing: false,
         /**
@@ -3958,8 +4040,9 @@ export default {
         rootAdmissionBatches.set(parent, batch);
       }
       const ticket = batch.coordinator.begin();
+      batch.pendingTickets += 1;
       const token = batch.epoch + ":" + (++batch.sequence);
-      const entry = { token, epoch: batch.epoch, settled: false, outcome: void 0, ticket };
+      const entry = { token, epoch: batch.epoch, settled: false, outcome: void 0, discarded: false, ticket };
       batch.entries.set(token, entry);
       return {
         ...ticket,
@@ -3971,7 +4054,10 @@ export default {
         parent,
         settle() {
           const settled = ticket.settle();
-          if (settled) entry.settled = true;
+          if (settled) {
+            entry.settled = true;
+            batch.pendingTickets -= 1;
+          }
           return settled;
         },
         whenReady: () => ticket.whenReady(),
@@ -3990,6 +4076,37 @@ export default {
         && outcome.handoffAdmission !== void 0) {
         notePendingCloseAdmission(admission.parent, outcome.handoffAdmission);
       }
+    }
+    /**
+     * 丢弃一个**已经 beginRootAdmission**、但最终没有向调用方交出任何 admission 结论的 ticket。
+     *
+     * 只用于「格式合法但目标未知/越权」的拒绝路径（childId 的 CHILD_NOT_FOUND）：这次调用
+     * 没有派发、没有投递、没有 interrupt，也没有产生任何 handoff，因此：
+     * 1. 记录 rejected outcome 并 settle 协调器，让本批在途计数归位，批次不会停在
+     *    admission-outcome-pending（否则 finalize 永远收不了口）；
+     * 2. 把 entry 标记为 discarded —— finalize 的「完整 token 集」只能由**模型真正收到
+     *    凭据**的 admission 组成；把模型永远拿不到的 token 留在必需集里，会让同一 epoch
+     *    之后的合法收口永远 incomplete-admission-token-set（这正是「毒化 root batch」）；
+     * 3. 若本批已无在途 ticket、且全部 entry 都是 discarded，就把整批从 map 撤下：之后
+     *    「本 turn 没有真实 admission」的 finalize(epoch 0 + 空 token 集) 仍然回到既有的
+     *    no-admission 幂等语义，而不是被一个空批次挡成 admission-epoch-mismatch。
+     *
+     * 撤批是精确的：只在本批仍是该 root 的当前批次、未 closed、未进入 pending-close/
+     * finalizing、且没有任何在途 ticket 时执行，绝不撤掉后续真实 admission 所属的批次。
+     */
+    function discardRootAdmission(admission, outcome) {
+      if (admission?.entry === void 0) return;
+      admission.entry.outcome = outcome;
+      admission.entry.discarded = true;
+      admission.settle();
+      admission.entry.settled = true;
+      const batch = rootAdmissionBatches.get(admission.parent);
+      if (batch === void 0 || batch.closed === true || batch.pendingClose !== void 0 || batch.finalizing === true) return;
+      if (batch.pendingTickets !== 0) return;
+      for (const entry of batch.entries.values()) {
+        if (entry.discarded !== true) return;
+      }
+      if (rootAdmissionBatches.get(admission.parent) === batch) rootAdmissionBatches.delete(admission.parent);
     }
     function roleAdmissionFailure(phase, error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4880,11 +4997,54 @@ export default {
       const recordedFanoutChild = typeof agent?.id === "string" ? source().childModels?.[agent.id] : void 0;
       const fanoutChild = isFanoutAgent(agent) || isFanoutIdentity(recordedFanoutChild);
       if (fanoutChild) {
+        // 身份预检必须发生在**任何副作用之前**：下面的 registerPluginExpertChildAgent /
+        // guard 安装 / handleAgentCreated 都会改状态。仅靠 handleAgentCreated 的返回值挡不住
+        // 错误 marker —— false 只表示「没有对应的 live attempt」，被复制/篡改的
+        // parentTaskId、shardId、attempt 或指向别的 root 的 parent 同样得到 false，却已经让
+        // 错误 marker 拿到了 exact Agent 登记与 scoped guard（本函数的注释下方即为原漏洞面）。
+        // 预检与 runtime 内部复用同一份判定（marker/persisted identity + 实际 parent +
+        // active record 的 canonical parent），失败即 fail-closed 终止本 created 路由。
+        // 预检**能力本身**缺失（fanoutHost 未装配，或旧 runtime 没有该方法）与「预检不通过」
+        // 必须同形 fail-closed：调用方只认 `ok === true`，undefined / 非对象判定一律按
+        // fanout_precheck_unavailable 拒绝，绝不能当成通过——否则残缺 runtime 或旧替身会让
+        // 错误 marker 直接拿到 exact Agent 登记与 scoped guard。
+        const identityVerdict = typeof fanoutHost?.precheckFanoutChildIdentity === "function"
+          ? fanoutHost.precheckFanoutChildIdentity(agent, recordedFanoutChild)
+          : void 0;
+        if (identityVerdict === void 0 || identityVerdict === null || identityVerdict.ok !== true) {
+          const rejectReason = typeof identityVerdict?.reason === "string" && identityVerdict.reason.length > 0
+            ? identityVerdict.reason
+            : "fanout_precheck_unavailable";
+          ctx.logger.warn("dsh-expert-group: fan-out child identity precheck rejected (" + rejectReason
+            + ") for " + (typeof agent?.id === "string" ? agent.id : "unknown"));
+          // 直接终止：绝不登记/装 guard，也**不回落**普通专家恢复分支——那条路径会把
+          // 不可信（或无从证明）的身份快照当成可自动恢复的专家 child 继续使用。
+          fanoutHost?.restore();
+          return;
+        }
+        // fan-out child 也必须在**本分支**完成 exact Agent 登记与 scoped guard 安装：
+        // 本分支在早期通用 created listener 之后、普通专家分支之前 return，早期 listener
+        // 运行时该 Agent 尚未登记（guard 会 fail-closed 不安装）；而 record 已终态清理的
+        // cold-resume child 也不会再触发 fan-out 的 onAgentCreated 回调，只依赖那条路径
+        // 会让 report/send_message/deny 硬防线在冷恢复后整体缺失。
+        //
+        // 身份仍以 exact Agent 对象为准：role/parentId marker 只是可复制 metadata，只有
+        // 这里登记的实例才允许安装 guard；普通（非 fan-out）child 不经过本分支，边界不放宽。
+        registerPluginExpertChildAgent(agent);
+        // role/parentId 优先取当前 marker；cold-resume 的 agent.options 只有 provider/model，
+        // 因此回落到 trusted persisted fanout 快照（能走到本分支即已由 isFanoutAgent /
+        // isFanoutIdentity 证明完整 fan-out 身份）。历史快照缺少普通 parentId 时，可在
+        // 同一前提下用 fanoutParentAgentId 兼容补齐。
+        const fanoutRole = agent?.options?.[ROLE_MARKER] ?? recordedFanoutChild?.role;
+        const fanoutParentId = agent?.options?.[PARENT_MARKER]
+          ?? recordedFanoutChild?.parentId
+          ?? (isFanoutIdentity(recordedFanoutChild) ? recordedFanoutChild.fanoutParentAgentId : void 0);
+        installExpertReportGuardForAgent(agent, { role: fanoutRole, parentId: fanoutParentId, source: "fanout" });
         fanoutHost?.handleAgentCreated(agent, recordedFanoutChild);
         fanoutHost.restore();
         return;
       }
-      fanoutHost.restore();
+      fanoutHost?.restore();
       if (typeof agent?.id === "string") {
         const registered = agents.get(agent.id);
         const currentChildRecord = recoveryRecords.get(agent.id);
@@ -5017,6 +5177,11 @@ export default {
       // P2：已清理 record 的迟到 rebuild child 不写入快照，避免后续 cold-resume
       // 把一个父代理已放弃的 child 当成可复用任务重新登记。
       const isExpertChild = typeof role === "string" && typeof parentId === "string" && !ignoredLateRecoveryChild;
+      // cold-resume 的 agent.options 只有 provider/model；若当前没有 marker，保留
+      // DEG 快照中的原值（包括 malformed 值），避免恢复写回把 fail-closed 证据擦掉。
+      const denyMarkerSnapshot = agent.options?.[DENY_MARKER] !== void 0
+        ? agent.options[DENY_MARKER]
+        : recordedExpert?.[DENY_MARKER];
       if (pluginChildAuthenticated) registerPluginExpertChildAgent(agent);
       if (isExpertChild) {
         // 该监听器在早期 guard listener 之后运行；此时 role/parentId 已从 marker、
@@ -5028,7 +5193,18 @@ export default {
           provider: agent.options.provider,
           model: agent.options.model,
           reasoningEffort: effort === void 0 ? void 0 : String(effort),
-          ...(isExpertChild ? { role, parentId, ...(isContinuable ? { continuable: true } : {}) } : {}),
+          ...(isExpertChild ? {
+            role,
+            parentId,
+            ...(isContinuable ? { continuable: true } : {}),
+            // Host recovery 不持久化 RC1 agentOptions；把 admission deny 快照放入
+            // DEG 自有 child_models，供 cold-resume 的 scoped guard 恢复同一边界。
+            ...(denyMarkerSnapshot === void 0
+              ? {}
+              : { [DENY_MARKER]: Array.isArray(denyMarkerSnapshot)
+                ? [...denyMarkerSnapshot]
+                : denyMarkerSnapshot }),
+          } : {}),
         });
       }
       installEffortInjection(agent, effort);
@@ -5818,6 +5994,11 @@ export default {
       // 全部角色约束，因此这里 fail-closed，而不是回落到某个通用人格。
       if (ROLE_META[record.role] === void 0) throw new Error("cannot rebuild recovery child because its expert role is unavailable");
       const oldChildId = record.childId;
+      // recovery record 仍保存旧 request.toolFilter；新版本若已保存 marker，优先沿用
+      // admission 的完整结果，再用旧字段兼容历史记录。
+      const recoveryDeny = ensureExpertSendMessageDenied(
+        source?.[DENY_MARKER] ?? source?.agentOptions?.[DENY_MARKER] ?? source.toolFilter,
+      );
       const request = {
         label: source.label,
         prompt: [{ type: "text", text: buildExpertTaskPrompt(record.role, promptText) }],
@@ -5829,12 +6010,13 @@ export default {
           [ROLE_MARKER]: record.role,
           [PARENT_MARKER]: record.parentId,
           [CONTINUABLE_MARKER]: true,
+          [DENY_MARKER]: recoveryDeny,
         },
         // 路由仍沿用 source 的 provider/model，但 persona 必须在 admission 边界重新解析：
         // 恢复是"新建 child"的一条路径，因此既不能复用旧快照，也不能跳过用户覆盖
         // 与固定纪律的分层（纪律升级后同样必须立刻生效）。
         persona: resolvePersonaForAdmission(record.role),
-        toolFilter: { deny: ensureExpertSendMessageDenied(source.toolFilter) },
+        toolFilter: { deny: recoveryDeny },
         maxDepth: source.maxDepth ?? 1,
       };
       const pending = { parent: record.parentAgent, parentId: record.parentId, role: record.role, record, op };
@@ -5842,10 +6024,9 @@ export default {
       let childId;
       let messageId;
       try {
-        ({ childId, messageId } = await subagents.startContinuable({
-          provider: "spawn",
-          label: source.label,
+        ({ childId, messageId } = await startExpertActivation({
           request,
+          label: source.label,
           signal: op.controller?.signal,
         }));
         if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
@@ -6342,14 +6523,94 @@ export default {
     /** 已挂载角色对应的工具注销器；注册必须归当前 ctx Fiber 所有。 */
     const toolDisposers = new Map();
 
-    /** spawn provider 是否具备本工具用到的全部能力：
-     *  depthLimit（maxDepth 上限）、prepareContinuable（后台可继续）、
-     *  persona 与 toolFilter（角色人格与只读约束）。 */
+    /**
+     * spawn provider 是否具备本工具用到的全部能力。
+     *
+     * RC1 把角色人格和工具过滤从 provider capability 中移除，并由公开
+     * subagents.startActivation 负责 admission；旧 Host/测试替身仍可能只提供
+     * startContinuable + persona/toolFilter。两套契约都必须严格按其自身字段判断，
+     * 不能因为 RC1 已有 prepareContinuable 就误把缺少启动 seam 的 provider 当成可用。
+     */
     function spawnProviderReady() {
       const provider = subagents.getProvider("spawn");
       if (provider === void 0) return false;
       const caps = provider.capabilities ?? {};
-      return caps.depthLimit === true && caps.toolFilter === true && caps.persona === true && typeof provider.prepareContinuable === "function";
+      // startActivation 一旦存在即是 RC1 实际 seam；即使 legacy 能力完整，
+      // RC1 capability 不完整也必须 fail-closed，不能报告 ready 后再误走 RC1。
+      if (typeof subagents.startActivation === "function") {
+        return typeof provider.prepareContinuable === "function"
+          && caps.agentOptions === true
+          && caps.depthLimit === true;
+      }
+      return typeof provider.prepareContinuable === "function"
+        && caps.depthLimit === true
+        && caps.toolFilter === true
+        && caps.persona === true
+        && typeof subagents.startContinuable === "function";
+    }
+
+    /**
+     * 把完整专家 persona 放进 RC1 的首条任务消息。
+     *
+     * RC1 不再接受 SubagentStartRequest.persona/toolFilter；runtime guard 仍负责
+     * 强制工具边界，这里只迁移原先由 persona 提供的角色身份与固定纪律。插入点
+     * 放在已有「你是 ... 子代理。」身份行之后，保证所有角色 prompt 的首行契约、
+     * 图片 ContentBlock 顺序和任务正文都不变。返回新数组/新 block，绝不修改
+     * admission 调用方持有的 request，避免 recovery/fan-out 共享对象被串改。
+     */
+    function promptWithExpertPersona(prompt, persona) {
+      if (typeof persona !== "string" || persona.length === 0) return prompt;
+      const decorate = (text) => {
+        if (typeof text !== "string") return text;
+        const firstLineEnd = text.indexOf("\n");
+        if (firstLineEnd < 0) return persona + "\n\n" + text;
+        return text.slice(0, firstLineEnd + 1) + persona + "\n\n" + text.slice(firstLineEnd + 1);
+      };
+      if (typeof prompt === "string") return decorate(prompt);
+      if (!Array.isArray(prompt)) return prompt;
+      const textIndex = prompt.findIndex((block) => block?.type === "text" && typeof block.text === "string");
+      if (textIndex < 0) return [{ type: "text", text: persona }, ...prompt];
+      return prompt.map((block, index) => index === textIndex ? { ...block, text: decorate(block.text) } : block);
+    }
+
+    /**
+     * DEG-only 的双契约启动适配器。
+     *
+     * startActivation 存在时只组装 RC1 公共字段：request 去掉已删除的 label、
+     * persona、toolFilter，delivery 固定为 parent，让 DSH manager 负责 parent
+     * notification 和 activation 生命周期。startActivation 本身抛错时原样上抛，
+     * 只有方法不存在才回退旧 startContinuable，避免把 admission 错误伪装成兼容路径。
+     */
+    async function startExpertActivation({ request, label, signal }) {
+      if (typeof subagents.startActivation === "function") {
+        // RC1 manager 会在 admission 前直接调用 signal.throwIfAborted()；缺失或不完整的 signal
+        // 必须在 DEG 边界 fail-closed，不能把 RC1 合同错误伪装成 legacy fallback。
+        if (signal === void 0 || signal === null || typeof signal.throwIfAborted !== "function") {
+          throw new TypeError("RC1 startActivation requires an AbortSignal");
+        }
+        const { label: _requestLabel, signal: _requestSignal, persona, toolFilter: _toolFilter, ...activationRequest } = request ?? {};
+        const role = activationRequest.agentOptions?.[ROLE_MARKER];
+        const rc1Request = {
+          ...activationRequest,
+          prompt: promptWithExpertPersona(activationRequest.prompt, persona ?? (typeof role === "string" ? resolvePersonaForAdmission(role) : void 0)),
+        };
+        return subagents.startActivation({
+          provider: "spawn",
+          label: typeof label === "string" ? label : request?.label,
+          request: rc1Request,
+          signal,
+          delivery: "parent",
+        });
+      }
+      if (typeof subagents.startContinuable === "function") {
+        return subagents.startContinuable({
+          provider: "spawn",
+          label: typeof label === "string" ? label : request?.label,
+          request,
+          signal,
+        });
+      }
+      throw new Error("subagent provider \"spawn\" has no supported activation method");
     }
 
     /**
@@ -6919,6 +7180,8 @@ export default {
             [ROLE_MARKER]: input.role,
             [PARENT_MARKER]: parent.id,
             [CONTINUABLE_MARKER]: true,
+            // RC1 不消费 request.toolFilter；保留 fan-out admission 的完整 deny 结果。
+            [DENY_MARKER]: ensureExpertSendMessageDenied(deny),
             [FANOUT_MARKER]: true,
             [FANOUT_PARENT_TASK_MARKER]: input.parentTaskId,
             [FANOUT_PARENT_AGENT_MARKER]: parent.id,
@@ -6933,10 +7196,9 @@ export default {
         };
         return { request, parentAgent: parent, parentId: parent.id, role: input.role };
       },
-      startContinuable: ({ request, signal }) => subagents.startContinuable({
-        provider: "spawn",
-        label: request.label,
+      startContinuable: ({ request, signal }) => startExpertActivation({
         request,
+        label: request.label,
         signal,
       }),
       /**
@@ -7003,6 +7265,10 @@ export default {
             ...(typeof role === "string" ? { role } : {}),
             ...(typeof parentId === "string" ? { parentId } : {}),
             continuable: true,
+            // fan-out 走独立 onAgentCreated 回调；这里同步保存 RC1 admission deny 快照。
+            ...(Array.isArray(agent.options?.[DENY_MARKER])
+              ? { [DENY_MARKER]: [...agent.options[DENY_MARKER]] }
+              : {}),
             ...(fanoutIdentity ? {
               fanout: true,
               fanoutParentTaskId: parentTaskId,
@@ -7274,6 +7540,7 @@ export default {
           record: target.record,
           childId: target.childId,
           parent,
+          signal,
           scope,
           routeKey,
           request,
@@ -7288,7 +7555,7 @@ export default {
        * 只接受仍可验证的 exact record（parent/role/owner 一致），其他情况 fail-closed
        * 上抛，绝不静默新建一个与旧任务无关的 child。
        */
-      async function rebuildExistingChildForContinuation({ record, childId, parent, scope, routeKey, request, label, taskKey, rootToken }) {
+      async function rebuildExistingChildForContinuation({ record, childId, parent, signal, scope, routeKey, request, label, taskKey, rootToken }) {
         if (record === void 0 || record.parentId !== parent.id || record.role !== role) {
           throw new Error(role + " 续作失败：child " + childId + " 已不可恢复且缺少可验证的恢复记录");
         }
@@ -7302,11 +7569,10 @@ export default {
         let rebuiltChildId;
         let messageId;
         try {
-          ({ childId: rebuiltChildId, messageId } = await subagents.startContinuable({
-            provider: "spawn",
-            label,
+          ({ childId: rebuiltChildId, messageId } = await startExpertActivation({
             request,
-            signal: void 0,
+            label,
+            signal,
           }));
         } catch (error) {
           const capacityError = createSubagentCapacityError(error);
@@ -7558,10 +7824,9 @@ export default {
           let childId;
           let messageId;
           try {
-            ({ childId, messageId } = await subagents.startContinuable({
-              provider: "spawn",
-              label,
+            ({ childId, messageId } = await startExpertActivation({
               request,
+              label,
               signal,
             }));
           } catch (error) {
@@ -7765,6 +8030,7 @@ export default {
           // 文字上下文说明（函数不接受任何用户输入），主任务仍由主代理持有并综合。
           const observerTaskPrompt = buildExpertTaskPrompt("observer", buildObserverVisualTask());
           const promptContent = buildImageContent({ attachments: imageAttachments, text: observerTaskPrompt, role: "Observer" });
+          const observerDeny = ensureExpertSendMessageDenied(effectiveDeny(parent, READONLY_DENY, true));
           const request = {
             label: "用户图片",
             prompt: promptContent,
@@ -7776,9 +8042,10 @@ export default {
               [ROLE_MARKER]: role,
               [PARENT_MARKER]: parent.id,
               [CONTINUABLE_MARKER]: true,
+              [DENY_MARKER]: observerDeny,
             },
             persona: resolvePersonaForAdmission("observer"),
-            toolFilter: { deny: ensureExpertSendMessageDenied(effectiveDeny(parent, READONLY_DENY, true)) },
+            toolFilter: { deny: observerDeny },
             maxDepth: 1,
           };
           const scope = delegationScopeKey(parent.id, role);
@@ -8040,7 +8307,7 @@ export default {
           // advisory 会伪造出「已为这个 child 开了一批要 finalize 的 admission」的假象。
           if (cancelHandle.present === true) {
             if (!spawnProviderReady()) {
-              throw new Error(`subagent provider "spawn" is not available (missing depthLimit/toolFilter/persona/prepareContinuable); the ${role} expert tool cannot cancel a child`);
+              throw new Error(`subagent provider "spawn" is not available (missing a supported activation seam/provider capabilities/prepareContinuable); the ${role} expert tool cannot cancel a child`);
             }
             const cancelled = await cancelExplicitChild({
               childId: cancelHandle.value,
@@ -8055,7 +8322,7 @@ export default {
           let failurePhase = "provider";
           try {
           if (!spawnProviderReady()) {
-            throw new Error(`subagent provider "spawn" is not available (missing depthLimit/toolFilter/persona/prepareContinuable); the ${role} expert tool cannot start a child`);
+            throw new Error(`subagent provider "spawn" is not available (missing a supported activation seam/provider capabilities/prepareContinuable); the ${role} expert tool cannot start a child`);
           }
           failurePhase = "selection";
           const resolvedRole = resolveRole(parent.id, role);
@@ -8137,6 +8404,9 @@ export default {
               // 供重启后按 parentId+role+route 恢复可复用 child。
               [ROLE_MARKER]: role,
               [PARENT_MARKER]: parent.id,
+              // RC1 不再读取 request.toolFilter；把 admission 解析出的完整 deny 边界
+              // 随 child options 传入 DEG 私有 runtime guard。
+              [DENY_MARKER]: childDeny,
             },
             // persona 在 admission 边界解析：设置页保存的自定义提示词只影响之后
             // 新建的 child，既有 running/idle/ready child 保持创建时的 persona。
@@ -8169,17 +8439,22 @@ export default {
             ? resolveContinueTarget({ childId: continueHandle.value, parent, scope, taskKey, currentRouteKey: routeKey })
             : { target: void 0, warning: "" };
           if (continueRequested && resolvedContinue.target === void 0) {
-            const warning = resolvedContinue.warning;
-            return {
-              kind: "advisory",
-              started: false,
-              accepted: false,
+            // 未知/越权但格式合法的 childId：绝不派发、绝不投递、绝不 interrupt，也绝不
+            // 回落到「当前 scope 最近 child」或静默改成新建。
+            //
+            // 返回值必须**不带** admission 凭据：带 admissionEpoch/admissionToken 的
+            // advisory 会伪造出「已为它开了一批要 finalize 的 admission」的假象，让模型
+            // 把一次纯拒绝当成真实 child admission 去收口。
+            //
+            // 同时必须把上面已经 begin 的内部 ticket 记录为已拒绝并 settle（见
+            // discardRootAdmission）：否则本批会永久停在 admission-outcome-pending，
+            // 而该 token 又从未交给调用方，最终把整个 root 批次毒化成无法收口。
+            discardRootAdmission(admissionTicket, {
+              kind: "rejected",
               reason: "child-not-found",
               code: "CHILD_NOT_FOUND",
-              warning,
-              admissionEpoch: admissionTicket.epoch,
-              admissionToken: admissionTicket.token,
-            };
+            });
+            return rejectedHandleResult("child-not-found", "CHILD_NOT_FOUND", resolvedContinue.warning);
           }
 
           // 所有输入形态都只等待 scope/admission、必要的 child 投递和 Goal pause CAS，
