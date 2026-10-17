@@ -400,6 +400,20 @@ export function createFanoutRuntimeModule({
     },
     // 关闭后的迟到 fan-out 事件仍交给 runtime 识别：已知 child/session 返回 true，
     // 这样 index.js 不会把它们误交给旧 recovery；未知对象仍返回 false，保留正常事件路由。
+    /**
+     * guard/登记之前的 fan-out child 身份预检（只读转发）。
+     *
+     * 组合根必须在**任何副作用之前**调用它：handleAgentCreated 的 false 只表示「没有对应
+     * live attempt」，不能作为身份证据。runtime 可以是测试替身（未实现该方法）——此时必须
+     * 返回**结构化失败**而不是 undefined：调用方只认 `ok === true`，缺能力与「预检不通过」
+     * 必须同形 fail-closed，绝不因转发返回 undefined 而被当成通过，也不因转发抛错而把正常
+     * 的 created 事件打断。
+     */
+    precheckFanoutChildIdentity: (agent, persistedIdentity) => (
+      typeof runtime.precheckFanoutChildIdentity === "function"
+        ? runtime.precheckFanoutChildIdentity(agent, persistedIdentity)
+        : { ok: false, reason: "fanout_precheck_unavailable" }
+    ),
     handleAgentCreated: (agent, persistedIdentity) => runtime.handleAgentCreated(agent, persistedIdentity),
     handleAgentDisposed: (agent, persistedIdentity) => runtime.handleAgentDisposed(agent, persistedIdentity),
     handleSessionEvent: (session, event) => runtime.handleSessionEvent(session, event),

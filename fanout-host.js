@@ -86,6 +86,12 @@ export function fanoutAttemptKey(parentTaskId, shardId, attempt) {
   return [String(parentTaskId), String(shardId), String(attempt)].join("\u001f");
 }
 
+/**
+ * fan-out 身份的四个可比较字段：预检要求 marker 与持久化身份在这些字段上逐字一致
+ * （不做字段级合并，否则冲突会被静默取一方，等于放行伪造 marker）。
+ */
+const FANOUT_IDENTITY_FIELDS = Object.freeze(["parentTaskId", "parentAgentId", "shardId", "attempt"]);
+
 function markerFanoutIdentity(options) {
   if (options?.[FANOUT_MARKER] !== true) return undefined;
   const parentTaskId = markerText(options, FANOUT_PARENT_TASK_MARKER);
@@ -1064,12 +1070,86 @@ export function createFanoutRuntime(options = {}) {
   });
   const unsubscribeManager = manager.subscribe((event) => rememberEvent(event));
 
+  /**
+   * fan-out child 身份预检（只读、fail-closed）。
+   *
+   * 为什么必须独立于 handleAgentCreated：后者的 false 只表示「没有对应的 live attempt」，
+   * 它不构成任何身份证据——把别人的 parentTaskId/shardId/attempt 复制过来、或把 parent
+   * 指到另一个 root 的错误 marker 同样得到 false，却可能已经被上游当成 fan-out child
+   * 登记了 exact Agent 并安装了 scoped guard。因此把一致性判定独立成显式预检，供
+   * index.js 在**产生任何副作用之前**调用，handleAgentCreated 自身也复用同一份判定。
+   *
+   * 判定顺序（每一条不成立都 fail-closed，返回第一个原因）：
+   * 1. marker 与持久化 fan-out 身份同时存在时，四个身份字段必须逐字一致；
+   * 2. 实际 `agent.parent.id` 存在时必须等于 fan-out parentAgentId；缺失时（合法
+   *    cold-resume 的 Agent 可能没有 parent 引用）按可信持久化身份继续判定；
+   * 3. 该 attempt 的 active runtime record 存在时，先要求 record 的两个 canonical parent
+   *    来源（record.parentId / record.parentAgent.id）彼此一致：两者都非空却不相等即
+   *    `fanout_record_parent_conflict`，绝不用集合合并接受单边匹配；一致后再要求
+   *    marker/实际 parentAgentId 等于该 canonical parent，覆盖「admission 由 root-a 预备、
+   *    created marker/parent 却写 root-b」的 mismatch；record 尚未写入 canonical parent
+   *    时同样无从证明，一并拒绝。
+   *
+   * 只读：不写 record、不登记 id、不安装任何 guard。
+   *
+   * @param {object} agent - agent/created 携带的 exact Agent。
+   * @param {object} [persistedIdentity] - 该 child id 的持久化模型快照（可选）。
+   * @returns {{ok:true, identity:object} | {ok:false, reason:string}}
+   */
+  function precheckFanoutChildIdentity(agent, persistedIdentity) {
+    const markerIdentity = markerFanoutIdentity(markerOptions(agent));
+    const persisted = persistedFanoutIdentity(persistedIdentity);
+    if (markerIdentity === undefined && persisted === undefined) {
+      return { ok: false, reason: "fanout_identity_missing" };
+    }
+    if (markerIdentity !== undefined && persisted !== undefined) {
+      for (const field of FANOUT_IDENTITY_FIELDS) {
+        if (markerIdentity[field] !== persisted[field]) {
+          return { ok: false, reason: "fanout_identity_conflict:" + field };
+        }
+      }
+    }
+    const identity = markerIdentity ?? persisted;
+    const actualParentId = nonEmptyText(agent?.parent?.id);
+    if (actualParentId !== "" && actualParentId !== identity.parentAgentId) {
+      return { ok: false, reason: "fanout_parent_agent_mismatch" };
+    }
+    const record = records.get(fanoutAttemptKey(identity.parentTaskId, identity.shardId, identity.attempt));
+    if (record !== undefined) {
+      // canonical parent 只取 admission 边界写入的两个来源（record.parentId / record.parentAgent.id）。
+      const recordParentId = nonEmptyText(record.parentId);
+      const recordParentAgentId = nonEmptyText(record.parentAgent?.id);
+      // 两个来源都非空却不相等：record 自身的父归属自相矛盾。此时**不能**合并成集合后接受
+      // 「单边匹配」——那等于让伪造方挑一个对自己有利的来源当证据。矛盾必须先于匹配拒绝。
+      if (recordParentId !== "" && recordParentAgentId !== "" && recordParentId !== recordParentAgentId) {
+        return { ok: false, reason: "fanout_record_parent_conflict" };
+      }
+      // 只有两个来源一致（或仅一个可用）时才存在唯一 canonical parent；两者都缺失时没有
+      // 任何可证明的归属，同样 fail-closed（绝不用 marker 自己的值给自己作证）。
+      const canonicalParentId = recordParentId !== "" ? recordParentId : recordParentAgentId;
+      if (canonicalParentId === "") return { ok: false, reason: "fanout_record_parent_unproven" };
+      if (canonicalParentId !== identity.parentAgentId) return { ok: false, reason: "fanout_record_parent_mismatch" };
+      if (actualParentId !== "" && actualParentId !== canonicalParentId) {
+        return { ok: false, reason: "fanout_record_parent_mismatch" };
+      }
+    }
+    return { ok: true, identity };
+  }
+
   function handleAgentCreated(agent, persistedIdentity) {
     if (!isFanoutAgent(agent) && !isFanoutIdentity(persistedIdentity)) return false;
+    /**
+     * 与 index.js 的 guard 安装前预检是**同一份判定**：直接调用方（测试替身、未来入口）
+     * 也必须 fail-closed，不能让不一致的 marker 借「没有对应 record」的 false 绕过边界。
+     */
+    const precheckVerdict = precheckFanoutChildIdentity(agent, persistedIdentity);
+    if (precheckVerdict.ok !== true) {
+      log("fan-out agent/created identity precheck rejected: " + precheckVerdict.reason);
+      return false;
+    }
     const marker = markerOptions(agent);
-    const identity = markerFanoutIdentity(marker) ?? persistedFanoutIdentity(persistedIdentity);
-    if (identity === undefined) return false;
-    const { parentTaskId, parentAgentId, shardId, attempt } = identity;
+    // 预检通过时 identity 必然存在（ok:true 的唯一构造路径），不再重复判空。
+    const { parentTaskId, parentAgentId, shardId, attempt } = precheckVerdict.identity;
     const key = fanoutAttemptKey(parentTaskId, shardId, attempt);
     const sessionId = sessionIdOf(agent);
     rememberKnownId(childIdOf(agent) ?? agent?.id);
@@ -1111,6 +1191,11 @@ export function createFanoutRuntime(options = {}) {
           shardId,
           attempt,
           parentAgentId,
+          // canonical parentId：record 在 admission 边界已由 buildRequest 归一
+          // （缺少 prepared.parentId 时回落到 exact parentAgent.id），因此这里优先
+          // 用它而不是 fan-out 专有 marker。下游据它写 child_models.parentId 并补装
+          // scoped guard；漏掉字段会让 guard 身份解析 fail-closed 不安装。
+          parentId: record.parentId ?? parentAgentId,
           role: markerText(marker, "__degExpertRole") ?? persistedIdentity?.role,
         });
       } catch (error) {
@@ -1465,6 +1550,11 @@ export function createFanoutRuntime(options = {}) {
     continuationReadiness,
     canceller,
     isFanoutAgent,
+    /**
+     * guard/登记之前的 fan-out child 身份预检（只读）：index.js 必须在安装 scoped guard、
+     * 登记 exact Agent 之前调用它；失败即终止该 created 路由（见 precheckFanoutChildIdentity）。
+     */
+    precheckFanoutChildIdentity,
     handleAgentCreated,
     handleSessionEvent,
     handleAgentDisposed,
