@@ -25,7 +25,7 @@
  * 已删除**，理由与收益：
  *
  * 1. **契约**：package.json peerDependencies 下限是 `@deepseek-ai/dsh-client-modules`
- *    `^0.2.0-rc.2`，README 声明的目标运行时同为 `0.2.0-rc.2`；宿主只加载
+ *    `^0.2.1-rc.2`，README 声明的目标运行时同为 `0.2.1-rc.1` / `0.2.1-rc.2`；宿主只加载
  *    exports["./client"] 指向的装配产物，而该产物恒含本脚本生成的投影片段，且投影排在
  *    唯一 descriptor 之前执行，因此 `require("dsh-expert-group/client-freshness")`
  *    必然命中同一张模块表——fallback 在生产路径上不可达。
