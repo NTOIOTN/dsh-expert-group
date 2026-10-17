@@ -13,16 +13,21 @@
  * - 目标版本取「命令行位置参数 → DSH_VERSION 环境变量 → 内置默认」三档，因此默认值只需要
  *   在这一处维护：`package.json` 的 release 脚本不再硬编码任何 DSH 版本（避免宿主升级后
  *   发布链把 peer range 钉回旧 minor）。
+ * - 写回的 range 形式是「下界（floor）」而不是 caret 区间：peer 值写成 `>=<targetVersion>`，
+ *   语义是"宿主版本不得低于该下界"。caret 形式（`^0.2.1-rc.2`）在 prerelease 线上会把可接受
+ *   集合钉死：宿主发 rc.3 或正式版时，`^0.2.1-rc.2` 的语义并不能表达"不低于 rc.2"这一意图，
+ *   下界形式才是本插件真正想声明的宿主契约，也是 package.json 当前的统一写法。
  */
 import { readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
 /**
- * 默认目标 DSH 版本（本插件唯一支持的宿主版本线）。
+ * 默认目标 DSH 宿主「下界」（本插件唯一支持的宿主版本线）。
  * 宿主升级时只改这一处；发布链与 peer 基线都随它走。
+ * 注意：该值是下界而不是 caret 区间的中心版本，写回形式为 `>=<version>`。
  */
-const DEFAULT_DSH_VERSION = '0.2.1-rc.2';
+const DEFAULT_DSH_VERSION = '0.2.1-rc.1';
 
 /** 仓库根：scripts/ 的父目录；与调用者 cwd 无关。 */
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -46,21 +51,23 @@ if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(targetVersion)) {
 
 const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
 
-// 更新所有@deepseek-ai/dsh-*包
+// 更新所有 @deepseek-ai/dsh-* 包：统一写下界形式 `>=<targetVersion>`（floor 语义），
+// 不再写 caret 区间——caret 会把可接受的宿主集合钉死在某一条 prerelease 线上。
 let count = 0;
 const dshPackages = [];
 for (const key in pkg.peerDependencies) {
   if (key.startsWith('@deepseek-ai/dsh-')) {
     const oldVersion = pkg.peerDependencies[key];
-    pkg.peerDependencies[key] = `^${targetVersion}`;
-    dshPackages.push({ name: key, old: oldVersion, new: `^${targetVersion}` });
+    const newRange = `>=${targetVersion}`;
+    pkg.peerDependencies[key] = newRange;
+    dshPackages.push({ name: key, old: oldVersion, new: newRange });
     count++;
   }
 }
 
 writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
 
-console.log(`✅ 已更新 ${count} 个包到 ^${targetVersion}`);
+console.log(`✅ 已更新 ${count} 个包到下界 >=${targetVersion}`);
 console.log('\n变更清单:');
 dshPackages.forEach(({ name, old, new: newVer }) => {
   console.log(`  ${name}: ${old} → ${newVer}`);
@@ -68,8 +75,9 @@ dshPackages.forEach(({ name, old, new: newVer }) => {
 
 /**
  * 判断 pnpm-lock.yaml 是否仍引用旧的 @deepseek-ai/dsh-* 版本。
- * 文本匹配足以覆盖本门禁场景：命中任一「@deepseek-ai/dsh-*: ^<targetVersion>」即视为已同步，
- * 因此结果偏保守（宁可提示重建，也不误报"已同步"）。
+ * 文本匹配足以覆盖本门禁场景：命中任一「@deepseek-ai/dsh-*: >=<targetVersion>」即视为已同步，
+ * 因此结果偏保守（宁可提示重建，也不误报"已同步"）——正则锚定的是下界形式，lockfile 里若仍是
+ * 旧的 caret specifier 或别的下界值都会判定为过期。
  * @returns {boolean} true 表示 lockfile 仍引用旧版本、需要重建
  */
 function lockfileStale() {
@@ -81,11 +89,11 @@ function lockfileStale() {
     return true;
   }
   // 转义目标版本里的正则元字符（semver 可能含 '-'、'+' 等），避免误匹配。
-  // 目标版本出现在 lockfile 的 `specifier` 行；匹配从包名到 `^<version>` 的整段形状，
-  // 版本尾部不得再跟标识符字符（否则 ^0.9.9 会误匹配 ^0.9.9-other）。YAML 允许
-  // 包名与版本两侧带引号，因此引号按可选处理。
+  // 目标版本出现在 lockfile 的 `specifier` 行；匹配从包名到 `>=<version>` 的整段形状，
+  // 版本尾部不得再跟标识符字符（否则 >=0.9.9 会误匹配 >=0.9.9-other）。YAML 允许
+  // 包名与版本两侧带引号，因此引号按可选处理。`>` 与 `=` 在正则中是普通字符，无需转义。
   const escaped = targetVersion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const dshEntry = new RegExp(`@deepseek-ai/dsh-[\\w.-]+['"]?\\s*:[\\s\\S]{0,40}?['"]?\\^${escaped}(?![\\w.-])`);
+  const dshEntry = new RegExp(`@deepseek-ai/dsh-[\\w.-]+['"]?\\s*:[\\s\\S]{0,40}?['"]?>=${escaped}(?![\\w.-])`);
   return !dshEntry.test(text);
 }
 

@@ -24,33 +24,27 @@
 - **无内置默认模型**：新安装后所有角色均为空，需在“dsh-expert-group”设置页从 DSH
   已配置的模型中自行选择并保存；未配置模型的角色在调用时会给出明确提示。
 - 模型与思考深度通过 `llm.listProviders/listModels` + `resolveCallConfig` 校验，只接受设置中已添加的模型。
-- **动态 settings 保存能力**：插件不在模块加载期 import `@deepseek-ai/dsh-settings`（package 声明的是 `^0.2.1-rc.2` peer，宿主应提供兼容版本，插件自身不额外加载该包）。目标运行时为 `0.2.1-rc.1` / `0.2.1-rc.2`（即 `>0.2.1-rc.1` 的 RC2 契约宿主线）；插件通过宿主 settings 服务的 describe/update/mutate 面读写 profile 条目，并由 DEG 自有的 settings-commit 端点完成语义校验与 revision 冲突检测（宿主不再提供 owner validate 钩子）。
+- **动态 settings 保存能力**：插件不在模块加载期 import `@deepseek-ai/dsh-settings`（package 声明的是 `>=0.2.1-rc.1` peer，宿主应提供兼容版本，插件自身不额外加载该包）。目标运行时为 `0.2.1-rc.1` / `0.2.1-rc.2`（即 `>0.2.1-rc.1` 的 RC2 契约宿主线）；插件通过宿主 settings 服务的 describe/update/mutate 面读写 profile 条目，并由 DEG 自有的 settings-commit 端点完成语义校验与 revision 冲突检测（宿主不再提供 owner validate 钩子）。
 - 子代理的 `reasoningEffort` 通过子代理 `agent/request` waterfall 注入，绕开 `dsh-tool-subagent`
   `AgentOptions` 尚未公开该字段的限制。
 
 ## 安装
 
-本插件发布到 npm 公共源，用 DSH 官方 `dsh plugin` CLI 按包名安装（`--profile` 为必填参数，一般填 `web`）：
-
-```powershell
-dsh plugin --profile web add dsh-expert-group
-```
-
-也可以直接用 npm 安装：
+本插件发布到 npm 公共源，可直接用 npm 安装：
 
 ```bash
 npm i dsh-expert-group
 ```
 
-前置条件：DSH Web 可正常运行（`dsh web`）、Node.js ≥ 22，且 PATH 上有 `pnpm`。安装后重启 `dsh web` 使插件生效。
+也可以在 DSH 的「添加插件」页面按包名安装：在输入框中填入 `dsh-expert-group`，按需在右侧切换安装源，然后点击「安装」。
 
-桌面版（Electron 客户端）的 `desktop` profile 由客户端独占管理，PATH 上的 `dsh` CLI 改不动它：先打开 Desktop 完成初始化再完全退出，用安装目录自带的 CLI 执行同一命令。
+![DSH「添加插件」对话框截图：输入框中填写的是 dsh-expert-group，右侧可切换安装源](docs/assets/dsh-plugin-add-dialog.png)
 
-```powershell
-& '<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd' plugin --profile desktop add dsh-expert-group
-```
+> 该截图存放在仓库的 `docs/assets/` 下；npm 安装包按 `package.json` 的 `files` 白名单发布、**不包含 `docs/`**，因此从 npm 安装的副本里这张图不会显示，在仓库中阅读一切正常。
 
-安装后重新打开 Desktop 使插件生效。本插件不内置角色默认模型：先在 DSH「设置 → 模型」配置模型，再到「设置 → dsh-expert-group」为各角色选择模型并保存。
+前置条件：DSH 版本 ≥ `0.2.1-rc.1`、DSH Web 可正常运行（`dsh web`）、Node.js ≥ 22，且 PATH 上有 `pnpm`。安装后重启 `dsh web` 使插件生效。
+
+本插件不内置角色默认模型：先在 DSH「设置 → 模型」配置模型，再到「设置 → dsh-expert-group」为各角色选择模型并保存。
 
 ## 界面总览
 

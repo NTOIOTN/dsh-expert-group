@@ -10500,9 +10500,13 @@ window.__ModuleLoader__.load({
       ".deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}" +
       ".deg_settings_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}" +
       ".deg_settings_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);align-items:center;gap:20px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
-      ".deg_settings_management_row{grid-template-columns:minmax(0,1fr) auto minmax(180px,280px)}" +
-      ".deg_settings_management_row>.deg_settings_checkbox{white-space:nowrap}" +
-      ".deg_settings_management_row>.deg_settings_control{justify-self:end}" +
+      // 管理行的四个控件按内容宽度排列，并用 space-between 吸收剩余空间，让 599px/760px 容器中的间距均匀。
+      ".deg_settings_management_row{display:flex;align-items:center;justify-content:space-between;column-gap:16px;row-gap:12px;flex-wrap:nowrap;min-width:0}" +
+      // 统一 29px 行高与数字输入框，保证四个控件的 bounding box 顶部对齐，同时保留可用点击高度。
+      ".deg_settings_management_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}" +
+      ".deg_settings_management_row>.deg_settings_control{flex:0 0 auto;justify-self:auto;min-width:max-content;white-space:nowrap;height:29px;box-sizing:border-box}" +
+      // 520px 以下取消强制单行并左对齐，允许控件按整项换行；固定内容宽度避免标签折行、溢出或输入框被压缩。
+      "@media (max-width:520px){.deg_settings_management_row{flex-wrap:wrap;justify-content:flex-start}}" +
       ".deg_settings_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}" +
       ".deg_settings_control{display:flex;align-items:center;gap:10px;min-width:0}" +
       ".deg_settings_control input[type=range]{width:100%;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
