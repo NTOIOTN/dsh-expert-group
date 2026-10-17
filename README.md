@@ -36,6 +36,12 @@
 dsh plugin --profile web add dsh-expert-group
 ```
 
+也可以直接用 npm 安装：
+
+```bash
+npm i dsh-expert-group
+```
+
 前置条件：DSH Web 可正常运行（`dsh web`）、Node.js ≥ 22，且 PATH 上有 `pnpm`。安装后重启 `dsh web` 使插件生效。
 
 桌面版（Electron 客户端）的 `desktop` profile 由客户端独占管理，PATH 上的 `dsh` CLI 改不动它：先打开 Desktop 完成初始化再完全退出，用安装目录自带的 CLI 执行同一命令。
