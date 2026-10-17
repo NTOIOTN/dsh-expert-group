@@ -610,6 +610,31 @@
   const SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS = 4;
   /** 侧栏打开状态的复合键分隔符：会话 id、rootSessionId 与资源地址都是单行文本，NUL 不会出现在其中。 */
   const SIDEBAR_TAB_KEY_SEPARATOR = "\u0000";
+  /**
+   * 右栏 tab 的两个来源。
+   *
+   * - `auto`：「自动打开」（Auto）本次运行亲手打开的 tab，只有它允许被自动关闭；
+   * - `manual`：用户点击箭头打开、或外部已存在但不由本插件自动动作发起的 tab。
+   * 双来源是「手动优先」判定唯一依据：自动同步绝不关闭 manual 来源的 tab。
+   */
+  const SIDEBAR_TAB_ORIGIN_AUTO = "auto";
+  const SIDEBAR_TAB_ORIGIN_MANUAL = "manual";
+  /**
+   * 自动关闭的有界重试上限。
+   *
+   * 宿主 close(tabId) 可能同步抛错或长期失败；自动同步每 2.5 秒一轮，没有上限就会变成
+   * 后台重试风暴。达到上限后只撤销「这是 Auto 打开的」记账（tab 原样留给用户手动关闭），
+   * 绝不猜测 tabId、也绝不改用批量关闭入口。
+   */
+  const SIDEBAR_AUTO_CLOSE_MAX_ATTEMPTS = 3;
+  /**
+   * 自动来源/抑制记集合的条目上限（按插入顺序淘汰最旧一项）。
+   *
+   * 复合键含 rootSessionId：面板实例跨多个 root 复用时，别的 root 的键在当前快照里无法判定
+   * 是否仍然存在（快照只描述当前 root），因此除了「快照里已消失就清理」之外还需要这条上限，
+   * 保证长期运行的面板不会无界增长。
+   */
+  const SIDEBAR_AUTO_KEY_LIMIT = 128;
 
   function object(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -1380,6 +1405,11 @@
       ".deg_expert_group_header_title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
       ".deg_expert_group_header_action,.deg_expert_group_chevron,.deg_expert_group_action,.deg_expert_group_sidebar_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}",
       ".deg_expert_group_header_action{width:24px;height:24px;margin-left:auto}",
+      // 标题栏 Auto 开关：紧凑到与标题同一行，右对齐且不换行，绝不遮挡标题或右侧操作按钮。
+      ".deg_expert_group_header_auto{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;margin-left:8px;font-weight:400;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
+      ".deg_expert_group_header_auto_input{margin:0;cursor:pointer}",
+      ".deg_expert_group_header_auto_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+      ".deg_expert_group_header_auto_label{font-size:12px;line-height:16px}",
       ".deg_expert_group_header_action:hover,.deg_expert_group_chevron:hover,.deg_expert_group_action:hover:not(:disabled),.deg_expert_group_sidebar_action:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
       ".deg_expert_group_header_action:focus-visible,.deg_expert_group_chevron:focus-visible,.deg_expert_group_action:focus-visible,.deg_expert_group_sidebar_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
       ".deg_expert_group_tree{min-width:0;padding-top:5px}",
@@ -2594,6 +2624,16 @@
       const versionPair = typeof react.useState === "function" ? react.useState(0) : [0, () => {}];
       const version = versionPair[0];
       const bump = versionPair[1];
+      /**
+       * 面板标题栏 Auto 开关的本地乐观值（null = 跟随权威读面）。
+       *
+       * 开关的持久化要走一次 settings-commit 往返；没有本地覆盖时，用户点击后要等下一次
+       * 轮询（最长 2.5 秒）才会看到勾选状态变化。这里先乐观翻转，写失败或权威值变化时
+       * 立刻回退到读面值（绝不让开关停在错误状态）。
+       */
+      const autoOpenDraftPair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
+      const autoOpenDraft = autoOpenDraftPair[0];
+      const setAutoOpenDraft = autoOpenDraftPair[1];
       const model = modelApi();
       // 展开状态只依赖 storage 与 root；缓存 store 可避免每次 RPC/通知重渲染都重复读取
       // sessionStorage 和解析同一份展开键。
@@ -2741,21 +2781,91 @@
       const refreshRef = typeof react.useRef === "function" ? react.useRef(refresh) : { current: refresh };
       refreshRef.current = refresh;
       /**
-       * 子代理侧栏打开状态：复合键（sessionId + rootSessionId + 资源地址）→ { sessionId, rootSessionId, tabId, title, misses }。
+       * 子代理侧栏打开状态：复合键（sessionId + rootSessionId + 资源地址）→
+       * { sessionId, rootSessionId, tabId, title, misses, origin }。
        *
        * 用 ref 而不是 state 的理由与 pendingSet 相同：一次渲染里可能同时存在多个已打开的子代理
        * （每个 root、每个资源地址各一条记录），状态必须按「哪个 root 的哪个地址」隔离，绝不使用
        * 单一全局 boolean——那会让两个子代理互相顶掉，也无法区分不同会话。重渲染统一走 bump。
        * misses 是该 tab 连续被观测到缺失的次数（见 SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS）。
+       * origin 是该 tab 的来源（auto | manual，见 SIDEBAR_TAB_ORIGIN_*）：只有 auto 来源才允许
+       * 被自动同步关闭，manual 来源（用户手动打开、外部已存在的 tab）一律不碰。
        */
       const sidebarTabRecordsRef = typeof react.useRef === "function" ? react.useRef(new Map()) : { current: new Map() };
        /**
-        * 已发起但尚未从 active() 得到落地证据的打开动作：key → { sessionId, rootSessionId, resourceAddress, expiresAt }。
+        * 已发起但尚未从 active() 得到落地证据的打开动作：
+        * key → { sessionId, rootSessionId, resourceAddress, expiresAt, origin }。
         *
         * DSH 的 openResource 可能先提交导航意图，下一次渲染才出现 active tab；这段窗口不能让第二次
         * 点击再次 openResource，也不能提前伪造 <<。observer/轮询读到匹配 active() 后才转成正式记录。
         */
        const sidebarTabOpeningRef = typeof react.useRef === "function" ? react.useRef(new Map()) : { current: new Map() };
+      /**
+       * Auto（自动打开运行中的子代理侧栏）的来源与抑制账本，键与打开记录完全同构
+       * （sidebar session + rootSessionId + 资源地址），因此不同会话/root 的状态互不影响。
+       *
+       * - 来源：Auto 本次运行亲手发出过打开动作的资源。它同时是「不要重复打开」的记账：
+       *   命中即跳过（哪怕这次打开始终没有落地证据，也绝不再发第二次 openResource）；
+       *   只有这个集合里的 key 才允许被自动关闭。
+       * - 抑制：用户手动关闭过的资源。Auto 不得立刻重开它；用户手动重新打开同一资源时清除
+       *   （手动意图始终优先）。
+       * 两个集合都按当前快照与上限清理（见 syncAutoSidebarTabs 的清理阶段）。
+       */
+      const sidebarAutoOriginRef = typeof react.useRef === "function" ? react.useRef(new Map()) : { current: new Map() };
+      const sidebarAutoSuppressedRef = typeof react.useRef === "function" ? react.useRef(new Map()) : { current: new Map() };
+      /** 自动关闭的重试记账：key → 已尝试次数（成功或资源重新变成运行中时清空）。 */
+      const sidebarAutoCloseAttemptsRef = typeof react.useRef === "function" ? react.useRef(new Map()) : { current: new Map() };
+      /**
+       * 自动打开的**预留**（reservation）：key → { sessionId, rootSessionId, address, epoch }。
+       *
+       * 与来源标记严格分离：预留只在候选选择的那一刻写入，用来挡住同一资源的重复动作；只有
+       * openResource 真的成功发出、且宿主有可追踪能力时才升级成「Auto 亲手打开」的来源。
+       * split busy、准备失败、layout 失效、open 抛错、root/sidebar session 变化等失败路径一律
+       * 撤销预留（见 handleSidebarAction 的 finally）：否则一次失败会被永久记成「已经开过」，
+       * 该资源在本次运行里再也打不开。
+       */
+      const sidebarAutoReservationRef = typeof react.useRef === "function" ? react.useRef(new Map()) : { current: new Map() };
+      /**
+       * 自动动作的级联标记与失败屏障。
+       *
+       * 撤销预留之后，「下一次同步」会立刻重新选中同一个资源，而自动动作收尾时又会立刻跑一次
+       * 尾随同步。若宿主的失败是**持续**的（本会话的 split 事务仍在途 ⇒ busy；宿主持续拒绝分栏；
+       * openResource 持续抛错），「失败 → 撤销预留 → 立刻重选」这条链路会在微任务里自转：它永远
+       * 不让出宏任务，宿主的提交证据也就永远不会被观察到，页面与预算一起被拖住。
+       *
+       * 因此：同一次级联（自动动作收尾引发的那条同步链）里失败过的 key 不再入选；失败仍然可重试，
+       * 但下一次尝试一定发生在**外部同步轮**（2.5 秒轮询 / observer / 可见性变化 / 会话通知）里，
+       * 那里才能观察到形成失败条件的宿主状态是否已经改变。
+       */
+      const sidebarAutoCascadeRef = typeof react.useRef === "function" ? react.useRef(false) : { current: false };
+      const sidebarAutoFailedKeysRef = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };
+      /**
+       * Auto 动作代次：Auto 开关的权威值每次变化（含关闭）时递增。
+       *
+       * 在途自动动作在自己那一轮渲染的闭包里捕获取代次，并在每个 await 之后、真正调用宿主
+       * openResource()/close() 之前复核：代次不符说明用户已经关掉（或重新打开）Auto，那次自动
+       * 动作一律放弃——绝不把「已经关掉的 Auto」变成一次迟到的用户可见打开。
+       */
+      const sidebarAutoEpochRef = typeof react.useRef === "function" ? react.useRef(0) : { current: 0 };
+      /**
+       * 用户手动意图记录：key → { sessionId, rootSessionId, address, intent }。
+       *
+       * 唯一目的：Auto 的动作正在同一个 key 上等待（split/layout/open）时，手动点击不能被 pending
+       * 锁直接丢弃。意图只记录「用户要打开还是关闭」，由在途动作在副作用之前让位，或由同一条同步
+       * 链路在它收尾后结算（见 applyPendingManualIntent）：手动关闭绝不被 Auto 随后重开，手动打开
+       * 的最终 tab 一律记为 manual 来源。
+       */
+      const sidebarManualIntentRef = typeof react.useRef === "function" ? react.useRef(new Map()) : { current: new Map() };
+      /**
+       * Auto 动作串行闸门。
+       *
+       * 自动同步可能同时看到多个候选（多个运行中的子代理），但同一 tick 里连发多个
+       * split()/openResource() 会互相抢 pane（第二个动作看到的 pane 证据仍是第一帧之前的）。
+       * 因此一次只放行一个动作，动作收尾后由同一条同步链路推进下一个候选。
+       */
+      const sidebarAutoBusyRef = typeof react.useRef === "function" ? react.useRef(false) : { current: false };
+      /** 最近一次同步观察到的 Auto 开关值；变化时 bump 一次（空闲轮询绝不重渲染）。 */
+      const sidebarAutoSignatureRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
       /**
        * 当前首次 split 的用户意图；它跨越 split → openResource → openTabs/DOM 提交窗口，
        * 只能在目标 tab 已经落到返回的 pane 后才交给 install 侧结算。
@@ -2924,6 +3034,41 @@
       const commitSidebarSplit = typeof config.commitSidebarSplit === "function" ? config.commitSidebarSplit : null;
       const cancelSidebarSplit = typeof config.cancelSidebarSplit === "function" ? config.cancelSidebarSplit : null;
       const openSidebarResource = methodOf(sidebarRight, "openResource");
+      /**
+       * Auto（自动打开运行中的子代理侧栏）的实时读面：install 注入的 getter，每次同步现读。
+       *
+       * 直接 createExpertGroupPanel（旧宿主/单测）没有该依赖时按**关闭**处理：默认行为必须
+       * 与历史逐字节一致（不做任何自动 open/close）。读取抛错同样按关闭处理——自动行为只是
+       * 体验增强，绝不能影响面板渲染或既有的手动箭头。
+       */
+      const readAutoOpenSetting = typeof config.getAutoOpenSubagentSidebar === "function"
+        ? config.getAutoOpenSubagentSidebar
+        : null;
+      /** 面板标题栏 Auto 开关的写面；缺失时开关只读（渲染 disabled），绝不假装能改。 */
+      const writeAutoOpenSetting = typeof config.setAutoOpenSubagentSidebar === "function"
+        ? config.setAutoOpenSubagentSidebar
+        : null;
+      const autoOpenEnabled = () => {
+        if (readAutoOpenSetting === null) return false;
+        try { return readAutoOpenSetting() === true; } catch { return false; }
+      };
+      /**
+       * 标题栏 Auto 开关的点击处理：先本地乐观翻转，再把显式布尔交给写面持久化。
+       *
+       * 写面缺失或返回非 true（只读文档、宿主校验/并发失败）时立刻清掉本地值，开关回退到权威读面；
+       * 成功时本地值与读面一致，下一次同步观察到权威值变化会再清一次（幂等，绝不闪回）。
+       */
+      const toggleAutoOpen = (next) => {
+        const value = next === true;
+        if (writeAutoOpenSetting === null) return;
+        setAutoOpenDraft(value);
+        void Promise.resolve()
+          .then(() => writeAutoOpenSetting(value))
+          .then(
+            (accepted) => { if (accepted !== true) setAutoOpenDraft(null); },
+            () => { setAutoOpenDraft(null); },
+          );
+      };
       // 新版宿主提供公开 split()，返回新 pane 的 PaneId；只有拿到这个回执后才打开资源，
       // 避免 preferNewPane 失败时静默回落到 Expert Group 所在 pane。旧宿主没有 split() 时
       // 保留 preferNewPane 兼容路径，但绝不调用 float()，不制造用户可见浮窗。
@@ -3609,7 +3754,13 @@
         }
       };
 
-      const syncSidebarTabs = () => {
+      /**
+       * 第一阶段：既有「右栏 tab 记录/库存同步」（外部关闭观察、在途打开结算、批量签名更新）。
+       *
+       * 它保留了原有的提前 return（records 为空时不做任何 DOM 查询）；自动同步因此被拆到
+       * 独立的第二阶段（syncSidebarTabs），那些短路不会再吞掉自动打开/关闭。
+       */
+      const syncSidebarTabRecords = () => {
         // 右栏拖拽手柄锁复用这条既有生命周期（挂载 / body 子树变更 / 2.5 秒轮询 / 可见性变化）：
         // 活跃 tab 一变就重估，绝不为它单独再挂一个长期 observer。请求失败只影响这一次重估。
         try { requestRightbarDragSync?.(); } catch { /* 手柄锁只是体验优化，绝不影响面板。 */ }
@@ -3652,6 +3803,22 @@
          }
          // 先完成精确 split 提交，再执行关闭同步；guide-only 或错误 pane 仍继续等待。
          tryCommitSidebarSplit();
+         /**
+          * 手动意图的兜底结算扫描（在任何提前 return 之前）：
+          * 在途动作收尾、打开记录落地或超时都可能让一个意图变成可结算状态。数量级等于用户点击次数，
+          * 因此每轮扫描的成本可以忽略；仍然在途的意图由 applyPendingManualIntent 自己跳过。
+          * 别的 session/root 的条目在这里永远结算不了（它属于那个 surface 自己的闭包），直接删除，
+          * 保证面板跨 root 复用时不泄漏手动意图。
+          */
+         for (const key of [...sidebarManualIntentRef.current.keys()]) {
+           const entry = sidebarManualIntentRef.current.get(key);
+           if (entry === undefined) continue;
+           if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) {
+             sidebarManualIntentRef.current.delete(key);
+             continue;
+           }
+           applyPendingManualIntent(key);
+         }
          // 先完成打开记录，再执行关闭同步；同 pane 回落不再被转换成独立浮窗。
          // 这里保留「没有打开记录就直接返回」的既有短路（它保证空闲时不会发生任何 DOM 查询）；
          // 批量控件的聚合状态更新已经在**这个短路之前**完成，因此 records 为空时 inventory 的变化
@@ -3681,6 +3848,433 @@
         }
         bump((value) => value + 1);
       };
+
+      /**
+       * 当前 sidebar session 的公开 inventory 里，某个资源地址对应的已提交 tabId。
+       *
+       * 返回值必须区分两种「没有」——这是能力降级 fail-closed 的唯一判据：
+       * - readable === false：inventory 不可读（旧宿主 / 读取抛错）。此时既证明不了资源已打开，
+       *   也证明不了它没打开，调用方一律不得据此自动打开（否则可能开出重复页）；
+       * - readable === true && tabId === null：读到了 inventory，确认这个地址没有已提交 tab。
+       * 判定字段与 recordSidebarTab 逐条同源（同 session、kind、contentId），因此「自动打开前的
+       * 存在性检查」与「关闭用的 tabId」永远来自同一个来源，绝不按「当前 active 是谁」猜 tab。
+       */
+      const sidebarResourceTabStateOf = (resourceAddress) => {
+        const inventory = readSidebarOpenTabs();
+        if (inventory === null) return { readable: false, tabId: null };
+        for (const entry of inventory) {
+          const candidate = object(entry);
+          if (text(candidate.sessionId, null) !== sidebarSessionId) continue;
+          if (text(candidate.kind, null) !== SUBAGENT_CHAT_KIND) continue;
+          if (text(candidate.contentId, null) !== resourceAddress) continue;
+          return { readable: true, tabId: text(candidate.tabId, null) };
+        }
+        return { readable: true, tabId: null };
+      };
+      /**
+       * active() 是否已经是这个资源（kind 与 contentId 同时匹配）。
+       *
+       * inventory 不可读或提交延迟时，它仍能证明「这个资源已经开着」：这样的 tab 只算手动/未知
+       * 来源，Auto 既不接管（不写 auto 来源）也不重复打开；它只在「可追踪」判定里作为证据使用。
+       */
+      const sidebarActiveResourceMatches = (resourceAddress) => {
+        if (readActiveSidebarResource === null) return false;
+        let tab = null;
+        try { tab = object(readActiveSidebarResource.call(sidebarRight)); } catch { return false; }
+        if (text(tab.kind, null) !== SUBAGENT_CHAT_KIND) return false;
+        return text(tab.contentId, null) === resourceAddress;
+      };
+      /**
+       * 自动打开必须同时具备的能力（缺一项即 fail-closed，绝不自动打开）：
+       * 1. 公开 close()：没有它，Auto 打开的 tab 将来无法被精确回收（只能用 tabId 关闭，绝不改用
+       *    批量入口或按 active 猜）；
+       * 2. 落地证据读面（active() 或 openTabs inventory）与左箭头图标：没有证据就无法确认这次打开
+       *    有没有落地，也就没有可关闭的 << 状态；
+       * 3. 公开 openResource()：没有它连打开动作都发不出去。
+       * 只约束自动路径：这些能力缺失时手动箭头与历史行为逐条不变。
+       */
+      const sidebarAutoOpenCapable = () => openSidebarResource !== null
+        && closeSidebarResource !== null
+        && (readActiveSidebarResource !== null || sidebarOpenTabsAvailable === true)
+        && typeof primitives?.IconChevronLeftOutlineRegular === "function";
+
+      /** 当前 surface 自己的手动意图记录；别的 session/root 的键在当前闭包里一律不可见。 */
+      const sidebarManualIntentOf = (key) => {
+        const entry = sidebarManualIntentRef.current.get(key);
+        if (entry === undefined) return undefined;
+        if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) return undefined;
+        return entry;
+      };
+      /**
+       * Auto 同步第二阶段的候选选择：先给一个「该关的」候选，再给一个「该开的」候选。
+       *
+       * 一个同步轮次最多产出一个候选（见 sidebarAutoBusyRef）：多个候选由动作收尾后的同一条
+       * 同步链路逐个推进，绝不并发发多个 split/openResource。
+       */
+      const autoCloseCandidate = (running) => {
+        const origin = sidebarAutoOriginRef.current;
+        const records = sidebarTabRecordsRef.current;
+        const openings = sidebarTabOpeningRef.current;
+        const attempts = sidebarAutoCloseAttemptsRef.current;
+        for (const [key, entry] of origin) {
+          // 只处理当前 surface 的记账：别的 session/root 的键在当前快照里无法判定，绝不越权操作。
+          if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
+          if (running.has(entry.address) === true) {
+            // 资源重新变成运行中：它已经开着就保持开着，重试记账一并清零。
+            attempts.delete(key);
+            continue;
+          }
+          const record = records.get(key);
+          const scopedRecord = record !== undefined
+            && record.sessionId === sidebarSessionId && record.rootSessionId === rootSessionId
+            ? record
+            : undefined;
+          if (scopedRecord === undefined) {
+            // 没有已确认的 tabId 时绝不猜一个 id 去关：这次打开仍在途就继续等它落地，
+            // 否则只撤销来源标记（元素已经不在这个 surface 上了）。
+            const opening = openings.get(key);
+            if (opening !== undefined && opening.sessionId === sidebarSessionId && opening.rootSessionId === rootSessionId) continue;
+            if (sidebarTabPendingRef.current.has(key) === true) continue;
+            origin.delete(key);
+            attempts.delete(key);
+            continue;
+          }
+          if (scopedRecord.origin !== SIDEBAR_TAB_ORIGIN_AUTO) {
+            // 记录已经被手动接管（用户手动打开或外部 tab）：手动优先，撤销自动来源，绝不关闭它。
+            origin.delete(key);
+            attempts.delete(key);
+            continue;
+          }
+          if (closeSidebarResource === null) {
+            // 宿主没有公开 close（旧宿主）：撤销记账，绝不退化成别的关闭方式。
+            origin.delete(key);
+            attempts.delete(key);
+            continue;
+          }
+          if (sidebarTabPendingRef.current.has(key) === true) continue;
+          // 本次级联里已经为它尝试过并失败：同一批微任务里绝不重试（见 sidebarAutoFailedKeysRef）。
+          if (sidebarAutoFailedKeysRef.current.has(key) === true) continue;
+          // 用户刚刚在这个 key 上表达过手动意图：交给手动链路结算，Auto 本轮让位（手动恒优先）。
+          if (sidebarManualIntentOf(key) !== undefined) continue;
+          const used = attempts.get(key) ?? 0;
+          if (used >= SIDEBAR_AUTO_CLOSE_MAX_ATTEMPTS) {
+            // 有界重试用尽：只撤销来源标记，tab 留给用户（绝不无限重试，也绝不改用批量入口）。
+            origin.delete(key);
+            attempts.delete(key);
+            continue;
+          }
+          attempts.set(key, used + 1);
+          // attemptsBefore 让「动作在真正调用 close 之前被撤销」的路径能精确回退这一次尝试计数，
+          // 否则一次被取消的自动关闭就会白烧掉一次有界重试预算。
+          return { key, address: entry.address, kind: "close", attemptsBefore: used };
+        }
+        return null;
+      };
+      const autoOpenCandidate = (running) => {
+        // 能力降级 fail-closed：close()/落地证据/左箭头任一缺失时绝不自动打开（见 sidebarAutoOpenCapable）。
+        if (sidebarAutoOpenCapable() !== true) return null;
+        const origin = sidebarAutoOriginRef.current;
+        const suppressed = sidebarAutoSuppressedRef.current;
+        const reservations = sidebarAutoReservationRef.current;
+        const records = sidebarTabRecordsRef.current;
+        const openings = sidebarTabOpeningRef.current;
+        for (const address of running) {
+          const key = sidebarTabKey(sidebarSessionId, rootSessionId, address);
+          // 本次级联里已经为它尝试过并失败：绝不在同一批微任务里重试（见 sidebarAutoFailedKeysRef）。
+          if (sidebarAutoFailedKeysRef.current.has(key) === true) continue;
+          // 用户手动关闭过：绝不立刻重开（抑制只由用户手动重新打开清除）。
+          if (suppressed.has(key) === true) continue;
+          // 本次运行已经为它成功发出过打开动作：绝不重复打开（与失败无关，失败会撤销预留）。
+          if (origin.has(key) === true) continue;
+          // 已经有一个候选为它预留：同一资源绝不并发两个动作。
+          if (reservations.has(key) === true) continue;
+          if (sidebarTabPendingRef.current.has(key) === true) continue;
+          // 用户在同一个 key 上有未结算的手动意图：让手动链路先结算，Auto 本轮跳过。
+          if (sidebarManualIntentOf(key) !== undefined) continue;
+          const record = records.get(key);
+          if (record !== undefined && record.sessionId === sidebarSessionId && record.rootSessionId === rootSessionId) continue;
+          const opening = openings.get(key);
+          if (opening !== undefined && opening.sessionId === sidebarSessionId && opening.rootSessionId === rootSessionId) continue;
+          /**
+           * 存在性检查必须「先可读、再确认没有」：
+           * - inventory 不可读时无法证明资源没打开，fail-closed 跳过这个候选（宁可不动，也不开出重复页）；
+           * - inventory 可读但没有该地址、而 active() 已经是它（提交延迟 / 别的 pane）：同样视为已经存在
+           *   的手动/未知来源，不重复打开，也不写 auto 来源。
+           */
+          const state = sidebarResourceTabStateOf(address);
+          if (state.readable !== true) continue;
+          if (state.tabId !== null) continue;
+          if (sidebarActiveResourceMatches(address) === true) continue;
+          /**
+           * 先写**预留**再发动作：任何重入（observer/轮询/尾随同步）都不会为同一个资源再选一次。
+           * 预留只是候选去重，绝不等于「Auto 已经打开」——只有 openResource 真的成功发出后才会
+           * 升级成来源标记；失败路径在 handleSidebarAction 的 finally 里撤销它，使后续同步可以重试。
+           */
+          const epoch = sidebarAutoEpochRef.current;
+          reservations.set(key, { sessionId: sidebarSessionId, rootSessionId, address, epoch });
+          trimAutoKeyMap(reservations);
+          return { key, address, kind: "open", epoch };
+        }
+        return null;
+      };
+      /** 上限淘汰：按插入顺序丢弃最旧的键（复合键跨 root 保留时的安全阀，见 SIDEBAR_AUTO_KEY_LIMIT）。 */
+      const trimAutoKeyMap = (map) => {
+        while (map.size > SIDEBAR_AUTO_KEY_LIMIT) {
+          const oldest = map.keys().next();
+          if (oldest.done === true) break;
+          map.delete(oldest.value);
+        }
+      };
+      /**
+       * 清理已经离开当前快照的复合键（来源与抑制两个集合），避免长期泄漏。
+       *
+       * 只清理当前 surface 的键：别的 session/root 的资源不在这一份快照里，无法判定是否仍存在。
+       * 本轮已经选中的候选键必须保留——它正要被关闭，删掉记账会让这次关闭失去来源身份。
+       */
+      const cleanupAutoSidebarKeys = (known, actingKey) => {
+        for (const map of [sidebarAutoOriginRef.current, sidebarAutoSuppressedRef.current]) {
+          for (const [key, entry] of map) {
+            if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
+            if (key === actingKey) continue;
+            if (known.has(entry.address) === true) continue;
+            map.delete(key);
+            sidebarAutoCloseAttemptsRef.current.delete(key);
+          }
+        }
+        // 预留同样要清理，但**在途动作自己那一条绝不能被清理**：它的 finally 才是唯一的释放点，
+        // 提前删掉会让同一条动作在收尾时把后来者的预留一起删掉。
+        for (const [key, entry] of sidebarAutoReservationRef.current) {
+          if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
+          if (key === actingKey) continue;
+          if (known.has(entry.address) === true) continue;
+          if (sidebarTabPendingRef.current.has(key) === true) continue;
+          sidebarAutoReservationRef.current.delete(key);
+        }
+      };
+      /**
+       * 放行一个自动动作。
+       *
+       * 复用用户点击的同一条入口（handleSidebarAction + origin=auto）：同一把 pending 锁、同一段
+       * split 事务、同一套「用真实 tabId 关闭」的记录语义，因此自动路径不存在第二套打开/关闭实现。
+       * 动作收尾后才重新推进同步，下一个候选（或清理）由那条链路继续。
+       */
+      const launchAutoSidebarAction = (candidate) => {
+        sidebarAutoBusyRef.current = true;
+        void Promise.resolve()
+          // candidate 作为自动动作上下文（kind/epoch/预留）传入：动作必须在每个 await 之后
+          // 复核它是否仍然有效，并在收尾时无条件释放预留（见 handleSidebarAction）。
+          .then(() => handleSidebarAction(candidate.key, candidate.address, SIDEBAR_TAB_ORIGIN_AUTO, candidate))
+          .catch(() => { /* 打开/关闭失败只影响这一次动作：状态由既有记录与重试记账负责。 */ })
+          .then(() => {
+            sidebarAutoBusyRef.current = false;
+            /**
+             * 尾随同步只用来推进「下一个候选」。它必须带着级联标记执行：这一轮里失败过的 key
+             * 不会被重新选中，因此「失败 → 撤销预留 → 立刻重选」不在微任务里自转（见
+             * sidebarAutoFailedKeysRef）。真正的重试留给下一个外部同步轮。
+             */
+            sidebarAutoCascadeRef.current = true;
+            try {
+              // 用引用取最新一轮渲染的同步器（与 observer/轮询同一写法），绝不复用当前闭包。
+              sidebarTabSyncRef.current?.();
+            } finally {
+              sidebarAutoCascadeRef.current = false;
+            }
+          });
+      };
+      /**
+       * 第二阶段：Auto（自动打开运行中的子代理侧栏）同步。
+       *
+       * 顺序固定为「先关后开」，并且只在有属于当前 root 的真实快照时动作：
+       * 1. 关闭：Auto 亲手打开过的资源一旦不在运行中集合里，就用**已确认记录里的真实 tabId** 走
+       *    既有 handleSidebarAction 关闭路径（绝不猜 tabId、绝不调用批量关闭）；
+       * 2. 打开：运行中、尚未打开、且没有被用户手动关闭抑制的资源走既有打开路径；
+       * 3. 清理：把已经离开当前快照的复合键从来源/抑制集合里移除。
+       *
+       * 开关关闭时不做任何自动 open/close（历史行为逐字节不变），已打开的 tab 交由用户手动处理；
+       * 清理阶段与开关无关，它只维护插件自己的记账，不触碰宿主。
+       */
+      const syncAutoSidebarTabs = () => {
+        const source = snapshot;
+        // 没有快照（首次加载 / 读取失败）时没有「谁在运行」的证据：既不打开也不关闭。
+        if (source === null || source === undefined) return;
+        // root 切换瞬间旧快照可能仍在 state 里：只有属于当前 root 的快照才能决定动作。
+        if (text(source.rootSessionId, null) !== rootSessionId) return;
+        const known = knownSidebarResourceAddresses();
+        const running = runningSidebarResourceAddresses();
+        const enabled = autoOpenEnabled();
+        let candidate = null;
+        if (enabled === true && sidebarAutoBusyRef.current !== true) {
+          candidate = autoCloseCandidate(running) ?? autoOpenCandidate(running);
+        }
+        cleanupAutoSidebarKeys(known, candidate === null ? null : candidate.key);
+        if (candidate === null) return;
+        launchAutoSidebarAction(candidate);
+      };
+
+      /**
+       * 自动动作是否仍然有效：Auto 仍开启、动作代次未变、面板仍挂在同一个 root / sidebar session 上。
+       *
+       * 这是「关闭 Auto 取消在途打开」的判据：Auto getter 每次现读（权威读面），代次在开关变化时
+       * 递增，surface 身份用与 handleSidebarAction 入口相同的三个 ref 复核。任一项不成立，那次自动
+       * 动作一律放弃副作用。
+       */
+      const autoActionStillValid = (context) => {
+        if (context === null || context === undefined) return false;
+        if (autoOpenEnabled() !== true) return false;
+        if (sidebarAutoEpochRef.current !== context.epoch) return false;
+        return mountedRef.current === true
+          && currentRootRef.current === rootSessionId
+          && currentSidebarSessionRef.current === sidebarSessionId;
+      };
+      /**
+       * 撤销一次自动动作的在途记账（Auto 关闭 / 代次过期 / 手动接管 / 失败路径共用）。
+       *
+       * 三件事缺一不可：
+       * 1. 收口这次动作开出的 split 事务：否则右栏会停在事务的临时 50%，直到 15 秒 deadline 才回落；
+       * 2. 删掉这个 key 的在途打开记录：这次打开没有发出，不能让后续同步把它当成「还没确认的打开」；
+       * 3. 释放预留：失败绝不等于「已经打开过」，下一次同步必须能重新选中这个资源。
+       * 来源标记只在 openResource 成功发出时才存在，因此这里不删除它（关闭类动作被撤销后，
+       * 那个 tab 仍然属于 Auto，开关重新打开后仍可被自动回收）。
+       */
+      const abandonAutoSidebarAction = (key, context) => {
+        if (sidebarSplitIntentRef.current?.key === key) cancelPendingSidebarSplit("auto-abandoned");
+        sidebarTabOpeningRef.current.delete(key);
+        sidebarAutoReservationRef.current.delete(key);
+        releaseAutoCloseAttempt(key, context);
+      };
+      /** 回退候选选择时预支的那一次自动关闭重试（动作在真正调用 close 之前被撤销时调用）。 */
+      const releaseAutoCloseAttempt = (key, context) => {
+        if (context === null || context === undefined || context.kind !== "close") return;
+        const attempts = sidebarAutoCloseAttemptsRef.current;
+        if (attempts.has(key) !== true) return;
+        if (context.attemptsBefore === 0) attempts.delete(key);
+        else attempts.set(key, context.attemptsBefore);
+      };
+      /**
+       * 自动动作在副作用之前必须让位的「手动接管」状态：
+       * - "close"：用户在同一个 key 上留下过关闭意图——Auto 绝不能在关闭意图之后再打开一个 tab；
+       * - "open"：用户手动要求打开这个资源——打开照常发出，但最终 tab 必须记成 manual 来源；
+       * - null：没有手动接管。
+       */
+      const autoTakeoverStateOf = (key) => {
+        const intent = sidebarManualIntentOf(key);
+        if (intent === undefined) return null;
+        return intent.intent === "close" ? "close" : "open";
+      };
+      /**
+       * 记录一次「在途动作期间」的用户手动意图。
+       *
+       * 触发点只有两个（用户点击落在一个已被 pending 锁或未落地打开占用的 key 上）：意图方向按
+       * 点击那一刻的按钮语义判定——已经有记录（<<）表示要关闭，没有记录（>>）表示要打开，
+       * 绝不按动作在途时的中间态猜方向。方向判定与 handleSidebarAction 的分支条件同源。
+       */
+      const recordSidebarManualIntent = (key, resourceAddress) => {
+        const record = sidebarTabRecordsRef.current.get(key);
+        const scoped = record !== undefined
+          && record.sessionId === sidebarSessionId && record.rootSessionId === rootSessionId;
+        sidebarManualIntentRef.current.set(key, {
+          sessionId: sidebarSessionId,
+          rootSessionId,
+          address: resourceAddress,
+          intent: scoped ? "close" : "open",
+        });
+      };
+      /**
+       * 结算一个 key 上的手动意图（在途动作收尾后，以及同步的兜底扫描里调用）。
+       *
+       * 手动恒优先，但**只按当下的真实状态结算**，绝不盲目重放那次点击：
+       * - 还有动作在途（pending）或打开尚未落地：这一轮什么都不做，等下一次收尾再结算；
+       * - 「打开」：已经开着就把来源改回 manual（Auto 不再管它）；还没开出才补发一次**手动**打开，
+       *   走与点击完全相同的入口（唯一区别是 origin=manual，因此后续绝不会被自动关闭）；
+       * - 「关闭」：有精确 tabId 时走同一入口关闭并登记抑制；没有可关闭的 tab 时只登记抑制，
+       *   绝不为了「执行这次关闭」而先打开一个 tab。
+       */
+      const applyPendingManualIntent = (key) => {
+        const entry = sidebarManualIntentOf(key);
+        if (entry === undefined) return;
+        // 同一 key 仍有动作在途：它收尾时会再结算一次，绝不在这里并发派发第二个动作。
+        if (sidebarTabPendingRef.current.has(key) === true) return;
+        const opening = sidebarTabOpeningRef.current.get(key);
+        const openingScoped = opening !== undefined
+          && opening.sessionId === sidebarSessionId && opening.rootSessionId === rootSessionId;
+        const record = sidebarTabRecordsRef.current.get(key);
+        const recordScoped = record !== undefined
+          && record.sessionId === sidebarSessionId && record.rootSessionId === rootSessionId;
+        if (entry.intent === "open") {
+          if (openingScoped) {
+            // 这次打开仍在途：把它的来源改成 manual，落地后就是手动 tab（绝不并发第二次 openResource）。
+            opening.origin = SIDEBAR_TAB_ORIGIN_MANUAL;
+            sidebarManualIntentRef.current.delete(key);
+            return;
+          }
+          if (recordScoped) {
+            // 用户手动打开 = 他重新要这个会话：清除抑制，并把来源收回 manual（Auto 不得再自动关它）。
+            record.origin = SIDEBAR_TAB_ORIGIN_MANUAL;
+            sidebarAutoSuppressedRef.current.delete(key);
+            sidebarAutoOriginRef.current.delete(key);
+            sidebarAutoCloseAttemptsRef.current.delete(key);
+            sidebarManualIntentRef.current.delete(key);
+            return;
+          }
+          sidebarManualIntentRef.current.delete(key);
+          void handleSidebarAction(key, entry.address, SIDEBAR_TAB_ORIGIN_MANUAL);
+          return;
+        }
+        // intent === "close"
+        if (recordScoped) {
+          sidebarManualIntentRef.current.delete(key);
+          void handleSidebarAction(key, entry.address, SIDEBAR_TAB_ORIGIN_MANUAL);
+          return;
+        }
+        if (openingScoped) {
+          /**
+           * 打开仍在途、此刻没有可精确关闭的 tabId：抑制先登记（用户要的是关闭，Auto 不得重开），
+           * 意图保留到它落地或超时——由同一条同步链路再结算一次，绝不在没有 tabId 时猜一个 id 去关。
+           */
+          sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: entry.address });
+          trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+          return;
+        }
+        // 没有可关闭的 tab：只登记抑制与撤销自动记账，绝不为了「执行关闭」先打开一个 tab。
+        sidebarManualIntentRef.current.delete(key);
+        sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: entry.address });
+        trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+        sidebarAutoOriginRef.current.delete(key);
+        sidebarAutoCloseAttemptsRef.current.delete(key);
+      };
+
+      /**
+       * 右栏 tab 的完整同步入口（挂载 effect / 2.5 秒轮询 / sessions 通知 / observer / 可见性变化
+       * 全部只经由它）：先跑既有的记录/库存同步，再跑 Auto 自动同步。
+       *
+       * 顺序不可颠倒：自动打开必须建立在「库存与在途记录已经结算完」的基础上，否则同一个资源
+       * 会被先记录再打开，重复消耗 pane。
+       */
+      const syncSidebarTabs = () => {
+        /**
+         * 外部同步轮（挂载 / 2.5 秒轮询 / observer / 可见性变化 / 会话通知）都是新的一轮：自动动作的
+         * 失败屏障在这里失效，因此同一个资源仍然可以被重试。自动动作收尾的那条尾随同步例外——它
+         * 只是同一批微任务里的推进，不构成「宿主状态可能已经改变」的新证据。
+         */
+        if (sidebarAutoCascadeRef.current !== true) sidebarAutoFailedKeysRef.current.clear();
+        syncSidebarTabRecords();
+        // Auto 开关是渲染输入：设置页保存或面板自身切换后必须重渲染一次（标题栏开关的勾选态）。
+        // 与批量签名同一模式：只有真的变化才 bump，空闲轮询绝不产生重渲染。
+        const autoNow = autoOpenEnabled();
+        if (sidebarAutoSignatureRef.current !== autoNow) {
+          sidebarAutoSignatureRef.current = autoNow;
+          /**
+           * 开关的权威值一变（含关闭）就推进自动动作代次：已经发出、仍在等待 split/layout 的在途
+           * 自动动作会在下一次复核时放弃——「关闭 Auto」必须立刻取消还没落地的自动打开，而不是
+           * 等它把 tab 打开之后再交给用户手动关。已存在的 tab 不受影响（关闭 Auto 绝不自动关 tab）。
+           */
+          sidebarAutoEpochRef.current += 1;
+          // 权威值变化后丢弃本地乐观值，开关始终收敛到读出的事实。
+          setAutoOpenDraft(null);
+          bump((value) => value + 1);
+        }
+        syncAutoSidebarTabs();
+      };
       // 挂载 effect 与轮询/observer 回调都只经由这个引用取最新闭包（见 sidebarTabSyncRef 的说明）。
       sidebarTabSyncRef.current = syncSidebarTabs;
 
@@ -3692,12 +4286,19 @@
        * - `kind === "subagentchat"`：active 可能仍是用户原本在看的别的 tab；
        * - `contentId === 资源地址`：同一个 kind 下也可能是另一个子代理的地址。
        * 不满足时保持 >> 的打开语义（按钮照旧可再次点击打开），绝不猜测 tabId。
+       *
+       * origin 的来源优先级：显式传入的动作来源 > 在途打开记录里记下的来源 > 已存在记录的来源 >
+       * **manual**。最后那条兜底正是规格要求：「外部已存在但未由自动动作发起的 tab 视为手动来源」，
+       * 因此自动同步永远关不掉一个它没有亲手打开过的 tab。
        */
-      const recordSidebarTab = (key, resourceAddress) => {
+      const recordSidebarTab = (key, resourceAddress, actionOrigin) => {
         if (closeSidebarResource === null) return false;
          if (readActiveSidebarResource === null && readSidebarOpenTabs() === null) return false;
         // 左箭头图标缺失时不会渲染 <<，因此也不该建立只在 << 上才有意义的记录。
         if (typeof primitives?.IconChevronLeftOutlineRegular !== "function") return false;
+        const declaredOrigin = actionOrigin === SIDEBAR_TAB_ORIGIN_AUTO || actionOrigin === SIDEBAR_TAB_ORIGIN_MANUAL
+          ? actionOrigin
+          : null;
         let tab = null;
         const inventory = readSidebarOpenTabs();
         if (inventory !== null) {
@@ -3729,13 +4330,32 @@
         if (text(source.kind, null) !== SUBAGENT_CHAT_KIND) return false;
         if (text(source.contentId, null) !== resourceAddress) return false;
         const previous = sidebarTabRecordsRef.current.get(key);
+        const opening = sidebarTabOpeningRef.current.get(key);
+        /**
+         * 手动接管优先于调用方声明的来源：用户在那个 key 上留下过「要打开」的手动意图时，即使这次
+         * 打开是 Auto 发出的，最终 tab 也必须记成 manual——手动打开的最终来源必须是 manual，
+         * Auto 绝不能在资源结束后把它当成自己的 tab 关掉。
+         */
+        const manualTakeover = sidebarManualIntentOf(key);
+        const origin = manualTakeover !== undefined && manualTakeover.intent === "open"
+          ? SIDEBAR_TAB_ORIGIN_MANUAL
+          : (declaredOrigin
+            ?? (previous !== undefined && previous.sessionId === sidebarSessionId && previous.rootSessionId === rootSessionId
+              ? previous.origin
+              : null)
+            ?? (opening !== undefined && opening.sessionId === sidebarSessionId && opening.rootSessionId === rootSessionId
+              ? opening.origin
+              : null)
+            ?? SIDEBAR_TAB_ORIGIN_MANUAL);
+        const recordOrigin = origin === SIDEBAR_TAB_ORIGIN_AUTO ? SIDEBAR_TAB_ORIGIN_AUTO : SIDEBAR_TAB_ORIGIN_MANUAL;
         if (previous !== undefined && previous.sessionId === sidebarSessionId
           && previous.rootSessionId === rootSessionId && previous.tabId === tabId) {
           previous.title = tabTitle ?? previous.title;
           previous.misses = 0;
+          previous.origin = recordOrigin;
           return true;
         }
-        sidebarTabRecordsRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, tabId, title: tabTitle, misses: 0 });
+        sidebarTabRecordsRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, tabId, title: tabTitle, misses: 0, origin: recordOrigin });
          bump((value) => value + 1);
          return true;
       };
@@ -3747,18 +4367,68 @@
        * 宿主的提交，重入点击若穿过检查就会发出第二次 openResource（第二个重复 tab）或提前走关闭。
        * 抛错处理：openResource / close 抛错只影响这一次动作，绝不写状态——打开失败保持 >>，
        * 关闭失败保持 <<（用户可以再点一次），两种情况都不会把按钮和真实世界对不上。
+       *
+       * origin 是**内部**参数，默认 manual：普通 UI 调用（箭头、键盘）一律手动来源；只有自动同步
+       * 显式传 auto。它决定三件事：记录来源、手动动作是否清除抑制/自动来源、关闭时是否登记抑制。
+       *
+       * autoAction 也是**内部**参数，只在自动路径上出现：{ kind, epoch, attemptsBefore }。它让同一条
+       * 实现能在每个 await 之后、真正调用宿主 open/close 之前复核「Auto 是否仍然开启、动作是否已过期、
+       * 用户是否已经手动接管」，并在收尾时无条件释放在途预留（见 finally）。
        */
-      const handleSidebarAction = async (key, resourceAddress) => {
+      const handleSidebarAction = async (key, resourceAddress, actionOrigin, autoAction) => {
+        const origin = actionOrigin === SIDEBAR_TAB_ORIGIN_AUTO ? SIDEBAR_TAB_ORIGIN_AUTO : SIDEBAR_TAB_ORIGIN_MANUAL;
+        const autoContext = origin === SIDEBAR_TAB_ORIGIN_AUTO && autoAction !== null && typeof autoAction === "object"
+          ? {
+            kind: autoAction.kind === "close" ? "close" : "open",
+            epoch: Number.isFinite(Number(autoAction.epoch)) ? Number(autoAction.epoch) : sidebarAutoEpochRef.current,
+            attemptsBefore: Number.isFinite(Number(autoAction.attemptsBefore)) ? Number(autoAction.attemptsBefore) : 0,
+          }
+          : null;
         // React 重挂载或 root 切换后，旧 DOM 可能短暂保留旧 handler；它不能操作当前 session-scoped 服务。
         if (mountedRef.current !== true
            || currentRootRef.current !== rootSessionId
-           || currentSidebarSessionRef.current !== sidebarSessionId) return;
+           || currentSidebarSessionRef.current !== sidebarSessionId) {
+          /**
+           * 连入口都没通过的自动动作：这里必须自己释放候选选择时写下的预留（以及自动关闭的重试记账）。
+           * 这些键属于已经被换掉的 surface，当前闭包之后再也不会为它们做清理。
+           */
+          if (autoContext !== null) {
+            sidebarAutoReservationRef.current.delete(key);
+            releaseAutoCloseAttempt(key, autoContext);
+          }
+          return;
+        }
         const pending = sidebarTabPendingRef.current;
-        if (pending.has(key)) return;
+        if (pending.has(key)) {
+          /**
+           * 同一个 key 上已经有动作在途（典型：Auto 正在等 split 返回 pane / 等布局提交 / 等打开落地）。
+           * 用户此刻的手动点击绝不能因为「锁被占用」而消失：它被记成手动意图，由在途动作在副作用之前
+           * 让位、或由本函数收尾后立即结算（见 applyPendingManualIntent）。手动意图只在手动路径上记录。
+           */
+          if (origin === SIDEBAR_TAB_ORIGIN_MANUAL) recordSidebarManualIntent(key, resourceAddress);
+          return;
+        }
         pending.add(key);
+        /** 本次动作是否真的把 openResource 发给了宿主：只有它才允许建立 auto 来源标记。 */
+        let openIssued = false;
         try {
+          /**
+           * 副作用之前的第一道复核（自动路径）：Auto 开关的权威值与动作代次都可能在等待期间变化。
+           * 关闭 Auto 时必须在这里放弃——包括「已经 split 出 pane」的前一阶段遗留在途记录的情况。
+           */
+          if (autoContext !== null && autoActionStillValid(autoContext) !== true) {
+            abandonAutoSidebarAction(key, autoContext);
+            return;
+          }
           const record = sidebarTabRecordsRef.current.get(key);
-           if (record === undefined && sidebarTabOpeningRef.current.has(key)) return;
+          if (record === undefined && sidebarTabOpeningRef.current.has(key)) {
+            /**
+             * 打开已经发出、落地证据还没到：手动点击同样不能丢。按意图记账，等它落地（或超时）后
+             * 由同步链路结算；在这之前绝不补发第二次 openResource，也绝不猜 tabId 去关闭。
+             */
+            if (origin === SIDEBAR_TAB_ORIGIN_MANUAL) recordSidebarManualIntent(key, resourceAddress);
+            return;
+          }
           // 关闭态：只调用记录里的精确 tabId。绝不根据 active() 当前是谁来决定关哪个 tab。
           if (record !== undefined && closeSidebarResource !== null) {
             let closed = false;
@@ -3777,6 +4447,19 @@
                */
               if (sidebarSplitIntentRef.current?.key === key) cancelPendingSidebarSplit("close");
               sidebarTabRecordsRef.current.delete(key);
+              sidebarAutoCloseAttemptsRef.current.delete(key);
+              /**
+               * 关闭成功后收口来源与抑制记账（两种开放的语义差别就在这两行）：
+               *
+               * - 自动关闭：只撤销来源标记——本次运行不会再对同一个资源重复动作；
+               * - 手动关闭：除撤销来源外还要登记**抑制**，Auto 不得立刻把它重新打开。抑制只由
+               *   用户手动重新打开同一资源清除（手动意图优先）。
+               */
+              sidebarAutoOriginRef.current.delete(key);
+              if (origin === SIDEBAR_TAB_ORIGIN_MANUAL) {
+                sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
+                trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+              }
               bump((value) => value + 1);
               // 关闭改变了右栏组成，必须立刻重估一次：宽度与手柄锁都在同一条同步链路上。
               syncSidebarTabs();
@@ -3784,6 +4467,25 @@
             return;
           }
           if (openSidebarResource === null) return;
+          /**
+           * 自动动作的副作用复核点：真实的用户可见副作用（split / openResource）之前必须重新确认
+           * 「Auto 仍开启」「动作代次没过期」「用户没有在同一个 key 上手动接管」。返回值：
+           * - "proceed"：照常执行；
+           * - "abort"：Auto 已关闭/动作已过期，或用户要求关闭 → 撤销在途记账，绝不发出副作用；
+           * - "manual"：用户手动要求打开 → 动作可以继续，但最终 tab 必须记成 manual 来源。
+           * 手动路径（autoContext === null）永远是 "proceed"，历史行为逐字不变。
+           */
+          const reviewAutoSideEffect = () => {
+            if (autoContext === null) return "proceed";
+            if (autoContext === null) return "proceed";
+            if (autoActionStillValid(autoContext) !== true) return "abort";
+            const takeover = autoTakeoverStateOf(key);
+            if (takeover === "close") return "abort";
+            if (takeover === "open") return "manual";
+            return "proceed";
+          };
+          /** 本次打开最终要记的来源：自动动作只在没有手动接管时才是 auto。 */
+          let effectiveOrigin = origin;
           const canTrackOpen = closeSidebarResource !== null
              && (readActiveSidebarResource !== null || sidebarOpenTabsAvailable === true)
              && typeof primitives?.IconChevronLeftOutlineRegular === "function";
@@ -3795,7 +4497,20 @@
               rootSessionId,
               resourceAddress,
               expiresAt: Date.now() + SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS,
+              origin,
             });
+          }
+          /**
+           * 手动打开的意图优先于自动记账：
+           *
+           * - 清除抑制：用户手动重新打开 = 他重新要这个会话，Auto 之后可以继续管理它；
+           * - 撤销自动来源：这次打开是手动来源，Auto 绝不能在资源结束时把它当成自己的 tab 关掉。
+           * 两条都在发动作之前写，因此这一段没有 await，不存在与自动同步交叉的窗口。
+           */
+          if (origin === SIDEBAR_TAB_ORIGIN_MANUAL) {
+            sidebarAutoSuppressedRef.current.delete(key);
+            sidebarAutoOriginRef.current.delete(key);
+            sidebarAutoCloseAttemptsRef.current.delete(key);
           }
           const targetPaneId = existingSubagentPaneId();
           let openOptions = null;
@@ -3854,6 +4569,21 @@
                 sidebarTabOpeningRef.current.delete(key);
                 return;
               }
+              /**
+               * 布局等待是这条路径上唯一会跨越用户操作窗口的 await：用户可能在这里关闭了 Auto，
+               * 也可能在同一个 key 上手动接管。此时连 split() 都还没调用，直接放弃是代价最小的时机。
+               */
+              const afterLayoutReview = reviewAutoSideEffect();
+              if (afterLayoutReview === "abort") {
+                abandonAutoSidebarAction(key, autoContext);
+                if (autoTakeoverStateOf(key) === "close") {
+                  // 用户要的是关闭：立刻登记抑制，Auto 不得在下一轮同步里把它重新选成候选。
+                  sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
+                  trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+                }
+                return;
+              }
+              if (afterLayoutReview === "manual") effectiveOrigin = SIDEBAR_TAB_ORIGIN_MANUAL;
             }
             let paneId = null;
             try { paneId = splitSidebarPane.call(sidebarRight); } catch { paneId = null; }
@@ -3885,7 +4615,33 @@
             // 旧宿主没有公开 split()：保留历史 preferNewPane 请求，兼容旧版本。
             openOptions = { kind: SUBAGENT_CHAT_KIND, preferNewPane: true };
           }
+          /**
+           * 真正发出副作用之前的最后一道复核：从「读记录」到这里可能已经跨过 split 前的布局等待，
+           * Auto 开关与用户手动意图都可能变化。只有通过复核才允许调用宿主 openResource()——绝不把
+           * 一个已经关掉的 Auto 变成一次迟到的自动打开。
+           */
+          const beforeOpenReview = reviewAutoSideEffect();
+          if (beforeOpenReview === "abort") {
+            abandonAutoSidebarAction(key, autoContext);
+            if (autoTakeoverStateOf(key) === "close") {
+              // 用户要的是关闭：立刻登记抑制，绝不在同一轮或下一轮同步里把这个资源重新打开。
+              sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
+              trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+            }
+            return;
+          }
+          if (beforeOpenReview === "manual") effectiveOrigin = SIDEBAR_TAB_ORIGIN_MANUAL;
           openSidebarResource.call(sidebarRight, resourceAddress, openOptions);
+          openIssued = true;
+          /**
+           * 预留 → 来源的升级点：只有 openResource 真的成功发出、且宿主具备可追踪能力（能读到 tabId、
+           * 能精确关闭）时，才把这次打开记成「Auto 亲手打开」。openResource 抛错时直接走 catch，
+           * 来源标记绝不写；能力不足时也不写——将来无法精确回收的 tab 不归 Auto 管。
+           */
+          if (effectiveOrigin === SIDEBAR_TAB_ORIGIN_AUTO && canTrackOpen === true) {
+            sidebarAutoOriginRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
+            trimAutoKeyMap(sidebarAutoOriginRef.current);
+          }
           if (splitToken !== null) {
             let acknowledged = true;
             if (markSidebarSplitOpen !== null) {
@@ -3898,7 +4654,7 @@
             }
           }
           // 记录必须发生在 openResource 之后：它读的是宿主提交后的 active tab，是打开的证据。
-          const opened = recordSidebarTab(key, resourceAddress);
+          const opened = recordSidebarTab(key, resourceAddress, effectiveOrigin);
           // 只要这次打开的 tab 已经落定，就不能留下 opening 记录：它的语义是「这次打开还没有确定
           // 证据」（split 事务仍在等待 pane 证据、或本来就没有事务时都一样）。残留的 opening 会让
           // 用户收回这个 tab 之后的下一次同步把关闭记录重新建回来（<< 复活），并把之后的点击挡成
@@ -3912,7 +4668,29 @@
            sidebarTabOpeningRef.current.delete(key);
            /* 宿主暂时打不开/关不掉这个地址：只影响这一次侧栏动作，状态绝不被污染。 */
          }
-        finally { pending.delete(key); }
+        finally {
+          pending.delete(key);
+          /**
+           * 自动动作收尾时无条件释放在途记账（split busy、准备失败、layout 失效、open 抛错、
+           * surface 变化、被撤销都走这里）：
+           * - 预留必须释放，否则一次失败会被永久记成「已经打开过」，该资源在本次运行里再也打不开；
+           * - 打开没有真正发出时，这个 key 不存在「Auto 亲手打开」的事实，残留来源标记一并撤销。
+           */
+          if (autoContext !== null) {
+            sidebarAutoReservationRef.current.delete(key);
+            if (autoContext.kind === "open" && openIssued !== true) {
+              sidebarAutoOriginRef.current.delete(key);
+              // 本次打开没有发出：把 key 记进失败屏障，同一批微任务里绝不再重选它（见其说明）。
+              sidebarAutoFailedKeysRef.current.add(key);
+            }
+            if (openIssued === true) sidebarAutoFailedKeysRef.current.delete(key);
+          }
+          /**
+           * 在途动作收尾后立刻结算用户在这个窗口里表达的手动意图：手动恒优先，绝不因为「那次点击撞上
+           * 了 pending 锁」而丢失。没有意图时这一步是幂等空操作。
+           */
+          applyPendingManualIntent(key);
+        }
       };
 
       /**
@@ -4373,9 +5151,32 @@
                 ...visibleChildren.map((node, index) => node.kind === "fanout" ? renderFanout(node, index) : renderExpert(node, index, rootSessionId)),
                 renderIdleGroup(idleChildren, idleBatchSlot),
               ]) : null));
+      /**
+       * 标题栏「Auto」开关（紧凑、与标题同一行，不遮挡标题与行内批量控件）：
+       *
+       * - 勾选态：权威读面（install 注入的 getter，每次渲染现读）叠加本地乐观值；
+       * - 可访问性：input 自带 aria-label="Auto"，可见文字也是 Auto，说明性文案只放在 title 里，
+       *   不新增任何长段落；
+       * - 写面缺失（直接 createExpertGroupPanel 的旧宿主/单测）时 disabled：绝不渲染一个点了没反应的开关。
+       */
+      const autoOpenChecked = autoOpenDraft === null ? autoOpenEnabled() : autoOpenDraft === true;
+      const autoOpenToggle = react.createElement("label", {
+        className: "deg_expert_group_header_auto",
+        title: "自动打开运行中的子代理侧栏会话",
+      },
+      react.createElement("input", {
+        type: "checkbox",
+        className: "deg_expert_group_header_auto_input",
+        "aria-label": "Auto",
+        checked: autoOpenChecked,
+        disabled: writeAutoOpenSetting === null,
+        onChange: (event) => toggleAutoOpen(event?.target?.checked === true),
+      }),
+      react.createElement("span", { className: "deg_expert_group_header_auto_label" }, "Auto"));
       return react.createElement("section", { className: "deg_expert_group", "data-version": version, "aria-label": "Expert Group" },
         react.createElement("header", { className: "deg_expert_group_header" },
           react.createElement("span", { className: "deg_expert_group_header_title" }, "Expert Group"),
+          autoOpenToggle,
           viewState.error !== null ? react.createElement("span", { className: "deg_expert_group_error", title: viewState.error }, "快照读取失败") : null,
           viewState.error !== null ? react.createElement("button", { type: "button", className: "deg_expert_group_header_action", title: "重试", "aria-label": "重试", onClick: retry }, makeIcon(primitives, "IconRefreshOutlineRegular", { size: 14 })) : null), body);
     }
@@ -12091,6 +12892,8 @@ window.__ModuleLoader__.load({
         observerPreferred: source.observerPreferred === true,
         // 任务管理缺字段时保持开启：默认必须维持 Expert Group 注册到侧边栏的历史行为。
         taskManagementEnabled: source.taskManagementEnabled !== false,
+        // 自动打开缺字段/非法值时一律按关闭归一：默认不做任何自动 open/close。
+        autoOpenSubagentSidebar: source.autoOpenSubagentSidebar === true,
       };
     }
 
@@ -15517,6 +16320,11 @@ window.__ModuleLoader__.load({
         if (candidate.taskManagementEnabled !== source.taskManagementEnabled) {
           ops.push({ op: "set", path: ["taskManagementEnabled"], value: candidate.taskManagementEnabled });
         }
+        // 自动打开与任务管理同一形状：新客户端的完整候选始终显式携带该字段，
+        // Host 按「显式字段才写 patch」处理，旧客户端缺字段因此不可能覆盖它。
+        if (candidate.autoOpenSubagentSidebar !== source.autoOpenSubagentSidebar) {
+          ops.push({ op: "set", path: ["autoOpenSubagentSidebar"], value: candidate.autoOpenSubagentSidebar });
+        }
         if (promptChanged) {
           ops.push({ op: "set", path: ["promptOverrides"], value: candidatePromptOverrides });
         }
@@ -16090,6 +16898,17 @@ window.__ModuleLoader__.load({
               onChange: (event) => editDraft((previous) => ({ ...previous, taskManagementEnabled: event.target.checked })),
             }),
             react.createElement("span", { className: "deg_settings_label" }, "任务管理")),
+          // 「Auto」= 自动打开运行中的子代理右侧栏会话：与任务管理同一行的紧凑开关。
+          // 说明性文案只放在 title（悬浮提示）里，可见文字保持一个单词，不挤压既有控件。
+          react.createElement("label", { className: "deg_settings_checkbox", title: "自动打开运行中的子代理侧栏会话" },
+            react.createElement("input", {
+              type: "checkbox",
+              "aria-label": "Auto",
+              checked: draft.autoOpenSubagentSidebar,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, autoOpenSubagentSidebar: event.target.checked === true })),
+            }),
+            react.createElement("span", { className: "deg_settings_label" }, "Auto")),
           react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-concurrency-limit" },
             react.createElement("span", { className: "deg_settings_label" }, "单个角色并发上限"),
             react.createElement("input", {
@@ -16831,6 +17650,57 @@ window.__ModuleLoader__.load({
           slots: ctx.slots,
           // 浏览器 confirm 是同步 API，Panel 以 Promise/boolean 双兼容方式消费。
           confirm: (message) => typeof globalThis.confirm === "function" && globalThis.confirm(message) === true,
+          /**
+           * 「自动打开」的实时读面：面板每次同步都现读配置表单快照。
+           *
+           * 不在这里读取一次再当常量传下去：设置页保存后必须立刻生效，而重装整个侧边栏
+           * （disposer 不可复用）只为跟随一个偏好是过度且会打断侧栏状态的做法。
+           * 读取失败/字段缺失一律按关闭（历史行为）。
+           */
+          getAutoOpenSubagentSidebar: () => readAutoOpenSubagentSidebar(),
+          /** 面板标题栏 Auto 开关的写面：必须显式提交布尔值，否则设置页会一直显示旧值。 */
+          setAutoOpenSubagentSidebar: (next) => commitAutoOpenSubagentSidebar(next),
+        };
+        /**
+         * 「自动打开运行中的子代理侧栏」读面：唯一来源是配置表单当前快照。
+         *
+         * 只有显式 true 才算开启——旧文档缺字段、非布尔值与读取异常全部按关闭处理，
+         * 保证默认行为与历史逐字节一致（不做任何自动 open/close）。
+         */
+        const readAutoOpenSubagentSidebar = () => {
+          try {
+            const snapshot = typeof settingsForm?.getSnapshot === "function" ? settingsForm.getSnapshot() : void 0;
+            return snapshot?.value?.autoOpenSubagentSidebar === true;
+          } catch {
+            return false;
+          }
+        };
+        /**
+         * 写面：把表单快照原样作为整体候选，只翻转 autoOpenSubagentSidebar 一个字段。
+         *
+         * 走的是设置页同一条 settings-commit（完整候选 + expectedRevision CAS），因此
+         * 宿主的语义校验与并发栅栏照常生效；这里**不**重放设置页草稿，避免把未保存的
+         * 编辑顺带提交。只读文档、快照不可用、校验失败或传输失败都返回 false，面板据此
+         * 回退到权威读面（开关不会停在错误状态）。
+         */
+        const commitAutoOpenSubagentSidebar = async (next) => {
+          try {
+            const snapshot = typeof settingsForm?.getSnapshot === "function" ? settingsForm.getSnapshot() : void 0;
+            if (snapshot?.writable !== true) return false;
+            const value = snapshot.value;
+            if (value === null || typeof value !== "object") return false;
+            await commitSettingsCandidate(
+              { ...value, autoOpenSubagentSidebar: next === true },
+              snapshot.revision,
+              globalThis.fetch,
+              ctx?.connection,
+              PROMPT_ROLE_IDS,
+            );
+            return true;
+          } catch {
+            // 失败原因（只读/目录校验/修订冲突）由设置页承担呈现；面板只回退开关状态。
+            return false;
+          }
         };
         const readTaskManagementEnabled = () => {
           try {

@@ -809,7 +809,7 @@ function normalizeNotificationHoldMs(value) {
  * 插件组合 Config。
  *
  * 前两个字段是插件启停配置（普通 Config）：它们是部署期行为，不是设置页的即时偏好。
- * 其余九个字段是设置页可即时修改的偏好，必须标记 `.volatile()`：DSH 0.1.7 的
+ * 其余十个字段是设置页可即时修改的偏好，必须标记 `.volatile()`：DSH 0.1.7 的
  * `ctx.settings` 只把「本条目 Config 上的 volatile 字段」投影成可编辑表单，并且
  * **只有声明了 volatile 字段的条目才会出现在 `describe()` 中**；写入非 volatile
  * 路径会被宿主直接拒绝。
@@ -817,7 +817,7 @@ function normalizeNotificationHoldMs(value) {
  * 字段语义与默认值必须与设置页的读取面一致：`describe()` 返回的 value 是
  * defaults resolved 后的结果（provider 空字符串表示用户尚未选择 provider，
  * promptOverrides 空对象表示全部跟随代码默认 persona）。运行期读源由
- * host/settings-source 从 describe() 取得，提交端点只写这九个字段。
+ * host/settings-source 从 describe() 取得，提交端点只写这十个字段。
  */
 const Config = z.object({
   // 主代理能力默认启用；false 可用于仅使用专家工具的兼容部署。
@@ -834,6 +834,9 @@ const Config = z.object({
   observerPreferred: z.boolean().default(false).volatile(),
   // 「任务管理」开关默认开启：旧文档缺字段时维持 Expert Group 注册到侧边栏的历史行为。
   taskManagementEnabled: z.boolean().default(true).volatile(),
+  // 「自动打开运行中的子代理侧栏」默认关闭：这是纯增量体验，旧文档/旧客户端缺字段时
+  // 必须保持「不做任何自动 open/close」的历史行为，绝不能按开启解释。
+  autoOpenSubagentSidebar: z.boolean().default(false).volatile(),
   // 六个角色的专家专属提示词覆盖（角色 id -> 自定义文本）。缺失或空对象表示全部
   // 使用代码里的默认 persona；这里只做类型层（角色键与长度）校验，写入边界的
   // 语义校验在 DEG 自有提交端点内（宿主新契约没有 validate 钩子）。
@@ -971,6 +974,9 @@ function normalizeSnapshot(snapshot, visibleRoles) {
     observerPreferred: snapshot?.observerPreferred === true,
     // 只有显式 false 才关闭侧边栏注册；缺字段（旧配置/旧客户端）按历史行为保持开启。
     taskManagementEnabled: snapshot?.taskManagementEnabled !== false,
+    // 只有显式 true 才开启自动打开；缺字段（旧文档/旧客户端/非法值）一律按关闭归一，
+    // 历史行为因此逐字节不变：默认不做任何自动 open/close。
+    autoOpenSubagentSidebar: snapshot?.autoOpenSubagentSidebar === true,
   };
 }
 
@@ -4052,6 +4058,7 @@ export default {
       roleConcurrencyLimit: DEFAULT_ROLE_CONCURRENCY_LIMIT,
       observerPreferred: false,
       taskManagementEnabled: true,
+      autoOpenSubagentSidebar: false,
     });
     // binding 生成器由 host/storage-binding 持有；storageBinding.* 调用为兼容投影。
     // ready 前和服务重载期间保留最后一次成功读取的快照，避免空快照覆盖已加载数据。
@@ -4097,6 +4104,9 @@ export default {
         roleConcurrencyLimit: settingsSnapshot.roleConcurrencyLimit,
         observerPreferred: settingsSnapshot.observerPreferred,
         taskManagementEnabled: settingsSnapshot.taskManagementEnabled,
+        // 自动打开属于全局 settings：必须随同一份快照进入 source()，否则冷恢复/服务重载
+        // 之后 client 读到的值会悄悄退回默认关闭。
+        autoOpenSubagentSidebar: settingsSnapshot.autoOpenSubagentSidebar,
         ...storageBinding.snapshots(),
       };
     }
@@ -4172,6 +4182,7 @@ export default {
       roleConcurrencyLimit: DEFAULT_ROLE_CONCURRENCY_LIMIT,
       observerPreferred: false,
       taskManagementEnabled: true,
+      autoOpenSubagentSidebar: false,
     }, {
       setSource(next) {
         settingsSource = () => normalizeSnapshot(next(), activeRoles());
@@ -4656,6 +4667,12 @@ export default {
       if (hasTaskManagementEnabled && typeof candidate.taskManagementEnabled !== "boolean") {
         throw new ValidationError("设置 taskManagementEnabled 无效");
       }
+      // 自动打开沿用同一兼容语义（与 taskManagementEnabled 逐字同款）：缺字段表示旧客户端，
+      // 不写 patch；显式提供时严格要求布尔，绝不用 truthy 值隐式开启自动行为。
+      const hasAutoOpenSubagentSidebar = candidate.autoOpenSubagentSidebar !== void 0;
+      if (hasAutoOpenSubagentSidebar && typeof candidate.autoOpenSubagentSidebar !== "boolean") {
+        throw new ValidationError("设置 autoOpenSubagentSidebar 无效");
+      }
       // 提示词覆盖沿用同一"缺字段即不覆盖"兼容语义：旧客户端提交的候选被原样放行，
       // 已有的自定义提示词不会被一次无关的通知设置保存清空。
       const hasPromptOverrides = candidate[PROMPT_OVERRIDES_SETTINGS_KEY] !== void 0;
@@ -4680,6 +4697,8 @@ export default {
         observerPreferred: candidate.observerPreferred === true,
         // 缺字段（旧客户端/旧文档）按开启归一：默认必须维持侧边栏注册的历史行为。
         taskManagementEnabled: candidate.taskManagementEnabled !== false,
+        // 缺字段（旧客户端/旧文档）按关闭归一：默认必须维持「无自动 open/close」的历史行为。
+        autoOpenSubagentSidebar: candidate.autoOpenSubagentSidebar === true,
       };
     }
 
@@ -4711,6 +4730,9 @@ export default {
     function commitSettingsCandidate(candidate, expectedRevision, signal) {
       // 旧客户端缺少任务管理字段时既不写 patch，也不在响应里新增字段（保持历史形状）。
       const hasTaskManagementEnabled = candidate?.taskManagementEnabled !== void 0;
+      // 自动打开同理：缺字段不写 patch，也不在响应里新增字段——一次无关的通知设置保存
+      // 绝不能把用户已经开启的自动打开重置回默认关闭。
+      const hasAutoOpenSubagentSidebar = candidate?.autoOpenSubagentSidebar !== void 0;
       // 提示词覆盖同理：缺字段不写 patch，避免旧客户端的保存顺带清空已有自定义提示词。
       const hasPromptOverrides = candidate?.[PROMPT_OVERRIDES_SETTINGS_KEY] !== void 0;
       return settingsRuntime.enqueueCommit(async () => {
@@ -4733,6 +4755,8 @@ export default {
           ...(candidate.observerPreferred === void 0 ? {} : { observerPreferred: validated.observerPreferred }),
           // 任务管理同样是「缺字段即不覆盖」：旧客户端保存通知设置不得顺带重置侧边栏注册。
           ...(hasTaskManagementEnabled ? { taskManagementEnabled: validated.taskManagementEnabled } : {}),
+          // 自动打开沿用同一写面规则：只有显式提供该字段的候选才能改写它。
+          ...(hasAutoOpenSubagentSidebar ? { autoOpenSubagentSidebar: validated.autoOpenSubagentSidebar } : {}),
           // 提示词覆盖按整份映射提交（不做键级合并）：空对象显式清空全部自定义提示词。
           ...(hasPromptOverrides ? { [PROMPT_OVERRIDES_SETTINGS_KEY]: validated[PROMPT_OVERRIDES_SETTINGS_KEY] } : {}),
         };
@@ -4745,6 +4769,7 @@ export default {
         if (candidate.observerPreferred === void 0) delete committedSettings.observerPreferred;
         if (candidate.roleConcurrencyLimit === void 0) delete committedSettings.roleConcurrencyLimit;
         if (!hasTaskManagementEnabled) delete committedSettings.taskManagementEnabled;
+        if (!hasAutoOpenSubagentSidebar) delete committedSettings.autoOpenSubagentSidebar;
         if (!hasPromptOverrides) delete committedSettings[PROMPT_OVERRIDES_SETTINGS_KEY];
         return {
           settings: committedSettings,
@@ -9524,6 +9549,8 @@ export default {
             roleConcurrencyLimit: snap.roleConcurrencyLimit,
             // 任务管理默认开启：meta 只回传归一后的生效值，供设置页与诊断读取。
             taskManagementEnabled: snap.taskManagementEnabled !== false,
+            // 自动打开默认关闭：meta 只回传归一后的生效布尔值。
+            autoOpenSubagentSidebar: snap.autoOpenSubagentSidebar === true,
             // 只读提示词自定义投影：六个角色（含未启用的 observer）、各自当前生效的
             // 专家专属 persona 与 grapheme 上限。设置页据此渲染编辑器与"恢复默认"，
             // 不需要也不允许自己猜测 Host 状态。这里不含固定执行纪律副本。

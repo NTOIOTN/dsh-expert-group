@@ -2443,6 +2443,8 @@ window.__ModuleLoader__.load({
         observerPreferred: source.observerPreferred === true,
         // 任务管理缺字段时保持开启：默认必须维持 Expert Group 注册到侧边栏的历史行为。
         taskManagementEnabled: source.taskManagementEnabled !== false,
+        // 自动打开缺字段/非法值时一律按关闭归一：默认不做任何自动 open/close。
+        autoOpenSubagentSidebar: source.autoOpenSubagentSidebar === true,
       };
     }
 
@@ -5869,6 +5871,11 @@ window.__ModuleLoader__.load({
         if (candidate.taskManagementEnabled !== source.taskManagementEnabled) {
           ops.push({ op: "set", path: ["taskManagementEnabled"], value: candidate.taskManagementEnabled });
         }
+        // 自动打开与任务管理同一形状：新客户端的完整候选始终显式携带该字段，
+        // Host 按「显式字段才写 patch」处理，旧客户端缺字段因此不可能覆盖它。
+        if (candidate.autoOpenSubagentSidebar !== source.autoOpenSubagentSidebar) {
+          ops.push({ op: "set", path: ["autoOpenSubagentSidebar"], value: candidate.autoOpenSubagentSidebar });
+        }
         if (promptChanged) {
           ops.push({ op: "set", path: ["promptOverrides"], value: candidatePromptOverrides });
         }
@@ -6442,6 +6449,17 @@ window.__ModuleLoader__.load({
               onChange: (event) => editDraft((previous) => ({ ...previous, taskManagementEnabled: event.target.checked })),
             }),
             react.createElement("span", { className: "deg_settings_label" }, "任务管理")),
+          // 「Auto」= 自动打开运行中的子代理右侧栏会话：与任务管理同一行的紧凑开关。
+          // 说明性文案只放在 title（悬浮提示）里，可见文字保持一个单词，不挤压既有控件。
+          react.createElement("label", { className: "deg_settings_checkbox", title: "自动打开运行中的子代理侧栏会话" },
+            react.createElement("input", {
+              type: "checkbox",
+              "aria-label": "Auto",
+              checked: draft.autoOpenSubagentSidebar,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, autoOpenSubagentSidebar: event.target.checked === true })),
+            }),
+            react.createElement("span", { className: "deg_settings_label" }, "Auto")),
           react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-concurrency-limit" },
             react.createElement("span", { className: "deg_settings_label" }, "单个角色并发上限"),
             react.createElement("input", {
@@ -7183,6 +7201,57 @@ window.__ModuleLoader__.load({
           slots: ctx.slots,
           // 浏览器 confirm 是同步 API，Panel 以 Promise/boolean 双兼容方式消费。
           confirm: (message) => typeof globalThis.confirm === "function" && globalThis.confirm(message) === true,
+          /**
+           * 「自动打开」的实时读面：面板每次同步都现读配置表单快照。
+           *
+           * 不在这里读取一次再当常量传下去：设置页保存后必须立刻生效，而重装整个侧边栏
+           * （disposer 不可复用）只为跟随一个偏好是过度且会打断侧栏状态的做法。
+           * 读取失败/字段缺失一律按关闭（历史行为）。
+           */
+          getAutoOpenSubagentSidebar: () => readAutoOpenSubagentSidebar(),
+          /** 面板标题栏 Auto 开关的写面：必须显式提交布尔值，否则设置页会一直显示旧值。 */
+          setAutoOpenSubagentSidebar: (next) => commitAutoOpenSubagentSidebar(next),
+        };
+        /**
+         * 「自动打开运行中的子代理侧栏」读面：唯一来源是配置表单当前快照。
+         *
+         * 只有显式 true 才算开启——旧文档缺字段、非布尔值与读取异常全部按关闭处理，
+         * 保证默认行为与历史逐字节一致（不做任何自动 open/close）。
+         */
+        const readAutoOpenSubagentSidebar = () => {
+          try {
+            const snapshot = typeof settingsForm?.getSnapshot === "function" ? settingsForm.getSnapshot() : void 0;
+            return snapshot?.value?.autoOpenSubagentSidebar === true;
+          } catch {
+            return false;
+          }
+        };
+        /**
+         * 写面：把表单快照原样作为整体候选，只翻转 autoOpenSubagentSidebar 一个字段。
+         *
+         * 走的是设置页同一条 settings-commit（完整候选 + expectedRevision CAS），因此
+         * 宿主的语义校验与并发栅栏照常生效；这里**不**重放设置页草稿，避免把未保存的
+         * 编辑顺带提交。只读文档、快照不可用、校验失败或传输失败都返回 false，面板据此
+         * 回退到权威读面（开关不会停在错误状态）。
+         */
+        const commitAutoOpenSubagentSidebar = async (next) => {
+          try {
+            const snapshot = typeof settingsForm?.getSnapshot === "function" ? settingsForm.getSnapshot() : void 0;
+            if (snapshot?.writable !== true) return false;
+            const value = snapshot.value;
+            if (value === null || typeof value !== "object") return false;
+            await commitSettingsCandidate(
+              { ...value, autoOpenSubagentSidebar: next === true },
+              snapshot.revision,
+              globalThis.fetch,
+              ctx?.connection,
+              PROMPT_ROLE_IDS,
+            );
+            return true;
+          } catch {
+            // 失败原因（只读/目录校验/修订冲突）由设置页承担呈现；面板只回退开关状态。
+            return false;
+          }
         };
         const readTaskManagementEnabled = () => {
           try {
