@@ -3999,7 +3999,13 @@
           // 关闭态：只调用记录里的精确 tabId。绝不根据 active() 当前是谁来决定关哪个 tab。
           if (record !== undefined && closeSidebarResource !== null) {
             let closed = false;
-            try { closeSidebarResource.call(sidebarRight, record.tabId); closed = true; } catch { closed = false; }
+            try {
+              // close() 可异步失败；结算前不能删掉 Auto 来源，否则失败 tab 会被当成手动 tab 而永不重试。
+              await closeSidebarResource.call(sidebarRight, record.tabId);
+              closed = true;
+            } catch {
+              closed = false;
+            }
             if (closed === true) {
               /**
                * 关闭成功后一起收口这个 key 上尚未结算的分栏事务。
