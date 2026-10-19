@@ -1,5 +1,7 @@
 # dsh-expert-group
 
+[English](README.en.md) | **中文**
+
 > settings 命名空间 `dsh-expert-group` 保存全局 provider、`defaults` 和通知偏好；会话覆盖与子代理快照属于插件自己的 `dsh_expert_group` storage domain。
 
 一个可安装到 DSH（DeepSeek Harness）的外部 **dual-face Cordis bundle**，其专家分工、
@@ -52,9 +54,9 @@ DEG 在 DSH Web 界面上的可见面只有三处，彼此独立、互不重叠�
 
 | 界面 | 位置 | 能做什么 | 详细说明 |
 | --- | --- | --- | --- |
-| **dsh-expert-group 设置页** | 设置 → `dsh-expert-group` | 维护全局 provider、六类专家的默认模型与思考深度，以及通知偏好、`Observer优先`、`任务管理` 与单个角色并发上限 | [设置页功能详解](#设置页功能详解dsh-expert-group) |
+| **dsh-expert-group 设置页** | 设置 → `dsh-expert-group` | 维护全局 provider、六类专家的默认模型与思考深度，以及通知偏好、`Observer优先`、`任务管理`、`Auto` 与单个角色并发上限 | [设置页功能详解](#设置页功能详解dsh-expert-group) |
 | **Expert Group 任务侧边栏** | 右侧栏（原生右栏，或装有 better-sidebar 时的独立页） | 查看当前根会话的任务树与运行状态；用 `>>` / `<<` 在右栏打开或关闭某个子代理会话；取消 / 重试 fan-out 任务 | [Expert Group 任务侧边栏](#expert-group-任务侧边栏) |
-| **运行状态行与系统通知** | 主视图左下角 / Windows 桌面右下角 | 运行中显示 `Orchestrator running`、`Explorer running` 等运行词；任务进入终态时由 Windows Toast 提醒 | [Web 状态提示](#web-状态提示) |
+| **运行状态行与系统通知** | 主视图左下角 / Windows 桌面右下角 | 运行中显示 `Orchestrator running`、`Explorer running` 等运行词；任务进入终态时由 Windows Toast 提醒 | Web 状态提示 |
 
 DEG 没有模型可调用的通知工具，也不在会话标题栏或右侧栏放模型配置入口：全局专家配置只在设置页维护，会话内的主模型覆盖仍由 DSH Host 自己管理。
 
@@ -201,6 +203,7 @@ DEG 没有模型可调用的通知工具，也不在会话标题栏或右侧栏�
 | --- | --- | --- | --- |
 | `Observer优先` | 关闭 | `observerPreferred` | 开启后图片提交改为 Observer 优先路由，并要求 Observer 模型明确支持 image，否则给出 `已开启 Observer优先，但 Observer 模型未明确支持 image；原始输入已保留。`；主代理提示词也切换到 Observer 优先段落 |
 | `任务管理` | 开启 | `taskManagementEnabled` | 控制 DEG 是否把 Expert Group 注册到侧边栏：关闭并保存后调用当前 install 返回的 disposer 释放注册（原生右栏与 better-sidebar 的默认侧栏保持不变），重新开启并保存后重新注册；字段缺失或读取失败一律按开启处理 |
+| `Auto` | 关闭 | `autoOpenSubagentSidebar` | 开启后，子代理运行期间自动在右栏打开它的会话页，并在子代理结束、资源空闲后自动收回；只关闭本次运行中由 Auto 亲自打开的 tab，用户手动打开的 tab 不会被自动关闭。关闭后可用 `>>` / `<<` 手动打开或关闭 |
 | `单个角色并发上限` | `10` | `roleConcurrencyLimit` | 取值范围 `1–64` 的整数。**不是即时生效**，点保存后才应用；非法值由 Host 拒绝（`设置 roleConcurrencyLimit 无效`） |
 
 ### 13. 页脚与保存
@@ -229,27 +232,12 @@ DEG 没有模型可调用的通知工具，也不在会话标题栏或右侧栏�
 
 > 面向使用者的逐控件说明与截图见前面的「[设置页功能详解](#设置页功能详解dsh-expert-group)」；本节只记录实现细节与边界。
 
-- **全局专家配置只在“dsh-expert-group”设置页维护**：provider、各专家默认模型/思考深度、通知开关和音量、`Observer优先` 与 **任务管理** 都会持久化到插件 settings namespace。
+- **全局专家配置只在“dsh-expert-group”设置页维护**：provider、各专家默认模型/思考深度、通知开关和音量、`Observer优先`、**任务管理** 与 **Auto** 都会持久化到插件 settings namespace。
 - 插件不再提供右侧**模型配置**面板、better-sidebar 的“专家模型”Tab 或会话标题栏入口；模型选择仍只在设置页维护。任务状态由下述 Expert Group 侧边栏展示。
 - 设置页的模型候选只来自 DSH 当前模型目录（“设置 → 模型”中已添加的模型），保存前会由客户端和 Host 双重校验。
 - **“模型配置”区域（默认折叠）**：设置页底部另有一个同样默认折叠的区域，复制 DSH 内置模型设置页的可见能力——provider 目录、API Key（走 credentials 服务，只写不读明文）、Base URL、协议、添加/删除 provider、获取模型、模型增删、模型 ID/显示名、上下文窗口、最大输出 token、输入类型，以及模型目录的「适配器默认 / 用户覆盖 / 恢复默认」。范围**不包括**内置页的隐藏高级 YAML 字段（`transport`、`retryPolicy`、`compat` 等）：卡片只写自己看得见的字段，这些字段既不被显示也不被重建。
 - **与角色配置分开保存**：每个 provider 卡片各自持有草稿并有独立的「应用 / 取消」，区域本身没有保存按钮；上方角色表的保存按钮与行为完全不变。提交以卡片打开时读到的 namespace revision 作为栅栏：外部（其它会话/页面）已推进 revision 时拒绝覆盖，卡片显示冲突提示与「重新打开」入口。
 - **七个思考档位（可多选）**：每个模型条目的高级设置里有 `off / minimal / low / medium / high / xhigh / max` 七个复选框，顺序与 DSH 的 pi-ai 档位词表一致，且无论当前目录是否声明支持都始终显示。已有模型按 `reasoningEfforts` 映射恢复勾选；新模型七档全部不勾选。保存时 `off` 写空字符串值、其余档位写同名小写字符串，只增删这七个可见键并保留未展示的未知键；七档全不勾选且没有未知键时删除 `reasoningEfforts` 字段。
-- **模型目录的继承/覆盖/恢复默认**：没有用户覆盖时显示适配器/组合层默认（只读展示），首次实际编辑才 materialize 一份用户覆盖（写入卡片可见字段）；「恢复默认」删除用户覆盖（`unset`），绝不把默认值固化成冗余覆盖。
-- **能力多选与角色单选分离**：卡片上的七档是**模型能力**（该模型会提供哪些档位），`dsh-expert-group.defaults.<role>.reasoningEffort` 仍是**角色单选**。若一次保存会删除/取消某个正被角色默认使用的档位，保存被阻止并列出受影响角色，插件**不会**自动改写角色配置。
-- 保存成功后区域会重新读取 provider 目录与凭据状态，因此上方角色表的可用档位随之刷新。
-- 客户端唯一的数据流实现在 `client-model-config.js`（装配期与 freshness 一样先于 descriptor 执行的浏览器安全 IIFE）；`scripts/assemble-client.mjs` 负责把它拼进发布 bundle，请勿手工编辑 `client-bundle.js`。
-- 子代理实际生效的 `provider / model / reasoningEffort` 快照仍写入插件自有 `dsh_expert_group` storage domain 的 `child_models` 表（上限 300 条自动淘汰最旧记录）；这是运行数据，不是 settings 配置。
-- **图片路由（问题2）**：`Observer优先` 默认关闭并持久化在该 settings namespace。根会话 Composer 的图片提交先经客户端公开 `ConversationController.sendSession` 接缝上传到 Host；Host 对全部图片严格校验，使用真实转码器将 JPEG/WebP/GIF 转为 PNG，并通过公开 `ctx.attachments.saveImage` 创建新的 PNG durable ref。PNG 字节也会先验签再保存，绝不只改文件名后缀。副本保持 durable，随 session/attachment 引用存活，由 Host 的 retention/GC 回收不可达对象；插件不修改原始 durable attachment ref。能力判定优先读取最新的 `model/selection` 与 `request/header` 事件证据，模型切换后立即发图不会把旧 header 当作当前模型；旧宿主缺少事件面时才保守回退兼容路径。
-- **提交期路由复核（TOCTOU）**：Host 判定能力后会签发一个不泄露 `provider/model` 的不透明 `routeClaim`（Node `randomUUID`，claim 表只存 Host 侧路由摘要，容量上限 64 + 5 分钟 TTL，惰性淘汰、同时绑定签发它的 root session 与 **exact root generation token**）。客户端在真正 `session.prompt` 之前用同一 Connection/legacy RPC 发起 `image-route-validate` 复核：路由变化返回 409 `route-changed`、claim 伪造/过期/跨会话/跨代际返回 400 `route-claim-invalid`，两者都会 abandon 本次提交且**不**调用 `session.prompt`；Host 自身也会在能力异步查询之后再核对一次 claim，避免明显窗口。同一个 `sessionId` 的 root 被重建/替换（replacement、重启恢复）后，旧 claim 立即失效并清理，绝不会把旧代际的图片提交落到新 root 上。
-- **签发失败回收**：claim 只有在**成功交付**给客户端时才保留。签发之后若 Host 自检发现路由变化、请求被取消、命中结构化错误，或响应写入实际失败（传输层吸收 socket 竞态并返回 `written:false`），Host 都会立即删除该 claim（连同暂存的 durable refs），因此不会留下客户端永远无法消费的 pending claim。
-- **Observer 两阶段提交（避免孤儿 child）**：`target=observer` 时 `image-route` **只**完成 PNG 规范化、能力判定与 claim 签发，并把 Host 创建的 durable PNG refs 暂存在 claim 条目里（只存 ref、不存字节、不存用户文本），绝不启动 child。客户端随后执行 `image-route-validate`（对 observer claim **只验证不消费**，可安全重复复核）→ `image-route-observer-commit`（Host 复核当前路由 → Observer admission → 一次性消费 claim 并丢弃暂存 refs）。commit 失败（路由变化/claim 失效/重复提交/取消/跨代际）一律不启动 child；若 admission 已被接受而后续检测失败，Host 会用公开 `subagents.interrupt(childId, { kind: "ancestor", agent })` 尽力中断该 child。claim 条目带 `issued/committing` 状态：并发或重复 commit 返回 409 `route-commit-in-progress`（成功后变为 `route-claim-invalid`），进入 commit 前取消请求会顺带删除 claim，claim 表始终有界。
-- **Observer 清理 token（commit 成功后的补偿与释放）**：commit 成功时 Host 额外签发一次性 `cleanupToken`（`randomUUID`，绑定 `{sessionId, exact root generation, childId}`，不含 provider/model/text；独立表同样容量上限 64 + 5 分钟 TTL + 卸载清理，且**只淘汰过期项**）。客户端在提交 root prompt 之后按结果二选一：失败/取消路径（prompt 非成功返回、抛错、被取消、retirement 非 `observed`、插件在等待期间被卸载）尽力调用 `image-route-observer-cancel` 让 Host 中断刚创建的 child；成功 `observed` 路径调用 `image-route-observer-release` **只释放凭据、绝不 interrupt**，否则 token 会一直占到 TTL，连续成功提交填满容量后新的 Observer commit 会被 503 拒绝。两个动作都是严格 `action/sessionId/childId/cleanupToken`（Connection/legacy 都要求图片专用标记），**不复用**调用方可能已取消的信号，失败只尽力而为且不改变原始 prompt 结果；token 在全部校验通过后立即消费（不可重放），伪造/跨会话/串 child/重复消费统一返回 404 `route-cleanup-invalid`（不泄露是哪一项校验失败）。
-- **容量预占与交付校验**：commit 在**启动 Observer 之前**原子预占一个 cleanup token 槽位（`已签发 + 已预占 < 上限`，检查与自增之间无 await，因此并发 commit 不可能超发）；容量已满时拒绝本次 commit 并返回 503 `observer-cleanup-capacity`、删除 routeClaim、不创建 child —— 绝不为新 child 淘汰仍可能活跃的旧 token（那会让旧 child 失去客户端补偿通道而孤儿化）。admission 或后置检查失败会释放预占，签发成功则把预占转成 token。**所有 image-route 成功响应都做交付判定**（传输层报告 `written:false` 的 socket 竞态不算交付）：commit 响应未交付时立即撤销刚签发的 token 并 `interrupt` 该 child；`image-route-validate` 未交付时删除仍处于"只验证不消费"的 observer claim（连同暂存 durable refs），使客户端既无法继续 commit 也不占用容量（main 的 validate 成功即消费语义不变）。
-- **旧 Host 兼容**：main 路径在没有 `routeClaim` 的旧 Host 上保持既有提交行为（不发校验请求、不静默假设校验通过）；`target=observer` 的响应没有 `routeClaim` 时客户端**必须 fail-closed**（abandon、不调用 `session.prompt`，提示"Host 不支持安全的 Observer 图片提交，请升级插件/Host"），因为旧 Host 会在 image-route 阶段就启动 child，无法保证"能力判定模型 == 实际 prompt 模型"，也无法在提交失败时避免孤儿 child。
-- 当 Observer 直接接收图片时，插件只使用 Host 创建的 `image/png` durable attachment ContentBlock；Observer admission 固定为有界的纯视觉子任务（正文由 `prompt-contracts.js` 的固定契约与"无用户文字上下文"说明组成），禁止读取主任务上下文、执行主任务步骤、修改文件或调用委派/goal/finalize 工具。**自动图片入口不向 Observer 传递任何用户原始文本**（含路径、秘密与注入载荷；`buildObserverVisualTask()` 不接受参数）；主代理仍通过 root prompt 持有原始 text，客户端提交文字通知说明视觉报告会经既有 child feedback 返回、原始任务仍由主代理持有。需要携带用户问题的视觉任务只能走 role tool 的手工调用路径。主模型直达时，Host 返回的也必须是实际 PNG encoded image。
-- **取消语义**：`llm.resolveModelInfo` 等异步边界抛出的 `AbortError/ABORT_ERR`（或请求 signal 已取消）一律不被能力兜底吞掉，图片路由的 normalize 后、能力查询前后、claim 校验/commit 前后与 Observer admission 前后都做 fail-fast，由同一个 `mapRpcError` 映射为 `gateway/cancelled`（499）；只有真正的非取消失败才按 `unknown` → main-first 继续。取消的 commit 不会 admission，也不会留下 pending claim；已 admission 但随后取消时会尽力中断 child。
-- **原生输入边界**：插件通过公开的 `ConversationController.sendSession` 接缝覆盖 Composer 根会话图片提交，并在 `Session.beginSubmission/prompt` 上保留原生回显、模式、requestId、退休和失败收尾语义；它不能拦截其他调用方绕过 Composer 直接调用的原生 Session.prompt。因此该边界不是对 DSH 核心的修改或承诺全局拦截；`image-routing.js` 和 Observer role tool 仍提供可独立测试的 PNG 规范化与三态路由。unknown 能力始终保持 main-first，不静默切换。
 
 ## Expert Group 任务侧边栏
 
