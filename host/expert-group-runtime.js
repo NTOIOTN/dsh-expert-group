@@ -5,6 +5,15 @@
  * 收敛为 expert-group-snapshot 深模块的输入。它不持久化第二套任务状态，也不参与
  * 任务调度、恢复或 fan-out 结算。
  *
+ * 首屏与权威快照（本次性能修复的核心契约）：
+ * - `snapshotForSession` 先返回**轻量（fast）**快照：它跳过全部冷读（`sessionQuery.readSession`），
+ *   只用 DEG 自己的持久化记录与 live 对象投影，快照上带 `partial: true`；
+ * - 每次请求都**幂等**地在后台启动**完整（full）**构建（同一 root 同时只允许一个在跑），完成后
+ *   写入按 root 的内存缓存，供客户端 ≤2.5s 的轮询取回权威快照（`partial: false`）；
+ * - 完整快照「只是过期、没有失效事件」时继续返回上一份权威快照（不降级，避免界面抖动）；
+ *   一旦收到失效事件，则当次请求改用新的轻量快照，保证状态变化立刻可见；
+ * - 缓存由事件挂点（`invalidateSnapshots`，见 index.js 的接线）与兜底 TTL 失效，并按 root 限制容量。
+ *
  * @module dsh-expert-group/host/expert-group-runtime
  */
 import { buildExpertGroupSnapshot } from "./expert-group-snapshot.js";
@@ -351,8 +360,105 @@ function firstRejection(results) {
 }
 
 /**
+ * 快照缓存按 root 的数量上限（**硬上限**）。
+ *
+ * 缓存值是一份完整快照（树规模随专家数增长），因此必须显式限制 root 数量；被淘汰的 root
+ * 只是丢掉已有的权威结果，下一次请求会重新走「轻量返回 + 后台重建」，不会产生错误。
+ * 取值 8：覆盖「用户来回切换若干个会话」的常见宽度，又让内存占用有明确上界。
+ * 所有会创建条目的路径（含轻量构建返回 null、完整构建失败）都必须维护这个上限；
+ * 淘汰是真正的 LRU（命中与写入都提权），避免活跃 root 被一次性查询挤掉后 full→fast→full 抖动。
+ */
+const SNAPSHOT_CACHE_LIMIT = 8;
+
+/**
+ * 轻量（partial）快照的兜底 TTL。
+ *
+ * 轻量快照只由事件挂点（invalidateSnapshots）与这个 TTL 决定新鲜度。它**必须与客户端轮询
+ * 周期（2500ms）解耦**：若两者相等，严格 `<` 的新鲜度判定会让「恰好晚到一点」的下一次轮询
+ * 落在过期之后，于是在完整快照就绪之前每次轮询都要重建一次轻量快照。
+ * 取值 6000ms = 2.4× 轮询周期：即使连续两次轮询被合并或延迟（隐藏标签页恢复、通知触发的
+ * 尾随刷新），缓存仍覆盖下一次轮询；代价只是「事件没到」时陈旧上界从 2.5s 放宽到 6s，
+ * 而真正的状态变化由失效事件即时反映，不依赖这个兜底。
+ */
+const FAST_SNAPSHOT_TTL_MS = 6000;
+
+/**
+ * 完整（权威）快照的兜底 TTL。
+ *
+ * 完整快照重建的代价是每个冷 child 一次 `readSession`，因此不能被轮询无限放大；TTL 取 5s
+ * （≤ 需求上限），其间由 invalidation 事件提供即时性：只要有可观察的状态变化就立刻重建。
+ */
+const FULL_SNAPSHOT_TTL_MS = 5000;
+
+/**
+ * 完整快照的**绝对**宽限上限：超过它就不再返回任何缓存的完整快照。
+ *
+ * 后台重建持续失败（上游存储故障）或 root 已被释放、持久化证据暂时消失时，继续返回任意旧的
+ * 权威快照会让界面无限期停在错误状态；超过 4×TTL（20s）后改用轻量快照（它至少反映当前 DEG
+ * 记录），连轻量也拿不到就回落到既有的「重新构建 / 404」契约（见 resolveSnapshotForSession）。
+ */
+const FULL_SNAPSHOT_GRACE_MS = 4 * FULL_SNAPSHOT_TTL_MS;
+
+/**
+ * 代次不一致（构建期间发生过失效）的完整快照还能兜底多久。
+ *
+ * 这类结果的内容是构建期间真实读到的，只是「读完到完成」之间又出现了可观察变化；当轻量路径
+ * 拿不到任何存在性证据（fast 为 null）时，用它在**很短**的窗口内顶住比直接空屏更接近真实状态。
+ * 窗口取 2×TTL（10s），且必须同时满足 FULL_SNAPSHOT_GRACE_MS 的绝对上限；它永远不会被当作
+ * 「新鲜」或「只是过期」的权威结果返回。
+ */
+const FULL_SNAPSHOT_STALE_GRACE_MS = 2 * FULL_SNAPSHOT_TTL_MS;
+
+/**
+ * 因「构建期间发生过失效」而需要的重建，两次之间的最小间隔（去抖）。
+ *
+ * 构建开始时捕获代次、完成时若代次已变化则不作权威，这是正确性要求；但活跃会话里失效事件
+ * 可能每几秒就来一次，若每个请求都立刻重跑全量冷读，就会退化成「每请求一次全量构建」。
+ * 因此一次被判为非权威的构建之后，至少间隔一个完整 TTL（5s，与 FULL_SNAPSHOT_TTL_MS 同量级）
+ * 才允许再次后台重建；这段时间由毫秒级的轻量快照承担展示。
+ */
+const STALE_REBUILD_MIN_INTERVAL_MS = FULL_SNAPSHOT_TTL_MS;
+
+/**
+ * 后台完整构建**失败**后的重试退避上限（R1）。
+ *
+ * 失败退避与上面的 STALE_REBUILD_MIN_INTERVAL_MS 是两条**互相独立**的闸门：
+ * - STALE_REBUILD_MIN_INTERVAL_MS 处理「构建成功但期间发生过失效」，是去抖；
+ * - 这里的失败退避处理「构建直接失败」（冷读报权限/存储错误、上游短暂不可用），是**指数退避**。
+ *
+ * 基数取 FULL_SNAPSHOT_TTL_MS（5s），第 n 次连续失败后等待 min(5s × 2^(n-1), 40s)：
+ * 5s → 10s → 20s → 40s → 40s…。上限取 8×TTL（40s）：既让持续故障下的重试频率收敛到「每 40s
+ * 一次全量冷读」，又保证上游恢复后最迟 40s 内能重新拿到权威快照（不会永远停在 partial）。
+ * 任一次成功立即把退避级别清零。
+ *
+ * 失效事件**不**提前解除失败退避：失败反映的是上游冷读健康度，与「这份快照是否陈旧」正交；
+ * 而活跃会话的失效事件可能每几秒就来一次，若用它放行重试，退避会被事件流完全绕过，退化成
+ * 「每请求一次全量冷读」——正是 R1 要修的问题。展示层的即时性已由毫秒级轻量快照保证。
+ */
+const FULL_SNAPSHOT_RETRY_MAX_MS = 8 * FULL_SNAPSHOT_TTL_MS;
+
+/**
+ * 同时在飞的完整构建条目数量**安全上限**（R3）。
+ *
+ * SNAPSHOT_CACHE_LIMIT 只约束「非在飞」条目；在飞条目在构建结束前**不得**被淘汰，否则
+ * awaitFullBuild 看不到该构建、后续请求会为同一 root 启动第二个构建（同一 root 同时只有一个
+ * 构建的契约被破坏，且每个构建各自建立冷读协调器，跨 root 的实际 I/O 并发被放大）。
+ * 这里额外给在飞条目一个安全上限，防止「大量陌生 root 同时构建」把缓存撑成无界增长：
+ * 取 2×SNAPSHOT_CACHE_LIMIT（16）。正常情况下远达不到，只有异常增长（例如被大量不同 root
+ * 的请求同时驱动）时才会退化为淘汰最久未用的在飞条目——这是有意的「有界优先」取舍。
+ */
+const SNAPSHOT_INFLIGHT_LIMIT = 2 * SNAPSHOT_CACHE_LIMIT;
+
+/**
  * @param {object} dependencies
- * @returns {{snapshotForSession(sessionId:string): Promise<object>}}
+ * @param {Function} [dependencies.projectionTitleFor] - 可选：零 I/O 的会话标题读面
+ *   （`(childId) => string|null`）。轻量快照拿不到冷会话日志，用它替代冷会话标题，
+ *   位于既有降级链的同一槽位（见 collectExperts 的 taskName）。
+ * @param {object} [dependencies.logger] - 可选：`{warn}`。后台完整构建失败不再向请求方抛出，
+ *   因此需要一条宿主日志出口；缺失时静默（只保留 lastError，供 awaitFullBuild 观察）。
+ * @returns {{snapshotForSession(sessionId:string): Promise<object>,
+ *   invalidateSnapshots(sessionId?:string): number,
+ *   awaitFullBuild(sessionId:string): Promise<object|null>}}
  */
 export function createExpertGroupRuntime({
   agents,
@@ -363,17 +469,58 @@ export function createExpertGroupRuntime({
   recoveryRecords,
   source,
   sessionQuery,
+  projectionTitleFor,
+  logger,
   now = Date.now,
 } = {}) {
   if (!(recoveryRecords instanceof Map)) throw new TypeError("Expert Group runtime 需要 recoveryRecords Map");
   if (typeof now !== "function") throw new TypeError("Expert Group runtime 需要 now 函数");
-  // root 与 child surface 可能同时请求同一份树；只合并重叠的构建期，完成后不保留
-  // 旧快照，确保下一次通知仍读取最新状态。
+  // root 与 child surface 可能同时请求同一份树；只合并重叠的构建期。首屏请求不再等待完整
+  // 构建，因此表项仍按「请求期」存在：完成后删除，只保留下面按 root 的两级结果缓存。
   const snapshotInFlight = new Map();
 
   function persistedChildren() {
     const snapshot = safeCall(() => source?.(), null);
     return snapshot?.childModels && typeof snapshot.childModels === "object" ? snapshot.childModels : {};
+  }
+
+  /**
+   * 轻量快照专用的会话标题读面（可选能力，期望零 I/O）。
+   *
+   * 冷会话标题原本只能在 `readSession` 之后读到，而轻量路径不做任何冷读，因此这里留一个
+   * **可选**依赖槽：宿主提供 `projectionTitleFor` 时用它替代冷会话标题；没有提供（或它读不到、
+   * 抛错、返回空串）时返回 null，降级链继续落到 child_models.lastDispatch.description。
+   *
+   * 探测与调用都必须 fail-soft：可选服务缺失绝不能影响首屏，因此所有异常在这里被收敛成 null。
+   */
+  function projectionTitleOf(childId) {
+    if (typeof projectionTitleFor !== "function") return null;
+    return firstText(safeCall(() => projectionTitleFor(childId), null));
+  }
+
+  /**
+   * fan-out 分片身份一致性校验（**只用廉价记录，绝不冷读**）。
+   *
+   * 归属证明回答的是「这个 child 属于本 root 吗」；本函数回答的是更强的「它属于**本分片的这一次
+   * attempt** 吗」。完整路径靠 `readSession` 的 header 证明前者，轻量路径没有这次读取，因此两种
+   * 模式都用 `child_models` 记录自带的 fan-out 身份做**反证**：记录一旦声明了
+   * fanoutParentTaskId / fanoutShardId / fanoutAttempt，就必须与当前父任务 / 分片 / attempt 一致，
+   * 否则返回 true（调用方把该 childId 清空），保证 fast 与 full 的归属结论一致、都 fail-closed。
+   *
+   * 只有「记录存在且与之矛盾」才算反证：完全没有记录的 child（例如由 live agent 的
+   * header.parentSession 证明归属）不受影响，避免把可用的导航键误删。
+   */
+  function fanoutIdentityContradicts(record, childSnapshot, { parentTaskId, shardId, attempt }) {
+    for (const source of [record, childSnapshot]) {
+      if (source === null || source === undefined) continue;
+      const declaredTask = nonEmpty(source.fanoutParentTaskId);
+      if (declaredTask !== null && declaredTask !== parentTaskId) return true;
+      const declaredShard = nonEmpty(source.fanoutShardId);
+      if (declaredShard !== null && shardId !== null && declaredShard !== shardId) return true;
+      const declaredAttempt = Number.isSafeInteger(source.fanoutAttempt) ? source.fanoutAttempt : null;
+      if (declaredAttempt !== null && attempt !== null && declaredAttempt !== attempt) return true;
+    }
+    return false;
   }
 
   /**
@@ -522,7 +669,7 @@ export function createExpertGroupRuntime({
    * 本次构建的 `coordinator`，因此 fan-out attempt 与普通 expert 阶段对同一个 child 只会
    * 调用一次 readSession（同一 parentSessionId + childId 共享同一个读取 promise）。
    */
-  async function resolveOwnedChild(childId, { rootId, parentTaskId, persisted, cache, coordinator }) {
+  async function resolveOwnedChild(childId, { rootId, parentTaskId, persisted, cache, coordinator, fast }) {
     if (typeof childId !== "string" || childId.length === 0) {
       return { owned: false, childId: null, agent: undefined, session: undefined, childSnapshot: null };
     }
@@ -543,7 +690,10 @@ export function createExpertGroupRuntime({
     if (verdict === "foreign") {
       resolved = { owned: false, childId, agent: undefined, session: undefined, childSnapshot: null };
     } else if (verdict === "owned" || ownedByFanoutRecord) {
-      const session = record?.session ?? agent?.session ?? await coordinator.read(childId, rootId);
+      // 轻量路径（fast）不做冷读：只有 live/cached 会话可用，其余保持 undefined，
+      // 由投影层按「证据不足」处理（childId 保留，但不会读到任何会话内容）。
+      const session = record?.session ?? agent?.session
+        ?? (fast === true ? undefined : await coordinator.read(childId, rootId));
       resolved = {
         owned: true,
         childId,
@@ -552,6 +702,20 @@ export function createExpertGroupRuntime({
         // 归属已由显式证据或父任务级记录证明，允许该记录提供 provider/model 回退。
         childSnapshot,
       };
+    } else if (fast === true) {
+      // 轻量路径的归属判定 fail-closed：没有任何显式父证据、也没有父任务级记录时，
+      // 不读日志就无法证明这个 child 属于本根，因此按「不属于本根」处理，
+      // 输出副本会把它的 childId 清空（绝不猜测，也绝不跨 root 泄漏条目）。
+      //
+      // ── partial 阶段与 full 阶段的行为差异（B4，**有意保留**）──────────────────
+      // 完整构建在这里还会再冷读一次会话日志，用 header 的 id / parentSession 补证归属，
+      // 因此同一份数据在 full 里可能「有」childId，而在 partial 里是 null：
+      //   partial（首屏，无导航键）→ full 完成后恢复导航键。
+      // 这是**保守方向**的差异（先无、后有）：partial 阶段宁可少一个可点击的导航目标，
+      // 也不允许把来源不明的会话挂到本根任务树上（跨 root 泄漏比暂时少一个链接严重得多）。
+      // 因此这里保留 fail-closed 隔离，不修改归属逻辑；该行为由
+      // test/expert-group-runtime.test.mjs 的「partial 阶段无导航键、full 完成后恢复」用例锁定。
+      resolved = { owned: false, childId, agent: undefined, session: undefined, childSnapshot: null };
     } else {
       const coldSession = await coordinator.read(childId, rootId);
       resolved = coldSession === undefined
@@ -562,7 +726,7 @@ export function createExpertGroupRuntime({
     return resolved;
   }
 
-  async function collectExperts(root, coordinator) {
+  async function collectExperts(root, coordinator, { fast = false } = {}) {
     const persisted = persistedChildren();
     const ids = new Set();
     for (const record of recoveryRecords.values()) {
@@ -600,10 +764,14 @@ export function createExpertGroupRuntime({
     // 失败时本阶段会先停止领取新项、等已启动的读取全部 settle，再把首个错误原样抛出，因此
     // 构建失败返回时不会有残留的冷读，snapshotInFlight 清理后同一 root 的立即重试也不会与
     // 旧批次重叠（并发上限仍然只有一个批次的量级）。
-    await forEachWithConcurrency(candidates, COLD_READ_CONCURRENCY, async (candidate) => {
-      if (candidate.session !== undefined && candidate.session !== null) return;
-      candidate.session = await coordinator.read(candidate.childId, root.id);
-    });
+    // 轻量路径（fast）**完全跳过**这一步：没有 live/cached 会话的 candidate 保持 session 为
+    // undefined，绝不触发任何 sessionQuery.readSession——这正是首屏 5~15s 的根因。
+    if (fast !== true) {
+      await forEachWithConcurrency(candidates, COLD_READ_CONCURRENCY, async (candidate) => {
+        if (candidate.session !== undefined && candidate.session !== null) return;
+        candidate.session = await coordinator.read(candidate.childId, root.id);
+      });
+    }
 
     // 第三步（同步，顺序 = candidates = ids）：投影顺序只由 candidates 决定，与冷读完成顺序无关，
     // 因此并发不会改变快照里 expert 的既有顺序。
@@ -617,20 +785,39 @@ export function createExpertGroupRuntime({
       const status = expertStatus({ agent, record, session, events });
       const mode = record?.continuable === true || childSnapshot?.continuable === true
         || agent?.options?.__degExpertContinuable === true ? "continuable" : "unknown";
+      /**
+       * 轻量路径的「证据不足」判定：既没有 live/cached 会话，也没有 live agent。
+       *
+       * 这种情况下 expertStatus 的 ready/idle 只是「读不到东西」的兜底值，客户端的活动证据链
+       * 会把它读成「已结束/空闲」；因此降级为词表里的 unknown，并**省略 running 布尔**，
+       * 让客户端落回「没有活动证据」，从而渲染中性圆点、不输出活动文案。
+       * 注意：终态（succeeded/failed/…）本来就必须由 turn/end 证明，这里的降级不可能伪造终态；
+       * 而 running/waiting 这类有真实证据的状态不受影响。
+       */
+      const evidenceFree = fast === true && (session === undefined || session === null)
+        && (agent === undefined || agent === null);
+      const projectedStatus = evidenceFree && (status === "ready" || status === "idle") ? "unknown" : status;
       experts.push({
         id: childId,
         kind: "expert",
         sessionId: childId,
         parentSessionId: root.id,
         // context.label 是最新 accepted dispatch 的短描述；冷恢复再读持久 child model。
-        taskName: firstText(context?.label, childSnapshot?.lastDispatch?.description, sessionTitle(session, childId, events)),
+        // 降级顺序与完整构建完全一致（描述优先于会话标题），轻量路径只是把读不到的冷会话标题
+        // 换成同样语义的可选零 I/O 读面（projectionTitleOf），避免 full 替换 fast 时任务名跳动。
+        taskName: firstText(
+          context?.label,
+          childSnapshot?.lastDispatch?.description,
+          projectionTitleOf(childId),
+          sessionTitle(session, childId, events),
+        ),
         content: firstText(context?.promptText, childSnapshot?.lastDispatch?.prompt, sessionPrompt),
         contentSource: context?.promptText ? "dispatch-prompt" : sessionPrompt ? "session-log" : "unavailable",
         role: firstText(record?.role, childSnapshot?.role, agent?.options?.__degExpertRole),
         ...metadata,
-        status,
-        running: firstText(agent?.status, session?.status) === "running",
-        runSummary: runSummary(session, status, mode, events),
+        status: projectedStatus,
+        ...(evidenceFree ? {} : { running: firstText(agent?.status, session?.status) === "running" }),
+        runSummary: runSummary(session, projectedStatus, mode, events),
         continuable: mode === "continuable",
         createdAt: createdAtOf(session?.createdAt, session?.header?.createdAt, childSnapshot?.createdAt),
       });
@@ -648,9 +835,10 @@ export function createExpertGroupRuntime({
    * **首错契约**：shard 内的首错按 proofIds 的稳定顺序选取（attempts 输入顺序，末尾是导航回退），
    * 与读取完成时序无关——先调度但迟到的失败，仍然优先于后调度却更早返回的失败。
    */
-  async function projectFanoutShard(shard, task, { rootId, persisted, cache, coordinator }) {
+  async function projectFanoutShard(shard, task, { rootId, persisted, cache, coordinator, fast }) {
     const attempts = Array.isArray(shard?.attempts) ? shard.attempts : [];
     const latestAttempt = attempts.length > 0 ? attempts[attempts.length - 1] : undefined;
+    const shardId = firstText(shard?.shardId);
     // 导航目标是最新 attempt 的 child；manager 若在 shard 上直接给了 childId，则作为回退。
     const navigationChildId = firstText(latestAttempt?.childId, shard?.childId);
     const parentTaskId = firstText(task?.parentTaskId);
@@ -660,7 +848,7 @@ export function createExpertGroupRuntime({
     const requestProof = (childId) => {
       if (childId === null || proofPromises.has(childId)) return;
       proofIds.push(childId);
-      proofPromises.set(childId, resolveOwnedChild(childId, { rootId, parentTaskId, persisted, cache, coordinator }));
+      proofPromises.set(childId, resolveOwnedChild(childId, { rootId, parentTaskId, persisted, cache, coordinator, fast }));
     };
     for (const attempt of attempts) requestProof(firstText(attempt?.childId));
     requestProof(navigationChildId);
@@ -669,11 +857,32 @@ export function createExpertGroupRuntime({
     if (failure !== null) throw failure.reason;
     const proofs = new Map(proofIds.map((childId, index) => [childId, settled[index].value]));
     const navigationProof = navigationChildId === null ? undefined : proofs.get(navigationChildId);
-    const ownedChild = navigationProof?.owned === true ? navigationProof : undefined;
-    // 归属未证明的 childId 一律从**输出副本**清空：manager 的权威快照保持原样。
+    /**
+     * 廉价反证（两种模式都执行，保证 fast 与 full 的归属结论一致、且都 fail-closed）：
+     * 记录里声明了别的父任务 / 别的分片 / 别的 attempt 时，即使归属证明还算通过，
+     * 也必须把该 childId 从输出副本清空——否则本行会挂上不属于它的会话。
+     * 反证只用已经在手的持久化记录与 recovery 记录，不产生任何额外 IO。
+     */
+    const contradicts = (childId, attemptNumber) => {
+      if (childId === null) return false;
+      return fanoutIdentityContradicts(recoveryRecords.get(childId), persisted[childId], {
+        parentTaskId,
+        shardId,
+        attempt: Number.isSafeInteger(attemptNumber) ? attemptNumber : null,
+      });
+    };
+    const ownedChild = navigationProof?.owned === true
+      && contradicts(navigationChildId, latestAttempt?.attempt) !== true
+      ? navigationProof
+      : undefined;
+    // 归属未证明（或身份反证成立）的 childId 一律从**输出副本**清空：manager 的权威快照保持原样。
     const projectedAttempts = attempts.map((attempt) => {
-      const proof = proofs.get(firstText(attempt?.childId));
-      return proof === undefined || proof.owned ? attempt : { ...attempt, childId: null };
+      const childId = firstText(attempt?.childId);
+      const proof = proofs.get(childId);
+      if (proof === undefined || proof.owned === true) {
+        return contradicts(childId, attempt?.attempt) ? { ...attempt, childId: null } : attempt;
+      }
+      return { ...attempt, childId: null };
     });
     const shardStatus = firstText(shard?.status, ownedChild?.agent?.status, ownedChild?.session?.status) ?? "unknown";
     return {
@@ -714,29 +923,44 @@ export function createExpertGroupRuntime({
     return settled.map((result) => result.value);
   }
 
-  async function buildSnapshotForSession(sessionId) {
+  async function buildSnapshotForSession(sessionId, { fast = false } = {}) {
     const id = nonEmpty(sessionId);
     if (id === null) throw new TypeError("expert-group-snapshot 需要 sessionId");
     // 本次构建独有的冷读协调器：root 冷读、普通 expert 阶段与 fan-out 阶段共用同一份读取
     // promise 缓存与同一个全局并发上限；构建结束即回收，不会被后续快照或别的 root 复用。
+    // 轻量构建（fast）不会调用它——那时它只是一个空协调器，不产生任何 IO。
     const coordinator = createColdReadCoordinator();
     // 没有 ownership 证明时 fail-closed；fanoutHost 的全局 list 不能作为当前根的回退。
     const rawFanoutTasks = fanoutTasksOwnedBy(id);
     const persisted = persistedChildren();
+    const knownByChild = Object.values(persisted).some((child) => child?.parentId === id);
+    const knownByFanout = Array.isArray(rawFanoutTasks) && rawFanoutTasks.length > 0;
     let root = safeCall(() => lineage?.activeRoot?.(id), undefined) ?? safeCall(() => agents?.get?.(id), undefined);
+    // 轻量路径用占位 root 时，root 自身也没有任何运行证据；投影层据此把它降级为中性状态。
+    let placeholderRoot = false;
 
     if (root === undefined || root === null || root.id !== id) {
-      const coldSession = await coordinator.read(id, null);
-      if (coldSession !== undefined) {
-        root = { id, status: "ready", session: coldSession, options: coldSession.header?.config ?? {} };
+      if (fast === true) {
+        // 轻量路径不冷读 root 会话。首屏只要求「有内容」，而 root 行的显示并不依赖会话日志
+        // （第一行固定「主代理」，标题由客户端自己的会话投影给出）；因此这里只做廉价的存在性判定：
+        // - 有 DEG 记录或 fan-out 任务能证明该 id 被使用过 → 用占位 root 继续投影子节点；
+        // - 完全没有证据 → 返回 null，让调用方回落到完整构建，从而保留「陌生 id 一律 404」
+        //   以及「冷 root 会话仍能读到标题/内容」这两个既有契约。
+        if (!knownByChild && !knownByFanout) return null;
+        const session = { id, header: { id }, events: [], status: "ready", requestHeader: () => ({ config: {} }) };
+        root = { id, status: "ready", session, options: {} };
+        placeholderRoot = true;
+      } else {
+        const coldSession = await coordinator.read(id, null);
+        if (coldSession !== undefined) {
+          root = { id, status: "ready", session: coldSession, options: coldSession.header?.config ?? {} };
+        }
       }
     }
 
     if (root === undefined || root === null || root.id !== id) {
       // sessionQuery 是可选服务。它缺失时，只允许已有 DEG 记录能够证明 ownership 的根；
       // 一个完全陌生的 id 仍返回 404，不能借任务视图枚举别的会话。
-      const knownByChild = Object.values(persisted).some((child) => child?.parentId === id);
-      const knownByFanout = Array.isArray(rawFanoutTasks) && rawFanoutTasks.length > 0;
       if (!knownByChild && !knownByFanout) {
         const error = new Error("root session not found: " + id);
         error.code = "session-not-found";
@@ -762,12 +986,13 @@ export function createExpertGroupRuntime({
     // 普通 expert 阶段先启动：它决定首屏的专家列表，理应优先占用冷读队列；fan-out 阶段紧随其后
     // 启动。两个阶段**并行**推进，但共享同一个冷读协调器，因此真实 readSession 全局最多
     // COLD_READ_CONCURRENCY 个同时在飞，同一个 child 也不会被两个阶段读两次。
-    const expertsStage = collectExperts(root, coordinator);
+    const expertsStage = collectExperts(root, coordinator, { fast });
     const fanoutStage = projectFanoutTasks(rawFanoutTasks, {
       rootId: id,
       persisted,
       cache: childOwnership,
       coordinator,
+      fast,
     });
     // 两个阶段都用 allSettled 收敛：阶段内部已保证各自已调度的分支全部 settle，这里再保证跨阶段
     // 收敛，因此构建失败返回时不会有残留冷读，同一 root 的立即重试不会与旧批次重叠。
@@ -793,23 +1018,385 @@ export function createExpertGroupRuntime({
         contentSource: goal?.objective ? "goal" : userRequest ? "recent-user-request" : "unavailable",
         role: "orchestrator",
         ...metadata,
-        status: rootStatus,
-        running: rootStatus === "running",
-        runSummary: runSummary(session, rootStatus, "one-shot", rootEvents),
+        // 占位 root（轻量路径且没有 live root）没有任何运行证据：状态降级为 unknown 并省略
+        // running 布尔，客户端因此渲染中性圆点而不是「已结束」的绿色圆点。
+        status: placeholderRoot ? "unknown" : rootStatus,
+        ...(placeholderRoot ? {} : { running: rootStatus === "running" }),
+        runSummary: runSummary(session, placeholderRoot ? "unknown" : rootStatus, "one-shot", rootEvents),
         continuable: false,
         createdAt: createdAtOf(session?.createdAt, session?.header?.createdAt, header?.createdAt),
       },
       experts,
       fanoutTasks,
+      // partial 是本次新增的快照级标记：true = 轻量快照（跳过了全部冷读，状态可能不完整），
+      // false = 完整权威快照。客户端据此在轻量快照期间保持状态圆点/活动文案中性。
+      partial: fast === true,
     });
+  }
+
+  // ── 按 root 的两级快照缓存（轻量 / 完整） ────────────────────────────────────
+  //
+  // 结构：rootId → { full, fast, generation, building, lastError, rebuildBlockedUntil,
+  //                    failureCount, retryBlockedUntil }
+  // - full/fast：{ snapshot, at, generation }。generation 是**该次构建开始时**捕获的代次，
+  //   用来判定「这份结果读完之后有没有发生失效事件」，时间戳只用来兜底 TTL；
+  //   **at 只在真正构建出该级结果时写入，命中缓存绝不刷新**（R2）：否则持续轮询会把 6s 的
+  //   陈旧上界退化成「滑动空闲 TTL」，一旦失效事件被漏掉，同一份 partial 就能无限期复用；
+  // - generation：每次 invalidateSnapshots 命中该 root 时递增。失效**不删除**已缓存的快照：它只
+  //   表示「这份结果可能已经不代表当前状态」。因此失效后的下一个请求会同步构建一份新的轻量快照
+  //   （毫秒级），保证状态变化立刻可见；而「只是过期、没有失效事件」时继续返回上一份权威快照
+  //   （不降级），避免界面在 full ↔ fast 之间抖动；
+  // - building：该 root 正在进行的完整构建（同一 root 同时只允许一个）；
+  // - lastError：最近一次后台完整构建的错误对象，供 awaitFullBuild（测试/诊断）原样观察；
+  // - rebuildBlockedUntil：因「构建期间发生过失效」而需要的重建的最早启动时刻（去抖），
+  //   保证活跃会话下不会退化成「每个请求一次全量冷读」；
+  // - failureCount / retryBlockedUntil：后台完整构建**连续失败**次数与失败重试的最早启动时刻
+  //   （R1 的指数退避，与上面的失效去抖是两条独立闸门；成功后立即清零）。
+  //
+  // 容量契约（R3）：
+  // - **非在飞**条目受 SNAPSHOT_CACHE_LIMIT（8）约束，这是「缓存结果」的硬上限；
+  // - **在飞**（building !== null）条目在构建结束前**不得**被淘汰：淘汰它会让 awaitFullBuild
+  //   看不到该构建、后续请求为同一 root 再起一个构建，破坏「同一 root 同时只有一个构建」；
+  // - 在飞条目另有独立安全上限 SNAPSHOT_INFLIGHT_LIMIT（16），防止异常增长把缓存撑成无界；
+  // - 因此条目总数上界是 8 + 16 = 24。
+  // 顺序是真正的 LRU——命中与写入都会把条目提到队尾，因此活跃 root 不会被一次性查询挤掉。
+  const snapshotCache = new Map();
+
+  /** 把条目提到 LRU 队尾（Map 的插入顺序即 LRU 顺序：队首最久未使用）。 */
+  function touchEntry(rootId) {
+    const entry = snapshotCache.get(rootId);
+    if (entry === undefined) return;
+    snapshotCache.delete(rootId);
+    snapshotCache.set(rootId, entry);
+  }
+
+  function cacheEntry(rootId) {
+    const existing = snapshotCache.get(rootId);
+    if (existing !== undefined) {
+      // 命中即提权：正在被轮询/观察的 root 不会被别的会话的一次性查询挤掉。
+      touchEntry(rootId);
+      return existing;
+    }
+    const entry = {
+      full: null,
+      fast: null,
+      generation: 0,
+      building: null,
+      lastError: null,
+      rebuildBlockedUntil: 0,
+      // R1：连续失败次数与失败退避截止时刻（成功后清零，见 ensureFullBuild）。
+      failureCount: 0,
+      retryBlockedUntil: 0,
+    };
+    snapshotCache.set(rootId, entry);
+    // 创建路径同样维护硬上限：「轻量返回 null」「完整构建失败」这些不写结果的路径也会留下
+    // 条目，容量不能只靠成功写入那一条路径收敛。
+    evictSnapshots(rootId);
+    return entry;
+  }
+
+  /**
+   * 把缓存收敛到容量契约（R3）：非在飞条目 ≤ SNAPSHOT_CACHE_LIMIT，在飞条目 ≤ SNAPSHOT_INFLIGHT_LIMIT。
+   *
+   * 淘汰顺序（按 Map 的插入顺序 = LRU 顺序，队首最久未使用）：
+   * 1. 先淘汰**非在飞**条目，直到非在飞数量回到 SNAPSHOT_CACHE_LIMIT；
+   * 2. 只有在飞条目本身超过安全上限时，才按 LRU 淘汰最久未用的在飞条目。
+   *
+   * 关键不变量：在飞条目**不会**因为非在飞条目超限而被淘汰。淘汰一个在飞条目会让
+   * awaitFullBuild 看不到该构建、后续请求为同一 root 启动第二个构建（同一 root 同时只有一个构建
+   * 的契约被破坏，且每个构建各自建立冷读协调器，跨 root 的实际 I/O 并发被放大）。
+   * keepRootId 是刚刚创建/正在写入的 root，任何一轮都不淘汰它，避免「刚建好就被自己挤掉」。
+   */
+  function evictSnapshots(keepRootId = null) {
+    const idleLimit = SNAPSHOT_CACHE_LIMIT;
+    const inflightLimit = SNAPSHOT_INFLIGHT_LIMIT;
+    // 先数一遍在飞数量：后面两轮都要用到，避免每淘汰一个就重扫全表。
+    let inflight = 0;
+    for (const entry of snapshotCache.values()) {
+      if (entry.building !== null) inflight += 1;
+    }
+    let idle = snapshotCache.size - inflight;
+    if (idle <= idleLimit && inflight <= inflightLimit) return;
+    for (const [rootId, entry] of snapshotCache) {
+      if (idle <= idleLimit) break;
+      if (rootId === keepRootId) continue;
+      if (entry.building !== null) continue;
+      snapshotCache.delete(rootId);
+      idle -= 1;
+    }
+    // 在飞条目只在超过**自己的**安全上限时才淘汰（异常增长的兜底，正常路径不会触发）。
+    if (inflight <= inflightLimit) return;
+    for (const [rootId, entry] of snapshotCache) {
+      if (inflight <= inflightLimit) return;
+      if (rootId === keepRootId) continue;
+      if (entry.building === null) continue;
+      snapshotCache.delete(rootId);
+      inflight -= 1;
+    }
+  }
+
+  /**
+   * 某一级缓存是否新鲜：写入代次必须等于当前代次（其间没有失效事件），且未超过该级 TTL。
+   *
+   * 两级的代次都在**各自构建开始时**捕获（见 ensureFullBuild / resolveSnapshotForSession）：
+   * 构建期间到达的失效事件会让这份结果落成「非当前权威」，绝不会被当成最新版返回。
+   */
+  function isFresh(level, entry, timestamp, ttlMs) {
+    if (level === null || level.generation !== entry.generation) return false;
+    return timestamp - level.at < ttlMs;
+  }
+
+  /**
+   * 上屏可用的完整快照（阻塞项 B2）。
+   *
+   * 任何返回缓存 full 的路径都必须同时满足两条约束：
+   * ① 代次一致，或处于**明确的短宽限**内（FULL_SNAPSHOT_STALE_GRACE_MS）；
+   * ② 未超过**绝对宽限上限**（FULL_SNAPSHOT_GRACE_MS）。
+   * 超出上限一律返回 null，由调用方回落到轻量快照 / 既有的完整构建（可能得到 404），
+   * 从而保证「root 被释放、持久化证据消失、上游持续失败」时不会无限期展示已失效的 root。
+   */
+  function displayableFull(entry, timestamp) {
+    if (entry.full === null) return null;
+    const age = timestamp - entry.full.at;
+    if (age >= FULL_SNAPSHOT_GRACE_MS) return null;
+    if (entry.full.generation === entry.generation) return entry.full.snapshot;
+    // 代次不一致：构建期间发生过失效，内容仍是那一次真实读取，只允许在很短的窗口内兜底。
+    return age < FULL_SNAPSHOT_STALE_GRACE_MS ? entry.full.snapshot : null;
+  }
+
+  /**
+   * 幂等地启动该 root 的后台完整构建。
+   *
+   * - 已有在飞构建时直接复用同一个 promise（同一 root 同时只有一个 readSession 批次）；
+   * - **构建开始时**捕获代次并随结果写入缓存（阻塞项 B1）：构建期间到达的失效事件因此会体现在
+   *   「写入代次 ≠ 当前代次」上，该结果不会被标记成当前权威，最多只在
+   *   FULL_SNAPSHOT_STALE_GRACE_MS 的短宽限内兜底；
+   * - 一次被判为非权威的构建之后，间隔 STALE_REBUILD_MIN_INTERVAL_MS 才允许再次后台重建
+   *   （去抖）：否则活跃会话里每次失效都会立刻重跑全量冷读，退化成「每请求一次全量构建」；
+   * - 成功后写入 full 缓存并记录写入时刻与代次；失败时记录 lastError 并写一条宿主日志
+   *   （完整构建不再阻塞请求，因此错误只能从这里暴露）；两条路径都维护缓存硬上限；
+   * - 返回值可能是 rejected promise：调用方要么 await 它（「无法证明 root 存在」的回落路径，
+   *   需要原样抛出错误），要么像普通请求路径那样忽略它。内部已挂了一个 catch 处理器，
+   *   所以忽略也不会产生未处理的 rejection。
+   */
+  function ensureFullBuild(rootId) {
+    const entry = cacheEntry(rootId);
+    if (entry.building !== null) return entry.building;
+    entry.lastError = null;
+    // 代次在构建**开始**时捕获：完成时不再读取 entry.generation。
+    const buildGeneration = entry.generation;
+    const settled = buildSnapshotForSession(rootId, { fast: false }).then(
+      (snapshot) => {
+        entry.full = { snapshot, at: now(), generation: buildGeneration };
+        // 成功即重置失败退避（R1）：下一次失败重新从基数开始，不会因为历史失败次数被长期拖慢。
+        entry.failureCount = 0;
+        entry.retryBlockedUntil = 0;
+        // 构建期间发生过失效：这份结果不是当前权威。除「写入代次 ≠ 当前代次」之外，还要显式
+        // 记下一条宿主日志，并推迟下一次重建，避免活跃会话下被失效事件驱动成每请求全量冷读。
+        if (buildGeneration !== entry.generation) {
+          entry.rebuildBlockedUntil = now() + STALE_REBUILD_MIN_INTERVAL_MS;
+          logStaleBuild(rootId);
+        }
+        if (entry.building === settled) entry.building = null;
+        touchEntry(rootId);
+        evictSnapshots(rootId);
+        return snapshot;
+      },
+      (error) => {
+        entry.lastError = error;
+        // 失败退避（R1）：连续失败按 5s → 10s → 20s → 40s → 40s… 指数上升并封顶。
+        // 没有这条闸门时，下一次轮询（约 2.5s 后）会立刻重新冷读全部 child，活跃会话下
+        // 按轮询周期反复重跑全量冷读，并让界面长期停在 partial。
+        entry.failureCount += 1;
+        const backoffMs = Math.min(
+          FULL_SNAPSHOT_TTL_MS * (2 ** Math.min(entry.failureCount - 1, 16)),
+          FULL_SNAPSHOT_RETRY_MAX_MS,
+        );
+        entry.retryBlockedUntil = now() + backoffMs;
+        if (entry.building === settled) entry.building = null;
+        touchEntry(rootId);
+        evictSnapshots(rootId);
+        logBuildFailure(rootId, error, backoffMs);
+        throw error;
+      },
+    );
+    entry.building = settled;
+    // 立即消费一次 rejection：后台失败不得变成未处理的 rejection；awaitFullBuild 的调用方
+    // 拿到的仍是同一个 promise（因此仍是同一个错误对象）。
+    settled.catch(() => {});
+    return settled;
+  }
+
+  /**
+   * 是否允许启动一次**新的**后台完整构建（两条独立的闸门）。
+   *
+   * 1. 失效去抖：上一次构建「成功但期间发生过失效」后，冷却 STALE_REBUILD_MIN_INTERVAL_MS；
+   * 2. 失败退避（R1）：上一次构建直接失败后，按指数退避冷却 FULL_SNAPSHOT_RETRY_MAX_MS 封顶。
+   *
+   * 两个窗口内的请求继续由毫秒级的轻量快照承担展示，不再触发全量冷读；已有在飞构建时
+   * ensureFullBuild 自身就会复用，因此这里只看冷却。失效事件**不**提前解除失败退避：失败反映
+   * 的是上游冷读健康度，与「这份快照是否陈旧」正交，用事件放行会让退避被事件流完全绕过。
+   */
+  function canStartFullBuild(entry) {
+    if (entry.building !== null) return true;
+    const timestamp = now();
+    return timestamp >= entry.rebuildBlockedUntil && timestamp >= entry.retryBlockedUntil;
+  }
+
+  /**
+   * 幂等地确保后台完整构建已启动。
+   *
+   * 与 ensureFullBuild 的唯一区别是它先过冷却闸门：被判为非权威的构建之后，冷却窗口内的请求
+   * 不会启动新的全量冷读（返回 undefined，调用方不得依赖返回值）。
+   * 注意这里刻意**不调用 cacheEntry**：冷却闸门只是读，不应因为一次被挡下的请求就创建条目或
+   * 提升 LRU 顺序（容量由真正产生结果的路径维护）。
+   */
+  function requestFullBuild(rootId) {
+    const entry = snapshotCache.get(rootId);
+    if (entry !== undefined && !canStartFullBuild(entry)) return undefined;
+    return ensureFullBuild(rootId);
+  }
+
+  function logStaleBuild(rootId) {
+    if (typeof logger?.warn !== "function") return;
+    safeCall(() => logger.warn(
+      "dsh-expert-group: expert-group snapshot build for " + rootId
+      + " finished after an invalidation event; result is not authoritative and the next rebuild is deferred",
+    ));
+  }
+
+  function logBuildFailure(rootId, error, backoffMs) {
+    if (typeof logger?.warn !== "function") return;
+    const message = error instanceof Error ? error.message : String(error);
+    // 日志里带上本次退避时长：持续故障时能直接从宿主日志看出重试节奏在收敛。
+    const suffix = Number.isFinite(backoffMs) ? "; retrying in " + backoffMs + "ms" : "";
+    safeCall(() => logger.warn("dsh-expert-group: background expert-group snapshot build for " + rootId + " failed: " + message + suffix));
+  }
+
+  /**
+   * 使某个会话（root 本身，或属于某个 root 的 child）相关的快照缓存失效。
+   *
+   * 判定顺序（全部是 O(1) 的 Map 读，找不到就什么都不做，因此幂等、无泄漏）：
+   * 1. 该 id 自己就是缓存里的 root；
+   * 2. recoveryRecords 的 parentId（live/恢复代际的 child）；
+   * 3. 持久化 child_models 的 parentId（重启后只剩持久记录的 child）。
+   *
+   * **默认 no-op（阻塞项 B3③）**：id 缺失/非法（undefined、空串、纯空白、非字符串）时什么都不做，
+   * 返回 0。事件挂点可能拿到缺失的 session/agent id（见 index.js 的接线），若把「没有 id」
+   * 解释成「清空全部」，一次无关事件就会把全部 root 打回冷启动。全局失效必须显式调用：
+   * `invalidateSnapshots({ all: true })`。
+   * 返回被标记失效的 root 数量，便于调用方/测试观察。
+   */
+  function invalidateSnapshots(sessionId) {
+    // 显式全局失效：只有调用方明确传对象才生效，绝不从「缺失 id」推断。
+    if (sessionId !== null && typeof sessionId === "object" && sessionId.all === true) {
+      let count = 0;
+      for (const entry of snapshotCache.values()) {
+        entry.generation += 1;
+        count += 1;
+      }
+      return count;
+    }
+    const id = nonEmpty(sessionId);
+    if (id === null) return 0;
+    const parentId = snapshotCache.has(id)
+      ? id
+      : firstText(
+        recoveryRecords.get(id)?.parentId,
+        persistedChildren()[id]?.parentId,
+      );
+    const entry = parentId === null ? undefined : snapshotCache.get(parentId);
+    if (entry === undefined) return 0;
+    entry.generation += 1;
+    // 失效只影响「这份结果还算不算当前权威」，不重置去抖窗口：冷却窗口从构建完成时刻起算，
+    // 否则「失效即放行」会让去抖完全失效。
+    return 1;
+  }
+
+  /**
+   * 请求路径：轻量优先、完整后台补齐。首屏因此不再等待任何冷读。
+   *
+   * 顺序（①②③④ 是需求给定的顺序，后两条是同一契约下的防抖动收敛）：
+   * 1. 完整快照「新鲜」（代次一致且未超 FULL TTL）→ 直接返回；
+   * 2. 完整快照「只是过期」（代次仍一致、未超**绝对**宽限上限）→ 返回它并后台重建：期间没有
+   *    任何可观察的状态变化，降级为轻量快照只会让界面在 full ↔ fast 之间抖动；
+   * 3. 完整快照「已失效」（收到过失效事件）或超过宽限上限 → 必须给出与新状态一致的结果：
+   *    新鲜轻量快照 → 直接返回；否则同步构建一份轻量快照（毫秒级）后返回；
+   * 4. 上述每条路径都**幂等**地确保该 root 的后台完整构建已启动（同一 root 同时只有一个；
+   *    被判为非权威的构建之后有一个 STALE_REBUILD_MIN_INTERVAL_MS 的冷却窗口）。
+   *
+   * 边界：轻量构建返回 null 表示「没有任何证据证明该 root 存在」。此时只允许用**仍在宽限内**的
+   * 完整快照兜底（displayableFull 同时检查代次与绝对上限）；连它也没有就 await 后台完整构建，
+   * 保留原有的 404 / 错误传播契约——绝不无限期展示已失效的 root。
+   */
+  async function resolveSnapshotForSession(id) {
+    const timestamp = now();
+    const entry = cacheEntry(id);
+    if (isFresh(entry.full, entry, timestamp, FULL_SNAPSHOT_TTL_MS)) return entry.full.snapshot;
+    if (entry.full !== null
+      && entry.full.generation === entry.generation
+      && timestamp - entry.full.at < FULL_SNAPSHOT_GRACE_MS) {
+      // 「只是过期」而不是「已失效」：期间没有任何可观察的状态变化，因此继续用上一份权威快照
+      // 顶住（不降级为轻量快照），同时后台重建。稳态下这保证界面不会在 full ↔ fast 之间抖动。
+      requestFullBuild(id);
+      return entry.full.snapshot;
+    }
+    // 已失效（收到过状态变化事件）或超过宽限期：必须给出与新状态一致的结果。
+    // 轻量快照是同步构建的毫秒级投影，先用它保证「状态变化立刻可见」，完整快照紧随其后替换。
+    // 代次同样在**构建开始时**捕获（与完整构建同一条规则）。
+    //
+    // R2：**命中缓存时绝不续期**。只有真正重建 fast 时才写入新的时间戳与代次；否则持续轮询会
+    // 把 FAST_SNAPSHOT_TTL_MS 退化成「滑动空闲 TTL」——只要失效事件被漏掉（事件挂点没拿到 id、
+    // 宿主事件丢失、客户端轮询早于事件落库），同一份 partial 就能无限期复用。
+    // 现在「陈旧上界」由**首次构建时刻**的绝对时间保证：距上次真正重建满 6s 必然重建一次。
+    //
+    // R5：轻量构建 await 之后必须复核代次。若失效恰好发生在构建期间，这份结果就不是当前权威，
+    // 不能作为本次响应返回（否则客户端会拿到旧代次的 partial 并把它当成最新状态）。
+    // 处理方式是最小正确做法：立即**再重建一次**（轻量构建是零 I/O 的同步投影，重算不引入阻塞、
+    // 不触发任何冷读），并把这次重建结果当作当前权威；最多重算一次，避免理论上
+    // 「失效事件与构建无限交替」时自旋。
+    let fast;
+    let fastGeneration = entry.generation;
+    if (isFresh(entry.fast, entry, timestamp, FAST_SNAPSHOT_TTL_MS)) {
+      // 命中已有轻量快照：直接复用，**不写回时间戳**（R2）。
+      fast = entry.fast.snapshot;
+    } else {
+      // 真正重建：代次在构建**开始时**捕获（与完整构建同一条规则）。
+      fastGeneration = entry.generation;
+      fast = await buildSnapshotForSession(id, { fast: true });
+      if (fast !== null && fastGeneration !== entry.generation) {
+        // R5：构建期间发生过失效，这份结果不是当前权威——丢弃它，按**当前**代次重算一次
+        // （仍是零 I/O 的同步轻量投影，不引入阻塞、不触发冷读）。只重算一次，避免自旋。
+        fastGeneration = entry.generation;
+        fast = await buildSnapshotForSession(id, { fast: true });
+      }
+      // 只有真正重建成功时才写入新的时间戳与代次；命中路径保持原有 at 不变。
+      if (fast !== null) {
+        entry.fast = { snapshot: fast, at: now(), generation: fastGeneration };
+        touchEntry(id);
+        evictSnapshots(id);
+      }
+    }
+    if (fast === null) {
+      // 证据不足：只接受仍在宽限内的完整快照兜底（代次一致，或处于明确的短宽限），
+      // 否则等完整构建——它要么给出权威结果，要么按既有契约抛 session-not-found（404）。
+      const fallback = displayableFull(entry, timestamp);
+      if (fallback !== null) {
+        requestFullBuild(id);
+        return fallback;
+      }
+      return await ensureFullBuild(id);
+    }
+    requestFullBuild(id);
+    return fast;
   }
 
   async function snapshotForSession(sessionId) {
     const id = nonEmpty(sessionId);
-    if (id === null) return buildSnapshotForSession(sessionId);
+    if (id === null) return buildSnapshotForSession(sessionId, { fast: false });
     const existing = snapshotInFlight.get(id);
     if (existing !== undefined) return existing;
-    const promise = buildSnapshotForSession(id);
+    const promise = resolveSnapshotForSession(id);
     snapshotInFlight.set(id, promise);
     try {
       return await promise;
@@ -818,5 +1405,28 @@ export function createExpertGroupRuntime({
     }
   }
 
-  return Object.freeze({ snapshotForSession });
+  /**
+   * 等待某个 root 的后台完整构建收敛，并返回完整快照。
+   *
+   * 语义（供测试与收尾使用，不参与首屏与 RPC 信封）：
+   * - 有在飞构建 → 等它 settle；成功返回完整快照，失败**原样抛出**同一个错误对象；
+   * - 没有在飞构建 → 返回**仍在宽限内**的缓存完整快照（R4：与请求路径共用 displayableFull 的
+   *   同一套有界判定：代次一致，或处于明确的短宽限，且都不超过绝对宽限 FULL_SNAPSHOT_GRACE_MS）；
+   *   超过上限一律返回 null，绝不无限期返回已失效的 full；
+   * - 没有可用缓存但上一次后台构建失败 → 抛出该错误（错误契约不变）；
+   * - 从未构建过（未知 root）→ 返回 null。
+   */
+  async function awaitFullBuild(sessionId) {
+    const id = nonEmpty(sessionId);
+    if (id === null) return null;
+    const entry = snapshotCache.get(id);
+    if (entry === undefined) return null;
+    if (entry.building !== null) return await entry.building;
+    const cached = displayableFull(entry, now());
+    if (cached !== null) return cached;
+    if (entry.lastError !== null) throw entry.lastError;
+    return null;
+  }
+
+  return Object.freeze({ snapshotForSession, invalidateSnapshots, awaitFullBuild });
 }

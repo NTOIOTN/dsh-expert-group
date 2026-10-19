@@ -423,9 +423,11 @@ function projectChildren(experts, fanoutTasks) {
  * @param {Array} [input.experts] - 普通专家记录（自身状态由 DSH 给出）。
  * @param {Array} [input.fanoutTasks] - fan-out manager 的父任务快照。
  * @param {number} [input.generatedAt] - 投影生成时间（epoch 毫秒）。
+ * @param {boolean} [input.partial] - 是否为**轻量快照**（跳过全部冷读、状态可能不完整）。
+ *   true 时客户端必须保持状态圆点与活动文案中性，等完整快照（partial:false）替换。
  * @returns {object} schemaVersion:1 的只读 JSON 树。
  */
-export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks, generatedAt } = {}) {
+export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks, generatedAt, partial } = {}) {
   const rootSessionId = assertSessionId(sessionId);
   const declaredRootId = identityOf(root);
   if (declaredRootId !== null && declaredRootId !== rootSessionId) {
@@ -438,6 +440,8 @@ export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks
     sessionId: rootSessionId,
     rootSessionId,
     generatedAt: numberOrNull(generatedAt),
+    // partial 只有明确 true 才为 true：完整快照与旧调用方一律是权威快照（false）。
+    partial: partial === true,
     root: {
       ...projectSessionNode(root, {
         kind: "root",

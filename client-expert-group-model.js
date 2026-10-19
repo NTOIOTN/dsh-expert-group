@@ -114,18 +114,36 @@
   }
 
   /**
-   * 归一化代理运行状态：对外只有 running | ready。
+   * 轻量（partial）快照下的中性运行状态：既不声明运行，也不声明已结束。
+   *
+   * 与 ready 的区别：ready 是「有证据表明当前没在运行」（圆点渲染成绿色 done），
+   * unknown 是「证据不足」——轻量快照跳过了冷读，此时既不能声明运行也不能声明结束，
+   * 圆点与活动文案必须保持中性。它不是协议状态词表的一员，只用于展示层。
+   */
+  const UNKNOWN_RUNTIME_STATUS = "unknown";
+
+  /**
+   * 归一化代理运行状态：默认只有 running | ready；轻量快照下多一个中性值 unknown。
    *
    * 只用 activitySignalOf 的活动证据链：明确运行为 running，其余（inactive、缺失、
    * 目录未命中且无其它运行证据）一律 ready。目录 activity 与 Host 旧信号冲突时，
    * 以目录 activity 为准，不把真实 running 降级成 ready。
    *
+   * partial 选项（Host 的轻量快照）：证据链返回 null（完全没有任何活动证据，既不是
+   * running 也不是 inactive）时返回中性值 unknown，让圆点与活动文案保持中性；
+   * 只要存在任何证据（目录 activity/status、节点 running 布尔、协议 status）就仍按原规则渲染。
+   * 不传 options 时行为与旧实现逐字一致（旧 Host、测试与所有既有调用点不受影响）。
+   *
    * @param {object} node - 快照节点（专家/根/fan-out 任务或分片）。
    * @param {object} [entry] - sessions 快照里的官方目录项。
-   * @returns {"running"|"ready"}
+   * @param {{partial?: boolean}} [options] - 展示层选项；partial 为 true 时才可能出现中性值。
+   * @returns {"running"|"ready"|"unknown"}
    */
-  function runtimeStatusOf(node, entry) {
-    return activitySignalOf(node, entry) === "running" ? "running" : "ready";
+  function runtimeStatusOf(node, entry, options) {
+    const signal = activitySignalOf(node, entry);
+    if (signal === "running") return "running";
+    if (isObject(options) && options.partial === true && signal === null) return UNKNOWN_RUNTIME_STATUS;
+    return "ready";
   }
 
   /** 只有精确命中词表的 mode 才能映射文案；未知/非法值返回 null（不猜）。 */
@@ -302,6 +320,13 @@
     return [...expertChildren, ...fanoutChildren];
   }
 
+  /**
+   * 快照归一。
+   *
+   * partial 是 Host 新增的快照级标记：true = **轻量快照**（Host 跳过了全部冷读，状态可能不完整），
+   * false/缺失 = 完整权威快照。客户端只把它当成「状态证据不完整」的信号，渲染规则见
+   * runtimeStatusOf 的 partial 选项；缺失时按完整快照处理（旧 Host 行为不变）。
+   */
   function normalizeExpertGroupSnapshot(raw) {
     if (!isObject(raw) || raw.schemaVersion !== SCHEMA_VERSION) return null;
     const sourceRoot = isObject(raw.root) ? raw.root : {};
@@ -322,6 +347,7 @@
       sessionId: rootSessionId,
       rootSessionId,
       generatedAt: numberOrNull(raw.generatedAt),
+      partial: raw.partial === true,
       root,
     };
   }
@@ -418,6 +444,7 @@
   global[SYMBOL] = Object.freeze({
     SCHEMA_VERSION,
     RUNTIME_STATUSES,
+    UNKNOWN_RUNTIME_STATUS,
     normalizeExpertGroupSnapshot,
     normalizeStatus,
     runtimeStatusOf,

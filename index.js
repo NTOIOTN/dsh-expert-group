@@ -7920,6 +7920,15 @@ export default {
     ctx.effect(() => () => fanoutHost?.close(), "dsh-expert-group: fan-out runtime");
 
     // Expert Group 只投影现有状态；它不订阅或改变任务生命周期，RPC 调用时按需生成快照。
+    // 快照分两级：首屏返回轻量快照（跳过全部冷读），完整快照在后台构建后写回缓存
+    // （见 host/expert-group-runtime.js 的「按 root 的两级快照缓存」）。
+    //
+    // 关于 host 侧的会话标题读面（可选依赖 projectionTitleFor）：轻量快照拿不到冷会话日志，
+    // 理论上可用 ctx.sessionProjectionCache 的 cachedSnapshot(header) 零 I/O 补齐标题，
+    // 但该服务只接受带 lifecycle 身份（version/createdAt/cwd/isSeeded）的**权威 header**，
+    // 而 DEG 在“不冷读”的首屏里拿不到 cold child 的 header——唯一来源是 sessionQuery 的
+    // 全量语料 listing，正是本次要消除的开销。因此这里故意不接线：轻量快照的 taskName
+    // 直接降级到 child_models.lastDispatch.description（完整快照里的优先级本来就高于会话标题）。
     const expertGroupRuntime = createExpertGroupRuntime({
       agents,
       goals,
@@ -7929,7 +7938,40 @@ export default {
       recoveryRecords,
       source,
       sessionQuery: () => expertGroupSessionQuery,
+      logger: ctx.logger,
     });
+    /**
+     * 快照缓存失效接线（幂等、O(1)）。
+     *
+     * 快照缓存按 root 保存，必须跟随可观察的状态变化失效，否则 2.5s 轮询会一直复用同一份
+     * 旧快照（兜底 TTL 只能把陈旧限制在 5s，不能提供即时性）。这里复用既有事件挂点：
+     * - session/event 只取**真正改变快照内容**的两类事件：turn/end（子代理一轮结束，终态可能变化）
+     *   与 user/message（child dispatch 被接受，任务名/内容变化）。普通消息与工具事件不失效：
+     *   它们不改变快照里的任何字段，却会在活跃会话里每隔几秒触发一次完整重建（界面抖动）。
+     *   事件所属会话可能是 child，由 runtime 按 recoveryRecords / child_models 的 parentId 反查 root；
+     * - agent/created / agent/status / agent/disposed：子代理的创建、状态变化与释放。
+     * 两个挂点都只做一次 Map 读并在必要时递增代次，不写任何持久状态，也不产生第二套事实源。
+     *
+     * 接线处**先过滤缺失 id**：事件负载可能没有 session/agent（可选链后得到 undefined），
+     * 而「没有 id」绝不能表达任何失效语义。runtime 侧已经把缺失 id 定为 no-op（全局失效只认
+     * 显式 API），这里再挡一层，避免把空 id 当作会话身份带进缓存查找。
+     */
+    const invalidateSnapshotFor = (sessionId) => {
+      // 空/非字符串 id 直接丢弃：这不是「清空全部」，只是一次不携带身份的事件。
+      if (typeof sessionId !== "string" || sessionId.trim().length === 0) return;
+      try { expertGroupRuntime.invalidateSnapshots(sessionId); } catch (error) {
+        // 失效只是缓存优化：任何异常都不得影响事件派发本身。
+        ctx.logger.warn("dsh-expert-group: snapshot cache invalidation failed: " + (error instanceof Error ? error.message : String(error)));
+      }
+    };
+    ctx.on("session/event", (session, event) => {
+      const type = event?.type;
+      if (type !== "turn/end" && type !== "user/message") return;
+      invalidateSnapshotFor(session?.id);
+    });
+    ctx.on("agent/created", ({ agent } = {}) => invalidateSnapshotFor(agent?.id));
+    ctx.on("agent/status", ({ agent } = {}) => invalidateSnapshotFor(agent?.id));
+    ctx.on("agent/disposed", ({ agent } = {}) => invalidateSnapshotFor(agent?.id));
 
     let routeImageToObserver;
     function mountRole(role) {

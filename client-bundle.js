@@ -116,18 +116,36 @@
   }
 
   /**
-   * 归一化代理运行状态：对外只有 running | ready。
+   * 轻量（partial）快照下的中性运行状态：既不声明运行，也不声明已结束。
+   *
+   * 与 ready 的区别：ready 是「有证据表明当前没在运行」（圆点渲染成绿色 done），
+   * unknown 是「证据不足」——轻量快照跳过了冷读，此时既不能声明运行也不能声明结束，
+   * 圆点与活动文案必须保持中性。它不是协议状态词表的一员，只用于展示层。
+   */
+  const UNKNOWN_RUNTIME_STATUS = "unknown";
+
+  /**
+   * 归一化代理运行状态：默认只有 running | ready；轻量快照下多一个中性值 unknown。
    *
    * 只用 activitySignalOf 的活动证据链：明确运行为 running，其余（inactive、缺失、
    * 目录未命中且无其它运行证据）一律 ready。目录 activity 与 Host 旧信号冲突时，
    * 以目录 activity 为准，不把真实 running 降级成 ready。
    *
+   * partial 选项（Host 的轻量快照）：证据链返回 null（完全没有任何活动证据，既不是
+   * running 也不是 inactive）时返回中性值 unknown，让圆点与活动文案保持中性；
+   * 只要存在任何证据（目录 activity/status、节点 running 布尔、协议 status）就仍按原规则渲染。
+   * 不传 options 时行为与旧实现逐字一致（旧 Host、测试与所有既有调用点不受影响）。
+   *
    * @param {object} node - 快照节点（专家/根/fan-out 任务或分片）。
    * @param {object} [entry] - sessions 快照里的官方目录项。
-   * @returns {"running"|"ready"}
+   * @param {{partial?: boolean}} [options] - 展示层选项；partial 为 true 时才可能出现中性值。
+   * @returns {"running"|"ready"|"unknown"}
    */
-  function runtimeStatusOf(node, entry) {
-    return activitySignalOf(node, entry) === "running" ? "running" : "ready";
+  function runtimeStatusOf(node, entry, options) {
+    const signal = activitySignalOf(node, entry);
+    if (signal === "running") return "running";
+    if (isObject(options) && options.partial === true && signal === null) return UNKNOWN_RUNTIME_STATUS;
+    return "ready";
   }
 
   /** 只有精确命中词表的 mode 才能映射文案；未知/非法值返回 null（不猜）。 */
@@ -304,6 +322,13 @@
     return [...expertChildren, ...fanoutChildren];
   }
 
+  /**
+   * 快照归一。
+   *
+   * partial 是 Host 新增的快照级标记：true = **轻量快照**（Host 跳过了全部冷读，状态可能不完整），
+   * false/缺失 = 完整权威快照。客户端只把它当成「状态证据不完整」的信号，渲染规则见
+   * runtimeStatusOf 的 partial 选项；缺失时按完整快照处理（旧 Host 行为不变）。
+   */
   function normalizeExpertGroupSnapshot(raw) {
     if (!isObject(raw) || raw.schemaVersion !== SCHEMA_VERSION) return null;
     const sourceRoot = isObject(raw.root) ? raw.root : {};
@@ -324,6 +349,7 @@
       sessionId: rootSessionId,
       rootSessionId,
       generatedAt: numberOrNull(raw.generatedAt),
+      partial: raw.partial === true,
       root,
     };
   }
@@ -420,6 +446,7 @@
   global[SYMBOL] = Object.freeze({
     SCHEMA_VERSION,
     RUNTIME_STATUSES,
+    UNKNOWN_RUNTIME_STATUS,
     normalizeExpertGroupSnapshot,
     normalizeStatus,
     runtimeStatusOf,
@@ -438,14 +465,21 @@
   const MODEL_SYMBOL = Symbol.for("dsh-expert-group/client-expert-group-model");
   const MODEL = global[MODEL_SYMBOL] || {};
   const modelApi = () => global[MODEL_SYMBOL] || MODEL;
-  /** 右侧栏对外的代理运行状态只有 running | ready 两个规范值。 */
-  const RUNTIME_STATUS_LABELS = Object.freeze({ running: "running", ready: "ready" });
+  /**
+   * 右侧栏对外的代理运行状态：默认是 running | ready 两个规范值。
+   *
+   * unknown 是**轻量（partial）快照专用**的中性值（见 client-expert-group-model.js 的
+   * UNKNOWN_RUNTIME_STATUS）：证据不足时不声明运行、也不声明结束。完整快照永远不会产生它，
+   * 因此正常渲染、无障碍标签与圆点语义都不受影响。
+   */
+  const RUNTIME_STATUS_LABELS = Object.freeze({ running: "running", ready: "ready", unknown: "unknown" });
   /**
    * 规范运行状态到 primitives.StateDot 的语义映射：
-   * running 用 ongoing（DSH 原生 1 秒追逐动画），ready 用 done（绿色静态圆点）。
+   * running 用 ongoing（DSH 原生 1 秒追逐动画），ready 用 done（绿色静态圆点），
+   * unknown 用 idle——官方词表里唯一「无进展信息」的中性态，既不是进行中也不是已完成。
    * 插件不自造第二套动画，动画只由官方组件提供。
    */
-  const RUNTIME_STATE_DOT = Object.freeze({ running: "ongoing", ready: "done" });
+  const RUNTIME_STATE_DOT = Object.freeze({ running: "ongoing", ready: "done", unknown: "idle" });
   // ACTIVE_STATUSES / RETRY_STATUSES 只服务于 fan-out 管理语义（取消/重试判定），不是展示状态词表。
   const ACTIVE_STATUSES = new Set(["queued", "waiting", "running"]);
   const RETRY_STATUSES = new Set(["failed", "timed_out", "interrupted"]);
@@ -590,6 +624,27 @@
   const SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS = 2;
   /** 打开后等待 active() 提交的最长时间；超时只释放待确认记录，不伪造 << 状态。 */
   const SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS = 15000;
+  /**
+   * 共享来源账本里「Auto 打开已经发出、tabId 始终没落地」的**占位条目**存活上限。
+   *
+   * 取值理由：与本地 opening 的等待窗口（SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS，15 秒）对齐——
+   * 两者回答的是同一个问题「这次打开还要等多久才算没有落地证据」。窗口内保留占位：它承担「同一个资源
+   * 绝不并发第二次 openResource」的去重语义（autoOpenCandidate 的 origin.has(key)）。窗口外释放占位，
+   * 让「资源仍 running 且地址上确实没有 tab」的形状能有一次有界重试——每次重试至少间隔一个窗口，
+   * 绝不自转（同一批微任务内还有 sidebarAutoFailedKeysRef 失败屏障兜底）。
+   *
+   * 为什么必须有这条 TTL：占位同时占着归属账本的容量槽位（SIDEBAR_AUTO_KEY_LIMIT = 128），而候选
+   * 选择又靠 origin.has(key) 跳过重试。宿主始终没落地该 tab 时，一批占位会把账本占满，Auto 从此
+   * 再也开不出任何新 tab——纯可用性故障，而且只有整页刷新（清掉内存账本）才能恢复。
+   */
+  const SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS = SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS;
+  /**
+   * 别的 scope（别的 root / sidebar session）的占位回收阈值：留出 4 倍余量，避免打断另一个 surface
+   * 仍在进行中的打开动作；超过它还在的占位一律回收（占位本身不是归属证据，回收不会授权任何关闭，
+   * 而且别的 scope 的候选选择必须在发出 openResource 前重新核对它自己的 inventory，因此也不可能
+   * 因此开出重复 tab）。
+   */
+  const SIDEBAR_AUTO_OPEN_PLACEHOLDER_FOREIGN_TTL_MS = 4 * SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS;
   /** 首次 split 的跨 inventory/DOM 提交 deadline，避免临时 50% 状态无限期占用右栏。 */
   const SIDEBAR_SPLIT_TRANSACTION_TIMEOUT_MS = 15000;
   /** RAF 被后台节流时的短 fallback；只负责放行一次 split 尝试，不改变事务提交 deadline。 */
@@ -1110,9 +1165,11 @@
    * 规范运行状态（展示与图标唯一使用的状态）。
    * 模型可用时由模型按官方源字段归一，模型缺失时才退回可证明的 running 布尔。
    */
-  function runtimeStatusOf(node, entry) {
+  function runtimeStatusOf(node, entry, options) {
     const model = modelApi();
-    if (typeof model.runtimeStatusOf === "function") return model.runtimeStatusOf(node, entry);
+    if (typeof model.runtimeStatusOf === "function") return model.runtimeStatusOf(node, entry, options);
+    // 模型缺失的降级路径：没有证据链可判，轻量快照下一律中性。
+    if (options?.partial === true && object(node).running !== true) return "unknown";
     return object(node).running === true ? "running" : "ready";
   }
 
@@ -1380,6 +1437,9 @@
     return left.schemaVersion === right.schemaVersion
       && left.sessionId === right.sessionId
       && left.rootSessionId === right.rootSessionId
+      // partial 必须参与比较：任务树内容恰好一致时（轻量快照与完整快照投影结果相同），
+      // 从 partial→完整 的升级仍要上屏，否则中性渲染会一直留在界面上。
+      && (left.partial === true) === (right.partial === true)
       && snapshotContentEquals(left.root, right.root);
   }
 
@@ -1523,6 +1583,8 @@
       ".deg_expert_group_state_dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor}",
       ".deg_expert_group_state_dot[data-state=running]{color:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary))}",
       ".deg_expert_group_state_dot[data-state=ready]{color:var(--dsw-alias-state-success-primary)}",
+      // 轻量（partial）快照的中性圆点：用次要文字色，既不是「运行中」蓝也不是「已完成」绿。
+      ".deg_expert_group_state_dot[data-state=unknown]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
       // 固定 30px 批量控件紧跟标题文字；不占独立 grid 尾列，也不使用自动外边距推向行尾。
       // 标题自身 min-width:0 + 单行省略，窄宽度下只收缩文字，箭头与批量控件保持固定占位。
       ".deg_expert_group_trailing{display:flex;flex:0 0 30px;align-items:center;justify-content:center;width:30px;height:20px;min-width:30px}",
@@ -2561,6 +2623,511 @@
     };
   }
 
+  /* ----------------------------------------------------------------------------------------------- *
+   * realm 级共享 Auto 账本（跨 bundle 重新执行/HMR）、持久归属标记（跨整页刷新）与有界诊断
+   * ----------------------------------------------------------------------------------------------- */
+
+  /**
+   * 本 realm 的共享 Auto 账本槽位。
+   *
+   * 症状与根因（现场证据）：DSH 的 ClientModuleSystem 支持 HMR，插件客户端模块被失效后会在**同一个
+   * realm 重新执行整份 bundle**（见 client-freshness.js 的 REGISTERED_LOADERS_KEY 说明）。这些账本
+   * 原先建在 createExpertGroupPanel 的工厂闭包里，bundle 重新执行即全部归零：一个正在运行的子代理
+   * 期间跑过构建（HMR）之后，它那个已经打开的 tab 在下一次收养时只能落到 manual 兜底——Auto 从此
+   * 再也不会把它收回去（用户看到的正是「只有能跑构建的角色更容易残留」）。
+   *
+   * 因此账本必须挂在 realm 的 globalThis 上（与 client-freshness 同一手法、同一条注释风格）：
+   * 首次执行创建，之后每次 bundle 重新执行都复用同一批 Map。整页刷新或进程重启后 realm 是新的，
+   * 账本自然为空——那条安全取舍由**持久归属标记**（见 SIDEBAR_AUTO_OWNERSHIP_KEY）承担。
+   *
+   * globalThis 不可用 / 被冻结 / 写入被拒时退回「每次执行各自 new Map」的旧行为，绝不抛错（同
+   * client-freshness 的降级策略）。
+   */
+  const SIDEBAR_SHARED_AUTO_LEDGER_KEY = Symbol.for("dsh-expert-group/sidebar#shared-auto-ledger");
+  const SIDEBAR_SHARED_AUTO_LEDGER_VERSION = 1;
+  /** 持久归属标记的版本化键（与 dsh-expert-group:rightbar-presented:v1 同命名风格）。 */
+  const SIDEBAR_AUTO_OWNERSHIP_KEY = "dsh-expert-group:auto-ownership:v1";
+  const SIDEBAR_AUTO_OWNERSHIP_LIMIT = 128;
+  const SIDEBAR_AUTO_OWNERSHIP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  const SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO = "auto";
+  const SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL = "manual";
+  /** 归属标记的内存索引槽位（与 localStorage 同源 write-through；测试可重置）。 */
+  const SIDEBAR_AUTO_OWNERSHIP_MEMORY_KEY = Symbol.for("dsh-expert-group/sidebar#auto-ownership-memory");
+  /** 有界诊断环形缓冲：只记结论摘要，绝不记提示词 / 消息正文 / 令牌 / 凭据。 */
+  const SIDEBAR_AUTO_DIAG_KEY = "dsh-expert-group:auto-diag:v1";
+  const SIDEBAR_AUTO_DIAG_LIMIT = 60;
+  const SIDEBAR_AUTO_DIAG_ENTRY_MAX_CHARS = 360;
+  const SIDEBAR_AUTO_DIAG_TEXT_MAX_CHARS = 96;
+  /** 账本里八份 Map 的字段名（顺序即诊断里的 sizes 顺序）。 */
+  const SIDEBAR_SHARED_AUTO_LEDGER_FIELDS = [
+    "origin", "suppressed", "closeAttempts", "closeAttemptOwners",
+    "closeVerifications", "closeCooldowns", "tabMisses", "tabCloseInFlight",
+  ];
+
+  /** 安全取 realm 的 globalThis：不可用时给 null，调用方一律走降级分支。 */
+  const sidebarRealmHost = () => {
+    try {
+      return typeof globalThis === "object" && globalThis !== null ? globalThis : null;
+    } catch {
+      return null;
+    }
+  };
+
+  /** 安全读 localStorage：缺失 / 被拒 / 抛错一律返回 null（调用方静默降级）。 */
+  const sidebarLocalStorage = () => {
+    try {
+      const host = sidebarRealmHost();
+      const storage = host === null ? null : host.localStorage;
+      if (storage === null || storage === undefined) return null;
+      if (typeof storage.getItem !== "function" || typeof storage.setItem !== "function") return null;
+      return storage;
+    } catch {
+      return null;
+    }
+  };
+
+  /** 有界文本字段：非字符串按字符串化处理并截断，空值返回 undefined（不写这个字段）。 */
+  const sidebarBoundedText = (value) => {
+    if (value === null || value === undefined) return undefined;
+    const text = typeof value === "string" ? value : String(value);
+    if (text.length === 0) return undefined;
+    return text.length > SIDEBAR_AUTO_DIAG_TEXT_MAX_CHARS ? text.slice(0, SIDEBAR_AUTO_DIAG_TEXT_MAX_CHARS) : text;
+  };
+
+  /** 复合键摘要：只落 hash，绝不落 session / root / 地址原文。 */
+  const sidebarAutoKeyDigest = (key) => {
+    const source = typeof key === "string" ? key : String(key);
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < source.length; index += 1) {
+      hash ^= source.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return "k" + hash.toString(36);
+  };
+
+  const sidebarAutoScopedKey = (sessionId, rootId, address) => String(sessionId) + "|" + String(rootId) + "|" + String(address);
+
+  /**
+   * realm 共享 Auto 来源账本（sharedAutoLedger.origin）条目的唯一构造函数。
+   *
+   * 条目形状：{ sessionId, rootSessionId, address, tabId }。**tabId 是这条账本的全部证明力所在**：
+   * 它必须是「写入这一刻，插件亲眼在宿主 inventory 里读到的那个 tab」。
+   *
+   * - 非 null：这条条目证明「这个 tab 是 Auto 亲手打开/替换并落地的那一个」。任何据此认定 auto 的
+   *   位置都必须要求 entry.tabId 与当前观察到的 tabId **逐字相等**；只要求「有条目」是不够的
+   *   （缺陷 1：旧 tab 被用户/宿主移除而插件未观察到时，同 realm 的收养会把用户新开的同地址 tab
+   *   当成 Auto 的旧 tab 认领，资源一空闲就把它关掉）。
+   * - null：只表示「本次运行已经为这个资源发出过一次 Auto 打开、落地证据还没到」这条**去重记账**，
+   *   它**不是**归属证据——任何收养 / 关闭判据都不许把它当作 auto。
+   *
+   * 只有插件亲眼观察到的那次 Auto 打开/替换落地（recordSidebarTab 从宿主 inventory 读到 tabId 的
+   * 那一刻）才允许写入或刷新 tabId。宿主合法重 mint 新 id 而插件没有观察到时，这条绑定随之失配，
+   * 收养一律退化成 manual——宁可漏收一次（tab 留在右栏交给用户手动处理），也绝不误关一个可能是
+   * 用户自己刚打开的 tab。
+   */
+  const sidebarAutoOriginEntry = (sessionId, rootId, address, tabId) => ({
+    sessionId,
+    rootSessionId: rootId,
+    address,
+    tabId: typeof tabId === "string" && tabId.length > 0 ? tabId : null,
+    /**
+     * 写入时刻：**只有占位**（tabId === null，「打开已发出、落地证据还没到」）用它判 TTL，
+     * 见 SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS 与 sweepAutoOpenPlaceholders。
+     * 落地条目（tabId 非 null）不使用它：那条生命周期由既有收口路径负责（verified-closed /
+     * inventory-absent / tab-recycled / resource-running），比 TTL 精确得多，绝不能被 TTL 顺手回收。
+     */
+    writtenAt: Date.now(),
+  });
+
+  /** 读一条来源账本条目绑定的 tabId：缺失 / 畸形一律 null（调用方必须按「不是我们的 tab」处理）。 */
+  const sidebarAutoOriginTabIdOf = (entry) => {
+    if (entry === null || entry === undefined || typeof entry !== "object") return null;
+    return typeof entry.tabId === "string" && entry.tabId.length > 0 ? entry.tabId : null;
+  };
+
+  /** 读一条来源账本条目的写入时刻：缺失 / 畸形一律 0（按「最旧」处理，优先回收）。 */
+  const sidebarAutoOriginWrittenAtOf = (entry) => {
+    if (entry === null || entry === undefined || typeof entry !== "object") return 0;
+    const value = Number(entry.writtenAt);
+    return Number.isFinite(value) ? value : 0;
+  };
+
+  /**
+   * 写一条诊断（环形、有界、失败静默）。
+   *
+   * 结构：{ t, kind, event?, action?, verdict?, reason?, key?, origin?, reused?, degraded?, sizes? }，
+   * key 一律是摘要（sidebarAutoKeyDigest），绝不含原文；单条 JSON 超过硬上限时先丢 sizes 再整体丢弃。
+   */
+  const recordSidebarAutoDiag = (entry) => {
+    try {
+      const storage = sidebarLocalStorage();
+      if (storage === null) return;
+      const source = entry !== null && typeof entry === "object" ? entry : {};
+      const normalized = { t: Date.now() };
+      for (const field of ["kind", "event", "action", "verdict", "reason", "key", "origin"]) {
+        const value = sidebarBoundedText(source[field]);
+        if (value !== undefined) normalized[field] = value;
+      }
+      if (source.reused === true) normalized.reused = true;
+      if (source.degraded === true) normalized.degraded = true;
+      if (source.sizes !== null && typeof source.sizes === "object") {
+        const sizes = {};
+        for (const name of SIDEBAR_SHARED_AUTO_LEDGER_FIELDS) {
+          const value = Number(source.sizes[name]);
+          if (Number.isFinite(value) === true) sizes[name] = Math.max(0, Math.trunc(value));
+        }
+        normalized.sizes = sizes;
+      }
+      let serialized = JSON.stringify(normalized);
+      if (serialized.length > SIDEBAR_AUTO_DIAG_ENTRY_MAX_CHARS) {
+        delete normalized.sizes;
+        serialized = JSON.stringify(normalized);
+      }
+      if (serialized.length > SIDEBAR_AUTO_DIAG_ENTRY_MAX_CHARS) return;
+      let list = [];
+      const raw = storage.getItem(SIDEBAR_AUTO_DIAG_KEY);
+      if (typeof raw === "string" && raw.length > 0) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) === true) list = parsed.slice(-SIDEBAR_AUTO_DIAG_LIMIT);
+      }
+      list.push(JSON.parse(serialized));
+      storage.setItem(SIDEBAR_AUTO_DIAG_KEY, JSON.stringify(list.slice(-SIDEBAR_AUTO_DIAG_LIMIT)));
+    } catch {
+      /* 诊断只服务排查：任何失败都静默，绝不阻断功能。 */
+    }
+  };
+
+  /** 新建一份共享 Auto 账本（八份 Map + 必要元数据）。 */
+  const createSidebarSharedAutoLedger = () => {
+    const ledger = { version: SIDEBAR_SHARED_AUTO_LEDGER_VERSION, createdAt: Date.now() };
+    for (const field of SIDEBAR_SHARED_AUTO_LEDGER_FIELDS) ledger[field] = new Map();
+    return ledger;
+  };
+
+  /**
+   * 鸭子类型校验：只认「版本一致 + 八份 Map 都在」的账本，避免跨 realm / 旧格式的脏值被复用。
+   * 不用 instanceof：测试替身与 vm realm 里的 Map 不共享构造函数。
+   */
+  const isSidebarSharedAutoLedger = (value) => {
+    if (value === null || typeof value !== "object") return false;
+    if (value.version !== SIDEBAR_SHARED_AUTO_LEDGER_VERSION) return false;
+    for (const field of SIDEBAR_SHARED_AUTO_LEDGER_FIELDS) {
+      const map = value[field];
+      if (map === null || typeof map !== "object" || typeof map.get !== "function" || typeof map.set !== "function") return false;
+    }
+    return true;
+  };
+
+  /** 各 Map 规模的只读快照（诊断用；缺失字段按 0 计）。 */
+  const sidebarSharedAutoLedgerSizes = (ledger) => {
+    const sizes = {};
+    for (const field of SIDEBAR_SHARED_AUTO_LEDGER_FIELDS) {
+      const map = ledger === null || ledger === undefined ? null : ledger[field];
+      sizes[field] = map !== null && typeof map === "object" && Number.isFinite(Number(map.size)) ? Number(map.size) : 0;
+    }
+    return sizes;
+  };
+
+  const sidebarSharedAutoLedgerTotal = (ledger) => {
+    const sizes = sidebarSharedAutoLedgerSizes(ledger);
+    let total = 0;
+    for (const field of SIDEBAR_SHARED_AUTO_LEDGER_FIELDS) total += sizes[field];
+    return total;
+  };
+
+  /**
+   * 取本 realm 的共享 Auto 账本：命中即复用（reused=true），否则新建并写回 realm 槽位。
+   *
+   * 写回失败（globalThis 被冻结 / 受限）时只返回这一份新账本，绝不抛错：行为退回「每次执行各自
+   * new Map」的旧语义，功能可用性不受影响。
+   */
+  const resolveSidebarSharedAutoLedger = () => {
+    const host = sidebarRealmHost();
+    let existing = null;
+    if (host !== null) {
+      try { existing = host[SIDEBAR_SHARED_AUTO_LEDGER_KEY]; } catch { existing = null; }
+    }
+    if (isSidebarSharedAutoLedger(existing) === true) {
+      return { ledger: existing, reused: true, degraded: false };
+    }
+    const created = createSidebarSharedAutoLedger();
+    let degraded = host === null;
+    if (host !== null) {
+      try {
+        Object.defineProperty(host, SIDEBAR_SHARED_AUTO_LEDGER_KEY, { value: created, configurable: true, writable: true });
+      } catch {
+        degraded = true;
+      }
+    }
+    return { ledger: created, reused: false, degraded };
+  };
+
+  /**
+   * 归属标记的内存索引（懒加载 + write-through）：命中 realm 槽位即复用，否则新建并写回。
+   * 槽位不可用时返回 null——此时所有读写直接走 localStorage（仍然正确，只是每次都要解析）。
+   */
+  const sidebarOwnershipMemory = () => {
+    const host = sidebarRealmHost();
+    if (host === null) return null;
+    try {
+      const existing = host[SIDEBAR_AUTO_OWNERSHIP_MEMORY_KEY];
+      if (existing !== null && typeof existing === "object" && existing.entries instanceof Map) return existing;
+    } catch { return null; }
+    try {
+      const created = { entries: new Map(), loaded: false };
+      Object.defineProperty(host, SIDEBAR_AUTO_OWNERSHIP_MEMORY_KEY, { value: created, configurable: true, writable: true });
+      return created;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * 把持久条目数组整理成 Map：只做两件「数据卫生」的事——丢掉 TTL 过期条目、同一 key 去重
+   * （manual 优先）。
+   *
+   * **这里刻意不做任何按上限的 LRU 淘汰**（缺陷 2）：条目描述的 owner 在载入这一刻完全可能仍然
+   * 有效（宿主里那个 tab 还开着，只是插件这一帧还没有 inventory 证据），LRU 淘汰它们等于永久丢掉
+   * 一批仍然打开的 Auto owner——它们再也不会被自动收回，刷新也不能恢复。容量改由**写入路径**
+   * 分账 fail-closed 控制：新增 auto 条目在满额时被拒绝，manual 条目照常写入（见
+   * writeSidebarAutoOwnership / sidebarOwnershipAcceptsNewAuto）。
+   */
+  const normalizeSidebarOwnershipEntries = (raw, now) => {
+    const entries = new Map();
+    if (Array.isArray(raw) !== true) return entries;
+    for (const item of raw) {
+      if (item === null || typeof item !== "object") continue;
+      const key = typeof item.key === "string" ? item.key : null;
+      if (key === null) continue;
+      const updatedAt = Number(item.updatedAt);
+      if (Number.isFinite(updatedAt) !== true || now - updatedAt > SIDEBAR_AUTO_OWNERSHIP_TTL_MS) continue;
+      const origin = item.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
+        ? SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
+        : SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO;
+      const previous = entries.get(key);
+      if (previous !== undefined && previous.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL) continue;
+      /**
+       * tabId 是「写下这条归属的那一刻，宿主 inventory 里这个地址的 tab id」（缺省表示这次写入没有
+       * 可证明的 tab）。只有 **auto** 条目在收养时会按它比对（见 recordSidebarTab 的 tabId 绑定闸门）：
+       * 宿主重新 mint 了新 id 就说明这条条目描述的那个 tab 已经不存在，此时宁可退化成 manual
+       * （漏收一次、留给用户手动处理），也绝不让 Auto 去关一个可能是用户自己刚打开的 tab。
+       */
+      entries.delete(key);
+      entries.set(key, {
+        key,
+        origin,
+        updatedAt,
+        reason: sidebarBoundedText(item.reason),
+        tabId: sidebarBoundedText(item.tabId),
+      });
+    }
+    return entries;
+  };
+
+  /** 读取（必要时从 localStorage 懒加载）归属索引；两处都不可用时返回空的临时索引。 */
+  const sidebarOwnershipEntries = () => {
+    const memory = sidebarOwnershipMemory();
+    if (memory === null) {
+      const storage = sidebarLocalStorage();
+      if (storage === null) return new Map();
+      try {
+        const raw = storage.getItem(SIDEBAR_AUTO_OWNERSHIP_KEY);
+        return normalizeSidebarOwnershipEntries(raw === null || raw.length === 0 ? [] : JSON.parse(raw), Date.now());
+      } catch {
+        return new Map();
+      }
+    }
+    if (memory.loaded !== true) {
+      memory.loaded = true;
+      const storage = sidebarLocalStorage();
+      if (storage !== null) {
+        try {
+          const raw = storage.getItem(SIDEBAR_AUTO_OWNERSHIP_KEY);
+          memory.entries = normalizeSidebarOwnershipEntries(raw === null || raw.length === 0 ? [] : JSON.parse(raw), Date.now());
+        } catch {
+          memory.entries = new Map();
+        }
+      }
+    }
+    return memory.entries;
+  };
+
+  /** 把索引写回 localStorage（失败 / 不可用一律静默：内存仍然一致，只是不持久）。 */
+  const persistSidebarOwnership = (entries) => {
+    const storage = sidebarLocalStorage();
+    if (storage === null) return false;
+    try {
+      const list = [];
+      for (const entry of entries.values()) {
+        const item = { key: entry.key, origin: entry.origin, updatedAt: entry.updatedAt };
+        if (entry.reason !== undefined) item.reason = entry.reason;
+        // tabId 必须随条目一起持久化：整页刷新之后它是唯一能证明「这条 auto 归属描述的是哪个 tab」的证据。
+        if (entry.tabId !== undefined) item.tabId = entry.tabId;
+        list.push(item);
+      }
+      storage.setItem(SIDEBAR_AUTO_OWNERSHIP_KEY, JSON.stringify(list));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * 读一个地址的持久归属：返回 { origin, tabId }，没有标记时返回 null。
+   *
+   * - origin 命中 manual 一律 manual（安全侧），命中 auto 才 auto；
+   * - tabId 是写入那一刻宿主 inventory 里这个地址的 tab id（没有可证明的 tab 时为 null）；
+   *   只有 auto 条目会被调用方按它比对，manual 条目只按 origin 判定。
+   *
+   * 读取本身绝不修改任何状态，失败一律当作「没有标记」（调用方按 manual 兜底）。
+   * options.quiet === true 时连诊断也不写：调用点可能是每轮同步都会跑的判据（自动打开候选、
+   * 空闲资源的抑制清除扫描），它们的结论由各自的决策 / 删除诊断承担，不该把有界诊断环挤满。
+   */
+  const readSidebarAutoOwnershipEntry = (sessionId, rootId, address, options) => {
+    try {
+      const key = sidebarAutoScopedKey(sessionId, rootId, address);
+      const entry = sidebarOwnershipEntries().get(key);
+      const origin = entry === undefined
+        ? null
+        : (entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL ? SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL : SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO);
+      if (options === null || options === undefined || options.quiet !== true) {
+        recordSidebarAutoDiag({ kind: "ownership", event: "hit", origin, key: sidebarAutoKeyDigest(key) });
+      }
+      if (entry === undefined) return null;
+      return {
+        origin,
+        tabId: typeof entry.tabId === "string" && entry.tabId.length > 0 ? entry.tabId : null,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  /** 持久表里的 auto 条目数（容量只对 auto 计账：manual 是用户意图，恒优先、从不被容量拒绝）。 */
+  const sidebarOwnershipAutoCount = (entries) => {
+    let count = 0;
+    for (const entry of entries.values()) {
+      if (entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO) count += 1;
+    }
+    return count;
+  };
+
+  /**
+   * 持久表是否还容得下这个地址的一条 **auto** 归属（fail-closed 容量判据，缺陷 2）。
+   *
+   * 判据只有一条：写入之后 auto 条目数不得超过 SIDEBAR_AUTO_OWNERSHIP_LIMIT。**绝不为了腾位而
+   * 淘汰任何已有条目**——持久表里的 auto 条目描述的 owner 在本帧完全可能仍然有效（宿主里那个 tab
+   * 还开着），LRU（或任何「看起来更旧」的排序）淘汰它同样会让那个 tab 永久失去 Auto 归属，刷新
+   * 也不能恢复。
+   *
+   * manual 条目不参与这里的容量判定：它表达用户意图，写入 / 改写一律照常（手动恒优先）。因此本
+   * 函数回答的是「新增/改写一条 auto 条目能不能被保留」，而不是「表里总共有多少条」。
+   *
+   * 读取失败（localStorage 不可用 / 抛错）按「容得下」处理：内存账本仍然守着同一份容量，持久层
+   * 只是「刷新之后的记忆」，读不到它不该让自动打开整体失效（与既有的静默降级一致）。
+   */
+  const sidebarOwnershipAcceptsNewAuto = (sessionId, rootId, address) => {
+    try {
+      const entries = sidebarOwnershipEntries();
+      const key = sidebarAutoScopedKey(sessionId, rootId, address);
+      const existing = entries.get(key);
+      const existingIsAuto = existing !== undefined && existing.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO;
+      const nextAutoCount = sidebarOwnershipAutoCount(entries) - (existingIsAuto ? 1 : 0) + 1;
+      return nextAutoCount <= SIDEBAR_AUTO_OWNERSHIP_LIMIT;
+    } catch {
+      return true;
+    }
+  };
+
+  /**
+   * 写入归属标记（内存与 localStorage 同一处收口）并记一条诊断；返回是否真的写进去了。
+   *
+   * tabId 只在**调用方真的读到了宿主 inventory 里这个地址的 tab** 时才传（当前唯一的 auto 调用点
+   * 是 recordSidebarTab）：它把这条归属绑定到具体的 tab 上，刷新之后的收养必须靠它证明「还是同一个
+   * tab」（见 recordSidebarTab 的 tabId 绑定闸门）。manual 条目不需要它，传 undefined 即可。
+   *
+   * 容量 fail-closed（缺陷 2）：会挤掉仍有效 owner 的新增 / 改写（即写入之后 auto 条目数超过上限）
+   * **一律拒绝**，并留下一条 reject/capacity 诊断。manual 写入从不被容量拒绝——但同样绝不为了腾位
+   * 去淘汰任何已有条目，因此持久表最多是「上限条 auto + 用户自己产生的 manual 条目」。
+   * 到达上限是可用性代价而不是错误：那个资源不自动打开，用户仍然可以手动打开（手动打开照常写
+   * manual 归属，见 handleSidebarAction 的入口写入）。
+   */
+  const writeSidebarAutoOwnership = (sessionId, rootId, address, origin, reason, tabId) => {
+    try {
+      const normalizedOrigin = origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
+        ? SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
+        : SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO;
+      const entries = sidebarOwnershipEntries();
+      const key = sidebarAutoScopedKey(sessionId, rootId, address);
+      if (normalizedOrigin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
+        && sidebarOwnershipAcceptsNewAuto(sessionId, rootId, address) !== true) {
+        recordSidebarAutoDiag({ kind: "ownership", event: "reject", origin: normalizedOrigin, reason: "capacity", key: sidebarAutoKeyDigest(key) });
+        return false;
+      }
+      entries.delete(key);
+      entries.set(key, {
+        key,
+        origin: normalizedOrigin,
+        updatedAt: Date.now(),
+        reason: sidebarBoundedText(reason),
+        tabId: sidebarBoundedText(tabId),
+      });
+      persistSidebarOwnership(entries);
+      recordSidebarAutoDiag({ kind: "ownership", event: "write", origin: normalizedOrigin, reason, key: sidebarAutoKeyDigest(key) });
+      return true;
+    } catch {
+      /* 归属标记只影响「刷新之后还认不认」，任何失败都静默。 */
+      return false;
+    }
+  };
+
+  /**
+   * 删除归属标记（与写入同源：内存删掉后立刻落盘）。
+   *
+   * 默认**拒绝**删除 manual 条目：manual 是用户的手动意图（手动关闭 / 手动打开），而调用这条删除的
+   * 路径全是 Auto 自己的收口（verified-close / inventory-absent / tab-recycled / resource-running）。
+   * 让 Auto 的收口顺手删掉用户的抑制，就等于「刷新之后用户的关闭又被撤销」——正是 P1-B 要堵的洞。
+   * 因此这里只回答「Auto 自己的归属是否已经不需要了」，manual 条目一律保留并留一条 keep 诊断。
+   *
+   * options.manual === true 是唯一的例外：只有「观察到资源已经明确空闲（ready）」那条专用清点路径
+   * 才允许清除 manual（见 clearManualSuppressionOfIdleResources），语义是「这一轮运行已经结束，
+   * 用户当时的关闭意图不再需要跨运行保留」。
+   */
+  const deleteSidebarAutoOwnership = (sessionId, rootId, address, reason, options) => {
+    try {
+      const entries = sidebarOwnershipEntries();
+      const key = sidebarAutoScopedKey(sessionId, rootId, address);
+      const entry = entries.get(key);
+      if (entry === undefined) {
+        recordSidebarAutoDiag({ kind: "ownership", event: "delete-miss", reason, key: sidebarAutoKeyDigest(key) });
+        return false;
+      }
+      if (entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
+        && (options === null || options === undefined || options.manual !== true)) {
+        recordSidebarAutoDiag({ kind: "ownership", event: "keep", origin: SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, reason, key: sidebarAutoKeyDigest(key) });
+        return false;
+      }
+      entries.delete(key);
+      persistSidebarOwnership(entries);
+      recordSidebarAutoDiag({ kind: "ownership", event: "delete", reason, key: sidebarAutoKeyDigest(key) });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /** 记录一次自动打开/自动关闭决策（候选 + 结算），失败原因只留截断后的一行。 */
+  const recordSidebarAutoDecision = (event, candidate, verdict, reason) => {
+    recordSidebarAutoDiag({
+      kind: "decision",
+      event,
+      action: candidate === null || candidate === undefined ? undefined : candidate.kind,
+      verdict,
+      reason,
+      key: candidate === null || candidate === undefined ? undefined : sidebarAutoKeyDigest(candidate.key),
+    });
+  };
+
   function createExpertGroupPanel(deps) {
     const config = object(deps);
     const react = config.react;
@@ -2673,10 +3240,37 @@
      * busy 闸门、tab 打开记录（records/openings）、手动意图都属于「当前这一帧 surface 的在途状态」，
      * 跨实例共享只会让旧实例的在途状态污染新实例。键始终是（sidebar session + rootSessionId +
      * 资源地址）复合键，因此共享也不会让不同 root / 不同 session 互相影响。
+     *
+     * 生命周期（本轮修复）：这八份 Map 不只是「同一 install 内共享」，而是**本 realm 内共享**——
+     * bundle 被 HMR 重新执行之后仍复用同一批 Map（见 resolveSidebarSharedAutoLedger）。否则一次
+     * 构建（fixer 角色最容易触发）就会把「这个 tab 是 Auto 亲手打开的」全部抹掉，tab 随即被收养成
+     * manual 并永久留在右栏。跨整页刷新/进程重启的归属由持久标记层负责（SIDEBAR_AUTO_OWNERSHIP_KEY）。
      */
-    const sharedSidebarAutoOrigin = new Map();
-    const sharedSidebarAutoSuppressed = new Map();
-    const sharedSidebarAutoCloseAttempts = new Map();
+    const sharedAutoLedgerState = resolveSidebarSharedAutoLedger();
+    const sharedAutoLedger = sharedAutoLedgerState.ledger;
+    recordSidebarAutoDiag({
+      kind: "install",
+      reused: sharedAutoLedgerState.reused,
+      degraded: sharedAutoLedgerState.degraded,
+      sizes: sidebarSharedAutoLedgerSizes(sharedAutoLedger),
+    });
+    if (sharedAutoLedgerState.reused === true && sharedAutoLedgerState.degraded !== true
+      && sidebarSharedAutoLedgerTotal(sharedAutoLedger) > 0) {
+      // 只在「复用了一份非空账本」时提示一行：用户开着 DevTools 就能确认 HMR 之后归属没有丢。
+      try {
+        console.info("[dsh-expert-group] 本 realm 已有共享 Auto 账本：本次装载复用既有的归属 / 预算 / 确认计数（bundle 重新执行或 HMR）");
+      } catch { /* 控制台不可用不影响功能。 */ }
+    }
+    /**
+     * realm 共享的 Auto 来源账本：key → { sessionId, rootSessionId, address, tabId }。
+     *
+     * tabId 是「Auto 打开/替换落地那一刻，插件亲眼在宿主 inventory 里读到的那个 tab」，它让这份
+     * 跨 bundle 重新执行（HMR）/ 跨 Panel 实例的账本不再只是一句「我们打开过」——所有据此认定
+     * auto 的位置都必须比对 tabId（见 sidebarAutoOriginEntry / sidebarAutoOriginTabIdOf）。
+     */
+    const sharedSidebarAutoOrigin = sharedAutoLedger.origin;
+    const sharedSidebarAutoSuppressed = sharedAutoLedger.suppressed;
+    const sharedSidebarAutoCloseAttempts = sharedAutoLedger.closeAttempts;
     /**
      * 跨 Panel 实例共享的「这条自动关闭重试预算归谁」账本：key → 本次预支预算的**不可复用**令牌。
      *
@@ -2684,7 +3278,7 @@
      * 旧代次手里的令牌都不可能与后来者的令牌相等。写入与删除与 closeAttempts 同步进行，并沿用同一
      * 个 trimAutoKeyMap/128 上限，绝不引入第二份无界 Map。
      */
-    const sharedSidebarAutoCloseAttemptOwners = new Map();
+    const sharedSidebarAutoCloseAttemptOwners = sharedAutoLedger.closeAttemptOwners;
     /**
      * 跨 Panel 实例共享的「close 请求已经发出、等待 inventory 验证」状态：key → 验证记录
      * { sessionId, rootSessionId, tabId, address, attemptToken, manual, misses, deadline, lease }。
@@ -2693,14 +3287,14 @@
      * 时才算 verified-closed。验证链因此必须与来源账本同层共享——重挂载后的新实例继续采样、继续收口，
      * 而不是把「请求完成」当成「已经关闭」。租约同时被这条记录持有，下一轮同步绝不会重复 close。
      */
-    const sharedSidebarAutoCloseVerifications = new Map();
+    const sharedSidebarAutoCloseVerifications = sharedAutoLedger.closeVerifications;
     /**
      * 跨 Panel 实例共享的自动关闭失败冷却：key → { step, until }。
      *
      * 与重试计数同层共享：scope remount 或同一个实例 A→B→A 绝不能绕过失败上限（否则频繁重挂载就等于
      * 无限重试）。generation token 只负责阻止旧动作越权，不改变这份预算的生命周期。
      */
-    const sharedSidebarAutoCloseCooldowns = new Map();
+    const sharedSidebarAutoCloseCooldowns = sharedAutoLedger.closeCooldowns;
     /**
      * 跨 Panel 实例共享的 Auto 候选采样计数：key → { sessionId, rootSessionId, tabId, misses }。
      *
@@ -2718,7 +3312,7 @@
      * - 限容：**纯 LRU**（按最近一次采样时间排序）+ SIDEBAR_AUTO_KEY_LIMIT，绝不新增无界 Map；
      *   绝不用当前实例的局部 record / 在途状态判定别的 scope 的共享条目（见 trimSharedSidebarAutoTabMisses）。
      */
-    const sharedSidebarAutoTabMisses = new Map();
+    const sharedSidebarAutoTabMisses = sharedAutoLedger.tabMisses;
     /**
      * sharedSidebarAutoTabMisses 的限容淘汰：**纯 LRU**——按「最近一次采样」排序，淘汰最久没被采样的条目。
      *
@@ -2764,7 +3358,7 @@
      * 少了这层结果信号，等待者只能看到「锁空了」：要么对已经关掉的 tab 重复 close，要么把一次失败的
      * 竞争当成「有人处理了」而丢掉用户的关闭意图。
      */
-    const sharedSidebarTabCloseInFlight = new Map();
+    const sharedSidebarTabCloseInFlight = sharedAutoLedger.tabCloseInFlight;
 
     function Panel(props) {
       const ctx = props?.ctx || config.ctx;
@@ -3376,6 +3970,19 @@
        };
              const sidebarOpenTabsAvailable = readSidebarOpenTabs() !== null;
                      const snapshot = viewState.snapshot;
+      /**
+       * 轻量（partial）快照标记：Host 首屏返回 partial:true 表示它跳过了全部冷读，
+       * 状态与任务名可能不完整。渲染层据此把「没有任何活动证据」的圆点与活动文案保持中性；
+       * 完整快照（partial:false/缺失）与旧宿主一律走既有渲染路径，逐字不变。
+       */
+      const partialSnapshot = snapshot?.partial === true;
+      /**
+       * 容器（空闲分组）在轻量快照下使用的中性运行状态：取值与模型导出的
+       * UNKNOWN_RUNTIME_STATUS 同源，模型缺失时按同名字面量兜底，避免两处各存一份词表。
+       */
+      const neutralRuntimeStatus = typeof model.UNKNOWN_RUNTIME_STATUS === "string" && model.UNKNOWN_RUNTIME_STATUS.length > 0
+        ? model.UNKNOWN_RUNTIME_STATUS
+        : "unknown";
        const sidebarSnapshotSyncRef = typeof react.useRef === "function"
          ? react.useRef({ rootSessionId, sidebarSessionId, snapshot })
          : { current: { rootSessionId, sidebarSessionId, snapshot } };
@@ -3793,14 +4400,33 @@
       const sidebarRootChildren = () => (Array.isArray(snapshot?.root?.children) ? snapshot.root.children : []);
 
       /**
+       * 空闲证据规则（空闲分组与空闲批量关闭候选的**唯一**判定入口）。
+       *
+       * 只有 runtimeStatusOfNode(...) === "ready"（**有证据**表明当前未运行）才算空闲：
+       * - 轻量快照（partial:true）下「没有任何活动证据」的节点被归一为中性值 unknown，
+       *   它既不是 running 也不是 ready，因此既不得进入空闲分组、也不得成为空闲批量关闭候选——
+       *   否则用户会依据轻量快照关掉实际仍在运行、只是首屏读不到状态的会话；
+       * - 完整快照（partial:false）到达后不会再出现 unknown，规则自动回到既有行为，不留永久性差异；
+       * - running 与 unknown 一样被排除，保守方向不变。
+       *
+       * partial 证据规则通过 options 一路传到模型的活动证据链，与行内圆点、第三行文案同源；
+       * 这里只读当前渲染的 partialSnapshot，切换 root 或快照换代都会随闭包一起更新。
+       */
+      const sidebarNodeIsIdleReady = (node, parentId, childId) =>
+        runtimeStatusOfNode(node, parentId, childId, { partial: partialSnapshot }) === "ready";
+
+      /**
        * 空闲分组收纳 ready 直接专家和已结算的 fan-out 父任务。
-       * 父任务必须命中 manager 终态，不能仅凭子会话暂时未运行或未知状态提前移动。
+       * 父任务必须命中 manager 终态，不能仅凭子会话暂时未运行或未知状态提前移动（manager 的聚合
+       * 状态本身就是真实证据，不是「没有证据」，因此不受 partial 影响）。
+       * 直接专家走 sidebarNodeIsIdleReady：轻量快照下没有活动证据的专家是 unknown，既不进空闲组
+       * （留在主代理下，等完整快照到达再按完整证据归组），也不进空闲关闭候选。
        */
       const sidebarIdleChildren = () => sidebarRootChildren()
         .filter((node) => {
           if (node.kind === "fanout") return FANOUT_SETTLED_STATUSES.has(statusOf(node));
           return node.kind === "expert"
-            && runtimeStatusOfNode(node, rootSessionId, text(node.sessionId, null)) === "ready";
+            && sidebarNodeIsIdleReady(node, rootSessionId, text(node.sessionId, null));
         });
 
       /**
@@ -3814,8 +4440,10 @@
       };
 
       /**
-       * 空闲分组的资源地址集合；成员判定严格复用当前 idleChildren。
-       * fan-out 父任务代表其最新 attempt 的分片会话，只收录当前未运行的会话地址。
+       * 空闲分组的资源地址集合；成员判定严格复用当前 idleChildren，并在这里用同一条证据规则
+       * （sidebarNodeIsIdleReady）再复核一次：分组与候选绝不出现第二套判定，轻量快照下没有活动
+       * 证据（unknown）的节点因此在两道关口都被排除，绝不会进入空闲批量关闭候选。
+       * fan-out 父任务代表其最新 attempt 的分片会话，只收录当前未运行（ready）的会话地址。
        */
       const idleSidebarResourceAddresses = (nodes) => {
         const addresses = new Set();
@@ -3825,7 +4453,9 @@
             for (const shard of Array.isArray(source.shards) ? source.shards : []) {
               const shardSource = object(shard);
               const shardChildId = text(shardSource.childId, null);
-              if (shardChildId === null || runtimeStatusOfNode(shardSource, rootSessionId, shardChildId) !== "ready") continue;
+              // childId 缺失（Host 在轻量快照里清空了无法证明归属的 child）与 unknown 状态一样，
+              // 都不能进候选：没有精确地址就没有可关闭的目标，没有证据就不能判定它已空闲。
+              if (shardChildId === null || sidebarNodeIsIdleReady(shardSource, rootSessionId, shardChildId) !== true) continue;
               const shardAddress = subagentChatAddress(subagentAddressOfChild(shardChildId, rootSessionId, {
                 ...shardSource,
                 kind: "expert",
@@ -3836,6 +4466,9 @@
           }
           const childId = text(source.sessionId, text(source.childId, null));
           if (childId === null) continue;
+          // 防御式复核：实参与 idleChildren 的成员判定逐字相同，因此对既有成员的结果完全不变；
+          // 即使调用方以后传进来一份非 idleChildren 的列表，unknown/running 也绝不会漏成候选。
+          if (sidebarNodeIsIdleReady(source, rootSessionId, text(source.sessionId, null)) !== true) continue;
           const address = subagentChatAddress(subagentAddressOfChild(childId, rootSessionId, source));
           if (address !== null) addresses.add(address);
         }
@@ -4250,6 +4883,17 @@
             // 资源重新变成运行中：它已经开着就保持开着，重试预算、owner 身份与失败冷却一并清零。
             // **绝不**丢弃仍在验证中的关闭：那条链属于「已经发出的一次关闭」，它的收口（删记录、
             // 撤销来源 / 登记抑制）与重试预算无关；丢掉它会让 record 与箭头永久停在 <<。
+            /**
+             * 归属标记同源清理：只有在「这个 key 上确实有过一次关闭在途/预算消耗」时才清——那才是
+             * 「资源又跑起来了，旧归属已经过期」的形状；普通的运行中 Auto tab（刚打开、没有任何关闭
+             * 记账）绝不能被顺手清掉，否则一次刷新就会把它降级成 manual，正是本插件要修的漏收。
+             * 清掉之后，下一次自动打开会重新打点（见 recordSidebarTab 的 auto-open 写入）。
+             */
+            if (attempts.has(key) === true
+              || sidebarAutoCloseCooldownsRef.current.has(key) === true
+              || sidebarAutoCloseVerificationsRef.current.has(key) === true) {
+              deleteSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, "resource-running");
+            }
             clearAutoCloseBudget(key);
             continue;
 
@@ -4271,6 +4915,23 @@
           }
           if (scopedRecord.origin !== SIDEBAR_TAB_ORIGIN_AUTO) {
             // 记录已经被手动接管（用户手动打开或外部 tab）：手动优先，撤销自动来源，绝不关闭它。
+            origin.delete(key);
+            clearAutoCloseAttempt(key);
+            continue;
+          }
+          /**
+           * 来源账本 ⇄ 记录 的 tabId 绑定闸门（与收养路径同一条判据，缺陷 1 的第二个消费点）。
+           *
+           * 这本账本是 realm 共享的，条目里的 tabId 是「Auto 打开/替换落地那一刻亲眼看到的 tab」。
+           * 条目与记录指向同一个 tab 时它才证明这条关闭候选仍是我们自己开出来的那个 tab；一旦两者
+           * 对不上（宿主重 mint 了新 id、而插件没有观察到那次替换），账本那条已经不能代表任何还在
+           * 我们手里的 tab —— 按安全侧撤销这条自动来源，绝不按它关闭。
+           *
+           * 条目 tabId 为 null（这次自动打开已经发出、落地证据还没到）不触发本闸门：那种条目本身
+           * 就不是归属证据，真正的判据在下一条（scopedRecord 的 tabId）与关闭 preflight 上。
+           */
+          const boundAutoTabId = sidebarAutoOriginTabIdOf(entry);
+          if (boundAutoTabId !== null && boundAutoTabId !== scopedRecord.tabId) {
             origin.delete(key);
             clearAutoCloseAttempt(key);
             continue;
@@ -4321,6 +4982,7 @@
             records.delete(key);
             origin.delete(key);
             clearAutoCloseAttempt(key);
+            deleteSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, "inventory-absent");
             bump((value) => value + 1);
             continue;
           }
@@ -4328,6 +4990,7 @@
             records.delete(key);
             origin.delete(key);
             clearAutoCloseBudget(key);
+            deleteSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, "tab-recycled");
             bump((value) => value + 1);
             continue;
           }
@@ -4386,13 +5049,36 @@
           const key = sidebarTabKey(sidebarSessionId, rootSessionId, address);
           // 本次级联里已经为它尝试过并失败：绝不在同一批微任务里重试（见 sidebarAutoFailedKeysRef）。
           if (sidebarAutoFailedKeysRef.current.has(key) === true) continue;
-          // 用户手动关闭过：绝不立刻重开（抑制只由用户手动重新打开清除）。
+          // 用户手动关闭过：绝不立刻重开（抑制只由用户手动重新打开，或资源明确空闲后的清点清除）。
           if (suppressed.has(key) === true) continue;
+          /**
+           * 持久 manual 抑制（跨整页刷新）：内存里的 suppressed 在刷新之后是空的，但用户的关闭意图
+           * 落在持久条目上（见 SIDEBAR_AUTO_OWNERSHIP_KEY）——manual 恒优先，这里必须与内存抑制同强度
+           * 地跳过这个地址。少了这一步，「资源仍在运行 + 用户已手动关闭该 tab + 刷新」会被 Auto
+           * 重新打开（P1-B）。
+           *
+           * 抑制的清除时机**只**由资源状态决定：观察到这个地址明确空闲（ready）时清除（见
+           * clearManualSuppressionOfIdleResources）。因此刷新时正在运行、用户已关闭的 tab 不会被重开，
+           * 而子代理真正结束之后标记消失，下一次运行仍能正常自动打开。
+           *
+           * 读面走 quiet 通道：这条判据每轮同步都会执行，结论由下面那条决策诊断承担。
+           */
+          const persistedForOpen = readSidebarAutoOwnershipEntry(sidebarSessionId, rootSessionId, address, { quiet: true });
+          if (persistedForOpen !== null && persistedForOpen.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL) {
+            recordSidebarAutoDecision("open", { key, kind: "open" }, "skip", "persisted-manual");
+            continue;
+          }
           // 本次运行已经为它成功发出过打开动作：绝不重复打开（与失败无关，失败会撤销预留）。
           if (origin.has(key) === true) continue;
-          // 容量 fail-closed：Auto 归属账本已满且没有可淘汰的历史条目时，拒绝新的自动打开——
-          // 绝不淘汰仍可精确关闭的 Auto owner（那会让已打开的 tab 永久失去归属）。
-          if (autoSidebarOwnershipHasCapacity(key) !== true) continue;
+          /**
+           * 容量 fail-closed：内存账本或持久表装不下这条新 owner 时**不打开**（记 owner-capacity
+           * 诊断）。绝不为了腾位淘汰别的 scope 仍然有效的 owner——到达上限是可用性代价而不是错误：
+           * 用户仍然可以手动打开这个资源（手动打开照常写 manual 归属）。
+           */
+          if (autoSidebarOwnershipHasCapacity(key, address) !== true) {
+            recordSidebarAutoDecision("open", { key, kind: "open" }, "skip", "owner-capacity");
+            continue;
+          }
           // 已经有一个候选为它预留：同一资源绝不并发两个动作。
           if (reservations.has(key) === true) continue;
           if (sidebarTabPendingRef.current.has(key) === true) continue;
@@ -4428,8 +5114,14 @@
        * 上限淘汰（复合键跨 root 保留时的安全阀，见 SIDEBAR_AUTO_KEY_LIMIT）。
        *
        * activeAware = true 时优先淘汰「没有当前 record / 没有在途动作 / 没有验证 / 没有冷却」的历史条目；
-       * 若 128 项全是活动条目，则**什么都不淘汰**（fail-closed）：绝不丢掉仍可精确关闭的 Auto owner，
-       * 新增的自动打开改由 autoSidebarOwnershipHasCapacity 拒绝。false 保持既有语义（按插入顺序丢最旧）。
+       * 若 128 项全是活动条目，则**什么都不淘汰**（fail-closed）。false 保持既有语义（按插入顺序丢最旧）。
+       *
+       * 注意（缺陷 2）：这里调用 sidebarAutoCloseKeyIsActive 判「活动」，而它读的是**当前这个 Panel
+       * 实例**的在途状态与**当前 scope**的 record。因此这套淘汰只允许用在「条目重新出现时会自行重建」
+       * 的记账上（重试预算 / owner 令牌 / 冷却 / 抑制）。**归属账本不复用它**：那种判据会把别的
+       * root 仍然有效的 Auto owner 判成 inactive 淘汰掉（内存），那个 tab 从此永久脱离 Auto——
+       * 归属容量改由 autoOpenCandidate 在发出 openResource 之前 fail-closed 拒绝（不淘汰任何人），
+       * 见 autoSidebarOwnershipHasCapacity。
        */
       const trimAutoKeyMap = (map, activeAware) => {
         while (map.size > SIDEBAR_AUTO_KEY_LIMIT) {
@@ -4488,19 +5180,28 @@
         clearAutoCloseAttempt(key);
       };
       /**
-       * Auto 归属账本是否还有容纳新 key 的容量（fail-closed）。
+       * 新 owner 能不能被**内存账本 + 持久表**同时保留（fail-closed 容量判据，缺陷 2）。
        *
-       * 账本已满且没有任何可淘汰的历史条目时拒绝新的自动打开：宁可不开，也绝不淘汰仍可精确关闭的
-       * Auto owner（那会让一个已经打开的 tab 永久失去归属，正是本插件要修的症状）。
+       * 判据刻意与当前面板的局部状态无关：内存账本只回答「还装得下吗」（size < 上限），持久表由
+       * sidebarOwnershipAcceptsNewAuto 回答（写入之后 auto 条目数不越过上限）。**绝不**再看
+       * 「这个 key 在别的 scope 里是否活动」来决定谁可以被淘汰：
+       *
+       * - 旧实现在这里扫描整本 origin，用 sidebarAutoCloseKeyIsActive（它读的是**当前这个实例**的
+       *   pending / opening / reservation / verification / cooldown 与**当前 scope**的 record）挑一个
+       *   「不活动」的条目当可淘汰对象。别的 root / sidebar session 的条目在当前实例里天然「不活动」，
+       *   于是 B scope 打开 128 个资源就能把 A scope 仍然有效的 owner 判成 inactive 淘汰掉——A 那个
+       *   tab 从此永久脱离 Auto（自动关闭只遍历这本账本，刷新也不能恢复）。
+       * - 换成纯 LRU 同样不安全：淘汰依据只是「更旧」，而被淘汰的条目完全可能仍然对应一个打开的 tab。
+       *
+       * 因此到达上限时唯一的动作是**不开**（记录 owner-capacity 诊断，见 autoOpenCandidate）：
+       * 不打开只是可用性代价（用户仍可手动打开，手动打开照常写 manual 归属），而误淘汰是永久漏收。
+       * owner 释放（verified-closed / inventory-absent / tab-recycled / 资源重新运行等既有收口）之后，
+       * 新的自动打开自动恢复正常。
        */
-      const autoSidebarOwnershipHasCapacity = (key) => {
+      const autoSidebarOwnershipHasCapacity = (key, address) => {
         const origin = sidebarAutoOriginRef.current;
-        if (origin.has(key) === true) return true;
-        if (origin.size < SIDEBAR_AUTO_KEY_LIMIT) return true;
-        for (const candidate of origin.keys()) {
-          if (sidebarAutoCloseKeyIsActive(candidate) !== true) return true;
-        }
-        return false;
+        if (origin.has(key) !== true && origin.size >= SIDEBAR_AUTO_KEY_LIMIT) return false;
+        return sidebarOwnershipAcceptsNewAuto(sidebarSessionId, rootSessionId, address);
       };
       /**
        * 无条件收口一个 key 的共享自动关闭记账（重试预算 + owner 身份）。
@@ -4855,6 +5556,11 @@
           if (entry.manual === true && entry.address !== null && entry.address !== undefined) {
             sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: entry.address });
             trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+            // 手动关闭：抑制语义同步落到持久归属标记上（刷新之后同样绝不再当 auto）。
+            writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
+          } else if (entry.address !== null && entry.address !== undefined) {
+            // 验证关闭成功 / inventory 已证明这个 tabId 不在：归属标记同步删除，绝不残留陈旧 auto。
+            deleteSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, "verified-closed");
           }
         } else if (entry.attemptToken !== null && entry.attemptToken !== undefined) {
           // tabId 已经不属于这次验证：只按令牌结算本次动作自己的那一笔预算（owner 已被后来者替换时
@@ -5099,6 +5805,65 @@
         }
       };
       /**
+       * 回收「Auto 打开已经发出、tabId 始终没落地」的共享来源**占位**（缺陷 2）。
+       *
+       * 为什么必须有这一步：占位同时承担两件事——(a) autoOpenCandidate 靠 origin.has(key) 跳过
+       * 「本次运行已经为它打开过」，(b) 它占着归属账本的容量槽位（128）。宿主始终没落地该 tab 时，
+       * 这两件事都会变成长期伤害：资源明明还在 running，Auto 却既不再打开、又占着名额，一批这样的
+       * 占位就能把账本占满，让 Auto 再也开不出任何新 tab——只有整页刷新（内存账本归零）才能恢复。
+       *
+       * 判据（只在期限到达之后才动，期限见 SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS）：
+       * - 本 scope：先按当前 inventory **精确核对**。地址上仍然没有 tab ⇒ 释放占位，让下一轮外部同步
+       *   重新选出这个候选（一次有界重试：至少间隔一个 TTL 窗口，同一批微任务里还有失败屏障兜底）；
+       *   地址上已经有 tab ⇒ 同样释放（归属判定已经由 record / 收养路径接管，占位不再有意义）；
+       *   **inventory 读不出来 ⇒ 一律保留（fail-closed）**：读不到既不证明存在、也不证明不存在，
+       *   绝不当成「没有 tab」去释放。
+       * - 别的 scope：占位本身不是归属证据（tabId 为空），释放它不会授权任何关闭；而对方候选选择
+       *   必须在发出 openResource 之前重新核对它自己的 inventory，因此也不可能因此开出重复 tab。
+       *   为免打断另一个 surface 仍在进行中的打开，这里用 4 倍期限（FOREIGN_TTL）。
+       *
+       * 在途动作（pending / 本地 opening）绝不释放：那两种状态说明这次打开还在被观察，提前释放会让
+       * 尾随同步立刻再开一次。
+       */
+      const sweepAutoOpenPlaceholders = (running) => {
+        const originMap = sidebarAutoOriginRef.current;
+        if (originMap.size === 0) return;
+        const now = Date.now();
+        for (const [key, entry] of [...originMap]) {
+          // 已落地的条目（tabId 非空）由既有收口路径负责（verified-closed / inventory-absent /
+          // tab-recycled / resource-running），TTL 绝不去碰它们。
+          if (sidebarAutoOriginTabIdOf(entry) !== null) continue;
+          const age = now - sidebarAutoOriginWrittenAtOf(entry);
+          const scoped = entry.sessionId === sidebarSessionId && entry.rootSessionId === rootSessionId;
+          if (scoped !== true) {
+            if (age < SIDEBAR_AUTO_OPEN_PLACEHOLDER_FOREIGN_TTL_MS) continue;
+            originMap.delete(key);
+            recordSidebarAutoDiag({ kind: "ownership", event: "delete", reason: "placeholder-foreign-expired", key: sidebarAutoKeyDigest(key) });
+            continue;
+          }
+          if (age < SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS) continue;
+          if (sidebarTabPendingRef.current.has(key) === true) continue;
+          if (sidebarTabOpeningRef.current.has(key) === true) continue;
+          const state = sidebarResourceTabStateOf(entry.address);
+          if (state.readable !== true) {
+            // fail-closed：读不到 inventory 时保留占位，绝不把「读不到」当成「没有 tab」。
+            recordSidebarAutoDiag({ kind: "ownership", event: "keep", reason: "placeholder-unreadable", key: sidebarAutoKeyDigest(key) });
+            continue;
+          }
+          originMap.delete(key);
+          recordSidebarAutoDiag({
+            kind: "ownership",
+            event: "delete",
+            reason: state.tabId === null
+              ? (running !== null && running !== undefined && running.has(entry.address) === true
+                ? "placeholder-retry"
+                : "placeholder-released")
+              : "placeholder-superseded",
+            key: sidebarAutoKeyDigest(key),
+          });
+        }
+      };
+      /**
        * 放行一个自动动作。
        *
        * 复用用户点击的同一条入口（handleSidebarAction + origin=auto）：同一把 pending 锁、同一段
@@ -5107,11 +5872,23 @@
        */
       const launchAutoSidebarAction = (candidate) => {
         sidebarAutoBusyRef.current = true;
+        /**
+         * 自动打开/自动关闭决策的诊断记录（只记结论与 key 摘要，绝不记提示词/正文/令牌）：
+         * 候选选中时记一条 launch，结算/失败时再记一条，便于事后离线核对「某次构建之后这个 tab 为什么
+         * 没被收回去」。
+         */
+        recordSidebarAutoDecision("launch", candidate, "candidate");
         void Promise.resolve()
           // candidate 作为自动动作上下文（kind/epoch/预留）传入：动作必须在每个 await 之后
           // 复核它是否仍然有效，并在收尾时无条件释放预留（见 handleSidebarAction）。
           .then(() => handleSidebarAction(candidate.key, candidate.address, SIDEBAR_TAB_ORIGIN_AUTO, candidate))
-          .catch(() => { /* 打开/关闭失败只影响这一次动作：状态由既有记录与重试记账负责。 */ })
+          .then(
+            () => { recordSidebarAutoDecision("settle", candidate, "ok"); },
+            (error) => {
+              /* 打开/关闭失败只影响这一次动作：状态由既有记录与重试记账负责。 */
+              recordSidebarAutoDecision("settle", candidate, "failed", sidebarBoundedText(error === null || error === undefined ? undefined : error.message));
+            },
+          )
           .then(() => {
             sidebarAutoBusyRef.current = false;
             /**
@@ -5140,6 +5917,38 @@
           });
       };
       /**
+       * 观察到「资源已经明确空闲」时清除这个地址的 manual 抑制（内存 + 持久两层）。
+       *
+       * 清除时机只按**资源状态**判定（onIdle）：
+       * - 资源仍在运行（在 running 集合里）⇒ 一律保留：这正是「刷新时正在运行、用户已手动关闭的 tab」
+       *   的形状，清掉就等于把用户的关闭又撤销一次（P1-B）；
+       * - 资源已明确空闲（ready）⇒ 清除：这一轮运行已经结束，用户当时的关闭意图不再需要跨运行保留，
+       *   下一次运行必须能正常自动打开（否则一次手动关闭就永久关掉了这个地址的自动行为）；
+       * - 快照里既看不到运行也看不到空闲（暂时缺项 / 状态 unknown）⇒ 一律保留：那既不证明在运行、
+       *   也不证明已结束，按 fail-closed 不动。空闲集合由 idleSidebarResourceAddresses（与空闲分组的
+       *   成员判定同源）给出。
+       *
+       * 只清 manual：
+       * - 内存层（sidebarAutoSuppressedRef）与持久层是同一个语义的两份存储，必须一起清，否则刷新前的
+       *   内存抑制会继续挡住下一次运行；
+       * - **auto 标记绝不在这里清除**（origin !== manual 直接跳过）：一个正在等待收口的 auto tab 一旦
+       *   在空闲观察里被降级成 manual，就再也不会被自动收回——auto 仍只由 verified-close /
+       *   inventory-absent / tab-recycled 三条路径清除（见 deleteSidebarAutoOwnership 的说明）。
+       *
+       * 限项：只遍历当前 root 的空闲地址（快照已有），因此不会跨 scope 误清别的 root / session 的键
+       * （键由当前 sidebar session + root + 地址现算）。
+       */
+      const clearManualSuppressionOfIdleResources = (idle) => {
+        if (idle === null || idle === undefined || idle.size === 0) return;
+        for (const address of idle) {
+          const key = sidebarTabKey(sidebarSessionId, rootSessionId, address);
+          if (sidebarAutoSuppressedRef.current.has(key) === true) sidebarAutoSuppressedRef.current.delete(key);
+          const persisted = readSidebarAutoOwnershipEntry(sidebarSessionId, rootSessionId, address, { quiet: true });
+          if (persisted === null || persisted.origin !== SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL) continue;
+          deleteSidebarAutoOwnership(sidebarSessionId, rootSessionId, address, "resource-idle", { manual: true });
+        }
+      };
+      /**
        * 第二阶段：Auto（自动打开运行中的子代理侧栏）同步。
        *
        * 顺序固定为「先关后开」，并且只在有属于当前 root 的真实快照时动作：
@@ -5160,6 +5969,17 @@
         const known = knownSidebarResourceAddresses();
         const running = runningSidebarResourceAddresses();
         const enabled = autoOpenEnabled();
+        /**
+         * 先回收过期的打开占位（缺陷 2）：它只维护插件自己的记账、绝不触碰宿主，因此与 Auto 开关无关
+         * （与下面的记账清理同一条边界）。放在候选选择之前，被回收的容量当轮就能重新用上。
+         */
+        sweepAutoOpenPlaceholders(running);
+        /**
+         * manual 抑制的清除只由「明确空闲」驱动，且与 Auto 开关无关（与上面的记账清理同一条边界：
+         * 它只维护本插件自己的标记，绝不触碰宿主）。先清再选候选：清掉之后这一轮的开候选判据读到的
+         * 就是最新状态；空闲地址本来就不在 running 集合里，因此这一步不会为本次运行重新打开任何 tab。
+         */
+        clearManualSuppressionOfIdleResources(idleSidebarResourceAddresses(sidebarIdleChildren()));
         let candidate = null;
         if (enabled === true && sidebarAutoBusyRef.current !== true) {
           candidate = autoCloseCandidate(running) ?? autoOpenCandidate(running);
@@ -5290,6 +6110,7 @@
           if (recordScoped) {
             // 用户手动打开 = 他重新要这个会话：清除抑制，并把来源收回 manual（Auto 不得再自动关它）。
             record.origin = SIDEBAR_TAB_ORIGIN_MANUAL;
+            writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-open");
             sidebarAutoSuppressedRef.current.delete(key);
             sidebarAutoOriginRef.current.delete(key);
             // 手动接管这个 key：未结算的自动关闭预算（含 owner）一并作废，Auto 不得再按旧预算重试。
@@ -5304,6 +6125,8 @@
         // intent === "close"
         if (recordScoped) {
           sidebarManualIntentRef.current.delete(key);
+          // 手动关闭信号在这里就落持久标记（抑制写入要等验证收口，太晚；手动恒优先必须立刻生效）。
+          writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
           void handleSidebarAction(key, entry.address, SIDEBAR_TAB_ORIGIN_MANUAL);
           return;
         }
@@ -5314,12 +6137,14 @@
            */
           sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: entry.address });
           trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+          writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
           return;
         }
         // 没有可关闭的 tab：只登记抑制与撤销自动记账，绝不为了「执行关闭」先打开一个 tab。
         sidebarManualIntentRef.current.delete(key);
         sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: entry.address });
         trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+        writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
         sidebarAutoOriginRef.current.delete(key);
         // 手动关闭意图接管这个 key：未结算的自动关闭预算（含 owner）一并作废。
         clearAutoCloseAttempt(key);
@@ -5371,11 +6196,22 @@
        * - `contentId === 资源地址`：同一个 kind 下也可能是另一个子代理的地址。
        * 不满足时保持 >> 的打开语义（按钮照旧可再次点击打开），绝不猜测 tabId。
        *
-       * origin 的来源优先级：显式传入的动作来源 > 在途打开记录里记下的来源 > 已存在记录的来源 >
-       * **manual**。最后那条兜底正是规格要求：「外部已存在但未由自动动作发起的 tab 视为手动来源」，
-       * 因此自动同步永远关不掉一个它没有亲手打开过的 tab。
+       * origin 的来源优先级（缺陷 1 之后的定稿判据，**每一层都必须自带证据**）：
+       * 手动意图 / 持久 manual > 显式传入的动作来源（**且必须带因果证明**）> 已存在记录（**且 tabId
+       * 必须相等**）> 在途打开记录（**且因果证明成立**）> realm 共享来源账本（tabId 逐字相等）>
+       * 持久 auto（tabId 逐字相等）> **manual** 兜底。最后那条兜底正是规格要求：「外部已存在但未由
+       * 自动动作发起的 tab 视为手动来源」，因此自动同步永远关不掉一个它没有亲手打开过的 tab。
+       *
+       * 为什么「本次动作声明的来源」还不够：宿主 openResource() 的公开契约里**没有返回值**（返回
+       * void，见 lib/types/client/service.d.ts），而且默认 revealIfOpened=true —— 同一个
+       * (kind, contentId) 已经有 tab 时它**揭示那一个**，绝不新建。所以「调用过 openResource」+
+       * 「随后 inventory 里有一个同地址 tab」并不能证明那个 tab 是我们创建出来的：它完全可能是用户
+       * 在等待窗口里从 DSH 其它入口打开的同一个资源。认领它就等于事后替用户关掉他的 tab。
+       *
+       * 因此 actionProof.autoProven 只由「发出 openResource **之前**亲眼确认 inventory 可读、且该
+       * 地址没有已提交 tab」写成（见 handleSidebarAction 的因果证明点）。缺证明一律 manual。
        */
-      const recordSidebarTab = (key, resourceAddress, actionOrigin) => {
+      const recordSidebarTab = (key, resourceAddress, actionOrigin, actionProof) => {
         if (closeSidebarResource === null) return false;
          if (readActiveSidebarResource === null && readSidebarOpenTabs() === null) return false;
         // 左箭头图标缺失时不会渲染 <<，因此也不该建立只在 << 上才有意义的记录。
@@ -5383,6 +6219,13 @@
         const declaredOrigin = actionOrigin === SIDEBAR_TAB_ORIGIN_AUTO || actionOrigin === SIDEBAR_TAB_ORIGIN_MANUAL
           ? actionOrigin
           : null;
+        /**
+         * 本次动作是否带**因果证明**：只有 handleSidebarAction 的自动路径会传它，而且只在
+         * 「发出 openResource 之前 inventory 可读且该地址确实没有 tab」时为 true。
+         * 手动路径带 null（不需要证明：手动动作恒按 manual 记账）。
+         */
+        const declaredAutoProven = actionProof !== null && actionProof !== undefined
+          && actionProof.autoProven === true;
         let tab = null;
         const inventory = readSidebarOpenTabs();
         if (inventory !== null) {
@@ -5415,6 +6258,24 @@
         if (text(source.contentId, null) !== resourceAddress) return false;
         const previous = sidebarTabRecordsRef.current.get(key);
         const opening = sidebarTabOpeningRef.current.get(key);
+        const previousScoped = previous !== undefined
+          && previous.sessionId === sidebarSessionId && previous.rootSessionId === rootSessionId
+          ? previous
+          : undefined;
+        const openingScoped = opening !== undefined
+          && opening.sessionId === sidebarSessionId && opening.rootSessionId === rootSessionId
+          ? opening
+          : undefined;
+        /**
+         * 别的写入者证据（缺陷 1 的第二个判据）：这次打开**还没有**把 openResource 发给宿主
+         * （causalIssuedAt 还是 null），我们却已经能读到这个地址上的 tab —— 那只可能是别人先打开的
+         * （用户从 DSH 其它入口、或另一个 surface）。这次动作从此不再是这个 tab 的因果来源，落地
+         * 时一律按 manual 记账，并把它写进在途记录，后续任何一次落地观察都不会再翻案。
+         */
+        if (openingScoped !== undefined
+          && (openingScoped.causalIssuedAt === null || openingScoped.causalIssuedAt === undefined)) {
+          openingScoped.foreignWriter = true;
+        }
         /**
          * 手动接管优先于调用方声明的来源：用户在那个 key 上留下过「要打开」的手动意图时，即使这次
          * 打开是 Auto 发出的，最终 tab 也必须记成 manual——手动打开的最终来源必须是 manual，
@@ -5428,26 +6289,180 @@
          * 实例内的 previous 与 opening 也都是空的；唯一能证明「这个 tab 是 Auto 亲手打开的」的
          * 就是这条跨实例账本。缺了它，收养只能落到 manual 兜底，Auto 从此不再管这个 tab。
          *
-         * 只认显式记成 auto 的账本条目，并且必须同 session + 同 root：别的 scope 的条目一律不可见，
-         * 因此来源未知的外部 tab 与其它 pane 的同地址 tab 都不会被误收养成 Auto 的 tab。
+         * 只认显式记成 auto 的账本条目，并且必须同 session + 同 root、且绑定的 tabId 与当前证据
+         * 逐字相等（见下面的绑定闸门）：别的 scope 的条目一律不可见，来源未知的外部 tab、其它 pane
+         * 的同地址 tab，以及「同地址但已经换了 tabId」的 tab 都不会被误收养成 Auto 的 tab。
          */
         const sharedOrigin = sidebarAutoOriginRef.current.get(key);
         const sharedOriginScoped = sharedOrigin !== undefined
           && sharedOrigin.sessionId === sidebarSessionId && sharedOrigin.rootSessionId === rootSessionId
           ? sharedOrigin
           : undefined;
-        const origin = manualTakeover !== undefined && manualTakeover.intent === "open"
+        /**
+         * tabId 绑定闸门（缺陷 1，与持久条目那条闸门逐字同源，只是证据来自另一层）：
+         *
+         * 共享账本的条目里记着「Auto 打开/替换落地那一刻亲眼看到的 tab」。只要求「有条目」是不够的：
+         * 旧 tab 被用户或宿主移除而插件没有观察到时，同一个 realm 里的下一次收养（重挂载 / 记录被判
+         * stale 后的重建）会在同地址上看到**用户新开的 tab**——它的 tabId 与条目里那个不一样。不比对
+         * tabId 就按 auto 收养，等于替用户认领他刚打开的 tab，资源随后的 idle 就会把它自动关掉。
+         *
+         * 条目没有 tabId（null：这次自动打开已经发出、落地证据还没到）同样**不是** auto 证据：它只
+         * 回答「这次运行是否已经为它发过打开」，任何归属判定都必须按「证据不足」处理。
+         */
+        const sharedOriginTabId = sidebarAutoOriginTabIdOf(sharedOriginScoped);
+        const sharedOriginBound = sharedOriginTabId !== null && sharedOriginTabId === tabId;
+        const sharedOriginStale = sharedOriginScoped !== undefined && sharedOriginBound !== true;
+        /**
+         * 持久归属标记是「整页刷新 / 进程重启 / HMR 之后」唯一还活着的证据（见 SIDEBAR_AUTO_OWNERSHIP_KEY）：
+         * 命中 manual 一律 manual（手动恒优先，安全侧）；命中 auto 还要过下面那条 tabId 绑定闸门才按
+         * auto 收养；没有标记按既有 manual 兜底。内存（含 realm 共享账本）与持久层不一致时以 manual
+         * 为准，并在下面把内存来源一并抹掉，绝不留「内存 auto / 持久 manual」的歧义。
+         */
+        const persistedEntry = readSidebarAutoOwnershipEntry(sidebarSessionId, rootSessionId, resourceAddress);
+        const persistedManual = persistedEntry !== null && persistedEntry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL;
+        /**
+         * tabId 绑定闸门（P1-A）：持久 auto 条目只认「写入时那个 tab」。
+         *
+         * 条目里的 tabId 是记录这条 auto 归属时宿主 inventory 里这个地址的 tab。整页刷新之后持久条目
+         * 是唯一还活着的证据，而右栏里同地址的 tab 完全可能是**另一次 tab 创建**出来的（旧 tab 被用户
+         * 或宿主移除而插件没观察到、用户随后从 DSH 其它入口打开同一地址）。不比对 tabId 就按 auto 收养，
+         * 等于替用户认领他刚打开的 tab——资源随后 idle，Auto 就会把它关掉。
+         *
+         * 判定顺序（三档，manual 恒优先）：
+         * 1. manual：手动意图（manualIntentOpen）/ 持久 manual 一律 manual，安全侧；
+         * 2. 陈旧 auto：持久条目的 tabId 与当前证据不符（或旧格式条目根本没记 tabId）⇒ 它**不再**
+         *    作为 auto 证据参与收养。若内存里也没有别的来源证据，最终落到下面的 manual 兜底，并在统一
+         *    写入点把这条陈旧条目改写成 manual（理由 manual-stale-auto），避免它长期误导后续判断；
+         * 3. auto：只有「内存来源证据」或「tabId 逐字相等的持久 auto」才认 auto。
+         *
+         * 为什么内存证据（本次动作声明的来源 / 已有记录 / 在途打开）仍然优先：它们是**本 realm 亲眼
+         * 观察到的** Auto 动作；但「亲眼观察」必须落实到**证据**上，不能只凭「有一个 auto 来源」：
+         * - 本次动作声明的来源（declaredOrigin）：必须带因果证明（actionProof.autoProven，见上面的
+         *   说明）——宿主 openResource 没有返回值、而且默认是「已存在就揭示」，光调用过它不足以
+         *   证明随后出现的那个 tab 是我们创建的；
+         * - 已有记录（previous.origin）：必须 previous.tabId === 当前落地 tabId —— 记录说的是
+         *   「T 这个 tab 归 Auto」，宿主换了一个新 id 之后这条记录已经不指向任何还在我们手里的 tab；
+         * - 在途打开（opening）：必须 causalProof === "proven"（发出之前亲眼确认地址上没有 tab）、
+         *   causalIssuedAt 非空（openResource 真的发出去过）、且 foreignWriter 未置位（期间没有
+         *   观察到别的写入者）。
+         * 而 realm 共享来源账本与持久条目各要多过一道 tabId 逐字相等的绑定闸门。任何一层缺证据都
+         * 按安全侧落 manual：宁可漏收一次，也绝不误关用户刚打开的 tab。
+         *
+         * 取舍（刻意）：本机页面刷新时宿主从它自己的持久化布局里带回**同一批 tabId**，因此正常刷新场景
+         * 仍然恢复 auto；只有宿主真的重新 mint 了 id 时才退化成 manual——宁可漏收一次（那个 tab 留在
+         * 右栏里交给用户手动处理，绝不会自己消失），也绝不误关一个可能是用户刚打开的 tab。
+         */
+        const persistedAutoBound = persistedEntry !== null
+          && persistedEntry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
+          && persistedEntry.tabId !== null
+          && persistedEntry.tabId === tabId;
+        const persistedStaleAuto = persistedEntry !== null
+          && persistedEntry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
+          && persistedAutoBound !== true;
+        /**
+         * 内存两层的证据闸门（缺陷 1）：
+         * - previous：记录必须**绑定当前这个 tabId**，否则那条 auto 记录描述的是另一个已经不存在的
+         *   tab（宿主重 mint / 回收），继承它就等于替用户认领他刚打开的 tab；
+         * - opening：因果证明成立、openResource 真的发出过、期间没有别的写入者（见 causalProof /
+         *   causalIssuedAt / foreignWriter 的说明）。
+         */
+        const previousUsableAuto = previousScoped !== undefined
+          && previousScoped.origin === SIDEBAR_TAB_ORIGIN_AUTO
+          && previousScoped.tabId === tabId;
+        const openingUsableAuto = openingScoped !== undefined
+          && openingScoped.origin === SIDEBAR_TAB_ORIGIN_AUTO
+          && openingScoped.causalProof === "proven"
+          && openingScoped.causalIssuedAt !== null && openingScoped.causalIssuedAt !== undefined
+          && openingScoped.foreignWriter !== true;
+        /**
+         * 声明的来源也要过证据闸门：声明 auto 但缺因果证明时**直接落 manual**，绝不继续借用更弱的
+         * 层（那正是缺陷 1 的误关形状：这次落地可能压根不是我们的动作打出来的那个 tab）。
+         */
+        const declaredUsable = declaredOrigin === SIDEBAR_TAB_ORIGIN_AUTO
+          ? (declaredAutoProven === true ? SIDEBAR_TAB_ORIGIN_AUTO : SIDEBAR_TAB_ORIGIN_MANUAL)
+          : declaredOrigin;
+        const manualIntentOpen = manualTakeover !== undefined && manualTakeover.intent === "open";
+        const origin = manualIntentOpen || persistedManual
           ? SIDEBAR_TAB_ORIGIN_MANUAL
-          : (declaredOrigin
-            ?? (previous !== undefined && previous.sessionId === sidebarSessionId && previous.rootSessionId === rootSessionId
-              ? previous.origin
-              : null)
-            ?? (opening !== undefined && opening.sessionId === sidebarSessionId && opening.rootSessionId === rootSessionId
-              ? opening.origin
-              : null)
-            ?? (sharedOriginScoped !== undefined ? SIDEBAR_TAB_ORIGIN_AUTO : null)
-            ?? SIDEBAR_TAB_ORIGIN_MANUAL);
+          : (declaredUsable
+            ?? (previousUsableAuto === true
+              ? SIDEBAR_TAB_ORIGIN_AUTO
+              : (openingUsableAuto === true
+                ? SIDEBAR_TAB_ORIGIN_AUTO
+                : (sharedOriginBound === true
+                  ? SIDEBAR_TAB_ORIGIN_AUTO
+                  : (persistedAutoBound === true ? SIDEBAR_TAB_ORIGIN_AUTO : SIDEBAR_TAB_ORIGIN_MANUAL)))));
         const recordOrigin = origin === SIDEBAR_TAB_ORIGIN_AUTO ? SIDEBAR_TAB_ORIGIN_AUTO : SIDEBAR_TAB_ORIGIN_MANUAL;
+        /**
+         * 证据存在但 tabId 对不上（或根本没有 tabId）时，那条共享账本条目已经被这一轮判定为**不是**
+         * 本次归属的证据，必须就地清掉：它会一直躺在 realm 账本里，在下一次收养里继续参与判断
+         * （长期误导），也会让「本次运行已经为它发过打开」这条去重记账与真实状态脱节。
+         *
+         * 清掉不会造成重复打开：这个地址此刻确实有 tab（收养的前提就是 inventory 里读到了它），
+         * autoOpenCandidate 的「inventory 里已经有这个地址的 tab」判据会照常跳过。持久 manual 与
+         * 内存 auto 的歧义同样按 manual 清理（既有语义）。
+         */
+        if (sharedOriginStale === true
+          || (persistedManual === true && sharedOriginScoped !== undefined)) {
+          sidebarAutoOriginRef.current.delete(key);
+        }
+        /**
+         * 归属成立（auto）时，把**当前亲眼观察到的 tabId** 写进共享来源账本：关闭候选的遍历与
+         * 「绝不重复打开」的记账都长在这份账本上，两者本来就是同一份归属证据；缺了它，收养出来的
+         * record 虽然是 auto，Auto 却永远不会再为它选出关闭候选（仍然漏收）。
+         *
+         * 这里也是**唯一**允许刷新 tabId 的位置之一（另一个是 handleSidebarAction 里 openResource
+         * 成功落地的那次调用）：tabId 一律来自本次从宿主 inventory / active 读到的证据，绝不缓存、
+         * 绝不猜测。刻意不做任何限容淘汰——归属容量由 autoOpenCandidate 在发出 openResource 之前
+         * fail-closed 判定（见 autoSidebarOwnershipHasCapacity），收养路径绝不允许挤掉别的 scope
+         * 仍然有效的 owner。
+         */
+        if (recordOrigin === SIDEBAR_TAB_ORIGIN_AUTO) {
+          sidebarAutoOriginRef.current.set(
+            key,
+            sidebarAutoOriginEntry(sidebarSessionId, rootSessionId, resourceAddress, tabId),
+          );
+        }
+        /**
+         * 归属标记与内存账本在**同一处**收口（写入 / 删除同源）：
+         * - auto：DEG 自己成功打开（openIssued 成功落地）时写 auto-open；收养证据证明是 Auto 时写
+         *   auto-adopt。同一地址此前若是 manual，必须由这次自动打开改回 auto（这是插件新开的一次自动行为）；
+         * - manual：手动打开 / 手动接管 / 来源未知的外部 tab 一律写 manual（手动恒优先）。
+         */
+        writeSidebarAutoOwnership(
+          sidebarSessionId,
+          rootSessionId,
+          resourceAddress,
+          recordOrigin === SIDEBAR_TAB_ORIGIN_AUTO ? SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO : SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,
+          recordOrigin === SIDEBAR_TAB_ORIGIN_AUTO
+            ? (declaredOrigin === SIDEBAR_TAB_ORIGIN_AUTO ? "auto-open" : "auto-adopt")
+            /**
+             * 陈旧 auto 被降级成 manual 时用独立理由：诊断里据此能区分「用户手动接管」
+             * （manual-takeover）与「某条 auto 证据的 tabId 与当前 tab 不符，按安全侧退让」两种完全
+             * 不同的原因，事后排查「这个 tab 为什么没被自动收回」时才有的放矢。
+             *
+             * - manual-stale-auto：持久条目的 tabId 与当前 tab 不符（跨整页刷新的那条证据）；
+             * - manual-stale-origin：realm 共享来源账本的 tabId 与当前 tab 不符或缺席（同一次页面
+             *   会话内、宿主重 mint 了 tabId 而插件没有观察到那次替换）；
+             * - manual-unproven-open：本次自动打开**没有**因果证明（发出前没能确认地址上没有 tab），
+             *   或因果证明成立却在途期间观察到了别的写入者——落地到的这个 tab 无法与「用户自己打开的
+             *   同一个资源」区分，按安全侧落 manual（缺陷 1）。
+             */
+            : (manualIntentOpen === true
+              ? "manual-open"
+              : (persistedStaleAuto === true
+                ? "manual-stale-auto"
+                : (sharedOriginStale === true
+                  ? "manual-stale-origin"
+                  : (declaredOrigin === SIDEBAR_TAB_ORIGIN_AUTO && declaredAutoProven !== true
+                    ? "manual-unproven-open"
+                    : (openingScoped !== undefined && openingScoped.origin === SIDEBAR_TAB_ORIGIN_AUTO
+                      && openingUsableAuto !== true && previousUsableAuto !== true
+                      ? "manual-unproven-open"
+                      : "manual-takeover"))))),
+          // 条目与内存账本同源写入当前的 tabId：下一次刷新后的收养按它比对（见上面的绑定闸门）。
+          tabId,
+        );
         if (previous !== undefined && previous.sessionId === sidebarSessionId
           && previous.rootSessionId === rootSessionId && previous.tabId === tabId) {
           previous.title = tabTitle ?? previous.title;
@@ -5478,6 +6493,21 @@
        */
       const handleSidebarAction = async (key, resourceAddress, actionOrigin, autoAction) => {
         const origin = actionOrigin === SIDEBAR_TAB_ORIGIN_AUTO ? SIDEBAR_TAB_ORIGIN_AUTO : SIDEBAR_TAB_ORIGIN_MANUAL;
+        /**
+         * 手动来源的动作在入口就把归属标记改写成 manual（手动恒优先，且必须在任何 await 之前落盘）：
+         * 有记录 ⇒ 用户在关闭这个 tab（manual-close）；没有记录 ⇒ 用户在打开它（manual-open）。
+         * 这条写入同时抹掉内存里的共享来源，绝不留「内存 auto / 持久 manual」的歧义。
+         */
+        if (origin === SIDEBAR_TAB_ORIGIN_MANUAL) {
+          const manualRecord = sidebarTabRecordsRef.current.get(key);
+          writeSidebarAutoOwnership(
+            sidebarSessionId,
+            rootSessionId,
+            resourceAddress,
+            SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,
+            manualRecord === undefined ? "manual-open" : "manual-close",
+          );
+        }
         const autoContext = origin === SIDEBAR_TAB_ORIGIN_AUTO && autoAction !== null && typeof autoAction === "object"
           ? {
             kind: autoAction.kind === "close" ? "close" : "open",
@@ -5723,6 +6753,7 @@
                 if (origin === SIDEBAR_TAB_ORIGIN_MANUAL) {
                   sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
                   trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+                  writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, resourceAddress, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
                 }
               }
 
@@ -5745,6 +6776,17 @@
             if (autoContext === null) return "proceed";
             if (autoContext === null) return "proceed";
             if (autoActionStillValid(autoContext) !== true) return "abort";
+            /**
+             * 这里刻意**不**再加一道「持久 manual ⇒ abort」的闸门（持久抑制的判据只落在候选选择处，
+             * 见 autoOpenCandidate）。原因：这条路是「候选已经选中、正在等宿主布局」的在途窗口，窗口里
+             * 出现的 manual 条目可能来自用户**手动打开同一个资源**（handleSidebarAction 的入口写入），
+             * 那种形状的既有契约是「这一次打开照常发出，但最终 tab 记成 manual」（见 autoTakeoverStateOf
+             * 的 "open" 分支与「等待布局期间手动打开」用例）；在这里 abort 会连同用户的手动意图一起
+             * 丢掉（那次点击不会补发 openResource）。
+             *
+             * 窗口里的「手动关闭」不依赖持久条目：它由 applyPendingManualIntent 立刻写抑制，并且
+             * autoTakeoverStateOf 返回 "close" ⇒ 下面直接 abort，行为逐字不变。
+             */
             const takeover = autoTakeoverStateOf(key);
             if (takeover === "close") return "abort";
             if (takeover === "open") return "manual";
@@ -5764,6 +6806,20 @@
               resourceAddress,
               expiresAt: Date.now() + SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS,
               origin,
+              /**
+               * 因果证明状态（缺陷 1）：这一次打开到底凭什么说「随后落地的那个 tab 是我们创建的」。
+               *
+               * - causalProof："pending"（还没判）→ "proven"（发出 openResource 之前亲眼确认
+               *   inventory 可读且该地址没有已提交 tab）/ "failed"（有 tab 或读不到，一律不认领）；
+               * - causalIssuedAt：openResource 真正发给宿主的时刻（null = 还没发出）。在此之前读到
+               *   同地址 tab 只可能是**别的写入者**；
+               * - foreignWriter：期间观察到别的写入者的证据（见 recordSidebarTab 的置位点）。
+               *
+               * 三个字段缺一不可：任何一层不成立都不允许把落地证据认成 auto（宁可漏收一次）。
+               */
+              causalProof: "pending",
+              causalIssuedAt: null,
+              foreignWriter: false,
             });
           }
           /**
@@ -5845,6 +6901,7 @@
                   // 用户要的是关闭：立刻登记抑制，Auto 不得在下一轮同步里把它重新选成候选。
                   sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
                   trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+                  writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, resourceAddress, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
                 }
                 return;
               }
@@ -5892,20 +6949,118 @@
               // 用户要的是关闭：立刻登记抑制，绝不在同一轮或下一轮同步里把这个资源重新打开。
               sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
               trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+              writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, resourceAddress, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
             }
             return;
           }
           if (beforeOpenReview === "manual") effectiveOrigin = SIDEBAR_TAB_ORIGIN_MANUAL;
-          openSidebarResource.call(sidebarRight, resourceAddress, openOptions);
+          /**
+           * 副作用之前的**因果证明**（缺陷 1，与复核点在同一个同步段里，中间没有任何 await）。
+           *
+           * 宿主 openResource() 的公开契约里没有返回值（void），默认 revealIfOpened=true —— 同一个
+           * (kind, contentId) 已经有 tab 时它只是**揭示**那一个。因此「我们调用过 openResource」+
+           * 「随后 inventory 里出现同地址 tab」并不构成因果：那个 tab 完全可能是用户刚刚从 DSH 其它
+           * 入口打开的同一个资源。这里在发动作之前亲眼核对一次：
+           * - inventory 可读、且该地址没有已提交 tab ⇒ 之后出现的那个 tab 只可能是本次调用打出来的
+           *   （同一帧内没有别的写入者能插进来），记为 proven；
+           * - 已经有 tab（用户在等待窗口里打开了它）、或 inventory 读不出来（证明不了）⇒ 一律降级
+           *   manual：这次调用最多只是揭示别人的 tab，绝不认领、绝不在资源结束后把它关掉。
+           *
+           * 取舍（刻意）：宁可漏收一次（那个 tab 留在右栏交给用户手动处理），也绝不误关用户刚打开的
+           * tab。手动路径（autoContext === null）不需要证明：它本来就记 manual。
+           */
+          let openProof = null;
+          if (autoContext !== null) {
+            const openWitness = sidebarResourceTabStateOf(resourceAddress);
+            const autoProven = openWitness.readable === true && openWitness.tabId === null;
+            openProof = { autoProven };
+            if (autoProven !== true) {
+              /**
+               * 刻意**不**在这里改 effectiveOrigin：留成 auto 才能让「声明过 auto 但缺因果证明」这个
+               * 事实一路带到来源判据（recordSidebarTab 的 declaredUsable ⇒ manual，理由
+               * manual-unproven-open，诊断里一眼能看出是**没证明出来**而不是用户手动接管）。
+               * 占位写入与最终归属都由 openProof 把关。
+               */
+              recordSidebarAutoDecision("open", { key, kind: "open" }, "downgrade", "causal-unproven");
+            }
+            const pendingOpening = sidebarTabOpeningRef.current.get(key);
+            if (pendingOpening !== undefined
+              && pendingOpening.sessionId === sidebarSessionId && pendingOpening.rootSessionId === rootSessionId) {
+              pendingOpening.causalProof = autoProven === true ? "proven" : "failed";
+            }
+          }
+          /**
+           * 「已发出」标记必须写在**调用之前**、与调用处在同一个同步段里（时序加固，可用性阻塞）。
+           *
+           * 宿主链路（已按实现核实，见 @deepseek-ai/dsh-client-ui-sidebar-right/lib/client.js 与
+           * client-store 的 snapshot store）：openResource → store.actions.openContent → zustand setState
+           * 的同步 forEach → adopt() 里 store.subscribe(sync) 注册的回调 → inventory.publish() →
+           * openTabs.set → 插件在挂载期注册的 inventory 订阅回调。整条链路上没有任何 await / 微任务，
+           * 宿主因此会在 openResource() **返回之前**同步重入本插件一次（syncSidebarTabs →
+           * syncSidebarTabRecords → 对在途 opening 调 recordSidebarTab）。
+           *
+           * 若标记晚于这次重入写入（旧实现），重入结算读到的 causalIssuedAt 还是 null，于是按
+           * 「别的写入者」置位 foreignWriter 并把 tab 记成 manual、落盘持久 manual 归属；随后的声明式
+           * Auto 记录又被持久 manual 压制，资源结束也收不回来（不会误关，但正常自动收回失效）。
+           *
+           * 三件套一条都不放宽：标记只让重入结算把这次 landing 认作**本次调用**打出来的 tab，是否可作
+           * auto 证据仍由 recordSidebarTab 判：发出前 inventory 可读且该地址无 tab（causalProof ===
+           * "proven"）+ 标记非空 + 期间没有别的写入者（foreignWriter !== true）。调用**同步抛错**时立刻
+           * 回滚标记（下面的 try/catch），绝不留下「已经发出」的假证据。
+           */
+          const issuedOpening = autoContext === null ? undefined : sidebarTabOpeningRef.current.get(key);
+          const issuedOpeningScoped = issuedOpening !== undefined
+            && issuedOpening.sessionId === sidebarSessionId && issuedOpening.rootSessionId === rootSessionId
+            ? issuedOpening
+            : undefined;
+          // 回滚用的原值：畸形值按 null（「还没发出」）处理，绝不把脏值留在记录里。
+          const issuedAtBefore = issuedOpeningScoped === undefined
+            || issuedOpeningScoped.causalIssuedAt === null || issuedOpeningScoped.causalIssuedAt === undefined
+            ? null
+            : issuedOpeningScoped.causalIssuedAt;
+          if (issuedOpeningScoped !== undefined) issuedOpeningScoped.causalIssuedAt = Date.now();
+          try {
+            openSidebarResource.call(sidebarRight, resourceAddress, openOptions);
+          } catch (error) {
+            /**
+             * 同步抛错：宿主没有完成这次打开，这次调用必须回到「从未发出」的状态——否则任何一条把它们
+             * 联系起来的后续判据（重入结算 / 重试 / 收养）都可能把失败的动作当成已发出的证据。
+             * 回滚后原样抛出，交给外层 catch 收口（撤销来源占位、清掉在途记录）。
+             */
+            if (issuedOpeningScoped !== undefined) issuedOpeningScoped.causalIssuedAt = issuedAtBefore;
+            throw error;
+          }
           openIssued = true;
           /**
            * 预留 → 来源的升级点：只有 openResource 真的成功发出、且宿主具备可追踪能力（能读到 tabId、
            * 能精确关闭）时，才把这次打开记成「Auto 亲手打开」。openResource 抛错时直接走 catch，
            * 来源标记绝不写；能力不足时也不写——将来无法精确回收的 tab 不归 Auto 管。
            */
-          if (effectiveOrigin === SIDEBAR_TAB_ORIGIN_AUTO && canTrackOpen === true) {
-            sidebarAutoOriginRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
-            trimAutoKeyMap(sidebarAutoOriginRef.current, true);
+          if (effectiveOrigin === SIDEBAR_TAB_ORIGIN_AUTO && canTrackOpen === true
+            && openProof !== null && openProof.autoProven === true) {
+            /**
+             * 此刻落地证据还没到（tabId 未知）：这里只写下「本次运行已经为它发出过一次 Auto 打开」
+             * 这条去重记账，tabId 一律留空——它不是归属证据（见 sidebarAutoOriginEntry）。真正的
+             * tabId 只由 recordSidebarTab 在宿主 inventory 里**亲手读到那个 tab** 时写入 / 刷新。
+             *
+             * 刻意不做限容淘汰：归属容量由候选选择阶段在发出 openResource 之前 fail-closed 判定
+             * （见 autoSidebarOwnershipHasCapacity），这里绝不允许挤掉别的 scope 仍然有效的 owner。
+             *
+             * 覆盖闸门（时序加固）：这次打开可能在**调用内部**就已经被重入结算（宿主同步发布 inventory，
+             * 见上面「已发出」标记的说明），结算会把**真实 tabId** 写进这条账本条目。那条条目比占位强，
+             * 绝不能用 tabId=null 的占位把它覆盖回「落地证据还没到」：覆盖会让这条账本条目短暂失去
+             * tabId 绑定（紧接着的声明式 recordSidebarTab 通常会按当时的证据重新写下绑定，但那条写入
+             * 依赖「此刻还读得到 tabId」；读不到时这次丢失就一直留着），此后重挂载 / 重收养只能看到共享
+             * 账本，绑定失配即退化 manual，Auto 再也收不回这个 tab——与本次加固要修的症状同类。
+             * 只放行「没有 tabId」的写入（含条目缺失 / 畸形值），其余一律保留现场。
+             */
+            const landedOriginEntry = sidebarAutoOriginRef.current.get(key);
+            if (sidebarAutoOriginTabIdOf(landedOriginEntry) === null) {
+              sidebarAutoOriginRef.current.set(
+                key,
+                sidebarAutoOriginEntry(sidebarSessionId, rootSessionId, resourceAddress, null),
+              );
+            }
           }
           if (splitToken !== null) {
             let acknowledged = true;
@@ -5919,7 +7074,8 @@
             }
           }
           // 记录必须发生在 openResource 之后：它读的是宿主提交后的 active tab，是打开的证据。
-          const opened = recordSidebarTab(key, resourceAddress, effectiveOrigin);
+          // openProof 把「发出之前地址上没有 tab」这条因果证据一路带进来源判据（见 recordSidebarTab）。
+          const opened = recordSidebarTab(key, resourceAddress, effectiveOrigin, openProof);
           // 只要这次打开的 tab 已经落定，就不能留下 opening 记录：它的语义是「这次打开还没有确定
           // 证据」（split 事务仍在等待 pane 证据、或本来就没有事务时都一样）。残留的 opening 会让
           // 用户收回这个 tab 之后的下一次同步把关闭记录重新建回来（<< 复活），并把之后的点击挡成
@@ -6029,6 +7185,8 @@
              * absent / recycled / unreadable 一律跳过这一项，绝不按 active tab 或渲染时快照猜一个 id。
              */
             if (sidebarTabPresenceInInventory(tabId, candidateAddress) !== "present") continue;
+            // 批量关闭是显式手动语义：按候选地址把持久标记改写成 manual（手动恒优先）。
+            writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, candidateAddress, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
             /**
              * 与单 tab 关闭共用同一个执行入口（同一把 session + root + tabId 租约 + 结算信号）：
              * 这个 tab 上已经有一次关闭在途时（典型：用户刚点的单项箭头还停在宿主 Promise 里），
@@ -6277,13 +7435,15 @@
        * 的 childId），缺失时只用快照证据。运行状态本身必须继续来自目录 activity 与 DEG 元数据，
        * 目录项缺失也绝不把 running 猜成 ready。
        */
-      const runtimeStatusOfNode = (node, parentId, childId) => runtimeStatusOf(
+      const runtimeStatusOfNode = (node, parentId, childId, options) => runtimeStatusOf(
         node,
         catalogEntryOf(parentId, childId ?? text(object(node).sessionId, null)),
+        options,
       );
 
       const renderExpert = (node, index, parentId) => {
-        const runtimeStatus = runtimeStatusOfNode(node, parentId);
+        // 轻量快照里没有活动证据的专家行渲染中性圆点（不声明已结束），完整快照不受影响。
+        const runtimeStatus = runtimeStatusOfNode(node, parentId, undefined, { partial: partialSnapshot });
         return react.createElement("div", { key: node.id || node.sessionId || "expert-" + index, className: "deg_expert_group_node" },
           react.createElement("div", { className: "deg_expert_group_row", "data-status": runtimeStatus, "data-expanded": true },
             statusIcon(react, primitives, runtimeStatus),
@@ -6310,9 +7470,12 @@
         // 空闲分组的批量候选只来自当前 idleChildren；运行中的专家或分片会被排除。
         // slot 与计数标题同属第三列的 inline flex，标题按可用宽度省略，slot 不会被推到行尾。
         if (trailing !== undefined && trailing !== null) idleTitleChildren.push(trailing);
+        // 轻量快照下分组容器同样不声明「已结束」：它收纳的成员状态可能还没被完整读取，
+        // 因此容器圆点跟随成员的中性态；完整快照仍按既有 ready 圆点渲染。
+        const idleGroupStatus = partialSnapshot === true ? neutralRuntimeStatus : "ready";
         return react.createElement("div", { className: "deg_expert_group_idle_group", "data-expanded": open },
-          react.createElement("div", { className: "deg_expert_group_row deg_expert_group_idle_header", "data-status": "ready", "data-expanded": open },
-            statusIcon(react, primitives, "ready"),
+          react.createElement("div", { className: "deg_expert_group_row deg_expert_group_idle_header", "data-status": idleGroupStatus, "data-expanded": open },
+            statusIcon(react, primitives, idleGroupStatus),
             renderChevron(group, open),
             react.createElement("div", { className: "deg_expert_group_idle_title_line" }, ...idleTitleChildren)),
           open ? react.createElement("div", { className: "deg_expert_group_children deg_expert_group_idle_children" }, members.map((node, index) => node.kind === "fanout" ? renderFanout(node, index) : renderExpert(node, index, rootSessionId))) : null);
@@ -6441,23 +7604,29 @@
 
       const children = Array.isArray(snapshot?.root?.children) ? snapshot.root.children : [];
       // 普通专家按实际运行状态分组，fan-out 父任务则按 manager 的聚合终态进入空闲组。
+      // 轻量快照（partial）下没有活动证据的专家是 unknown：既不进空闲组、也不进空闲关闭候选，
+      // 先留在主代理下，等完整快照到达后按完整证据恢复既有归组（见 sidebarNodeIsIdleReady）。
       // fan-out 展示与取消/重试仍使用各自的 manager 状态，不受分组位置影响。
       const idleChildren = sidebarIdleChildren();
       const visibleChildren = children.filter((node) => !idleChildren.includes(node));
       // 两行标题后的批量 slot 内容：主代理行只覆盖运行中的普通专家/最新分片，空闲标题行只覆盖
-      // idleChildren。两者都只在渲染期纯读 openTabs inventory 与 close 能力（inventory 读不出来、
+      // idleChildren（因此天然继承同一套证据规则：unknown 成员不在其中，绝不成为关闭候选）。
+      // 两者都只在渲染期纯读 openTabs inventory 与 close 能力（inventory 读不出来、
       // 或候选存在但 close 缺失时返回 null，不渲染任何东西）；打开能力不参与这里的判定。
       const rootBatchSlot = renderSidebarBatchSlot(runningSidebarResourceAddresses(), "运行中的子代理");
       const idleBatchSlot = renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren), "空闲子代理");
       const root = snapshot?.root;
       const rootOpen = root === null ? true : expand(root);
+      // 根行的圆点走与专家行同一条 partial 规则：轻量快照里没有活动证据的根会话渲染中性圆点，
+      // 而不是「已结束」的绿色圆点；完整快照与旧宿主下与既有渲染逐字一致。
+      const rootStatus = runtimeStatusOf(root, null, { partial: partialSnapshot });
       const body = viewState.loading && snapshot === null
         ? react.createElement("div", { className: "deg_expert_group_tree", "aria-busy": "true" }, react.createElement("div", { className: "deg_expert_group_skeleton" }), react.createElement("div", { className: "deg_expert_group_skeleton" }))
         : snapshot === null
           ? react.createElement("div", { className: "deg_expert_group_empty" }, "暂无 Expert Group 任务")
           : react.createElement("div", { className: "deg_expert_group_tree" },
             react.createElement("div", { className: "deg_expert_group_node deg_expert_group_node_root", "data-root": "true" },
-              react.createElement("div", { className: "deg_expert_group_row", "data-status": runtimeStatusOf(root, null), "data-expanded": true }, statusIcon(react, primitives, runtimeStatusOf(root, null)), renderChevron(root, rootOpen), react.createElement("div", null, renderThreeLines(root, { sessionId: root.sessionId, parentId: null, expanded: true, trailing: rootBatchSlot }))),
+              react.createElement("div", { className: "deg_expert_group_row", "data-status": rootStatus, "data-expanded": true }, statusIcon(react, primitives, rootStatus), renderChevron(root, rootOpen), react.createElement("div", null, renderThreeLines(root, { sessionId: root.sessionId, parentId: null, expanded: true, trailing: rootBatchSlot }))),
               rootOpen ? react.createElement("div", { className: "deg_expert_group_children" }, [
                 ...visibleChildren.map((node, index) => node.kind === "fanout" ? renderFanout(node, index) : renderExpert(node, index, rootSessionId)),
                 renderIdleGroup(idleChildren, idleBatchSlot),
