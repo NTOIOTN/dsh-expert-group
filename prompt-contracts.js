@@ -6,7 +6,8 @@
  * - 专家专属 persona 是用户可自定义的部分：默认值由本文件维护，用户覆盖来自
  *   dsh-expert-group settings namespace 的 promptOverrides 字段。
  * - 固定执行纪律由代码维护且不可编辑：无论用户覆盖成什么，解析结果都会在末尾
- *   追加一次固定纪律，因此覆盖永远删除不掉叶子 worker、send_message 与交付协议约束。
+ *   追加一次固定纪律（英文短句，覆盖叶子 worker、send_message 与五标题交付协议），
+ *   因此覆盖永远删除不掉这些约束。
  * - 用户输入按普通文本处理：这里只做字符串拼接，不做任何模板变量替换或转义，
  *   花括号、美元符号、换行都原样保留。
  *
@@ -15,17 +16,16 @@
  */
 import { listRoles, requireRole } from "./role-registry.js";
 
-export const ROLE_TOOL_ADMISSION_CONTRACT = [
-  " 调用专家工具派发任务时，prompt 必须统一使用中文，第一句必须是“你是 XXX 子代理。”且作为第一行；任务正文必须自包含，写明 workspace 路径、允许范围和预期验证。固定 child 纪律由 persona、toolFilter 和 runtime guard 注入和执行，主代理不要在任务正文重复写入 send_message、叶子 worker 或最终 assistant 输出规则。",
-  " 非阻塞 admission 会创建或复用一个 durable continuable child，并返回 childId、admissionEpoch 和 admissionToken；run_in_background 仅为兼容输入，省略、true、false 都不会等待 child 的最终输出或反馈。",
-  " 普通 role 语义不是「每个 parent 每个 role 只有一个活动 child」：归一化后完全相同的任务复用**它自己**那个 child（reused，不新建、不投递）；不同任务各自新建独立 child，同一个 parent+role 下可以并存多个 child。不同 prompt 绝不会被自动当成旧 child 的续作或 steer，也不会取消旧 child。",
-  " 续作必须显式指定 childId（此前回执里的 subagentId）：带 childId 时本轮 prompt 只投递给该 child；不带 childId 时一律按新任务派发。childId 必须是当前 root 该角色已知的专家 child，否则返回无 admission 凭据的 rejected（CHILD_NOT_FOUND）而不派发。childId 与 cancelChildId 只要出现就必须是非空且非纯空白的字符串：空串、纯空白或非字符串一律 fail-closed 返回 rejected（code 为 INVALID_CHILD_ID / INVALID_CANCEL_CHILD_ID），既不派发也不新建 child。取消同样必须用 cancelChildId 显式定位单个 child（公开 subagents.interrupt），绝不按 parent+role 猜目标，因此不会误取消同 scope 的其他独立 child；未知或不属于本 root 该角色的目标返回无 admission 凭据的 rejected（CHILD_NOT_FOUND），既不会登记 admission 也不会 interrupt。",
-  "只有设置 continue_parent_turn:true 前检查 affectedPaths 并明确确认任务独立且范围不重叠；否则必须检查每个结果，并使用准确 epoch 和完整 token 集调用 root-only dsh_expert_group_finalize。",
-  "对校验通过、且至少含一个 accepted work 的批次，finalize 先登记本批全部已接受工作，再立即返回带 admissionEpoch 与 acceptedCount 的非终态 waiting 回执：waiting 只表示「等待已登记」，不表示专家已完成、批次已收口或已有终态结论，工具调用本身并不等专家结束，因此不会长时间占用 run_code 的执行预算。收到 waiting 后不要再次调用 finalize，也不要轮询或重试——waiting 不是异步 task handle，没有 status 查询接口，重复调用 finalize、反复 list_agents 或自造状态查询都不必要。",
-  "等待由插件在 root turn 的 turn-stopping 生命周期边界用同一张 wait 账本继续：root turn 保持打开且没有超时（专家可能运行数小时），直到本批每一个精确关联的专家任务真正结束；随后插件以 DEG 插件来源，向同一 root run 的后续模型 step 投递一次收口结论（含 finalized、admissionEpoch 与 acceptedCount），专家任务的具体结果仍由 DSH 的结算通知提供。该投递是插件内部在生命周期边界上的实现细节，不是模型可调用的操作：模型仍然不要直接调用 Agent.whenIdle/Agent.steer，也不要声称存在未公开的 FIFO 队列。",
-  "role 调用不会结束 root，DSH 会在稍后交付 feedback；queue=true 只在带 childId 的显式续作下生效（经公开的 subagents.sendMessage 投递，只排队不请求取消），不能把它当作等待机制。",
-  "role 工具仅允许 root 使用，child 是叶子 worker。显式续作使用公开的 manager sendMessage；带 childId 且 queue=false 可以先经公开的 interrupt 请求取消再投递同一 sendMessage。RC1 sendMessage 可以在运行 child 的最近边界 steer；不要直接调用 Agent.whenIdle/Agent.steer，也不要声称存在未公开的 FIFO 队列。非成功任务最多自动重试 5 次，之后才判定为最终失败。",
-].join("");
+/**
+ * role tool 的固定派发契约（英文，随每个 role tool description 下发）。
+ *
+ * 只保留 ROLE_TOOL_ADMISSION_CONTRACT 需要的五项边界：任务自包含 + workspace 路径 +
+ * 允许范围 + 预期验证 + affectedPaths。完整编排协议留在 root prompt（orchestrator.js），
+ * child 固定纪律由 persona/toolFilter 与 runtime guard 在 admission 边界注入到 child
+ * 自身，因此这里绝不重复复制它们——否则每个 tool schema 都会背上一份长文本，抬高
+ * 宿主展示成本与上下文占用。
+ */
+export const ROLE_TOOL_ADMISSION_CONTRACT = " Every expert dispatch prompt must be self-contained: state the workspace path, the allowed scope, the expected verification, and the affectedPaths. The fixed child discipline is injected by the plugin on the child itself, so never restate it in the task body.";
 
 /**
  * 生产注册与测试共用同一个 builder，避免源码正则复制或重建实际 tool description。
@@ -85,10 +85,14 @@ export function buildObserverVisualTask() {
  *
  * 与专家专属 persona 分开保存，解析有效 persona 时在末尾追加一次；因此用户哪怕
  * 把覆盖文本写成空字符串语义（纯空白会被写入边界拒绝）也删除不掉这些约束。
+ *
+ * 文本固定为英文短句：角色 persona 本身是英文，纪律与它同语言可避免中英混排带来的
+ * token 浪费与语义漂移；语义与原先的中文条款严格等价，五项最终输出标题保持中文原文
+ * （它们是交付协议要求的字面标题，翻译会改变最终交付行为）。
  */
-export const NO_DELEGATION_RULE = " 专家是叶子 worker：禁止委派或创建其他子代理，禁止调用 workflow/ralph/goal 工具；只能完成父代理交付的单一范围，缺少前置条件时在最终结果中报告给父代理。";
-export const SEND_MESSAGE_RULE = " 禁止直接调用 send_message，也不得通过 run_code 间接调用 send_message；不要主动向父代理发送消息。";
-export const FINAL_SUMMARY_RULE = " 使用中文完成任务，并仅在最终 assistant 输出中交付结果；不得通过 report 或其他工具发送中间或最终总结。最终输出必须严格按以下五个独立标题依次组织，且不能增加其他标题：任务结果；关键发现或修改内容；实际变更文件；验证结果；未完成项或阻塞原因。若没有文件修改或未完成项/阻塞，也必须明确说明。";
+export const NO_DELEGATION_RULE = " You are a leaf worker: never delegate or create other subagents, and never call workflow, ralph, or goal tools. Complete only the single scope your parent handed you; if a prerequisite is missing, report it to your parent in your final result.";
+export const SEND_MESSAGE_RULE = " Never call send_message directly, and never reach it indirectly through run_code; do not proactively message your parent.";
+export const FINAL_SUMMARY_RULE = " Do the task in Chinese and deliver the result only in your final assistant output; never send an interim or final summary through report or any other tool. That final output must use exactly these five independent headings, in this order, and add no others: 任务结果；关键发现或修改内容；实际变更文件；验证结果；未完成项或阻塞原因. If nothing was changed, or nothing is unfinished or blocked, say so explicitly.";
 
 /** 追加到专家专属 persona 之后的固定执行纪律（顺序固定，便于回归断言）。 */
 export const FIXED_EXPERT_DISCIPLINE = NO_DELEGATION_RULE + SEND_MESSAGE_RULE + FINAL_SUMMARY_RULE;
@@ -138,6 +142,9 @@ export const DEFAULT_EXPERT_PERSONA = Object.freeze(Object.fromEntries(listRoles
  *
  * 无论有没有自定义覆盖，固定执行纪律都恰好追加一次，因此覆盖只能替换专家专属
  * 部分，不能删除工具过滤、权限边界或交付协议。纯字符串拼接，不做模板替换。
+ *
+ * 交付通道：返回值经 request.persona 交给 RC1 child composition，由宿主应用到 child
+ * 系统提示词 section（不再拼进首条任务消息），因此不要在 prompt 里重复注入它。
  *
  * @param {string} role - 专家角色 id（未注册角色抛 UNKNOWN_ROLE）。
  * @param {string|undefined} override - 该角色的自定义覆盖（空白视为没有覆盖）。

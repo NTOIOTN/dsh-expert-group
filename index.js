@@ -38,7 +38,7 @@ import {
   recoveryDispatchCanStart, recoveryOpIsAccepted, recoveryOpCanBeSuperseded, interruptFailureCanFallback,
   isSubagentCapacityError, createSubagentCapacityError, describeSubagentCapacityFailure, SUBAGENT_CAPACITY_MESSAGE,
   applyTurnToTasks, taskKeysForTurn, supersedeTaskBindings, rebindPendingTaskByClaimed, evictOldestEntries,
-  shouldRebuildRecoveryChild, shouldInstallRebuiltChild, recoveryRebuildCanCommit, sameDurableSessionId, createSessionGenerationState, createHandoffFailureRegistry, restrictableDenyNames, readonlyDenyCandidates, isReadonlyDynamicMcpName,
+  shouldRebuildRecoveryChild, shouldInstallRebuiltChild, recoveryRebuildCanCommit, sameDurableSessionId, createSessionGenerationState, createHandoffFailureRegistry, readonlyDenyCandidates, isReadonlyDynamicMcpName,
   rememberClaimedPlaceholder, takePendingCreation, rollbackCreatedChildAcceptance, shouldForgetTask,
   STATUS_ROLE_IDS, PROMPT_OVERRIDES_SETTINGS_KEY, PROMPT_OVERRIDE_MAX_GRAPHEMES,
   PROMPT_OVERRIDE_INVALID_CODE, PROMPT_OVERRIDE_UNKNOWN_ROLE_CODE,
@@ -604,6 +604,42 @@ const CONTINUABLE_MARKER = "__degExpertContinuable";
 /** 子代理 child.options 上携带 admission 时计算出的完整 deny 清单，供 RC1 runtime guard 使用。 */
 const DENY_MARKER = "__degExpertDeny";
 
+/**
+ * 子代理 child.options 上携带 admission 时解析出的完整 persona（专家专属部分 + 固定纪律）。
+ *
+ * 与 deny marker 同源同形：Host recovery 不持久化 RC1 agentOptions，因此该值会随
+ * child_models 快照一起落盘，供冷恢复的 composition 兜底重建系统提示词——那时 settings
+ * 覆盖可能已经被改过，既有 child 必须继续使用它创建时的人格。它只是内部快照，
+ * 绝不进入任务 prompt，也不出现在任何用户可见文案里。
+ */
+const PERSONA_MARKER = "__degExpertPersona";
+
+/**
+ * persona marker 的长度上限（UTF-16 code unit）。
+ *
+ * 自定义专家提示词的写入上限是 PROMPT_OVERRIDE_MAX_GRAPHEMES（grapheme 口径），固定执行
+ * 纪律再由 resolveExpertPersona 追加一次；grapheme 与 code unit 不是 1:1（星平面字符占
+ * 2 个 code unit），因此按 2 倍上限再加纪律余量。marker 是 durable 快照，超限一律视为
+ * malformed 并回退到当前 admission 解析，不让异常逃逸到 child 创建路径。
+ */
+const MAX_EXPERT_PERSONA_MARKER_CHARS = PROMPT_OVERRIDE_MAX_GRAPHEMES * 2 + 2048;
+
+/**
+ * 校验 persona marker 的形状。
+ *
+ * 快照可能来自旧版本、被外部改写的 durable 数据或第三方写入，因此只接受明确合法的
+ * 非空字符串；其余（undefined/null/数字/对象/超限字符串）一律返回 undefined，
+ * 让调用方回退到 recorded 快照或当前 admission 解析，而不是把任意值注册成系统提示词。
+ *
+ * @param {unknown} value - 待校验的 marker 值。
+ * @returns {string|undefined} 合法 persona 文本；不合法时 undefined。
+ */
+function validPersonaMarker(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_EXPERT_PERSONA_MARKER_CHARS
+    ? value
+    : void 0;
+}
+
 /** 只有同时带插件角色与父会话 marker 的有效专家 child 才安装 report/send_message guard。 */
 const EXPERT_ROLES = new Set(listRoles().map((entry) => entry.id));
 const EXPERT_REPORT_GUARD_REASON = "插件专家 child 不允许调用 report；请在最终 assistant 输出中按五个固定标题交付结果。";
@@ -691,9 +727,11 @@ export function shouldBlockExpertSendMessage(options, execution, identity) {
 const MAX_EXPERT_DENY_MARKER_ENTRIES = 512;
 
 /**
- * 解析 child 的完整工具 deny 边界。RC1 不再消费 request.toolFilter，因此新 child
- * 优先使用 admission marker；没有 marker 的旧恢复记录则按角色静态清单兜底，
- * 未知角色按只读处理，避免历史数据缺字段时意外扩大权限。
+ * 解析 child 的完整工具 deny 边界。RC1 会把 request.toolFilter 交给 child composition
+ * 执行一次 tools.restrict，但那份 request 不是 DEG 的持久化事实来源（宿主不还原
+ * cold-resume 的 request.toolFilter），所以运行期 guard 与冷恢复一律以 admission marker
+ * 为权威快照；没有 marker 的旧恢复记录则按角色静态清单兜底，未知角色按只读处理，
+ * 避免历史数据缺字段时意外扩大权限。
  *
  * marker 是 admission 时的可见性快照，但静态策略候选仍要在 runtime guard 中合并：
  * parent 的工具视图可能在 child 生命周期内变化，不能因当时不可见而漏拦新增可见的
@@ -731,6 +769,479 @@ function shouldBlockExpertDeniedTool(options, execution, identity) {
   if (denyNames === void 0) return "插件专家 child deny marker 无效，已拒绝工具调用";
   if (!denyNames.has(execution.name)) return void 0;
   return `插件专家 child 禁止调用工具 ${execution.name}`;
+}
+
+/** DSH 的 deployment persona 前缀 section 名：与宿主 applyChildOverrides 同名才能让 scoped 注册遮蔽全局同名项。 */
+const EXPERT_PERSONA_PREFIX_SECTION = "deployment:persona-prefix";
+/** DSH SECTION_ORDERS.DEPLOYMENT_PERSONA_PREFIX 的固定排序值；宿主缺 getSectionOrder 时用它兜底。 */
+const EXPERT_PERSONA_PREFIX_ORDER = 0;
+
+/** 稳定提取 error 文案：日志只接受字符串，避免把任意值拼进告警。 */
+function compositionErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 读取宿主 scope 视图里「可以交给 tools.restrict()」的名称集合。
+ *
+ * dsh-tools 的 restrict() 只接受 `view(scope).restrictableNames`：它由全局层与祖先层构成，
+ * own 层注册不进入该集合（own 层天然豁免于 restriction）。因此这既是 restrict() 的准入判据，
+ * 也是「哪些名字交给 restrict 不会让整次调用抛错」的唯一权威来源；注意同名工具可以同时存在于
+ * inherited 与 own 两层（例如全局 send_message 与 child 自己的遮蔽定义）。
+ * scope 形如 child Agent / 父 Agent（宿主自己就用 `chainLayers(exec.agent)`）；
+ * 传 undefined 表示无作用域的全局视图。宿主没有 view() 或返回形状不符时返回 undefined，
+ * 让调用方回退到可见性探针。
+ *
+ * @param {object} toolService - 宿主 tools 服务。
+ * @param {object} [scope] - 视图作用域（Agent 对象）；undefined 表示全局视图。
+ * @returns {Set<string>|undefined} 可 restrict 名称集合；不可用时 undefined。
+ */
+function restrictableScopeNames(toolService, scope) {
+  try {
+    if (typeof toolService?.view !== "function") return void 0;
+    const names = toolService.view(scope)?.restrictableNames;
+    return names !== void 0 && names !== null && typeof names.has === "function" ? names : void 0;
+  } catch {
+    // view() 不可用（宿主版本差异、替身形状不符）只代表判据缺失，不能让 composition 失败。
+    return void 0;
+  }
+}
+
+/**
+ * 把 deny 候选收窄为宿主 tools.restrict() 会接受的名称。
+ *
+ * 优先使用 scope 视图的 restrictableNames（与 restrict() 内部同一判据：全局层 + 祖先层，
+ * 含 agent preset 落在祖先层的工具名）；拿不到该 API 时回退到可见性探针（无作用域的
+ * tools.get 只看全局层）。两条路径都必须排除 run_code：它是 Code Mode 展示传输，
+ * 既不是可 restrict 的工具，restrict() 也会直接拒绝。
+ *
+ * 为什么必须用宿主自己的判据：探针只回答「当前解析到某个定义」，不回答「能否 restrict」。
+ * 凡不在 restrictableNames 里的名字交给 restrict() 都会让**整次** restriction 抛错，
+ * 连带丢掉 report 等真实 deny；反之被过滤掉的名称继续由既有执行期防线覆盖
+ * （expertGuardDenyNames + shouldBlockExpertDeniedTool / shouldBlockExpertSendMessage），
+ * cold-resume 也按同一份 marker/快照恢复同一边界，因此「schema 未隐藏」只是降级，不是权限缺口。
+ *
+ * @param {string[]} names - admission 的完整 deny 清单。
+ * @param {Set<string>|undefined} restrictableNames - 宿主作用域视图的可 restrict 名称。
+ * @param {Function} [isVisible] - 没有 restrictableNames 时的可见性探针。
+ * @returns {string[]} 可以安全交给 tools.restrict 的名称。
+ */
+function restrictableDenyNamesInScope(names, restrictableNames, isVisible) {
+  const candidates = names.filter((name) => name !== "run_code");
+  if (restrictableNames !== void 0) return candidates.filter((name) => restrictableNames.has(name));
+  if (typeof isVisible !== "function") return candidates;
+  // 只保留探针明确报告 true 的名称：false 与探针异常同样按"不可 restrict"处理。
+  return candidates.filter((name) => {
+    try { return isVisible(name) === true; } catch { return false; }
+  });
+}
+
+/** 宿主 guidance 判定读取的工具名：DEG 在 child 自身作用域遮蔽同名全局定义。 */
+const EXPERT_SHADOW_SEND_MESSAGE_NAME = "send_message";
+
+/**
+ * shadow 生效性判定结果。取值集合同时是 child_models 里 [SHADOW_MARKER] 的合法值
+ * （durable schema 用同一个显式枚举约束），不要再新增其它取值。
+ * - verified    ：child 视图解析到的正是本次注册的遮蔽定义 → 宿主 guidance 判定不命中
+ * - absent      ：child 视图解析不到任何 send_message → 宿主判定同样不命中
+ * - foreign     ：child 视图解析到的是**别人的**定义 → 宿主可能追加引导段 → fail loud
+ * - unavailable ：宿主没有 tools.register 能力 → 兼容层保持 no-op（不抛错）
+ * - unverified  ：无法判定（没有 tools.get、没有 scope，或 get 抛错）→ 只记录（不抛错）
+ */
+const SHADOW_STATUS = Object.freeze({
+  VERIFIED: "verified",
+  ABSENT: "absent",
+  FOREIGN: "foreign",
+  UNAVAILABLE: "unavailable",
+  UNVERIFIED: "unverified",
+});
+
+/** shadow 判定结果的 durable marker 名（与 __degExpertDeny/__degExpertPersona 同层风格）。 */
+const SHADOW_MARKER = "__degSendMessageShadow";
+
+/**
+ * Agent -> { status, reason }：shadow 判定的详细信息。
+ *
+ * WeakMap 以 Agent 对象为键，Agent 回收即随之消失，不跨 child 保留。
+ * 键必须是显式传入的 child Agent（spec.scope），绝不从 childCtx 读未注入的懒 agent getter。
+ */
+const expertShadowStatusByAgent = new WeakMap();
+
+/**
+ * childId -> status：供 child_models 快照（writeChildModel / writeChildModelPatch）读取。
+ *
+ * 只在 child 存活期间保留：composition disposer 释放时删除，避免跨 child 泄漏；
+ * admission 被拒（foreign）的 child 不会写快照，因此那条映射在抛错前删除。
+ */
+const expertShadowStatusByChildId = new Map();
+
+/** 供持久化路径读取的 marker 片段；没有判定结果（非 DEG child / 未安装 shadow）时返回空对象。 */
+function shadowMarkerFields(childId) {
+  const status = typeof childId === "string" ? expertShadowStatusByChildId.get(childId) : void 0;
+  return status === void 0 ? {} : { [SHADOW_MARKER]: status };
+}
+
+/** 删除某 child 的进程内状态映射（disposer 释放、或 admission 被拒时调用）。 */
+function forgetExpertShadowStatus(childId) {
+  if (typeof childId === "string" && childId.length > 0) expertShadowStatusByChildId.delete(childId);
+}
+
+/**
+ * 用**对象身份**判定 child 实际会解析到哪个 send_message 定义。
+ *
+ * 为什么不读宿主的 adjacent symbol：DEG 既不 import 宿主 internal，也不构造该 symbol；
+ * 而 dsh-tools 的 get(name, scope) 返回注册时存进去的**同一个对象**（不做克隆），因此
+ * 「解析结果 === 本次注册的定义」这一身份比对与「宿主 guidance 判定不会命中」严格等价，
+ * 不需要任何宿主私有标记。own 层条目覆盖同名 inherited（view() 语义），所以 shadow 生效时
+ * 必然相等。
+ *
+ * 三态与「是否可判定」分开：拿不到判据（没有 get、没有 scope、get 抛错）时返回 unverified，
+ * 调用方只记录、不抛错；只有确证解析到**别人的**定义时才是 foreign。
+ *
+ * @param {object|undefined} definition - 本次注册的定义；宿主没有 register 能力时为 undefined。
+ * @param {object} toolService - 宿主 tools 服务。
+ * @param {object} [scope] - child Agent（显式传入，绝不从 childCtx 读懒 getter）。
+ * @returns {{status:string, reason:string}} 判定结果与人类可读原因。
+ */
+function resolveShadowStatus(definition, toolService, scope) {
+  if (definition === void 0) {
+    // 用词刻意避开 "unavailable" 之外的同义描述：该词只在 unavailable 分支出现，
+    // 保证日志按 "unavailable" grep 时不会同时命中 unverified。
+    return { status: SHADOW_STATUS.UNAVAILABLE, reason: "the host child tool scope provides no tools.register" };
+  }
+  const scopeUsable = scope !== null && scope !== undefined
+    && (typeof scope === "object" || typeof scope === "function");
+  if (!scopeUsable) {
+    return { status: SHADOW_STATUS.UNVERIFIED, reason: "no child scope (Agent) was provided for verification" };
+  }
+  if (typeof toolService?.get !== "function") {
+    return { status: SHADOW_STATUS.UNVERIFIED, reason: "the host child tool scope provides no tools.get" };
+  }
+  let resolved;
+  try {
+    resolved = toolService.get(EXPERT_SHADOW_SEND_MESSAGE_NAME, scope);
+  } catch (error) {
+    return { status: SHADOW_STATUS.UNVERIFIED, reason: "tools.get threw: " + compositionErrorMessage(error) };
+  }
+  if (resolved === void 0 || resolved === null) {
+    return { status: SHADOW_STATUS.ABSENT, reason: "the child scope resolves no send_message at all" };
+  }
+  if (resolved === definition) {
+    return { status: SHADOW_STATUS.VERIFIED, reason: "the child scope resolves the DEG fail-closed shadow" };
+  }
+  return { status: SHADOW_STATUS.FOREIGN, reason: "the child scope resolves a different send_message definition" };
+}
+
+/**
+ * 记录 shadow 判定结果：Agent 键（WeakMap）保存详情，childId 键（Map）供 child_models 快照读取。
+ *
+ * @param {object} [scope] - child Agent。
+ * @param {string} status - SHADOW_STATUS 之一。
+ * @param {string} reason - 人类可读原因。
+ * @returns {string|undefined} 该 child 的 session id（用于后续清理）。
+ */
+function recordExpertShadowStatus(scope, status, reason) {
+  if (scope !== null && scope !== undefined && (typeof scope === "object" || typeof scope === "function")) {
+    expertShadowStatusByAgent.set(scope, { status, reason });
+  }
+  let childId;
+  try {
+    childId = typeof scope?.id === "string" && scope.id.length > 0 ? scope.id : void 0;
+  } catch {
+    // 严格 Context / 懒 getter 抛错时按「没有 childId」处理：状态仍记在 Agent 键上。
+    childId = void 0;
+  }
+  if (childId !== void 0) expertShadowStatusByChildId.set(childId, status);
+  return childId;
+}
+
+/**
+ * child scope -> 已安装 shadow 的记录（定义对象 + disposer + 判定结果）。
+ *
+ * own 层同层重名会让宿主 register() 抛错，因此同一 child scope 只允许注册一次：
+ * 重复 agent/created / 重复安装 composition 在这里直接短路（幂等，不产生第二个 disposer，
+ * 也不产生告警噪声），但判定结果仍会被复用。disposer 释放后删除表项，允许后续重新安装。
+ */
+const expertShadowSendMessageDisposers = new WeakMap();
+
+/**
+ * 构造 child 自身作用域里的 send_message 遮蔽定义。
+ *
+ * 为什么需要：宿主在提交首条任务消息前读取 `tools.get("send_message", child)`，只有解析到的
+ * 定义带 adjacent 标记（Symbol.for("dsh.subagent.adjacentAgentSendMessageTool")）时，才把
+ * 「Your parent agent id … send_message …」引导段追加进首条任务消息。dsh-tools 的语义是
+ * own 层注册遮蔽 inherited（全局/祖先）定义、且 restriction 不影响 own 层注册，因此在 child
+ * 作用域注册同名定义即可让该判定解析到本定义，引导段不再污染 buildExpertTaskPrompt 的两段结构。
+ *
+ * 形状与宿主 tool-subagent-control 的全局 send_message 完全一致（参数、输出 schema、render），
+ * 让模型可见的工具契约不漂移；但本定义刻意**不带** adjacent 标记 —— 既不 import 宿主的
+ * internal 模块，也不自己构造该 symbol。
+ *
+ * execute 是纯 fail-closed：本定义不持有任何服务引用（连 ctx 都没有），绝不转发
+ * ctx.subagents.sendMessage 或任何其它投递通道，也不产生消息投递副作用，直接抛错。
+ * 已知代价：child 的 schema 里仍会出现一个不可用的 send_message，由 child guard 与本定义
+ * 的拒绝共同兜底。
+ *
+ * @returns {object} 可直接交给宿主 tools.register() 的工具定义。
+ */
+function createShadowedExpertSendMessageDefinition() {
+  return defineTool({
+    name: EXPERT_SHADOW_SEND_MESSAGE_NAME,
+    description: "Unavailable in this expert child: dsh-expert-group replaces send_message with a fail-closed definition, so every call is rejected. Never call it; deliver your result only in your final assistant output, using the five fixed headings required by your discipline.",
+    parameters: {
+      agent_id: {
+        type: "string",
+        required: true,
+        description: "Ignored: this definition always rejects. The agent id of your direct continuable child, or your direct parent when you are a resident continuable child.",
+      },
+      message: {
+        type: "string",
+        required: true,
+        description: "Ignored: this definition always rejects. The message that would have been delivered.",
+      },
+    },
+    output: {
+      // 输出 schema 与宿主标准 send_message 保持同一形状，避免工具契约在 child 内漂移；
+      // 这里永远只会抛错，因此 render 只是形状占位。
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { messageId: { type: "string", required: true } },
+      },
+      render(_args, _value) {
+        return [{ type: "text", text: "send_message is unavailable in this expert child (dsh-expert-group)" }];
+      },
+    },
+    isConcurrencySafe: () => false,
+    execute() {
+      throw new Error("dsh-expert-group: send_message 对专家 child 不可用；结果只在最终 assistant 输出中按固定标题交付，不走任何投递通道");
+    },
+  });
+}
+
+/**
+ * 在 child 自身作用域注册 send_message 遮蔽定义，并校验它是否真的生效。
+ *
+ * 幂等：同一 child scope 已处理过就直接复用记录（不重复注册、不抛错、不产生第二个 disposer）。
+ * 降级：宿主没有 tools.register（精简替身）→ unavailable，不抛错；register() 抛错
+ * （同层重名、形状校验失败）→ 保留既有 warning 文案后继续判定。
+ *
+ * 判定永远发生在注册尝试**之后**（注册抛错时也要判定：那时 child 很可能解析到别人的定义）：
+ * 用 tools.get("send_message", scope) 取回 child 实际会解析到的定义，与本次注册的定义做
+ * 身份比对，得到 verified / absent / foreign / unavailable / unverified。
+ * 只有 foreign 由调用方 fail loud；其余状态只记录。
+ *
+ * 释放：返回的 disposer 与其它 composition disposer 一样由调用方统一释放，释放后清理幂等表项。
+ *
+ * @param {object} childCtx - child Agent 的 scoped context。
+ * @param {Function} warn - 非致命告警回调。
+ * @param {object} [scope] - child Agent（视图作用域）；显式传入，绝不从 childCtx 读懒 getter。
+ * @returns {{dispose:(() => void)|undefined, status:string, reason:string}} 安装结果与判定。
+ */
+function installShadowedExpertSendMessage(childCtx, warn, scope) {
+  const toolService = childCtx?.tools;
+  const cacheable = childCtx !== null && childCtx !== undefined
+    && (typeof childCtx === "object" || typeof childCtx === "function");
+  const cached = cacheable ? expertShadowSendMessageDisposers.get(childCtx) : void 0;
+  if (cached !== void 0) {
+    // 幂等：本 scope 只注册一次；判定结果沿用首次记录（宿主视图变化由宿主自己负责）。
+    return { dispose: void 0, status: cached.status, reason: cached.reason };
+  }
+
+  let definition;
+  let dispose;
+  if (typeof toolService?.register === "function") {
+    definition = createShadowedExpertSendMessageDefinition();
+    try {
+      const registered = toolService.register(definition);
+      if (typeof registered === "function") dispose = registered;
+    } catch (error) {
+      // 既有告警前缀保持不变（可 grep）；注册失败本身不抛错，是否 fail loud 由下面的判定决定。
+      warn("dsh-expert-group: expert child composition fallback could not shadow send_message: " + compositionErrorMessage(error));
+    }
+  }
+
+  const verdict = resolveShadowStatus(definition, toolService, scope);
+  if (verdict.status === SHADOW_STATUS.UNVERIFIED) {
+    // 可 grep 的专用告警：无法证明 shadow 生效，只能记录（既不拒绝 child，也不静默）。
+    warn("dsh-expert-group: expert child send_message shadow could not be verified (unverified): " + verdict.reason);
+  }
+  if (verdict.status === SHADOW_STATUS.UNAVAILABLE) {
+    // 可 grep 的专用告警：宿主的 child 作用域没有 tools.register 能力，DEG 无法注册遮蔽定义；
+    // 若宿主仍能看到全局相邻 Agent 的 send_message，它就会照常追加 parent/send_message 引导段。
+    // 这仍然**非致命**：精简替身/能力缺失保持兼容层 no-op 语义，绝不因此拒绝 child。
+    // 告警词与 unverified 明确区分，便于区分「能力缺失的兼容性退化」与「无法判定」。
+    // 文案自带全部事实（不追加 reason：unavailable 的 reason 是固定串，追加只会重复同一句）。
+    warn("dsh-expert-group: expert child send_message shadow is unavailable (unavailable): "
+      + "the host child tool scope has no tools.register capability, so DEG cannot register its fail-closed send_message shadow; "
+      + "the host may therefore append the parent/send_message return guidance paragraph to this child's first task message.");
+  }
+
+  const record = { definition, status: verdict.status, reason: verdict.reason };
+  const owned = dispose === void 0 ? void 0 : () => {
+    try {
+      dispose();
+    } finally {
+      if (cacheable && expertShadowSendMessageDisposers.get(childCtx) === record) expertShadowSendMessageDisposers.delete(childCtx);
+    }
+  };
+  if (cacheable) expertShadowSendMessageDisposers.set(childCtx, record);
+  return { dispose: owned, status: verdict.status, reason: verdict.reason };
+}
+
+/** 解析宿主 SECTION_ORDERS 中的 persona 前缀排序；缺失或非有限值时退回 DSH 固定值 0。 */
+function resolvePersonaPrefixOrder(promptService) {
+  const order = typeof promptService?.getSectionOrder === "function"
+    ? promptService.getSectionOrder("DEPLOYMENT_PERSONA_PREFIX")
+    : void 0;
+  return Number.isFinite(order) ? order : EXPERT_PERSONA_PREFIX_ORDER;
+}
+
+/**
+ * 旧 RC1 startLocal 兼容层：把 admission 算出的 child composition 直接补到 child 自己的
+ * scoped context 上（persona + 工具 deny 边界）。
+ *
+ * 为什么需要：部分宿主版本的 RC1 初次创建路径只把 descriptor 写进 child session，不把
+ * request.persona / request.toolFilter 应用到 child scope。结果是 expert child 既拿不到
+ * 角色系统提示词，又仍然"看得见" send_message；宿主一旦在 child 视图里解析到带 adjacent
+ * 标记的 send_message，就会把 parent agent id、send_message 调用说明与结果回传要求追加到
+ * 首条任务消息，污染 buildExpertTaskPrompt 的「身份行 + 任务正文」两段结构。
+ *
+ * 三步（顺序有语义）：
+ * ① 在 child 自身作用域注册 send_message 遮蔽定义：own 层遮蔽 inherited，使宿主的
+ *    `get("send_message", child)` 解析到不带 adjacent 标记、且 fail-closed 的定义；
+ *    随后用对象身份比对判定它是否真的生效。
+ * ② 施加 admission 的 deny：只把当前 scope 的 restrictableNames 里的名字交给
+ *    tools.restrict()，避免 own 层名称让整次 restriction 抛错。
+ * ③ 注册角色 persona section（与宿主 child composition 同名，作用域内遮蔽全局默认项）。
+ *
+ * 时机：调用点在 agent/created（早于宿主 guidance 判定与首条任务消息提交，也早于第一次
+ * system prompt 组装），因此补上的 section、restriction 与遮蔽定义都会被首个模型 step 采用。
+ *
+ * fail loud 的边界（只对确有证据的一种情况抛错）：
+ * - foreign（child 视图确实解析到别人的 send_message 定义）→ 抛错，让 agent/created 监听器
+ *   失败并拒绝该 expert child admission（宿主不会写出受污染的首条任务消息）；抛错前回滚本次
+ *   已安装的层，并删除该 child 的进程内状态映射，绝不留下半装状态或失败的 child_models 记录。
+ * - 其余情况一律不抛错：verified / absent（判定完成，宿主判定不命中）、unavailable（宿主没有
+ *   tools.register 能力，保持兼容层 no-op 语义）、unverified（缺 tools.get 或没有 scope，
+ *   无法判定）→ 只记录状态 + 告警。
+ * - 本函数只对 DEG 认证过的 expert child 生效：root agent 与非 DEG agent 不会走到这里。
+ *
+ * 幂等与兼容（宿主已正确应用 composition 时必须完全无害）：
+ * - shadow 注册按 child scope 幂等：重复安装不重复注册、不抛错。
+ * - tools.restrict() 的限制是相交叠加，重复施加不会放宽边界；宿主施加过的那份由宿主
+ *   自己的 disposer 负责撤销，这里只撤销自己那一层。
+ * - 同名 section 已在该 scope 注册时按「已存在」处理（宿主 scoped section 遮蔽全局同名
+ *   项），绝不因重复注册抛错而让 child 创建失败。
+ * - 缺少 tools.register / tools.restrict / systemPrompt.section 的宿主或测试替身直接跳过；
+ *   除 foreign 外的注册失败也只告警降级。
+ *
+ * @param {object} childCtx - child Agent 的 scoped context（agent.ctx）。
+ * @param {object} [spec] - 兼容层输入。
+ * @param {string[]} [spec.deny] - admission 计算出的 deny 清单（可含静态与动态 MCP 名称）。
+ * @param {string} [spec.persona] - resolvePersonaForAdmission(role) 的结果，原样注册。
+ * @param {object} [spec.scope] - 该 child 的 Agent 对象，作为 tools.view(scope) 的视图作用域
+ *   （显式传入，绝不从 childCtx 读未注入的懒 agent getter）；缺失时 restrict 判据退回全局视图。
+ * @param {Function} [spec.isVisible] - 没有 restrictableNames 时的可见性探针。
+ * @param {object} [spec.logger] - 宿主 logger，仅用于非致命告警。
+ * @returns {(() => void)|undefined} 组合 disposer；什么都没安装时返回 undefined，
+ *   与 installExpertReportGuard 的 no-op 语义一致（避免被误记为「已安装」而挡住重试）。
+ */
+export function installExpertChildComposition(childCtx, spec = {}) {
+  const disposers = [];
+  const warn = (message) => {
+    try { spec.logger?.warn?.(message); } catch { /* 日志失败不得影响 child 创建 */ }
+  };
+  /** 逆序释放本次安装的层；单个失败不阻断其余清理，并清空数组保证只释放一次。 */
+  const releaseInstalled = () => {
+    for (const dispose of [...disposers].reverse()) {
+      try { dispose(); } catch (error) {
+        warn("dsh-expert-group: expert child composition fallback cleanup failed: " + compositionErrorMessage(error));
+      }
+    }
+    disposers.length = 0;
+  };
+
+  // ① 宿主引导段防线：在 child 自身作用域遮蔽全局 send_message（own 层遮蔽 inherited）。
+  // own 层注册天然豁免于 restriction，因此即使下面的 deny 名单仍含 send_message（宿主全局层
+  // 提供该名字时它属于 restrictableNames），被隐藏的也只是 inherit 的那份，child 解析到的
+  // 始终是本遮蔽定义，宿主 guidance 判定不会再看到 adjacent 标记。
+  //
+  // 本步同时做生效性判定（对象身份比对，不读宿主 adjacent symbol）：verified / absent 表示
+  // 宿主判定一定不命中；unavailable / unverified 无法判定，只记录；只有 foreign（child 确实
+  // 解析到别人的定义）才 fail loud —— 此时抛出异常会让 agent/created 监听器失败，而
+  // @deepseek-ai/cordis 的 serial 派发对每个监听器 await 且**没有** try/catch（cordis lib
+  // 的 serial()），@deepseek-ai/dsh-agent 的 agents.announce 正是用它串行派发：announce/publish
+  // 因此拒绝 → 宿主 dispose 该 child → admission 被拒，且宿主不会执行到 subagent-index.js 里
+  // 追加 parent/send_message 引导段的那一步（不会产生受污染的首条任务消息）。
+  const shadow = installShadowedExpertSendMessage(childCtx, warn, spec.scope);
+  if (shadow.dispose !== void 0) disposers.push(shadow.dispose);
+  const shadowChildId = recordExpertShadowStatus(spec.scope, shadow.status, shadow.reason);
+  if (shadow.status === SHADOW_STATUS.FOREIGN) {
+    warn("dsh-expert-group: expert child send_message shadow is not effective (foreign): " + shadow.reason);
+    // 回滚本次已安装的层：child 会被宿主 dispose，但 DEG 自己不能留半装状态；
+    // 同时删除 childId 状态映射——被拒的 child 不会写 child_models 快照。
+    releaseInstalled();
+    forgetExpertShadowStatus(shadowChildId);
+    throw new Error(
+      "dsh-expert-group: 拒绝该 expert child admission —— child 工具作用域解析到的 send_message 不是 DEG 的 fail-closed 遮蔽定义（"
+      + shadow.reason + "）。宿主 dsh-subagent 会在提交首条任务消息前读取 tools.get(\"send_message\", child)，"
+      + "并在该定义带 adjacent 标记时把「Your parent agent id … send_message …」引导段追加进任务 prompt；"
+      + "DEG 拒绝让 expert child 以受污染的任务开场运行。可操作提示：检查是否有其它插件或子层把 send_message 注册进该 child 作用域、"
+      + "或宿主 tools.register/view 的遮蔽语义是否已变化，排除冲突后重新派发该任务。",
+    );
+  }
+
+  // ② 工具边界：尝试施加 admission 的 deny 清单。判据优先取当前 child scope 的
+  // restrictableNames（工具服务 restrict() 内部同一判据），拿不到该 API 时才回退到
+  // 可见性探针；两条路径都不把 run_code 交给 restrict，也不把 restrict 会拒绝的名字交出去。
+  const toolService = childCtx?.tools;
+  const denyCandidates = Array.isArray(spec.deny)
+    ? [...new Set(spec.deny.filter((name) => typeof name === "string" && name.length > 0 && name !== "run_code"))]
+    : [];
+  if (denyCandidates.length > 0 && typeof toolService?.restrict === "function") {
+    const probe = typeof spec.isVisible === "function"
+      ? spec.isVisible
+      : typeof toolService?.get === "function" ? (name) => toolService.get(name) !== void 0 : void 0;
+    const names = restrictableDenyNamesInScope(denyCandidates, restrictableScopeNames(toolService, spec.scope), probe);
+    if (names.length > 0) {
+      try {
+        const dispose = toolService.restrict({ deny: names });
+        if (typeof dispose === "function") disposers.push(dispose);
+      } catch (error) {
+        // 失败只降级为「schema 未隐藏」：scoped guard 仍按同一份 deny 名单拒绝调用。
+        warn("dsh-expert-group: expert child composition fallback could not restrict tools: " + compositionErrorMessage(error));
+      }
+    }
+  }
+
+  // ③ 角色系统提示词：与宿主 child composition 同名 section，作用域内遮蔽全局默认项。
+  const promptService = childCtx?.systemPrompt;
+  if (typeof spec.persona === "string" && spec.persona.length > 0 && typeof promptService?.section === "function") {
+    try {
+      const dispose = promptService.section({
+        name: EXPERT_PERSONA_PREFIX_SECTION,
+        order: resolvePersonaPrefixOrder(promptService),
+        text: spec.persona,
+      });
+      if (typeof dispose === "function") disposers.push(dispose);
+    } catch (error) {
+      const message = compositionErrorMessage(error);
+      // 同名 section 已在该 scope 注册 = 宿主已经应用过 composition，属于正常情况。
+      if (!/already registered/iu.test(message)) {
+        warn("dsh-expert-group: expert child composition fallback could not register persona section: " + message);
+      }
+    }
+  }
+
+  if (disposers.length === 0) return void 0;
+  return () => {
+    // 逆序释放：后注册的先撤销；三类 disposer 来自不同服务，单个失败不阻断其余清理。
+    releaseInstalled();
+    // 进程内状态只服务活动 child：释放时一并清理，避免 childId 映射跨 child 泄漏
+    //（durable 侧仍由 child_models 记录里的 [SHADOW_MARKER] 保留审计痕迹）。
+    forgetExpertShadowStatus(shadowChildId);
+  };
 }
 
 /**
@@ -926,6 +1437,20 @@ export const DOMAIN_CHILD_MODEL_RECORD = domainZ.object({
   // RC1 agentOptions 不由 Host recovery 持久化；保存 DEG admission 的完整 deny 边界，
   // 供 scoped guard 在 cold-resume 时恢复。长度上限与运行期校验保持一致。
   [DENY_MARKER]: domainZ.array(domainZ.string()).max(MAX_EXPERT_DENY_MARKER_ENTRIES).optional(),
+  // 与 deny marker 同理：保存 admission 时解析出的完整 persona，供 cold-resume 的
+  // composition 兜底重建系统提示词。设置页之后的变化只影响新 child，既有 child 必须
+  // 继续使用记录值；长度上限与运行期校验（validPersonaMarker）保持一致。
+  [PERSONA_MARKER]: domainZ.string().min(1).max(MAX_EXPERT_PERSONA_MARKER_CHARS).optional(),
+  // shadow 生效性判定快照（与 deny/persona 同层 marker）：只用于诊断与冷会话审计，
+  // 不参与权限判定。取值集合与运行期 SHADOW_STATUS 完全一致，durable schema 用同一枚举
+  // 约束，避免把任意字符串写进快照（真实 storage-domain 会整条拒绝非法取值）。
+  [SHADOW_MARKER]: domainZ.enum([
+    SHADOW_STATUS.VERIFIED,
+    SHADOW_STATUS.ABSENT,
+    SHADOW_STATUS.FOREIGN,
+    SHADOW_STATUS.UNAVAILABLE,
+    SHADOW_STATUS.UNVERIFIED,
+  ]).optional(),
   // 最近一次 accepted dispatch 的短描述用于冷会话侧栏；它不是第二套任务数据库。
   lastDispatch: domainZ.object({
     description: domainZ.string().optional(),
@@ -3815,13 +4340,22 @@ export default {
       }, "dsh-expert-group: root structured path guard");
       rootStructuredGuardDisposers.set(agent, ownerCleanup);
     }
+    /**
+     * 为已认证的插件专家 child 安装 scoped guard 与缺失的 child composition。
+     *
+     * 两者都挂在同一个 child scope，并共用 expertReportGuardDisposers 生命周期：
+     * - guard：report/send_message/deny 的执行期硬防线（原有行为）；
+     * - composition 兜底：旧 RC1 startLocal 初次路径丢弃 request.persona/toolFilter 时，
+     *   在 agent/created（首条任务消息提交前）补齐系统提示词 persona 与工具 deny 边界。
+     * 只有 exact Agent 认证 + 有效角色身份才允许安装；普通 child、root 与未认证迟到
+     * child 既没有登记也没有身份，因此不受影响。
+     */
     function installExpertReportGuardForAgent(agent, resolvedIdentity) {
       // marker/parent 只是可复制的 metadata；只有 acceptance/created 流程登记过的
-      // exact Agent 才允许安装 scoped guard，避免普通 child 被误伤。
+      // exact Agent 才允许安装 scoped surface，避免普通 child 被误伤。
       if (!isRegisteredPluginExpertChild(agent)
         || isRootAgentForStructuredGuard(agent)
-        || expertReportGuardDisposers.has(agent)
-        || typeof agent?.ctx?.tools?.guard !== "function") return;
+        || expertReportGuardDisposers.has(agent)) return;
       // 先在安装函数外确认身份，避免 installExpertReportGuard 返回的 no-op 被当成
       // 已安装并永久记录；身份监听器稍后可用已解析 role/parentId 重试。
       const identity = resolvedIdentity ?? resolveExpertReportIdentity(
@@ -3830,8 +4364,51 @@ export default {
         (childId) => source().childModels?.[childId],
       );
       if (!isPluginExpertChildIdentity(identity)) return;
-      const dispose = installExpertReportGuard(agent.ctx, (childId) => source().childModels?.[childId], identity, agent);
-      if (typeof dispose === "function") expertReportGuardDisposers.set(agent, dispose);
+      const disposers = [];
+      if (typeof agent?.ctx?.tools?.guard === "function") {
+        disposers.push(installExpertReportGuard(agent.ctx, (childId) => source().childModels?.[childId], identity, agent));
+      }
+      // cold-resume 的 agent.options 只有 provider/model：与 guard 一致，优先当前 marker，
+      // 回落到 DEG 自有 child_models 的 admission deny 快照，最后才是角色静态清单。
+      const persistedDeny = typeof agent?.id === "string" ? source().childModels?.[agent.id]?.[DENY_MARKER] : void 0;
+      const denyOptions = agent?.options?.[DENY_MARKER] !== void 0
+        ? agent?.options
+        : persistedDeny !== void 0
+          ? { ...agent?.options, [DENY_MARKER]: persistedDeny }
+          : agent?.options;
+      // composition 兜底的 persona 与 deny marker 用同一套恢复优先级：
+      // 1) 新建 child 的 agent.options marker —— 本次 admission 解析出的完整人格；
+      // 2) cold-resume 的 DEG child_models 快照记录值 —— settings 覆盖可能在 child 创建
+      //    之后被改过，既有 child 必须继续使用记录人格，而不是被新覆盖改写；
+      // 3) 只有旧记录确实缺少该字段时，才在当前 admission 边界重新解析（与 rebuild 同语义）。
+      // 记录值与 marker 都经过形状校验：malformed 快照一律回退，不让异常逃逸到 child 创建路径。
+      const recordedPersona = typeof agent?.id === "string"
+        ? validPersonaMarker(source().childModels?.[agent.id]?.[PERSONA_MARKER])
+        : void 0;
+      const childPersona = validPersonaMarker(agent?.options?.[PERSONA_MARKER])
+        ?? recordedPersona
+        ?? resolvePersonaForAdmission(identity.role);
+      // 兼容层独立于 tools.guard：精简替身缺少 guard 时仍按可用能力补 composition。
+      const compositionDispose = installExpertChildComposition(agent?.ctx, {
+        deny: [...(expertGuardDenyNames(denyOptions, identity) ?? [])],
+        persona: childPersona,
+        // restrict 判据用该 child 自己的 scope 视图（tools.view(agent).restrictableNames）：
+        // 与工具服务 restrict() 内部同一判据，因此不会把 restrict 会拒绝的名字交出去，
+        // 也能覆盖只落在祖先层（agent preset）的名字。Agent 由调用方显式传入，
+        // 绝不从 childCtx 读未注入的懒 agent getter。
+        scope: agent,
+        logger: ctx.logger,
+      });
+      if (typeof compositionDispose === "function") disposers.push(compositionDispose);
+      // 什么都没安装就不登记，保留「身份监听器稍后可用已解析身份重试」的既有语义。
+      if (disposers.length === 0) return;
+      expertReportGuardDisposers.set(agent, () => {
+        for (const dispose of disposers) {
+          try { dispose(); } catch (error) {
+            ctx.logger.warn("dsh-expert-group: expert child scoped surface cleanup failed: " + (error instanceof Error ? error.message : String(error)));
+          }
+        }
+      });
     }
     // 既有 root 在插件加载早于/晚于 agent 创建两种时序都要覆盖；agent.ctx.effect
     // 负责随 root 生命周期释放 guard，插件 effect 负责卸载时撤销创建监听与残余 owner。
@@ -4590,6 +5167,9 @@ export default {
         ...(pickText(record?.role, agent?.options?.[ROLE_MARKER]) !== null ? { role: pickText(record?.role, agent?.options?.[ROLE_MARKER]) } : {}),
         ...(pickText(record?.parentId, agent?.options?.[PARENT_MARKER]) !== null ? { parentId: pickText(record?.parentId, agent?.options?.[PARENT_MARKER]) } : {}),
         continuable: true,
+        // shadow 生效性判定快照（与 deny/persona 同层 marker）：只在有判定结果时写入，
+        // 该 child 的进程内状态映射被释放后不再补写（durable 记录保留最后一次判定）。
+        ...shadowMarkerFields(childId),
         lastDispatch: {
           description: typeof label === "string" ? label : void 0,
           prompt: typeof prompt === "string" ? prompt : void 0,
@@ -5182,6 +5762,12 @@ export default {
       const denyMarkerSnapshot = agent.options?.[DENY_MARKER] !== void 0
         ? agent.options[DENY_MARKER]
         : recordedExpert?.[DENY_MARKER];
+      // persona 与 deny 同源：优先当前 marker，cold-resume 则保留 DEG 快照中的记录值，
+      // 避免恢复写回把"创建时的人格"擦成当前 settings 覆盖。这里只接受通过形状校验的
+      // 字符串——marker 在 durable schema 里是 string 字段，malformed 值写回会让整条
+      // child_models 记录在真实 storage-domain 写入边界被拒绝（连带丢掉 provider/model）。
+      const personaMarkerSnapshot = validPersonaMarker(agent.options?.[PERSONA_MARKER])
+        ?? validPersonaMarker(recordedExpert?.[PERSONA_MARKER]);
       if (pluginChildAuthenticated) registerPluginExpertChildAgent(agent);
       if (isExpertChild) {
         // 该监听器在早期 guard listener 之后运行；此时 role/parentId 已从 marker、
@@ -5204,6 +5790,12 @@ export default {
               : { [DENY_MARKER]: Array.isArray(denyMarkerSnapshot)
                 ? [...denyMarkerSnapshot]
                 : denyMarkerSnapshot }),
+            // 同一份 admission persona 快照：cold-resume 恢复写回不得擦除记录值；
+            // malformed 值在写入前已被过滤，不会污染 durable schema。
+            ...(personaMarkerSnapshot === void 0 ? {} : { [PERSONA_MARKER]: personaMarkerSnapshot }),
+            // shadow 生效性判定快照：composition 已在本监听器之前安装并判定，
+            // 因此这里能写出 verified/absent 等实际结果（foreign 会让本监听器不会被执行）。
+            ...shadowMarkerFields(agent.id),
           } : {}),
         });
       }
@@ -5999,6 +6591,11 @@ export default {
       const recoveryDeny = ensureExpertSendMessageDenied(
         source?.[DENY_MARKER] ?? source?.agentOptions?.[DENY_MARKER] ?? source.toolFilter,
       );
+      // 路由仍沿用 source 的 provider/model，但 persona 必须在 admission 边界重新解析：
+      // 恢复是"新建 child"的一条路径，因此既不能复用旧快照，也不能跳过用户覆盖
+      // 与固定纪律的分层（纪律升级后同样必须立刻生效）。解析结果除交给宿主 composition
+      // 外同时写入内部 marker，让 agent/created 的持久化看到同一个值。
+      const childPersona = resolvePersonaForAdmission(record.role);
       const request = {
         label: source.label,
         prompt: [{ type: "text", text: buildExpertTaskPrompt(record.role, promptText) }],
@@ -6011,11 +6608,9 @@ export default {
           [PARENT_MARKER]: record.parentId,
           [CONTINUABLE_MARKER]: true,
           [DENY_MARKER]: recoveryDeny,
+          [PERSONA_MARKER]: childPersona,
         },
-        // 路由仍沿用 source 的 provider/model，但 persona 必须在 admission 边界重新解析：
-        // 恢复是"新建 child"的一条路径，因此既不能复用旧快照，也不能跳过用户覆盖
-        // 与固定纪律的分层（纪律升级后同样必须立刻生效）。
-        persona: resolvePersonaForAdmission(record.role),
+        persona: childPersona,
         toolFilter: { deny: recoveryDeny },
         maxDepth: source.maxDepth ?? 1,
       };
@@ -6550,36 +7145,17 @@ export default {
     }
 
     /**
-     * 把完整专家 persona 放进 RC1 的首条任务消息。
-     *
-     * RC1 不再接受 SubagentStartRequest.persona/toolFilter；runtime guard 仍负责
-     * 强制工具边界，这里只迁移原先由 persona 提供的角色身份与固定纪律。插入点
-     * 放在已有「你是 ... 子代理。」身份行之后，保证所有角色 prompt 的首行契约、
-     * 图片 ContentBlock 顺序和任务正文都不变。返回新数组/新 block，绝不修改
-     * admission 调用方持有的 request，避免 recovery/fan-out 共享对象被串改。
-     */
-    function promptWithExpertPersona(prompt, persona) {
-      if (typeof persona !== "string" || persona.length === 0) return prompt;
-      const decorate = (text) => {
-        if (typeof text !== "string") return text;
-        const firstLineEnd = text.indexOf("\n");
-        if (firstLineEnd < 0) return persona + "\n\n" + text;
-        return text.slice(0, firstLineEnd + 1) + persona + "\n\n" + text.slice(firstLineEnd + 1);
-      };
-      if (typeof prompt === "string") return decorate(prompt);
-      if (!Array.isArray(prompt)) return prompt;
-      const textIndex = prompt.findIndex((block) => block?.type === "text" && typeof block.text === "string");
-      if (textIndex < 0) return [{ type: "text", text: persona }, ...prompt];
-      return prompt.map((block, index) => index === textIndex ? { ...block, text: decorate(block.text) } : block);
-    }
-
-    /**
      * DEG-only 的双契约启动适配器。
      *
-     * startActivation 存在时只组装 RC1 公共字段：request 去掉已删除的 label、
-     * persona、toolFilter，delivery 固定为 parent，让 DSH manager 负责 parent
-     * notification 和 activation 生命周期。startActivation 本身抛错时原样上抛，
-     * 只有方法不存在才回退旧 startContinuable，避免把 admission 错误伪装成兼容路径。
+     * startActivation 存在时只组装 RC1 公共字段：request 仅剥离顶层 label 与 signal
+     * （label 走 spec.label、signal 走 spec.signal），其余字段原样透传。persona 与
+     * toolFilter 是 RC1 的 child composition 注入字段——宿主在 child scope 上应用
+     * 它们（persona → child 系统提示词 section，toolFilter → childCtx.tools.restrict），
+     * 因此既不能剥离，也不能把 persona 拼进首条任务消息：任务消息只保留
+     * buildExpertTaskPrompt 生成的「身份行 + 任务内容」两段。delivery 固定为 parent，
+     * 让 DSH manager 负责 parent notification 和 activation 生命周期。
+     * startActivation 本身抛错时原样上抛，只有方法不存在才回退旧 startContinuable，
+     * 避免把 admission 错误伪装成兼容路径。
      */
     async function startExpertActivation({ request, label, signal }) {
       if (typeof subagents.startActivation === "function") {
@@ -6588,16 +7164,11 @@ export default {
         if (signal === void 0 || signal === null || typeof signal.throwIfAborted !== "function") {
           throw new TypeError("RC1 startActivation requires an AbortSignal");
         }
-        const { label: _requestLabel, signal: _requestSignal, persona, toolFilter: _toolFilter, ...activationRequest } = request ?? {};
-        const role = activationRequest.agentOptions?.[ROLE_MARKER];
-        const rc1Request = {
-          ...activationRequest,
-          prompt: promptWithExpertPersona(activationRequest.prompt, persona ?? (typeof role === "string" ? resolvePersonaForAdmission(role) : void 0)),
-        };
+        const { label: _requestLabel, signal: _requestSignal, ...activationRequest } = request ?? {};
         return subagents.startActivation({
           provider: "spawn",
           label: typeof label === "string" ? label : request?.label,
-          request: rc1Request,
+          request: activationRequest,
           signal,
           delivery: "parent",
         });
@@ -6615,12 +7186,14 @@ export default {
 
     /**
      * 计算此刻应拒绝的工具名。
-     * tools.restrict() 对“未知全局工具名”直接抛错，而 bash/pwsh 按平台门控、
-     * workflow 属 agent preset（隔离域）注册，任何一项都可能不在当前组合里。
-     * 因此这里动态过滤：只允许当前全局工具视图中的名称进入 deny；scope-local
-     * 工具虽然可能出现在父代理视图中，但 tools.restrict() 不接受这类名称。
-     * 这能避免子代理创建窗口把 scope-local 工具误传给全局限制校验。
-     * @param parent - 调用工具的子代理父代理（Agent 对象）。
+     *
+     * tools.restrict() 对「未知工具名」直接抛错，而 bash/pwsh 按平台门控、workflow 属
+     * agent preset（隔离域）注册，任何一项都可能不在当前组合里。因此这里必须按宿主自己的
+     * 准入判据过滤：优先使用父 agent scope 视图的 restrictableNames（与 restrict() 内部
+     * 同一集合：全局层 + 祖先层，own 层名称会被排除）；宿主没有 view() 时回退到全局
+     * 可见性探针（tools.get 无作用域即全局视图）。两条路径都不把 run_code 交给 restrict。
+     *
+     * @param parent - 调用工具的子代理父代理（Agent 对象），同时作为视图作用域。
      * @param denyList - 静态候选列表（EXPERT_DELEGATION_DENY 或 READONLY_DENY）。
      */
     function effectiveDeny(parent, denyList, includeDynamicMcp = false) {
@@ -6631,6 +7204,7 @@ export default {
           return false;
         }
       };
+      const restrictableNames = restrictableScopeNames(tools, parent);
       if (includeDynamicMcp) {
         // DSH restriction 只支持精确名称；只读 child 必须先取得完整可见 schema，
         // 否则无法证明动态 MCP 工具已被覆盖，直接拒绝 admission。child 自有
@@ -6647,9 +7221,9 @@ export default {
         if (!Array.isArray(visibleSchemas) || visibleSchemas.some((schema) => typeof schema?.name !== "string" || schema.name.length === 0)) {
           throw new Error("只读专家工具 schema 不完整，已拒绝启动以保持动态 MCP fail-closed");
         }
-        return restrictableDenyNames(readonlyDenyCandidates(denyList, visibleSchemas), isVisible);
+        return restrictableDenyNamesInScope(readonlyDenyCandidates(denyList, visibleSchemas), restrictableNames, isVisible);
       }
-      return restrictableDenyNames(denyList, isVisible);
+      return restrictableDenyNamesInScope(denyList, restrictableNames, isVisible);
     }
 
     /**
@@ -7169,6 +7743,11 @@ export default {
           ...(shardName === undefined ? [] : ["任务名称：" + shardName]),
           input.prompt,
         ].join("\n");
+        // 分片任务同样在 admission 边界解析当前权威 persona：设置页保存后，
+        // 之后新建的 fan-out child 使用新覆盖，正在运行的分片不受影响。
+        // 同一份值写入内部 marker，由 onAgentCreated 随 child_models 持久化，
+        // 供冷恢复的 composition 兜底使用（不会进入任务 prompt）。
+        const childPersona = resolvePersonaForAdmission(input.role);
         const request = {
           label: "fan-out " + input.role + "/" + input.shardId + (shardName === undefined ? "" : " · " + shardName) + " #" + input.attempt,
           prompt: [{ type: "text", text: buildExpertTaskPrompt(input.role, taskText) }],
@@ -7180,17 +7759,17 @@ export default {
             [ROLE_MARKER]: input.role,
             [PARENT_MARKER]: parent.id,
             [CONTINUABLE_MARKER]: true,
-            // RC1 不消费 request.toolFilter；保留 fan-out admission 的完整 deny 结果。
+            // RC1 把 request.toolFilter 应用到 child composition；这里同步保留 fan-out
+            // admission 的完整 deny 结果，供冷恢复的 scoped guard 使用。
             [DENY_MARKER]: ensureExpertSendMessageDenied(deny),
+            [PERSONA_MARKER]: childPersona,
             [FANOUT_MARKER]: true,
             [FANOUT_PARENT_TASK_MARKER]: input.parentTaskId,
             [FANOUT_PARENT_AGENT_MARKER]: parent.id,
             [FANOUT_SHARD_MARKER]: input.shardId,
             [FANOUT_ATTEMPT_MARKER]: input.attempt,
           },
-          // 分片任务同样在 admission 边界解析当前权威 persona：设置页保存后，
-          // 之后新建的 fan-out child 使用新覆盖，正在运行的分片不受影响。
-          persona: resolvePersonaForAdmission(input.role),
+          persona: childPersona,
           toolFilter: { deny: ensureExpertSendMessageDenied(deny) },
           maxDepth: 1,
         };
@@ -7258,6 +7837,10 @@ export default {
           && Number.isSafeInteger(attempt)
           && attempt > 0;
         if (childId !== void 0 && typeof provider === "string" && typeof model === "string") {
+          // persona 与 deny 同源：fan-out 走独立 onAgentCreated 回调，这里同步保存
+          // admission 快照，冷恢复的 composition 兜底据此重建角色人格；malformed 值
+          // 不写入 durable schema（真实 storage-domain 会在写入边界整条拒绝）。
+          const personaSnapshot = validPersonaMarker(agent.options?.[PERSONA_MARKER]);
           void writeChildModel(childId, {
             provider,
             model,
@@ -7269,6 +7852,10 @@ export default {
             ...(Array.isArray(agent.options?.[DENY_MARKER])
               ? { [DENY_MARKER]: [...agent.options[DENY_MARKER]] }
               : {}),
+            ...(personaSnapshot === void 0 ? {} : { [PERSONA_MARKER]: personaSnapshot }),
+            // shadow 生效性判定快照：fan-out child 的 composition 也走同一条安装路径，
+            // 判定结果在 onAgentCreated 之前已记录（foreign 时 child 根本不会被创建）。
+            ...shadowMarkerFields(childId),
             ...(fanoutIdentity ? {
               fanout: true,
               fanoutParentTaskId: parentTaskId,
@@ -8031,6 +8618,9 @@ export default {
           const observerTaskPrompt = buildExpertTaskPrompt("observer", buildObserverVisualTask());
           const promptContent = buildImageContent({ attachments: imageAttachments, text: observerTaskPrompt, role: "Observer" });
           const observerDeny = ensureExpertSendMessageDenied(effectiveDeny(parent, READONLY_DENY, true));
+          // 自动图片入口也走同一 admission 语义：persona 只解析一次，既交给宿主
+          // composition，也写入内部 marker 供冷恢复兜底（绝不进入视觉任务 prompt）。
+          const childPersona = resolvePersonaForAdmission("observer");
           const request = {
             label: "用户图片",
             prompt: promptContent,
@@ -8043,8 +8633,9 @@ export default {
               [PARENT_MARKER]: parent.id,
               [CONTINUABLE_MARKER]: true,
               [DENY_MARKER]: observerDeny,
+              [PERSONA_MARKER]: childPersona,
             },
-            persona: resolvePersonaForAdmission("observer"),
+            persona: childPersona,
             toolFilter: { deny: observerDeny },
             maxDepth: 1,
           };
@@ -8392,6 +8983,11 @@ export default {
             });
             }
           }
+          // persona 在 admission 边界**只解析一次**：同一个值既交给宿主 composition
+          // (request.persona)，也写入内部 marker 供 agent/created 持久化与冷恢复兜底。
+          // 设置页保存的自定义提示词只影响之后新建的 child，既有 running/idle/ready
+          // child 保持创建时的 persona；marker 绝不进入任务 prompt。
+          const childPersona = resolvePersonaForAdmission(role);
           const request = {
             label: args.description,
             prompt: promptContent,
@@ -8404,13 +9000,17 @@ export default {
               // 供重启后按 parentId+role+route 恢复可复用 child。
               [ROLE_MARKER]: role,
               [PARENT_MARKER]: parent.id,
-              // RC1 不再读取 request.toolFilter；把 admission 解析出的完整 deny 边界
-              // 随 child options 传入 DEG 私有 runtime guard。
+              // RC1 会把 request.toolFilter 应用到 child composition（childCtx.tools.restrict），
+              // 同时把同一份 admission deny 边界随 child options 传入 DEG 私有 runtime guard：
+              // 前者在创建窗口生效，后者在 child 生命周期内持续生效并在冷恢复后重建。
               [DENY_MARKER]: childDeny,
+              // 同一份 persona 的内部快照：Host 不持久化 RC1 agentOptions，因此它会随
+              // child_models 落盘，供冷恢复重建时优先于当前 settings 覆盖。
+              [PERSONA_MARKER]: childPersona,
             },
-            // persona 在 admission 边界解析：设置页保存的自定义提示词只影响之后
-            // 新建的 child，既有 running/idle/ready child 保持创建时的 persona。
-            persona: resolvePersonaForAdmission(role),
+            // 两个字段都是 child composition 注入项：RC1 由宿主应用到 child 系统提示词
+            // section 与 childCtx.tools.restrict，legacy provider 仍按自身 capability 消费。
+            persona: childPersona,
             toolFilter: { deny: childDeny },
             // 第二道硬防线：专家是叶子工作者，maxDepth 1 禁止其再创建孙代理
             // （子代理 depth 为 1，再委派 depth 2 会触发 SubagentDepthError）。

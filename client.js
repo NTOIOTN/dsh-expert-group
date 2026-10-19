@@ -2222,7 +2222,10 @@ window.__ModuleLoader__.load({
     const PROMPT_ROLE_IDS = SETTINGS_ROLE_IDS;
     const DEFAULT_PROMPT_MAX_GRAPHEMES = 32000;
     const PROMPT_WARNING_RATIO = 0.9;
-    const PROMPT_DISCIPLINE_HINT = "固定执行纪律由插件在运行时自动追加且不可编辑，包含叶子 worker、工具与权限边界、continuable child 约束、交付协议和中文输出要求。";
+    // 只读提示的语义必须与运行期一致：固定执行纪律由 child 的 persona/system context
+    // 与 scoped 工具策略（tools.restrict + runtime guard）在运行时注入，**不写进任务
+    // 提示词**；用户只能编辑专家专属部分，纪律本身不可编辑、也不随草稿提交。
+    const PROMPT_DISCIPLINE_HINT = "固定执行纪律不可编辑：它由 child 的 persona/system context 与 scoped 工具策略在运行时注入，不写进任务提示词；内容包含叶子 worker、工具与权限边界、continuable child 约束、交付协议和中文输出要求。";
 
     /**
      * grapheme 分段器按「locale + granularity」缓存。
@@ -6430,16 +6433,21 @@ window.__ModuleLoader__.load({
               disabled: saving,
               onChange: (event) => editDraft((previous) => ({ ...previous, notificationHoldMs: notificationHoldMsOf(Number(event.target.value)) })),
             }, NOTIFICATION_HOLD_OPTIONS.map((option) => react.createElement("option", { key: option.value, value: option.value }, option.label)))),
-          react.createElement("label", { className: "deg_settings_control" },
+          // 两个输入控件分别提供可访问名称，避免一个 label 同时包裹多个可标记控件。
+          react.createElement("div", { className: "deg_settings_control" },
             react.createElement("span", { className: "deg_settings_label" }, "通知音量"),
             react.createElement("input", {
+              id: "deg-settings-notification-volume-range",
               type: "range", min: 0, max: 100, step: 1,
+              "aria-label": "通知音量滑块",
               value: draft.notificationVolume,
               disabled: saving,
               onChange: (event) => editDraft((previous) => ({ ...previous, notificationVolume: clampNotificationVolume(event.target.value) })),
             }),
             react.createElement("input", {
+              id: "deg-settings-notification-volume-number",
               type: "number", min: 0, max: 100, step: 1,
+              "aria-label": "通知音量数值",
               value: draft.notificationVolume,
               disabled: saving,
               onChange: (event) => editDraft((previous) => ({ ...previous, notificationVolume: clampNotificationVolume(event.target.value) })),
