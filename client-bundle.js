@@ -4416,17 +4416,46 @@
         runtimeStatusOfNode(node, parentId, childId, { partial: partialSnapshot }) === "ready";
 
       /**
+       * 空闲分组的**成员**判定（显示从宽）。
+       *
+       * 在严格判据之外，额外接受轻量快照下「没有任何活动证据」的 unknown 节点：它们与 ready
+       * 一样被收纳进分组，只是圆点与文案保持中性（见 renderExpert / renderIdleGroup）。
+       * 这样同一份数据在 partial:true 与 partial:false 下分组**成员集合与顺序完全一致**，
+       * 消除「同一节点在两条路径之间来回跳位」的用户可见缺陷。
+       *
+       * 只放宽**显示**：任何会真的操作宿主资源的路径（批量关闭候选、manual 抑制清理）都必须继续
+       * 使用严格的 sidebarNodeIsIdleReady，不得改用本函数。
+       */
+      const sidebarNodeIsIdleMembership = (node, parentId, childId) => {
+        const status = runtimeStatusOfNode(node, parentId, childId, { partial: partialSnapshot });
+        if (status === "ready") return true;
+        // unknown 只可能来自 partial 快照（完整快照的证据链不会返回它）：此时纳入分组显示。
+        return partialSnapshot === true && status === neutralRuntimeStatus;
+      };
+
+      /**
        * 空闲分组收纳 ready 直接专家和已结算的 fan-out 父任务。
        * 父任务必须命中 manager 终态，不能仅凭子会话暂时未运行或未知状态提前移动（manager 的聚合
        * 状态本身就是真实证据，不是「没有证据」，因此不受 partial 影响）。
-       * 直接专家走 sidebarNodeIsIdleReady：轻量快照下没有活动证据的专家是 unknown，既不进空闲组
-       * （留在主代理下，等完整快照到达再按完整证据归组），也不进空闲关闭候选。
+       *
+       * 直接专家走 sidebarNodeIsIdleMembership：**显示从宽**——轻量快照下没有活动证据的专家
+       * （unknown）也纳入分组，使它在 partial / full 下的组内相对位置完全一致。
+       *
+       * 为什么显示要放宽：排序键是 createdAt，而轻量快照没有冷读、拿不到专家会话的创建时间
+       * （真实 child_models 记录里也没有该字段），因此同一批节点在 partial 与 full 下的排序结果
+       * 本来就可能不同；若再让「是否进组」也随证据变化，同一次 partial↔full 切换会**同时**改变
+       * 分组归属与组内下标，用户在空闲列表里看到的就是「某个 fan-out 分组每隔 2.5 秒来回跳」。
+       * 让成员集合在两条路径下一致，位置变化就只剩「锚点补齐前的一次性收敛」，不再是反复跳动。
+       *
+       * 操作安全性不变：unknown 节点**仍然不参与**任何批量/清理动作——空闲批量关闭候选
+       * （idleSidebarResourceAddresses）与 manual 抑制清理（clearManualSuppressionOfIdleResources）
+       * 都继续用严格的 sidebarNodeIsIdleReady 判定，绝不放宽。
        */
       const sidebarIdleChildren = () => sidebarRootChildren()
         .filter((node) => {
           if (node.kind === "fanout") return FANOUT_SETTLED_STATUSES.has(statusOf(node));
           return node.kind === "expert"
-            && sidebarNodeIsIdleReady(node, rootSessionId, text(node.sessionId, null));
+            && sidebarNodeIsIdleMembership(node, rootSessionId, text(node.sessionId, null));
         });
 
       /**
@@ -4440,9 +4469,13 @@
       };
 
       /**
-       * 空闲分组的资源地址集合；成员判定严格复用当前 idleChildren，并在这里用同一条证据规则
-       * （sidebarNodeIsIdleReady）再复核一次：分组与候选绝不出现第二套判定，轻量快照下没有活动
-       * 证据（unknown）的节点因此在两道关口都被排除，绝不会进入空闲批量关闭候选。
+       * 空闲分组的资源地址集合（空闲批量关闭的**唯一**候选来源）。
+       *
+       * 注意这里与分组**成员**判定是两条不同严格度的规则（修复 B 的「显示从宽、操作从严」）：
+       * 分组成员用 sidebarNodeIsIdleMembership（unknown 也进组显示），而候选在这里用严格的
+       * sidebarNodeIsIdleReady 再复核一次——轻量快照下没有活动证据（unknown）的节点虽然现在会
+       * 出现在分组里，但绝不会成为可关闭的目标。两道关口的差异是**有意**的：
+       * 位置稳定性优先，操作安全性不变（一次误关会毁掉用户正在运行的会话，代价远高于一次跳位）。
        * fan-out 父任务代表其最新 attempt 的分片会话，只收录当前未运行（ready）的会话地址。
        */
       const idleSidebarResourceAddresses = (nodes) => {
@@ -5925,8 +5958,9 @@
        * - 资源已明确空闲（ready）⇒ 清除：这一轮运行已经结束，用户当时的关闭意图不再需要跨运行保留，
        *   下一次运行必须能正常自动打开（否则一次手动关闭就永久关掉了这个地址的自动行为）；
        * - 快照里既看不到运行也看不到空闲（暂时缺项 / 状态 unknown）⇒ 一律保留：那既不证明在运行、
-       *   也不证明已结束，按 fail-closed 不动。空闲集合由 idleSidebarResourceAddresses（与空闲分组的
-       *   成员判定同源）给出。
+       *   也不证明已结束，按 fail-closed 不动。空闲集合由 idleSidebarResourceAddresses 给出，它用的是
+       *   **严格**证据规则（sidebarNodeIsIdleReady），因此轻量快照下虽然 unknown 节点也会显示在空闲
+       *   分组里（修复 B 的显示从宽），它们的 manual 抑制仍然一律保留、绝不被这里清掉。
        *
        * 只清 manual：
        * - 内存层（sidebarAutoSuppressedRef）与持久层是同一个语义的两份存储，必须一起清，否则刷新前的
@@ -7604,8 +7638,9 @@
 
       const children = Array.isArray(snapshot?.root?.children) ? snapshot.root.children : [];
       // 普通专家按实际运行状态分组，fan-out 父任务则按 manager 的聚合终态进入空闲组。
-      // 轻量快照（partial）下没有活动证据的专家是 unknown：既不进空闲组、也不进空闲关闭候选，
-      // 先留在主代理下，等完整快照到达后按完整证据恢复既有归组（见 sidebarNodeIsIdleReady）。
+      // 轻量快照（partial）下没有活动证据的专家是 unknown：**仍进空闲组显示**（位置与完整快照
+      // 一致，不再因证据缺失而换组），但圆点/文案保持中性，且不参与任何批量关闭或抑制清理
+      // （见 sidebarNodeIsIdleMembership 与 idleSidebarResourceAddresses 的分工）。
       // fan-out 展示与取消/重试仍使用各自的 manager 状态，不受分组位置影响。
       const idleChildren = sidebarIdleChildren();
       const visibleChildren = children.filter((node) => !idleChildren.includes(node));

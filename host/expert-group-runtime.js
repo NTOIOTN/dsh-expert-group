@@ -923,7 +923,61 @@ export function createExpertGroupRuntime({
     return settled.map((result) => result.value);
   }
 
-  async function buildSnapshotForSession(sessionId, { fast = false } = {}) {
+  /**
+   * 从一份**完整**快照里提取排序锚点并写入该 root 的缓存条目（修复 A）。
+   *
+   * 只记录 root.children 上**非空有限数值**的 createdAt（专家节点与 fan-out 父任务都在这一层，
+   * 分片/attempt 不参与顶层排序，无需记录）。已有锚点不被空值覆盖：某次完整构建若因为上游暂时
+   * 读不到时间而给出 null，不应把已知的好锚点抹掉。整段读取 fail-soft：快照形状异常时静默跳过，
+   * 绝不影响完整构建本身的成功返回。
+   */
+  function rememberSortAnchor(entry, snapshot) {
+    const anchor = entry.sortAnchor;
+    if (!(anchor instanceof Map)) return;
+    const children = safeCall(() => snapshot?.root?.children, null);
+    if (!Array.isArray(children)) return;
+    for (const node of children) {
+      if (node === null || typeof node !== "object") continue;
+      const createdAt = node.createdAt;
+      if (typeof createdAt !== "number" || !Number.isFinite(createdAt)) continue;
+      const key = firstText(node.id, node.parentTaskId, node.sessionId, node.childId);
+      if (key !== null) anchor.set(key, createdAt);
+    }
+  }
+
+  /**
+   * 用**排序锚点**给轻量快照补上 createdAt（修复 A）。
+   *
+   * 背景：唯一排序点（expert-group-snapshot.js 的 sortByCreatedAt）按 createdAt 升序、缺失兜底
+   * Infinity 排到最后。普通专家的 createdAt 在完整路径由冷读到的 session.createdAt 补上，而真实
+   * child_models 记录里没有这个字段，轻量路径又没有 session，因此 fast 下恒为 null；fan-out 任务的
+   * createdAt 来自 manager，两条路径一致。于是同一个 fan-out 节点在 partial / full 之间相对位置
+   * 会跳变（Explorer 因 createdAt 最小恒居第一，所以它稳定，Oracle 会来回跳）。
+   *
+   * 处理方式：完整构建成功后把该快照里所有节点的 id → createdAt 记进缓存条目的锚点；轻量构建时
+   * 只对 **createdAt 为 null** 的节点用锚点兜底填充，锚点里没有的保持 null（既有兜底行为不变）。
+   * 这样两条路径对同一节点给出同一个键，排序结果一致，且**不修改排序语义本身**。
+   *
+   * 只按节点 id 匹配（专家节点 id 即 childId/sessionId，fan-out 节点 id 即 parentTaskId），
+   * 因此锚点天然按 root 隔离：它挂在该 root 的缓存条目上，绝不跨 root 共享。
+   */
+  function applySortAnchor(nodes, sortAnchor) {
+    if (!(sortAnchor instanceof Map) || sortAnchor.size === 0) return nodes;
+    for (const node of nodes) {
+      if (node === null || typeof node !== "object") continue;
+      // 只补缺失值：已有真实 createdAt（完整路径 / manager 给出的任务时间）绝不被覆盖。
+      if (node.createdAt !== null && node.createdAt !== undefined) continue;
+      // 键与快照层一致：专家节点的 id 就是 childId/sessionId，fan-out 父任务的 id 由 parentTaskId
+      // 派生（原始 manager 任务对象上没有 id 字段，因此这里按同一优先级回退）。
+      const key = firstText(node.id, node.parentTaskId, node.sessionId, node.childId);
+      if (key === null) continue;
+      const anchored = sortAnchor.get(key);
+      if (typeof anchored === "number" && Number.isFinite(anchored)) node.createdAt = anchored;
+    }
+    return nodes;
+  }
+
+  async function buildSnapshotForSession(sessionId, { fast = false, sortAnchor = null } = {}) {
     const id = nonEmpty(sessionId);
     if (id === null) throw new TypeError("expert-group-snapshot 需要 sessionId");
     // 本次构建独有的冷读协调器：root 冷读、普通 expert 阶段与 fan-out 阶段共用同一份读取
@@ -1006,6 +1060,9 @@ export function createExpertGroupRuntime({
     if (stageFailure !== null) throw stageFailure.reason;
     const experts = expertOutcome.value;
     const fanoutTasks = fanoutOutcome.value;
+    // 修复 A：轻量路径用排序锚点补 createdAt，让同一节点在 partial / full 下拿到同一个排序键。
+    // 完整路径不传锚点（它的 createdAt 本来就是权威值），因此这里只影响 fast。
+    if (fast === true) applySortAnchor([...experts, ...fanoutTasks], sortAnchor);
     return buildExpertGroupSnapshot({
       sessionId: id,
       generatedAt: now(),
@@ -1037,7 +1094,7 @@ export function createExpertGroupRuntime({
   // ── 按 root 的两级快照缓存（轻量 / 完整） ────────────────────────────────────
   //
   // 结构：rootId → { full, fast, generation, building, lastError, rebuildBlockedUntil,
-  //                    failureCount, retryBlockedUntil }
+  //                    failureCount, retryBlockedUntil, sortAnchor }
   // - full/fast：{ snapshot, at, generation }。generation 是**该次构建开始时**捕获的代次，
   //   用来判定「这份结果读完之后有没有发生失效事件」，时间戳只用来兜底 TTL；
   //   **at 只在真正构建出该级结果时写入，命中缓存绝不刷新**（R2）：否则持续轮询会把 6s 的
@@ -1051,7 +1108,10 @@ export function createExpertGroupRuntime({
   // - rebuildBlockedUntil：因「构建期间发生过失效」而需要的重建的最早启动时刻（去抖），
   //   保证活跃会话下不会退化成「每个请求一次全量冷读」；
   // - failureCount / retryBlockedUntil：后台完整构建**连续失败**次数与失败重试的最早启动时刻
-  //   （R1 的指数退避，与上面的失效去抖是两条独立闸门；成功后立即清零）。
+  //   （R1 的指数退避，与上面的失效去抖是两条独立闸门；成功后立即清零）；
+  // - sortAnchor：节点 id → createdAt 的**排序锚点**（修复 A）。只由完整构建成功写入，轻量构建
+  //   用它给缺失的 createdAt 兜底，使同一节点在 partial / full 下拿到同一个排序键、相对位置不再
+  //   跳变。锚点挂在条目上 ⇒ 与缓存条目同生命周期、按 rootId 天然隔离，绝不跨 root 泄漏。
   //
   // 容量契约（R3）：
   // - **非在飞**条目受 SNAPSHOT_CACHE_LIMIT（8）约束，这是「缓存结果」的硬上限；
@@ -1087,6 +1147,9 @@ export function createExpertGroupRuntime({
       // R1：连续失败次数与失败退避截止时刻（成功后清零，见 ensureFullBuild）。
       failureCount: 0,
       retryBlockedUntil: 0,
+      // 修复 A：排序锚点（节点 id → createdAt），只由**完整构建成功**写入，供轻量构建补缺。
+      // 挂在条目上 = 与缓存条目同生命周期、按 rootId 天然隔离，条目被淘汰时锚点一起消失。
+      sortAnchor: new Map(),
     };
     snapshotCache.set(rootId, entry);
     // 创建路径同样维护硬上限：「轻量返回 null」「完整构建失败」这些不写结果的路径也会留下
@@ -1188,6 +1251,9 @@ export function createExpertGroupRuntime({
     const settled = buildSnapshotForSession(rootId, { fast: false }).then(
       (snapshot) => {
         entry.full = { snapshot, at: now(), generation: buildGeneration };
+        // 修复 A：完整快照是权威的 createdAt 来源，构建成功后把 id → createdAt 记成锚点，
+        // 供后续轻量快照补齐同一个排序键。只记录非空有限数值；空值不覆盖已有锚点。
+        rememberSortAnchor(entry, snapshot);
         // 成功即重置失败退避（R1）：下一次失败重新从基数开始，不会因为历史失败次数被长期拖慢。
         entry.failureCount = 0;
         entry.retryBlockedUntil = 0;
@@ -1362,13 +1428,14 @@ export function createExpertGroupRuntime({
       fast = entry.fast.snapshot;
     } else {
       // 真正重建：代次在构建**开始时**捕获（与完整构建同一条规则）。
+      // 修复 A：把该 root 的排序锚点传给轻量构建，用它给缺失的 createdAt 兜底（按 root 隔离）。
       fastGeneration = entry.generation;
-      fast = await buildSnapshotForSession(id, { fast: true });
+      fast = await buildSnapshotForSession(id, { fast: true, sortAnchor: entry.sortAnchor });
       if (fast !== null && fastGeneration !== entry.generation) {
         // R5：构建期间发生过失效，这份结果不是当前权威——丢弃它，按**当前**代次重算一次
         // （仍是零 I/O 的同步轻量投影，不引入阻塞、不触发冷读）。只重算一次，避免自旋。
         fastGeneration = entry.generation;
-        fast = await buildSnapshotForSession(id, { fast: true });
+        fast = await buildSnapshotForSession(id, { fast: true, sortAnchor: entry.sortAnchor });
       }
       // 只有真正重建成功时才写入新的时间戳与代次；命中路径保持原有 at 不变。
       if (fast !== null) {
