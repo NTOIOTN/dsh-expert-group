@@ -202,6 +202,62 @@
    * 保证长期运行的面板不会无界增长。
    */
   const SIDEBAR_AUTO_KEY_LIMIT = 128;
+  /**
+   * 宿主 close() 请求的 watchdog 上限。
+   *
+   * 宿主 closeIn 在 actions / surface 缺失、tab 不存在或 canCloseTab=false 时会静默 no-op，也可能
+   * 返回一个永不 settle 的 Promise。没有上限，Auto 的 busy 闸门与 pending 锁就会被一次宿主调用永久
+   * 占住（后续候选再也推进不了）。10 秒 = 四次 2.5 秒轮询：足够正常宿主结算，也足够在真实 UI 上
+   * 表现为「这一轮让位、下一轮重试」。
+   */
+  const SIDEBAR_TAB_CLOSE_WATCHDOG_MS = 10000;
+  /**
+   * close 请求 resolve 之后的验证窗口：resolve 只代表请求完成，绝不代表 tab 已经关闭。
+   *
+   * 验证只认 readSidebarOpenTabs() 的**精确 tabId** 结果，并沿用既有的
+   * SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS = 2 次连续缺失确认（2.5 秒轮询 ⇒ 正常验证窗口约 5 秒）。
+   * 10 秒是这条验证链的上限：超时后释放租约、保留 record / origin / attempt，由下一次同步决定重试。
+   */
+  const SIDEBAR_TAB_CLOSE_VERIFY_TIMEOUT_MS = 10000;
+  /**
+   * watchdog 超时后的迟到结果隔离窗。
+   *
+   * 宿主 Promise 不可取消：超时之后它仍可能迟到 resolve / reject。隔离窗至少跨过一次 2.5 秒
+   * inventory 采样，因此这段时间里同一个 tab 绝不再发第二次 close，迟到结果也就没有机会与新的
+   * 一次关闭重叠——它只能作用于仍匹配的旧租约（见 requestSidebarTabClose 的收口）。
+   *
+   * **这个窗口覆盖不到的边界**（必须由别的证据补齐，绝不能被它假装覆盖）：
+   * 1. 它是**固定长度**，只保证「窗口内不重叠」——宿主可能在窗口释放之后才落地一次不可取消的副作用；
+   * 2. 它不知道这个 tabId 此刻承载的是谁——宿主可以把已经释放的 tabId 复用给**另一个资源**。
+   * 因此「重试之前必须用地址证据证明这个 tabId 仍然是我们要关的那个资源」是独立于本窗口的硬闸门
+   * （见 sidebarTabPresenceInInventory 的 contentId 判据与 closeSidebarTabWithLease 的 preflight）：
+   * 本窗口只负责把迟到结果的落点钉死在旧租约上，绝不承担「id 没有被复用」这个假设。
+   */
+  const SIDEBAR_TAB_CLOSE_LATE_QUARANTINE_MS = 3000;
+  /**
+   * 自动关闭失败后的冷却慢车道：60 秒起，指数退避 60/120/240/480 秒，上限 15 分钟。
+   *
+   * 三次快速预算用尽（或「resolve 后 inventory 仍 present」累计三次）后**不再删除 origin**，而是
+   * 进入冷却：冷却期内同一个 key 零次 close 请求，origin / record 原样保留，到期后允许一次新的
+   * 真实 close（失败则退避到下一档）。
+   */
+  const SIDEBAR_AUTO_CLOSE_COOLDOWN_BASE_MS = 60000;
+  const SIDEBAR_AUTO_CLOSE_COOLDOWN_MAX_MS = 900000;
+
+  /**
+   * 关闭租约的四种结算原因。
+   *
+   * 等待者（用户触发的手动单项与批量）绝不能只看一个布尔「成功/失败」：同一个 tabId 上的两次
+   * 关闭可能属于**不同的 key**（宿主把已经释放的 id 回收给了另一个资源），而「上一次结算是
+   * recycled」对没有地址证据的等待者什么都不能证明。因此结算必须携带原因，等待者用自己的期望
+   * 地址重新探针复核之后再决定下一步（见 closeSidebarTabWithLease 的等待分支）。
+   * 布尔写法保留兼容：true ⇒ "closed"、false ⇒ "failed"。
+   */
+  const SIDEBAR_TAB_CLOSE_SETTLE_REASONS = new Set(["closed", "recycled", "failed", "timeout"]);
+  function closeSettleReason(outcome) {
+    if (SIDEBAR_TAB_CLOSE_SETTLE_REASONS.has(outcome) === true) return outcome;
+    return outcome === true ? "closed" : "failed";
+  }
 
   function object(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -433,6 +489,18 @@
   function sidebarTabKey(sessionId, rootSessionId, resourceAddress) {
     return String(sessionId) + SIDEBAR_TAB_KEY_SEPARATOR
       + String(rootSessionId) + SIDEBAR_TAB_KEY_SEPARATOR + String(resourceAddress);
+  }
+
+  /**
+   * 「同一个 tab 的关闭在途」锁的复合键：sessionId + rootSessionId + 宿主 tabId。
+   *
+   * 与 sidebarTabKey（按资源地址记账）刻意不同：同一个资源地址在别的 session / 别的 root 里对应的是
+   * 另一个右栏 tab，只有 tabId 才能证明「宿主正在处理同一个 tab」。关闭的副作用作用在 tabId 上，
+   * 因此重复关闭的判据也只能是 tabId。
+   */
+  function sidebarTabCloseKey(sessionId, rootSessionId, tabId) {
+    return String(sessionId) + SIDEBAR_TAB_KEY_SEPARATOR
+      + String(rootSessionId) + SIDEBAR_TAB_KEY_SEPARATOR + String(tabId);
   }
 
   function sessionEntries(value) {
@@ -2147,6 +2215,124 @@
       return { rootSessionId, snapshot: cached, loading: cached === null, error: null };
     };
 
+    /**
+     * 跨 Panel 实例共享的 Auto 账本（同一插件 install 内共享；重装插件或重启进程即随之消失）。
+     *
+     * 症状与根因：真实 DSH 的 keyed session surface 会卸载旧 Panel 实例、再用同一个已安装组件挂载
+     * 新实例，而宿主右栏的 tab 与它自己那份 inventory 原样保留。这三份账本原先都建在 Panel 内的
+     * useRef 上，卸载即丢失，因此新实例在 syncSidebarTabRecords() 的收养路径里只能把宿主里已经
+     * 存在的 tab 记成 manual 来源（recordSidebarTab 的兜底），Auto 随后主动放弃关闭它——用户看到的
+     * 就是「子代理已经空闲，Auto 开出来的那个 tab 却永远留在右栏」。
+     *
+     * 只共享回答「这个 tab 是不是 Auto 亲手打开、还归不归 Auto 管」所必需的集合：
+     * - origin：Auto 亲手发出过打开动作的资源（键与打开记录同构）；它同时是「绝不重复打开」的记账；
+     * - suppressed：用户手动关闭过的资源，Auto 不得立刻重开；
+     * - closeAttempts：自动关闭的有界重试计数（重挂载不得白送或重置预算）；
+     * - closeAttemptOwners：每条 closeAttempts 预算**当前所有者**的不可复用令牌（见下方说明）。
+     *
+     * 重试预算必须带所有者身份：预支与回滚分别发生在「候选选择」和「动作在副作用之前被撤销」两个
+     * 时刻，中间可能跨越一次面板重挂载或同一个实例的 A→B→A 回代。预算本身按 key 共享，因此旧代次
+     * 的迟到回滚若只按 key 写回 attemptsBefore，就会删掉/覆盖新代次已经预支的那一笔预算——同一个
+     * key 的实际 close 次数随之突破 3 次上限。owner 账本把「这笔预算现在是谁的」也放进同一层共享
+     * 状态，回滚只认对象身份，旧令牌一律 fail-safe。
+     *
+     * 其余状态一律留在 Panel 实例内：在途动作与预留（reservation）、Auto 代次（epoch）、失败屏障、
+     * busy 闸门、tab 打开记录（records/openings）、手动意图都属于「当前这一帧 surface 的在途状态」，
+     * 跨实例共享只会让旧实例的在途状态污染新实例。键始终是（sidebar session + rootSessionId +
+     * 资源地址）复合键，因此共享也不会让不同 root / 不同 session 互相影响。
+     */
+    const sharedSidebarAutoOrigin = new Map();
+    const sharedSidebarAutoSuppressed = new Map();
+    const sharedSidebarAutoCloseAttempts = new Map();
+    /**
+     * 跨 Panel 实例共享的「这条自动关闭重试预算归谁」账本：key → 本次预支预算的**不可复用**令牌。
+     *
+     * 键与 closeAttempts 完全同构，取值是候选选择那一刻新建的对象（对象身份即所有权），因此任何
+     * 旧代次手里的令牌都不可能与后来者的令牌相等。写入与删除与 closeAttempts 同步进行，并沿用同一
+     * 个 trimAutoKeyMap/128 上限，绝不引入第二份无界 Map。
+     */
+    const sharedSidebarAutoCloseAttemptOwners = new Map();
+    /**
+     * 跨 Panel 实例共享的「close 请求已经发出、等待 inventory 验证」状态：key → 验证记录
+     * { sessionId, rootSessionId, tabId, address, attemptToken, manual, misses, deadline, lease }。
+     *
+     * 关闭请求 resolve 之后绝不能立刻收口：记录只在**连续两次可读 inventory 都读不到这个精确 tabId**
+     * 时才算 verified-closed。验证链因此必须与来源账本同层共享——重挂载后的新实例继续采样、继续收口，
+     * 而不是把「请求完成」当成「已经关闭」。租约同时被这条记录持有，下一轮同步绝不会重复 close。
+     */
+    const sharedSidebarAutoCloseVerifications = new Map();
+    /**
+     * 跨 Panel 实例共享的自动关闭失败冷却：key → { step, until }。
+     *
+     * 与重试计数同层共享：scope remount 或同一个实例 A→B→A 绝不能绕过失败上限（否则频繁重挂载就等于
+     * 无限重试）。generation token 只负责阻止旧动作越权，不改变这份预算的生命周期。
+     */
+    const sharedSidebarAutoCloseCooldowns = new Map();
+    /**
+     * 跨 Panel 实例共享的 Auto 候选采样计数：key → { sessionId, rootSessionId, tabId, misses }。
+     *
+     * 症状与根因：候选选择阶段的在场判据原先只采**一次**样。宿主 inventory 只要在这一帧短暂缺项
+     * （布局换桶、面板重挂载、宿主提交窗口的中间态都是正常抖动），单次 absent 就会立刻删掉这个 key
+     * 的 record / 来源 / 预算——tab 明明还在宿主里，却永久失去 Auto 归属，资源结束后再也不会被
+     * 自动收回（用户看到的正是「偶尔漏收」）。记录同步器（record.misses）与关闭验证链
+     * （verification.misses）都要求 SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS 次**连续**缺失，候选选择
+     * 必须与它们同一条确认语义，否则同一份 inventory 在两处被解释成两种强度。
+     *
+     * - 生命周期：第一次 absent/recycled 采样时写入；任一 present 采样立刻清零（与既有语义一致）；
+     *   这个 key 的 Auto 关闭记账整体收口时（clearAutoCloseAttempt，覆盖预算 / owner / 冷却的
+     *   所有入口）一并删除，因此绝不跨代残留；
+     * - 计数只对**同一个 tabId** 有效：record 换成宿主新分配的 tabId 时旧计数自动作废；
+     * - 限容：**纯 LRU**（按最近一次采样时间排序）+ SIDEBAR_AUTO_KEY_LIMIT，绝不新增无界 Map；
+     *   绝不用当前实例的局部 record / 在途状态判定别的 scope 的共享条目（见 trimSharedSidebarAutoTabMisses）。
+     */
+    const sharedSidebarAutoTabMisses = new Map();
+    /**
+     * sharedSidebarAutoTabMisses 的限容淘汰：**纯 LRU**——按「最近一次采样」排序，淘汰最久没被采样的条目。
+     *
+     * 为什么这条 Map 绝不能用 trimAutoKeyMap(map, true) 那套「活动感知」淘汰：
+     * 1. 生命周期不匹配。这份计数必须**跨 Panel 实例、跨 root / sidebar session 共享**（确认序列要在
+     *    重挂载之后继续推进），而活动判定 sidebarAutoCloseKeyIsActive 读的是**当前这个实例**的局部
+     *    在途状态（pending / opening / reservation / verification / cooldown）与**当前 scope** 的
+     *    record。别的 scope 的条目在当前实例里天然「不活动」，于是它们会在别的 scope 的一次普通采样
+     *    写入时被当成历史条目淘汰——正是本插件要修的「偶尔漏收」：目标 key 的确认计数被打回 1，永远
+     *    到不了 SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS，record / origin 保留但那个 tab 再也不自动收回。
+     * 2. 采样计数本来就与在途状态无关：它只回答「这个 tabId 连续几次被**可读采样**判为不在场」。
+     *    跨 scope 的条目同样需要完整数满两次，因此可淘汰性只能由「最后一次采样有多旧」决定，绝不能由
+     *    当前帧的 record / 在途状态决定。
+     *
+     * 为什么 128 上限够用：确认只需 2 次采样，而**每次采样都会把这个 key 重新插到队尾**
+     * （见 sampleAutoTabMisses），所以一个正在确认中的 key 只有在「它两次采样之间又插入了 128 次其它
+     * 采样」时才会被挤掉；每个 surface 每轮至多推进自己的一条采样，真实轮询周期远小于这个量级。
+     * 上限本身继续防止复合键（session + root + 资源地址）随长生命周期无界增长。
+     */
+    const trimSharedSidebarAutoTabMisses = () => {
+      while (sharedSidebarAutoTabMisses.size > SIDEBAR_AUTO_KEY_LIMIT) {
+        const oldest = sharedSidebarAutoTabMisses.keys().next();
+        if (oldest.done === true) break;
+        sharedSidebarAutoTabMisses.delete(oldest.value);
+      }
+    };
+    /**
+     * 跨 Panel 实例共享的「同一个 tab 上已经有一次关闭在途」租约：key =（sidebar session + root + tabId）
+     * → 租约对象（身份 + 结算信号）。
+     *
+     * 症状与根因：宿主右栏的 close() 可能是异步的（返回 Promise，结算后才真的移除 tab）。旧 Panel 实例
+     * 发出这次关闭后就被卸载了，但那次调用的续体仍在运行；而它的 pending 锁与 busy 闸门都是**实例级**
+     * 的，新实例一概看不见——宿主 inventory 里这个 tab 还在，新实例收养它之后会为同一个 tabId 再发一次
+     * close。宿主若非幂等（或复用了 tabId），用户就会看到重复副作用（关掉别人的 tab / 抛错）。
+     *
+     * 因此这把锁必须与来源账本同层共享：身份是（当前 sidebar session + root + tabId），Auto 单 tab 关闭、
+     * 手动单 tab 关闭与批量关闭三个入口共用它；只在真正调用宿主 close 的那一小段持有，并在 finally 归还。
+     * 锁只回答「这个 tab 现在有人在关吗」，不携带任何 Panel 实例状态。
+     *
+     * 值不是「无结果的 token」而是一份**可结算的租约**：它额外携带那一次 close 的真实结果（成功 / 失败）
+     * 与一个等待信号。竞争方（用户触发的手动单项与批量）必须等到结算再决定下一步——上次成功就当作这个
+     * tab 已经被关掉、绝不再 close；上次失败才允许用当前 inventory 复核同一个 tabId 后做一次有限重试。
+     * 少了这层结果信号，等待者只能看到「锁空了」：要么对已经关掉的 tab 重复 close，要么把一次失败的
+     * 竞争当成「有人处理了」而丢掉用户的关闭意图。
+     */
+    const sharedSidebarTabCloseInFlight = new Map();
+
     function Panel(props) {
       const ctx = props?.ctx || config.ctx;
       let tabInfo = null;
@@ -2226,6 +2412,48 @@
       currentRootRef.current = rootSessionId;
       const currentSidebarSessionRef = typeof react.useRef === "function" ? react.useRef(sidebarSessionId) : { current: sidebarSessionId };
       currentSidebarSessionRef.current = sidebarSessionId;
+      /**
+       * surface 身份令牌：给每一条「跨 await 的异步动作」用的**不可复用**身份。
+       *
+       * 症状与根因：异步动作（自动打开/关闭、批量关闭、等待竞争租约）在 await 之后只用
+       * mountedRef + currentRootRef + currentSidebarSessionRef 复核「当前 surface」。这三条判据
+       * 比较的是**当前字符串值**，于是有一条真实交错会漏过去：同一个 Panel 实例快速
+       * root/sidebar session A→B→A 之后，旧闭包捕获的字符串会与当前值**重新相等**——旧动作由此
+       * 把自己的迟到收尾当成当前 surface 的收尾继续执行，删掉「A 里已经换成新 tabId 的 record /
+       * Auto 来源」，并用旧快照推进同步。字符串判据挡得住「切走了没回来」，挡不住「切走又切回」。
+       *
+       * 因此每个 Panel 实例在挂载时生成一份唯一身份，并在 sidebarSessionId / rootSessionId 每一次
+       * 变化时换成**新对象**（A→B→A 两次都换）：异步动作启动时捕获自己那一份，await 之后只回答
+       * 「还是不是我出发时那一份」。令牌必须比较对象身份，绝不能只比较当前字符串值。
+       *
+       * 生成时机：首次渲染（挂载）与「root/sidebar session 与上一帧不同」的那一帧。同一组值下的
+       * 普通重渲染（轮询、通知、展开状态变化）与 StrictMode 的双渲染都不会换令牌（hook 槽位不变），
+       * 因此正在执行的异步动作不会被误判成 stale；组件重挂载则必然换（新实例 = 新 ref 槽位）。
+       */
+      const surfaceTokenScopeRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      const surfaceTokenRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      const surfaceTokenScope = surfaceTokenScopeRef.current;
+      if (surfaceTokenScope === null
+        || surfaceTokenScope.rootSessionId !== rootSessionId
+        || surfaceTokenScope.sidebarSessionId !== sidebarSessionId) {
+        surfaceTokenScopeRef.current = { rootSessionId, sidebarSessionId };
+        surfaceTokenRef.current = { rootSessionId, sidebarSessionId };
+      }
+      /** 本帧闭包捕获的 surface 身份：所有异步动作在启动时捕获它，await 之后只与这一份比较。 */
+      const surfaceToken = surfaceTokenRef.current;
+      /**
+       * 异步动作的 surface 闸门：mounted / root / sidebar session 三条既有判据**同时**成立，
+       * 并且令牌仍然是出发时那一份，才允许继续。
+       *
+       * 两组判据缺一不可：字符串判据负责「切走了、没回来」与「别的 root 的同地址记录」，令牌负责
+       * 「切走了又切回同一组值」（A→B→A）与「重挂载后的旧闭包」。await 之后、旧闭包调用
+       * syncSidebarTabs() 之前、以及会改共享 Auto 账本 / 记录 / 手动抑制的迟到收尾分支，都必须先过
+       * 这一道闸门。
+       */
+      const sidebarSurfaceStillCurrent = () => mountedRef.current === true
+        && currentRootRef.current === rootSessionId
+        && currentSidebarSessionRef.current === sidebarSessionId
+        && surfaceTokenRef.current === surfaceToken;
       const refreshStateRef = typeof react.useRef === "function"
         ? react.useRef({ rootSessionId: null, inFlight: null, pending: false })
         : { current: { rootSessionId: null, inFlight: null, pending: false } };
@@ -2378,10 +2606,30 @@
        *   （手动意图始终优先）。
        * 两个集合都按当前快照与上限清理（见 syncAutoSidebarTabs 的清理阶段）。
        */
-      const sidebarAutoOriginRef = typeof react.useRef === "function" ? react.useRef(new Map()) : { current: new Map() };
-      const sidebarAutoSuppressedRef = typeof react.useRef === "function" ? react.useRef(new Map()) : { current: new Map() };
-      /** 自动关闭的重试记账：key → 已尝试次数（成功或资源重新变成运行中时清空）。 */
-      const sidebarAutoCloseAttemptsRef = typeof react.useRef === "function" ? react.useRef(new Map()) : { current: new Map() };
+      // 这几个集合指向 createExpertGroupPanel 闭包里的共享账本：重挂载后的新实例靠它认领旧实例开出的
+      // tab（见 sharedSidebarAutoOrigin 的说明）。ref 只是持有者，读写结构逐字不变。
+      const sidebarAutoOriginRef = typeof react.useRef === "function" ? react.useRef(sharedSidebarAutoOrigin) : { current: sharedSidebarAutoOrigin };
+      const sidebarAutoSuppressedRef = typeof react.useRef === "function" ? react.useRef(sharedSidebarAutoSuppressed) : { current: sharedSidebarAutoSuppressed };
+      /** 自动关闭的重试记账：key → 已尝试次数（成功或资源重新变成运行中时清空）；跨重挂载保留。 */
+      const sidebarAutoCloseAttemptsRef = typeof react.useRef === "function" ? react.useRef(sharedSidebarAutoCloseAttempts) : { current: sharedSidebarAutoCloseAttempts };
+      /**
+       * 自动关闭重试预算的所有者账本：key → 本次预支预算的不可复用令牌；与重试计数同层共享。
+       *
+       * 只有「当前 owner 就是自己出发时那一份令牌」的动作才允许回滚这次预支（见 releaseAutoCloseAttempt），
+       * 因此旧代次在副作用之前被撤销时绝不可能删掉/覆盖新代次已经预支的预算。
+       */
+      const sidebarAutoCloseAttemptOwnersRef = typeof react.useRef === "function" ? react.useRef(sharedSidebarAutoCloseAttemptOwners) : { current: sharedSidebarAutoCloseAttemptOwners };
+      /** 关闭请求的验证记录（跨重挂载保留：验证由后续任意一次同步按精确 inventory 完成）。 */
+      const sidebarAutoCloseVerificationsRef = typeof react.useRef === "function" ? react.useRef(sharedSidebarAutoCloseVerifications) : { current: sharedSidebarAutoCloseVerifications };
+      /** 自动关闭失败冷却账本（跨重挂载保留：remount 绝不能绕过失败上限）。 */
+      const sidebarAutoCloseCooldownsRef = typeof react.useRef === "function" ? react.useRef(sharedSidebarAutoCloseCooldowns) : { current: sharedSidebarAutoCloseCooldowns };
+      /**
+       * Auto 候选采样到的「这个 tab 连续不在场」计数（跨重挂载保留，见 sharedSidebarAutoTabMisses）。
+       *
+       * 与来源 / 抑制 / 预算同层共享：一次重挂载绝不能把「已经确认缺失一次」重置成「还没采样过」，
+       * 否则同一条确认语义会被 remount 反复打断（那正是「单次缺失即收口」的另一种写法）。
+       */
+      const sidebarAutoTabMissesRef = typeof react.useRef === "function" ? react.useRef(sharedSidebarAutoTabMisses) : { current: sharedSidebarAutoTabMisses };
       /**
        * 自动打开的**预留**（reservation）：key → { sessionId, rootSessionId, address, epoch }。
        *
@@ -3171,6 +3419,12 @@
        * - contentId 精确等于集合中的地址：同一个 kind 下也可能是另一个子代理的地址。
        *
        * 结果按 tabId 去重：宿主 inventory 理论上可能有重复记录，重复 tabId 只能关一次。
+       *
+       * 候选携带 { tabId, address } **两个字段**，而不是只带 tabId：候选集合是点击那一刻的渲染
+       * 快照，而真正调用 close() 之前可能已经跨过若干次 await（前一个候选的 close、宿主的提交）。
+       * 宿主可以把一个已经释放的 tabId 回收给**另一个资源**——只按 tabId 执行就等于盲关别人的 tab。
+       * 地址与 tabId 一起进候选，执行时才能用同一个地址做「这个 id 此刻仍然是我们要关的那个资源」
+       * 的复核（见 handleSidebarBatchClose 与 sidebarTabPresenceInInventory 的 contentId 判据）。
        */
       const sidebarBatchCandidates = (addresses, inventory) => {
         const seen = new Set();
@@ -3188,7 +3442,7 @@
             if (contentId === null || addresses.has(contentId) !== true) continue;
             if (seen.has(tabId) === true) continue;
             seen.add(tabId);
-            candidates.push(tabId);
+            candidates.push({ tabId, address: contentId });
           } catch { continue; }
         }
         return candidates;
@@ -3221,9 +3475,17 @@
       /**
        * 两行批量状态的合并签名：只在候选集合真的变化时触发一次重渲染（空闲轮询绝不空转重渲染）。
        * 两行必须一起进签名——只跟踪主代理行会让空闲分组的手动开/关 tab 迟迟不被反映。
+       *
+       * 候选是 { tabId, address }：签名必须把**两个字段**都编码进去。只取 tabId 会让「同一个 id 换了
+       * 资源地址」这种真实变化被当成没变化（按钮计数不变，但该关的目标已经变了）；直接 join 对象则退化
+       * 成 "[object Object]"——两种都会让签名失去意义。分隔符用 NUL，与复合键同一个约定。
        */
       const sidebarBatchSignatureOf = (runningState, idleState) => {
-        const part = (state) => (state.kind === "close" ? "close:" + state.candidates.join(",") : state.kind);
+        const part = (state) => (state.kind === "close"
+          ? "close:" + state.candidates
+            .map((candidate) => candidate.tabId + SIDEBAR_TAB_KEY_SEPARATOR + candidate.address)
+            .join(",")
+          : state.kind);
         return part(runningState) + "|" + part(idleState);
       };
 
@@ -3293,14 +3555,38 @@
        * 再被后续同步当成「还没确认的打开」而重建关闭记录（用户明明已经收回了这个 tab）。因此这里
        * 一并删除该 key 的 opening 记录；意图缺失时它是一次幂等空操作。
        */
-      const cancelPendingSidebarSplit = (reason) => {
+      const cancelPendingSidebarSplit = (reason, expectedIntentToken) => {
         const intent = sidebarSplitIntentRef.current;
         if (intent === null) return;
+        /**
+         * 可选的令牌闸门：显式传入令牌的调用方（关闭收口）必须与当前意图的**不可复用令牌**逐对象
+         * 相等才允许取消；不传令牌的调用方（卸载、超时、动作被撤销、打开失败）保持既有语义——它们
+         * 手里的意图就是它们此刻正在处理的那一份。null 是**有效**的期望值：它只可能来自「出发时根本
+         * 没有意图」，此刻槽位里的任何意图都必然是后来者，一律不取消。
+         */
+        if (expectedIntentToken !== undefined && intent.token !== expectedIntentToken) return;
         sidebarSplitIntentRef.current = null;
         // 意图里带着 key，收口范围因此精确到这一次点击，绝不误伤别的行的在途记录。
         sidebarTabOpeningRef.current.delete(intent.key);
         if (cancelSidebarSplit === null) return;
         try { cancelSidebarSplit.call(config, intent.token, { reason }); } catch { /* 收口失败不能阻断面板同步。 */ }
+      };
+      /**
+       * 关闭收口专用的 split 事务取消：只有当前意图**仍然是这次关闭出发时看到的那一份**才允许取消。
+       *
+       * 特征判据必须是比较意图的**不可复用令牌**（每次 beginSidebarSplit 新建的对象身份），而不是
+       * 只比 key：split 意图槽位在一个实例里只有一份，同一个 key 上的新一次打开会把它整份替换掉，
+       * 旧 close 的迟到收口（尤其 verified-recycled）若按 key 取消，取消的就是新 generation 的
+       * split/open 事务——右栏从临时 50% 掉回、新 pane 的打开失去归属，而那次打开与这次关闭毫无关系。
+       *
+       * 令牌为 null（出发时根本没有意图）时一律不取消：它只可能属于后来者。
+       */
+      const cancelPendingSidebarSplitOfClose = (key, splitIntentToken) => {
+        const intent = sidebarSplitIntentRef.current;
+        if (intent === null || intent.key !== key) return;
+        if (splitIntentToken === null || splitIntentToken === undefined) return;
+        if (intent.token !== splitIntentToken) return;
+        cancelPendingSidebarSplit("close", splitIntentToken);
       };
 
       /**
@@ -3350,8 +3636,26 @@
         const openings = sidebarTabOpeningRef.current;
          const now = Date.now();
                    const openingResolved = [];
-          if (records.size === 0) {
+          /**
+           * 初始收养的判据是「当前（sidebar session + root）还没有任何打开记录」，而不是全局
+           * records.size：同一个 Panel 实例会按新的 props.scope 切换到另一个 root，前一个 root
+           * 遗留的记录绝不能让当前 root 跳过这一步——否则宿主里已经存在的 tab 永远收不到记录，
+           * Auto 也就再也认不出自己打开过的 tab（箭头停在 >>，资源结束后也不会自动关闭）。
+           *
+           * 记录键始终是（sidebar session + root + 地址）复合键，因此按 scope 收养不会覆盖或
+           * 误伤别的 root 的记录。tabId 一律当场从当前 openTabs inventory 现读（见 recordSidebarTab），
+           * 绝不跨重挂载缓存 tabId：宿主的 tabId 只由它自己那份 inventory 证明。
+           */
+          let scopedRecordExists = false;
+          for (const record of records.values()) {
+            if (record.sessionId === sidebarSessionId && record.rootSessionId === rootSessionId) {
+              scopedRecordExists = true;
+              break;
+            }
+          }
+          if (scopedRecordExists !== true) {
             for (const resourceAddress of knownSidebarResourceAddresses()) {
+              if (sidebarAdoptionEvidenceAvailable(resourceAddress) !== true) continue;
               const key = sidebarTabKey(sidebarSessionId, rootSessionId, resourceAddress);
               if (recordSidebarTab(key, resourceAddress)) openings.delete(key);
             }
@@ -3430,13 +3734,36 @@
         const inventory = readSidebarOpenTabs();
         if (inventory === null) return { readable: false, tabId: null };
         for (const entry of inventory) {
-          const candidate = object(entry);
-          if (text(candidate.sessionId, null) !== sidebarSessionId) continue;
-          if (text(candidate.kind, null) !== SUBAGENT_CHAT_KIND) continue;
-          if (text(candidate.contentId, null) !== resourceAddress) continue;
-          return { readable: true, tabId: text(candidate.tabId, null) };
+          /**
+           * 单条畸形条目（属性 getter 抛错）只跳过它自己：它既证明不了资源已打开，也不代表整份
+           * inventory 不可读，因此绝不让它把异常抛到同步链路上、也绝不因此改变 readable 的语义。
+           */
+          try {
+            const candidate = object(entry);
+            if (text(candidate.sessionId, null) !== sidebarSessionId) continue;
+            if (text(candidate.kind, null) !== SUBAGENT_CHAT_KIND) continue;
+            if (text(candidate.contentId, null) !== resourceAddress) continue;
+            return { readable: true, tabId: text(candidate.tabId, null) };
+          } catch { continue; }
         }
         return { readable: true, tabId: null };
+      };
+      /**
+       * 收养路径（面板重挂载 / 切换 root 后从宿主重建记录）的证据门槛。
+       *
+       * 收养没有「本次动作」这一上下文，而 recordSidebarTab 的 active() 兜底读面**不带 session**：
+       * 同一个 root 的 child surface 是独立右栏，它自己的 active tab 不能证明当前 session 已经打开
+       * 了这个资源。若在 inventory 可读时也接受兜底，新 Session 就会借用旧 Session 的 tabId（<< 指向
+       * 别人的 tab，点击会关闭别的栏里的会话）。
+       *
+       * 因此：inventory 可读 ⇒ 必须由**当前 session** 的条目证明；只有 inventory 不可读（旧宿主 /
+       * 读取抛错）才沿用 active() 这一唯一证据——那条路径的既有契约是「外部已存在的 tab 记为手动
+       * 来源，Auto 既不接管也不关闭」（见 recordSidebarTab 与 Auto 的相关用例）。
+       */
+      const sidebarAdoptionEvidenceAvailable = (resourceAddress) => {
+        const state = sidebarResourceTabStateOf(resourceAddress);
+        if (state.readable !== true) return true;
+        return state.tabId !== null;
       };
       /**
        * active() 是否已经是这个资源（kind 与 contentId 同时匹配）。
@@ -3487,9 +3814,12 @@
           // 只处理当前 surface 的记账：别的 session/root 的键在当前快照里无法判定，绝不越权操作。
           if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
           if (running.has(entry.address) === true) {
-            // 资源重新变成运行中：它已经开着就保持开着，重试记账一并清零。
-            attempts.delete(key);
+            // 资源重新变成运行中：它已经开着就保持开着，重试预算、owner 身份与失败冷却一并清零。
+            // **绝不**丢弃仍在验证中的关闭：那条链属于「已经发出的一次关闭」，它的收口（删记录、
+            // 撤销来源 / 登记抑制）与重试预算无关；丢掉它会让 record 与箭头永久停在 <<。
+            clearAutoCloseBudget(key);
             continue;
+
           }
           const record = records.get(key);
           const scopedRecord = record !== undefined
@@ -3503,19 +3833,75 @@
             if (opening !== undefined && opening.sessionId === sidebarSessionId && opening.rootSessionId === rootSessionId) continue;
             if (sidebarTabPendingRef.current.has(key) === true) continue;
             origin.delete(key);
-            attempts.delete(key);
+            clearAutoCloseAttempt(key);
             continue;
           }
           if (scopedRecord.origin !== SIDEBAR_TAB_ORIGIN_AUTO) {
             // 记录已经被手动接管（用户手动打开或外部 tab）：手动优先，撤销自动来源，绝不关闭它。
             origin.delete(key);
-            attempts.delete(key);
+            clearAutoCloseAttempt(key);
+            continue;
+          }
+          /**
+           * 同一个 tab 上已经有一次关闭在途（典型：旧 Panel 实例的 close Promise 还没结算，当前实例
+           * 刚刚从宿主 inventory 收养了它）：这一轮直接让位，绝不排队第二次关闭。
+           *
+           * 这里既不推进重试计数、也不撤销来源——那次关闭的成败由发起它的链路按成功路径结算；当前
+           * 轮次只是「有人在关，别插手」。真正的执行点还会再确认一次（候选选择与执行之间隔着一次
+           * 微任务跳转与一次可能的组件重挂载，见 handleSidebarAction）。
+           */
+          if (sidebarTabCloseInFlight(scopedRecord.tabId) === true) continue;
+          /**
+           * 宿主的公开 inventory 明确读到这个 tabId 不在（absent），或已经被回收给**另一个资源**
+           * （recycled：条目暴露的 contentId 与本 key 的资源地址不一致）——两者都必须先过
+           * 「连续两次可读采样」的确认闸门，才允许收口这个 key 的归属：
+           *
+           * 单次缺项**不构成**「tab 已经不在」的证据。宿主 inventory 在这类时机短暂缺项是正常抖动
+           * （布局换桶、面板重挂载、提交窗口的中间态），而单次 absent 就删掉 record / 来源 / 预算等于
+           * 让一个仍然开着的 tab 永久脱离 Auto（正是用户报的「偶尔漏收」）；单次 recycled 更是把一次
+           * 读取抖动升格成「旧 tab 已消失」，会顺手清掉冷却与预算。记录同步器与关闭验证链都要求
+           * SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS 次连续缺失，候选选择必须与它们同一条强度。
+           *
+           * 计数语义（见 sharedSidebarAutoTabMisses）：
+           * - present：计数清零，照旧继续走关闭路径；
+           * - absent / recycled：累加连续计数，未达确认次数时**保留** record / 来源 / 预算 / 冷却，
+           *   本轮既不关闭也不收口（下一轮可读采样继续确认）；
+           * - unreadable（旧宿主只有 active()）：既不证明存在也不证明不存在，绝不推进计数——保持既有
+           *   语义，仍按已确认记录发起关闭，由 closeSidebarTabWithLease 的 preflight fail-closed。
+           *
+           * 确认收口时两种证据的收口范围与旧实现逐字一致：absent 清预算（保留冷却），recycled 连冷却
+           * 一起清（这个 key 的 tab 已经不存在，一条永远等不到自己 tab 的冷却只会白白屏蔽真实关闭）。
+           * 别的 key 的记录不在本次收口范围内：每个 key 只按自己的地址与自己的 record 结算。
+           */
+          const recordPresence = sidebarTabPresenceInInventory(scopedRecord.tabId, entry.address);
+          const recordMissing = recordPresence === "absent" || recordPresence === "recycled";
+          if (recordMissing === true) {
+            // 还没到连续两次的确认次数：本轮保留 record / 来源 / 预算 / 冷却，既不关闭也不收口。
+            if (sampleAutoTabMisses(key, scopedRecord.tabId, true) < SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS) continue;
+          } else if (recordPresence === "present") {
+            // 任一正向证据清零，与记录同步器「正向证据清零」逐字同源。
+            sampleAutoTabMisses(key, scopedRecord.tabId, false);
+          }
+          // 落到这里的其余情况只有 unreadable：既不推进计数也不清零——读不到既不证明存在也不证明不存在，
+          // 与关闭验证链同一条语义，随后仍按已确认记录走关闭路径（preflight 会 fail-closed）。
+          if (recordPresence === "absent") {
+            records.delete(key);
+            origin.delete(key);
+            clearAutoCloseAttempt(key);
+            bump((value) => value + 1);
+            continue;
+          }
+          if (recordPresence === "recycled") {
+            records.delete(key);
+            origin.delete(key);
+            clearAutoCloseBudget(key);
+            bump((value) => value + 1);
             continue;
           }
           if (closeSidebarResource === null) {
             // 宿主没有公开 close（旧宿主）：撤销记账，绝不退化成别的关闭方式。
             origin.delete(key);
-            attempts.delete(key);
+            clearAutoCloseAttempt(key);
             continue;
           }
           if (sidebarTabPendingRef.current.has(key) === true) continue;
@@ -3523,17 +3909,35 @@
           if (sidebarAutoFailedKeysRef.current.has(key) === true) continue;
           // 用户刚刚在这个 key 上表达过手动意图：交给手动链路结算，Auto 本轮让位（手动恒优先）。
           if (sidebarManualIntentOf(key) !== undefined) continue;
+          // 上一次关闭请求还在验证中（租约被验证链持有）：这一轮让位，绝不为同一个 key 再发一次 close。
+          if (sidebarAutoCloseVerificationsRef.current.has(key) === true) continue;
+          // 冷却慢车道：冷却期内零次 close 请求，origin / record 一律保留（绝不删除归属）。
+          if (autoCloseCooldownActive(key) === true) continue;
+          // 冷却到期：清空快速预算，允许一次新的真实 close（失败后再退避到下一档）。
+          releaseExpiredAutoCloseCooldown(key);
           const used = attempts.get(key) ?? 0;
           if (used >= SIDEBAR_AUTO_CLOSE_MAX_ATTEMPTS) {
-            // 有界重试用尽：只撤销来源标记，tab 留给用户（绝不无限重试，也绝不改用批量入口）。
-            origin.delete(key);
-            attempts.delete(key);
+            // 快速预算用尽：**保留 origin 与 record**，改为进入冷却慢车道（60 秒起指数退避）。
+            // 绝不删除归属——删除就等于让一个仍然打开的 tab 永久脱离 Auto（「偶尔漏收」的症状）。
+            enterAutoCloseCooldown(key);
             continue;
           }
+          /**
+           * 每次候选都创建一份**不可复用**的身份令牌（对象身份，而不是可重复的计数或字符串），并
+           * 登记进共享 owner 账本：这条预算现在归这一次动作。只有令牌仍然匹配的动作才允许回滚它，
+           * 因此旧代次在副作用之前被撤销时绝不可能删掉/覆盖新代次已经预支的那一笔预算。
+           */
+          const attemptToken = { key, attemptsBefore: used };
           attempts.set(key, used + 1);
+          sidebarAutoCloseAttemptOwnersRef.current.set(key, attemptToken);
+          // 与来源 / 抑制两个集合同一把安全阀：复合键跨 root 保留，计数绝不能随长生命周期无界增长。
+          // owner 账本与它同序写入，因此用同一个上限、同一套淘汰规则（绝不新增无界 Map）。
+          trimAutoKeyMap(attempts, true);
+          trimAutoKeyMap(sidebarAutoCloseAttemptOwnersRef.current, true);
           // attemptsBefore 让「动作在真正调用 close 之前被撤销」的路径能精确回退这一次尝试计数，
-          // 否则一次被取消的自动关闭就会白烧掉一次有界重试预算。
-          return { key, address: entry.address, kind: "close", attemptsBefore: used };
+          // 否则一次被取消的自动关闭就会白烧掉一次有界重试预算；attemptToken 是回滚的**所有权凭据**，
+          // 必须随 autoContext 一路带到每个可能回滚的分支（见 handleSidebarAction）。
+          return { key, address: entry.address, kind: "close", attemptsBefore: used, attemptToken };
         }
         return null;
       };
@@ -3553,6 +3957,9 @@
           if (suppressed.has(key) === true) continue;
           // 本次运行已经为它成功发出过打开动作：绝不重复打开（与失败无关，失败会撤销预留）。
           if (origin.has(key) === true) continue;
+          // 容量 fail-closed：Auto 归属账本已满且没有可淘汰的历史条目时，拒绝新的自动打开——
+          // 绝不淘汰仍可精确关闭的 Auto owner（那会让已打开的 tab 永久失去归属）。
+          if (autoSidebarOwnershipHasCapacity(key) !== true) continue;
           // 已经有一个候选为它预留：同一资源绝不并发两个动作。
           if (reservations.has(key) === true) continue;
           if (sidebarTabPendingRef.current.has(key) === true) continue;
@@ -3584,13 +3991,648 @@
         }
         return null;
       };
-      /** 上限淘汰：按插入顺序丢弃最旧的键（复合键跨 root 保留时的安全阀，见 SIDEBAR_AUTO_KEY_LIMIT）。 */
-      const trimAutoKeyMap = (map) => {
+      /**
+       * 上限淘汰（复合键跨 root 保留时的安全阀，见 SIDEBAR_AUTO_KEY_LIMIT）。
+       *
+       * activeAware = true 时优先淘汰「没有当前 record / 没有在途动作 / 没有验证 / 没有冷却」的历史条目；
+       * 若 128 项全是活动条目，则**什么都不淘汰**（fail-closed）：绝不丢掉仍可精确关闭的 Auto owner，
+       * 新增的自动打开改由 autoSidebarOwnershipHasCapacity 拒绝。false 保持既有语义（按插入顺序丢最旧）。
+       */
+      const trimAutoKeyMap = (map, activeAware) => {
         while (map.size > SIDEBAR_AUTO_KEY_LIMIT) {
-          const oldest = map.keys().next();
-          if (oldest.done === true) break;
-          map.delete(oldest.value);
+          let victim = null;
+          for (const candidate of map.keys()) {
+            if (activeAware !== true || sidebarAutoCloseKeyIsActive(candidate) !== true) {
+              victim = candidate;
+              break;
+            }
+          }
+          if (victim === null) break;
+          map.delete(victim);
         }
+      };
+      /**
+       * 这个 key 现在是否还有「活动的 Auto 关闭记账」。
+       *
+       * 判据（任一成立即活动）：仍在途的打开记录 / 预留 / pending 动作 / 关闭验证 / 失败冷却 / 当前 scope
+       * 下仍有精确 record。限容淘汰与「快照缺项」清理都必须给这些 key 让位——它们仍然可能被精确关闭。
+       */
+      const sidebarAutoCloseKeyIsActive = (key) => {
+        if (sidebarTabPendingRef.current.has(key) === true) return true;
+        if (sidebarTabOpeningRef.current.has(key) === true) return true;
+        if (sidebarAutoReservationRef.current.has(key) === true) return true;
+        if (sidebarAutoCloseVerificationsRef.current.has(key) === true) return true;
+        if (sidebarAutoCloseCooldownsRef.current.has(key) === true) return true;
+        const record = sidebarTabRecordsRef.current.get(key);
+        return record !== undefined
+          && record.sessionId === sidebarSessionId
+          && record.rootSessionId === rootSessionId;
+      };
+      /** 清空一个 key 的失败冷却与重试预算（verified-closed / 手动接管 / 资源重新运行共用）。 */
+      const clearAutoCloseBudget = (key) => {
+        clearAutoCloseAttempt(key);
+        sidebarAutoCloseCooldownsRef.current.delete(key);
+      };
+      /** 进入冷却慢车道：60 秒起指数退避、上限 15 分钟；origin / record 一律保留。 */
+      const enterAutoCloseCooldown = (key) => {
+        const cooldowns = sidebarAutoCloseCooldownsRef.current;
+        const previous = cooldowns.get(key);
+        const step = previous === undefined ? 0 : Math.min(previous.step + 1, 4);
+        const delay = Math.min(SIDEBAR_AUTO_CLOSE_COOLDOWN_BASE_MS * (2 ** step), SIDEBAR_AUTO_CLOSE_COOLDOWN_MAX_MS);
+        cooldowns.set(key, { step, until: Date.now() + delay });
+        trimAutoKeyMap(cooldowns, true);
+      };
+      /** 冷却是否仍在生效：生效期内同一个 key 零次 close 请求。 */
+      const autoCloseCooldownActive = (key) => {
+        const entry = sidebarAutoCloseCooldownsRef.current.get(key);
+        return entry !== undefined && entry.until > Date.now();
+      };
+      /** 冷却到期：清空快速预算，让这个 key 重新进入快速车道（失败后由 enterAutoCloseCooldown 退避到下一档）。 */
+      const releaseExpiredAutoCloseCooldown = (key) => {
+        const cooldowns = sidebarAutoCloseCooldownsRef.current;
+        const entry = cooldowns.get(key);
+        if (entry === undefined || entry.until > Date.now()) return;
+        clearAutoCloseAttempt(key);
+      };
+      /**
+       * Auto 归属账本是否还有容纳新 key 的容量（fail-closed）。
+       *
+       * 账本已满且没有任何可淘汰的历史条目时拒绝新的自动打开：宁可不开，也绝不淘汰仍可精确关闭的
+       * Auto owner（那会让一个已经打开的 tab 永久失去归属，正是本插件要修的症状）。
+       */
+      const autoSidebarOwnershipHasCapacity = (key) => {
+        const origin = sidebarAutoOriginRef.current;
+        if (origin.has(key) === true) return true;
+        if (origin.size < SIDEBAR_AUTO_KEY_LIMIT) return true;
+        for (const candidate of origin.keys()) {
+          if (sidebarAutoCloseKeyIsActive(candidate) !== true) return true;
+        }
+        return false;
+      };
+      /**
+       * 无条件收口一个 key 的共享自动关闭记账（重试预算 + owner 身份）。
+       *
+       * 只用于「这个 key 的预算整体不再需要」的路径：资源重新变成运行中、记录消失或被手动接管、
+       * inventory 已证明 tab 不在、宿主没有公开 close、有界重试用尽、成功关闭后的收口与清理阶段。
+       * 预算与 owner 必须同生共死：只删预算而留下 owner，会让旧令牌在**下一次**预支之后仍被误判成
+       * 所有者；只删 owner 而留下预算，则旧令牌只能 fail-safe 地放弃回滚（白烧一次预算，但有界性
+       * 不受影响）。两者一起删，语义最直白。
+       */
+      const clearAutoCloseAttempt = (key) => {
+        sidebarAutoCloseAttemptsRef.current.delete(key);
+        sidebarAutoCloseAttemptOwnersRef.current.delete(key);
+        // 候选采样计数与这条预算同生共死：预算整体不再需要时，采样序列也一并作废，绝不跨代残留。
+        sidebarAutoTabMissesRef.current.delete(key);
+      };
+      /**
+       * 候选选择阶段的「这个 tab 连续不在场」计数（见 sharedSidebarAutoTabMisses）。
+       *
+       * 只有计数记录里的 tabId 与当前 record 的 tabId 一致时才有效：宿主为同一个 key 重新分配了
+       * tabId（旧 tab 消失、同一个资源换成新 tab）之后，旧计数绝不能计入新一代的确认。
+       */
+      const autoTabMissesOf = (key, tabId) => {
+        const entry = sidebarAutoTabMissesRef.current.get(key);
+        if (entry === undefined || entry.tabId !== tabId) return 0;
+        return Number.isFinite(entry.misses) ? entry.misses : 0;
+      };
+      /**
+       * 记一次候选采样结果，返回这个 tabId 的连续不在场次数。
+       *
+       * present（missing !== true）一律清零，与记录同步器「任一正向证据清零」逐字同源；absent 与
+       * recycled 共用同一条连续计数（两者都独立证明「这个 tabId 已经不再承载我们的资源」）。
+       * unreadable 的采样绝不走到这里——读不到既不证明存在也不证明不存在，绝不推进计数。
+       */
+      const sampleAutoTabMisses = (key, tabId, missing) => {
+        const map = sidebarAutoTabMissesRef.current;
+        // 先读旧计数（只有同一个 tabId 才有效），再摘掉旧条目：两步都不能省（见下面的 LRU 说明）。
+        const previousMisses = autoTabMissesOf(key, tabId);
+        map.delete(key);
+        // present：清零就是「条目保持删除状态」，与记录同步器「任一正向证据清零」逐字同源。
+        if (missing !== true) return 0;
+        const misses = previousMisses + 1;
+        map.set(key, { sessionId: sidebarSessionId, rootSessionId, tabId, misses });
+        /**
+         * 次序即 LRU：Map 对已存在的键 set 不会改变插入位置，因此上面先 delete 再 set，让这次采样把这
+         * 个 key 刷到队尾；淘汰也只按「最后一次采样有多旧」进行（见 trimSharedSidebarAutoTabMisses）。
+         * 与其它 Auto 账本同一个 SIDEBAR_AUTO_KEY_LIMIT 上限：候选采样计数绝不成为第二个无界 Map。
+         */
+        trimSharedSidebarAutoTabMisses();
+        return misses;
+      };
+      /**
+       * 一次「已经真的关掉」的结算后的预算收口（成功关闭 / 已证明 tab 消失）。
+       *
+       * - 手动动作（autoContext === null）：手动恒优先，直接清空这个 key 的预算与 owner；
+       * - 自动关闭动作：只有 owner 仍是本次动作的令牌时才清空。旧代次的迟到结算绝不碰后来者的预算——
+       *   它可能已经在同一个 key 上重新预支了一笔，清零就等于把 3 次上限又还给它；
+       * - 自动打开动作（没有 close 令牌，却因为期间出现了记录而走到关闭）：只要这个 key 上已经存在
+       *   任何更新的 owner，就同样不清零——令牌不属于本次动作，那笔预算就与它无关。
+       */
+      const settleAutoCloseAttempt = (key, context) => {
+        if (context !== null && context !== undefined) {
+          const owners = sidebarAutoCloseAttemptOwnersRef.current;
+          if (context.kind === "close") {
+            if (owners.get(key) !== context.attemptToken) return;
+          } else if (owners.has(key) === true) {
+            return;
+          }
+        }
+        clearAutoCloseAttempt(key);
+      };
+      /**
+       * 当前 surface 下某个宿主 tabId 的关闭锁身份（见 sharedSidebarTabCloseInFlight）。
+       *
+       * session / root 都取**当前渲染**的值：旧实例的迟到收尾用它自己那一轮的 surface 身份归还锁，
+       * 因此绝不会误删新实例（或别的 root / session）持有的那一把。
+       */
+      const sidebarTabCloseKeyOf = (tabId) => sidebarTabCloseKey(sidebarSessionId, rootSessionId, tabId);
+      /** 当前 surface 下一个 tabId 的在途关闭租约（没有在途关闭时返回 null）。 */
+      const sidebarTabCloseLeaseOf = (tabId) => sharedSidebarTabCloseInFlight.get(sidebarTabCloseKeyOf(tabId)) ?? null;
+      /**
+       * 这个 tab 当前是否有一次关闭在途。
+       *
+       * 只读探测，供候选选择阶段提前让位：不为一个已经在关的 tab 预支一次有界重试预算，也不把它
+       * 记成「尝试失败」（真正的执行点还会在调用宿主 close 之前再确认一次，见 handleSidebarAction）。
+       */
+      const sidebarTabCloseInFlight = (tabId) => sidebarTabCloseLeaseOf(tabId) !== null;
+      /**
+       * 取得一个 tab 的关闭权（fail-closed）：已经有一次关闭在途时返回 null，调用方按各自的并发语义
+       * 决定「等待它结算」还是「直接让位」。
+       *
+       * 租约不是无结果的 token，而是一份**可结算的信号**：token.ok 记录那一次关闭的**验证结果**
+       * （true = inventory 连续两次读不到这个精确 tabId，verified-closed；false = 失败 / 超时 / 未验证），
+       * token.wait() 让竞争者等到结算再决定下一步——上次已验证关闭就不必再 close，上次未验证才用当前
+       * inventory 证明同一个 tabId 仍在之后做一次有限重试。宿主 Promise 的 resolve 绝不直接置 ok=true：
+       * 它只把租约推进到 verifying，真正的结算由验证链或 watchdog 完成。
+       *
+       * 返回的 release 只在「Map 里仍然是本次 token」时才删除，因此旧实例的迟到收尾绝不会删掉新实例
+       * （或后来者）持有的锁；release 只归还这一个身份，不触碰任何 Panel 状态（绝不改另一个实例的
+       * pending / records / 来源账本）。调用方必须把它放进 finally：同步 throw、Promise reject、组件
+       * 卸载后迟到的续体都走同一条归还路径，锁绝不留到下一次动作。
+       */
+      const acquireSidebarTabClose = (tabId) => {
+        const key = sidebarTabCloseKeyOf(tabId);
+        if (sharedSidebarTabCloseInFlight.has(key) === true) return null;
+        let settleWaiters = null;
+        const settled = new Promise((resolve) => { settleWaiters = resolve; });
+        const token = {
+          key,
+          /**
+           * 结算原因：null = 尚未结算；"closed" = 这次 close 已被 inventory 验证为关闭（或缺席）；
+           * "recycled" = 这次 close 的依据是「这个 tabId 已被宿主回收给另一个资源」（旧 tab 已消失，
+           * close 一次都没有发出）；"failed" = 失败 / 未验证 / 让位；"timeout" = watchdog 或验证窗口超时。
+           * 宿主 Promise 的 resolve **绝不**直接把结果置成 "closed"（resolve 只代表请求完成）。
+           */
+          result: null,
+          /**
+           * 结算结果的布尔投影（仅 "closed" 为 true），保留给「只关心关没关」的读取点。
+           *
+           * 竞争方**不得**只看它：跨 key 交错时（A 的「旧 tab 已消失」与 T 自己的关闭落在同一个
+           * tabId 上）布尔值分不清「谁证明的、凭什么证明的」。等待者必须读 result，并用自己的
+           * 期望地址重新探针复核之后再决定（见 closeSidebarTabWithLease 的等待分支）。
+           */
+          ok: null,
+          settled: false,
+          /** 租约状态：in-flight（请求已发出）→ verifying（等待 inventory 验证）/ quarantined（超时隔离窗）。 */
+          state: "in-flight",
+          /** 验证窗口或迟到隔离窗的截止时间（虚拟时间；0 = 未设置）。 */
+          holdUntil: 0,
+          /** 等待这次关闭结算（永不 reject：结果通过 token.result / token.ok 读取）。 */
+          wait: () => settled,
+          /** 结算入口的同一份实现（同步链路需要从 map 里归还隔离窗到期的租约，见 verifyPendingSidebarCloses）。 */
+          release: null,
+        };
+        sharedSidebarTabCloseInFlight.set(key, token);
+        let released = false;
+        /**
+         * 结算并归还租约。outcome 是**原因**（四值，见 SIDEBAR_TAB_CLOSE_SETTLE_REASONS），布尔写法保留
+         * 兼容：true ⇒ "closed"、false ⇒ "failed"。先写结果再唤醒等待者（等待者读到的一定是这次关闭的
+         * 原因，而不是「锁空了」），最后只在 Map 里仍然是自己这个 token 时才删除——旧实例的迟到收尾
+         * 绝不移除后来者的租约。
+         */
+        const release = (outcome) => {
+          if (released === true) return;
+          released = true;
+          const reason = closeSettleReason(outcome);
+          token.result = reason;
+          token.ok = reason === "closed";
+          token.settled = true;
+          const resolve = settleWaiters;
+          settleWaiters = null;
+          if (resolve !== null) resolve(reason);
+          if (sharedSidebarTabCloseInFlight.get(key) === token) sharedSidebarTabCloseInFlight.delete(key);
+        };
+        token.release = release;
+        return {
+          token,
+          /** 保留租约到 holdUntil：期间候选选择一律让位（绝不重复 close），迟到结果也没有机会重叠。 */
+          hold(state, holdUntil) {
+            if (released === true) return;
+            token.state = state;
+            token.holdUntil = holdUntil;
+          },
+          /**
+           * 结算并归还：先写结果再唤醒等待者（等待者读到的一定是这次关闭的结果，而不是「锁空了」），
+           * 最后只在 Map 里仍然是自己这个 token 时才删除——旧实例的迟到收尾绝不移除后来者的租约。
+           * ok 只有在 inventory 验证为关闭（verified-closed）时才为 true。
+           */
+          release,
+        };
+      };
+      /**
+       * 当前 inventory 里这个**精确 tabId** 的在场证据（必须属于当前 sidebar session，且仍是本插件的
+       * 子代理会话 kind）。四态返回，因为「读不到」「确认没有」与「这个 id 已经换了资源」必须分开：
+       * - "present"：命中同一个 (session, kind, tabId)，且条目若暴露了资源地址就与期望地址逐字一致
+       *   → 可以安全地再发一次 close；
+       * - "absent"：这个 tab 已经离开宿主，绝不再 close（用户的关闭意图已经达成）；
+       * - "recycled"：tabId 还在，但它此刻承载的是**另一个资源**的地址——旧 tab 已经消失、宿主把这个
+       *   id 回收给了别的资源。绝不对这个 id 发 close（那会关掉别人的 tab），只按「旧 tab 已消失」
+       *   收口自己这个 key 的记账；
+       * - "unreadable"：证明不了任何事 → fail-closed，绝不按 active tab 猜一个 id 去关。
+       *
+       * expectedAddress 是可选的第二个判据（调用方拿得到这个 key 的资源地址时才传）：
+       * 地址判据**只在条目真的暴露了可读的非空 contentId 时才生效**——条目缺 contentId、值为空串或
+       * 类型不可读（getter 抛错被跳过）都**不构成任何 mismatch 证据**，一律退回 present（这是本轮
+       * 刻意的 fail-open 取舍，必须保留）。绝不能用可能系统性缺失的字段推断「id 被复用」，那会退化成
+       * 永远不关闭：只要宿主某一版 inventory 结构性缺 contentId，本插件的每一次关闭都会在 preflight
+       * 被判定成 recycled，一个 tab 也关不掉（用户可见的**永久漏收**），比下面的残余风险更糟。
+       *
+       * **残余风险（本轮已知、未消除）**：contentId 缺失 ⇒ 无法区分「这个 tabId 仍是我们的 tab」与
+       * 「这个 tabId 已被宿主回收给另一个资源」。在这种宿主上，一次基于 tabId 的关闭请求理论上可能
+       * 落到复用了这个 id 的新 tab 上。风险边界由三件事共同限制，缺一不可：
+       * 1. 命中条件仍要求 (当前 sidebar session + kind=subagentchat + 精确 tabId) 三条同时成立，
+       *    别的 surface、别的 kind 的同名 id 一律不会被命中；
+       * 2. 关闭入口仍受「会话 + root + tabId」租约与迟到隔离窗约束（同一时刻只有一个在途请求），
+       *    不会并发重复发请求；
+       * 3. 只有具备可关闭 tabId 的 Auto 归属、用户手动点击或批量候选才会走到这里，绝不主动扫描
+       *    inventory 去关闭任何 tab。
+       * 一旦宿主提供了 contentId，判据立刻恢复为地址逐字比较（同一个函数、同一条记录）。
+       *
+       * 地址判据与 recordSidebarTab / sidebarBatchCandidates 逐条同源：一条 record 能存在，本身就要
+       * 求当时的 inventory 条目（或 active()）的 contentId 与 key 的资源地址逐字相等；而传给宿主
+       * openResource() 的也正是同一个地址字符串。因此「现在这一条的 contentId 变了」恰好就是
+       * 「这个 tabId 已经不是我们的资源」的精确证据（见 closeSidebarTabWithLease 的 preflight）。
+       */
+      const sidebarTabPresenceInInventory = (tabId, expectedAddress = null) => {
+        const inventory = readSidebarOpenTabs();
+        if (inventory === null) return "unreadable";
+        const expected = text(expectedAddress, null);
+        for (const entry of inventory) {
+          // 单条畸形记录只跳过它自己：它既不证明存在，也不代表整份 inventory 不可读。
+          try {
+            const candidate = object(entry);
+            if (text(candidate.sessionId, null) !== sidebarSessionId) continue;
+            if (text(candidate.kind, null) !== SUBAGENT_CHAT_KIND) continue;
+            if (text(candidate.tabId, null) !== tabId) continue;
+            // 没有期望地址，或这一条没有暴露可读地址：无法证伪 → 保持既有的 present 语义。
+            if (expected === null) return "present";
+            const contentId = text(candidate.contentId, null);
+            // fail-open（刻意保留）：条目没有可读的 contentId 时无法证伪，只能按 present 处理，
+            // 否则在「inventory 结构性缺 contentId」的宿主上永远关不掉任何 tab。残余风险见上方说明。
+            if (contentId === null) return "present";
+            return contentId === expected ? "present" : "recycled";
+          } catch { continue; }
+        }
+        return "absent";
+      };
+      /**
+       * 发出一次宿主 close 请求，并用 watchdog 封顶。返回 "resolved" | "rejected" | "timeout"。
+       *
+       * 宿主 Promise 不可取消：超时之后它仍可能迟到 resolve / reject。这里用一次性的 settled 闸门把
+       * 迟到结果彻底隔离——它既不释放租约、也不清理任何归属，只让这一次调用安静地结束；同一个 tab 在
+       * 隔离窗（SIDEBAR_TAB_CLOSE_LATE_QUARANTINE_MS）内绝不会再收到第二次 close。
+       */
+      const requestSidebarTabClose = (tabId) => new Promise((resolve) => {
+        let settled = false;
+        let timer = null;
+        const finish = (outcome) => {
+          if (settled === true) return;
+          settled = true;
+          if (timer !== null) {
+            try { globalThis.clearTimeout?.(timer); } catch { /* 清理失败不影响结果。 */ }
+          }
+          resolve(outcome);
+        };
+        try {
+          timer = typeof globalThis.setTimeout === "function"
+            ? globalThis.setTimeout(() => finish("timeout"), SIDEBAR_TAB_CLOSE_WATCHDOG_MS)
+            : null;
+        } catch { timer = null; }
+        let result = null;
+        try {
+          // close() 可同步抛错；结算前不能删掉来源，否则失败 tab 会被当成手动 tab 而永不重试。
+          result = closeSidebarResource.call(sidebarRight, tabId);
+        } catch {
+          finish("rejected");
+          return;
+        }
+        Promise.resolve(result).then(() => finish("resolved"), () => finish("rejected"));
+      });
+      /**
+       * 等待一个竞争租约结算，最多等 timeoutMs；超时返回 false（绝不无限 await）。
+       *
+       * 手动单项与批量关闭共用这条等待：宿主的 Promise 可能永不 settle，没有上限就会把用户的点击
+       * 永久挂在一次与它无关的宿主调用上。
+       */
+      const waitForSidebarCloseLease = (leaseToken, timeoutMs) => new Promise((resolve) => {
+        let done = false;
+        let timer = null;
+        const finish = (value) => {
+          if (done === true) return;
+          done = true;
+          if (timer !== null) {
+            try { globalThis.clearTimeout?.(timer); } catch { /* 同上。 */ }
+          }
+          resolve(value);
+        };
+        try {
+          timer = typeof globalThis.setTimeout === "function" ? globalThis.setTimeout(() => finish(false), timeoutMs) : null;
+        } catch { timer = null; }
+        Promise.resolve(leaseToken.wait()).then(() => finish(true), () => finish(true));
+      });
+      /**
+       * 登记一条「close 请求已经发出、等待 inventory 验证」记录，并让租约保持在验证窗口里。
+       *
+       * 记录随来源账本同层共享：重挂载后的新实例继续采样、继续收口；租约被它持有，因此下一轮同步
+       * 绝不会为同一个 tab 再发第二次 close。attemptToken 与 manual 决定验证成功后如何收口预算与来源。
+       */
+      const beginSidebarCloseVerification = (lease, tabId, verify) => {
+        const entry = {
+          sessionId: sidebarSessionId,
+          rootSessionId,
+          tabId,
+          address: verify?.address ?? null,
+          attemptToken: verify?.attemptToken ?? null,
+          manual: verify?.manual === true,
+          /**
+           * 这次关闭出发时看到的 split 意图身份（不可复用令牌，见 sidebarSplitIntentRef）。
+           *
+           * 收口时只有当前意图**仍然是这一份**才允许取消它：这次关闭可能在验证窗口里跨越一次
+           * 面板重挂载或用户/Auto 的新一次打开，按 key 无条件取消会把同 key 新 generation 的
+           * split/open 事务一起掐掉（右栏从临时 50% 掉回、新 pane 的打开失去归属）。
+           */
+          splitIntentToken: verify?.splitIntentToken ?? null,
+          misses: 0,
+          deadline: Date.now() + SIDEBAR_TAB_CLOSE_VERIFY_TIMEOUT_MS,
+          lease,
+        };
+        sidebarAutoCloseVerificationsRef.current.set(verify.key, entry);
+        trimAutoKeyMap(sidebarAutoCloseVerificationsRef.current, true);
+        lease.hold("verifying", entry.deadline);
+        return entry;
+      };
+      /**
+       * verified-closed / verified-recycled 的唯一收口点：删除 record、按令牌结算 attempt、撤销
+       * origin（手动则登记抑制）、清掉冷却与验证记录，最后归还租约并**带上原因**（见 reason 参数）。
+       *
+       * 两种证据走同一条收口：连续两次读不到这个**精确 tabId**，或连续两次读到这个 id 已经被另一个
+       * 资源复用（地址不一致）——后者说明旧 tab 已经消失、这个 id 不再属于我们，同样不能再关。
+       * 但两者的**租约结算原因必须不同**（"closed" vs "recycled"）：等待者可能是另一个 key 的关闭，
+       * 它只能用自己的地址证据复核，绝不能把「这个 id 被别人回收了」当成「我那个 tab 已经关掉」。
+       *
+       * 记录只在它的 tabId 与本次验证完全一致时才删除：旧代次的验证绝不能删掉新 tabId 的 record。
+       */
+      const finishVerifiedSidebarClose = (key, entry, reason) => {
+        const records = sidebarTabRecordsRef.current;
+        const record = records.get(key);
+        const scopedRecord = record !== undefined
+          && record.sessionId === sidebarSessionId
+          && record.rootSessionId === rootSessionId
+          ? record
+          : undefined;
+        /**
+         * (key, tabId, attemptToken) 一致性闸门：这次验证只对「它自己关闭的那个 tabId」有收口权。
+         * 宿主换过 tabId 时（旧 tab 消失、同一个资源换成新 tab），旧验证只能归还自己的租约并清理
+         * 自己那一笔令牌对应的预算，绝不删除新 generation 的 record / origin / 冷却。
+         */
+        const sameTab = scopedRecord !== undefined && scopedRecord.tabId === entry.tabId;
+        /**
+         * 分栏事务的收口只认**这次关闭出发时看到的那一份意图**（不可复用令牌逐对象相等）：
+         * record 可能已被记录同步层删掉，但这次关闭确实发生了，事务必须收口，否则右栏会一直停在
+         * 临时 50%。反过来，意图已经被新 generation 取代时（用户/Auto 重新打开同一个资源）绝不取消
+         * 它——旧 close 的迟到收口取消一个新事务，会让右栏从 50% 掉回、新 pane 的打开失去归属。
+         */
+        cancelPendingSidebarSplitOfClose(key, entry.splitIntentToken);
+        if (sameTab === true) {
+          records.delete(key);
+          if (entry.attemptToken === null || entry.attemptToken === undefined) clearAutoCloseAttempt(key);
+          else settleAutoCloseAttempt(key, { kind: "close", attemptToken: entry.attemptToken });
+          sidebarAutoCloseCooldownsRef.current.delete(key);
+          sidebarAutoOriginRef.current.delete(key);
+          if (entry.manual === true && entry.address !== null && entry.address !== undefined) {
+            sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: entry.address });
+            trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+          }
+        } else if (entry.attemptToken !== null && entry.attemptToken !== undefined) {
+          // tabId 已经不属于这次验证：只按令牌结算本次动作自己的那一笔预算（owner 已被后来者替换时
+          // settleAutoCloseAttempt 会自动放弃）。
+          settleAutoCloseAttempt(key, { kind: "close", attemptToken: entry.attemptToken });
+        }
+        sidebarAutoCloseVerificationsRef.current.delete(key);
+        // 结算原因随租约带给等待者：recycled 与 closed 对**别人**的证明力完全不同（见 token.result）。
+        entry.lease?.release?.(reason === "recycled" ? "recycled" : "closed");
+        bump((value) => value + 1);
+      };
+
+      /**
+       * 关闭请求的验证链（每轮同步跑一次）：
+       * 1. 隔离窗到期的迟到结果租约：只归还自己那一把（不碰 record / origin / attempt）；
+       * 2. 验证记录：只有连续两次可读 inventory 都读不到这个**精确 tabId**、或读到这个 id 已经被
+       *    **另一个资源**复用（contentId 与本 key 的资源地址不一致）才算 verified-closed；
+       *    present 重置缺失计数并保留归属；unreadable 不推进缺失计数（读不到证明不了任何事）；
+       *    超过验证窗口仍未验证则释放租约、保留 record/origin/attempt，由下一次同步决定是否重试。
+       */
+      const verifyPendingSidebarCloses = () => {
+        const now = Date.now();
+        for (const [, token] of sharedSidebarTabCloseInFlight) {
+          if (token.state !== "quarantined") continue;
+          if (token.holdUntil > now) continue;
+          // 隔离窗到期只说明那次请求**从未被验证**（watchdog 超时）：结算原因必须是 timeout，
+          // 绝不能是 closed——等待者据此知道「什么都没被证明」，需要自己用地址证据复核。
+          token.release?.("timeout");
+        }
+        const verifications = sidebarAutoCloseVerificationsRef.current;
+        for (const [key, entry] of [...verifications]) {
+          if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
+          // 地址证据来自这次关闭自己那个 key 的资源地址（批量入口没有 key，地址为 null ⇒ 不比较地址）。
+          const presence = sidebarTabPresenceInInventory(entry.tabId, entry.address);
+          if (presence === "present") entry.misses = 0;
+          else if (presence !== "unreadable") entry.misses += 1;
+          /**
+           * absent 与 recycled 都独立证明「这个精确 tabId 已经不再承载我们的资源」，因此可以混用同
+           * 一个缺失计数：两种证据各采一次同样满足「连续两次」的确认要求（unreadable 绝不推进计数）。
+           */
+          if (presence !== "present" && presence !== "unreadable"
+            && entry.misses >= SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS) {
+            // 结算原因按证据分型：recycled（id 已被别的资源占用）绝不能对外冒充 verified-closed。
+            finishVerifiedSidebarClose(key, entry, presence === "recycled" ? "recycled" : "closed");
+            continue;
+          }
+          if (now >= entry.deadline) {
+            // 验证超时：释放租约与验证记录，**保留** record / origin / attempt。
+            verifications.delete(key);
+            entry.lease?.release?.("timeout");
+            // 同一批微任务级联里绝不立刻重选同一个 key（下一轮外部同步才重试）。
+            sidebarAutoFailedKeysRef.current.add(key);
+          }
+        }
+      };
+
+      /**
+       * 关闭一个 tab 的唯一执行入口（单 tab 关闭与批量关闭共用），把「租约 + 结算信号 + 有限重试」
+       * 全部收在这里。
+       *
+       * 并发语义由 waitForCompeting 区分：
+       * - true（用户触发的手动单项与批量）：同一个 tabId 上已经有一次关闭在途时，等待它结算，然后
+       *   **用它自己的期望地址重新探针复核**再决定——结算原因只说明「上一次关闭凭什么结束」，而
+       *   这个 tabId 在两次关闭之间完全可能被宿主回收给另一个资源：
+       *   · 复核为 present（且地址一致）⇒ 这个 id 此刻仍然是我们要关的那个 tab，才允许一次有限重试；
+       *   · 复核为 absent ⇒ 我们的 tab 已经不在，按 verified-closed 收口，绝不再 close；
+       *   · 复核为 recycled ⇒ 这个 id 已承载别的资源，按 verified-recycled 收口自己这个 key；
+       *   · 复核为 unreadable ⇒ fail-closed，什么都不做；
+       *   · 上一次结算原因是 recycled 而**自己又没有期望地址**可复核 ⇒ 一律跳过：别人的
+       *     「旧 tab 已消失」对没有地址证据的等待者什么都证明不了（recycled-unverifiable）。
+       * - false（Auto 自动同步）：遇到在途关闭立刻返回 contended 让位，绝不 await、绝不排队重试
+       *   （调用方负责回退本轮 closeAttempts/预留并维持防微任务循环屏障）。
+       *
+       * status 语义（只有 verified-closed / closed / verified-recycled 才允许调用方收口归属）：
+       * - verified-closed：preflight 或验证链用**精确 tabId** 的 inventory 证据证明这个 tab 已经不在；
+       * - verified-recycled：这个 tabId 已经被宿主回收给**另一个资源**（条目暴露的资源地址与本次
+       *   关闭那个 key 的地址不一致）⇒ 旧 tab 已经消失、新 tab 不是我们的。close **一次都没有发出**，
+       *   但结论与 verified-closed 等价：这个 key 的 record / 预算 / 冷却必须收口，且绝不允许重试；
+       * - request-resolved-unverified：宿主 close 已经 resolve，但仍在验证窗口里（记录/来源/计数全部保留）；
+       * - failed：宿主 close 同步抛错或 rejected（请求真的发出过，绝不回滚 count）；
+       * - timeout：watchdog 超时（同样不回滚 count，租约进入迟到隔离窗）；
+       * - contended / contended-timeout：有人在关，本次不发 / 等待竞争租约超过同一个 10 秒上限；
+       * - recycled-unverifiable：上次结算是 recycled，而本次等待者没有地址证据可复核 ⇒ 跳过
+       *   （既不关闭也不收口归属），等下一次带地址证据的动作或同步链自行收口；
+       * - unreadable：inventory 不可读（或地址不可证伪时保持既有语义），fail-closed 不发；
+       * - stale：等待期间 surface 换代；unavailable：宿主没有 close 能力。
+       */
+      const closeSidebarTabWithLease = async (tabId, options) => {
+        if (closeSidebarResource === null) return { status: "unavailable", closed: false };
+        const waitForCompeting = options?.waitForCompeting === true;
+        // verify：close 请求 resolve 之后的验证上下文 { key, address, attemptToken, manual }。
+        const verify = options?.verify ?? null;
+        let lease = acquireSidebarTabClose(tabId);
+        if (lease === null) {
+          if (waitForCompeting !== true) return { status: "contended", closed: false };
+          const competing = sidebarTabCloseLeaseOf(tabId);
+          // 探测与读取之间没有 await，因此这里理论上不可达；真出现只可能是锁被别的实现动过，
+          // fail-closed 让位总好过在拿不到结算信号的情况下盲发一次 close。
+          if (competing === null) return { status: "contended", closed: false };
+          // 等待结算：同一个 10 秒 watchdog 上限，绝不无限 await（宿主 Promise 不可取消）。
+          const settledInTime = await waitForSidebarCloseLease(competing, SIDEBAR_TAB_CLOSE_WATCHDOG_MS);
+          if (settledInTime !== true) return { status: "contended-timeout", closed: false };
+          /**
+           * 等待可能跨越一次组件重挂载、root / sidebar session 切换，或同一个实例的 A→B→A 快速
+           * 回返：那次关闭属于旧 surface，本次动作绝不在新 surface 上继续（旧 tab 的归属由它自己
+           * 那一轮的链路与既有同步器结算）。批量入口在 await 之后也有同一道复核，这里是共享执行
+           * 入口里的等价收口；判据含不可复用的 surface 令牌，因此「切走又切回同一组值」同样作废。
+           */
+          if (sidebarSurfaceStillCurrent() !== true) return { status: "stale", closed: false };
+          /**
+           * 等待者绝不直接采信别人的结算结论（旧实现只读布尔 ok），一律用自己的期望地址重新探针：
+           *
+           * 结算原因只回答「上一次关闭凭什么结束」：closed / recycled / failed / timeout。它**不**回答
+           * 「此刻这个 tabId 是不是我那个 tab」——两次关闭之间，宿主完全可能把这个已经释放的 id 回收给
+           * 另一个资源。跨 key 交错时（A 的 verified-recycled 与 T 的等待落在同一个 tabId 上），把 A 的
+           * 「旧 tab 已消失」当成 T 自己的关闭完成，就会让 T 误删自己的 record / 来源 / 抑制，或者相反：
+           * 对别人复用的新 tab 再发一次 close。地址复核是唯一的防线。
+           */
+          const settledReason = competing.result;
+          if (settledReason === "recycled"
+            && (verify?.address === null || verify?.address === undefined)) {
+            // 没有地址证据的等待者遇到 recycled：既不关闭也不收口——跳过这一次，绝不盲从别人的结论。
+            return { status: "recycled-unverifiable", closed: false };
+          }
+          /**
+           * 只有当前 inventory 明确证明同一个 tabId 仍存在**且仍然是我们要关的那个资源**（条目暴露的
+           * contentId 与本次关闭的地址一致），才允许这一次有限重试。
+           * - recycled：这个 id 已经被宿主回收给别的资源 ⇒ 旧 tab 已经消失，绝不重试（绝不关别人的 tab），
+           *   按「旧 tab 已消失」结算，调用方据此收口自己这个 key 的记账；
+           * - absent：同上（用户的关闭意图已经达成）；unreadable：fail-closed。
+           */
+          const presence = sidebarTabPresenceInInventory(tabId, verify?.address ?? null);
+          if (presence === "unreadable") return { status: "unreadable", closed: false };
+          if (presence === "recycled") return { status: "verified-recycled", closed: false };
+          if (presence !== "present") return { status: "verified-closed", closed: true };
+          lease = acquireSidebarTabClose(tabId);
+          // 已经有别人接手（或又一次在途）：有限重试到此为止，绝不排队等第二次。
+          if (lease === null) return { status: "contended", closed: false };
+        }
+        /**
+         * 调用 close 之前的 preflight：必须用**当前** openTabs inventory 精确确认目标 tabId，并且
+         * ——只要调用方给了这个 key 的资源地址——确认这个 id 此刻仍然承载**同一个资源地址**。
+         *
+         * 这是本插件唯一一次在副作用之前回答「这仍然是我们决定要关的那个 tab 吗」的地方：
+         * - present：可以调用 close；
+         * - absent：精确证据上的 verified-closed；
+         * - recycled：id 已被宿主回收给别的资源（旧 tab 已经消失）⇒ 绝不调用 close（那会关掉别人的
+         *   tab），按「旧 tab 已消失」结算并让调用方收口本 key 的 record / 预算 / 冷却；
+         * - unreadable：一律 fail-closed（不调用 close、不清理归属），绝不把「读不到」当成「没有」。
+         */
+        const preflight = sidebarTabPresenceInInventory(tabId, verify?.address ?? null);
+        /**
+         * 手动路径在**读面缺失**（旧宿主没有 openTabs）时的兼容：没有验证证据，但用户明确要求关闭——
+         * 照旧调用 close 并按历史语义收口，绝不因为读面缺失把用户的关闭意图丢掉。
+         * 自动路径没有这条退路：没有精确证据时 fail-closed（不调用 close、不清理归属）。
+         */
+        const manualWithoutEvidence = preflight === "unreadable" && verify !== null && verify.manual === true;
+        if (preflight === "unreadable" && manualWithoutEvidence !== true) {
+          // 什么都没发出、也什么都没证明：结算原因只能是 failed（等待者必须自己复核）。
+          lease.release("failed");
+          return { status: "unreadable", closed: false };
+        }
+
+        if (preflight === "absent") {
+          lease.release("closed");
+          return { status: "verified-closed", closed: true };
+        }
+        if (preflight === "recycled") {
+          /**
+           * 地址证据证明这个 tabId 已经换了资源：旧 tab 已经消失。绝不调用 close——重试一次就会把
+           * 别人（复用了这个 id 的新 tab）关掉。
+           *
+           * 租约必须按**原因**归还（"recycled"），而不是布尔 ok=true：这个结论只对「本次关闭那个
+           * key」有效（旧 tab 已消失），对同一个 tabId 上**别的 key** 的等待者完全没有证明力——
+           * 「id 被复用」恰恰意味着这个 id 现在承载的不是我们的资源。等待者一律用自己的期望地址重新
+           * 探针复核后再决定（见 closeSidebarTabWithLease 的等待分支），没有地址证据的一方直接跳过。
+           *
+           * 本次调用自己的 key 不受这条归还值影响：调用方按 verified-recycled 收口自己的 record /
+           * 预算 / 冷却（见 handleSidebarAction），并且同样过 (key, tabId) 一致性闸门。
+           */
+          lease.release("recycled");
+          return { status: "verified-recycled", closed: false };
+        }
+        const outcome = await requestSidebarTabClose(tabId);
+        if (outcome === "rejected") {
+          // 请求真的发出去过并失败：租约按未验证归还（failed），绝不回滚 count（那会突破三次快速上限）。
+          lease.release("failed");
+          return { status: "failed", closed: false };
+        }
+        if (outcome === "timeout") {
+          // 迟到结果隔离窗：租约保留到隔离窗结束（由同步链路归还），期间绝不再发第二次 close。
+          lease.hold("quarantined", Date.now() + SIDEBAR_TAB_CLOSE_LATE_QUARANTINE_MS);
+          return { status: "timeout", closed: false };
+        }
+        /**
+         * resolve 只代表请求完成：登记验证记录并**保留租约**，由后续同步按精确 inventory 收口。
+         * 没有可验证的 key（调用方没有 Auto 记账，例如批量入口）时按未验证归还租约，绝不当作已关闭。
+         */
+        if (manualWithoutEvidence === true) {
+          // 无 inventory 读面的手动关闭：历史语义（用户意图优先），按「已关闭」结算并归还租约。
+          lease.release("closed");
+          return { status: "closed", closed: true };
+        }
+        if (verify === null || verify.key === null || verify.key === undefined) {
+          // 没有可验证的 key（批量入口）：请求完成了但**什么都没被证明** ⇒ failed，等待者自己复核。
+          lease.release("failed");
+          return { status: "request-resolved-unverified", closed: false };
+        }
+
+        beginSidebarCloseVerification(lease, tabId, verify);
+        return { status: "request-resolved-unverified", closed: false };
       };
       /**
        * 清理已经离开当前快照的复合键（来源与抑制两个集合），避免长期泄漏。
@@ -3604,8 +4646,13 @@
             if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
             if (key === actingKey) continue;
             if (known.has(entry.address) === true) continue;
+            /**
+             * 快照里暂时缺了这个地址，但 key 上仍有活动记账（record / 在途打开 / pending / 验证 / 冷却）：
+             * 绝不删除 origin——否则冷却到期后就再也关不掉这个 tab（快照缺项不等于宿主里没有）。
+             */
+            if (sidebarAutoCloseKeyIsActive(key) === true) continue;
             map.delete(key);
-            sidebarAutoCloseAttemptsRef.current.delete(key);
+            clearAutoCloseBudget(key);
           }
         }
         // 预留同样要清理，但**在途动作自己那一条绝不能被清理**：它的 finally 才是唯一的释放点，
@@ -3638,7 +4685,18 @@
              * 尾随同步只用来推进「下一个候选」。它必须带着级联标记执行：这一轮里失败过的 key
              * 不会被重新选中，因此「失败 → 撤销预留 → 立刻重选」不在微任务里自转（见
              * sidebarAutoFailedKeysRef）。真正的重试留给下一个外部同步轮。
+             *
+             * 但这次推进同样只能由**仍然有效**的那一轮 surface 发起：动作的 await 可能跨越一次组件
+             * 重挂载 / root 切换，此时本闭包的 mountedRef 已经是 false（旧实例的挂载 effect 已清理），
+             * 而它手里的旧快照与共享 Auto 来源账本不是一回事——旧闭包的 syncSidebarTabs() 会把新
+             * Panel 刚写入的其它 Auto 来源当成「已经离开旧快照」清掉（新 Panel 随后再也认不出自己
+             * 打开过的 tab），并且「旧实例入口放弃动作 → 尾随同步又选中同一个候选」会形成不让出宏
+             * 任务的微任务自转（页面被拖住）。因此这里与 handleSidebarAction 的收尾闸门用同一条判据
+             * （含不可复用的 surface 令牌，重挂载与 A→B→A 都算失配）：surface 失配时只归还本实例的
+             * 级联闸门，绝不调用旧闭包的同步；新 Panel 的下一轮外部同步会按真实 inventory 继续推进
+             * 候选与清理。
              */
+            if (sidebarSurfaceStillCurrent() !== true) return;
             sidebarAutoCascadeRef.current = true;
             try {
               // 用引用取最新一轮渲染的同步器（与 observer/轮询同一写法），绝不复用当前闭包。
@@ -3709,13 +4767,35 @@
         sidebarAutoReservationRef.current.delete(key);
         releaseAutoCloseAttempt(key, context);
       };
-      /** 回退候选选择时预支的那一次自动关闭重试（动作在真正调用 close 之前被撤销时调用）。 */
+      /**
+       * 回退候选选择时预支的那一次自动关闭重试（动作在真正调用 close 之前被撤销时调用）。
+       *
+       * 只有**这条预算当前的所有者**才允许回滚：owner 账本里登记的必须与本次动作出发时拿到的是
+       * 同一份不可复用令牌。旧代次的迟到收尾（重挂载、同一个实例 A→B→A、Auto 关闭取消）完全可能
+       * 在新代次已经为同一个 key 重新预支预算之后才跑到这里——令牌不匹配时一律 fail-safe：绝不写、
+       * 绝不删共享 attempts，否则新代次的预算会被删掉（等于复活），同一个 key 的实际 close 次数就会
+       * 突破 3 次上限。owner 不存在或已被限容淘汰时同样 fail-safe（宁可白烧一次预算，也绝不动可能
+       * 属于后来者的计数）。
+       */
       const releaseAutoCloseAttempt = (key, context) => {
         if (context === null || context === undefined || context.kind !== "close") return;
+        const owners = sidebarAutoCloseAttemptOwnersRef.current;
+        const token = context.attemptToken;
+        if (token === null || token === undefined || owners.get(key) !== token) return;
         const attempts = sidebarAutoCloseAttemptsRef.current;
-        if (attempts.has(key) !== true) return;
+        // owner 还在、预算已经不在了（被限容淘汰或被别的收口路径清掉）：只清掉自己这一份 owner。
+        if (attempts.has(key) !== true) {
+          owners.delete(key);
+          return;
+        }
         if (context.attemptsBefore === 0) attempts.delete(key);
-        else attempts.set(key, context.attemptsBefore);
+        else {
+          attempts.set(key, context.attemptsBefore);
+          // 回退同样要限容：这一步是 set 的第二条路径，少了它这个 Map 就可能在长生命周期里无界增长。
+          trimAutoKeyMap(attempts);
+        }
+        // 回滚完成即交还所有权：此后同一个 key 的新预支由新的令牌持有，旧令牌再也回不来。
+        owners.delete(key);
       };
       /**
        * 自动动作在副作用之前必须让位的「手动接管」状态：
@@ -3779,7 +4859,8 @@
             record.origin = SIDEBAR_TAB_ORIGIN_MANUAL;
             sidebarAutoSuppressedRef.current.delete(key);
             sidebarAutoOriginRef.current.delete(key);
-            sidebarAutoCloseAttemptsRef.current.delete(key);
+            // 手动接管这个 key：未结算的自动关闭预算（含 owner）一并作废，Auto 不得再按旧预算重试。
+            clearAutoCloseAttempt(key);
             sidebarManualIntentRef.current.delete(key);
             return;
           }
@@ -3807,7 +4888,8 @@
         sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: entry.address });
         trimAutoKeyMap(sidebarAutoSuppressedRef.current);
         sidebarAutoOriginRef.current.delete(key);
-        sidebarAutoCloseAttemptsRef.current.delete(key);
+        // 手动关闭意图接管这个 key：未结算的自动关闭预算（含 owner）一并作废。
+        clearAutoCloseAttempt(key);
       };
 
       /**
@@ -3825,6 +4907,8 @@
          */
         if (sidebarAutoCascadeRef.current !== true) sidebarAutoFailedKeysRef.current.clear();
         syncSidebarTabRecords();
+        // 关闭请求的验证链先跑：上一轮 close 的验证结果必须先收口，候选选择才按真实归属推进。
+        verifyPendingSidebarCloses();
         // Auto 开关是渲染输入：设置页保存或面板自身切换后必须重渲染一次（标题栏开关的勾选态）。
         // 与批量签名同一模式：只有真的变化才 bump，空闲轮询绝不产生重渲染。
         const autoNow = autoOpenEnabled();
@@ -3904,6 +4988,21 @@
          * Auto 绝不能在资源结束后把它当成自己的 tab 关掉。
          */
         const manualTakeover = sidebarManualIntentOf(key);
+        /**
+         * 共享 Auto 来源账本（键与打开记录同构，见 sharedSidebarAutoOrigin）。
+         *
+         * 收养路径（面板重挂载后 / 切 root 后从 inventory 重建记录）没有「本次动作的显式来源」，
+         * 实例内的 previous 与 opening 也都是空的；唯一能证明「这个 tab 是 Auto 亲手打开的」的
+         * 就是这条跨实例账本。缺了它，收养只能落到 manual 兜底，Auto 从此不再管这个 tab。
+         *
+         * 只认显式记成 auto 的账本条目，并且必须同 session + 同 root：别的 scope 的条目一律不可见，
+         * 因此来源未知的外部 tab 与其它 pane 的同地址 tab 都不会被误收养成 Auto 的 tab。
+         */
+        const sharedOrigin = sidebarAutoOriginRef.current.get(key);
+        const sharedOriginScoped = sharedOrigin !== undefined
+          && sharedOrigin.sessionId === sidebarSessionId && sharedOrigin.rootSessionId === rootSessionId
+          ? sharedOrigin
+          : undefined;
         const origin = manualTakeover !== undefined && manualTakeover.intent === "open"
           ? SIDEBAR_TAB_ORIGIN_MANUAL
           : (declaredOrigin
@@ -3913,6 +5012,7 @@
             ?? (opening !== undefined && opening.sessionId === sidebarSessionId && opening.rootSessionId === rootSessionId
               ? opening.origin
               : null)
+            ?? (sharedOriginScoped !== undefined ? SIDEBAR_TAB_ORIGIN_AUTO : null)
             ?? SIDEBAR_TAB_ORIGIN_MANUAL);
         const recordOrigin = origin === SIDEBAR_TAB_ORIGIN_AUTO ? SIDEBAR_TAB_ORIGIN_AUTO : SIDEBAR_TAB_ORIGIN_MANUAL;
         if (previous !== undefined && previous.sessionId === sidebarSessionId
@@ -3938,9 +5038,10 @@
        * origin 是**内部**参数，默认 manual：普通 UI 调用（箭头、键盘）一律手动来源；只有自动同步
        * 显式传 auto。它决定三件事：记录来源、手动动作是否清除抑制/自动来源、关闭时是否登记抑制。
        *
-       * autoAction 也是**内部**参数，只在自动路径上出现：{ kind, epoch, attemptsBefore }。它让同一条
-       * 实现能在每个 await 之后、真正调用宿主 open/close 之前复核「Auto 是否仍然开启、动作是否已过期、
-       * 用户是否已经手动接管」，并在收尾时无条件释放在途预留（见 finally）。
+       * autoAction 也是**内部**参数，只在自动路径上出现：{ kind, epoch, attemptsBefore, attemptToken }。
+       * 它让同一条实现能在每个 await 之后、真正调用宿主 open/close 之前复核「Auto 是否仍然开启、动作
+       * 是否已过期、用户是否已经手动接管」，并在收尾时无条件释放在途预留（见 finally）。关闭类候选还
+       * 带着预支预算时新建的 attemptToken：回滚/收口共享重试计数只认这份不可复用的所有权凭据。
        */
       const handleSidebarAction = async (key, resourceAddress, actionOrigin, autoAction) => {
         const origin = actionOrigin === SIDEBAR_TAB_ORIGIN_AUTO ? SIDEBAR_TAB_ORIGIN_AUTO : SIDEBAR_TAB_ORIGIN_MANUAL;
@@ -3949,12 +5050,18 @@
             kind: autoAction.kind === "close" ? "close" : "open",
             epoch: Number.isFinite(Number(autoAction.epoch)) ? Number(autoAction.epoch) : sidebarAutoEpochRef.current,
             attemptsBefore: Number.isFinite(Number(autoAction.attemptsBefore)) ? Number(autoAction.attemptsBefore) : 0,
+            // 只有候选选择真的登记过一份令牌时才带上它：缺失/畸形一律按 null 处理，后续回滚因此
+            // fail-safe 地放弃（绝不按 key 盲写共享计数）。
+            attemptToken: autoAction.attemptToken !== null && autoAction.attemptToken !== undefined
+              && typeof autoAction.attemptToken === "object"
+              ? autoAction.attemptToken
+              : null,
           }
           : null;
         // React 重挂载或 root 切换后，旧 DOM 可能短暂保留旧 handler；它不能操作当前 session-scoped 服务。
-        if (mountedRef.current !== true
-           || currentRootRef.current !== rootSessionId
-           || currentSidebarSessionRef.current !== sidebarSessionId) {
+        // 这里的判据含不可复用的 surface 令牌：同一个实例 A→B→A 之后，旧 handler 手里的字符串会重新
+        // 相等，只有令牌能证明它已经不属于当前 surface。
+        if (sidebarSurfaceStillCurrent() !== true) {
           /**
            * 连入口都没通过的自动动作：这里必须自己释放候选选择时写下的预留（以及自动关闭的重试记账）。
            * 这些键属于已经被换掉的 surface，当前闭包之后再也不会为它们做清理。
@@ -3998,15 +5105,133 @@
           }
           // 关闭态：只调用记录里的精确 tabId。绝不根据 active() 当前是谁来决定关哪个 tab。
           if (record !== undefined && closeSidebarResource !== null) {
-            let closed = false;
-            try {
-              // close() 可异步失败；结算前不能删掉 Auto 来源，否则失败 tab 会被当成手动 tab 而永不重试。
-              await closeSidebarResource.call(sidebarRight, record.tabId);
-              closed = true;
-            } catch {
-              closed = false;
+            /**
+             * 关闭的唯一执行入口（见 closeSidebarTabWithLease）：
+             * - 手动单项（用户触发）：同一个 tabId 上已经有一次关闭在途时等待它结算——上次成功就当作
+             *   这个 tab 已经被关掉（绝不再 close），上次失败才用**当前** inventory 证明同一个 tabId
+             *   仍在之后做一次有限重试。用户的关闭意图因此既不会重复，也不会在竞争失败时被静默丢失；
+             * - 自动动作：遇到在途关闭立刻让位，绝不 await（Auto 同步绝不能被一次永不结算的宿主
+             *   Promise 拖住），并回退本轮 closeAttempts/预留、记入本次级联的失败屏障。
+             */
+            /**
+             * 这次关闭出发时看到的 split 意图身份（不可复用令牌）。
+             *
+             * 它的作用域**只到这次关闭**：收口时只有当前意图仍然是这一份才允许取消（见
+             * cancelPendingSidebarSplitOfClose）。只按 key 取消的旧写法会把验证窗口里出现的
+             * 同 key 新 generation 的 split/open 事务一起掐掉。出发时没有意图就记 null——
+             * 那一刻之后出现的任何意图都只属于后来者，这次关闭一律不碰。
+             */
+            const splitIntentAtClose = sidebarSplitIntentRef.current;
+            const closeSplitIntentToken = splitIntentAtClose !== null && splitIntentAtClose.key === key
+              ? splitIntentAtClose.token
+              : null;
+            const closeOutcome = await closeSidebarTabWithLease(record.tabId, {
+              waitForCompeting: origin === SIDEBAR_TAB_ORIGIN_MANUAL,
+              /**
+               * 验证上下文：close 请求 resolve 之后必须由 inventory 的精确 tabId 证据收口。
+               * 手动关闭同样要验证（attemptToken = null ⇒ 验证成功后按手动语义登记抑制）。
+               * splitIntentToken 随验证记录一起保留：验证链的收口可能在若干轮同步之后才发生。
+               */
+              verify: {
+                key,
+                address: resourceAddress,
+                attemptToken: autoContext === null ? null : autoContext.attemptToken,
+                manual: origin === SIDEBAR_TAB_ORIGIN_MANUAL,
+                splitIntentToken: closeSplitIntentToken,
+              },
+            });
+
+            /**
+             * await 之后的 surface 身份闸门（单项关闭的收尾边界，与批量入口同一条判据）。
+             *
+             * 这次 await 可能跨越一次组件重挂载或 root / sidebar session 切换：本闭包里的 ref、
+             * records 与快照都已经不属于当前 surface，而**共享**的 Auto 来源 / 抑制 / 重试记账却是
+             * 同一份。此时若还按旧闭包继续收尾（删记录、删共享来源、登记抑制、bump）并调用旧闭包的
+             * syncSidebarTabs()，旧快照会把新 Panel 刚刚写入的**其它** Auto 来源当成「已经离开当前
+             * 快照」而清掉——新 Panel 随后再也认不出自己打开过的 tab，资源结束后也不会自动关闭它。
+             *
+             * 因此任何返回结果（closed / failed / settled-closed / contended / unreadable / stale）
+             * 都必须在写共享账本、删记录、登记抑制或调用旧闭包同步**之前**复核 surface 身份；任一失配
+             * 立即停止本实例的后续收尾。判据含不可复用的 surface 令牌：同一个实例 A→B→A 之后
+             * root/sidebar session 字符串会重新相等，只有令牌能证明这次收尾已经不属于当前 surface
+             * （否则旧动作会删掉 A 里已经换成新 tabId 的 record / Auto 来源）。租约已经由
+             * closeSidebarTabWithLease 自己的 finally 结算并归还（这里绝不重复释放），旧 tab 的归属交给
+             * 新 Panel 后续同步按真实 inventory 结算：成功关掉的由那次同步收口，失败 / 还没落地的则仍
+             * 留在 inventory 里等下一轮有界重试。
+             */
+            if (sidebarSurfaceStillCurrent() !== true) {
+              return;
             }
-            if (closed === true) {
+            if (closeOutcome.status === "contended" || closeOutcome.status === "contended-timeout") {
+              /**
+               * 让位路径（自动动作）：这次关闭根本没有发出，因此必须归还候选选择时预支的那一次重试
+               * 预算与在途预留，否则一次「有人在关」的等待就会白烧掉一次有界重试，甚至让 Auto 提前
+               * 放弃这个 tab。**绝不在这里清理来源**：来源只在关闭真的成功后才允许撤销（失败 / 让位
+               * 都必须继续归 Auto 管，留给后续同步重试）。
+               */
+              if (autoContext !== null) {
+                sidebarAutoReservationRef.current.delete(key);
+                releaseAutoCloseAttempt(key, autoContext);
+                /**
+                 * 同时记进本次级联的失败屏障：这次关闭没有发出，但它绝不能在**同一批微任务级联**里被
+                 * 重新选中（候选与执行之间只隔一次微任务，动作收尾的尾随同步会立刻再选一次；若冲突
+                 * 持续存在，那会变成不让出宏任务的微任务死循环）。屏障在下一次外部同步轮自动失效，
+                 * 那时锁通常已经归还，重试照常。
+                 */
+                sidebarAutoFailedKeysRef.current.add(key);
+              }
+              return;
+            }
+            /**
+             * 只有拿到「已经关掉」的结算才收口：亲手关闭成功，或等待竞争租约后拿到成功 / inventory
+             * 已证明 tab 消失的结算。失败、inventory 不可读（fail-closed）与「有人接手」都不允许在
+             * 这里改写记录或来源——记录只由真实结算（这里或既有同步器）收口，绝不因为「这次不是自己
+             * 亲手关的」就跳过收口，否则会留下一份与宿主 inventory 不符的账。
+             */
+            if (closeOutcome.status === "unreadable") {
+              // preflight 没通过：close 根本没有发出 → 按令牌回滚这次预支，绝不清理归属。
+              if (autoContext !== null) {
+                sidebarAutoReservationRef.current.delete(key);
+                releaseAutoCloseAttempt(key, autoContext);
+                sidebarAutoFailedKeysRef.current.add(key);
+              }
+              return;
+            }
+            if (closeOutcome.status === "stale") {
+              // 等待期间 surface 换代：close 没有发出 → 同样按令牌回滚，旧 tab 交给新 generation 收口。
+              if (autoContext !== null) {
+                sidebarAutoReservationRef.current.delete(key);
+                releaseAutoCloseAttempt(key, autoContext);
+              }
+              return;
+            }
+            if (closeOutcome.status === "failed" || closeOutcome.status === "timeout") {
+              /**
+               * 请求真的发出去过（reject 或 watchdog 超时）：**绝不回滚 count**——回滚就等于把三次快速
+               * 上限又还给它，实际 close 次数会突破上限。record / origin / 冷却一律保留，留给后续同步重试。
+               */
+              sidebarAutoFailedKeysRef.current.add(key);
+              return;
+            }
+            if (closeOutcome.status === "request-resolved-unverified") {
+              /**
+               * resolve 只代表请求完成：验证链已经登记在共享账本里，record / origin / attempt 全部保留。
+               * 这里直接返回，绝不落到下面的 openResource 分支，也绝不当成「已经关掉」收口。
+               */
+              return;
+            }
+            /**
+             * verified-closed：精确 inventory 证据证明这个 tab 已经不在；
+             * verified-recycled：这个 tabId 已经被宿主回收给另一个资源（地址不一致）——旧 tab 已经
+             *   消失、close 一次也没有发出，但「这个 key 已经没有自己的 tab」这个结论与 verified-closed
+             *   完全等价，因此收口规则一致（下面的 (key, tabId) 一致性闸门照旧生效）；
+             * closed：旧宿主没有 inventory 读面时的手动关闭（历史语义，用户意图优先）。
+             * 只有这三种结算允许收口归属。
+             */
+            if (closeOutcome.status === "verified-closed" || closeOutcome.status === "closed"
+              || closeOutcome.status === "verified-recycled") {
+
+
               /**
                * 关闭成功后一起收口这个 key 上尚未结算的分栏事务。
                *
@@ -4018,21 +5243,56 @@
                *
                * 只有同 key 的意图会被取消：别的行的在途打开照旧继续。
                */
-              if (sidebarSplitIntentRef.current?.key === key) cancelPendingSidebarSplit("close");
-              sidebarTabRecordsRef.current.delete(key);
-              sidebarAutoCloseAttemptsRef.current.delete(key);
+              /**
+               * (key, tabId) 一致性闸门：只有这个 key 当前记录的 tabId 仍是本次动作关闭的那一个，才允许
+               * 收口 record / origin。宿主换过 tabId（旧 tab 消失、同一个资源换成新 tab）时，旧代次的
+               * 结算只能清理它自己那一笔预算，绝不能删掉新 generation 的 record 与 Auto 归属。
+               */
+              const currentRecord = sidebarTabRecordsRef.current.get(key);
+              const recordStillSame = currentRecord !== undefined && currentRecord.tabId === record.tabId;
+              /**
+               * 分栏事务只收口**这次关闭出发时看到的那一份意图**：这次关闭确实发生了，事务必须收口
+               * （否则右栏停在临时 50%）；但同一个 key 上如果已经出现新 generation 的 split/open
+               * 事务（用户或 Auto 重新打开了这个资源），旧 close 的结算绝不取消它——那会把新一次打开
+               * 的 pane 归属与临时扩栏一起打断。令牌逐对象比较，A→B→A 或同 key 重开都无法冒充。
+               */
+              cancelPendingSidebarSplitOfClose(key, closeSplitIntentToken);
+              if (recordStillSame === true) {
+                sidebarTabRecordsRef.current.delete(key);
+              }
+              // 重试预算按所有权收口：手动关闭恒优先，直接清空；自动关闭只有 owner 仍是本次动作的
+              // 令牌时才清空（旧代次的迟到成功结算绝不把后来者重新预支的预算一起清零）。
+              settleAutoCloseAttempt(key, autoContext);
+
               /**
                * 关闭成功后收口来源与抑制记账（两种开放的语义差别就在这两行）：
                *
                * - 自动关闭：只撤销来源标记——本次运行不会再对同一个资源重复动作；
                * - 手动关闭：除撤销来源外还要登记**抑制**，Auto 不得立刻把它重新打开。抑制只由
                *   用户手动重新打开同一资源清除（手动意图优先）。
+               *
+               * 「等待竞争租约后拿到成功结算」同样走这里：tab 确实已经被关掉，收口规则与亲手关闭一致；
+               * 反过来说，让位 / 失败 / inventory 不可读的路径一律在上面 return，绝不提前清理来源。
                */
-              sidebarAutoOriginRef.current.delete(key);
-              if (origin === SIDEBAR_TAB_ORIGIN_MANUAL) {
-                sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
-                trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+              // 来源与抑制同样只在这个 key 仍然指向本次关闭的那个 tabId 时收口：否则删掉的会是
+              // 新 generation 刚刚为**新 tabId** 写下的 Auto 归属。
+              if (recordStillSame === true && closeOutcome.status === "verified-recycled") {
+                /**
+                 * 地址复用证明旧 tab 已经消失：这个 key 的失败冷却也随之失效，必须一起清掉。否则一条
+                 * 永远等不到自己 tab 的冷却（最长 15 分钟）会白白屏蔽这个 key 后续的真实关闭。
+                 * 仍然只在 record 仍指向本次证明消失的那个 tabId 时清理：后来者已经接管这个 key 时，
+                 * 它的冷却记账不属于这次结算（与 finishVerifiedSidebarClose 的 sameTab 闸门同源）。
+                 */
+                sidebarAutoCloseCooldownsRef.current.delete(key);
               }
+              if (recordStillSame === true) {
+                sidebarAutoOriginRef.current.delete(key);
+                if (origin === SIDEBAR_TAB_ORIGIN_MANUAL) {
+                  sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
+                  trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+                }
+              }
+
               bump((value) => value + 1);
               // 关闭改变了右栏组成，必须立刻重估一次：宽度与手柄锁都在同一条同步链路上。
               syncSidebarTabs();
@@ -4083,7 +5343,8 @@
           if (origin === SIDEBAR_TAB_ORIGIN_MANUAL) {
             sidebarAutoSuppressedRef.current.delete(key);
             sidebarAutoOriginRef.current.delete(key);
-            sidebarAutoCloseAttemptsRef.current.delete(key);
+            // 用户手动重新打开同一资源：手动接管，这个 key 上未结算的自动关闭预算（含 owner）一并作废。
+            clearAutoCloseAttempt(key);
           }
           const targetPaneId = existingSubagentPaneId();
           let openOptions = null;
@@ -4132,9 +5393,7 @@
               // 宽度 action 返回只代表 store 已写入；必须等宿主把新宽度提交到 DockLayout，
               // 否则 split() 仍会读到旧 room.row=false，并弹出「栏宽不足」。
               await waitForSidebarSplitLayoutCommit();
-              const splitStillCurrent = mountedRef.current === true
-                && currentRootRef.current === rootSessionId
-                && currentSidebarSessionRef.current === sidebarSessionId
+              const splitStillCurrent = sidebarSurfaceStillCurrent() === true
                 && sidebarSplitIntentRef.current?.token === splitToken;
               if (!splitStillCurrent) {
                 // session 切换、卸载或 deadline 已经收口时，不得让旧点击继续操作新 surface。
@@ -4213,7 +5472,7 @@
            */
           if (effectiveOrigin === SIDEBAR_TAB_ORIGIN_AUTO && canTrackOpen === true) {
             sidebarAutoOriginRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
-            trimAutoKeyMap(sidebarAutoOriginRef.current);
+            trimAutoKeyMap(sidebarAutoOriginRef.current, true);
           }
           if (splitToken !== null) {
             let acknowledged = true;
@@ -4235,7 +5494,10 @@
           if (opened) sidebarTabOpeningRef.current.delete(key);
           // openResource 可能已经同步提交 tab：立即推进一次同步，让同 pane 回退不依赖下一轮 observer。
           // 若宿主稍后才渲染 DOM，keepMounted + observer/轮询仍会继续补偿。
-          syncSidebarTabs();
+          // 旧闭包绝不允许在新 surface 上推进同步：中间的宿主调用可能已经触发一次重挂载或 A→B→A
+          // 回返，那时这份闭包手里的快照会把新 Panel 的账本当成本轮的旧状态处理。新 Panel 自己的
+          // 下一轮外部同步会按真实 inventory 继续收口。
+          if (sidebarSurfaceStillCurrent() === true) syncSidebarTabs();
         } catch {
            if (sidebarSplitIntentRef.current?.key === key) cancelPendingSidebarSplit("resource-failed");
            sidebarTabOpeningRef.current.delete(key);
@@ -4244,25 +5506,37 @@
         finally {
           pending.delete(key);
           /**
-           * 自动动作收尾时无条件释放在途记账（split busy、准备失败、layout 失效、open 抛错、
-           * surface 变化、被撤销都走这里）：
-           * - 预留必须释放，否则一次失败会被永久记成「已经打开过」，该资源在本次运行里再也打不开；
-           * - 打开没有真正发出时，这个 key 不存在「Auto 亲手打开」的事实，残留来源标记一并撤销。
+           * 自动动作收尾时释放在途记账（split busy、准备失败、layout 失效、open 抛错、surface 变化、
+           * 被撤销都走这里）。必须按 surface 是否仍是出发时那一份分成两种行为：
+           *
+           * - 仍是出发时那一份：历史行为逐字不变——预留必须释放（否则一次失败会被永久记成「已经
+           *   打开过」，该资源在本次运行里再也打不开），打开没有真正发出时撤销残留来源，并结算用户
+           *   在这个窗口里留下的手动意图；
+           * - generation 已经换掉（组件重挂载，或同一个实例 A→B→A）：只能清理**明确属于本实例这一次
+           *   动作**的在途记录——预留是本实例的 Map，且候选选择在预留存在期间绝不会为同一个 key 再选
+           *   一次，因此这一刻它只可能是本次动作写下的那一笔。共享 Auto 账本（来源 / 抑制 / 重试）与
+           *   手动意图一律不碰：openIssued 为假说明本次动作从来没有发出过 openResource，此刻那个 key
+           *   上的来源只可能属于新 generation 已经成功打开的那次动作（旧实现无条件 delete 会把它清掉，
+           *   新 Panel 从此再也认不出自己开出的 tab，资源结束后也不会自动关闭它）。
            */
+          const surfaceCurrent = sidebarSurfaceStillCurrent() === true;
           if (autoContext !== null) {
             sidebarAutoReservationRef.current.delete(key);
-            if (autoContext.kind === "open" && openIssued !== true) {
+            if (surfaceCurrent === true && autoContext.kind === "open" && openIssued !== true) {
               sidebarAutoOriginRef.current.delete(key);
               // 本次打开没有发出：把 key 记进失败屏障，同一批微任务里绝不再重选它（见其说明）。
               sidebarAutoFailedKeysRef.current.add(key);
             }
-            if (openIssued === true) sidebarAutoFailedKeysRef.current.delete(key);
+            if (surfaceCurrent === true && openIssued === true) sidebarAutoFailedKeysRef.current.delete(key);
           }
           /**
            * 在途动作收尾后立刻结算用户在这个窗口里表达的手动意图：手动恒优先，绝不因为「那次点击撞上
            * 了 pending 锁」而丢失。没有意图时这一步是幂等空操作。
+           *
+           * 只由仍然属于当前 surface 的闭包结算：applyPendingManualIntent 会改共享的来源 / 抑制 / 重试
+           * 账本，并可能派发新的打开或关闭动作；surface 换代后这些收尾属于新 Panel 的下一轮外部同步。
            */
-          applyPendingManualIntent(key);
+          if (surfaceCurrent === true) applyPendingManualIntent(key);
         }
       };
 
@@ -4275,17 +5549,22 @@
        *    root/session 的批量按钮保持可用，绝不被一个与它无关的在途序列（甚至永不 settle 的
        *    宿主 Promise）阻塞；
        * 2) 候选集合在**点击那一刻**从同一个 inventory 快照固定下来（渲染期算好、随点击闭包传入），
-       *    后续再点同一个按钮也不会把新出现的 tab 混进这一轮；
-       * 3) 每次 await 前后都校验 mountedRef / currentRootRef / currentSidebarSessionRef：root 或
-       *    sidebar session 切换、组件卸载后立即停止后续关闭，绝不让旧点击继续操作新 surface。
+       *    后续再点同一个按钮也不会把新出现的 tab 混进这一轮；但这个快照只用来决定「处理哪些候选」，
+       *    真正调用 close 之前必须逐个重读**当前** inventory：等待前一个候选的 close 期间，同一个 tab
+       *    可能已经被单项入口成功关掉，按旧快照再 close 一次就是重复副作用。inventory 读不到时
+       *    fail-closed 跳过，绝不按 active tab 猜；
+       * 3) 每次 await 前后都过 surface 闸门（mountedRef / currentRootRef / currentSidebarSessionRef
+       *    三条既有判据 + 不可复用的 surface 令牌）：root 或 sidebar session 切换、组件卸载，以及
+       *    「切走又切回同一组值」（A→B→A）之后立即停止后续关闭，绝不让旧点击继续操作新 surface。
        *
        * 单项失败严格隔离：close 同步抛错或返回 rejected Promise 只跳过这一项并继续其余项，
        * 也绝不把失败项标成已关闭——关闭记录一律交给宿主 inventory 与既有同步器确认（这里不删记录）。
+       * 与单项入口共用同一个执行入口（closeSidebarTabWithLease）：候选上已经有一次关闭在途时等待它
+       * 结算，上次成功就直接收口、上次失败才用当前 inventory 复核后接管一次有限重试；用户按下的
+       * 批量意图绝不在冲突里被静默丢失，也绝不对已经关掉的 tab 重复调用 close。
        */
       const handleSidebarBatchClose = async (candidates) => {
-        if (mountedRef.current !== true
-          || currentRootRef.current !== rootSessionId
-          || currentSidebarSessionRef.current !== sidebarSessionId) return;
+        if (sidebarSurfaceStillCurrent() !== true) return;
         if (closeSidebarResource === null) return;
         if (Array.isArray(candidates) !== true || candidates.length === 0) return;
         // 锁只覆盖「这一个 surface」：同一个 scope 的重复点击被拦下，别的 root/session 的批量按钮
@@ -4297,29 +5576,55 @@
         // 立刻进入 pending 态：按钮 disabled + aria-busy，第二次点击在 has 检查处被拦下。
         bump((value) => value + 1);
         try {
-          for (const tabId of candidates) {
-            // await 之前：root/session 切换或卸载即停止后续关闭。
-            if (mountedRef.current !== true
-              || currentRootRef.current !== rootSessionId
-              || currentSidebarSessionRef.current !== sidebarSessionId) return;
-            try {
-              // 单项 await：同步抛错与 rejected Promise 都在这里被隔离，序列继续。
-              await closeSidebarResource.call(sidebarRight, tabId);
-            } catch { /* 单项失败只影响这一项：失败项绝不被标成已关闭，也不改写任何记录。 */ }
-            // await 之后：surface 已切换时不再继续（已经发出的那一次关闭照旧由宿主结算）。
-            if (mountedRef.current !== true
-              || currentRootRef.current !== rootSessionId
-              || currentSidebarSessionRef.current !== sidebarSessionId) return;
+          for (const candidate of candidates) {
+            // await 之前：surface 已经换掉（卸载、root/session 切换，或同一个实例 A→B→A 回返）即停止
+            // 后续关闭。判据含不可复用的 surface 令牌，字符串重新相等不算「还是当前 surface」。
+            if (sidebarSurfaceStillCurrent() !== true) return;
+            /**
+             * 候选形状闸门：候选必须**同时**携带 tabId 与资源地址（见 sidebarBatchCandidates）。
+             * 缺任何一个都无法在副作用之前回答「这个 id 此刻仍然是我们要关的那个资源」——一律跳过
+             * 这一项（其余候选继续处理），绝不退化成「只按 tabId 盲关」。
+             */
+            const tabId = text(object(candidate).tabId, null);
+            const candidateAddress = text(object(candidate).address, null);
+            if (tabId === null || candidateAddress === null) continue;
+            /**
+             * 每个候选调用前重新读**当前** inventory，并同时复核**地址**：候选集合只是点击那一刻的
+             * 渲染快照，而等待前一个候选的 close 期间，同一个 tab 完全可能已经被别的入口（用户刚点的
+             * 单项箭头、Auto 的关闭、旧 Panel 的迟到收尾）成功关闭，甚至这个 tabId 已经被宿主回收给了
+             * 另一个资源。只有「present 且条目暴露的地址与候选地址逐字一致」才允许调用 close；
+             * absent / recycled / unreadable 一律跳过这一项，绝不按 active tab 或渲染时快照猜一个 id。
+             */
+            if (sidebarTabPresenceInInventory(tabId, candidateAddress) !== "present") continue;
+            /**
+             * 与单 tab 关闭共用同一个执行入口（同一把 session + root + tabId 租约 + 结算信号）：
+             * 这个 tab 上已经有一次关闭在途时（典型：用户刚点的单项箭头还停在宿主 Promise 里），
+             * 批量必须等待它结算再决定——上次成功就直接收口（绝不重复 close），上次失败且当前
+             * inventory 仍证明这个精确 tabId 存在**且地址一致**时才接管**一次**有限重试。用户按下的
+             * 批量意图因此绝不在冲突里被静默丢失，也不会对已经关掉的 tab 重复调用 close。
+             */
+            await closeSidebarTabWithLease(tabId, {
+              waitForCompeting: true,
+              /**
+               * 批量入口没有 key（它的候选只有 tabId + 地址）：按手动语义处理，不做验证收口——记录由
+               * 同步层结算。地址必须传下去：它既是 preflight 的地址判据，也是等待竞争租约时等待者
+               * 自己那份复核证据（没有地址证据的等待者遇到 recycled 结算只能跳过）。
+               */
+              verify: { key: null, address: candidateAddress, attemptToken: null, manual: true },
+            });
+
+            // await 之后：surface 已切换（含同一个实例 A→B→A 回返）时不再继续（已经发出的那一次
+            // 关闭照旧由宿主结算）。判据含不可复用的 surface 令牌，字符串重新相等不算「还是当前 surface」。
+            if (sidebarSurfaceStillCurrent() !== true) return;
           }
         } finally {
           // 只释放自己那一个 scope：旧序列的收尾绝不改写别的 root/session 的锁。
           pendingScopes.delete(scopeKey);
           // 重渲染与同步只服务**自己这一轮渲染**的 surface：root/session 已经切换时它们会去操作
           // 新 surface（旧 scope 的 bump 会让新 root 白白重渲染、旧闭包的 sync 会去同步旧 root）。
-          // 回到同一个 root/session（键相同）时仍照常收尾，按钮不会因为缺少重渲染而停在 disabled。
-          if (mountedRef.current === true
-            && currentRootRef.current === rootSessionId
-            && currentSidebarSessionRef.current === sidebarSessionId) {
+          // 判据含不可复用的 surface 令牌：同一个实例 A→B→A 之后字符串会重新相等，但这一轮批量序列
+          // 已经不属于当前 surface，收尾交给新 Panel 自己的同步（bump 只由它自己发起）。
+          if (sidebarSurfaceStillCurrent() === true) {
             bump((value) => value + 1);
             // 关闭序列结束后推进一次同步：候选集合与签名都按宿主 inventory 重新读取，
             // 真正被宿主关掉的 tab 由既有同步器（present/active/浮窗标题证据）结算，插件不抢先删记录。
