@@ -89,6 +89,12 @@ function createWaitHost({
   sessionActivity = "subagent",
   descendantListing = "subagent",
   descendantRowTransform,
+  /**
+   * 覆盖权威 listing seam 的具体实现（只给日志泄漏回归用）：传入后它会替代 harness 的
+   * listDescendants，让用例可以抛出一个**带敏感 message** 的异常，验证等待路径的日志
+   * 只记录固定前缀与错误名。省略时保持 harness 的受控模式语义。
+   */
+  descendantListingImplementation,
   durableNonResidentRows,
   sessionActivityTransport = true,
   // 默认 "live"：真实 rc.2 宿主**一定**提供 agents.list()，等待的运行判定必须用同一份
@@ -116,9 +122,18 @@ function createWaitHost({
       ? {}
       : { rootChildren: rootChildren === "live" ? () => host.agents.roots() : rootChildren }),
     settings: {
-      value: { provider: "mock", defaults: { explorer: { provider: "mock", model: "mock" } } },
+      // 这些用例只验证等待语义；关闭系统通知，避免完成通知 spawn 真实 PowerShell
+      // 子进程（会污染桌面并把测试尾延迟拖到秒级）。通知文案由专门用例覆盖。
+      value: {
+        provider: "mock",
+        defaults: { explorer: { provider: "mock", model: "mock" } },
+        notificationEnabled: false,
+      },
     },
     subagents: {
+      ...(typeof descendantListingImplementation === "function"
+        ? { listDescendants: descendantListingImplementation }
+        : {}),
       async startContinuable({ request }) {
         const index = children.length + 1;
         const childId = typeof childIdFactory === "function"
@@ -159,6 +174,23 @@ function createWaitHost({
   host.apply();
   const root = host.registerRootAgent(ROOT_ID);
   return { host, root, children, steered };
+}
+
+/**
+ * 等待条件成立——替代「睡固定墙钟再断言」。
+ *
+ * 背景：`host/turn-wait.js` 的退避重查间隔是 10/20/40/80…ms，本文件里两个用例过去用
+ * 固定 `setTimeout(80)` 等一次重查落地：既白等一次退避的余量，又对定时器精度敏感
+ * （Windows 上 setTimeout 的实际触发可能晚于名义值）。这里每 5ms 轮询一次，条件一成立
+ * 立刻返回；`timeoutMs` 只是兜底上限，真正的回归会由随后的断言（pending 仍是 pending、
+ * calls 不足等）给出失败，而不是把失败变成超时等待。
+ */
+async function waitUntil(predicate, timeoutMs = 600) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return predicate();
 }
 
 /** 把 Promise 的最终状态投影成可断言的值（不 await，保持 pending 可见）。 */
@@ -958,7 +990,7 @@ test("后代快照瞬时失败后：没有新事件也必须退避重查并释�
 
   // 本用例没有 outstanding work，等待只验证快照失败后的退避复查。
   const pending = track(registry.wait(root));
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  await waitUntil(() => pending.status === "resolved");
   await flushAsyncWork(8);
 
   assert.ok(calls >= 2, "瞬时查询失败后必须在没有新事件时自动重查");
@@ -992,7 +1024,7 @@ test("child 静默结束后：已结算工作不能因缺少 agent/status 事件
 
   // 模拟 durable child 进入 ready，但宿主没有发出 agent/status/disposed 事件。
   childRunning = false;
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  await waitUntil(() => pending.status === "resolved");
   await flushAsyncWork(8);
 
   assert.equal(pending.status, "resolved", "没有状态事件也必须通过后代快照重查发现 child 已结束");
@@ -1346,6 +1378,51 @@ test("listing 整条 reject 时继续等待", async () => {
   insertNotice(host, root, children[0], "fb-listing-throw");
   await flushAsyncWork(20);
   assert.equal(pending.status, "pending", "listing 失败必须按 unknown 处理");
+  assertNoGoalCalls(probe);
+});
+
+test("等待异常日志只记固定前缀与错误名：不得输出异常 message 原文", async () => {
+  /**
+   * 等待路径的异常可能来自宿主 provider、会话读取器甚至文件系统：message 里可能夹带
+   * 凭据、绝对路径或会话正文。日志只允许回答"哪一步失败 + 错误类型"，因此这里用一个
+   * 明显可识别的敏感 message 驱动真实失败路径，断言 logger 输出不含原文。
+   */
+  const SENSITIVE_MESSAGE = "token=SECRET-DO-NOT-LOG path=C:/secret/session.json prompt=internal task body";
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({
+    goalProbe: probe,
+    descendantListingImplementation: async () => {
+      throw new Error(SENSITIVE_MESSAGE);
+    },
+  });
+  const outcome = await startAdmission(host, root);
+  const pending = track(finalizeLifecycle(host, root, outcome));
+  await flushAsyncWork(8);
+
+  endChildTurn(host, children[0]);
+  host.setAgentStatus(children[0].child, "idle");
+  insertNotice(host, root, children[0], "fb-listing-sensitive");
+  await flushAsyncWork(20);
+  // 日志修复不得改变等待语义：查询失败仍然是 unknown（继续等待）。
+  assert.equal(pending.status, "pending", "listing 失败必须按 unknown 处理");
+
+  const warnings = host.warnings
+    .filter((entry) => entry.kind === "logger-warn")
+    .map((entry) => String(entry.message));
+  const listingWarnings = warnings.filter((message) => message.includes("root turn wait descendant-listing failed"));
+  assert.ok(listingWarnings.length > 0, "等待路径仍必须留下固定前缀的诊断（不是静默吞错）");
+  for (const message of listingWarnings) {
+    // 只允许「固定前缀 + 错误名」：Error 是异常构造器名，不含任何 message 片段。
+    assert.match(message, /root turn wait descendant-listing failed: Error$/);
+    assert.equal(message.includes("SECRET-DO-NOT-LOG"), false, "日志不得输出异常 message 里的敏感片段");
+    assert.equal(message.includes("/secret/session.json"), false, "日志不得输出异常 message 里的路径");
+    assert.equal(message.includes("internal task body"), false, "日志不得输出异常 message 里的正文");
+  }
+  assert.equal(
+    warnings.some((message) => message.includes(SENSITIVE_MESSAGE)),
+    false,
+    "任何等待告警都不得携带异常 message 原文",
+  );
   assertNoGoalCalls(probe);
 });
 
@@ -2126,19 +2203,51 @@ test("turn-stopping 兜底与 finalize 共用同一账本：child 仍在运行�
   assertNoGoalCalls(probe);
 });
 
-test("finalize 校验失败时不登记等待（Promise 立即收口，不悬挂）", async () => {
+test("finalize 前置校验失败时不登记等待（Promise 立即收口，不悬挂）", async () => {
   const probe = createGoalProbe();
   const { host, root } = createWaitHost({ goalProbe: probe });
   const outcome = await startAdmission(host, root);
+  // 票据 10：token 集不再是前置条件；这里用真正的前置校验（summary 未完成）证明
+  // 失败路径依旧立即返回 rejected，且绝不登记等待或悬挂 root turn。
   const result = await host.toolDefinition("dsh_expert_group_finalize").execute({
     admissionEpoch: outcome.admissionEpoch,
-    admissionTokens: [],
-    summaryCompleted: true,
+    admissionTokens: [outcome.admissionToken],
+    summaryCompleted: false,
     outcomesChecked: true,
     safeParallelWork: false,
   }, { agent: root });
   assert.equal(result.kind, "rejected");
-  assert.equal(result.reason, "incomplete-admission-token-set");
+  assert.equal(result.reason, "summary-or-outcome-check-required");
+  assert.ok(result.message.length > 0);
+  assertNoGoalCalls(probe);
+});
+
+test("finalize 只传 admissionEpoch 时同样登记同一张等待账本（token 只是诊断）", async () => {
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe });
+  const outcome = await startAdmission(host, root);
+  const receipt = await host.toolDefinition("dsh_expert_group_finalize").execute({
+    admissionEpoch: outcome.admissionEpoch,
+    summaryCompleted: true,
+    outcomesChecked: true,
+    safeParallelWork: false,
+  }, { agent: root });
+  assert.equal(receipt.kind, "waiting");
+  assert.equal(receipt.acceptedCount, 1);
+  assert.deepEqual(receipt.tokenDiagnostics.missing, [outcome.admissionToken]);
+
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1, "epoch-only 收口必须让 turn-stopping 参与同一张等待账本");
+  let settled = false;
+  stop.settled.then(() => { settled = true; });
+  await flushAsyncWork(10);
+  assert.equal(settled, false, "专家仍在运行时等待必须保持");
+
+  endChildTurn(host, children[0]);
+  host.setAgentStatus(children[0].child, "idle");
+  await flushAsyncWork(20);
+  assert.equal(settled, true, "专家静止后同一张账本一次性收口");
+  assert.equal(host.agentSteerMessages(root).length, 1);
   assertNoGoalCalls(probe);
 });
 
@@ -2219,9 +2328,11 @@ test("同一 root 第二轮：第二批的 accepted admission 同样能再次等
  * 与可手动触发的 invalidate 精确构造竞态。
  *
  * @param {(callIndex:number)=>Promise<object>} snapshot - 第 N 次查询（1 起）的返回。
+ * @param {{now?:Function,setTimeout?:Function,clearTimeout?:Function}} [clock]
+ *   可选假时钟；不传时使用真实定时器（退避复查按墙钟运行）。
  * @returns {{registry:object, calls:number[], agents:Set<object>, fire:(agent:object)=>void}}
  */
-function createFactoryRig(snapshot) {
+function createFactoryRig(snapshot, clock = {}) {
   const calls = [];
   const agents = new Set();
   const invalidators = new Map();
@@ -2235,6 +2346,9 @@ function createFactoryRig(snapshot) {
       return () => { set.delete(invalidate); };
     },
     onError: () => {},
+    ...(typeof clock.now === "function" ? { now: clock.now } : {}),
+    ...(typeof clock.setTimeout === "function" ? { setTimeout: clock.setTimeout } : {}),
+    ...(typeof clock.clearTimeout === "function" ? { clearTimeout: clock.clearTimeout } : {}),
   });
   return {
     registry,
@@ -2383,7 +2497,37 @@ test("recheck 消费：连续 reject 且无新事件时保持等待且不自旋"
   const agent = { id: "root-factory-nospin" };
   const first = createDeferred();
   const second = createDeferred();
-  const rig = createFactoryRig((index) => (index === 1 ? first.promise : second.promise));
+  // 假时钟：退避复查绝不能靠真实 10/20ms 墙钟抢在断言前触发（否则用例本身会变成
+  // 对机器负载的断言）。这里显式推进到期时间，既证明「不会同步自旋」，也证明
+  // 「退避到期后确实会重查」。
+  let now = 0;
+  let seq = 0;
+  const timers = new Map();
+  const clock = {
+    now: () => now,
+    setTimeout(callback, delay = 0, ...args) {
+      const id = ++seq;
+      timers.set(id, { at: now + Math.max(0, Number(delay) || 0), callback, args });
+      return id;
+    },
+    clearTimeout: (id) => { timers.delete(id); },
+    advance(ms) {
+      now += Math.max(0, Number(ms) || 0);
+      let progressed = true;
+      while (progressed) {
+        progressed = false;
+        for (const [id, timer] of [...timers]) {
+          if (timer.at > now) continue;
+          timers.delete(id);
+          progressed = true;
+          timer.callback(...timer.args);
+        }
+      }
+      return now;
+    },
+    get pending() { return timers.size; },
+  };
+  const rig = createFactoryRig((index) => (index === 1 ? first.promise : second.promise), clock);
   rig.agents.add(agent);
 
   const waitState = track(rig.registry.wait(agent));
@@ -2393,11 +2537,16 @@ test("recheck 消费：连续 reject 且无新事件时保持等待且不自旋"
   await flushAsyncWork(2);
   assert.equal(rig.calls.length, 2, "第一次 reject 消费 recheck 并重跑一次");
 
-  // 第二次查询也 reject，但期间没有任何新事件：绝不能继续重跑。
+  // 第二次查询也 reject，但期间没有任何新事件：先同步断言不自旋（还没有任何
+  // 定时器到期），再推进假时钟证明退避重查确实存在。
   second.reject(new Error("second failure"));
-  await flushAsyncWork(6);
-  assert.equal(rig.calls.length, 2, "没有新事件时不得继续重跑（不能自旋）");
+  await flushAsyncWork(2);
+  assert.equal(rig.calls.length, 2, "没有新事件时不得同步重跑（不能自旋）");
+  assert.ok(clock.pending >= 1, "失败后必须武装退避重查，而不是永久放弃观察");
   assert.equal(waitState.status, "pending", "查询持续失败必须保持等待（unknown 不放行）");
+  clock.advance(60 * 1000);
+  await flushAsyncWork(2);
+  assert.equal(rig.calls.length, 3, "退避到期后才允许重查");
 });
 
 test("retire：等待者以 released:false 收口，记录与监听立即回收，在途快照不得挂回", async () => {

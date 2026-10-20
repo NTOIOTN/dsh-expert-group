@@ -13,6 +13,32 @@ function describeError(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** JSON 安全的只读拷贝；诊断面绝不能把内部对象引用交给调用方。 */
+function cloneJson(value) {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把恢复失败归一为稳定结构（code/message/field/violation）。
+ *
+ * - manager 抛出的 FanoutValidationError 自带 code/field/violation，直接透传；
+ * - 其它异常统一归为 RESTORE_FAILED，避免把宿主内部错误类名当成稳定契约；
+ * - message 只用于诊断文案（index 会再做长度/控制字符归一），不写入任何持久化。
+ */
+function describeRestoreFailure(error) {
+  const code = typeof error?.code === "string" && error.code.length > 0 ? error.code : "RESTORE_FAILED";
+  const field = typeof error?.field === "string" && error.field.length > 0 ? error.field : null;
+  const violation = error?.violation !== null && typeof error?.violation === "object" && !Array.isArray(error.violation)
+    ? cloneJson(error.violation)
+    : null;
+  return Object.freeze({ code, message: describeError(error), field, violation });
+}
+
 function taskNeedsRoot(task) {
   return Array.isArray(task?.shards) && task.shards.some((shard) => (
     shard?.status === "queued" && shard?.cancelRequested !== true
@@ -111,6 +137,11 @@ export function createFanoutRuntimeModule({
   runtimeOptions = {},
   /** 动态有效的 per-role 默认并发上限（settings 解析函数）；缺省时沿用 runtimeOptions。 */
   concurrencyLimit,
+  /**
+   * 动态有效的角色级默认超时（settings 解析函数或静态毫秒数，票据 06）。
+   * manager 在每次新建 attempt 时读一次；0 表示不启用。
+   */
+  roleTimeoutMs,
   buildRequest,
   startContinuable,
   continueMessage,
@@ -186,6 +217,57 @@ export function createFanoutRuntimeModule({
    * 不参与任何授权写决策；close() 时整体丢弃。
    */
   const restoreReadCredentials = new Map();
+  /**
+   * 已回收任务的**归属提示**：parentTaskId -> parentSessionId（有界、只在内存）。
+   *
+   * 为什么需要它：回收会同时移除任务与全部归属索引，之后 get/events/写动作若只看活动
+   * 绑定与 settled 索引，就只能回答 "not-found"，无法把"这个任务曾属于你、但已被回收"
+   * 收敛成票据 05/09 约定的 task_not_found。这份提示只含 id（不复制任务数据），
+   * 有界（RECLAIMED_OWNER_MEMORY）、不写 storage、重启即消失，因此**不是**任务墓碑：
+   * - 不进入快照/列表/事件，任何查询都不会看到已回收任务本身；
+   * - 只回答"哪个 root 可以把自己的这个 id 视为 task_not_found"，对其他 root 一律
+   *   仍是 not_owner/not-found（不泄露跨 root 存在性）。
+   */
+  const reclaimedTaskOwners = new Map();
+  /** 归属提示上限：与 fanout.js 的迟到回调记忆同阶，远大于单次回收批量（maxTasks=64）。 */
+  const RECLAIMED_OWNER_MEMORY = 256;
+  /**
+   * 恢复失败 / 持久化结果的内存诊断面（只读、不写 storage）。
+   *
+   * - lastRestore：最近一次真实执行过的恢复结果（ok / 结构化 error / 计数）；
+   * - persistenceBlocked：恢复失败后的 fail-closed 闸门；只有成功恢复才清除；
+   * - lastPersistOutcome：Host 层最近一次落盘结果（saved / skipped(reason) /
+   *   failed(category)），失败分类的权威仍是 persistenceHealth。
+   */
+  let lastRestore = null;
+  let persistenceBlocked = null;
+  let lastPersistOutcome = null;
+
+  /** 记录最近一次真实恢复结果（只读诊断；error 由 describeRestoreFailure 归一）。 */
+  function recordRestoreOutcome({ ok, restored, deferred, pending, error }) {
+    lastRestore = Object.freeze({
+      ok: ok === true,
+      at: Date.now(),
+      restored: Number.isSafeInteger(restored) ? restored : 0,
+      deferred: Number.isSafeInteger(deferred) ? deferred : 0,
+      pending: pending === true,
+      error: error ?? null,
+    });
+    return lastRestore;
+  }
+
+  /** 记录最近一次 Host 层落盘结果（只读诊断；不触发新的持久化回调）。 */
+  function recordPersistOutcome(outcome) {
+    lastPersistOutcome = Object.freeze({
+      status: outcome?.status === "saved" || outcome?.status === "failed" ? outcome.status : "skipped",
+      reason: typeof outcome?.reason === "string" ? outcome.reason : null,
+      category: typeof outcome?.category === "string" ? outcome.category : null,
+      sequence: Number.isSafeInteger(outcome?.sequence) ? outcome.sequence : null,
+      at: Date.now(),
+    });
+    return lastPersistOutcome;
+  }
+
   const persistenceHealth = injectedPersistenceHealth === undefined
     ? createPersistenceHealth()
     : injectedPersistenceHealth;
@@ -225,6 +307,13 @@ export function createFanoutRuntimeModule({
   const dynamicConcurrencyLimit = typeof concurrencyLimit === "function" || typeof concurrencyLimit === "number"
     ? concurrencyLimit
     : undefined;
+  /**
+   * 动态角色默认超时的解析来源：与并发上限同一形式。
+   * 非法类型直接忽略（装配错误不能变成调度异常）；manager 侧还有一道校验兜底。
+   */
+  const dynamicRoleTimeoutMs = typeof roleTimeoutMs === "function" || typeof roleTimeoutMs === "number"
+    ? roleTimeoutMs
+    : undefined;
 
   const warn = (message) => {
     try { logger?.warn?.(message); } catch { /* 日志失败不影响调度 */ }
@@ -256,6 +345,116 @@ export function createFanoutRuntimeModule({
     if (typeof active === "string" && active.length > 0) return active;
     const snapshotOwner = ownershipSnapshot.get(parentTaskId);
     return typeof snapshotOwner === "string" && snapshotOwner.length > 0 ? snapshotOwner : null;
+  }
+
+  /**
+   * 记一条已回收任务的归属提示（有界，插入序淘汰最旧项）。
+   *
+   * @param {string} parentTaskId
+   * @param {string} ownerId
+   */
+  function rememberReclaimedOwner(parentTaskId, ownerId) {
+    if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return;
+    if (typeof ownerId !== "string" || ownerId.length === 0) return;
+    reclaimedTaskOwners.delete(parentTaskId);
+    reclaimedTaskOwners.set(parentTaskId, ownerId);
+    while (reclaimedTaskOwners.size > RECLAIMED_OWNER_MEMORY) {
+      const oldest = reclaimedTaskOwners.keys().next().value;
+      reclaimedTaskOwners.delete(oldest);
+    }
+  }
+
+  /** 已回收任务的归属提示（只读；没有记录返回 null）。 */
+  function reclaimedOwnerOf(parentTaskId) {
+    if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return null;
+    const owner = reclaimedTaskOwners.get(parentTaskId);
+    return typeof owner === "string" && owner.length > 0 ? owner : null;
+  }
+
+  /**
+   * 进程内「回收排除集合」：已进入回收流程的父任务 id（**落盘时**必须被排除）。
+   *
+   * 为什么需要它（票据 05 第三轮 blocking）：回收是三步——候选快照落盘、commit、最终快照。
+   * 关闭路径会在候选落盘的 await 期间由 manager.close() 再生成一份**仍含待回收任务**的快照
+   * 并落盘（它生成于 commit 之前）；如果最终快照写失败，磁盘就停在那份旧快照上，重启后
+   * 已回收任务复活。把 id 登记在这里后，**任何**经由 api.persist 的写入（关闭快照、普通
+   * 状态写入、最终快照）都会把它并入 omitParentTaskIds：即使快照正文生成于 commit 之前，
+   * 落盘投影也已经排除这些 id。
+   *
+   * 生命周期与回收三步严格对应：
+   * - 候选 persist **之前**登记：从此之后产生的任何快照在落盘时都被过滤；
+   * - 候选落盘失败（abort）或 commit 失败：撤销登记，并做一次**绕过**排除的补偿写入
+   *   （此时内存里任务还在，磁盘不能缺少它们）；
+   * - commit 成功 + 最终快照成功：撤销登记；
+   * - commit 成功 + 最终快照失败：**保留**登记，让后续写入继续排除这些 id（避免关闭期
+   *   旧快照复活任务），直到同 id 被新任务复用（manager 的 task_registered 事件）或进程退出。
+   *
+   * 有界（DURABLE_RECLAIM_OMIT_LIMIT）、只存 id 字符串、不写 storage、不进快照/诊断：
+   * 因此它不是任务墓碑；淘汰最旧项只会在"长期存储故障 + 大量回收"的极端情况下发生，
+   * 且只会回到"最终快照失败"本身的 best-effort 语义，不会产生新的逻辑分叉。
+   */
+  const durableReclaimOmit = new Set();
+  /** 排除集合上限：与已回收归属提示同阶，远大于单次回收批量（maxTasks=64）。 */
+  const DURABLE_RECLAIM_OMIT_LIMIT = 256;
+
+  /** 登记一个「落盘时必须排除」的 id（有界，插入序淘汰最旧项）。 */
+  function rememberDurableReclaimOmit(parentTaskId) {
+    if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return;
+    // 先删后插：重复登记会刷新插入序，淘汰时优先淘汰真正最久未使用的 id。
+    durableReclaimOmit.delete(parentTaskId);
+    durableReclaimOmit.add(parentTaskId);
+    while (durableReclaimOmit.size > DURABLE_RECLAIM_OMIT_LIMIT) {
+      const oldest = durableReclaimOmit.values().next().value;
+      durableReclaimOmit.delete(oldest);
+    }
+  }
+
+  /** 撤销一个 id 的落盘排除登记（回收中止/成功，或同 id 被新任务复用）。 */
+  function forgetDurableReclaimOmit(parentTaskId) {
+    if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return;
+    durableReclaimOmit.delete(parentTaskId);
+  }
+
+  /** 批量撤销（一次回收的全部 eligible id）。 */
+  function forgetDurableReclaimOmitMany(parentTaskIds) {
+    for (const parentTaskId of Array.isArray(parentTaskIds) ? parentTaskIds : []) {
+      forgetDurableReclaimOmit(parentTaskId);
+    }
+  }
+
+  /** 把可选排除集合归一成 Set（null 表示不过滤）。 */
+  function omitIdSet(options) {
+    const raw = options?.omitParentTaskIds;
+    if (raw === null || raw === undefined) return null;
+    const source = raw instanceof Set ? raw : (Array.isArray(raw) ? raw : null);
+    if (source === null) return null;
+    const set = new Set();
+    for (const entry of source) {
+      if (typeof entry === "string" && entry.length > 0) set.add(entry);
+    }
+    return set.size === 0 ? null : set;
+  }
+
+  /**
+   * 落盘排除集合的最终裁决：显式 omitParentTaskIds ∪ 进程内回收排除集合。
+   *
+   * - 正常写入（manager 的关闭快照、普通状态落盘、每次显式 flush、回收的候选/最终快照）
+   *   都必须继承 durableReclaimOmit：关闭快照生成于 commit 之前，只有在落盘投影里再过滤
+   *   一次，才能保证"最终快照写失败"时磁盘仍然不包含已回收任务。
+   * - `includeReclaimed: true` 是**内部旁路**，只给回收的补偿写入使用：候选落盘失败或
+   *   commit 失败时，内存里任务仍然存在，磁盘必须被写回"含这些任务"的状态；若补偿也继承
+   *   排除集合，就会把仍然在内存里的任务从磁盘删掉（新的分叉）。
+   *
+   * @param {{omitParentTaskIds?: string[]|Set<string>, includeReclaimed?: boolean}} [options]
+   * @returns {Set<string>|null} null 表示不过滤。
+   */
+  function effectiveOmitSet(options) {
+    const explicit = omitIdSet(options);
+    if (options?.includeReclaimed === true) return explicit;
+    if (durableReclaimOmit.size === 0) return explicit;
+    const merged = explicit === null ? new Set() : new Set(explicit);
+    for (const parentTaskId of durableReclaimOmit) merged.add(parentTaskId);
+    return merged.size === 0 ? null : merged;
   }
 
   /**
@@ -310,6 +509,40 @@ export function createFanoutRuntimeModule({
   }
 
   /**
+   * 该 root 的写入证据（票据 09）：live root + exact parent Agent + 绑定代际 token。
+   *
+   * 与 continuation 写路径复用**同一个**函数（activeBindingReplayEvidence），因此
+   * 「读能力」与「写能力」不会出现两套规则。这里只按 sessionId 从 registry 解析 exact
+   * Agent：同 id replacement 得到的是另一个对象，绑定证据自然失效（fail-closed）。
+   */
+  function liveWriteBindingFor(sessionId, parentTaskId) {
+    if (typeof sessionId !== "string" || sessionId.length === 0) return false;
+    if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return false;
+    const agent = typeof getAgent === "function" ? getAgent(sessionId) : undefined;
+    if (agent === null || agent === undefined) return false;
+    return activeBindingReplayEvidence(agent, parentTaskId) !== null;
+  }
+
+  /**
+   * 逐动作能力项的白名单归一：只保留 { allowed, reason? }，拒绝路径必须带稳定原因码。
+   *
+   * manager 的能力投影是内部结构；Host 在这里再收敛一次，保证 RPC / 快照 / 客户端
+   * 三处看到的是同一形状，且没有额外字段穿透到客户端。
+   */
+  function capabilityEntry(entry, fallbackReason = "not_supported") {
+    if (entry === null || typeof entry !== "object" || typeof entry.allowed !== "boolean") {
+      return { allowed: false, reason: fallbackReason };
+    }
+    if (entry.allowed === true) return { allowed: true };
+    const reason = typeof entry.reason === "string" && entry.reason.length > 0 ? entry.reason : fallbackReason;
+    return { allowed: false, reason };
+  }
+
+  function deniedCapability(reason) {
+    return { allowed: false, reason };
+  }
+
+  /**
    * 归还父任务归属：把归属写进 settled 索引并把创建/恢复时的快照用完即删。
    *
    * settled 索引是任务树与持久化投影的归属来源：lineage 释放活动绑定后，任务数据仍由
@@ -353,8 +586,19 @@ export function createFanoutRuntimeModule({
         throw error;
       }
     },
-    /** manager 事件回调：父任务终态后向父会话注入一次聚合反馈。 */
+    /**
+     * manager 事件回调：父任务终态后向父会话注入一次聚合反馈；同时维护回收排除集合。
+     *
+     * `task_registered` 必须在这里（先于 closed/restoring 早退）处理：排除集合表达的是
+     * "这个 id 在磁盘上必须被排除"，它只在"任务已不在内存"时成立。一旦 manager 重新登记
+     * 同 id 的任务（新提交，或恢复窗口内重新落地的任务），任务就重新存在于内存，继续排除
+     * 会让磁盘丢掉一个真实任务。这里只做一次有界的 Set 删除，不产生任何副作用。
+     */
     parentSettled(event) {
+      if (event?.type === "task_registered") {
+        forgetDurableReclaimOmit(event?.parentTaskId);
+        return false;
+      }
       if (closed || restoring || event?.type !== "task_settled") return false;
       const parentTaskId = event.parentTaskId;
       if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return false;
@@ -417,6 +661,8 @@ export function createFanoutRuntimeModule({
     handleAgentCreated: (agent, persistedIdentity) => runtime.handleAgentCreated(agent, persistedIdentity),
     handleAgentDisposed: (agent, persistedIdentity) => runtime.handleAgentDisposed(agent, persistedIdentity),
     handleSessionEvent: (session, event) => runtime.handleSessionEvent(session, event),
+    /** 事件日志只读状态（保留窗口/最早序号/累计丢弃/最近恢复结果）；旧 runtime 缺能力时返回 null。 */
+    eventLogStatus: () => (typeof runtime?.eventLogStatus === "function" ? runtime.eventLogStatus() : null),
     restoreEvents: (events) => (closed ? false : runtime.restoreEvents(events)),
     whenIdle: () => runtime.manager.whenIdle(),
     /**
@@ -454,6 +700,16 @@ export function createFanoutRuntimeModule({
       return resolvedOwner(parentTaskId);
     },
     /**
+     * 已回收任务的归属提示（只读，供 RPC 把查询/动作回执收敛为 task_not_found）。
+     *
+     * 只回答「哪个 root 曾拥有这个 id」，不回答任何任务状态；没有记录返回 null。
+     * 它不参与授权（写动作仍要求 live 写绑定），也不进入快照/列表/事件。
+     */
+    reclaimedOwnerOf(parentTaskId) {
+      if (closed) return null;
+      return reclaimedOwnerOf(parentTaskId);
+    },
+    /**
      * 「该 exact live root 能否证明自己拥有这个父任务」的只读判定。
      *
      * 为什么需要它：root turn 等待只能由**任务真正归属的那一代 root**建立，
@@ -481,12 +737,430 @@ export function createFanoutRuntimeModule({
       if (task === null || managerTaskIsTerminal(task)) return false;
       return activeBindingReplayEvidence(parent, parentTaskId) !== null;
     },
+    /**
+     * 「该 exact live root 是否仍拥有该父任务的写绑定」的只读判定（票据 09）。
+     *
+     * 授权条件与 continuation 写路径、ownsTask **同一套硬条件**
+     * （activeBindingReplayEvidence）：活动绑定 + exact parent Agent + 绑定代际 token 仍 live。
+     * 与 ownsTask 的唯一差别是**不排除终态任务**：终态任务的取消/重试/续作仍要由同一个
+     * 归属证据授权（submit 任务的绑定按既有语义保留到 root 销毁/关闭）。
+     *
+     * 纯读：不改变状态、不注册凭据；没有证据时返回 false（fail-closed）。
+     *
+     * @param {object} parent - 调用方 exact root Agent。
+     * @param {string} parentTaskId - fan-out 父任务 id。
+     * @returns {boolean}
+     */
+    hasLiveWriteBinding(parent, parentTaskId) {
+      if (closed) return false;
+      if (parent === null || typeof parent !== "object" || typeof parent.id !== "string") return false;
+      if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return false;
+      return activeBindingReplayEvidence(parent, parentTaskId) !== null;
+    },
+    /**
+     * 逐动作能力（票据 09）：归属判定 + manager 能力的唯一合并入口。
+     *
+     * 判定顺序固定：
+     * 1. 归属不匹配（活动绑定与已结算索引都不指向该 root）→ 全部 not_owner；
+     * 2. 归属匹配但任务不在 manager 里（含已回收）→ 全部 task_not_found；
+     * 3. 归属匹配 → **读永远 allowed**（活动绑定或冷恢复的已结算任务都可读）；
+     * 4. 写动作（cancel/retry/continue + shard 级）需要 live 写绑定：活动绑定、绑定的
+     *    exact parent Agent 就是 registry 里这一代 root、且绑定代际 token 仍 live；
+     *    否则一律 owner_not_live（冷恢复根、同 id replacement、绑定已释放都落在这里）。
+     *
+     * 因此读路径不会因为「可读」而获得任何写权限，冷恢复根也不会因为任务仍可读而
+     * 被误认为可写。
+     *
+     * @param {string} sessionId - 调用方根会话 id。
+     * @param {string} parentTaskId - fan-out 父任务 id。
+     * @returns {object} { parentTaskId, read, cancel, retry, continue, shards }；永不抛错。
+     */
+    capabilitiesOf(sessionId, parentTaskId) {
+      const taskId = typeof parentTaskId === "string" ? parentTaskId.trim() : "";
+      const denyAll = (reason) => ({
+        parentTaskId: taskId,
+        read: deniedCapability(reason),
+        cancel: deniedCapability(reason),
+        retry: deniedCapability(reason),
+        continue: deniedCapability(reason),
+        shards: {},
+      });
+      if (closed || taskId.length === 0) return denyAll("task_not_found");
+      // 先判归属（票据 09 的固定顺序）：非归属 root 连「任务是否存在」都不进入能力判定。
+      const owner = resolvedOwner(taskId);
+      if (typeof owner !== "string" || owner !== sessionId) {
+        // 已回收任务：把归属提示换算成 task_not_found（与票据 05/09 的查询语义一致），
+        // 但仍不暴露任何任务数据；其它 root 一律 not_owner。
+        if (reclaimedOwnerOf(taskId) === sessionId) return denyAll("task_not_found");
+        return denyAll("not_owner");
+      }
+      const task = runtime.manager.getTask(taskId);
+      if (task === null || task === void 0) return denyAll("task_not_found");
+      // 归属匹配：读能力（含冷恢复的已结算任务）无条件成立。
+      const canWrite = liveWriteBindingFor(sessionId, taskId);
+      const managerCaps = typeof runtime.manager.taskCapabilities === "function"
+        ? runtime.manager.taskCapabilities(taskId)
+        : null;
+      const shards = {};
+      for (const shard of Array.isArray(task.shards) ? task.shards : []) {
+        const shardId = typeof shard?.shardId === "string" && shard.shardId.length > 0 ? shard.shardId : null;
+        if (shardId === null) continue;
+        if (canWrite !== true) {
+          shards[shardId] = {
+            cancel: deniedCapability("owner_not_live"),
+            retry: deniedCapability("owner_not_live"),
+          };
+          continue;
+        }
+        const source = managerCaps?.shards !== null && typeof managerCaps?.shards === "object"
+          ? managerCaps.shards[shardId]
+          : undefined;
+        shards[shardId] = {
+          cancel: capabilityEntry(source?.cancel),
+          retry: capabilityEntry(source?.retry),
+        };
+      }
+      const actionCapability = (name) => (canWrite === true
+        ? capabilityEntry(managerCaps?.[name])
+        : deniedCapability("owner_not_live"));
+      return {
+        parentTaskId: taskId,
+        read: { allowed: true },
+        cancel: actionCapability("cancel"),
+        retry: actionCapability("retry"),
+        continue: actionCapability("continue"),
+        shards,
+      };
+    },
     getEvents: (options) => (closed
       ? { events: [], nextSequence: Number.isSafeInteger(options?.after) && options.after >= 0 ? options.after : 0 }
       : runtime.getEvents(options)),
     cancelParent: (parentTaskId) => (closed ? closedResult() : runtime.manager.cancelParent(parentTaskId)),
     cancelShard: (parentTaskId, shardId) => (closed ? closedResult() : runtime.manager.cancelShard(parentTaskId, shardId)),
     retryShard: (parentTaskId, shardId) => (closed ? closedResult() : runtime.manager.retryShard(parentTaskId, shardId)),
+    /**
+     * 显式回收本 root 已结算的父任务（票据 05）：两阶段 + 先落盘成功再移除。
+     *
+     * 职责边界：
+     * 1. Host 做**归属 + 写绑定**过滤：owner 必须命中 parent.id，且必须能证明
+     *    `activeBindingReplayEvidence(parent, id) !== null`（活动绑定 + exact parent Agent +
+     *    绑定代际 token 仍 live，票据 09）。后一项是防御性复核：冷恢复的已结算任务与同 id
+     *    replacement root 只有读权限，绝不能删除旧代际的终态任务，一律
+     *    `skipped.reason="owner_not_live"`。任务能否回收仍由 manager 的统一前置条件判定
+     *    （不存在/未终态/停止未确认 → 逐项 skipped，不泄露存在性）。
+     * 2. Host 负责真实落盘：等待 api.persist 的**实际结果**（复用既有重试/健康/代次），
+     *    只有 true 才 commit；失败或 false 一律 abortReclaim，内存状态不变。
+     * 3. commit 成功后清理宿主侧全部归属索引（settled/ownershipSnapshot/读凭据/恢复记账）
+     *    并释放 lineage 绑定；随后**无论是否 closed** 都再写一次"清理后的最终状态"
+     *    （见第 4 点），保证磁盘与内存一致。
+     * 4. 关闭竞态（票据 05 修复）：候选快照一旦**真实落盘成功**，回收在语义上已经成立。
+     *    如果这次 await 期间 Host/manager 被 close，仍必须 commit——否则磁盘（候选已排除
+     *    待回收任务）与内存（任务仍在）永久分叉，重启后任务“消失”。关闭后：
+     *    - commit 由 manager 按 token + 屏障完成移除（不 emit / 不 notifyPersistence /
+     *      不 schedule）；宿主侧归属索引清理是幂等 map 操作，照常执行；
+     *    - **仍要写最终快照**：close 会收敛其它运行中的父任务，其 notifyPersistence 触发的
+     *      写入快照生成于 commit 之前；生产写队列 FIFO，因此这次最终写入必然排在它之后；
+     *    - 仍如实返回 accepted:true 与 reclaimed，绝不因为关闭而谎称失败。
+     * 5. 进程内排除集合（票据 05 第三轮 blocking）：在候选 persist **之前**把 eligible id
+     *    登记进 durableReclaimOmit，于是关闭期旧快照、普通写入与最终快照在落盘投影里都会
+     *    被过滤。最终快照成功 → 撤销登记并返回 durable:true；最终快照失败 → **保留**登记
+     *    （后续写入继续排除这些 id，防止关闭旧快照复活任务），返回
+     *    `accepted:true, changed:true, durable:false, durabilityReason:"final_snapshot_failed"`，
+     *    绝不报告耐久成功。
+     * 6. commit 失败（残余的 token 失效路径）：候选已把待回收任务从磁盘排除，但内存未移除。
+     *    必须用当前 manager.snapshot()（`includeReclaimed:true` 绕过排除集合，因此包含
+     *    待回收任务）做一次 best-effort 写回恢复磁盘，再 abortReclaim，返回结构化失败；
+     *    写回失败只 warn，不吞错。候选落盘失败的 abort 路径同理：撤销登记 + 同样的补偿写入。
+     * 7. 同 id 恢复 × 最终快照（票据 05 第五轮 blocking）：最终快照**不传固定 omit**，
+     *    排除只由动态集合承担；写后对账若发现同 id 任务在最终写入 await 期间重新出现
+     *    （restore/task_registered），立即补写一笔最新投影并以其真实结果为准（最多两轮），
+     *    因此不会出现"内存有任务、磁盘没有，却返回 durable:true"。
+     *
+     * 并发：manager 的屏障保证回收与 submit/cancel/retry/continue/restore 串行；
+     * 宿主侧不需要第二把锁（所有写入口最终都进入 manager）。
+     *
+     * @param {object} parent - 调用方 exact root Agent。
+     * @param {string[]} parentTaskIds - 待回收父任务 id（可含非归属/未知项，逐项跳过）。
+     * @returns {Promise<object>} { accepted, reclaimed, skipped, count, ... }；永不抛错。
+     */
+    async reclaimTasks(parent, parentTaskIds) {
+      const rejected = (code, reason, skipped = []) => ({
+        accepted: false,
+        changed: false,
+        code,
+        reason,
+        reclaimed: [],
+        skipped,
+        count: 0,
+        // 拒绝路径没有产生任何耐久变更：绝不宣称 durable。
+        durable: false,
+      });
+      if (closed) return rejected("RUNTIME_CLOSED", "runtime_closed");
+      if (parent === null || typeof parent !== "object" || typeof parent.id !== "string") {
+        return rejected("INVALID_RECLAIM_INPUT", "invalid_parent");
+      }
+      if (!Array.isArray(parentTaskIds)) return rejected("INVALID_RECLAIM_INPUT", "invalid_parent_task_ids");
+      const ids = [];
+      const seen = new Set();
+      for (const raw of parentTaskIds) {
+        const id = typeof raw === "string" ? raw.trim() : "";
+        if (id.length === 0) return rejected("INVALID_RECLAIM_INPUT", "invalid_parent_task_ids");
+        if (seen.has(id)) continue;
+        seen.add(id);
+        ids.push(id);
+      }
+      if (ids.length === 0) return rejected("INVALID_RECLAIM_INPUT", "invalid_parent_task_ids");
+
+      // 归属过滤先于任何任务信息查询：非归属/未知 id 一律 not_owner（不泄露存在性）。
+      const skipped = [];
+      const owned = [];
+      for (const id of ids) {
+        const owner = resolvedOwner(id);
+        if (typeof owner !== "string" || owner.length === 0 || owner !== parent.id) {
+          skipped.push({ parentTaskId: id, reason: "not_owner" });
+          continue;
+        }
+        /**
+         * 防御性 exact live 写绑定校验（票据 09 写权限契约）：
+         * 回收会**删除任务**，属于写操作，只有"live root + exact parent Agent + 绑定代际
+         * token 仍 live"这一套硬条件成立时才允许。冷恢复的已结算任务（restore 时已归还
+         * 归属、绑定释放）与同 id replacement root（owner 字符串相同，但绑定对象是旧代际）
+         * 都只能读，这里必须跳过。
+         */
+        if (activeBindingReplayEvidence(parent, id) === null) {
+          skipped.push({ parentTaskId: id, reason: "owner_not_live" });
+          continue;
+        }
+        owned.push(id);
+      }
+      if (owned.length === 0) return rejected("NO_OWNED_TASKS", "no_owned_tasks", skipped);
+
+      const prepared = runtime.manager.prepareReclaim(owned);
+      if (prepared?.accepted !== true) {
+        return rejected(
+          typeof prepared?.code === "string" ? prepared.code : "RECLAIM_NOT_ACCEPTED",
+          typeof prepared?.reason === "string" ? prepared.reason : "reclaim_not_accepted",
+          [...skipped, ...(Array.isArray(prepared?.skipped) ? prepared.skipped : [])],
+        );
+      }
+      const eligible = prepared.parentTaskIds;
+      /**
+       * 先登记排除集合，**再**发起候选落盘：候选 await 期间关闭路径可能触发一份"快照
+       * 生成于 commit 之前、仍含待回收任务"的写入；只有在落盘投影里合并排除集合，那份
+       * 关闭快照才不会把任务写回磁盘（这正是第三轮 blocking 的根因）。
+       */
+      for (const parentTaskId of eligible) rememberDurableReclaimOmit(parentTaskId);
+      const persistOptions = { omitParentTaskIds: eligible };
+      let written = false;
+      try {
+        written = (await api.persist(prepared.candidate, persistOptions)) === true;
+      } catch (error) {
+        // api.persist 自身不抛错；这里只是防御性收口，异常等价于落盘失败。
+        warn("dsh-expert-group: fan-out reclaim persist failed: " + describeError(error));
+        written = false;
+      }
+      if (written !== true) {
+        // 落盘失败：必须回到"什么都没发生"，否则磁盘与内存会分叉。
+        const aborted = runtime.manager.abortReclaim(prepared.token);
+        const category = typeof runtime.manager.persistenceStatus === "function"
+          ? runtime.manager.persistenceStatus()?.lastResult?.category ?? null
+          : null;
+        if (aborted?.accepted !== true) {
+          warn("dsh-expert-group: fan-out reclaim abort failed: " + String(aborted?.reason));
+        }
+        // 撤销排除登记：任务仍在内存，之后的任何写入都必须重新包含它们。
+        forgetDurableReclaimOmitMany(eligible);
+        /**
+         * 补偿写入（第三轮 blocking）：候选 await 期间关闭路径排入的旧快照，其落盘投影已被
+         * 排除集合过滤——磁盘因此可能丢掉仍存在于内存的任务。这里用当前 manager.snapshot()
+         * 补写一次，`includeReclaimed:true` 绕过排除集合（补偿绝不能继承排除集合）。
+         * 失败只 warn：abort 已把内存恢复到原状，磁盘一致性交给后续成功写入。
+         */
+        try {
+          const compensated = await api.persist(runtime.manager.snapshot(), { includeReclaimed: true });
+          if (compensated !== true) {
+            warn("dsh-expert-group: fan-out reclaim abort compensation write was not confirmed");
+          }
+        } catch (error) {
+          warn("dsh-expert-group: fan-out reclaim abort compensation write failed: " + describeError(error));
+        }
+        return {
+          ...rejected("RECLAIM_PERSIST_FAILED", "persist_failed", [...skipped, ...(Array.isArray(prepared.skipped) ? prepared.skipped : [])]),
+          ...(typeof category === "string" && category.length > 0 ? { category } : {}),
+        };
+      }
+      /**
+       * 候选快照已经真实落盘，回收从此不可回退：即使 closed 也必须 commit。
+       * manager 在 closed 时仍按 token + 屏障移除任务（跳过 emit/notifyPersistence/schedule），
+       * 因此这里不按 closed 提前返回，也不把结果改写成"关闭成功"之类的伪造形状。
+       */
+      const committed = runtime.manager.commitReclaim(prepared.token);
+      if (committed?.accepted !== true) {
+        /**
+         * 候选已落盘但内存未能移除：磁盘此刻**已经排除**待回收任务，而内存仍持有它。
+         * 若不补偿，磁盘与内存永久分叉——重启后任务“消失”，且再也无法被回收/查询。
+         * 典型剩余原因只有 token 失效（屏障被并发 abort/回收覆盖），关闭本身不再是失败条件。
+         *
+         * 补偿顺序（票据 05 残余竞态修复）：先用当前 manager.snapshot()（**不带 omit**，
+         * 因此包含待回收任务）做一次 best-effort 写回，把磁盘恢复成“候选落盘之前”的
+         * 等价状态；写回失败只 warn（不伪造成功、不把结构化失败变成抛错），随后
+         * abortReclaim 清屏障并返回结构化失败。
+         */
+        warn("dsh-expert-group: fan-out reclaim commit failed: " + String(committed?.reason));
+        // 撤销排除登记：commit 未成立 → 任务仍在内存，补偿写入必须把它们写回磁盘。
+        forgetDurableReclaimOmitMany(eligible);
+        try {
+          /**
+           * `includeReclaimed:true` 是必须的：补偿快照正是"仍含待回收任务"的内存状态，
+           * 如果继承排除集合，写回会把待回收任务也排除掉，制造新的磁盘/内存分叉。
+           */
+          const compensated = await api.persist(runtime.manager.snapshot(), { includeReclaimed: true });
+          if (compensated !== true) {
+            warn("dsh-expert-group: fan-out reclaim compensation write was not confirmed");
+          }
+        } catch (error) {
+          warn("dsh-expert-group: fan-out reclaim compensation write failed: " + describeError(error));
+        }
+        const aborted = runtime.manager.abortReclaim(prepared.token);
+        if (aborted?.accepted !== true) {
+          warn("dsh-expert-group: fan-out reclaim abort after commit failure was not accepted: "
+            + String(aborted?.reason));
+        }
+        return rejected(
+          typeof committed?.code === "string" ? committed.code : "RECLAIM_COMMIT_FAILED",
+          typeof committed?.reason === "string" ? committed.reason : "reclaim_commit_failed",
+          [...skipped, ...(Array.isArray(prepared.skipped) ? prepared.skipped : [])],
+        );
+      }
+      const reclaimed = Array.isArray(committed.reclaimed) ? committed.reclaimed : eligible;
+      for (const parentTaskId of reclaimed) {
+        // 归属索引的全部出处都必须清理，否则重启后任务树/查询仍能寻址到已回收任务。
+        settledParentSessions.delete(parentTaskId);
+        ownershipSnapshot.delete(parentTaskId);
+        restoreReadCredentials.delete(parentTaskId);
+        restoredOwnership.delete(parentTaskId);
+        rememberReclaimedOwner(parentTaskId, parent.id);
+        try {
+          lineage.releaseParentTask(parentTaskId);
+        } catch (error) {
+          warn("dsh-expert-group: fan-out reclaim lineage release failed: " + describeError(error));
+        }
+      }
+      /**
+       * 最终快照**必写**（票据 05，不再按 closed 跳过）。
+       *
+       * 关闭路径会调用 manager.close()，把仍在运行的其它父任务收敛为 cancelled，并因此
+       * 触发一次 notifyPersistence → persistence.save → api.persist。那份快照生成于
+       * commit **之前**；生产的写队列是 FIFO，因此这里无论是否 closed 都 await 一次最终
+       * 快照：它在 FIFO 上必然排在那次关闭快照之后，磁盘最终不含已回收任务，同时保留
+       * 其它任务的关闭终态（cancelled）。
+       *
+       * 第三轮 blocking（最终快照可能失败）：即便这次写入失败，上面的关闭快照在落盘投影里
+       * 也已经被 durableReclaimOmit 过滤，因此磁盘不会复活任务。此时**必须**保留排除登记
+       * （后续任何写入继续排除这些 id），并如实返回 durable:false —— 回收已经提交（内存
+       * 与侧栏已移除），但"磁盘已耐久收敛"这件事没有得到确认，绝不能报告耐久成功。
+       *
+       * 第五轮 blocking（同 id 恢复 × 最终快照的固定 omit）：最终快照**不再传固定的
+       * omitParentTaskIds**。
+       *
+       * commit 之后 manager 里已经没有待回收任务，正常投影天然不含它们；需要排除的 id 由
+       * 进程内动态集合 durableReclaimOmit 承担（候选落盘前登记），而 restore()/task_registered
+       * 会在同 id 任务重新出现的那一刻**同步**撤销该登记。若这里仍传固定的
+       * omitParentTaskIds=[reclaimed]，那么"最终写入 await 期间同 id 任务被恢复/重新登记"时，
+       * 落盘投影（首轮与所有重试都带同一份固定 omit）依旧会把这个真实存在于内存的任务过滤
+       * 掉：内存有任务、磁盘没有，回收却返回 durable:true。
+       *
+       * 因此：投影只由动态集合决定（在写入那一刻已恢复的同 id 任务会正常进入快照），
+       * 在写入**期间**才出现的同 id 任务由下面的写后对账补写。
+       */
+      const writeFinalSnapshot = async (phase) => {
+        try {
+          return (await api.persist(runtime.manager.snapshot())) === true;
+        } catch (error) {
+          warn("dsh-expert-group: fan-out reclaim " + phase + " failed: " + describeError(error));
+          return false;
+        }
+      };
+      /**
+       * 某个 reclaimed id 是否仍在内存（写后恢复/重新登记的同 id 任务）。
+       * 读取失败时按"仍然存在"处理：宁可如实返回 durable:false，也不谎称耐久成功。
+       */
+      const reclaimedIsLive = (parentTaskId) => {
+        try {
+          return runtime.manager.getTask(parentTaskId) !== null;
+        } catch (error) {
+          warn("dsh-expert-group: fan-out reclaim liveness check failed: " + describeError(error));
+          return true;
+        }
+      };
+      /** 当前仍在内存里的 reclaimed id 列表。 */
+      const liveReclaimedIds = () => reclaimed.filter((parentTaskId) => reclaimedIsLive(parentTaskId));
+
+      let durable = await writeFinalSnapshot("final snapshot");
+      if (durable !== true) {
+        warn("dsh-expert-group: fan-out reclaim final snapshot write was not confirmed");
+      }
+      /**
+       * 写后对账（第五轮 blocking 的关键）：payload 在 api.persist **调用时**就完成了投影，
+       * 同 id 任务若是在这笔写入的 await 期间才被 restore()/task_registered 重新登记，就不会
+       * 出现在那份 payload 里——磁盘因此缺少一个内存里真实存在的任务。
+       *
+       * 规则：
+       * - 只有最终写入成功才需要（也只有资格）对账；
+       * - 每轮先记录"这一刻仍在内存里的同 id 任务"（本次投影会覆盖它们），再写一笔最新快照
+       *   （**不带固定 omit**；动态集合已被 restore/task_registered 撤销）并 await 真实结果；
+       * - 该笔写入成功 → 它覆盖到的 id 已确认在磁盘上；写入期间又出现的 id 进入下一轮；
+       * - 该笔写入失败 → durable:false（保留动态 omit，绝不伪造成功）；
+       * - 最多两轮，避免"恢复 × 写入"无限交错；两轮后仍有未被最后写入覆盖的同 id 任务时
+       *   durable:false。
+       */
+      const RECLAIM_FINAL_RECONCILE_ROUNDS = 2;
+      let pending = durable === true ? liveReclaimedIds() : [];
+      let reconcileWriteFailed = false;
+      for (let round = 1; round <= RECLAIM_FINAL_RECONCILE_ROUNDS && pending.length > 0; round += 1) {
+        // 这些 id 此刻在内存 → 本次投影会包含它们（动态集合已撤销，显式 omit 已移除）。
+        const covered = new Set(pending);
+        const confirmed = await writeFinalSnapshot("final snapshot reconciliation");
+        if (confirmed !== true) {
+          warn("dsh-expert-group: fan-out reclaim final snapshot reconciliation write was not confirmed");
+          durable = false;
+          reconcileWriteFailed = true;
+          break;
+        }
+        // 只关心"本笔写入期间才出现、因此没有被它覆盖"的同 id 任务。
+        pending = liveReclaimedIds().filter((parentTaskId) => !covered.has(parentTaskId));
+      }
+      if (reconcileWriteFailed === false && pending.length > 0) {
+        // 两轮对账后仍有未被最后写入覆盖的同 id 任务：无法确认磁盘耐久收敛。
+        warn("dsh-expert-group: fan-out reclaim final snapshot reconciliation did not converge");
+        durable = false;
+      }
+      if (durable === true) {
+        for (const parentTaskId of reclaimed) {
+          if (reclaimedIsLive(parentTaskId)) {
+            /**
+             * 写后重新存在的同 id 任务必须留在快照里：restore()/task_registered 已在任务出现
+             * 的那一刻同步撤销了它的登记，这里不再"清理"它（也绝不重新登记）。
+             */
+            continue;
+          }
+          // 最终（或对账）写入已确认磁盘不含该 id：撤销登记，后续写入不再需要过滤。
+          forgetDurableReclaimOmit(parentTaskId);
+        }
+      } else {
+        // 保留排除登记：关闭期旧快照已经/即将落盘时，后续写入继续排除这些 id，防止复活。
+        warn("dsh-expert-group: fan-out reclaim committed without a durable final snapshot");
+      }
+      return {
+        accepted: true,
+        changed: true,
+        reclaimed: [...reclaimed],
+        skipped: [...skipped, ...(Array.isArray(prepared.skipped) ? prepared.skipped : [])],
+        count: reclaimed.length,
+        durable,
+        ...(durable === true ? {} : { durabilityReason: "final_snapshot_failed" }),
+      };
+    },
     /**
      * 多轮复用：对**本 root 拥有的**父任务续作一轮（同一 parentTaskId / childId，新 attempt）。
      *
@@ -512,6 +1186,23 @@ export function createFanoutRuntimeModule({
       if (closed) return { ...closedResult() };
       const parentTaskId = typeof args?.parentTaskId === "string" ? args.parentTaskId.trim() : "";
       if (parentTaskId.length === 0) return { accepted: false, changed: false, reason: "missing_parent_task_id" };
+      /**
+       * 已回收任务：显式稳定的"任务已回收"拒绝（票据 05）。
+       *
+       * 回收释放了 lineage 绑定，若继续走下面的归属判定只会得到 not_owned_by_root，
+       * 让调用方误以为"这是别人的任务"。归属提示命中本 root 时给出 task_reclaimed，
+       * 并明确同一 requestId 重新提交会创建新任务（不保留旧任务墓碑）。
+       */
+      if (reclaimedOwnerOf(parentTaskId) === parent?.id) {
+        return {
+          accepted: false,
+          changed: false,
+          code: "TASK_RECLAIMED",
+          reason: "task_reclaimed",
+          parentTaskId,
+          reclaimed: true,
+        };
+      }
       /**
        * 幂等重放（**只读**，不新增 attempt/child/事件）：已记录的 requestId 直接返回上次结果。
        *
@@ -579,7 +1270,13 @@ export function createFanoutRuntimeModule({
      * 恢复快照：只恢复当前已存在的 root 任务；缺失 root 的 queued 任务留在
      * lineage deferred 中，等 root 出现后再恢复。
      */
-    restore() {
+    /**
+     * @param {{stopEvidenceBoundary?:"unknown"|"process-restart"}} [restoreOptions] - 停止证据
+     *   边界透传（票据 07）。缺省时由 manager 按快照 processInstance 自动判定：同进程重建
+     *   → unknown，不同/缺失 → process-restart。Host 冷启动与 agent-created/runtime-wired
+     *   恢复都走自动判定，绝不手工强制 process-restart。
+     */
+    restore(restoreOptions = {}) {
       if (closed) return { ...closedResult(), restored: 0, deferred: 0, pending: restorePending === true };
       if (typeof readSnapshot !== "function") return { restored: 0, deferred: 0, pending: restorePending === true };
       const snapshot = readSnapshot();
@@ -587,6 +1284,17 @@ export function createFanoutRuntimeModule({
         return { restored: 0, deferred: 0, pending: restorePending === true };
       }
       const existingTaskIds = new Set(runtime.manager.listTasks().map((task) => task.parentTaskId));
+      /**
+       * 来源进程身份（票据 07）：延迟恢复的任务必须保留"它来自哪个进程"。
+       *
+       * 为什么：延迟任务会被合并进本进程稍后落盘的快照，顶层 processInstance 随之变成
+       * 当前进程；若任务本身不携带来源身份，等 root 到达后再次 restore 就会被误判为
+       * "同进程重建"，running attempt 只能停在 unknown 且无法自动续跑。缺失（旧版本
+       * 快照）时用稳定的 unknown 哨兵，确保它绝不会等于当前进程身份。
+       */
+      const snapshotProcessInstance = typeof snapshot.processInstance === "string" && snapshot.processInstance.length > 0
+        ? snapshot.processInstance
+        : "proc:unknown@0";
       const restorableTasks = [];
       let deferredCount = 0;
       for (const task of snapshot.tasks) {
@@ -594,7 +1302,15 @@ export function createFanoutRuntimeModule({
         const parentId = lineage.parentSessionOf(task?.parentTaskId);
         if (taskNeedsRoot(task) && (typeof parentId !== "string" || getAgent(parentId) === void 0)) {
           deferredCount += 1;
-          lineage.deferTask({ parentTaskId: task.parentTaskId, parentId, task });
+          const originProcessInstance = typeof task?.processInstance === "string" && task.processInstance.length > 0
+            ? task.processInstance
+            : snapshotProcessInstance;
+          lineage.deferTask({
+            parentTaskId: task.parentTaskId,
+            parentId,
+            // processInstance 是 manager 认可的恢复边界字段：延迟任务靠它保留来源进程。
+            task: { ...task, processInstance: originProcessInstance },
+          });
           continue;
         }
         if (typeof parentId === "string") {
@@ -614,7 +1330,14 @@ export function createFanoutRuntimeModule({
         // resume: true 让唯一调度状态机按原规则继续执行未终态 work（queued attempt 复用、
         // running→interrupted 换新 attempt、role concurrency / affectedPaths / 取消意图
         // 全部由 manager 自己判定）；本模块只负责 ownership 与寻址。
-        runtime.manager.restore({ ...snapshot, tasks: restorableTasks }, { resume: true, merge: existingTaskIds.size > 0 });
+        const hasExplicitBoundary = restoreOptions !== null && typeof restoreOptions === "object"
+          && restoreOptions.stopEvidenceBoundary !== undefined;
+        runtime.manager.restore({ ...snapshot, tasks: restorableTasks }, {
+          resume: true,
+          merge: existingTaskIds.size > 0,
+          // 显式边界只透传、不改写；缺省时交给 manager 的进程身份自动判定。
+          ...(hasExplicitBoundary ? { stopEvidenceBoundary: restoreOptions.stopEvidenceBoundary } : {}),
+        });
         const snapshotParents = snapshot.parentSessions !== null && typeof snapshot.parentSessions === "object"
           && !Array.isArray(snapshot.parentSessions) ? snapshot.parentSessions : {};
         for (const task of restorableTasks) {
@@ -622,6 +1345,12 @@ export function createFanoutRuntimeModule({
           // 聚合反馈寻址，释放只能发生在真实终态或关闭路径。
           const parentTaskId = task?.parentTaskId;
           if (typeof parentTaskId !== "string") continue;
+          /**
+           * 同 id 复用的第二个等价入口：本进程确实从快照恢复了该任务 → 它重新存在于内存，
+           * 必须立刻撤销落盘排除登记。manager.restore 不发布 task_registered，若不在这里
+           * 撤销，恢复出来的真实任务会在下一次写入时被排除集合静默丢弃（磁盘丢任务）。
+           */
+          forgetDurableReclaimOmit(parentTaskId);
           // 顺序不可颠倒：必须在 lineage 释放之前取归属，否则只剩快照可查。
           const owner = resolvedOwner(parentTaskId) ?? snapshotParents[parentTaskId];
           if (typeof owner === "string" && owner.length > 0) ownershipSnapshot.set(parentTaskId, owner);
@@ -659,20 +1388,65 @@ export function createFanoutRuntimeModule({
           }
         }
         restorePending = lineage.deferredTasks().length > 0;
-        return { restored: restorableTasks.length, deferred: deferredCount, pending: restorePending };
+        const restoredCount = restorableTasks.length;
+        recordRestoreOutcome({ ok: true, restored: restoredCount, deferred: deferredCount, pending: restorePending, error: null });
+        // 只有成功恢复才清除 fail-closed 闸门：失败恢复后继续落盘会用当前（可能为空/
+        // 不完整）的内存状态覆盖磁盘上的原快照，等于把唯一可重试的副本毁掉。
+        persistenceBlocked = null;
+        return { ok: true, restored: restoredCount, deferred: deferredCount, pending: restorePending };
       } catch (error) {
-        warn("dsh-expert-group: fan-out snapshot restore failed: " + describeError(error));
-        return { restored: 0, deferred: deferredCount, pending: restorePending };
+        const failure = describeRestoreFailure(error);
+        recordRestoreOutcome({
+          ok: false,
+          restored: 0,
+          deferred: deferredCount,
+          pending: restorePending,
+          error: failure,
+        });
+        persistenceBlocked = Object.freeze({ reason: "restore_failed", code: failure.code, at: Date.now() });
+        warn("dsh-expert-group: fan-out snapshot restore failed [" + failure.code + "]: " + failure.message);
+        // manager.restore 的既有契约是"非法/超预算快照原子失败且不写 eventHistory"，
+        // 因此预算事件由 Host 在捕获后补发（recordBudgetViolation 只带元数据）。
+        if (failure.violation !== null && typeof runtime?.manager?.recordBudgetViolation === "function") {
+          try {
+            runtime.manager.recordBudgetViolation(failure.violation, "restore");
+          } catch (recordError) {
+            warn("dsh-expert-group: fan-out restore budget event failed: " + describeError(recordError));
+          }
+        }
+        return { ok: false, restored: 0, deferred: deferredCount, pending: restorePending, error: failure };
       } finally {
         restoring = false;
       }
     },
-    /** 持久化投影：合并 deferred 任务的 parentSessions，避免丢失不可寻址任务。 */
-    snapshotForStorage(snapshot) {
+    /**
+     * 持久化投影：合并 deferred 任务的 parentSessions，避免丢失不可寻址任务。
+     *
+     * @param {object} snapshot - manager 快照（回收候选可能已排除待回收任务）。
+     * @param {{omitParentTaskIds?: string[]|Set<string>, includeReclaimed?: boolean}} [options]
+     *   排除集合：待回收任务的 parentSessions/deferred 归属不得被合并回候选快照，否则
+     *   "先落盘的候选"会重新带上已回收 id 的归属映射（重启后虽不会复活任务，但会留下脏归属）。
+     *   除显式 omitParentTaskIds 外，这里**始终**合并进程内回收排除集合（effectiveOmitSet）：
+     *   关闭期旧快照、普通写入与最终快照的落盘投影因此一致；只有 `includeReclaimed: true`
+     *   的内部补偿写入可以绕过它。
+     */
+    snapshotForStorage(snapshot, options) {
+      const omitted = effectiveOmitSet(options);
       const parentSessions = lineage.parentSessionsSnapshot();
-      const tasksById = new Map((Array.isArray(snapshot?.tasks) ? snapshot.tasks : []).map((task) => [task?.parentTaskId, task]));
+      if (omitted !== null) {
+        for (const key of Object.keys(parentSessions)) {
+          if (omitted.has(key)) delete parentSessions[key];
+        }
+      }
+      const tasksById = new Map();
+      for (const task of Array.isArray(snapshot?.tasks) ? snapshot.tasks : []) {
+        const parentTaskId = task?.parentTaskId;
+        if (omitted !== null && omitted.has(parentTaskId)) continue;
+        tasksById.set(parentTaskId, task);
+      }
       for (const task of lineage.deferredTasks()) {
         const parentTaskId = task?.parentTaskId;
+        if (omitted !== null && omitted.has(parentTaskId)) continue;
         if (!tasksById.has(parentTaskId)) tasksById.set(parentTaskId, task);
         const parentId = lineage.deferredParentOf(parentTaskId);
         if (typeof parentId === "string" && parentId.length > 0) parentSessions[parentTaskId] = parentId;
@@ -681,17 +1455,51 @@ export function createFanoutRuntimeModule({
       // （或在 root 销毁时被整批摘除），但持久化必须保留它，否则重启后这些任务不再属于
       // 任何根（冷终态 fan-out 与 root 销毁后结算的任务都会从任务树消失）。
       for (const [parentTaskId, parentId] of settledParentSessions) {
+        if (omitted !== null && omitted.has(parentTaskId)) continue;
         if (parentSessions[parentTaskId] === undefined) parentSessions[parentTaskId] = parentId;
       }
       return { ...snapshot, tasks: [...tasksById.values()], parentSessions };
     },
     /**
-     * 落盘旁路：对同一次提交只做有界重试。generation stale 会重新读取 manager 最新快照
-     * 合并后再写；健康记录只在内存中更新，不触发新的 persistence 回调。
+     * 落盘旁路：对同一次提交只做有界重试。
+     *
+     * 首次尝试使用调用方传入的 snapshot（既有 API 语义）；**每次重试（attempt > 1）都在
+     * 写入前重新生成 payload**：读取当前 `runtime.manager.snapshot()`，再用
+     * `api.snapshotForStorage(latest, options)` 重新投影。options 原样透传，因此当前的
+     * durableReclaimOmit 与 `includeReclaimed:true` 内部旁路都照常生效。
+     *
+     * 为什么必须重新投影（票据 05 残余竞态：旧 transient 重试复活已回收任务）：
+     * 一次**普通**快照写入 ETIMEDOUT 失败后会进入退避；退避期间回收可能已经完成并返回
+     * durable:true（磁盘已不含该任务）。若重试原样重放**首轮 payload**，就会把已回收任务
+     * 写回磁盘，而内存里它已被删除——重启后任务复活。重新投影保证重试写入的是**最新
+     * 内存状态**：回收之后不含已回收任务；同 id 新任务登记之后包含新任务且不被旧 omit
+     * 误伤；回收候选自身的重试仍靠排除集合把待回收任务挡在磁盘之外。
+     *
+     * generation-stale 与普通 transient 共用这一套重新投影（不再有第二套合并逻辑）。
+     * 重新生成/投影失败时**绝不回退写旧 payload**（那正是复活路径）：按既有持久化失败
+     * 分类记录并返回 false（fail-closed）。
+     *
+     * 健康记录（recordSuccess / recordFailure）一律使用**本次实际写入**的 payload.sequence。
      */
-    async persist(snapshot) {
-      if (typeof writeSnapshot !== "function") return false;
-      let payload = api.snapshotForStorage(snapshot);
+    async persist(snapshot, options) {
+      if (typeof writeSnapshot !== "function") {
+        recordPersistOutcome({ status: "skipped", reason: "no_writer" });
+        return false;
+      }
+      /**
+       * 恢复失败后的 fail-closed 闸门：绝不能把当前（可能为空/不完整）的内存快照写回
+       * 磁盘——一次失败恢复就会覆盖磁盘上的原快照，重试也就无从读起。
+       * 只有成功恢复（restore() 的成功分支）才清除 persistenceBlocked。
+       */
+      if (persistenceBlocked !== null) {
+        recordPersistOutcome({ status: "skipped", reason: "restore_failed" });
+        return false;
+      }
+      /**
+       * payload 必须可重新赋值：重试会在**写入前**用最新内存状态重建它。
+       * 首次尝试仍使用调用方传入的 snapshot，保持既有 API/测试语义。
+       */
+      let payload = api.snapshotForStorage(snapshot, options);
       const token = persistenceHealth.beginDrain({
         generation: typeof getPersistenceGeneration === "function" ? getPersistenceGeneration() : payload.generation,
         sequence: payload.sequence,
@@ -709,12 +1517,20 @@ export function createFanoutRuntimeModule({
               throw { category: "permanent", message: "持久化写入未返回成功确认" };
             }
             persistenceHealth.recordSuccess({ generation, sequence: payload.sequence });
+            recordPersistOutcome({ status: "saved", sequence: payload.sequence });
             return true;
           } catch (error) {
             const failure = persistenceHealth.recordFailure({ error, generation, sequence: payload.sequence, attempt });
             const decision = persistenceHealth.retryDecision({ category: failure.category, attempt });
             if (!decision.retry) {
               warn("dsh-expert-group: fan-out snapshot persistence failed [" + failure.category + "]: " + describeError(error));
+              // 分类以 persistenceHealth 为权威；lastPersistOutcome 只做只读投影。
+              recordPersistOutcome({
+                status: "failed",
+                reason: "save_failed",
+                category: failure.category,
+                sequence: payload.sequence,
+              });
               return false;
             }
             // 指数退避：第 attempt 次失败后等待 base * 2^(attempt-1)（封顶 maxDelayMs）。
@@ -729,32 +1545,85 @@ export function createFanoutRuntimeModule({
               warn("dsh-expert-group: fan-out persistence retry backoff failed: " + describeError(waitError));
             }
             attempt = decision.nextAttempt;
-            if (decision.merge && typeof runtime?.manager?.snapshot === "function") {
-              try {
-                const previous = payload;
-                const latest = api.snapshotForStorage(runtime.manager.snapshot());
-                const previousSequence = Number.isSafeInteger(previous?.sequence) ? previous.sequence : 0;
-                const latestSequence = Number.isSafeInteger(latest?.sequence) ? latest.sequence : 0;
-                const events = new Map();
-                for (const event of Array.isArray(previous?.events) ? previous.events : []) {
-                  if (Number.isSafeInteger(event?.sequence)) events.set(event.sequence, event);
-                }
-                for (const event of Array.isArray(latest?.events) ? latest.events : []) {
-                  if (Number.isSafeInteger(event?.sequence)) events.set(event.sequence, event);
-                }
-                payload = {
-                  ...latest,
-                  sequence: Math.max(previousSequence, latestSequence),
-                  events: [...events.values()].sort((left, right) => left.sequence - right.sequence),
-                };
-              } catch (mergeError) {
-                warn("dsh-expert-group: fan-out snapshot merge failed: " + describeError(mergeError));
+            /**
+             * 重新投影：**每次重试写入前**都从当前内存状态重建 payload。
+             *
+             * - generation-stale 与普通 transient 走同一条路径，不再有第二套合并逻辑；
+             * - 必须放在退避**之后**：回收正是在退避期间完成，提前投影会把"回收前"的
+             *   状态写回磁盘，复活已回收任务；
+             * - options 原样透传：snapshotForStorage 内部按**当前** durableReclaimOmit
+             *   合并排除集合，`includeReclaimed:true` 的内部旁路也仍然有效。
+             */
+            try {
+              const managerSnapshot = typeof runtime?.manager?.snapshot === "function"
+                ? runtime.manager.snapshot()
+                : null;
+              if (managerSnapshot === null || typeof managerSnapshot !== "object" || Array.isArray(managerSnapshot)) {
+                throw Object.assign(new Error("fan-out manager snapshot unavailable for persistence retry"), {
+                  code: "PERSIST_RETRY_SNAPSHOT_UNAVAILABLE",
+                });
               }
+              payload = api.snapshotForStorage(managerSnapshot, options);
+            } catch (reprojectError) {
+              /**
+               * fail-closed：宁可这次落盘失败，也**绝不回退写旧 payload**——旧 payload 可能
+               * 仍含已回收任务，重放它正是本次要消除的复活路径。失败分类沿用
+               * persistenceHealth 的既有归类，lastPersistOutcome 只做只读投影。
+               */
+              const reprojectFailure = persistenceHealth.recordFailure({
+                error: reprojectError,
+                generation: typeof getPersistenceGeneration === "function"
+                  ? getPersistenceGeneration()
+                  : payload?.generation,
+                sequence: payload?.sequence,
+                attempt,
+              });
+              warn("dsh-expert-group: fan-out snapshot reprojection failed ["
+                + reprojectFailure.category + "]: " + describeError(reprojectError));
+              recordPersistOutcome({
+                status: "failed",
+                reason: "reproject_failed",
+                category: reprojectFailure.category,
+                sequence: payload?.sequence,
+              });
+              return false;
             }
           }
         }
       } finally {
         persistenceHealth.endDrain(token);
+      }
+    },
+    /**
+     * 只读恢复状态：最近一次恢复结果 + fail-closed 闸门。
+     *
+     * 这是票据 04 要求的新只读面：侧栏/诊断不再只能从"任务为 0"猜测恢复失败，
+     * 而是能拿到稳定 code、字段位置与预算违规（不含任何快照正文）。
+     */
+    restoreStatus: () => Object.freeze({
+      blocked: persistenceBlocked === null ? null : cloneJson(persistenceBlocked),
+      lastRestore: lastRestore === null ? null : cloneJson(lastRestore),
+    }),
+    /** 只读落盘状态：Host 层最近结果（分类权威仍在 persistenceHealth）。 */
+    persistenceStatus: () => Object.freeze({
+      lastResult: lastPersistOutcome === null ? null : cloneJson(lastPersistOutcome),
+      blocked: persistenceBlocked === null ? null : cloneJson(persistenceBlocked),
+    }),
+    /**
+     * 转发 manager 的预算事件补发入口（Host 恢复失败路径使用）。
+     * 关闭后/旧 manager 缺少能力时返回结构化失败，绝不向上抛错。
+     */
+    recordBudgetViolation(violation, phase, options) {
+      if (closed) return { recorded: false, reason: "runtime_closed" };
+      const manager = runtime?.manager;
+      if (typeof manager?.recordBudgetViolation !== "function") {
+        return { recorded: false, reason: "unsupported" };
+      }
+      try {
+        return manager.recordBudgetViolation(violation, phase, options);
+      } catch (error) {
+        warn("dsh-expert-group: fan-out budget violation record failed: " + describeError(error));
+        return { recorded: false, reason: "error" };
       }
     },
     describe: () => ({
@@ -765,7 +1634,42 @@ export function createFanoutRuntimeModule({
       // 已终态任务的归属索引（只读观测，不参与调度）：包含已释放活动 ownership 的恢复
       // 任务，以及 root 先销毁、任务后结算的任务。
       settledTasks: settledParentSessions.size,
+      // 已回收任务的归属提示条数（只读诊断；不暴露任何 id 或任务数据）。
+      reclaimedTasks: reclaimedTaskOwners.size,
       persistenceHealth: persistenceHealth.snapshot(),
+      // Host 事件日志的保留窗口状态（与 manager 的事件历史是两份投影：前者服务 RPC
+      // fanout-events，后者随快照持久化）；缺失时显式为 null。
+      eventLog: typeof runtime?.eventLogStatus === "function" ? runtime.eventLogStatus() : null,
+      /**
+       * 持久化/恢复诊断块（票据 04）：
+       * - lastResult/blocked/restore：Host 层最近一次真实结果（含失败原因码）；
+       * - manager：manager 自己观察到的最近一次落盘结果（skipped 原因/实测字节）；
+       * - eventHistory：manager 事件历史的丢弃计数与最早可用序号（gap 判定）。
+       * 三者都只含标量/结构化元数据，不含任务负载或快照正文。
+       */
+      persistence: {
+        lastResult: lastPersistOutcome === null ? null : cloneJson(lastPersistOutcome),
+        blocked: persistenceBlocked === null ? null : cloneJson(persistenceBlocked),
+        restore: lastRestore === null ? null : cloneJson(lastRestore),
+        manager: typeof runtime?.manager?.persistenceStatus === "function"
+          ? runtime.manager.persistenceStatus()
+          : null,
+        eventHistory: typeof runtime?.manager?.eventHistoryStatus === "function"
+          ? runtime.manager.eventHistoryStatus()
+          : null,
+      },
+      /**
+       * 停止边界诊断块（票据 07）：
+       * - stopPending / unconfirmed：已逻辑终态但停止未确认的 attempt 数；
+       * - legacy：旧快照派生身份、没有停止证据的 attempt 数；
+       * - boundary / boundarySource：最近一次 restore 使用的边界与来源（显式/自动）；
+       * - watchdogExpired / lastWatchdog：宽限到期计数与最近一次明细；
+       * - aging：Host 侧归属老化窗口（pending/aged/skipped/最近一次 aged）。
+       * 全部是计数/固定枚举，不含 prompt、结果或会话正文。
+       */
+      stop: typeof runtime?.stopDiagnostics === "function"
+        ? runtime.stopDiagnostics()
+        : (typeof runtime?.manager?.stopDiagnostics === "function" ? runtime.manager.stopDiagnostics() : null),
       // 只读并发视图（有效默认值 / 各 role 覆盖 / 解析来源）：让"设置页显示的并发上限"
       // 与实际调度值在同一处可诊断，不暴露任务负载。
       ...(typeof runtime?.manager?.concurrencyLimits === "function"
@@ -813,6 +1717,15 @@ export function createFanoutRuntimeModule({
       ownershipSnapshot.clear();
       // 读凭据同样随模块生命周期结束而丢弃（只读幂等重放不再可服务，读写都 fail-closed）。
       restoreReadCredentials.clear();
+      // 已回收归属提示只在进程内服务 task_not_found 语义，关闭后不再有意义。
+      reclaimedTaskOwners.clear();
+      /**
+       * 注意：durableReclaimOmit **不**在关闭时清空。
+       *
+       * 关闭路径本身会触发 manager.close() 的最终持久化（收敛运行中任务）；若在关闭前就
+       * 清空排除集合，那次写入会把"最终快照失败"的已回收任务重新写回磁盘，正好复原本轮
+       * 修复要消除的复活路径。集合只含 id 字符串且有界，随模块实例一起被丢弃。
+       */
       try {
         const managerClose = typeof runtime.manager?.close === "function" ? runtime.manager.close() : undefined;
         if (managerClose !== null && typeof managerClose === "object" && typeof managerClose.catch === "function") {
@@ -841,6 +1754,8 @@ export function createFanoutRuntimeModule({
     // 模块级解析函数（settings 接线）优先于 runtimeOptions.concurrencyLimit 的静态默认值：
     // 静态值只是"没有动态来源时"的兜底，不能让组合根的历史常量把 settings 压住。
     ...(dynamicConcurrencyLimit === undefined ? {} : { concurrencyLimit: dynamicConcurrencyLimit }),
+    // 角色级默认超时走同一优先级（票据 06）。
+    ...(dynamicRoleTimeoutMs === undefined ? {} : { roleTimeoutMs: dynamicRoleTimeoutMs }),
     buildRequest,
     startContinuable,
     interrupt,

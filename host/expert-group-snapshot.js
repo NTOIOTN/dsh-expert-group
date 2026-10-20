@@ -95,6 +95,71 @@ function numberOrNull(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+// ── 恢复状态（recovery）投影 ─────────────────────────────────────────────────
+
+/**
+ * recovery 块的固定状态集合（票据 04）。
+ *
+ * - none：本进程从未执行过恢复（没有持久化快照，或恢复入口尚未接线）；
+ * - ok：最近一次恢复成功（此时必须清空 code/message，失败细节不得残留）；
+ * - failed：最近一次恢复失败，原因码进 code，受限文案进 message。
+ */
+export const EXPERT_GROUP_RECOVERY_STATUSES = Object.freeze(["ok", "failed", "none"]);
+
+/**
+ * 稳定原因码的合法形态：只允许大写机器 token（如 INVALID_SNAPSHOT、BUDGET_EXCEEDED）。
+ *
+ * 这是**白名单式**约束而不是格式化：任何不符合形态的输入（自由文本、堆栈首行、
+ * 含路径/控制字符的字符串）都退化为 RESTORE_FAILED，绝不会被原样带进客户端。
+ */
+const RECOVERY_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+/** recovery.message 的字符上限：一行诊断文案，客户端横幅最多展示一行。 */
+export const RECOVERY_MESSAGE_MAX_LENGTH = 200;
+
+/**
+ * 受限 message：剔除控制字符（含换行/制表，避免多行撑爆横幅与日志）、
+ * 折叠连续空白并限制长度。绝不透传堆栈、路径或快照正文。
+ */
+function recoveryMessageOrNull(value) {
+  const raw = textOrNull(value);
+  if (raw === null) return null;
+  const cleaned = raw
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (cleaned.length === 0) return null;
+  return cleaned.length > RECOVERY_MESSAGE_MAX_LENGTH ? cleaned.slice(0, RECOVERY_MESSAGE_MAX_LENGTH) : cleaned;
+}
+
+/**
+ * 恢复状态块投影（白名单出口）。
+ *
+ * 入参是 Host 运行时从 fanoutHost.restoreStatus() 归一出来的**不可信候选**：
+ * 本函数只保留声明字段，其余一律丢弃（字段白名单），并对 code/message 做边界收敛。
+ * 恢复成功（status=ok）时强制清空 code/message；从未恢复过（none）同样不带任何
+ * 失败细节。返回 null 表示调用方没有提供 recovery 信息（旧调用方/旧 Host 兼容）。
+ */
+function projectRecovery(value) {
+  const source = asRecord(value);
+  if (source === undefined) return null;
+  const status = source.status === "failed" ? "failed" : source.status === "ok" ? "ok" : "none";
+  const rawCode = textOrNull(source.code);
+  // 只有 failed 才保留原因码；形态不合法时退化为稳定的兜底码。
+  const code = status === "failed"
+    ? (rawCode !== null && RECOVERY_CODE_PATTERN.test(rawCode) ? rawCode : "RESTORE_FAILED")
+    : null;
+  return {
+    status,
+    code,
+    message: status === "failed" ? recoveryMessageOrNull(source.message) : null,
+    at: numberOrNull(source.at),
+    retryable: status === "failed" && source.retryable === true,
+    // fail-closed 闸门状态是独立事实：即使最近一次恢复成功，也如实投影（正常应为 false）。
+    persistenceBlocked: source.persistenceBlocked === true,
+  };
+}
+
 /** 从候选字段里取第一个非空字符串，全部缺失时返回 null（不拼接、不猜测）。 */
 function firstText(...values) {
   for (const value of values) {
@@ -200,6 +265,9 @@ function projectSessionNode(record, { kind, id, sessionId }) {
     running: runningOf(source, status),
     runSummary: projectRunSummary(source?.runSummary),
     continuable: typeof source?.continuable === "boolean" ? source.continuable : null,
+    // 会话节点（root/普通专家）也有能力对象：read 恒 allowed，写动作一律 not_supported。
+    // 这样客户端可以用同一套「按能力渲染」逻辑处理所有节点，而不需要按 kind 特判。
+    capabilities: sessionCapabilities(),
     createdAt: numberOrNull(source?.createdAt),
   };
 }
@@ -223,6 +291,66 @@ function asArray(value) {
 /** 普通专家子节点投影。 */
 function projectExpertChildren(experts) {
   return asArray(experts).map((record) => projectExpertNode(record));
+}
+
+// ── 逐动作能力投影（票据 09） ───────────────────────────────────────────────
+
+/**
+ * 能力动作词表（Host 投影出口的唯一集合）。
+ *
+ * - 普通专家/根节点只有 read 有意义：写动作属于 fan-out 管理层，对这些节点一律
+ *   not_supported（客户端据此不渲染任何按钮）；
+ * - fan-out 父节点带任务级四项，shard 节点只带 cancel/retry。
+ */
+export const EXPERT_GROUP_CAPABILITY_ACTIONS = Object.freeze(["read", "cancel", "retry", "continue"]);
+export const EXPERT_GROUP_SHARD_CAPABILITY_ACTIONS = Object.freeze(["cancel", "retry"]);
+
+/**
+ * 能力原因码的最大长度：原因码是稳定的机器 token（如 task_not_found），客户端只做
+ * 展示/判定，不解析自由文本。超长输入截断而不是丢弃，避免旧 Host 的长文案撑爆横幅。
+ */
+export const CAPABILITY_REASON_MAX_LENGTH = 64;
+
+/** 会话节点（root/普通专家）的固定能力：只读可见，写动作不适用于会话。 */
+function sessionCapabilities() {
+  return {
+    read: { allowed: true },
+    cancel: { allowed: false, reason: "not_supported" },
+    retry: { allowed: false, reason: "not_supported" },
+    continue: { allowed: false, reason: "not_supported" },
+  };
+}
+
+/**
+ * 单项能力归一（白名单出口）：
+ * - 只有 allowed 是布尔才算有效项；其它形状返回 null（调用方整体省略该动作）；
+ * - allowed=true 时丢弃 reason（成功态不允许残留拒绝原因）；
+ * - allowed=false 时保留稳定原因码；缺失/空/非字符串退回 not_supported，并限制长度。
+ */
+function projectCapabilityEntry(value) {
+  const source = asRecord(value);
+  if (source === undefined || typeof source.allowed !== "boolean") return null;
+  if (source.allowed === true) return { allowed: true };
+  const rawReason = textOrNull(source.reason);
+  return {
+    allowed: false,
+    reason: rawReason === null ? "not_supported" : rawReason.slice(0, CAPABILITY_REASON_MAX_LENGTH),
+  };
+}
+
+/** 按动作词表投影能力对象；一个有效项都没有时返回 null（调用方省略字段）。 */
+function projectCapabilities(value, actions) {
+  const source = asRecord(value);
+  if (source === undefined) return null;
+  const projected = {};
+  let any = false;
+  for (const action of actions) {
+    const entry = projectCapabilityEntry(source[action]);
+    if (entry === null) continue;
+    projected[action] = entry;
+    any = true;
+  }
+  return any ? projected : null;
 }
 
 // ── fan-out 分支投影 ────────────────────────────────────────────────────────
@@ -314,6 +442,12 @@ function projectShardNode(shard, inherited = {}) {
     running: runningOf(source, status),
     runSummary: projectRunSummary(source?.runSummary),
     continuable: typeof source?.continuable === "boolean" ? source.continuable : null,
+    // shard 能力只覆盖管理层真正拥有的两个动作；缺失（旧 Host/直连投影）时整字段省略，
+    // 客户端据此回退到既有状态推导。
+    ...(() => {
+      const capabilities = projectCapabilities(source?.capabilities, EXPERT_GROUP_SHARD_CAPABILITY_ACTIONS);
+      return capabilities === null ? {} : { capabilities };
+    })(),
     childId: latestAttempt?.childId ?? null,
     createdAt: numberOrNull(source?.createdAt),
     attempts,
@@ -352,6 +486,12 @@ function projectFanoutNode(task) {
     running: runningOf(source, status),
     createdAt: numberOrNull(source?.createdAt),
     counts: projectCounts(source?.counts),
+    // 父任务能力：由 Host 注入（fanoutHost.capabilitiesOf）；旧调用方没有该字段时省略，
+    // 保持「不伪造授权」的投影原则。
+    ...(() => {
+      const capabilities = projectCapabilities(source?.capabilities, EXPERT_GROUP_CAPABILITY_ACTIONS);
+      return capabilities === null ? {} : { capabilities };
+    })(),
     shards: asArray(source?.shards).map((shard) => projectShardNode(shard, {
       role: source?.role,
       provider: source?.provider,
@@ -425,9 +565,12 @@ function projectChildren(experts, fanoutTasks) {
  * @param {number} [input.generatedAt] - 投影生成时间（epoch 毫秒）。
  * @param {boolean} [input.partial] - 是否为**轻量快照**（跳过全部冷读、状态可能不完整）。
  *   true 时客户端必须保持状态圆点与活动文案中性，等完整快照（partial:false）替换。
+ * @param {object} [input.recovery] - 可选的恢复状态候选（来自 fanoutHost.restoreStatus()）。
+ *   提供时投影为顶层可选 recovery 块；未提供时**整块省略**（旧调用方/旧 Host 兼容，
+ *   客户端按缺失回退为「没有恢复错误」）。
  * @returns {object} schemaVersion:1 的只读 JSON 树。
  */
-export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks, generatedAt, partial } = {}) {
+export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks, generatedAt, partial, recovery } = {}) {
   const rootSessionId = assertSessionId(sessionId);
   const declaredRootId = identityOf(root);
   if (declaredRootId !== null && declaredRootId !== rootSessionId) {
@@ -435,6 +578,7 @@ export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks
       "buildExpertGroupSnapshot 的 root 会话 id " + declaredRootId + " 与 sessionId " + rootSessionId + " 不一致",
     );
   }
+  const projectedRecovery = projectRecovery(recovery);
   return {
     schemaVersion: EXPERT_GROUP_SNAPSHOT_SCHEMA_VERSION,
     sessionId: rootSessionId,
@@ -442,6 +586,9 @@ export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks
     generatedAt: numberOrNull(generatedAt),
     // partial 只有明确 true 才为 true：完整快照与旧调用方一律是权威快照（false）。
     partial: partial === true,
+    // recovery 是**可选**顶层块：只有调用方提供了恢复状态候选时才出现。它只含
+    // 稳定原因码与受限文案，绝不携带快照正文、任务负载、堆栈或路径。
+    ...(projectedRecovery === null ? {} : { recovery: projectedRecovery }),
     root: {
       ...projectSessionNode(root, {
         kind: "root",

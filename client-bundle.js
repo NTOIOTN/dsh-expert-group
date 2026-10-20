@@ -16,9 +16,27 @@
     error: "failed", errored: "failed", active: "running", in_progress: "running", "in-progress": "running",
     working: "running", pending: "queued", scheduled: "queued", wait: "waiting",
   });
+  /**
+   * 逐动作能力（票据 09）的动作词表与原因码上限。
+   *
+   * 客户端只接受声明过的动作与布尔 allowed；reason 只作为稳定机器 token 展示/诊断，
+   * 超长内容截断，绝不把任意自由文本原样渲染进 UI。
+   */
+  const CAPABILITY_ACTIONS = Object.freeze(["read", "cancel", "retry", "continue"]);
+  const SHARD_CAPABILITY_ACTIONS = Object.freeze(["cancel", "retry"]);
+  const CAPABILITY_REASON_MAX_LENGTH = 64;
+
   const COUNT_FIELDS = Object.freeze([
     "queued", "waiting", "running", "succeeded", "failed", "cancelled", "timed_out", "interrupted", "pending",
   ]);
+  /**
+   * 恢复失败原因码的合法形态与文案上限（与 Host 投影同一契约，各自持有一份常量）。
+   *
+   * 客户端不 import Host 模块（浏览器侧只加载装配后的 bundle），因此这里保留同值副本；
+   * 任何形态不符的 code 都退化为 RESTORE_FAILED，绝不在 UI 上渲染自由文本。
+   */
+  const RECOVERY_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+  const RECOVERY_MESSAGE_MAX_LENGTH = 200;
   /**
    * 右侧栏对外的**代理运行状态**只有这两个规范值。
    *
@@ -204,6 +222,69 @@
     return { command: text(value.command), mode, activity };
   }
 
+  /**
+   * 恢复状态（recovery）块归一（票据 04）。
+   *
+   * Host 已在投影出口做了白名单与长度收敛；客户端仍做一次**只读、无猜测**的归一：
+   * - 缺字段 / 非对象 ⇒ null（旧 Host 兼容：没有 recovery 就当作没有恢复错误，不渲染横幅）；
+   * - status 只接受 ok/failed/none，其余落回 none；
+   * - failed 才保留原因码；形态不符时用稳定兜底码 RESTORE_FAILED（与 Host 同一 fallback）；
+   * - message 剔除控制字符并限制为一行（防御旧 Host / 第三方注入的负载）；
+   * - retryable 只认明确 true，persistenceBlocked 同理（展示层不用它做判定）。
+   */
+  function normalizeRecovery(value) {
+    if (!isObject(value)) return null;
+    const status = value.status === "failed" || value.status === "ok" ? value.status : "none";
+    const rawCode = text(value.code);
+    const code = status === "failed"
+      ? (rawCode !== null && RECOVERY_CODE_PATTERN.test(rawCode) ? rawCode : "RESTORE_FAILED")
+      : null;
+    const rawMessage = text(value.message);
+    const message = status === "failed" && rawMessage !== null
+      ? rawMessage.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, RECOVERY_MESSAGE_MAX_LENGTH) || null
+      : null;
+    return {
+      status,
+      code,
+      message,
+      at: numberOrNull(value.at),
+      retryable: status === "failed" && value.retryable === true,
+      persistenceBlocked: value.persistenceBlocked === true,
+    };
+  }
+
+  /**
+   * 单项能力归一（客户端侧的严格白名单）。
+   *
+   * Host 已做过一次收敛，但浏览器仍不能信任任意负载：
+   * - 只有 allowed 是布尔才产生有效项，其它形状一律丢弃（旧 Host/第三方注入不获得按钮）；
+   * - allowed=true 时丢弃 reason；allowed=false 时 reason 必须是字符串并截断，
+   *   缺失时回退稳定 token not_supported（绝不渲染空原因）。
+   */
+  function normalizeCapabilityEntry(value) {
+    if (!isObject(value) || typeof value.allowed !== "boolean") return null;
+    if (value.allowed === true) return { allowed: true };
+    const reason = text(value.reason);
+    return {
+      allowed: false,
+      reason: reason === null ? "not_supported" : reason.slice(0, CAPABILITY_REASON_MAX_LENGTH),
+    };
+  }
+
+  /** 按动作词表归一能力对象；没有任何有效动作时返回 null（调用方省略字段并回退旧行为）。 */
+  function normalizeCapabilities(value, actions) {
+    if (!isObject(value)) return null;
+    const normalized = {};
+    let any = false;
+    for (const action of actions) {
+      const entry = normalizeCapabilityEntry(value[action]);
+      if (entry === null) continue;
+      normalized[action] = entry;
+      any = true;
+    }
+    return any ? normalized : null;
+  }
+
   function normalizeAttempt(value) {
     const source = isObject(value) ? value : {};
     return {
@@ -238,6 +319,11 @@
       running: runningOf(status, source.running),
       runSummary: normalizeRunSummary(source.runSummary),
       continuable: typeof source.continuable === "boolean" ? source.continuable : null,
+      // shard 能力（票据 09）：只有 Host 给出可判定项时才存在；缺失时渲染层回退状态推导。
+      ...(() => {
+        const capabilities = normalizeCapabilities(source.capabilities, SHARD_CAPABILITY_ACTIONS);
+        return capabilities === null ? {} : { capabilities };
+      })(),
       childId: latest?.childId ?? text(source.childId),
       createdAt: numberOrNull(source.createdAt),
       attempts,
@@ -274,6 +360,11 @@
       running: runningOf(status, source.running),
       createdAt: numberOrNull(source.createdAt),
       counts: normalizeCounts(source.counts),
+      // 父任务能力：Host 权威投影；缺失（旧 Host）时省略字段，侧栏回退 ACTIVE/RETRY 状态推导。
+      ...(() => {
+        const capabilities = normalizeCapabilities(source.capabilities, CAPABILITY_ACTIONS);
+        return capabilities === null ? {} : { capabilities };
+      })(),
       shards: rawShards.map((shard) => normalizeShard(shard, source)),
     };
   }
@@ -297,6 +388,12 @@
       running: runningOf(status, source.running),
       runSummary: normalizeRunSummary(source.runSummary),
       continuable: typeof source.continuable === "boolean" ? source.continuable : null,
+      // 会话节点（root/普通专家）的能力对象：只描述 read/写动作是否适用，
+      // 侧栏不会在这些节点上渲染 fan-out 管理按钮。
+      ...(() => {
+        const capabilities = normalizeCapabilities(source.capabilities, CAPABILITY_ACTIONS);
+        return capabilities === null ? {} : { capabilities };
+      })(),
       createdAt: numberOrNull(source.createdAt),
       children: [],
     };
@@ -350,6 +447,9 @@
       rootSessionId,
       generatedAt: numberOrNull(raw.generatedAt),
       partial: raw.partial === true,
+      // recovery 是 Host 新增的**可选**顶层块：缺失/非法时为 null（旧 Host 行为逐字不变，
+      // 侧栏据此不渲染任何恢复错误横幅）。
+      recovery: normalizeRecovery(raw.recovery),
       root,
     };
   }
@@ -448,6 +548,7 @@
     RUNTIME_STATUSES,
     UNKNOWN_RUNTIME_STATUS,
     normalizeExpertGroupSnapshot,
+    normalizeCapabilities,
     normalizeStatus,
     runtimeStatusOf,
     formatAgentSummary,
@@ -1162,6 +1263,21 @@
   }
 
   /**
+   * 逐动作能力读取（票据 09）：只有 Host 明确给出 allowed 布尔时才作为权威。
+   *
+   * 返回 true/false/null：
+   * - true/false：严格按能力渲染（Host 是唯一判定来源）；
+   * - null：旧 Host/旧快照没有该字段（或形状非法）→ 调用方回退既有的
+   *   ACTIVE_STATUSES / RETRY_STATUSES 推导，兼容未升级的 Host。
+   * 这里刻意不把「有 capabilities 但缺该动作」当成允许：缺项与缺失整块同义，都回退。
+   */
+  function capabilityAllowed(node, action) {
+    const capabilities = object(object(node).capabilities);
+    const entry = object(capabilities[action]);
+    return typeof entry.allowed === "boolean" ? entry.allowed : null;
+  }
+
+  /**
    * 规范运行状态（展示与图标唯一使用的状态）。
    * 模型可用时由模型按官方源字段归一，模型缺失时才退回可证明的 running 布尔。
    */
@@ -1440,6 +1556,9 @@
       // partial 必须参与比较：任务树内容恰好一致时（轻量快照与完整快照投影结果相同），
       // 从 partial→完整 的升级仍要上屏，否则中性渲染会一直留在界面上。
       && (left.partial === true) === (right.partial === true)
+      // recovery 必须参与比较：恢复成功/失败切换时任务树可能一字未变，但错误横幅必须
+      // 立刻出现或消失——漏掉它会让「重试成功」停在旧横幅上（反之亦然）。
+      && snapshotContentEquals(left.recovery ?? null, right.recovery ?? null)
       && snapshotContentEquals(left.root, right.root);
   }
 
@@ -1538,6 +1657,18 @@
       ".deg_expert_group_header_auto_input{margin:0;cursor:pointer}",
       ".deg_expert_group_header_auto_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
       ".deg_expert_group_header_auto_label{font-size:12px;line-height:16px}",
+      // 恢复失败横幅（票据 04）：与标题栏的「快照读取失败」错误面完全独立，位于头部之下、
+      // 任务树之上；失败原因码与一行 message 同排，重试按钮固定右侧。整块用 flex-wrap：
+      // 窄右栏时补充行自动换到第二排，绝不挤压任务树的可点击区域。
+      ".deg_expert_group_recovery{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin:6px 0 0;padding:6px 8px;border:1px solid var(--dsw-alias-state-error-primary,var(--dsw-alias-state-warning-primary,#f59e0b));border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-primary));font-weight:600}",
+      // 主文案严格一行：超长 message 用省略号收束，完整内容在 title 里（Host 已限长 200 字符）。
+      ".deg_expert_group_recovery_text{flex:1 1 140px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      // 补充行（重试动作本身失败）：次级颜色、可换行，绝不覆盖主原因码。
+      ".deg_expert_group_recovery_retry_error{flex:1 1 100%;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-weight:400}",
+      ".deg_expert_group_recovery_retry{flex:0 0 auto;box-sizing:border-box;height:24px;padding:0 8px;border:0;border-radius:5px;background:transparent;color:inherit;font-weight:600;cursor:pointer}",
+      ".deg_expert_group_recovery_retry:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}",
+      ".deg_expert_group_recovery_retry:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+      ".deg_expert_group_recovery_retry:disabled{cursor:default;opacity:.7}",
       ".deg_expert_group_header_action:hover,.deg_expert_group_chevron:hover,.deg_expert_group_action:hover:not(:disabled),.deg_expert_group_sidebar_action:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
       ".deg_expert_group_header_action:focus-visible,.deg_expert_group_chevron:focus-visible,.deg_expert_group_action:focus-visible,.deg_expert_group_sidebar_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
       ".deg_expert_group_tree{min-width:0;padding-top:5px}",
@@ -7517,6 +7648,20 @@
 
       const pendingSet = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };
       /**
+       * 恢复重试的本地状态（票据 04）：{ rootSessionId, inFlight, error }。
+       *
+       * 为什么用 ref 而不是 state：与 pendingSet 同一模式——重试期间要立刻禁用按钮并显示
+       * 进度，只靠 Host 快照（2.5s 轮询 + 完整快照缓存）会有明显延迟；这里用 ref + bump
+       * 驱动一次同步重渲染。rootSessionId 绑定发起时的 root：同一实例切换 root 后，
+       * 旧请求的迟到结果绝不会显示在新会话的横幅上（也不会把新 root 的按钮标成处理中）。
+       *
+       * error 只保存**重试动作本身**的失败细节（业务失败返回的 error 块或传输/校验异常），
+       * 它是补充信息；恢复失败的主原因码始终来自 snapshot.recovery（Host 权威投影）。
+       */
+      const recoveryRetryRef = typeof react.useRef === "function"
+        ? react.useRef({ rootSessionId: null, inFlight: false, error: null })
+        : { current: { rootSessionId: null, inFlight: false, error: null } };
+      /**
        * 任务管理动作（取消分片 / 重试分片 / 取消父任务）的唯一入口。三条并发边界：
        *
        * 1) 去重锁覆盖「确认弹窗 await + RPC 发送 + 尾随刷新」全程：占位发生在**发起确认之前**，
@@ -7575,6 +7720,59 @@
         }
       };
 
+      /**
+       * 恢复重试入口（票据 04）：调用 fanout-restore-retry，成功后刷新快照。
+       *
+       * 失败语义（与既有动作错误面完全隔离）：
+       * - RPC 业务失败（restored:false）不是异常：Host 会把稳定原因码放在回执的 error 块里，
+       *   这里记录到横幅的补充行，**不**写入 title 区的「快照读取失败」槽；
+       * - 传输/校验异常（404 根会话不存在、网络失败）同样只记录补充行；横幅本身继续由
+       *   snapshot.recovery 驱动，因此「失败保持错误态与原因码」不依赖一次成功的快照刷新；
+       * - 成功（restored:true）后无论刷新是否成功，下一次成功快照都会把 recovery 变成 ok，
+       *   横幅随之消失（快照不再含 failed 块）。
+       *
+       * 并发边界与 runAction 一致：卸载后不写状态；切换 root 后旧结果只落回旧 root 的账本
+       * 而不污染当前 surface；同一 root 的在途重试直接忽略重复点击。
+       */
+      const retryRecovery = async () => {
+        if (mountedRef.current !== true) return;
+        const targetSessionId = typeof currentRootRef.current === "string" ? currentRootRef.current : "";
+        if (targetSessionId === "") return;
+        const previous = recoveryRetryRef.current;
+        if (previous.rootSessionId === targetSessionId && previous.inFlight === true) return;
+        recoveryRetryRef.current = { rootSessionId: targetSessionId, inFlight: true, error: null };
+        bump((value) => value + 1);
+        let failure = null;
+        try {
+          const result = await callRpc(config, contextRef.current, {
+            action: "fanout-restore-retry",
+            sessionId: targetSessionId,
+          });
+          if (result?.restored !== true) {
+            const error = object(result?.error);
+            const code = text(error.code, null);
+            // restored:false 且没有 error 块 = 磁盘上没有可恢复快照（Host 的既有早退语义）：
+            // 这不是失败，但也没有清除错误态，保持横幅并让用户知道重试没有恢复任何任务。
+            failure = code === null
+              ? { code: "NO_RESTORABLE_SNAPSHOT", message: "当前没有可恢复的持久化任务" }
+              : { code, message: text(error.message, "") };
+          }
+        } catch (error) {
+          failure = {
+            code: "RETRY_FAILED",
+            message: error instanceof Error ? error.message : String(error),
+          };
+        }
+        const stillCurrent = mountedRef.current === true && currentRootRef.current === targetSessionId;
+        recoveryRetryRef.current = { rootSessionId: targetSessionId, inFlight: false, error: stillCurrent ? failure : null };
+        // 卸载或已切走：迟到结果不触发刷新/重渲染（新 surface 自己维护状态）。
+        if (stillCurrent !== true) return;
+        bump((value) => value + 1);
+        // 无论成功还是失败都刷新：成功让横幅随 recovery=ok 消失，失败则把 Host 重新记录的
+        // 原因码/任务树取回来（失败原因码仍以 snapshot.recovery 为权威）。
+        await refreshRef.current();
+      };
+
       const renderAction = (label, Icon, onClick, pending) => react.createElement("button", {
         type: "button", className: "deg_expert_group_action", title: pending ? label + "（处理中）" : label,
         "aria-label": pending ? label + "（处理中）" : label, "aria-busy": pending || undefined, disabled: pending, onClick,
@@ -7602,8 +7800,15 @@
         const cancelKey = "cancel:" + task.parentTaskId + ":" + shardKey;
         const retryKey = "retry:" + task.parentTaskId + ":" + shardKey;
         const actions = [];
-        if (ACTIVE_STATUSES.has(status)) actions.push(renderAction("取消分片 " + shardKey, "IconStopFillRegular", () => runAction({ action: "fanout-cancel-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, cancelKey, true, "确认取消分片 " + shardKey + "？"), pendingSet.current.has(cancelKey)));
-        if (RETRY_STATUSES.has(status)) actions.push(renderAction("重试分片 " + shardKey, "IconRefreshOutlineRegular", () => runAction({ action: "fanout-retry-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, retryKey, false, ""), pendingSet.current.has(retryKey)));
+        // 票据 09：能力字段存在时严格按能力渲染；缺失时回退既有状态推导（旧 Host 兼容）。
+        // 拒绝原因不再由界面解释——Host 已把「为什么不可用」收敛成稳定原因码，
+        // 按钮的有无就是唯一可见结论，绝不给用户一个点了只会被拒绝的入口。
+        const cancelCapability = capabilityAllowed(shard, "cancel");
+        const retryCapability = capabilityAllowed(shard, "retry");
+        const showCancel = cancelCapability === null ? ACTIVE_STATUSES.has(status) : cancelCapability === true;
+        const showRetry = retryCapability === null ? RETRY_STATUSES.has(status) : retryCapability === true;
+        if (showCancel) actions.push(renderAction("取消分片 " + shardKey, "IconStopFillRegular", () => runAction({ action: "fanout-cancel-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, cancelKey, true, "确认取消分片 " + shardKey + "？"), pendingSet.current.has(cancelKey)));
+        if (showRetry) actions.push(renderAction("重试分片 " + shardKey, "IconRefreshOutlineRegular", () => runAction({ action: "fanout-retry-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, retryKey, false, ""), pendingSet.current.has(retryKey)));
         // 展示状态用规范运行状态，证据与第三行同源（最新 attempt 的 childId 查目录项）；
         // status 仍保留给取消/重试判定（管理语义不变）。
         const runtimeStatus = runtimeStatusOfNode(shardNode, rootSessionId, latestChildId);
@@ -7619,7 +7824,12 @@
         const open = expand(task);
         const incomplete = shards.filter((shard) => ACTIVE_STATUSES.has(statusOf(shard))).length;
         const parentKey = "cancel-parent:" + task.parentTaskId;
-        const actions = ACTIVE_STATUSES.has(statusOf(task)) || incomplete > 0
+        // 父任务取消同样以 Host 能力为准；能力缺失时保留「有活跃分片或父任务仍活跃」的旧判定。
+        const cancelCapability = capabilityAllowed(task, "cancel");
+        const showCancel = cancelCapability === null
+          ? (ACTIVE_STATUSES.has(statusOf(task)) || incomplete > 0)
+          : cancelCapability === true;
+        const actions = showCancel
           ? [renderAction("取消父任务（未完成 " + incomplete + " 个分片）", "IconStopFillRegular", () => runAction({ action: "fanout-cancel-parent", parentTaskId: task.parentTaskId }, parentKey, true, "确认取消父任务？未完成 " + incomplete + " 个分片。"), pendingSet.current.has(parentKey))]
           : [];
         // data-status 是对外的规范运行状态；管理状态改由 data-task-status 暴露，
@@ -7655,6 +7865,66 @@
       // 根行的圆点走与专家行同一条 partial 规则：轻量快照里没有活动证据的根会话渲染中性圆点，
       // 而不是「已结束」的绿色圆点；完整快照与旧宿主下与既有渲染逐字一致。
       const rootStatus = runtimeStatusOf(root, null, { partial: partialSnapshot });
+      /**
+       * 恢复失败横幅（票据 04）：**独立**于标题栏的「快照读取失败」错误面。
+       *
+       * 两者语义不同，绝不合并：
+       * - 快照读取失败 = 这次 RPC 没拿到任务树（viewState.error + 重试按钮）；
+       * - 恢复失败 = 任务树读得到，但持久化恢复失败（磁盘快照可能不完整，fail-closed 生效），
+       *   需要重新读取持久化快照并重跑恢复。
+       *
+       * 横幅只由 Host 的权威投影 snapshot.recovery 驱动（旧 Host 缺失该块 ⇒ 不渲染）；
+       * 本地 retry 状态只补充「重试中/重试失败」这一行，不替代原因码。
+       */
+      const recovery = snapshot?.recovery ?? null;
+      const recoveryFailed = recovery !== null && recovery.status === "failed";
+      const recoveryRetry = recoveryRetryRef.current;
+      // rootSessionId 绑定：切换 root 后旧请求的 in-flight/error 不属于当前 surface。
+      const recoveryRetryPending = recoveryRetry.inFlight === true && recoveryRetry.rootSessionId === rootSessionId;
+      const recoveryCode = recovery === null ? null : text(recovery.code, "RESTORE_FAILED");
+      // 补充行只在「当前仍是失败态，且重试失败与当前原因码同一来源」时显示：
+      // Host 后来换了原因码（例如先 INVALID_SNAPSHOT、修复后变 BUDGET_EXCEEDED）时，
+      // 旧重试的文案不再适用，必须让位给新的主原因码（两个稳定本地码始终保留）。
+      const recoveryRetryError = recoveryFailed === true
+        && recoveryRetry.rootSessionId === rootSessionId
+        && recoveryRetry.error !== null
+        && (recoveryRetry.error.code === recoveryCode
+          || recoveryRetry.error.code === "RETRY_FAILED"
+          || recoveryRetry.error.code === "NO_RESTORABLE_SNAPSHOT")
+        ? recoveryRetry.error
+        : null;
+      const recoveryMessage = recovery === null ? null : text(recovery.message, null);
+      const recoveryBanner = recoveryFailed !== true
+        ? null
+        : react.createElement("div", {
+          className: "deg_expert_group_recovery",
+          role: "alert",
+          "data-recovery-status": "failed",
+          "data-recovery-code": recoveryCode,
+          // title 提供完整文案：可见行按一行省略，悬停仍可读到全部（仍受 Host 200 字上限约束）。
+          title: recoveryMessage === null ? "恢复失败（" + recoveryCode + "）" : recoveryMessage,
+        },
+        react.createElement("span", { className: "deg_expert_group_recovery_text" },
+          "任务恢复失败（" + recoveryCode + "）" + (recoveryMessage === null ? "" : "：" + recoveryMessage)),
+        recoveryRetryError === null
+          ? null
+          : react.createElement("span", { className: "deg_expert_group_recovery_retry_error", role: "status" },
+            "重试未恢复（" + text(recoveryRetryError.code, "RETRY_FAILED") + "）"
+            + (text(recoveryRetryError.message, "") === "" ? "" : "：" + text(recoveryRetryError.message, ""))),
+        react.createElement("button", {
+          type: "button",
+          className: "deg_expert_group_recovery_retry",
+          // retryable=false 只影响提示语（结构性快照缺陷）；按钮仍保留：重试会重读磁盘，
+          // 外部修复后仍可能成功，入口绝不隐藏。
+          title: recovery.retryable === false
+            ? "该原因通常需要修复持久化快照后才能恢复；点击会重新读取当前持久化快照"
+            : "重新读取当前持久化快照并重跑恢复",
+          "aria-label": "重试恢复",
+          "aria-busy": recoveryRetryPending || undefined,
+          disabled: recoveryRetryPending,
+          onClick: retryRecovery,
+          // 文字按钮：进度态把文案换成「重试中…」，可见且可被辅助技术读到。
+        }, recoveryRetryPending ? "重试中…" : "重试恢复"));
       const body = viewState.loading && snapshot === null
         ? react.createElement("div", { className: "deg_expert_group_tree", "aria-busy": "true" }, react.createElement("div", { className: "deg_expert_group_skeleton" }), react.createElement("div", { className: "deg_expert_group_skeleton" }))
         : snapshot === null
@@ -7693,7 +7963,7 @@
           react.createElement("span", { className: "deg_expert_group_header_title" }, "Expert Group"),
           autoOpenToggle,
           viewState.error !== null ? react.createElement("span", { className: "deg_expert_group_error", title: viewState.error }, "快照读取失败") : null,
-          viewState.error !== null ? react.createElement("button", { type: "button", className: "deg_expert_group_header_action", title: "重试", "aria-label": "重试", onClick: retry }, makeIcon(primitives, "IconRefreshOutlineRegular", { size: 14 })) : null), body);
+          viewState.error !== null ? react.createElement("button", { type: "button", className: "deg_expert_group_header_action", title: "重试", "aria-label": "重试", onClick: retry }, makeIcon(primitives, "IconRefreshOutlineRegular", { size: 14 })) : null), recoveryBanner, body);
     }
     Panel.displayName = "ExpertGroupPanel";
     return Panel;
@@ -13009,13 +13279,16 @@ window.__ModuleLoader__.load({
       ".deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}" +
       ".deg_settings_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}" +
       ".deg_settings_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);align-items:center;gap:20px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
-      // 管理行的四个控件按内容宽度排列，并用 space-between 吸收剩余空间，让 599px/760px 容器中的间距均匀。
-      ".deg_settings_management_row{display:flex;align-items:center;justify-content:space-between;column-gap:16px;row-gap:12px;flex-wrap:nowrap;min-width:0}" +
-      // 统一 29px 行高与数字输入框，保证四个控件的 bounding box 顶部对齐，同时保留可用点击高度。
+      // 任务管理与自动侧栏开关放在模型配置之后、通知之前，始终可见且共享标准设置行间距。
+      ".deg_settings_task_row{display:flex;align-items:center;gap:28px;min-height:29px}" +
+      ".deg_settings_task_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}" +
+      // 底部 Observer 独立靠左，并将两个固定宽度数字控件作为紧凑组靠右排列。
+      ".deg_settings_management_row{display:flex;align-items:center;justify-content:space-between;column-gap:24px;row-gap:12px;min-width:0}" +
       ".deg_settings_management_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}" +
-      ".deg_settings_management_row>.deg_settings_control{flex:0 0 auto;justify-self:auto;min-width:max-content;white-space:nowrap;height:29px;box-sizing:border-box}" +
-      // 520px 以下取消强制单行并左对齐，允许控件按整项换行；固定内容宽度避免标签折行、溢出或输入框被压缩。
-      "@media (max-width:520px){.deg_settings_management_row{flex-wrap:wrap;justify-content:flex-start}}" +
+      ".deg_settings_limits{display:flex;align-items:center;justify-content:flex-end;gap:26px;min-width:0}" +
+      ".deg_settings_limits>.deg_settings_control{flex:0 0 auto;justify-self:auto;min-width:max-content;white-space:nowrap;height:29px;box-sizing:border-box}" +
+      // 520px 以下允许整项换行并左对齐，数字控件本身不缩窄、标签不拆行。
+      "@media (max-width:520px){.deg_settings_management_row{flex-wrap:wrap;justify-content:flex-start}.deg_settings_limits{flex-wrap:wrap;justify-content:flex-start;gap:16px 26px}}" +
       ".deg_settings_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}" +
       ".deg_settings_control{display:flex;align-items:center;gap:10px;min-width:0}" +
       ".deg_settings_control input[type=range]{width:100%;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
@@ -15400,6 +15673,26 @@ window.__ModuleLoader__.load({
       return Number.isSafeInteger(value) && value >= 1 && value <= 64 ? value : 10;
     }
 
+    // 与 Host 的默认值保持一致：10 小时；显式 0 仍表示禁用，不被默认值覆盖。
+    const DEFAULT_ROLE_TIMEOUT_MS = 36000000;
+
+    /**
+     * 角色默认超时（毫秒，票据 06）只接受 0（不启用）或
+     * 1000~86,400,000 的整秒毫秒数；缺失或非法值回退默认 10 小时。
+     *
+     * 客户端只做读取/草稿归一，权威拒绝仍在 Host 的 settings-commit
+     * （与 fanout.js validateTimeoutMs 同一语义）：这里不能把越界值渲染成“已保存”。
+     *
+     * @param {unknown} value - settings 中的超时值。
+     * @returns {number} 0 或合法启用值。
+     */
+    function normalizeRoleTimeoutMs(value) {
+      if (value === 0) return 0;
+      return Number.isSafeInteger(value) && value >= 1000 && value <= 86400000 && value % 1000 === 0
+        ? value
+        : DEFAULT_ROLE_TIMEOUT_MS;
+    }
+
     function normalizeSettingsDraft(value, roles, allowLegacyProviderFallback = true) {
       const source = value && typeof value === "object" ? value : {};
       const configuredProvider = typeof source.provider === "string" ? source.provider : "";
@@ -15443,6 +15736,8 @@ window.__ModuleLoader__.load({
         notificationVolume: clampNotificationVolume(source.notificationVolume),
         notificationHoldMs: notificationHoldMsOf(source.notificationHoldMs),
         roleConcurrencyLimit: normalizeRoleConcurrencyLimit(source.roleConcurrencyLimit),
+        // 角色默认超时缺失或非法时使用默认 10 小时；显式 0 保留为不启用。
+        roleTimeoutMs: normalizeRoleTimeoutMs(source.roleTimeoutMs),
         // 旧客户端/Host 缺少字段时保持关闭，避免升级后改变图片路由。
         observerPreferred: source.observerPreferred === true,
         // 任务管理缺字段时保持开启：默认必须维持 Expert Group 注册到侧边栏的历史行为。
@@ -18870,6 +19165,11 @@ window.__ModuleLoader__.load({
         if (candidate.roleConcurrencyLimit !== source.roleConcurrencyLimit) {
           ops.push({ op: "set", path: ["roleConcurrencyLimit"], value: candidate.roleConcurrencyLimit });
         }
+        // 角色默认超时（票据 06）：只有真正变化才写 op，避免一次无关保存把
+        // 用户已保存的值重置回 0。
+        if (candidate.roleTimeoutMs !== source.roleTimeoutMs) {
+          ops.push({ op: "set", path: ["roleTimeoutMs"], value: candidate.roleTimeoutMs });
+        }
         // 任务管理开关单独成一个保存 op，只用于判定「是否真的需要提交」；
         // 新客户端的完整候选始终显式携带该字段，Host 按「显式字段才写 patch」处理。
         if (candidate.taskManagementEnabled !== source.taskManagementEnabled) {
@@ -19379,6 +19679,26 @@ window.__ModuleLoader__.load({
         react.createElement("h2", { className: "deg_settings_title" }, "dsh-expert-group"),
         react.createElement("p", { className: "deg_settings_hint" }, "专家模型使用 DSH 当前已配置的 provider 和模型目录。"),
         modelConfigSection,
+        react.createElement("div", { className: "deg_settings_row deg_settings_task_row" },
+          react.createElement("label", { className: "deg_settings_checkbox" },
+            react.createElement("input", {
+              type: "checkbox",
+              "aria-label": "任务管理",
+              checked: draft.taskManagementEnabled,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, taskManagementEnabled: event.target.checked })),
+            }),
+            react.createElement("span", { className: "deg_settings_label" }, "任务管理")),
+          // 「Auto」自动打开运行中的子代理右侧栏会话；维持原悬浮说明与保存绑定。
+          react.createElement("label", { className: "deg_settings_checkbox", title: "自动打开运行中的子代理侧栏会话" },
+            react.createElement("input", {
+              type: "checkbox",
+              "aria-label": "Auto",
+              checked: draft.autoOpenSubagentSidebar,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, autoOpenSubagentSidebar: event.target.checked === true })),
+            }),
+            react.createElement("span", { className: "deg_settings_label" }, "Auto"))),
         react.createElement("div", { className: "deg_settings_row deg_settings_notification_row" },
           react.createElement("label", { className: "deg_settings_checkbox" },
             react.createElement("input", {
@@ -19449,26 +19769,7 @@ window.__ModuleLoader__.load({
           react.createElement("label", { className: "deg_settings_checkbox" },
             react.createElement("input", { type: "checkbox", "aria-label": "Observer优先", checked: draft.observerPreferred, disabled: saving, onChange: (event) => editDraft((previous) => ({ ...previous, observerPreferred: event.target.checked })) }),
             react.createElement("span", { className: "deg_settings_label" }, "Observer优先")),
-          react.createElement("label", { className: "deg_settings_checkbox" },
-            react.createElement("input", {
-              type: "checkbox",
-              "aria-label": "任务管理",
-              checked: draft.taskManagementEnabled,
-              disabled: saving,
-              onChange: (event) => editDraft((previous) => ({ ...previous, taskManagementEnabled: event.target.checked })),
-            }),
-            react.createElement("span", { className: "deg_settings_label" }, "任务管理")),
-          // 「Auto」= 自动打开运行中的子代理右侧栏会话：与任务管理同一行的紧凑开关。
-          // 说明性文案只放在 title（悬浮提示）里，可见文字保持一个单词，不挤压既有控件。
-          react.createElement("label", { className: "deg_settings_checkbox", title: "自动打开运行中的子代理侧栏会话" },
-            react.createElement("input", {
-              type: "checkbox",
-              "aria-label": "Auto",
-              checked: draft.autoOpenSubagentSidebar,
-              disabled: saving,
-              onChange: (event) => editDraft((previous) => ({ ...previous, autoOpenSubagentSidebar: event.target.checked === true })),
-            }),
-            react.createElement("span", { className: "deg_settings_label" }, "Auto")),
+          react.createElement("div", { className: "deg_settings_limits" },
           react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-concurrency-limit" },
             react.createElement("span", { className: "deg_settings_label" }, "单个角色并发上限"),
             react.createElement("input", {
@@ -19491,7 +19792,35 @@ window.__ModuleLoader__.load({
                     : Number.isFinite(number) ? number : previous.roleConcurrencyLimit,
                 }));
               },
-            }))),
+            })),
+          // 角色级默认超时（票据 06）：设置页以**秒**展示与编辑（0 = 不启用），提交时换算成
+          // Host 的毫秒字段 roleTimeoutMs；与并发上限同一行的紧凑布局。
+          // 精度与边界由 Host 与管理器共同保证；这里只提供步进与可访问名称。
+          react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-timeout-ms" },
+            react.createElement("span", { className: "deg_settings_label" }, "角色默认超时 (s)"),
+            react.createElement("input", {
+              id: "deg-settings-role-timeout-ms",
+              type: "number",
+              "aria-label": "角色默认超时",
+              title: "默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
+              min: 0,
+              max: 86400,
+              step: 1,
+              inputMode: "numeric",
+              value: draft.roleTimeoutMs === "" ? "" : draft.roleTimeoutMs / 1000,
+              disabled: saving,
+              onChange: (event) => {
+                const raw = event.target.value;
+                const seconds = raw === "" ? null : Number(raw);
+                editDraft((previous) => ({
+                  ...previous,
+                  // 草稿与 Host 字段保持毫秒；UI 只做秒 ↔ 毫秒换算，整秒取整。
+                  roleTimeoutMs: raw === ""
+                    ? ""
+                    : Number.isFinite(seconds) ? Math.round(seconds) * 1000 : previous.roleTimeoutMs,
+                }));
+              },
+            })))),
         directoryState.error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, directoryState.error) : null,
         error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, error) : null,
         react.createElement("div", { className: "deg_settings_footer" },

@@ -32,7 +32,7 @@ import {
   appendRecoveryRetryCount, buildRecoveryMessage, classifyTurnOutcome, lastTurnErrorMessage,
   subagentFeedbackChildId, createAdmissionBatchCoordinator, createHandoffAdmissionCohort,
   rootStructuredPathGuard, snapshotRunningRootDescendants, collectRuntimeRootDescendants,
-  messageIdsOfTurnWithClaimed, shouldAutoRecover, turnHasNonEmptyText,
+  messageIdsOfTurn, messageIdsOfTurnWithClaimed, shouldAutoRecover, turnHasNonEmptyText,
   createDelegationTracker, delegationScopeKey, delegationTaskKey,
   createRecoveryOp, clearRecoveryOpTimer, scheduleRecoveryOpTimer, findRecoveryOpByMessage, recoveryOpPendingForTurn, recoveryOpIsPending,
   recoveryDispatchCanStart, recoveryOpIsAccepted, recoveryOpCanBeSuperseded, interruptFailureCanFallback,
@@ -57,10 +57,11 @@ import { createSettingsRuntimeModule, SettingsDirectoryChangedError } from "./ho
 import { createRecoveryModule } from "./host/recovery.js";
 import { createRootTurnWaitRegistry } from "./host/turn-wait.js";
 import { createFanoutRuntimeModule } from "./host/fanout-runtime.js";
-import { createExpertGroupRuntime, rootNotificationLabel } from "./host/expert-group-runtime.js";
+import { createExpertGroupRuntime, restoreFailureRetryable, rootNotificationLabel } from "./host/expert-group-runtime.js";
 import { createPersistenceHealth } from "./host/persistence-health.js";
 import { DEFAULT_NOTIFICATION_VOLUME, SYSTEM_TOAST_REASONS, createSystemToastModule, normalizeToastVolume, terminationToastText, userWaitToastText } from "./host/system-toast.js";
 import { FANOUT_BUDGET, truncateFeedbackText } from "./resource-budget.js";
+import { MAX_RECLAIM_BATCH, MAX_TIMEOUT_MS, TIMEOUT_STEP_MS, validateTimeoutMs } from "./fanout.js";
 import { buildOrchestratorPrompt, isRootAgentContext } from "./orchestrator.js";
 import { buildImageContent, decideImageRoute, effectiveModelRoute, imageCapability, normalizeImageToPng, pngCopyName, toPngBytes } from "./image-routing.js";
 /**
@@ -296,9 +297,36 @@ function diagnosticToken(value, fallback = "other") {
   return typeof value === "string" && DIAGNOSTIC_TOKEN_PATTERN.test(value) ? value : fallback;
 }
 
+/** 诊断消息的最大长度（按字符计）：诊断面有界，长消息截断而不是整体放弃。 */
+const DIAGNOSTIC_MESSAGE_LIMIT = 160;
+
+/**
+ * 把插件自身产生的结构化诊断文案归一为可安全展示的消息。
+ *
+ * 与 diagnosticToken 的分工：token 只允许短标识符字符面（用于 code/来源），message
+ * 是给人读的固定文案（含中文与空格），不能过同一白名单。安全边界改由三件事保证：
+ * 1. 长度上限——诊断面不随输入增长；
+ * 2. 去掉控制字符并压缩换行——消息不会伪造多行日志/UI 结构；
+ * 3. 只接受字符串——非字符串一律返回 fallback，不把对象/数组序列化进诊断。
+ * 调用方（fanout 并发诊断）的文案由插件内部生成，不拼接设置原文或原始返回值。
+ */
+function diagnosticMessage(value, fallback = null) {
+  if (typeof value !== "string") return fallback;
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (cleaned.length === 0) return fallback;
+  return cleaned.length > DIAGNOSTIC_MESSAGE_LIMIT
+    ? cleaned.slice(0, DIAGNOSTIC_MESSAGE_LIMIT) + "…"
+    : cleaned;
+}
+
 /** 只接受非负安全整数计数；其它输入按 0 处理，诊断绝不返回 NaN/负数。 */
 function diagnosticCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+/** 只接受非负安全整数时间戳；缺失/非法返回 null（区分"从未发生"与 1970）。 */
+function diagnosticTime(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 /**
@@ -1364,12 +1392,32 @@ const DEFAULT_NOTIFICATION_HOLD_MS = 5000;
  */
 const DEFAULT_NOTIFICATION_VOLUME_SETTING = DEFAULT_NOTIFICATION_VOLUME;
 const DEFAULT_ROLE_CONCURRENCY_LIMIT = 10;
+/**
+ * 角色级默认超时（毫秒，票据 06）：默认 10 小时，显式 0 = 不启用。
+ *
+ * 与管理器的三级优先级（shard > 父任务 > 角色 > 未启用）共用同一语义；
+ * 设置读取面必须总能给出一个合法值，所以非法/缺失回退到默认 10 小时。
+ */
+const DEFAULT_ROLE_TIMEOUT_MS = 36000000;
 
 /** 角色并发上限必须是 1 到 64 的安全整数；旧配置或非法值回退到默认值。 */
 function normalizeRoleConcurrencyLimit(value) {
   return Number.isSafeInteger(value) && value >= 1 && value <= 64
     ? value
     : DEFAULT_ROLE_CONCURRENCY_LIMIT;
+}
+
+/**
+ * 角色默认超时归一：需与 fanout.js 的 validateTimeoutMs 同源（只接受 0 或
+ * 1000~86,400,000 的整秒毫秒数）。缺失/非法值回退默认 10 小时，保证读取面与
+ * 调度器永远拿不到越界值；写入面仍由 validateSettingsCandidate 严格拒绝。
+ *
+ * @param {unknown} value - 待归一的 settings 值。
+ * @returns {number} 0 或合法启用值。
+ */
+function normalizeRoleTimeoutMs(value) {
+  const check = validateTimeoutMs(value);
+  return check.ok && typeof check.value === "number" ? check.value : DEFAULT_ROLE_TIMEOUT_MS;
 }
 
 /** 只接受设置页提供的固定停留时长；旧配置或非法值回退到 10 秒。 */
@@ -1403,6 +1451,9 @@ const Config = z.object({
   notificationVolume: z.number().step(1).min(0).max(100).default(100).volatile(),
   notificationHoldMs: z.number().step(1).min(0).max(600000).default(DEFAULT_NOTIFICATION_HOLD_MS).volatile(),
   roleConcurrencyLimit: z.number().step(1).min(1).max(64).default(DEFAULT_ROLE_CONCURRENCY_LIMIT).volatile(),
+  // 角色级默认超时（毫秒，票据 06）：0 = 不启用；启用值为 1000~86,400,000 且为 1000 的整数倍。
+  // 它只影响保存之后创建的 attempt，不会改写运行中的分片（三级优先级见 fanout.js）。
+  roleTimeoutMs: z.number().step(TIMEOUT_STEP_MS).min(0).max(MAX_TIMEOUT_MS).default(DEFAULT_ROLE_TIMEOUT_MS).volatile(),
   // 旧 settings 文档可能没有该字段；schema 与归一边界都提供关闭默认值。
   observerPreferred: z.boolean().default(false).volatile(),
   // 「任务管理」开关默认开启：旧文档缺字段时维持 Expert Group 注册到侧边栏的历史行为。
@@ -1562,6 +1613,8 @@ function normalizeSnapshot(snapshot, visibleRoles) {
     notificationVolume: Number.isFinite(volume) ? Math.min(100, Math.max(0, Math.round(volume))) : 100,
     notificationHoldMs: normalizeNotificationHoldMs(snapshot?.notificationHoldMs),
     roleConcurrencyLimit: normalizeRoleConcurrencyLimit(snapshot?.roleConcurrencyLimit),
+    // 角色默认超时：旧配置/非法值归一为 0（不启用），不阻断读取。
+    roleTimeoutMs: normalizeRoleTimeoutMs(snapshot?.roleTimeoutMs),
     observerPreferred: snapshot?.observerPreferred === true,
     // 只有显式 false 才关闭侧边栏注册；缺字段（旧配置/旧客户端）按历史行为保持开启。
     taskManagementEnabled: snapshot?.taskManagementEnabled !== false,
@@ -1804,10 +1857,29 @@ export default {
      * fiber 正在清理时又建立新的等待或监听。
      */
     let turnWaitStopping = false;
-    /** 等待登记表的统一异常记录（只记错误名与固定前缀，不泄漏工作负载）。 */
+    /**
+     * 异常的安全标签：只保留"看起来像常规错误名"的标识符，其余一律归为 Error/类型名。
+     *
+     * 为什么需要白名单：错误名同样可能被上游塞入任意文本（例如把整段响应当 name），
+     * 因此只接受 ASCII 标识符（含 . 分隔的命名空间形），长度受限；控制字符、换行、
+     * 路径分隔符与中文等一律不输出。
+     */
+    function safeErrorLabel(error) {
+      const isObject = error !== null && typeof error === "object";
+      const name = isObject ? error.name : undefined;
+      if (typeof name === "string" && /^[A-Za-z_$][A-Za-z0-9_$.]{0,63}$/.test(name)) return name;
+      return isObject ? "Error" : typeof error;
+    }
+
+    /**
+     * 等待登记表的统一异常记录：只输出固定前缀 + 安全错误名，绝不输出 message 原文。
+     *
+     * 为什么不再拼接 error.message/String(error)：等待路径的异常可能来自宿主 provider、
+     * 会话读取器甚至文件系统，message 里可能夹带会话正文、prompt 片段、绝对路径或凭据；
+     * 日志只用于回答"哪一步失败、错误类型是什么"，不需要、也不应该承载这些内容。
+     */
     function logTurnWaitError(action, error) {
-      ctx.logger.warn("dsh-expert-group: root turn wait " + action + " failed: "
-        + (error instanceof Error ? error.message : String(error)));
+      ctx.logger.warn("dsh-expert-group: root turn wait " + action + " failed: " + safeErrorLabel(error));
     }
     function isRootAgentIdentity(agent) {
       return agent !== void 0
@@ -2334,17 +2406,88 @@ export default {
 
 
     /**
+     * 固定中文提示：长等待提醒（票据 11）。
+     *
+     * 文案刻意保持固定：提醒只表达「等待很久」与「人工逃生入口存在」，绝不包含 root id、
+     * 任务正文或任何专家输出；是否真的可以逃生仍由工具的权威查询判定，提示本身不授权、
+     * 也不释放任何等待。
+     */
+    const ROOT_WAIT_LONG_TOAST = Object.freeze({
+      title: "Expert Group",
+      body: "专家任务已等待超过 30 分钟仍未结算。若权威查询确认没有运行中的后代，可用 dsh_expert_group_abandon_wait 手动关闭等待账本；它不会终止专家，也不会释放影响范围保护。",
+    });
+    /** 固定中文提示：后代查询降级/失败（未知不等于已完成）。 */
+    const ROOT_WAIT_QUERY_DEGRADED_TOAST = Object.freeze({
+      title: "Expert Group",
+      body: "无法确认专家后代的运行状态（后代查询降级或失败），root turn 会继续等待；未知状态不等于专家已完成。",
+    });
+    /** 固定中文提示：收口结论投递失败（批次保持待收口）。 */
+    const ROOT_WAIT_DELIVERY_FAILED_TOAST = Object.freeze({
+      title: "Expert Group",
+      body: "专家批次已静止，但收口结论投递失败；批次保持待收口，插件会在后续 root turn 重试。",
+    });
+
+    /**
      * 唯一的 root turn 等待登记表：finalize 与 agent/turn-stopping 兜底共用。
      *
      * 释放条件见 host/turn-wait.js 的模块文档；本处只负责把宿主事实接进来。
+     * onLongWait/onIssue 只做用户可见提示（票据 11）：提示失败绝不改变等待语义，
+     * 去重与限流也全部由账本负责（记录级一次性 + 30 分钟时间桶）。
      */
+    /**
+     * 等待账本的用户可见提示开关（票据 11）。
+     *
+     * 生产默认开启；测试 Host 默认关闭，避免降级查询/长等待提示在成千上万个用例里
+     * 触发真实系统通知子进程（既污染桌面，也把测试墙钟拖到数秒级）。需要验证提示文案
+     * 的用例可显式传 waitLedgerNotifications: true，并注入 createSystemToast 替身。
+     * 这个开关只影响提示，不影响等待/收口/释放语义。
+     */
+    const waitLedgerNotificationsEnabled = config?.waitLedgerNotifications !== false;
     const rootTurnWaits = createRootTurnWaitRegistry({
       isLiveRoot: (agent) => isLiveRootAgent(agent),
       snapshotDescendants: (rootId) => snapshotRootTurnDescendants(rootId),
       subscribe: (agent, invalidate) => subscribeRootActivity(agent, invalidate),
       onKnownSnapshot: (agent, snapshot) => settleFinishedChildTurnWaits(agent, snapshot),
       onError: (error) => logTurnWaitError("check", error),
+      ...(waitLedgerNotificationsEnabled ? {
+        onLongWait: () => { sendSystemToast(ROOT_WAIT_LONG_TOAST); },
+        onIssue: (issue) => {
+          // kind 由账本固定枚举；未知 kind 静默忽略（绝不猜测文案）。
+          if (issue?.kind === "descendant-query-degraded") sendSystemToast(ROOT_WAIT_QUERY_DEGRADED_TOAST);
+          else if (issue?.kind === "finalization-delivery-failed") sendSystemToast(ROOT_WAIT_DELIVERY_FAILED_TOAST);
+        },
+      } : {}),
     });
+
+    /**
+     * 最近一次收口结论投递结果（诊断用，票据 11）。
+     *
+     * 为什么由接线层保留：投递发生在等待账本记录被销毁之后，单看 describe() 永远看不到
+     * 这次投递。这里只保留 ok/固定原因码/时间戳，不含消息正文、child id 或任务内容。
+     */
+    let lastRootWaitDelivery = null;
+    /** 人工关闭等待账本的累计成功次数（诊断用，只计数）。 */
+    let rootWaitAbandonCount = 0;
+
+    /**
+     * 记录一次收口结论投递结果，并同步到等待账本。
+     *
+     * 账本 noteDelivery 负责记录级 lastDelivery 与一次性提示；这里额外保留同一份结论，
+     * 让诊断在记录销毁后仍能回答「最近一次投递是否成功、失败原因是什么」。
+     * 任何异常都只告警：诊断/提示绝不影响投递路径的返回值与等待语义。
+     */
+    function noteRootWaitDelivery(parent, ok, reason) {
+      const normalized = ok === true;
+      const code = typeof reason === "string" && reason.length > 0
+        ? reason
+        : (normalized ? "delivered" : "delivery-failed");
+      lastRootWaitDelivery = { ok: normalized, reason: code, at: Date.now() };
+      try {
+        rootTurnWaits.noteDelivery(parent, { ok: normalized, reason: code });
+      } catch (error) {
+        logTurnWaitError("delivery-note", error);
+      }
+    }
 
     /**
      * 真实用户输入会打断当前 root 的等待，但不退休 root 记录，也不清除专家工作。
@@ -2362,12 +2505,39 @@ export default {
      * 也不应要求 root 通过 notify/finalize 去“结束”它。这里按 parent + child
      * 精确清理插件登记的 activity，保留 child/recovery record，避免把可复用 child
      * 当作已销毁对象处理。role 过滤用于防止同一 childId 的历史 route 误清理。
+     *
+     * 证据边界（票据 07）：唯一调用点是 host 投递的 **terminal child feedback**
+     * （settlement notice），且要求没有 pending recovery / gated feedback。root 结束、
+     * 代际更新、人工动作（含 dsh_expert_group_release_scope）都不得走到这里。
      */
     function releaseActiveExpertScope(parent, { childId, role } = {}) {
       if (!isRootAgentIdentity(parent) || typeof childId !== "string" || childId.length === 0) return 0;
       const tasks = delegationTracker.listActiveTasks(parent.id).filter((task) =>
         task.childId === childId && (role === void 0 || task.role === role));
       return delegationTracker.completeActiveTasksByIds(tasks.map((task) => task.id));
+    }
+
+    /**
+     * 已脱离 root 的活动范围只能由该 child 自己的权威停止信号释放（票据 07）。
+     *
+     * root 销毁/代际退休会丢弃 recovery record，正常的 handleChildTurnEnd 不再运行；
+     * 但 detached 活动项仍在阻塞同路径任务。这里只处理仍被该 child 持有的 detached
+     * 活动项，并且只认 **child turn/end**（本 turn 的稳定 messageId 命中）：
+     * - 未绑定 messageId 的活动项（admission 竞态）保持保护，等 disposal 或其他 turn；
+     * - 没有 detached 活动项时完全 no-op，普通 child/root session 不受影响。
+     * @param {object} session - child Session。
+     * @param {object} event - session/event 事件。
+     * @returns {number} 释放条数。
+     */
+    function releaseDetachedActivitiesOnChildTurnEnd(session, event) {
+      if (event?.type !== "turn/end" || typeof session?.id !== "string") return 0;
+      const turn = event?.data?.turn;
+      if (!Number.isSafeInteger(turn)) return 0;
+      if (delegationTracker.activeTaskCounts().detached === 0) return 0;
+      const events = Array.isArray(session.events) ? session.events : [];
+      const turnMsgIds = messageIdsOfTurn(events, turn);
+      if (turnMsgIds.size === 0) return 0;
+      return delegationTracker.completeDetachedActiveTasksForChild(session.id, { turnMsgIds });
     }
 
     function pendingRootUserWait(agent, generation) {
@@ -3714,15 +3884,85 @@ export default {
       return { tracked, engaged, invalid };
     }
 
+    /** tokenDiagnostics 有界数组的上限：超出部分只计数，避免诊断本身变成泄漏面。 */
+    const FINALIZE_TOKEN_DIAGNOSTIC_LIMIT = 32;
+
     /**
-     * root-only 显式收口：登记调用方明确列出的、已经返回结果的 admission，然后**立即**
-     * 返回非终态 waiting 回执（两阶段语义）。
+     * 把调用方传入的（可选）admissionTokens 与批次的有效 admission 集合做**纯诊断**核对。
      *
-     * 1. 校验阶段与旧实现完全一致（token 集完整性、outcome 已 settle、
-     *    continue_parent_turn / safeParallelWork 等拒绝条件、root generation）；
+     * 不变量：本函数只产出诊断，绝不改变收口集合，也绝不参与放行/拒绝判定。
+     * - 缺失（expected 里有、调用方没传）只记录到 missing，不阻塞收口；
+     * - 未知 token（含从未交付给调用方的 discarded ticket 对应的凭据）与重复条目只记录到
+     *   有界数组并计数，一律忽略；
+     * - 非字符串条目计入 invalid，不改变有效集合；
+     * - 有界数组去重且最多 FINALIZE_TOKEN_DIAGNOSTIC_LIMIT 条，其余只通过 ignored 计数；
+     *   诊断里绝不含 prompt / 任务正文，只有 token 字符串本身。
+     *
+     * @param {string[]} expectedTokens - 服务端枚举的有效 admission token（批次内唯一）。
+     * @param {unknown} rawTokens - 调用方传入的 admissionTokens（可缺省、可为任意形状）。
+     * @returns {{provided:number, expected:number, missing:string[], unknown:string[],
+     *   duplicates:string[], invalid:number, ignored:number}} 诊断快照。其中 provided 是
+     *   调用方传入的原始条目数（含重复与非字符串），ignored 是不影响收口集合的条目数。
+     */
+    function finalizeTokenDiagnostics(expectedTokens, rawTokens) {
+      const supplied = Array.isArray(rawTokens)
+        ? rawTokens
+        : rawTokens === void 0 || rawTokens === null ? [] : [rawTokens];
+      const expectedSet = new Set(expectedTokens);
+      const provided = [];
+      let invalid = 0;
+      for (const item of supplied) {
+        if (typeof item === "string") provided.push(item);
+        else invalid += 1;
+      }
+      const seen = new Set();
+      const seenDuplicates = new Set();
+      const unknown = [];
+      const duplicates = [];
+      let ignored = invalid;
+      for (const token of provided) {
+        if (seen.has(token)) {
+          ignored += 1;
+          if (!seenDuplicates.has(token) && duplicates.length < FINALIZE_TOKEN_DIAGNOSTIC_LIMIT) {
+            seenDuplicates.add(token);
+            duplicates.push(token);
+          }
+          continue;
+        }
+        seen.add(token);
+        if (!expectedSet.has(token)) {
+          ignored += 1;
+          if (unknown.length < FINALIZE_TOKEN_DIAGNOSTIC_LIMIT) unknown.push(token);
+        }
+      }
+      const missing = [];
+      for (const token of expectedTokens) {
+        if (!seen.has(token) && missing.length < FINALIZE_TOKEN_DIAGNOSTIC_LIMIT) missing.push(token);
+      }
+      return {
+        provided: supplied.length,
+        expected: expectedTokens.length,
+        missing,
+        unknown,
+        duplicates,
+        invalid,
+        ignored,
+      };
+    }
+
+    /**
+     * root-only 显式收口：按「当前 root/run + admissionEpoch」定位整批工作，登记服务端
+     * 枚举出的已接受 admission，然后**立即**返回非终态 waiting 回执（两阶段语义）。
+     *
+     * 1. 批次定位键只有「当前 root 的开放批次 + admissionEpoch」：服务端自己枚举该 epoch
+     *    下**全部有效** admission（过滤 discarded），调用方不需要、也不应该枚举 token；
+     *    `admissionTokens` 只是可选诊断参数（缺失/多余/重复/未知/非字符串都不阻塞收口，
+     *    只通过 tokenDiagnostics 回报）；保留 outcome 已 settle、safeParallelWork、
+     *    continue_parent_turn、accepted handoff、root generation 等真实前提校验；
      * 2. 把每个 accepted admission **一次性**登记进唯一的 root turn 等待登记表，并把批次
      *    标为 pending-close（保存 exact admission 凭据）；
-     * 3. **立即**返回 `{kind:"waiting", admissionEpoch, acceptedCount, reason:"experts-running"}`。
+     * 3. **立即**返回 `{kind:"waiting", admissionEpoch, acceptedCount, reason:"experts-running",
+     *    tokenDiagnostics}`（tokenDiagnostics 只是可选诊断，不影响收口集合）。
      *    工具调用绝不在 run_code 内等待专家结束，也绝不使用 `exec.signal` 等待——PTC 的
      *    600000ms 墙钟因此不再能截断收口；
      * 4. 继续等待由 root turn 的 `agent/turn-stopping` serial 边界承担（见
@@ -3741,91 +3981,97 @@ export default {
      *   新接受的 admission）。
      */
     async function finalizeRootAdmissionBatch(parent, exec, args, rootToken) {
-      const epoch = args?.admissionEpoch;
-      const tokens = args?.admissionTokens;
+      const rawEpoch = args?.admissionEpoch;
+      const epoch = Number.isSafeInteger(rawEpoch) ? rawEpoch : 0;
       const base = {
-        admissionEpoch: Number.isSafeInteger(epoch) ? epoch : 0,
+        admissionEpoch: epoch,
         acceptedCount: 0,
       };
+      // 拒绝回执的统一构造：reason 是稳定机器码（契约与测试按它断言），message 是
+      // 「当前真实状态 + 下一步动作」的可执行提示，渲染文本必须同时带出两者。
+      // tokenDiagnostics 只属于 waiting（诊断与拒绝原因无关），拒绝路径不携带。
+      const reject = (reason, message, extra) => ({
+        kind: "rejected",
+        ...base,
+        ...(extra === void 0 ? {} : extra),
+        reason,
+        message,
+      });
       if (args?.summaryCompleted !== true || args?.outcomesChecked !== true) {
-        return { kind: "rejected", ...base, reason: "summary-or-outcome-check-required" };
+        return reject("summary-or-outcome-check-required",
+          "finalize 之前必须先在 root 回复里写出总结并检查每个 role 结果；请把 summaryCompleted 与 outcomesChecked 都设为 true 后重试。");
       }
       if (args?.safeParallelWork === true) {
-        return { kind: "rejected", ...base, reason: "safe-parallel-work-remains" };
+        return reject("safe-parallel-work-remains",
+          "仍有安全的非重叠并行工作可以派发；请先派发它们，确认没有安全并行工作后再调用 finalize。");
       }
-      if (!Number.isSafeInteger(epoch) || !Array.isArray(tokens)) {
-        return { kind: "rejected", ...base, reason: "invalid-admission-token-set" };
+      if (!Number.isSafeInteger(rawEpoch)) {
+        return reject("invalid-admission-epoch",
+          "admissionEpoch 必须是 role 工具回执里的整数；请传入该值重试（没有调用任何 role 工具时用 0）。");
       }
-      // 拒绝/不完整回执必须带上可自诊断的 message。reason 仍是稳定机器码（契约与既有
-      // 测试都按 reason 断言），message 只补充「当前真实状态是什么」，让模型不必再靠猜
-      // 去补齐 admissionTokens / admissionEpoch。
       const batch = rootAdmissionBatches.get(parent);
       if (batch === void 0) {
-        if (epoch === 0 && tokens.length === 0) return { kind: "noop", ...base, reason: "no-admission" };
-        return {
-          kind: "rejected",
-          ...base,
-          reason: "stale-admission-epoch",
-          message: "no open admission batch",
-        };
+        // 没有开放批次且 epoch 为 0：本 turn 没有真实 admission，保持既有幂等 no-admission。
+        // admissionTokens 只是诊断，传多传少都不改变这个结论。
+        if (epoch === 0) return { kind: "noop", ...base, reason: "no-admission" };
+        return reject("no-admission-batch",
+          "该 root 当前没有开放的 admission 批次（admissionEpoch " + epoch + " 不存在）；请先调用 role 工具取得 admissionEpoch，或在不传 tokens 时用 epoch 0 收口。");
       }
-      // 已关闭批次上的「无 admission」调用（epoch 0 + 空 token 集）是幂等 no-admission，
-      // 不是 stale：模型在没有调用任何 role 工具时被要求用这个凭据收口，重复调用必须与
-      // 首次调用（没有开放批次时的 no-admission）得到同一个结论。这个判定必须早于 epoch
-      // 比较——0 永远不等于任何真实 epoch，放在后面会被 stale 分支抢先。**非零** epoch
-      // 仍然按 stale-admission-epoch 拒绝（那是真的过期凭据）。
-      if (batch.closed === true && epoch === 0 && tokens.length === 0) {
+      // 已关闭批次上的「无 admission」调用（epoch 0）是幂等 no-admission，不是 stale：
+      // 模型在没有调用任何 role 工具时被要求用这个凭据收口，重复调用必须与首次调用（没有
+      // 开放批次时的 no-admission）得到同一个结论。这个判定必须早于 epoch 比较——0 永远
+      // 不等于任何真实 epoch，放在后面会被 stale 分支抢先。**非零** epoch 仍按
+      // stale-admission-epoch 拒绝（那是真的过期凭据）。
+      if (batch.closed === true && epoch === 0) {
         return { kind: "noop", ...base, reason: "no-admission" };
       }
       if (batch.epoch !== epoch) {
-        return {
-          kind: "rejected",
-          ...base,
-          reason: batch.closed ? "stale-admission-epoch" : "admission-epoch-mismatch",
-          message: "current open admissionEpoch is " + batch.epoch,
-        };
+        return reject(
+          batch.closed ? "stale-admission-epoch" : "admission-epoch-mismatch",
+          batch.closed
+            ? "admissionEpoch " + epoch + " 已经收口关闭；不要重复 finalize，若之后新建了 admission，请用新回执里的 admissionEpoch 重试。"
+            : "当前打开的 admissionEpoch 是 " + batch.epoch + "；请用该值重试。",
+        );
       }
       if (batch.closed === true) return { kind: "noop", ...base, reason: "already-finalized" };
-      if (batch.finalizing === true) return { kind: "rejected", ...base, reason: "finalization-in-progress" };
-      const uniqueTokens = [...new Set(tokens)];
-      // 必需 token 集 = 真正交给调用方的 admission。被 discardRootAdmission 丢弃的
-      // ticket 从未返回过凭据（未知/越权 childId 的拒绝路径），把它算进必需集只会让
-      // 同一 epoch 之后的合法收口永远 incomplete-admission-token-set。
-      const expectedTokens = [...batch.entries.entries()]
-        .filter(([, entry]) => entry?.discarded !== true)
-        .map(([token]) => token);
-      if (uniqueTokens.length !== tokens.length || uniqueTokens.length !== expectedTokens.length
-        || expectedTokens.some((token) => !uniqueTokens.includes(token))) {
-        return {
-          kind: "rejected",
-          ...base,
-          reason: "incomplete-admission-token-set",
-          message: "expected " + expectedTokens.length + " admissionToken(s) in epoch " + batch.epoch
-            + "（含 accepted/advisory/failure/reused 全部结果）",
-        };
+      if (batch.finalizing === true) {
+        return reject("finalization-in-progress",
+          "同一批次正在收口；不要并发调用 finalize，等本次调用返回 waiting 即可。");
       }
-      const entries = expectedTokens.map((token) => batch.entries.get(token));
-      if (entries.some((entry) => entry?.settled !== true || entry.outcome === void 0)) {
-        return { kind: "rejected", ...base, reason: "admission-outcome-pending" };
+      // 收口集合 = 服务端枚举的**整批有效** admission（唯一判定来源）。被
+      // discardRootAdmission 丢弃的 ticket 从未把凭据交给调用方（未知/越权 childId 的
+      // 拒绝路径），既不在集合里，也不参与诊断的 expected。调用方传不传 admissionTokens、
+      // 传了什么都**不改变**这个集合——token 只是可选诊断。
+      const expectedEntries = [...batch.entries.entries()]
+        .filter(([, entry]) => entry?.discarded !== true);
+      const expectedTokens = expectedEntries.map(([token]) => token);
+      const tokenDiagnostics = finalizeTokenDiagnostics(expectedTokens, args?.admissionTokens);
+      const entries = expectedEntries.map(([, entry]) => entry);
+      const pendingEntries = entries.filter((entry) => entry?.settled !== true || entry.outcome === void 0);
+      if (pendingEntries.length > 0) {
+        return reject("admission-outcome-pending",
+          "epoch " + batch.epoch + " 仍有 " + pendingEntries.length + " 个 admission 没有返回结果；请等这些 role 工具返回后再调用 finalize。");
       }
-      // continue_parent_turn 的 admission 仍必须纳入完整 token 检查，但它本身没有
-      // handoff。若同一开放批次后续已没有安全并行工作，仍应只收口普通 accepted admission；
-      // 只有纯 continue 批次才拒绝 finalize，避免安全并行任务把批次永久锁死。
+      // continue_parent_turn 的 admission 仍在有效集合里，但它本身没有 handoff。若同一
+      // 开放批次后续已没有安全并行工作，仍应只收口普通 accepted admission；只有纯 continue
+      // 批次才拒绝 finalize，避免安全并行任务把批次永久锁死。
       const acceptedEntries = entries.filter((entry) => entry.outcome?.kind === "continuable"
         && entry.outcome.reused !== true && entry.outcome.continueParentTurn !== true);
       if (acceptedEntries.length === 0 && entries.some((entry) => entry.outcome?.continueParentTurn === true)) {
-        return { kind: "rejected", ...base, reason: "continue-parent-turn" };
+        return reject("continue-parent-turn",
+          "本批次只有 continue_parent_turn 的 admission，没有可收口的已接受工作；不需要调用 finalize，继续这些安全并行工作即可。");
       }
       if (acceptedEntries.some((entry) => entry.outcome.handoffAdmission === void 0)) {
-        return { kind: "rejected", ...base, reason: "accepted-handoff-missing" };
+        return reject("accepted-handoff-missing",
+          "有已接受的 admission 缺少 handoffAdmission；请等该 role 工具返回完整结果（含 handoff）后再调用 finalize。");
       }
       if (acceptedEntries.length === 0) {
         batch.closed = true;
         return { kind: "noop", ...base, reason: "no-accepted-admission" };
       }
-      // 同一批次的重复**合法** finalize（同样的 epoch 与完整 token 集）必须得到稳定的
-      // waiting：既不重复登记 work，也不重复关闭或投递。这项判定放在全部校验之后，因此
-      // 错误/陈旧凭据仍会按上面的分支立即 rejected。
+      // 同一批次的重复**合法** finalize 必须得到稳定的 waiting：既不重复登记 work，也不
+      // 重复关闭或投递。这项判定放在全部校验之后，因此错误/陈旧凭据仍会按上面的分支立即
+      // rejected；诊断按批次**当前**有效集合现算（pending-close 期间的新 admission 会被计入）。
       if (batch.pendingClose !== void 0) {
         return {
           kind: "waiting",
@@ -3834,6 +4080,7 @@ export default {
           // 完整 accepted 集（初始那次回执是已返回的快照，不追写）。
           acceptedCount: pendingCloseAcceptedCount(parent),
           reason: "experts-running",
+          tokenDiagnostics,
         };
       }
       // 两阶段收口：① 登记等待工作并标记 pending-close（同步、无任何 await）；
@@ -3843,7 +4090,9 @@ export default {
       try {
         if (!host.lineage.isLiveGeneration(parent, rootToken)) {
           batch.closed = true;
-          return { kind: "rejected", ...base, acceptedCount: acceptedEntries.length, reason: "root-generation-retired" };
+          return reject("root-generation-retired",
+            "root 代际已退休，本次收口不会登记也不会投递；不要重试，由当前 root 重新开始。",
+            { acceptedCount: acceptedEntries.length });
         }
         registerRootTurnWaitWork(parent, acceptedEntries);
         // pending-close 保存 exact admission 对象：等待账本的记录会在一次静止收口后被
@@ -3862,6 +4111,7 @@ export default {
           ...base,
           acceptedCount: acceptedEntries.length,
           reason: "experts-running",
+          tokenDiagnostics,
         };
       } finally {
         batch.finalizing = false;
@@ -4045,6 +4295,9 @@ export default {
           batch.steerUnavailableLogged = true;
           ctx.logger.warn("dsh-expert-group: root Agent.steer is unavailable; the finalization conclusion was not delivered");
         }
+        // 票据 11：这是真实的投递失败（runtime 缺公开 steer），必须可观测；
+        // 批次保持 pending-close，等待后续具备该能力的 turn/runtime 重试。
+        noteRootWaitDelivery(parent, false, "steer-unavailable");
         return false;
       }
       // 收口时刻的完整 accepted 集：pending-close 期间新接受的 admission 也在其中，
@@ -4060,6 +4313,7 @@ export default {
       } catch (error) {
         ctx.logger.warn("dsh-expert-group: root finalization message construction failed: "
           + (error instanceof Error ? error.name : "Error"));
+        noteRootWaitDelivery(parent, false, "message-construction-failed");
         return false;
       }
       try {
@@ -4068,10 +4322,12 @@ export default {
         // 投递失败保持 pending-close：结论还没有进入模型上下文，批次不能算收口完成。
         ctx.logger.warn("dsh-expert-group: root finalization steer failed: "
           + (error instanceof Error ? error.name : "Error"));
+        noteRootWaitDelivery(parent, false, "steer-failed");
         return false;
       }
       batch.closed = true;
       batch.pendingClose = void 0;
+      noteRootWaitDelivery(parent, true, "delivered");
       return true;
     }
 
@@ -4079,18 +4335,17 @@ export default {
 
     ctx.effect(() => tools.register(defineTool({
       name: "dsh_expert_group_finalize",
-      description: "Finalize the current root turn only after every role-tool admission result named by admissionTokens has returned, the root agent has completed its summary and integration/review/verification check, and no safe non-overlapping parallel work remains. This root-only action validates that batch against the open admission epoch, registers every accepted expert task on the root turn wait ledger, and returns immediately with a non-terminal waiting receipt carrying admissionEpoch and acceptedCount: it never waits inside the tool call, because the root turn lifecycle keeps waiting at the agent/turn-stopping boundary on that same ledger, with no timeout, as an expert may legitimately run for hours. A waiting receipt means the wait is registered, not that any expert finished; it is not an asynchronous task handle and there is no status to poll. Do not call finalize again for that batch and do not poll for status: once every accepted task has actually finished, the plugin closes the batch and steers one DEG-sourced finalization message into your next step automatically. Do not call it while safe parallel work remains; a pure continue_parent_turn batch has no accepted admission to finalize, while a later ordinary admission may finalize the complete checked token set.",
+      description: "Finalize the current root turn only after every result of the current admission batch has returned, the root agent has completed its summary and integration/review/verification check, and no safe non-overlapping parallel work remains. The batch is located by the current root/run plus admissionEpoch alone: the server enumerates the complete effective admission set for that epoch, so admissionTokens is an optional diagnostic argument, and missing, extra, duplicate, unknown, discarded, or non-string tokens never block finalization (they are only reported back in tokenDiagnostics). This root-only action registers every accepted expert task on the root turn wait ledger, and returns immediately with a non-terminal waiting receipt carrying admissionEpoch, acceptedCount, and tokenDiagnostics: it never waits inside the tool call, because the root turn lifecycle keeps waiting at the agent/turn-stopping boundary on that same ledger, with no timeout, as an expert may legitimately run for hours. A waiting receipt means the wait is registered, not that any expert finished; it is not an asynchronous task handle and there is no status to poll. Do not call finalize again for that batch and do not poll for status: once every accepted task has actually finished, the plugin closes the batch and steers one DEG-sourced finalization message into your next step automatically. Do not call it while safe parallel work remains; a pure continue_parent_turn batch has no accepted admission to finalize, while a later ordinary admission may finalize the same open batch. Every rejected receipt carries a stable reason code and an actionable message.",
       parameters: {
         admissionEpoch: {
           type: "number",
           required: true,
-          description: "The admissionEpoch returned by the role tools for the batch being checked; use 0 with an empty token list when no role tool was called.",
+          description: "The admissionEpoch returned by the role tools for the batch being checked; it is the only batch location key. Use 0 when no role tool was called.",
         },
         admissionTokens: {
           type: "array",
-          required: true,
-          items: { type: "string" },
-          description: "Every unique admissionToken returned by the role tools in this open batch, including accepted, advisory, and failure outcomes.",
+          items: { type: "json" },
+          description: "Optional diagnostic list of admissionToken values from role-tool receipts. It never changes the finalized batch: missing, extra, duplicate, unknown, discarded, or non-string entries are ignored for finalization and only reported back in tokenDiagnostics. Omit it in normal use.",
         },
         summaryCompleted: {
           type: "boolean",
@@ -4119,6 +4374,25 @@ export default {
             acceptedCount: { type: "number", required: true },
             reason: { type: "string", required: true },
             message: { type: "string" },
+            /**
+             * 可选诊断字段（票据 10）：只有 waiting 回执携带，其余 kind 省略。
+             * unknown / duplicates / missing 是有界字符串数组（去重、最多 32 条），其余
+             * 只通过计数表达；它们只描述调用方凭据与批次有效集合的差异，绝不改变收口集合，
+             * 也不含 prompt / 任务正文。
+             */
+            tokenDiagnostics: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                provided: { type: "number", required: true },
+                expected: { type: "number", required: true },
+                missing: { type: "array", required: true, items: { type: "string" } },
+                unknown: { type: "array", required: true, items: { type: "string" } },
+                duplicates: { type: "array", required: true, items: { type: "string" } },
+                invalid: { type: "number", required: true },
+                ignored: { type: "number", required: true },
+              },
+            },
           },
         },
         render(_args, value) {
@@ -4128,9 +4402,20 @@ export default {
           // waiting 是非终态回执：模型必须看到「等待已登记、不要重试、不要轮询」，
           // 否则会把 waiting 误当成最终结论，或者反复调用 finalize。
           if (value.kind === "waiting") {
+            const diagnostics = value.tokenDiagnostics;
+            // 诊断只回显计数与有界数组长度：渲染文本不展开 token 明细，避免把内部凭据
+            // 刷进模型上下文；需要具体条目时读回执 JSON。
+            const summary = diagnostics === void 0 ? ""
+              : " — token diagnostics: provided " + diagnostics.provided
+                + ", expected " + diagnostics.expected
+                + ", missing " + diagnostics.missing.length
+                + ", unknown " + diagnostics.unknown.length
+                + ", duplicates " + diagnostics.duplicates.length
+                + ", invalid " + diagnostics.invalid
+                + ", ignored " + diagnostics.ignored;
             return [{ type: "text", text: base
               + " — waiting registered for " + value.acceptedCount + " accepted expert task(s) in admissionEpoch "
-              + value.admissionEpoch
+              + value.admissionEpoch + summary
               + "; do not call finalize again and do not poll for status" }];
           }
           return [{ type: "text", text: base }];
@@ -4139,21 +4424,47 @@ export default {
       isConcurrencySafe: () => false,
       execute(args, exec) {
         const parent = exec?.agent;
-        if (!isLiveRootAgent(parent)) throw new Error("dsh_expert_group_finalize is root-only and requires the current live root agent");
+        const epoch = Number.isSafeInteger(args?.admissionEpoch) ? args.admissionEpoch : 0;
+        // root-only / 代际边界不再抛异常：调用方必须拿到结构化的 rejected 回执（稳定
+        // reason + 可执行 message），否则只能看到一条异常文本，无法按 reason 恢复。
+        if (!isLiveRootAgent(parent)) {
+          return {
+            kind: "rejected",
+            admissionEpoch: epoch,
+            acceptedCount: 0,
+            reason: "root-only",
+            message: "dsh_expert_group_finalize 只能由当前 live root agent 调用；专家子代理不要收口，直接返回自己的结果。",
+          };
+        }
         const rootToken = host.lineage.tokenFor(parent);
-        if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
+        if (!host.lineage.isLiveGeneration(parent, rootToken)) {
+          return {
+            kind: "rejected",
+            admissionEpoch: epoch,
+            acceptedCount: 0,
+            reason: "root-generation-retired",
+            message: "root 代际已退休，本次收口不会登记也不会投递；不要重试，由当前 root 重新开始。",
+          };
+        }
         return finalizeRootAdmissionBatch(parent, exec, args, rootToken);
       },
     })), "dsh-expert-group: root finalization tool");
 
+    /**
+     * 最近一次 release_scope 拒绝释放的只读摘要（诊断用）：
+     * 只有时间戳、活动条数与固定原因码，不含 child/agent id 或任务正文。
+     * @type {{at:number, activeCount:number, reason:string}|null}
+     */
+    let lastRefusedScopeRelease = null;
+
     ctx.effect(() => tools.register(defineTool({
       name: "dsh_expert_group_release_scope",
-      description: "Release the DEG plugin's stale active scope for one exact child. This root-only recovery action clears only the plugin's file-range guard; it does not stop, resume, notify, or conclude the child or the current root turn. Use it only after terminal child feedback has arrived and the child is ready, when normal turn/message correlation did not release the scope.",
+      description: "Read-only diagnosis of the DEG plugin's active file-range scope for one exact child. This root-only tool never releases the guard and never stops, resumes, notifies, or concludes the child or the current root turn: it returns a stable scope-release-refused receipt with the still-active activities so the caller can see what holds the scope. The guard is released only by authoritative child stop evidence (that child's turn/end or disposal) or a process restart; root completion, root generation replacement, and manual actions never release it. Call it only to inspect why a path is still guarded.",
       parameters: {
         childId: {
           type: "string",
           required: true,
-          description: "The exact durable child session id from the terminal feedback or agent list.",
+          description: "The exact durable child session id whose active DEG scope should be inspected.",
         },
         role: {
           type: "string",
@@ -4162,7 +4473,7 @@ export default {
         reason: {
           type: "string",
           required: true,
-          description: "Short explanation confirming terminal feedback was received and this is stale-scope recovery.",
+          description: "Short diagnostic note for the caller's own record; it is validated for non-emptiness and never changes the outcome.",
         },
       },
       output: {
@@ -4170,14 +4481,41 @@ export default {
           type: "object",
           additionalProperties: false,
           properties: {
-            kind: { type: "string", required: true, const: "scope-released" },
+            // 稳定拒绝回执：任何调用都不会释放保护，因此 kind 固定，不提供成功变体。
+            kind: { type: "string", required: true, const: "scope-release-refused" },
             childId: { type: "string", required: true },
-            releasedCount: { type: "number", required: true },
+            activeCount: { type: "number", required: true },
+            // 固定原因码：authoritative-stop-required / no-active-scope。
             reason: { type: "string", required: true },
+            /**
+             * 仍然持有保护的活动项摘要：activityId / role / taskKey 是插件内部标识，
+             * childId 仅为 exact 匹配回显，detached 表示所属 root 已销毁/代际退休。
+             * 不包含 prompt、description、affectedPaths 或 parentAgent。
+             */
+            active: {
+              type: "array",
+              required: true,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  activityId: { type: "string", required: true },
+                  role: { type: "string", required: true },
+                  taskKey: { type: "string", required: true },
+                  childId: { type: "string" },
+                  detached: { type: "boolean", required: true },
+                },
+              },
+            },
+            hint: { type: "string", required: true },
           },
         },
         render(_args, value) {
-          return [{ type: "text", text: "DEG scope released for " + value.childId + ": " + value.releasedCount }];
+          const activeText = value.active.length === 0
+            ? "no active scope"
+            : value.active.map((task) => task.role + "/" + task.activityId + (task.detached ? " (detached)" : "")).join(", ");
+          return [{ type: "text", text: "DEG scope NOT released for " + value.childId
+            + " (" + value.reason + ", active " + value.activeCount + ": " + activeText + "). " + value.hint }];
         },
       },
       isConcurrencySafe: () => false,
@@ -4189,10 +4527,174 @@ export default {
         const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
         if (childId.length === 0) throw new Error("dsh_expert_group_release_scope childId must be non-empty");
         if (reason.length === 0) throw new Error("dsh_expert_group_release_scope reason must be non-empty");
-        const releasedCount = releaseActiveExpertScope(parent, { childId, role });
-        return { kind: "scope-released", childId, releasedCount, reason };
+        // 只读诊断（票据 07/11）：人工动作不释放影响范围保护。活动项一律保留，等待该
+        // child 自己的权威停止证据；同一 parentId 下 detached 的旧代际活动项同样列出，
+        // 因为它们仍会阻塞当前 root 的同路径任务。
+        const active = delegationTracker.listActiveTasks(parent.id)
+          .filter((task) => task.childId === childId && (role === void 0 || task.role === role))
+          .map((task) => ({
+            activityId: task.id,
+            role: task.role,
+            taskKey: task.taskKey,
+            ...(typeof task.childId === "string" ? { childId: task.childId } : {}),
+            detached: task.detached === true,
+          }));
+        const refusalReason = active.length === 0 ? "no-active-scope" : "authoritative-stop-required";
+        lastRefusedScopeRelease = { at: Date.now(), activeCount: active.length, reason: refusalReason };
+        return {
+          kind: "scope-release-refused",
+          childId,
+          activeCount: active.length,
+          reason: refusalReason,
+          active,
+          hint: active.length === 0
+            ? "该 child 当前没有活动范围，无需释放；DEG 也不会因人工调用改变任何保护。"
+            : "DEG 只在权威停止证据（该 child 的 turn/end 或 disposal）或进程重启后释放影响范围保护；root 结束、代际更新与人工动作都不会释放，请等待该 child 的真实停止信号。",
+        };
       },
-    })), "dsh-expert-group: stale scope release tool");
+    })), "dsh-expert-group: scope diagnosis tool");
+
+    /**
+     * root-only 人工逃生：在**权威后代查询明确无活动后代**时关闭当前 admission 批次的
+     * 等待账本（票据 11）。
+     *
+     * 边界（fail-closed，逐条对应票据验收）：
+     * 1. 只接受当前 live root，且 generation 仍 live；
+     * 2. 必须有**开放**的 admission 批次（closed/abandoned 一律 no-open-batch）；
+     * 3. 后代查询必须明确回答 known===true；查询失败/降级/未知一律拒绝并返回稳定原因码；
+     * 4. running 非空一律拒绝（只回数量，不回 child id）；
+     * 5. 成功后只做三件事：标记 batch.abandoned/closed、清 pendingClose、收口等待账本。
+     *    绝不调用 delegationTracker/fanoutHost/cancel/notify 的任何释放或取消方法——
+     *    专家 child 继续运行，影响范围保护继续持有，真实停止判定不受影响。
+     */
+    ctx.effect(() => tools.register(defineTool({
+      name: "dsh_expert_group_abandon_wait",
+      description: "Root-only manual escape for a root turn wait ledger. Call it only when the authoritative root-scoped descendant query explicitly reports that no descendant is running (known and empty). It closes the current admission batch's wait ledger and marks the batch abandoned: it never cancels, interrupts, or concludes any expert child, never releases the DEG file-range scope, never changes the fanout manager, and never affects the real stop boundary. Query failure, capability degradation, or unknown descendant state is rejected with a stable reason code (descendant-query-unknown); running descendants are rejected as descendants-active; no open admission batch is rejected as no-open-batch. This tool is a last resort for a batch that is demonstrably still while the root turn cannot settle, not a way to skip waiting for live experts.",
+      parameters: {
+        reason: {
+          type: "string",
+          required: true,
+          description: "Why the wait ledger is being closed manually. Required and non-empty; it is validated for non-emptiness and never changes the authoritative descendant check.",
+        },
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            // 成功只回「等待账本已关闭」；拒绝是结构化回执，绝不抛异常。
+            kind: { type: "string", required: true, enum: ["wait-abandoned", "rejected"] },
+            admissionEpoch: { type: "number", required: true },
+            outstanding: { type: "number", required: true },
+            // 成功回执：关闭时刻（诊断用）。
+            abandonedAt: { type: "number" },
+            // 拒绝回执：稳定机器码 + 可执行提示。
+            reason: { type: "string" },
+            message: { type: "string" },
+            // 查询未知时的底层原因码（固定 token，不含错误消息）。
+            descendantReason: { type: "string" },
+            // 仍有运行后代时的数量（只回数量，不回任何 id）。
+            activeCount: { type: "number" },
+          },
+        },
+        render(_args, value) {
+          if (value.kind === "wait-abandoned") {
+            return [{
+              type: "text",
+              text: "root wait ledger abandoned: admissionEpoch " + value.admissionEpoch
+                + ", outstanding " + value.outstanding
+                + "; no child was cancelled and no scope was released",
+            }];
+          }
+          let text = "root wait abandon rejected: " + value.reason;
+          if (value.activeCount !== undefined) text += " — active descendants: " + value.activeCount;
+          if (value.descendantReason) text += " — descendant query: " + value.descendantReason;
+          if (value.message) text += " — " + value.message;
+          return [{ type: "text", text }];
+        },
+      },
+      isConcurrencySafe: () => false,
+      async execute(args, exec) {
+        const parent = exec?.agent;
+        const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
+        // 拒绝回执统一构造：admissionEpoch/outstanding 固定可与成功回执同形。
+        const reject = (code, message, extra) => ({
+          kind: "rejected",
+          admissionEpoch: 0,
+          outstanding: 0,
+          reason: code,
+          message,
+          ...(extra ?? {}),
+        });
+        if (!isLiveRootAgent(parent)) {
+          return reject("root-only", "dsh_expert_group_abandon_wait 只能由当前 live root agent 调用；专家子代理不要关闭等待账本。");
+        }
+        if (reason.length === 0) {
+          return reject("invalid-reason", "reason 必须是非空字符串：请写明本次人工关闭等待账本的原因。");
+        }
+        const rootToken = host.lineage.tokenFor(parent);
+        if (!host.lineage.isLiveGeneration(parent, rootToken)) {
+          return reject("root-generation-retired", "root 代际已退休，不能关闭等待账本；不要重试，由当前 root 重新开始。");
+        }
+        const batch = rootAdmissionBatches.get(parent);
+        if (batch === void 0 || batch.closed === true || batch.abandoned === true) {
+          return reject("no-open-batch", "该 root 当前没有开放的 admission 批次（或批次已关闭），没有可关闭的等待账本；请勿重复调用。");
+        }
+        let snapshot;
+        try {
+          snapshot = await snapshotRootTurnDescendants(parent.id);
+        } catch (error) {
+          // 同步/异步查询抛错都按未知处理：绝不凭异常逃生。
+          logTurnWaitError("abandon-wait-query", error);
+          snapshot = { known: false, running: [], reason: "descendant-query-failed" };
+        }
+        // await 之后必须复查：root 可能已退休、批次可能已被 finalize/另一路径关闭或替换。
+        if (!isLiveRootAgent(parent)) {
+          return reject("root-only", "root 在查询期间已不再是 live root；不要重试。", { admissionEpoch: batch.epoch });
+        }
+        if (rootAdmissionBatches.get(parent) !== batch || batch.closed === true || batch.abandoned === true) {
+          return reject("no-open-batch", "等待期间该 admission 批次已被关闭或替换；不要重试。", { admissionEpoch: batch.epoch });
+        }
+        if (snapshot?.known !== true) {
+          // 固定原因码：底层 reason 只作为诊断 token 回显，绝不把错误消息/异常原文带出。
+          const descendantReason = diagnosticToken(snapshot?.reason, "descendant-query-unknown");
+          return reject(
+            "descendant-query-unknown",
+            "无法权威确认后代是否已停止（查询失败/降级/状态未知），拒绝关闭等待账本；等待会继续，未知状态不能当作无活动后代。",
+            { admissionEpoch: batch.epoch, descendantReason },
+          );
+        }
+        // known===true 但 running 不是数组：契约不成立，按未知拒绝（人工逃生必须比等待
+        // 判定更保守，绝不能把 malformed 当成空列表）。
+        if (!Array.isArray(snapshot.running)) {
+          return reject(
+            "descendant-query-unknown",
+            "权威查询的回答结构非法（running 不是数组），拒绝关闭等待账本；等待会继续。",
+            { admissionEpoch: batch.epoch, descendantReason: "descendant-query-malformed" },
+          );
+        }
+        const running = snapshot.running;
+        if (running.length > 0) {
+          return reject(
+            "descendants-active",
+            "权威查询显示仍有运行中的后代，拒绝关闭等待账本；请等待这些专家真正结束。",
+            { admissionEpoch: batch.epoch, activeCount: running.length },
+          );
+        }
+        // 唯一写入：标记批次 + 清 pendingClose + 收口等待账本。绝不触碰 child/manager/scope。
+        batch.abandoned = true;
+        batch.closed = true;
+        batch.pendingClose = void 0;
+        const abandoned = rootTurnWaits.abandon(parent, "manual-abandon");
+        rootWaitAbandonCount += 1;
+        return {
+          kind: "wait-abandoned",
+          admissionEpoch: batch.epoch,
+          outstanding: abandoned.outstanding,
+          abandonedAt: Date.now(),
+        };
+      },
+    })), "dsh-expert-group: abandon wait ledger tool");
 
     /**
      * 收集「已接受、但还没有被 finalize 收口」的 role admission。
@@ -4253,6 +4755,9 @@ export default {
      * @returns {Promise<void>} 静止、收口完成或等待被取消后返回。
      */
     async function awaitRootTurnWaitFallback(parent, signal) {
+      // 票据 11：人工逃生已经关闭该批次时直接放行。abandoned 是显式标记（closed 之外
+      // 的语义位），保证即使账本仍被其它路径 engage 也绝不重新等待或投递。
+      if (rootAdmissionBatches.get(parent)?.abandoned === true) return;
       // 同步取一次 pending-close 快照：等待期间批次可能被其它边界关闭或代际退休，
       // 投递前的身份复查（deliverRootFinalizationConclusion）据此拒绝过期投递。
       const pendingClose = pendingCloseBatchFor(parent);
@@ -4285,6 +4790,8 @@ export default {
     ctx.on("agent/turn-stopping", (payload) => {
       const parent = payload?.agent;
       if (turnWaitStopping || !isRootAgentIdentity(parent) || !isLiveRootAgent(parent)) return;
+      // 票据 11：人工逃生关闭的批次直接放行，不再等待、不再投递。
+      if (rootAdmissionBatches.get(parent)?.abandoned === true) return;
       // 同步前置判定：既没有进入等待体系、也没有可补登记的 admission、也没有待收口的
       // pending-close 批次时直接放行——绝不为了「形式上返回 Promise」而在每个 turn 边界
       // 插入一次多余的异步查询。pending-close 必须参与：它的等待账本记录可能已被销毁
@@ -4568,9 +5075,9 @@ export default {
     }
 
     /**
-     * root admission 的显式 epoch。role tool 只负责登记并返回 token；finalize
-     * 收到完整 token 集合后关闭当前 epoch，后续 admission 会创建新 epoch，
-     * 不会把迟到调用或下一轮调用并入已经收口的批次。
+     * root admission 的显式 epoch。role tool 只负责登记并返回 token；finalize 以
+     * 「当前 root 的开放批次 + admissionEpoch」定位整批并收口后关闭当前 epoch，后续
+     * admission 会创建新 epoch，不会把迟到调用或下一轮调用并入已经收口的批次。
      */
     const rootAdmissionBatches = new WeakMap();
     let rootAdmissionEpoch = 0;
@@ -4661,11 +5168,12 @@ export default {
      * 没有派发、没有投递、没有 interrupt，也没有产生任何 handoff，因此：
      * 1. 记录 rejected outcome 并 settle 协调器，让本批在途计数归位，批次不会停在
      *    admission-outcome-pending（否则 finalize 永远收不了口）；
-     * 2. 把 entry 标记为 discarded —— finalize 的「完整 token 集」只能由**模型真正收到
-     *    凭据**的 admission 组成；把模型永远拿不到的 token 留在必需集里，会让同一 epoch
-     *    之后的合法收口永远 incomplete-admission-token-set（这正是「毒化 root batch」）；
+     * 2. 把 entry 标记为 discarded —— 收口集合由服务端枚举，只能包含**模型真正收到凭据**
+     *    的 admission；把模型永远拿不到的 ticket 留在有效集合里，会让 expected 与
+     *    tokenDiagnostics 虚高，也会让批次停在 admission-outcome-pending（这正是
+     *    「毒化 root batch」）；
      * 3. 若本批已无在途 ticket、且全部 entry 都是 discarded，就把整批从 map 撤下：之后
-     *    「本 turn 没有真实 admission」的 finalize(epoch 0 + 空 token 集) 仍然回到既有的
+     *    「本 turn 没有真实 admission」的 finalize(epoch 0，且不传 token) 仍然回到既有的
      *    no-admission 幂等语义，而不是被一个空批次挡成 admission-epoch-mismatch。
      *
      * 撤批是精确的：只在本批仍是该 root 的当前批次、未 closed、未进入 pending-close/
@@ -4730,7 +5238,9 @@ export default {
         recoveryRecords,
         transaction,
         releaseActivity: (activityIdToRelease) => delegationTracker.releaseActiveTask(activityIdToRelease),
-        dropRecord: (childId, reason, record) => dropRecoveryRecord(childId, reason, record),
+        // 事务回滚发生在 admission 边界：child 可能已经创建，不能据此释放范围保护；
+        // 回滚助手自己负责释放本次预登记的 activityId。
+        dropRecord: (childId, reason, record) => dropRecoveryRecord(childId, reason, record, { releaseScope: false }),
         message,
       });
     }
@@ -4750,6 +5260,7 @@ export default {
       notificationVolume: 100,
       notificationHoldMs: DEFAULT_NOTIFICATION_HOLD_MS,
       roleConcurrencyLimit: DEFAULT_ROLE_CONCURRENCY_LIMIT,
+      roleTimeoutMs: DEFAULT_ROLE_TIMEOUT_MS,
       observerPreferred: false,
       taskManagementEnabled: true,
       autoOpenSubagentSidebar: false,
@@ -4762,6 +5273,14 @@ export default {
     // fan-out 快照缓存由 host/storage-binding 持有（storageBinding.fanoutSnapshot()）。
     // fan-out 父任务 ownership 索引由 host/lineage 持有。
     let fanoutHost;
+    /**
+     * 最近一次冷启动 restoreEvents 的结果（票据 04）。
+     *
+     * 事件历史恢复的布尔返回值过去被直接丢弃：快照里的历史因超预算被整体拒绝时，
+     * 进程端 cursor 会从 0 重新开始，但没有任何日志/诊断说明原因。这里记录 accepted
+     * 与是否真的存在待恢复事件，供 describeRuntimeDiagnostics 与告警使用。
+     */
+    let lastFanoutEventRestore = null;
     /**
      * root replacement/dispose 后移除旧 Agent 的 fan-out 所有权索引。task/result
      * 历史仍由 manager 保留；只有 ownership 被摘除，避免同 id 新 root 复用旧任务。
@@ -4796,6 +5315,9 @@ export default {
         notificationVolume: settingsSnapshot.notificationVolume,
         notificationHoldMs: settingsSnapshot.notificationHoldMs,
         roleConcurrencyLimit: settingsSnapshot.roleConcurrencyLimit,
+        // 角色默认超时属于全局 settings：必须随同一份快照进入 source()，
+        // 否则冷恢复/服务重载之后读到的值会悄悄退回“不启用”。
+        roleTimeoutMs: settingsSnapshot.roleTimeoutMs,
         observerPreferred: settingsSnapshot.observerPreferred,
         taskManagementEnabled: settingsSnapshot.taskManagementEnabled,
         // 自动打开属于全局 settings：必须随同一份快照进入 source()，否则冷恢复/服务重载
@@ -4874,6 +5396,7 @@ export default {
       notificationVolume: 100,
       notificationHoldMs: DEFAULT_NOTIFICATION_HOLD_MS,
       roleConcurrencyLimit: DEFAULT_ROLE_CONCURRENCY_LIMIT,
+      roleTimeoutMs: DEFAULT_ROLE_TIMEOUT_MS,
       observerPreferred: false,
       taskManagementEnabled: true,
       autoOpenSubagentSidebar: false,
@@ -5001,10 +5524,27 @@ export default {
         }
         storageBinding.setDomainSnapshot(readDomainSnapshot(sessionEntries, childEntries));
         storageBinding.setFanoutSnapshot(fanoutEntries.find(([key]) => key === "current")?.[1]);
+        const persistedFanoutSnapshot = storageBinding.fanoutSnapshot();
         // 事件历史与任务快照同代持久化；Host 自有查询缓存也必须先水合，避免冷启动 cursor 从 0 重置。
-        fanoutHost.restoreEvents(storageBinding.fanoutSnapshot()?.events);
-        host.lineage.restoreParentSessions(storageBinding.fanoutSnapshot());
-        fanoutHost.restore();
+        const eventRestoreAccepted = fanoutHost.restoreEvents(persistedFanoutSnapshot?.events);
+        lastFanoutEventRestore = {
+          accepted: eventRestoreAccepted === true,
+          attempted: Array.isArray(persistedFanoutSnapshot?.events),
+          at: Date.now(),
+        };
+        if (eventRestoreAccepted !== true && Array.isArray(persistedFanoutSnapshot?.events)) {
+          // 恢复失败必须可见：布尔返回值 + 预算违规（只记资源名/字节，不记事件正文）。
+          const violation = typeof fanoutHost.budget === "function" ? fanoutHost.budget()?.lastViolation : null;
+          ctx.logger.warn("dsh-expert-group: fan-out event history restore rejected (events="
+            + persistedFanoutSnapshot.events.length
+            + (violation === null || violation === undefined
+              ? ""
+              : ", resource=" + String(violation.resource) + ", received=" + String(violation.receivedBytes)
+                + ", limit=" + String(violation.maxBytes))
+            + ")");
+        }
+        host.lineage.restoreParentSessions(persistedFanoutSnapshot);
+        consumeFanoutRestore("storage-ready", fanoutHost.restore());
         // 冷恢复：restore 之后为「已在运行、但本进程还没有登记」的 fan-out 父任务补登记
         // 等待工作。终态任务只标记已释放，绝不登记（它们不会再产生 task_settled）。
         reconcileFanoutGoalHandoffs();
@@ -5047,6 +5587,27 @@ export default {
           source,
         });
       } catch { /* 健康记录失败不得影响真实写入结果。 */ }
+    }
+
+    /**
+     * 消费一次 fan-out 恢复结果（票据 04）。
+     *
+     * restore 不再允许"失败即静默"：返回值里的结构化 error（code/field/violation）会
+     * 进入日志，并通过 fanoutHost.describe().persistence 进入 RPC 诊断；fail-closed 的
+     * persistenceBlocked 由 host/fanout-runtime 维护，这里只负责观测与告警。
+     *
+     * @param {string} label - 调用位置标签（storage-ready / agent-created / runtime-wired）。
+     * @param {object|undefined} outcome - fanoutHost.restore() 的返回值。
+     */
+    function consumeFanoutRestore(label, outcome) {
+      if (outcome === null || typeof outcome !== "object") return outcome;
+      if (outcome.ok === true) return outcome;
+      const error = outcome.error;
+      if (error === undefined || error === null) return outcome;
+      ctx.logger.warn("dsh-expert-group: fan-out snapshot restore failed (" + label + ") ["
+        + (typeof error.code === "string" && error.code.length > 0 ? error.code : "RESTORE_FAILED") + "]: "
+        + (typeof error.message === "string" ? error.message : "unknown"));
+      return outcome;
     }
 
     /** domain 写入串行，并在执行前等待当前 storage-domain generation ready。 */
@@ -5355,6 +5916,14 @@ export default {
       if (hasRoleConcurrencyLimit && roleConcurrencyLimit !== candidate.roleConcurrencyLimit) {
         throw new ValidationError("设置 roleConcurrencyLimit 无效");
       }
+      // 角色默认超时（票据 06）：缺字段（旧客户端）不写 patch；显式提供时必须严格
+      // 落在 0 或 1000~86,400,000 的整秒毫秒数上。归一后不等于原值（含 1500、
+      // 负数、字符串）就是非法，绝不静默回退成“不启用”。
+      const hasRoleTimeoutMs = candidate.roleTimeoutMs !== void 0;
+      const roleTimeoutMs = hasRoleTimeoutMs ? normalizeRoleTimeoutMs(candidate.roleTimeoutMs) : void 0;
+      if (hasRoleTimeoutMs && roleTimeoutMs !== candidate.roleTimeoutMs) {
+        throw new ValidationError("设置 roleTimeoutMs 无效");
+      }
       if (candidate.observerPreferred !== void 0 && typeof candidate.observerPreferred !== "boolean") {
         throw new ValidationError("设置 observerPreferred 无效");
       }
@@ -5448,6 +6017,8 @@ export default {
           notificationVolume: validated.notificationVolume,
           ...(candidate.notificationHoldMs === void 0 ? {} : { notificationHoldMs: validated.notificationHoldMs }),
           ...(candidate.roleConcurrencyLimit === void 0 ? {} : { roleConcurrencyLimit: validated.roleConcurrencyLimit }),
+          // 角色默认超时同样「缺字段即不覆盖」：旧客户端保存通知设置不得把它重置为 0。
+          ...(candidate.roleTimeoutMs === void 0 ? {} : { roleTimeoutMs: validated.roleTimeoutMs }),
           // 旧客户端缺失该字段时不覆盖已有值；新客户端显式提交 true/false。
           ...(candidate.observerPreferred === void 0 ? {} : { observerPreferred: validated.observerPreferred }),
           // 任务管理同样是「缺字段即不覆盖」：旧客户端保存通知设置不得顺带重置侧边栏注册。
@@ -5465,6 +6036,7 @@ export default {
         // 旧客户端没有这些字段；它的提交/返回保持历史形状，新客户端会在 normalize 后显式携带值。
         if (candidate.observerPreferred === void 0) delete committedSettings.observerPreferred;
         if (candidate.roleConcurrencyLimit === void 0) delete committedSettings.roleConcurrencyLimit;
+        if (candidate.roleTimeoutMs === void 0) delete committedSettings.roleTimeoutMs;
         if (!hasTaskManagementEnabled) delete committedSettings.taskManagementEnabled;
         if (!hasAutoOpenSubagentSidebar) delete committedSettings.autoOpenSubagentSidebar;
         if (!hasPromptOverrides) delete committedSettings[PROMPT_OVERRIDES_SETTINGS_KEY];
@@ -5599,7 +6171,7 @@ export default {
             + ") for " + (typeof agent?.id === "string" ? agent.id : "unknown"));
           // 直接终止：绝不登记/装 guard，也**不回落**普通专家恢复分支——那条路径会把
           // 不可信（或无从证明）的身份快照当成可自动恢复的专家 child 继续使用。
-          fanoutHost?.restore();
+          consumeFanoutRestore("agent-created-precheck-rejected", fanoutHost?.restore());
           return;
         }
         // fan-out child 也必须在**本分支**完成 exact Agent 登记与 scoped guard 安装：
@@ -5621,10 +6193,10 @@ export default {
           ?? (isFanoutIdentity(recordedFanoutChild) ? recordedFanoutChild.fanoutParentAgentId : void 0);
         installExpertReportGuardForAgent(agent, { role: fanoutRole, parentId: fanoutParentId, source: "fanout" });
         fanoutHost?.handleAgentCreated(agent, recordedFanoutChild);
-        fanoutHost.restore();
+        consumeFanoutRestore("agent-created-fanout", fanoutHost.restore());
         return;
       }
-      fanoutHost?.restore();
+      consumeFanoutRestore("agent-created", fanoutHost?.restore());
       if (typeof agent?.id === "string") {
         const registered = agents.get(agent.id);
         const currentChildRecord = recoveryRecords.get(agent.id);
@@ -5867,6 +6439,11 @@ export default {
         if (agents.get(agent.id) === agent) delegationTracker.dropParent(agent.id);
         dropParentRecoveryRecords(agent);
       }
+      // 权威 child disposal（票据 07）：root 已销毁/代际退休后，该 child 的 detached
+      // 活动范围不会再有关联的 turn/end（record 已丢弃），disposal 是它的最终停止证据。
+      // 仍属于 live root 的 child **不**在此释放：dispose 后它可能被 cold-resume 继续执行，
+      // 其保护只能由 turn/end / terminal feedback 释放（既有可恢复语义）。
+      if (typeof agent?.id === "string") delegationTracker.completeDetachedActiveTasksForChild(agent.id);
       // child Activation 的 disposed 不删除 durable recovery record；自动恢复仍需它。
       // 请求级状态只绑定当前 Agent 对象，销毁时必须立即摘除，迟到 hook 不能复活。
       invalidateRequestRetryState(agent);
@@ -6078,7 +6655,8 @@ export default {
       if (parentMismatch) {
         // expectedRecord 身份保护：并发 cold Activation 不能删除已经被另一条
         // generation 原子接管的 record。
-        dropRecoveryRecord(childId, "recovery child owner or role changed", record);
+        // 归属/角色变化只说明这条 record 不再可信，不证明 child 已停止：保留保护。
+        dropRecoveryRecord(childId, "recovery child owner or role changed", record, { releaseScope: false });
         record = void 0;
       }
       if (record !== void 0 && childAgent !== void 0) {
@@ -6087,7 +6665,8 @@ export default {
         const comparable = record.agent !== void 0 || record.session !== void 0 || childAgent.session !== void 0;
         const sameDurableSession = sameDurableSessionId(record.session, childAgent.session, childId);
         if (comparable && !sameDurableSession) {
-          dropRecoveryRecord(childId, "recovery child session generation changed", record);
+          // 新 session generation 接管 record 不代表旧执行体已停止：保留保护。
+          dropRecoveryRecord(childId, "recovery child session generation changed", record, { releaseScope: false });
           record = void 0;
         }
       }
@@ -6203,8 +6782,18 @@ export default {
     /**
      * 删除某 child 的恢复记录（父代理真销毁/插件卸载时防泄漏）。
      * 先清理所有 pending op，保留 accepted/messageId 事实并终止其投递信号。
+     *
+     * 影响范围保护必须与「记录被丢弃」解耦（票据 07）：root 销毁/代际退休、卸载、
+     * owner/session 归属变化等原因丢弃 record 时，并不等于该 child 已经停止。只有调用方
+     * 明确声明 releaseScope=true（该 child 已被权威 disposal/terminal turn 证明停止）
+     * 时才同时移除它的活动登记；其余原因保留保护，等待真实停止证据。
+     *
+     * @param {string} childId - exact child session id。
+     * @param {string} message - 诊断用原因文案（不写入任何持久化状态）。
+     * @param {object} [expectedRecord] - 期望删除的 record（并发替换保护）。
+     * @param {{releaseScope?:boolean}} [options] - releaseScope 缺省 false。
      */
-    function dropRecoveryRecord(childId, message, expectedRecord) {
+    function dropRecoveryRecord(childId, message, expectedRecord, { releaseScope = false } = {}) {
       const record = recoveryRecords.get(childId);
       if (expectedRecord !== void 0 && record !== expectedRecord) return;
       if (record === void 0) return;
@@ -6218,8 +6807,11 @@ export default {
         host.handoff.remove(entry);
       }
       failedHandoffChildren.clearChild(record.parentAgent, childId);
-      // 此记录已被确定丢弃，不能再留下会永久阻塞后续委派的活动范围。
-      delegationTracker.completeActiveTasksForChild(childId, record.parentId, record.parentAgent);
+      // 只在调用方证明了权威停止时才释放影响范围（releaseScope=true）。root 销毁/
+      // 代际退休/卸载只会丢弃 record，活动项继续以 detached 形式阻塞同路径任务。
+      if (releaseScope === true) {
+        delegationTracker.completeActiveTasksForChild(childId, record.parentId, record.parentAgent);
+      }
       for (const op of [...record.pendingRecoveries.values()]) {
         // 先同步终结状态：已排入 microtask 或正等待 sendMessage 的迟到回调必须观察到
         // done/非 dispatching。先清理该 op 的 timer；保留 accepted/messageId，
@@ -6241,7 +6833,8 @@ export default {
       for (const childId of [...recoveryRecords.keys()]) {
         const record = recoveryRecords.get(childId);
         if (record?.parentAgent === parent) {
-          dropRecoveryRecord(childId, "父代理已销毁，等待被中止", record);
+          // root 销毁/代际退休不释放影响范围保护（票据 07）：只丢弃 record。
+          dropRecoveryRecord(childId, "父代理已销毁，等待被中止", record, { releaseScope: false });
         }
       }
     }
@@ -6449,6 +7042,8 @@ export default {
       }
       // P1：恢复 op 创建时已捕获精确 activityIds。即使同 child 又出现相同
       // taskKey 的新任务，也只能清理本恢复链指向的旧活动项；不再按 key 扩大删除。
+      // 停止证据（票据 07）：本函数只在恢复指令**未被 manager 接受**（投递确定失败）
+      // 时调用；触发恢复的原 turn/end 已经到达，因此这些 activity 没有新的执行在写。
       delegationTracker.completeActiveTasksByIds(op?.activityIds);
     }
 
@@ -6483,6 +7078,9 @@ export default {
         }
         // 任务 binding 已淘汰时 supersededKeys 为空，仍必须清掉该 op 所有稳定
         // 活动关联；activityIds 是唯一清理依据，避免同 key 新活动被误删。
+        // 停止证据（票据 07）：只有从未 dispatching/acceptance 的 op 才可被取代
+        // （recoveryOpCanBeSuperseded），即恢复指令从未投递、没有产生新的 child turn；
+        // 触发恢复的原 turn/end 已经到达。已接受/在途 op 绝不在这里释放。
         delegationTracker.completeActiveTasksByIds(op.activityIds);
 
         count += 1;
@@ -7007,7 +7605,13 @@ export default {
           }
           return;
         }
-        if (event?.type !== "turn/end" || record === void 0) return;
+        if (event?.type !== "turn/end") return;
+        if (record === void 0) {
+          // root 销毁/代际退休后 record 已被清理，正常 turn/end 处理不再运行；但 detached
+          // 活动范围仍持有保护，只能由该 child 自己的 turn/end 释放（票据 07）。
+          releaseDetachedActivitiesOnChildTurnEnd(session, event);
+          return;
+        }
         if (recoveryRecords.get(session.id) !== record
           || !isCurrentRecoverySessionIdentity(record.parentAgent, record, session)) return;
         const admission = admissionForTurn(record, session, event, receipt);
@@ -7110,7 +7714,8 @@ export default {
 
       childActivationStates.clear();
       for (const childId of [...recoveryRecords.keys()]) {
-        dropRecoveryRecord(childId, "插件已卸载，等待被中止");
+        // 插件卸载不是进程重启边界：只丢弃 record，不释放仍可能被写入的范围保护。
+        dropRecoveryRecord(childId, "插件已卸载，等待被中止", void 0, { releaseScope: false });
       }
     }, "dsh-expert-group: recovery registry");
 
@@ -7358,6 +7963,16 @@ export default {
         { parentTaskId: task.parentTaskId, text: serialized },
         { maxBytes: FANOUT_BUDGET.maxFeedbackBytes - Buffer.byteLength(head, "utf8") },
       );
+      // 截断/不可测量过去只取 .text，事实被丢弃；现在把同源 violation 补发为统一
+      // budget_rejected(phase=feedback)。调用发生在 manager 的事件发布路径内，属于
+      // 同一持久化批；事件只带资源名/字节/上限，不含反馈正文。
+      if (trimmed.violation !== null && trimmed.violation !== undefined) {
+        try {
+          fanoutHost?.recordBudgetViolation?.(trimmed.violation, "feedback", { parentTaskId: task.parentTaskId });
+        } catch {
+          // 诊断失败不得影响父会话反馈注入。
+        }
+      }
       return head + trimmed.text;
     }
 
@@ -7603,6 +8218,11 @@ export default {
         case "not_owned_by_root":
           return "fan-out continuation 被拒绝：parentTaskId 不属于当前 root 的当前代际（" + String(detail.parentTaskId)
             + "，ownership: " + String(detail.ownership ?? "unproven") + "）";
+        case "task_reclaimed":
+          return "fan-out continuation 被拒绝：父任务已被回收（" + String(detail.parentTaskId)
+            + "）；同 requestId 重新提交会创建新任务，不会复用旧任务";
+        case "reclaim_in_progress":
+          return "fan-out continuation 被拒绝：另一个回收正在进行中，请稍后重试";
         case "not_live_root":
           return "fan-out continuation 被拒绝：调用方不是当前代际的 live root（root 已销毁或被同 id 新代际替换）";
         case "child_session_unavailable":
@@ -7721,6 +8341,14 @@ export default {
        * 校验兜底，scheduler 不会拿到 NaN/负数/越界值。
        */
       concurrencyLimit: () => normalizeRoleConcurrencyLimit(settingsSource()?.roleConcurrencyLimit),
+      /**
+       * 角色级默认超时（票据 06）：同样传解析函数，而不是快照值。
+       *
+       * 管理器每创建一个新 attempt 解析一次：设置保存后新 attempt 立即使用新值，
+       * 运行中的 attempt（超时已写入 attempt.timeoutMs）不被改写；0 = 不启用。
+       * 优先级：分片级 timeoutMs > 父任务 timeoutMs > 本项 > 未启用。
+       */
+      roleTimeoutMs: () => normalizeRoleTimeoutMs(settingsSource()?.roleTimeoutMs),
       buildRequest: async (input, signal) => {
         const parent = host.lineage.parentAgentOf(input.parentTaskId);
         if (parent === void 0) throw new Error("fan-out parent root is unavailable: " + input.parentTaskId);
@@ -7916,7 +8544,7 @@ export default {
       persistenceHealth,
       logger: ctx.logger,
     });
-    fanoutHost.restore();
+    consumeFanoutRestore("runtime-wired", fanoutHost.restore());
     ctx.effect(() => () => fanoutHost?.close(), "dsh-expert-group: fan-out runtime");
 
     // Expert Group 只投影现有状态；它不订阅或改变任务生命周期，RPC 调用时按需生成快照。
@@ -8156,7 +8784,8 @@ export default {
         }
         if (!host.lineage.isLiveGeneration(parent, rootToken)) {
           const lateRecord = recoveryRecords.get(target.childId);
-          if (lateRecord?.parentAgent === parent) dropRecoveryRecord(target.childId, "root generation retired", lateRecord);
+          // root 代际退休不释放保护：只丢弃无法再关联的 record。
+          if (lateRecord?.parentAgent === parent) dropRecoveryRecord(target.childId, "root generation retired", lateRecord, { releaseScope: false });
           throw new Error("root generation is no longer live");
         }
         if (outcome !== null) {
@@ -8210,7 +8839,7 @@ export default {
         }
         if (!host.lineage.isLiveGeneration(parent, rootToken)) {
           const lateRecord = recoveryRecords.get(rebuiltChildId);
-          if (lateRecord?.parentAgent === parent) dropRecoveryRecord(rebuiltChildId, "root generation retired", lateRecord);
+          if (lateRecord?.parentAgent === parent) dropRecoveryRecord(rebuiltChildId, "root generation retired", lateRecord, { releaseScope: false });
           throw new Error("root generation is no longer live");
         }
         if (typeof rebuiltChildId !== "string" || rebuiltChildId.length === 0
@@ -8306,6 +8935,10 @@ export default {
         record.tasks.set(taskKey, { messageId: null, childId, pendingMessage: true });
         evictOldestEntries(record.tasks, TASK_BINDING_LIMIT);
         let messageId;
+        // acceptance 事实与 lineage 复查解耦（票据 07）：sendMessage 返回 messageId 即
+        // 该 child 已经开始了一轮真实 turn，此后即使 root 代际退休也不是停止证据，
+        // 不能把这次预登记当成 "未创建 child" 释放。
+        let acceptedMessageId;
         try {
           // 同 route 的既有 child：queue=true 也由公开 manager sendMessage 投递；
           // queue=false 才先请求 interrupt。RC1 sendMessage 对 live/cold 统一负责 admission。
@@ -8320,6 +8953,7 @@ export default {
             interrupt: explicit === true && queue !== true,
             queue: queue === true,
           });
+          if (typeof messageId === "string" && messageId.length > 0) acceptedMessageId = messageId;
           if (typeof messageId !== "string" || messageId.length === 0) throw new Error("existing child admission returned an invalid messageId");
           if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
           if (pendingAdmission !== void 0) {
@@ -8333,9 +8967,11 @@ export default {
               settlePendingChildTurnEnds(parent, false, pendingAdmission);
               removePendingHandoffAdmission(pendingAdmission);
             }
-            if (activityId !== void 0) delegationTracker.releaseActiveTask(activityId);
+            // 只有确实没有产生 child turn（admission 在 acceptance 之前失败）才撤销
+            // 本次预登记；已接受的消息保留保护（detached），等待 child turn/end/disposal。
+            if (activityId !== void 0 && acceptedMessageId === void 0) delegationTracker.releaseActiveTask(activityId);
             const lateRecord = recoveryRecords.get(childId);
-            if (lateRecord?.parentAgent === parent) dropRecoveryRecord(childId, "root generation retired", lateRecord);
+            if (lateRecord?.parentAgent === parent) dropRecoveryRecord(childId, "root generation retired", lateRecord, { releaseScope: false });
             throw error;
           }
           // existing-child admission 失败只消费同一 token 暂存的 turn/end，不得 drain 其他 admission。
@@ -8421,9 +9057,11 @@ export default {
             const reused = await reuseOrSteer({ scope, childId: restored, taskKey, promptText: request.prompt[0].text, promptContent: request.prompt, parent, signal, queue, activityId, handoffExpected, rootToken, continuationRouteKey: routeKey });
             if (reused !== null) {
               if (!host.lineage.isLiveGeneration(parent, rootToken)) {
-                if (activityId !== void 0) delegationTracker.releaseActiveTask(activityId);
+                // reused 分支没有为本任务产生新的 child turn，预登记可撤销；真正投递
+                // 成功（queued/messageId）的 admission 属于已开始的 child turn，保留保护。
+                if (activityId !== void 0 && reused.reused === true) delegationTracker.releaseActiveTask(activityId);
                 const lateRecord = recoveryRecords.get(reused.subagentId);
-                if (lateRecord?.parentAgent === parent) dropRecoveryRecord(reused.subagentId, "root generation retired", lateRecord);
+                if (lateRecord?.parentAgent === parent) dropRecoveryRecord(reused.subagentId, "root generation retired", lateRecord, { releaseScope: false });
                 throw new Error("root generation is no longer live");
               }
               const restoredRecord = recoveryRecords.get(reused.subagentId);
@@ -8473,7 +9111,7 @@ export default {
               removePendingHandoffAdmission(pendingHandoffAdmission);
             }
             const lateRecord = recoveryRecords.get(childId);
-            if (lateRecord?.parentAgent === parent) dropRecoveryRecord(childId, "root generation retired", lateRecord);
+            if (lateRecord?.parentAgent === parent) dropRecoveryRecord(childId, "root generation retired", lateRecord, { releaseScope: false });
             throw new Error("root generation is no longer live");
           }
           if (pendingHandoffAdmission !== void 0) bindPendingHandoffAdmission(pendingHandoffAdmission, childId, messageId);
@@ -8540,7 +9178,7 @@ export default {
           rollbackCreationTransaction(creationTransaction, "startContinuable acceptance failed");
           if (!host.lineage.isLiveGeneration(parent, rootToken) && acceptedChildId !== void 0) {
             const lateRecord = recoveryRecords.get(acceptedChildId);
-            if (lateRecord?.parentAgent === parent) dropRecoveryRecord(acceptedChildId, "root generation retired", lateRecord);
+            if (lateRecord?.parentAgent === parent) dropRecoveryRecord(acceptedChildId, "root generation retired", lateRecord, { releaseScope: false });
           }
           // startContinuable 抛错：删除对应 pending 项（agent/created 未消费时
           // 清理残留，防泄漏；被消费过则 indexOf 为 -1，无操作）。
@@ -8599,14 +9237,19 @@ export default {
           delegationTracker.releaseActiveTask(admission.activityId);
           throw new Error("root generation is no longer live");
         }
+        // admission 是否已经产生 child turn：只有「未创建/未接受」的失败才能撤销预登记
+        // （票据 07：root 结束、代际更新都不是停止证据，不得释放已接受任务的范围保护）。
+        let accepted = false;
         try {
           const outcome = await delegateBackground({
             scope, taskKey, routeKey, request, parent, signal, label, queue, activityId: admission.activityId, handoffExpected, rootToken, explicitChildId,
           });
+          accepted = true;
           if (!host.lineage.isLiveGeneration(parent, rootToken)) {
-            delegationTracker.releaseActiveTask(admission.activityId);
+            // 本次任务已被 child 接受：保留为 detached 保护，等待该 child 自己的
+            // turn/end 或 disposal；代际退休本身绝不释放。
             const lateRecord = recoveryRecords.get(outcome?.subagentId);
-            if (lateRecord?.parentAgent === parent) dropRecoveryRecord(outcome.subagentId, "root generation retired", lateRecord);
+            if (lateRecord?.parentAgent === parent) dropRecoveryRecord(outcome.subagentId, "root generation retired", lateRecord, { releaseScope: false });
             removePendingHandoffAdmission(outcome?.handoffAdmission);
             throw new Error("root generation is no longer live");
           }
@@ -8615,7 +9258,9 @@ export default {
             ...(admission.scopeWarning === void 0 ? {} : { scopeWarning: admission.scopeWarning }),
           };
         } catch (error) {
-          delegationTracker.releaseActiveTask(admission.activityId);
+          // 已接受（delegateBackground 正常返回）后的迟到异常不释放保护；仍是 admission
+          // 明确失败/未创建 child 时才撤销本次预登记。
+          if (accepted !== true) delegationTracker.releaseActiveTask(admission.activityId);
           throw error;
         }
       }
@@ -9192,7 +9837,12 @@ export default {
         description: "向一个专用 role 提交多个独立 shard 的 fan-out 任务；原子校验、per-role 并发、wait-all、取消与手工重试由 Host 管理，调用立即返回 parentTaskId。"
           + "同一逻辑任务需要多轮续作（例如按上一轮结果继续修）时，不要重复提交新任务：带 continuation.parentTaskId 再调用本工具即可复用同一个父任务与同一批 child，"
           + "每个分片会新增一个 attempt（保留原 childId、保留历史 attempt），提交后父任务立即回到 running，本轮全部分片结束后回到 ready 并可继续下一轮。"
-          + "工具回执里的 continuation 字段给出 parentTaskId/shardId/childId/attempt/父级状态/reusable 以及下一轮调用所需字段。",
+          + "工具回执里的 continuation 字段给出 parentTaskId/shardId/childId/attempt/父级状态/reusable 以及下一轮调用所需字段。"
+          + "可选 timeoutMs：顶层是父任务默认超时、分片内的 timeoutMs 可覆盖它，0 表示显式禁用、省略则交给角色默认值（设置页 roleTimeoutMs）；"
+          + "启用值为 1000–86400000 毫秒且必须是 1000 的整数倍（精度 1 秒），超时只影响之后创建的 attempt。"
+          + "容量已满时，宿主可按 RPC fanout-reclaim（sessionId + parentTaskIds）回收本 root 已结算的父任务；"
+          + "回收不保留任务墓碑，针对已回收 parentTaskId 的查询返回 task_not_found；"
+          + "回收后同一 requestId 再提交视为新任务（旧幂等记录随任务删除），不会命中旧任务句柄。",
         parameters: {
           role: { type: "string", enum: activeRoles(), required: true, description: "One enabled expert role shared by all shards. 复用时必须与原任务的 role 一致。" },
           basePrompt: { type: "string", required: true, description: "Shared public goal delivered to every shard child. 复用时它是**本轮**的共享目标。" },
@@ -9211,6 +9861,12 @@ export default {
                 },
                 prompt: { type: "string", required: true },
                 affectedPaths: { type: "array", items: { type: "string" } },
+                // 分片级超时覆盖（票据 06）：0 = 显式禁用；启用值 1000–86400000 毫秒且为
+                // 1000 的整数倍。优先于父任务级默认值与角色级设置默认值。
+                timeoutMs: {
+                  type: "integer",
+                  description: "Optional per-shard timeout override in milliseconds: 0 disables the timeout for this shard; enabled values are 1000–86400000 and must be multiples of 1000 (1-second precision). It overrides the task-level timeoutMs and the per-role settings default (roleTimeoutMs). The timer starts when an attempt enters running and settles that latest attempt as timed_out, which can be retried by hand but is never retried automatically. Only attempts created after this call are affected; running shards are never changed.",
+                },
               },
             },
           },
@@ -9228,6 +9884,11 @@ export default {
           concurrencyLimit: {
             type: "integer",
             description: "Optional per-task running-child limit from 1 to 64, counted against this task's own running shards only. Dispatch requires BOTH this task-level limit AND the per-role shared pool (settings roleConcurrencyLimit, current value, plugin default 10) to allow the shard; the two caps are enforced independently. The per-role pool is a shared cap for the whole role and follows the current setting, so it may grow or shrink for later dispatches; a task-level value is frozen into the task snapshot and survives restore.",
+          },
+          // 父任务默认超时（票据 06）：与分片级同一校验语义，可被分片覆盖。
+          timeoutMs: {
+            type: "integer",
+            description: "Optional default shard timeout in milliseconds for this parent task: 0 disables it; enabled values are 1000–86400000 and must be multiples of 1000 (1-second precision). A shard-level timeoutMs overrides this value, and the per-role settings default (roleTimeoutMs) applies only when neither is set. The timer starts when an attempt enters running; a timeout settles the latest attempt as timed_out (retryable by hand, never auto-retried). It applies only to attempts created after this call and never changes running shards; omitted values keep the existing task default on continuation.",
           },
         },
         output: {
@@ -9290,6 +9951,9 @@ export default {
               role,
               basePrompt: args?.basePrompt,
               shards: args?.shards,
+              // 超时（票据 06）：本轮显式给出的父任务默认值覆盖任务级默认；
+              // 省略时沿用旧值，且只影响本轮之后创建的 attempt。
+              timeoutMs: args?.timeoutMs,
               requestId: continuation.requestId,
             });
             const continuationHandle = buildFanoutContinuationHandle(result.task);
@@ -10070,15 +10734,165 @@ export default {
       return typeof body?.sessionId === "string" ? body.sessionId.trim() : "";
     }
 
-    function fanoutRpcTaskFor(sessionId, parentTaskId) {
-      if (host.lineage.resolveOwner(parentTaskId) !== sessionId) return null;
-      return fanoutHost.getTask(parentTaskId);
+    /**
+     * 子会话判定（读根解析的前置闸门）。
+     *
+     * 与既有 get/notification 的判定同源：在线 header 的 parentSession/origin，或持久化
+     * child_models 记录。子会话即使以 root 的位置出现，也绝不能读根级 fan-out 视图。
+     */
+    function fanoutRpcIsChildSession(sessionId) {
+      if (typeof sessionId !== "string" || sessionId.length === 0) return false;
+      const agent = agents.get(sessionId);
+      const liveChild = agent?.session?.header?.origin === "subagent"
+        || agent?.session?.header?.parentSession !== void 0;
+      const recorded = source().childModels?.[sessionId];
+      return liveChild || recorded !== void 0;
+    }
+
+    /**
+     * 读动作的根解析（票据 09）：live root，或「root 不在线但仍有已归属任务」的冷恢复根。
+     *
+     * 冷恢复根没有 live Agent，但持久化归属索引里的任务仍必须可查询、可读事件；若它名下
+     * 一个任务都没有，就仍是未知 session（404）。子会话与完全未知 id 一律拒绝。
+     * 这里只决定「能否进入读路径」，不授予任何写权限。
+     */
+    function fanoutRpcReadRootSession(sessionId) {
+      if (typeof sessionId !== "string" || sessionId.length === 0) return false;
+      if (fanoutRpcIsChildSession(sessionId)) return false;
+      if (agents.get(sessionId) !== void 0) return true;
+      if (typeof fanoutHost?.tasksOwnedBy !== "function") return false;
+      const owned = fanoutHost.tasksOwnedBy(sessionId);
+      return Array.isArray(owned) && owned.length > 0;
+    }
+
+    /**
+     * 统一归属入口：活动绑定 + 已结算只读索引（RPC 不再直接用 lineage.resolveOwner）。
+     *
+     * 已回收任务的归属提示只用于把 get/events/写动作收敛成 task_not_found：它不是任务
+     * 墓碑（不含任务数据、不进快照/列表），也不会把已回收 id 暴露给其它 root。
+     */
+    function fanoutRpcOwnerOf(parentTaskId) {
+      if (typeof fanoutHost?.ownerOf === "function") {
+        const active = fanoutHost.ownerOf(parentTaskId);
+        if (typeof active === "string" && active.length > 0) return active;
+      }
+      if (typeof fanoutHost?.reclaimedOwnerOf === "function") {
+        const reclaimed = fanoutHost.reclaimedOwnerOf(parentTaskId);
+        if (typeof reclaimed === "string" && reclaimed.length > 0) return reclaimed;
+      }
+      return null;
+    }
+
+    /** 逐动作能力（票据 09）：Host 是唯一判定入口；旧 Host 缺少该能力时返回 null。 */
+    function fanoutRpcCapabilitiesOf(sessionId, parentTaskId) {
+      if (typeof fanoutHost?.capabilitiesOf !== "function") return null;
+      const capabilities = fanoutHost.capabilitiesOf(sessionId, parentTaskId);
+      return capabilities !== null && typeof capabilities === "object" ? capabilities : null;
+    }
+
+    /**
+     * 给任务快照附带逐动作能力（list/get/写动作回执共用，保证三处形状一致）。
+     *
+     * 能力缺失（旧 Host）时原样返回任务，绝不伪造授权；shard 能力按 shardId 对齐，
+     * 缺失条目的 shard 保持原样（客户端回退旧行为）。
+     */
+    function fanoutRpcTaskWithCapabilities(sessionId, task) {
+      if (task === null || task === void 0 || typeof task !== "object") return task;
+      const capabilities = fanoutRpcCapabilitiesOf(sessionId, task.parentTaskId);
+      if (capabilities === null) return task;
+      const shardCapabilities = capabilities.shards !== null && typeof capabilities.shards === "object"
+        && !Array.isArray(capabilities.shards)
+        ? capabilities.shards
+        : {};
+      const shards = Array.isArray(task.shards)
+        ? task.shards.map((shard) => {
+          const shardId = typeof shard?.shardId === "string" ? shard.shardId : "";
+          const shardCapability = shardCapabilities[shardId];
+          return shardCapability !== null && typeof shardCapability === "object"
+            ? { ...shard, capabilities: shardCapability }
+            : shard;
+        })
+        : task.shards;
+      return { ...task, capabilities, ...(Array.isArray(task.shards) ? { shards } : {}) };
+    }
+
+    /**
+     * 写动作的统一拒绝回执（票据 09）：HTTP 200 + accepted:false + 稳定原因码。
+     *
+     * 用于「归属匹配、任务已知，但当前没有可写绑定」的冷恢复根与同 id replacement：
+     * 任务数据仍按读权限返回（与侧栏快照一致），但写请求不被执行。任务未知/非归属
+     * 走 404（调用方在进入本函数前已判定），因此这里不泄露跨 root 的存在性。
+     */
+    function fanoutRpcSendOwnerNotLive(send, sessionId, parentTaskId, task) {
+      const capabilities = fanoutRpcCapabilitiesOf(sessionId, parentTaskId);
+      send(200, {
+        ok: true,
+        accepted: false,
+        changed: false,
+        reason: "owner_not_live",
+        parentTaskId,
+        task: fanoutRpcTaskWithCapabilities(sessionId, task),
+        ...(capabilities === null ? {} : { capabilities }),
+      });
     }
 
     function fanoutRpcAfter(value) {
       if (value === undefined) return 0;
       if (!Number.isSafeInteger(value) || value < 0) throw new ValidationError("after 必须是非负整数");
       return value;
+    }
+
+    /**
+     * 重读**当前**持久化 fan-out 快照（恢复重试专用的读边界）。
+     *
+     * 为什么不能只读 storageBinding.fanoutSnapshot()：那只是「初始化读表」或「本进程成功落盘」
+     * 时写入的投影缓存。恢复失败后 persist 被 fail-closed 跳过，缓存会一直停留在失败的那份
+     * 快照上；而重试的语义是「重新读取当前持久化快照」，磁盘内容可能已被外部修复（人工修复、
+     * 另一进程替换、手工还原备份）。因此这里直接从当前 ready binding 的 fanout 表读一次
+     * （**只读**，绝不写入），并同步投影缓存，让随后的 fanoutHost.restore() 读到同一份数据。
+     *
+     * storage 尚未 ready 或表读取失败时回落到既有投影缓存：恢复重试仍可执行（结果是
+     * 「没有可恢复快照」而不是未知异常），不会把存储故障伪装成成功。
+     */
+    function refreshFanoutSnapshotFromStorage() {
+      const binding = host.storage.active();
+      if (binding !== void 0 && binding.fanoutTable !== void 0) {
+        const entries = tableEntries(binding.fanoutTable);
+        if (entries !== void 0) {
+          const current = entries.find(([key]) => key === "current")?.[1];
+          storageBinding.setFanoutSnapshot(current);
+          return current;
+        }
+      }
+      return storageBinding.fanoutSnapshot();
+    }
+
+    /**
+     * 重试恢复前补齐 lineage 的 parentSessions 寻址索引。
+     *
+     * 冷启动路径在 restore 之前会调用 restoreParentSessions；重试走的是同一条恢复语义，
+     * 缺少这一步时：需要 live root 的 queued 任务会以 parentId=undefined 进入 deferred，
+     * 下一次 snapshotForStorage 就会丢掉它的 parentSessions 映射（重启后该任务不再属于任何根）；
+     * 非延迟的恢复任务也无法经由 bindParentTask 建立活动绑定（终态任务由已结算索引兜底，
+     * 因此不受影响）。
+     *
+     * 只补**当前没有归属**的条目：restoreParentSessions 会删除同名任务的 parentTokens
+     * （「没有绑定当时的 exact 代际证据 → 续作 fail-closed」），对仍被 live 绑定拥有的任务
+     * 调用它会无谓地撤销续作写权限。重试只服务「失败后还没有任何归属」的任务，因此过滤
+     * 掉已有 owner 的条目既满足恢复需要，也不会改动活动任务的权限证据。
+     */
+    function rehydrateFanoutOwnership(snapshot) {
+      const source = snapshot?.parentSessions;
+      if (source === null || typeof source !== "object" || Array.isArray(source)) return 0;
+      const missing = {};
+      for (const [parentTaskId, parentId] of Object.entries(source)) {
+        if (typeof parentTaskId !== "string" || parentTaskId.length === 0) continue;
+        if (typeof parentId !== "string" || parentId.length === 0) continue;
+        if (host.lineage.resolveOwner(parentTaskId) !== undefined) continue;
+        missing[parentTaskId] = parentId;
+      }
+      if (Object.keys(missing).length === 0) return 0;
+      return host.lineage.restoreParentSessions({ parentSessions: missing });
     }
 
     /**
@@ -10464,6 +11278,8 @@ export default {
             enableObserver: config.enableObserver === true,
             observerPreferred: snap.observerPreferred === true,
             roleConcurrencyLimit: snap.roleConcurrencyLimit,
+            // 角色默认超时（毫秒，0=不启用）：meta 只回传归一后的生效值。
+            roleTimeoutMs: snap.roleTimeoutMs,
             // 任务管理默认开启：meta 只回传归一后的生效值，供设置页与诊断读取。
             taskManagementEnabled: snap.taskManagementEnabled !== false,
             // 自动打开默认关闭：meta 只回传归一后的生效布尔值。
@@ -10488,18 +11304,296 @@ export default {
           return;
         }
 
+        if (body.action === "fanout-restore-retry") {
+          /**
+           * 恢复重试（票据 04）：重新读取**当前**持久化快照并重跑恢复。
+           *
+           * 授权边界：只允许 live root（复用 fanoutRpcRootSession 的同一套判定：非空、不是
+           * 任何子会话、不是 DEG 记录的 child、且 registry 里有 live Agent）。理由：
+           * 1. restore 会把任务重新放回 manager 并绑定 ownership，属于**写运行时状态**的操作，
+           *    必须与 cancel/retry 等写动作使用同一 fail-closed 边界；
+           * 2. 恢复后的归属绑定只认 exact live root Agent（getAgent(parentId)）；没有 live root 时
+           *    需要 root 的 queued 任务只能进 deferred，这次重试对它们等于没有恢复；
+           * 3. 该动作读取的是**全局**持久化快照（不按 root 过滤），若允许任意/冷 sessionId 触发，
+           *    就等于把一次宿主级恢复交给无法证明身份的调用方。冷 root 场景由下一次真实
+           *    agent/created（root 上线）自动重跑恢复，不依赖这条 RPC。
+           *
+           * 关键约束：本动作**只读 storage**，绝不写持久化数据；失败时保持 fail-closed 闸门与
+           * 同一原因码，成功时由 restore() 自己清除闸门。
+           */
+          const sessionId = fanoutRpcSessionId(body);
+          if (sessionId.length === 0) { fail(400, "bad-request", "缺少 sessionId"); return; }
+          if (fanoutRpcRootSession(sessionId) === void 0) {
+            fail(404, "session-not-found", "根会话不存在或尚未恢复");
+            return;
+          }
+          if (typeof fanoutHost === "undefined" || fanoutHost === null || typeof fanoutHost.restore !== "function") {
+            fail(503, "restore-unavailable", "fan-out 恢复入口不可用");
+            return;
+          }
+          // 读当前持久化快照（只读）→ 补齐缺失的归属寻址 → 重跑恢复。
+          const persistedSnapshot = refreshFanoutSnapshotFromStorage();
+          rehydrateFanoutOwnership(persistedSnapshot);
+          const outcome = consumeFanoutRestore("rpc-restore-retry", fanoutHost.restore());
+          const failure = outcome?.ok === true ? null : (outcome?.error ?? null);
+          const errorCode = typeof failure?.code === "string" && failure.code.length > 0 ? failure.code : null;
+          // 恢复状态变化必须立刻反映到下一次快照：否则 5s 的完整快照缓存会把旧 recovery 块
+          // 继续返回给侧栏（错误横幅在成功重试后仍然挂着）。失效只影响缓存代次，不写 storage。
+          expertGroupRuntime.invalidateSnapshots(sessionId);
+          send(200, {
+            ok: true,
+            sessionId,
+            // restored 表示「本次确实恢复了至少一个任务」；ok 仍是 RPC 信封层语义
+            // （请求被接受并执行），与既有 fanout-* RPC 的 accepted 语义一致。
+            restored: outcome?.ok === true,
+            restoredCount: Number.isSafeInteger(outcome?.restored) ? outcome.restored : 0,
+            deferred: Number.isSafeInteger(outcome?.deferred) ? outcome.deferred : 0,
+            pending: outcome?.pending === true,
+            // 失败原因码是稳定的机器 token；message 只用于诊断文案（客户端再受限显示）。
+            // 没有失败细节（例如磁盘上已没有可恢复快照）时为 null，绝不伪造原因码。
+            error: failure === null || errorCode === null
+              ? null
+              : {
+                code: errorCode,
+                message: typeof failure.message === "string" ? failure.message : "",
+                retryable: restoreFailureRetryable(errorCode),
+              },
+          });
+          return;
+        }
+
+        if (body.action === "fanout-reclaim") {
+          /**
+           * 显式回收已结算父任务（票据 05）。
+           *
+           * 授权边界与其它写动作同源：只允许 live root（子会话/未知/已销毁 root 一律 404），
+           * 且逐项按归属过滤——非归属与未知 id 都返回 skipped reason=not_owner，不泄露存在性。
+           * 仍被 root 等待账本（fanoutTurnWaitRecords）引用的任务先跳过：回收后该任务不会再
+           * 产生 task_settled，等待项会永久悬挂。
+           *
+           * 持久化语义由 fanoutHost.reclaimTasks 负责（先落盘成功再移除）：落盘失败返回 500
+           * 稳定 code reclaim-persist-failed，内存状态不变；其余"无任务可回收/输入被拒"
+           * 仍是 200 + 逐项 skipped（成功语义的"什么都没做"）。
+           */
+          const sessionId = fanoutRpcSessionId(body);
+          if (sessionId.length === 0) { fail(400, "bad-request", "缺少 sessionId"); return; }
+          if (fanoutRpcIsChildSession(sessionId)) {
+            fail(404, "session-not-found", "根会话不存在或尚未恢复");
+            return;
+          }
+          const parent = fanoutRpcRootSession(sessionId);
+          if (parent === void 0) { fail(404, "session-not-found", "根会话不存在或尚未恢复"); return; }
+          if (typeof fanoutHost === "undefined" || fanoutHost === null || typeof fanoutHost.reclaimTasks !== "function") {
+            fail(503, "reclaim-unavailable", "fan-out 回收入口不可用");
+            return;
+          }
+          if (!Array.isArray(body.parentTaskIds)) { fail(400, "bad-request", "parentTaskIds 必须是数组"); return; }
+          const reclaimIds = [];
+          const reclaimSeen = new Set();
+          for (const raw of body.parentTaskIds) {
+            const parentTaskId = typeof raw === "string" ? raw.trim() : "";
+            if (parentTaskId.length === 0) { fail(400, "bad-request", "parentTaskIds 只能包含非空字符串"); return; }
+            if (reclaimSeen.has(parentTaskId)) continue;
+            reclaimSeen.add(parentTaskId);
+            reclaimIds.push(parentTaskId);
+          }
+          if (reclaimIds.length === 0) { fail(400, "bad-request", "parentTaskIds 不能为空"); return; }
+          if (reclaimIds.length > MAX_RECLAIM_BATCH) {
+            fail(400, "bad-request", "单次最多回收 " + MAX_RECLAIM_BATCH + " 个父任务");
+            return;
+          }
+          const reclaimSkipped = [];
+          const reclaimable = [];
+          for (const parentTaskId of reclaimIds) {
+            // 未释放的 goal handoff：回收会让它的等待永远无法结算。
+            const waitRecord = fanoutTurnWaitRecords.get(parentTaskId);
+            if (waitRecord !== undefined && waitRecord.state !== "released") {
+              reclaimSkipped.push({ parentTaskId, reason: "referenced_by_wait" });
+              continue;
+            }
+            const owner = typeof fanoutHost.ownerOf === "function" ? fanoutHost.ownerOf(parentTaskId) : null;
+            if (owner === sessionId) {
+              /**
+               * 写权限边界（票据 09）：归属命中还不够——回收会删除任务，必须由**当前代际
+               * 的 exact live 写绑定**授权。冷恢复的已结算任务（restore 已归还归属、绑定
+               * 释放）与同 id replacement root（owner 字符串相同、绑定对象是旧代际）都只有
+               * 读权限，这里给逐项 skipped.reason="owner_not_live"，不进入回收。
+               * host.reclaimTasks 内部还有同一条件的防御性复核（双保险）。
+               */
+              const hasLiveWrite = typeof fanoutHost.hasLiveWriteBinding === "function"
+                && fanoutHost.hasLiveWriteBinding(parent, parentTaskId) === true;
+              if (hasLiveWrite !== true) {
+                reclaimSkipped.push({ parentTaskId, reason: "owner_not_live" });
+                continue;
+              }
+              reclaimable.push(parentTaskId);
+              continue;
+            }
+            // 已回收（归属提示命中本 root）→ task_not_found；其余统一 not_owner（不泄露存在性）。
+            const reclaimedOwner = typeof fanoutHost.reclaimedOwnerOf === "function"
+              ? fanoutHost.reclaimedOwnerOf(parentTaskId)
+              : null;
+            reclaimSkipped.push({
+              parentTaskId,
+              reason: owner === null && reclaimedOwner === sessionId ? "task_not_found" : "not_owner",
+            });
+          }
+          if (reclaimable.length === 0) {
+            // 什么都没做：durable 必须如实为 false（不做任何耐久声明）。
+            send(200, { ok: true, sessionId, reclaimed: [], skipped: reclaimSkipped, count: 0, durable: false });
+            return;
+          }
+          const outcome = await fanoutHost.reclaimTasks(parent, reclaimable);
+          if (outcome?.accepted !== true) {
+            const reason = typeof outcome?.reason === "string" ? outcome.reason : "reclaim_not_accepted";
+            const mergedSkipped = [...reclaimSkipped, ...(Array.isArray(outcome?.skipped) ? outcome.skipped : [])];
+            if (reason === "persist_failed") {
+              // 落盘失败：内存状态不变（manager 已 abortReclaim），因此可安全重试。
+              fail(500, "reclaim-persist-failed", "fan-out 回收未能落盘，任务保持不变，可稍后重试", {
+                skipped: mergedSkipped,
+                ...(typeof outcome?.category === "string" && outcome.category.length > 0
+                  ? { category: outcome.category }
+                  : {}),
+              });
+              return;
+            }
+            if (reason === "reclaim_in_progress" || outcome?.code === "RECLAIM_IN_PROGRESS") {
+              fail(409, "reclaim-in-progress", "已有回收正在进行中，请稍后重试");
+              return;
+            }
+            if (reason === "runtime_closed" || outcome?.code === "RUNTIME_CLOSED") {
+              fail(503, "reclaim-unavailable", "fan-out 回收入口不可用");
+              return;
+            }
+            // 其它拒绝（无任务可回收 / 输入被 manager 拒绝 / 候选快照闸门）：什么都没变。
+            send(200, {
+              ok: true,
+              sessionId,
+              reclaimed: [],
+              skipped: mergedSkipped,
+              count: 0,
+              rejected: reason,
+              // 什么都不曾落盘：绝不宣称耐久结果。
+              durable: false,
+            });
+            return;
+          }
+          const reclaimed = Array.isArray(outcome.reclaimed) ? outcome.reclaimed : [];
+          // 已回收任务的等待记录若已 released，顺手清掉：它们已不可寻址，留着只会占满有界表。
+          for (const parentTaskId of reclaimed) {
+            const waitRecord = fanoutTurnWaitRecords.get(parentTaskId);
+            if (waitRecord !== undefined && waitRecord.state === "released") {
+              fanoutTurnWaitRecords.delete(parentTaskId);
+            }
+          }
+          // 侧栏快照必须立刻反映回收结果（否则 5s 缓存会继续显示已回收任务）。
+          expertGroupRuntime.invalidateSnapshots(sessionId);
+          /**
+           * 耐久结果如实透出（票据 05 第三轮）：
+           * - durable:true —— 候选与最终快照都真实落盘，磁盘已收敛；
+           * - durable:false + durabilityReason:"final_snapshot_failed" —— 回收已提交
+           *   （内存与侧栏已移除任务），但最终快照写入失败，磁盘可能仍停留在关闭期旧快照的
+           *   位置（它已被进程内排除集合过滤，因此不会复活任务，但也不能声称耐久成功）。
+           */
+          send(200, {
+            ok: true,
+            sessionId,
+            reclaimed,
+            skipped: [...reclaimSkipped, ...(Array.isArray(outcome.skipped) ? outcome.skipped : [])],
+            count: reclaimed.length,
+            durable: outcome?.durable === true,
+            durabilityReason: typeof outcome?.durabilityReason === "string" ? outcome.durabilityReason : null,
+          });
+          return;
+        }
+
         if (body.action === "fanout-list" || body.action === "fanout-get" || body.action === "fanout-events"
           || body.action === "fanout-cancel-shard" || body.action === "fanout-cancel-parent"
           || body.action === "fanout-retry-shard" || body.action === "fanout-retry") {
           const sessionId = fanoutRpcSessionId(body);
           if (sessionId.length === 0) { fail(400, "bad-request", "缺少 sessionId"); return; }
-          const parent = fanoutRpcRootSession(sessionId);
-          if (parent === void 0) {
+          /**
+           * 读写根解析拆分（票据 09）：
+           * - 读动作（list/get/events）：live root，或「root 不在线但仍有已归属任务」的冷恢复根；
+           * - 写动作：必须 live root；冷恢复根在「任务已知」时返回 200 + owner_not_live，
+           *   非归属/未知任务一律 404，且不得借错误码泄露跨 root 的任务存在性。
+           */
+          const writeAction = body.action === "fanout-cancel-shard" || body.action === "fanout-cancel-parent"
+            || body.action === "fanout-retry-shard" || body.action === "fanout-retry";
+          if (writeAction !== true && fanoutRpcReadRootSession(sessionId) !== true) {
             fail(404, "session-not-found", "根会话不存在或尚未恢复");
             return;
           }
+          if (writeAction === true) {
+            // 子会话永远不能以 root 身份写任务（先于归属判定，避免用错误码区分身份）。
+            if (fanoutRpcIsChildSession(sessionId)) {
+              fail(404, "session-not-found", "根会话不存在或尚未恢复");
+              return;
+            }
+            const parentTaskId = typeof body.parentTaskId === "string" ? body.parentTaskId.trim() : "";
+            if (parentTaskId.length === 0) { fail(400, "bad-request", "缺少 parentTaskId"); return; }
+            // 归属判定先于任务存在性：非归属 root 连「任务是否存在」都不可探测。
+            if (fanoutRpcOwnerOf(parentTaskId) !== sessionId) {
+              fail(404, "not-found", "fan-out 父任务不存在或不属于当前根会话");
+              return;
+            }
+            const task = fanoutHost.getTask(parentTaskId);
+            if (task === null) {
+              // 归属索引仍指向本根但 manager 已无任务 = 已回收任务（票据 05/09 同一语义）。
+              fail(404, "task_not_found", "fan-out 父任务已不存在");
+              return;
+            }
+            const parent = fanoutRpcRootSession(sessionId);
+            /**
+             * 写授权硬条件（票据 09）：live root + exact parent Agent + 绑定代际 token。
+             * 冷恢复根（parent undefined）与同 id replacement（exact Agent/token 不匹配）
+             * 都落到同一回执：任务仍可按读权限返回，但写动作不被执行。
+             */
+            if (parent === void 0
+              || typeof fanoutHost?.hasLiveWriteBinding !== "function"
+              || fanoutHost.hasLiveWriteBinding(parent, parentTaskId) !== true) {
+              fanoutRpcSendOwnerNotLive(send, sessionId, parentTaskId, task);
+              return;
+            }
+            // 授权成立：执行 manager 的真实写入口，动作级原因（stop_unconfirmed 等）由它给出。
+            let result;
+            if (body.action === "fanout-cancel-parent") {
+              result = fanoutHost.cancelParent(parentTaskId);
+            } else {
+              const shardId = typeof body.shardId === "string" ? body.shardId.trim() : "";
+              if (shardId.length === 0) { fail(400, "bad-request", "缺少 shardId"); return; }
+              result = body.action === "fanout-cancel-shard"
+                ? fanoutHost.cancelShard(parentTaskId, shardId)
+                : fanoutHost.retryShard(parentTaskId, shardId);
+            }
+            const retriedTask = fanoutHost.getTask(parentTaskId);
+            // 手工重试会把已终态任务带回 pending（fanout.js 的 retryShard 是唯一入口，
+            // 只有本 RPC 调用它），而首次 settle 时该父任务**上一代次**的等待工作已经结算。
+            // 若这里不重新登记，root turn 就没有任何等待依据，会在重试的分片跑完前收口。
+            //
+            // 登记走**新代次**（fanout:<parentTaskId>:<attempt+1>），而不是复用旧键：复用旧键
+            // 会让「retry 期间的新工作」与「已结算的旧工作」无法区分，从而在分片跑完前放行。
+            // retry 成功后的任务是 pending，不会被终态守卫跳过；同 root 的 duplicate submit
+            // 仍由 records 的未释放状态幂等短路。retry 任务成功/失败/取消都会由 manager 聚合
+            // 出 task_settled → releaseFanoutGoalHandoff 结算它自己的代次。
+            if (result?.accepted === true && (body.action === "fanout-retry-shard" || body.action === "fanout-retry")) {
+              registerFanoutRetryGoalHandoff(parent, parentTaskId, retriedTask);
+            }
+            // 回执附带与 get/list/snapshot 同源的逐动作能力：客户端在动作后无需猜测新状态。
+            const capabilities = fanoutRpcCapabilitiesOf(sessionId, parentTaskId);
+            send(200, {
+              ok: true,
+              ...result,
+              task: fanoutRpcTaskWithCapabilities(sessionId, retriedTask),
+              ...(capabilities === null ? {} : { capabilities }),
+            });
+            return;
+          }
           if (body.action === "fanout-list") {
-            const tasks = host.lineage.tasksOwnedBy(sessionId);
+            // 唯一归属入口：fanoutHost.tasksOwnedBy（活动绑定 + 已结算只读索引）。
+            // 每个任务附带同一份能力投影，与侧栏快照保持逐字段一致。
+            const tasks = fanoutHost.tasksOwnedBy(sessionId)
+              .map((task) => fanoutRpcTaskWithCapabilities(sessionId, task));
             const eventBatch = fanoutHost.getEvents({ after: 0 });
             send(200, { ok: true, sessionId, tasks, cursor: eventBatch.nextSequence });
             return;
@@ -10512,11 +11606,18 @@ export default {
               fail(400, "bad-request", "parentTaskId 无效");
               return;
             }
-            // root-wide 查询不要求 parentTaskId；指定父任务时先做同一 ownership
-            // 校验，不能用事件自身字段绕过旧 root/new root 隔离。
-            if (hasParentTaskId && fanoutRpcTaskFor(sessionId, parentTaskId) === null) {
-              fail(404, "not-found", "fan-out 父任务不存在或不属于当前根会话");
-              return;
+            // root-wide 查询不要求 parentTaskId；指定父任务时先做同一 ownership 校验，
+            // 不能用事件自身字段绕过旧 root/new root 隔离。归属匹配但任务已回收 →
+            // task_not_found（与 get/写动作同一语义）；非归属 → not-found（不泄露存在性）。
+            if (hasParentTaskId) {
+              if (fanoutRpcOwnerOf(parentTaskId) !== sessionId) {
+                fail(404, "not-found", "fan-out 父任务不存在或不属于当前根会话");
+                return;
+              }
+              if (fanoutHost.getTask(parentTaskId) === null) {
+                fail(404, "task_not_found", "fan-out 父任务已不存在");
+                return;
+              }
             }
             const batch = fanoutHost.getEvents({
               after,
@@ -10524,45 +11625,42 @@ export default {
             });
             const events = hasParentTaskId
               ? batch.events
-              : batch.events.filter((event) => host.lineage.resolveOwner(event.parentTaskId) === sessionId);
-            send(200, { ok: true, events, cursor: batch.nextSequence });
+              // root-wide 事件只保留**仍存在**的本 root 任务：已回收任务的历史事件虽然还在
+              // Host 日志里（审计用途），但任务本身已不存在，不应再按 root 查询返回。
+              : batch.events.filter((event) => fanoutRpcOwnerOf(event.parentTaskId) === sessionId
+                && (typeof fanoutHost?.reclaimedOwnerOf === "function"
+                  ? fanoutHost.reclaimedOwnerOf(event.parentTaskId) === null
+                  : true));
+            // gap 字段来自 Host 的**全局**事件日志（与 parentTaskId 过滤无关）：客户端据此
+            // 判断 cursor 是否已早于保留窗口，避免把"读不到旧事件"误当成"没有新事件"。
+            send(200, {
+              ok: true,
+              events,
+              cursor: batch.nextSequence,
+              earliestSequence: batch.earliestSequence ?? null,
+              gap: batch.gap === true,
+              dropped: Number.isSafeInteger(batch.dropped) ? batch.dropped : 0,
+            });
             return;
           }
+          // fanout-get
           const parentTaskId = typeof body.parentTaskId === "string" ? body.parentTaskId.trim() : "";
           if (parentTaskId.length === 0) { fail(400, "bad-request", "缺少 parentTaskId"); return; }
-          const task = fanoutRpcTaskFor(sessionId, parentTaskId);
-          if (task === null) {
+          if (fanoutRpcOwnerOf(parentTaskId) !== sessionId) {
             fail(404, "not-found", "fan-out 父任务不存在或不属于当前根会话");
             return;
           }
-          if (body.action === "fanout-get") {
-            send(200, { ok: true, task });
+          const task = fanoutHost.getTask(parentTaskId);
+          if (task === null) {
+            fail(404, "task_not_found", "fan-out 父任务已不存在");
             return;
           }
-          let result;
-          if (body.action === "fanout-cancel-parent") {
-            result = fanoutHost.cancelParent(parentTaskId);
-          } else {
-            const shardId = typeof body.shardId === "string" ? body.shardId.trim() : "";
-            if (shardId.length === 0) { fail(400, "bad-request", "缺少 shardId"); return; }
-            result = body.action === "fanout-cancel-shard"
-              ? fanoutHost.cancelShard(parentTaskId, shardId)
-              : fanoutHost.retryShard(parentTaskId, shardId);
-          }
-          const retriedTask = fanoutHost.getTask(parentTaskId);
-          // 手工重试会把已终态任务带回 pending（fanout.js 的 retryShard 是唯一入口，
-          // 只有本 RPC 调用它），而首次 settle 时该父任务**上一代次**的等待工作已经结算。
-          // 若这里不重新登记，root turn 就没有任何等待依据，会在重试的分片跑完前收口。
-          //
-          // 登记走**新代次**（fanout:<parentTaskId>:<attempt+1>），而不是复用旧键：复用旧键
-          // 会让「retry 期间的新工作」与「已结算的旧工作」无法区分，从而在分片跑完前放行。
-          // retry 成功后的任务是 pending，不会被终态守卫跳过；同 root 的 duplicate submit
-          // 仍由 records 的未释放状态幂等短路。retry 任务成功/失败/取消都会由 manager 聚合
-          // 出 task_settled → releaseFanoutGoalHandoff 结算它自己的代次。
-          if (result?.accepted === true && (body.action === "fanout-retry-shard" || body.action === "fanout-retry")) {
-            registerFanoutRetryGoalHandoff(parent, parentTaskId, retriedTask);
-          }
-          send(200, { ok: true, ...result, task: retriedTask });
+          const capabilities = fanoutRpcCapabilitiesOf(sessionId, parentTaskId);
+          send(200, {
+            ok: true,
+            task: fanoutRpcTaskWithCapabilities(sessionId, task),
+            ...(capabilities === null ? {} : { capabilities }),
+          });
           return;
         }
         if (body.action === "settings-commit") {
@@ -11254,6 +12352,62 @@ export default {
       };
     }
 
+    /** rootTurnWait 诊断里 roots 摘要数组的固定上限（避免诊断随 root 数量增长）。 */
+    const ROOT_TURN_WAIT_DIAGNOSTIC_ROOT_LIMIT = 8;
+
+    /**
+     * root turn 等待账本的只读诊断投影（票据 11）。
+     *
+     * 只回答「还有多少未结算工作、最早等了多久、后代查询能力如何、最近一次收口投递是否
+     * 成功、有没有人工关闭过账本」。所有字段都是计数/固定枚举/时间戳：roots 摘要不含
+     * root/session id、agent 引用、work 键、prompt 或任何专家输出，因此可直接进入 meta。
+     */
+    function describeRootTurnWaitDiagnostics() {
+      let summaries = [];
+      try {
+        summaries = typeof rootTurnWaits.describeAll === "function" ? rootTurnWaits.describeAll() : [];
+      } catch {
+        // 诊断自身绝不因为账本读取失败而让 meta 失败：退化为空视图。
+        summaries = [];
+      }
+      let outstandingTotal = 0;
+      let oldestWaitedMs = 0;
+      const capability = { available: 0, degraded: 0, unavailable: 0 };
+      const roots = [];
+      for (const summary of summaries) {
+        if (summary === null || typeof summary !== "object") continue;
+        const outstanding = diagnosticCount(summary.outstanding);
+        const waitedMs = diagnosticCount(summary.waitedMs);
+        outstandingTotal += outstanding;
+        if (waitedMs > oldestWaitedMs) oldestWaitedMs = waitedMs;
+        // capabilityLevel 由账本从 lastSnapshot 导出；非法/缺失一律按 unavailable（未知不可用）。
+        const level = summary.capabilityLevel === "available" || summary.capabilityLevel === "degraded"
+          ? summary.capabilityLevel
+          : "unavailable";
+        capability[level] += 1;
+        if (roots.length < ROOT_TURN_WAIT_DIAGNOSTIC_ROOT_LIMIT) {
+          roots.push({ waitedMs, outstanding, capability: level });
+        }
+      }
+      return {
+        outstandingTotal: diagnosticCount(outstandingTotal),
+        // 账本的 describeAll 本身有 16 条上限，因此 rootCount 与下面聚合都是同界样本。
+        rootCount: diagnosticCount(summaries.length),
+        oldestWaitedMs: diagnosticCount(oldestWaitedMs),
+        abandonedCount: diagnosticCount(rootWaitAbandonCount),
+        // 最近一次收口投递：at/ok/固定原因码；从未投递过为 null。
+        lastDelivery: lastRootWaitDelivery === null
+          ? null
+          : {
+            at: diagnosticTime(lastRootWaitDelivery.at),
+            ok: lastRootWaitDelivery.ok === true,
+            reason: diagnosticToken(lastRootWaitDelivery.reason, null),
+          },
+        capability,
+        roots,
+      };
+    }
+
     /**
      * 运行时诊断摘要。
      *
@@ -11289,6 +12443,50 @@ export default {
           if (Number.isSafeInteger(roleLimits[role])) roleOverrides[role] = roleLimits[role];
         }
       }
+      /**
+       * 持久化/恢复诊断投影（票据 04）。
+       *
+       * 分类权威是 host/persistence-health（failureCategory/consecutiveFailures/时间戳），
+       * manager 只提供它亲眼观察到的落盘结果（saved/skipped(reason)/failed(bytes)）。
+       * 两者合并，但绝不把快照正文、任务负载或错误堆栈放进诊断。
+       */
+      const persistenceState = fanoutState.persistence ?? {};
+      const managerPersistence = persistenceState.manager ?? {};
+      const managerPersist = managerPersistence.lastResult ?? null;
+      const hostPersist = persistenceState.lastResult ?? null;
+      const blockedPersistence = persistenceState.blocked ?? null;
+      const persistenceHealthState = fanoutState.persistenceHealth ?? {};
+      const healthFailure = persistenceHealthState.lastFailure ?? null;
+      const healthSuccess = persistenceHealthState.lastSuccess ?? null;
+      const lastBudgetViolation = fanoutState.budget?.lastViolation ?? null;
+      const managerEventHistory = persistenceState.eventHistory ?? null;
+      const lastRestoreState = persistenceState.restore ?? null;
+      /**
+       * 停止边界诊断（票据 07）：manager 的未确认停止视图 + Host 的归属老化窗口。
+       * 只投影计数/固定枚举/时间戳，绝不透出 prompt、结果或会话正文。
+       */
+      const stopState = fanoutState.stop ?? null;
+      const stopAging = stopState?.aging ?? null;
+      /**
+       * 委派影响范围诊断（票据 07）：只回答「还有多少活动范围、其中多少已脱离 root」与
+       * 最近一次 release_scope 被拒绝的摘要（时间/条数/固定原因码）。活动项只计数，
+       * 不含 child/agent id、prompt、任务正文或路径。
+       */
+      const delegationCounts = delegationTracker.activeTaskCounts();
+      // 恢复失败 fail-closed 时以 Host 的 restore_failed 跳过原因为准；否则 Host 的
+      // skipped/failed 优先（它是真实写入结果），Host 成功时再取 manager 的投影
+      // （manager 额外带 skipped 原因与实测字节）。
+      const primaryPersist = blockedPersistence !== null
+        ? {
+          status: "skipped",
+          reason: typeof blockedPersistence.reason === "string" ? blockedPersistence.reason : "restore_failed",
+          bytes: managerPersist?.bytes ?? null,
+          category: null,
+        }
+        : (hostPersist !== null && hostPersist.status !== "saved"
+          ? { ...hostPersist, bytes: managerPersist?.bytes ?? null }
+          : (managerPersist ?? hostPersist));
+      const primaryCategory = persistenceHealthState.failureCategory ?? primaryPersist?.category ?? null;
       return {
         version: CAPABILITY_REPORT_VERSION,
         // 时间戳只用于"诊断新鲜度"判断，不参与业务判定。
@@ -11298,6 +12496,27 @@ export default {
           active: diagnosticCount(childActivationStates.size),
           tracked: diagnosticCount(recoveryRecords.size),
         },
+        /**
+         * 影响范围保护的只读投影（票据 07）：activeScopeCount 是仍持有 affectedPaths
+         * 保护的活动项总数，detachedScopeCount 是其中所属 root 已销毁/代际退休的部分
+         * （保护仍在，等待该 child 自己的权威停止证据）。
+         */
+        delegation: {
+          activeScopeCount: diagnosticCount(delegationCounts.total),
+          detachedScopeCount: diagnosticCount(delegationCounts.detached),
+          lastRefusedRelease: lastRefusedScopeRelease === null
+            ? null
+            : {
+              at: diagnosticTime(lastRefusedScopeRelease.at),
+              activeCount: diagnosticCount(lastRefusedScopeRelease.activeCount),
+              reason: diagnosticToken(lastRefusedScopeRelease.reason, null),
+            },
+        },
+        /**
+         * root turn 等待账本（票据 11）：未结算总量、最早等待、能力等级计数、最近一次
+         * 收口投递与有界 roots 摘要。只含计数/固定枚举/时间戳，不含任何 id 或正文。
+         */
+        rootTurnWait: describeRootTurnWaitDiagnostics(),
         fanout: {
           tasks: diagnosticCount(fanoutState.tasks),
           activeAttempts: diagnosticCount(fanoutState.activeAttempts),
@@ -11307,12 +12526,77 @@ export default {
           runningShards,
           restorePending: fanoutState.restorePending === true,
           closed: fanoutState.closed === true,
+          /**
+           * 事件历史窗口（票据 04）：
+           * - retained/bytes：当前保留的历史规模；
+           * - dropped/earliestSequence：已被裁剪的累计条数与最早可用序号（gap 判定）；
+           * - restore：冷启动 restoreEvents 的布尔结果（过去被丢弃）。
+           */
+          events: {
+            retained: diagnosticCount(fanoutState.budget?.events),
+            bytes: diagnosticCount(fanoutState.budget?.eventBytes),
+            dropped: diagnosticCount(managerEventHistory?.dropped),
+            earliestSequence: diagnosticTime(managerEventHistory?.earliestSequence),
+            restore: lastFanoutEventRestore === null
+              ? null
+              : {
+                accepted: lastFanoutEventRestore.accepted === true,
+                attempted: lastFanoutEventRestore.attempted === true,
+                at: diagnosticTime(lastFanoutEventRestore.at),
+              },
+            // Host 自有查询日志（服务 RPC fanout-events）的保留窗口状态；与 manager 的
+            // 持久化事件历史分开计数，两者都只暴露计数/序号。
+            log: fanoutState.eventLog === null || fanoutState.eventLog === undefined
+              ? null
+              : {
+                retained: diagnosticCount(fanoutState.eventLog.count),
+                dropped: diagnosticCount(fanoutState.eventLog.dropped),
+                earliestSequence: diagnosticTime(fanoutState.eventLog.earliestSequence),
+                restoreAccepted: fanoutState.eventLog.restoreAccepted === true,
+              },
+          },
+          /**
+           * 真实停止边界（票据 07）：
+           * - stopPending/legacy：聚合阻塞源与旧快照派生身份的规模；
+           * - boundary/boundarySource：最近一次恢复使用的边界（显式或按进程身份自动）；
+           * - watchdogExpired/attributedAged/needsAttention：宽限/老化/需人工处理的计数。
+           * 这些字段回答"任务为什么还没结算"，不暴露任何任务负载。
+           */
+          stop: {
+            stopPending: diagnosticCount(stopState?.stopPending),
+            unobserved: diagnosticCount(stopState?.unobserved),
+            requested: diagnosticCount(stopState?.requested),
+            watchdogExpired: diagnosticCount(stopState?.watchdogExpired),
+            legacy: diagnosticCount(stopState?.legacy),
+            attributedAged: diagnosticCount(stopState?.attributedAged),
+            needsAttention: diagnosticCount(stopState?.needsAttention),
+            boundary: diagnosticToken(stopState?.boundary, "unknown"),
+            boundarySource: diagnosticToken(stopState?.boundarySource, "unknown"),
+            lastWatchdogAt: diagnosticTime(stopState?.lastWatchdog?.at),
+            aging: stopAging === null || stopAging === undefined
+              ? null
+              : {
+                enabled: stopAging.enabled === true,
+                windowMs: diagnosticCount(stopAging.windowMs),
+                pending: diagnosticCount(stopAging.pending),
+                aged: diagnosticCount(stopAging.aged),
+                skipped: diagnosticCount(stopAging.skipped),
+                lastAgedAt: diagnosticTime(stopAging.lastAged?.at),
+                lastAgedReason: diagnosticToken(stopAging.lastAged?.reason, null),
+              },
+          },
           concurrency: {
             default: diagnosticCount(concurrency?.default),
             roles: roleOverrides,
-            // 解析来源与最近一次非法上限只保留固定枚举/类型，不含设置原文。
+            // 解析来源（live / snapshot / fallback）与最近一次非法上限只保留固定
+            // 枚举/类型；message 是插件内部固定文案（不含设置原文或原始返回值），
+            // 经长度与控制字符归一再透出，让用户能解释"设置页=3、实际并发=10"。
             source: diagnosticToken(concurrency?.source, "unknown"),
             invalidKind: concurrency?.invalid === undefined ? null : diagnosticToken(concurrency.invalid.kind),
+            invalidValueType: concurrency?.invalid === undefined
+              ? null
+              : diagnosticToken(concurrency.invalid.valueType, "unknown"),
+            invalidMessage: diagnosticMessage(concurrency?.invalid?.message),
           },
         },
         recovery: {
@@ -11341,6 +12625,47 @@ export default {
           status: typeof storageState.status === "string" ? diagnosticToken(storageState.status, "none") : "none",
           generation: diagnosticCount(storageState.generation),
           tables: Array.isArray(storageState.tableNames) ? diagnosticCount(storageState.tableNames.length) : 0,
+        },
+        /**
+         * 持久化与恢复可见性（票据 04）。
+         *
+         * 只回答"最近一次落盘是什么结果、失败属于哪一类、恢复是否失败/被阻塞、最近一次
+         * 预算拒绝是什么"，字段全部是固定枚举/计数/时间戳；不含快照正文、prompt、结果
+         * 或错误堆栈。侧栏错误态与恢复重试 RPC 由后续任务在这块只读投影之上实现。
+         */
+        persistence: {
+          lastResult: primaryPersist === null ? null : diagnosticToken(primaryPersist.status, "unknown"),
+          reason: primaryPersist === null ? null : diagnosticToken(primaryPersist.reason, null),
+          bytes: primaryPersist === null ? null : diagnosticTime(primaryPersist.bytes),
+          // 分类权威是 Host persistence-health；manager 自带 category 只作为回退。
+          category: diagnosticToken(primaryCategory, null),
+          consecutiveFailures: diagnosticCount(persistenceHealthState.consecutiveFailures),
+          lastSuccessAt: diagnosticTime(healthSuccess?.at),
+          lastFailureAt: diagnosticTime(healthFailure?.at),
+          blocked: blockedPersistence === null ? null : diagnosticToken(blockedPersistence.reason, "unknown"),
+          restore: lastRestoreState === null
+            ? null
+            : {
+              ok: lastRestoreState.ok === true,
+              code: diagnosticToken(lastRestoreState.error?.code, null),
+              field: diagnosticToken(lastRestoreState.error?.field, null),
+              message: diagnosticMessage(lastRestoreState.error?.message),
+              at: diagnosticTime(lastRestoreState.at),
+              restored: diagnosticCount(lastRestoreState.restored),
+              deferred: diagnosticCount(lastRestoreState.deferred),
+              pending: lastRestoreState.pending === true,
+            },
+          lastBudgetViolation: lastBudgetViolation === null
+            ? null
+            : {
+              code: diagnosticToken(lastBudgetViolation.code, null),
+              resource: diagnosticToken(lastBudgetViolation.resource, null),
+              phase: diagnosticToken(fanoutState.budget?.lastViolationPhase, null),
+              limit: diagnosticTime(lastBudgetViolation.limit),
+              receivedBytes: diagnosticTime(lastBudgetViolation.receivedBytes),
+              recoverable: lastBudgetViolation.recoverable === true,
+              complete: lastBudgetViolation.complete === true,
+            },
         },
         lineage: {
           currentRoots: diagnosticCount(lineageState.currentRoots),

@@ -45,13 +45,16 @@ window.__ModuleLoader__.load({
       ".deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}" +
       ".deg_settings_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}" +
       ".deg_settings_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);align-items:center;gap:20px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
-      // 管理行的四个控件按内容宽度排列，并用 space-between 吸收剩余空间，让 599px/760px 容器中的间距均匀。
-      ".deg_settings_management_row{display:flex;align-items:center;justify-content:space-between;column-gap:16px;row-gap:12px;flex-wrap:nowrap;min-width:0}" +
-      // 统一 29px 行高与数字输入框，保证四个控件的 bounding box 顶部对齐，同时保留可用点击高度。
+      // 任务管理与自动侧栏开关放在模型配置之后、通知之前，始终可见且共享标准设置行间距。
+      ".deg_settings_task_row{display:flex;align-items:center;gap:28px;min-height:29px}" +
+      ".deg_settings_task_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}" +
+      // 底部 Observer 独立靠左，并将两个固定宽度数字控件作为紧凑组靠右排列。
+      ".deg_settings_management_row{display:flex;align-items:center;justify-content:space-between;column-gap:24px;row-gap:12px;min-width:0}" +
       ".deg_settings_management_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}" +
-      ".deg_settings_management_row>.deg_settings_control{flex:0 0 auto;justify-self:auto;min-width:max-content;white-space:nowrap;height:29px;box-sizing:border-box}" +
-      // 520px 以下取消强制单行并左对齐，允许控件按整项换行；固定内容宽度避免标签折行、溢出或输入框被压缩。
-      "@media (max-width:520px){.deg_settings_management_row{flex-wrap:wrap;justify-content:flex-start}}" +
+      ".deg_settings_limits{display:flex;align-items:center;justify-content:flex-end;gap:26px;min-width:0}" +
+      ".deg_settings_limits>.deg_settings_control{flex:0 0 auto;justify-self:auto;min-width:max-content;white-space:nowrap;height:29px;box-sizing:border-box}" +
+      // 520px 以下允许整项换行并左对齐，数字控件本身不缩窄、标签不拆行。
+      "@media (max-width:520px){.deg_settings_management_row{flex-wrap:wrap;justify-content:flex-start}.deg_settings_limits{flex-wrap:wrap;justify-content:flex-start;gap:16px 26px}}" +
       ".deg_settings_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}" +
       ".deg_settings_control{display:flex;align-items:center;gap:10px;min-width:0}" +
       ".deg_settings_control input[type=range]{width:100%;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
@@ -2436,6 +2439,26 @@ window.__ModuleLoader__.load({
       return Number.isSafeInteger(value) && value >= 1 && value <= 64 ? value : 10;
     }
 
+    // 与 Host 的默认值保持一致：10 小时；显式 0 仍表示禁用，不被默认值覆盖。
+    const DEFAULT_ROLE_TIMEOUT_MS = 36000000;
+
+    /**
+     * 角色默认超时（毫秒，票据 06）只接受 0（不启用）或
+     * 1000~86,400,000 的整秒毫秒数；缺失或非法值回退默认 10 小时。
+     *
+     * 客户端只做读取/草稿归一，权威拒绝仍在 Host 的 settings-commit
+     * （与 fanout.js validateTimeoutMs 同一语义）：这里不能把越界值渲染成“已保存”。
+     *
+     * @param {unknown} value - settings 中的超时值。
+     * @returns {number} 0 或合法启用值。
+     */
+    function normalizeRoleTimeoutMs(value) {
+      if (value === 0) return 0;
+      return Number.isSafeInteger(value) && value >= 1000 && value <= 86400000 && value % 1000 === 0
+        ? value
+        : DEFAULT_ROLE_TIMEOUT_MS;
+    }
+
     function normalizeSettingsDraft(value, roles, allowLegacyProviderFallback = true) {
       const source = value && typeof value === "object" ? value : {};
       const configuredProvider = typeof source.provider === "string" ? source.provider : "";
@@ -2479,6 +2502,8 @@ window.__ModuleLoader__.load({
         notificationVolume: clampNotificationVolume(source.notificationVolume),
         notificationHoldMs: notificationHoldMsOf(source.notificationHoldMs),
         roleConcurrencyLimit: normalizeRoleConcurrencyLimit(source.roleConcurrencyLimit),
+        // 角色默认超时缺失或非法时使用默认 10 小时；显式 0 保留为不启用。
+        roleTimeoutMs: normalizeRoleTimeoutMs(source.roleTimeoutMs),
         // 旧客户端/Host 缺少字段时保持关闭，避免升级后改变图片路由。
         observerPreferred: source.observerPreferred === true,
         // 任务管理缺字段时保持开启：默认必须维持 Expert Group 注册到侧边栏的历史行为。
@@ -5906,6 +5931,11 @@ window.__ModuleLoader__.load({
         if (candidate.roleConcurrencyLimit !== source.roleConcurrencyLimit) {
           ops.push({ op: "set", path: ["roleConcurrencyLimit"], value: candidate.roleConcurrencyLimit });
         }
+        // 角色默认超时（票据 06）：只有真正变化才写 op，避免一次无关保存把
+        // 用户已保存的值重置回 0。
+        if (candidate.roleTimeoutMs !== source.roleTimeoutMs) {
+          ops.push({ op: "set", path: ["roleTimeoutMs"], value: candidate.roleTimeoutMs });
+        }
         // 任务管理开关单独成一个保存 op，只用于判定「是否真的需要提交」；
         // 新客户端的完整候选始终显式携带该字段，Host 按「显式字段才写 patch」处理。
         if (candidate.taskManagementEnabled !== source.taskManagementEnabled) {
@@ -6415,6 +6445,26 @@ window.__ModuleLoader__.load({
         react.createElement("h2", { className: "deg_settings_title" }, "dsh-expert-group"),
         react.createElement("p", { className: "deg_settings_hint" }, "专家模型使用 DSH 当前已配置的 provider 和模型目录。"),
         modelConfigSection,
+        react.createElement("div", { className: "deg_settings_row deg_settings_task_row" },
+          react.createElement("label", { className: "deg_settings_checkbox" },
+            react.createElement("input", {
+              type: "checkbox",
+              "aria-label": "任务管理",
+              checked: draft.taskManagementEnabled,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, taskManagementEnabled: event.target.checked })),
+            }),
+            react.createElement("span", { className: "deg_settings_label" }, "任务管理")),
+          // 「Auto」自动打开运行中的子代理右侧栏会话；维持原悬浮说明与保存绑定。
+          react.createElement("label", { className: "deg_settings_checkbox", title: "自动打开运行中的子代理侧栏会话" },
+            react.createElement("input", {
+              type: "checkbox",
+              "aria-label": "Auto",
+              checked: draft.autoOpenSubagentSidebar,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, autoOpenSubagentSidebar: event.target.checked === true })),
+            }),
+            react.createElement("span", { className: "deg_settings_label" }, "Auto"))),
         react.createElement("div", { className: "deg_settings_row deg_settings_notification_row" },
           react.createElement("label", { className: "deg_settings_checkbox" },
             react.createElement("input", {
@@ -6485,26 +6535,7 @@ window.__ModuleLoader__.load({
           react.createElement("label", { className: "deg_settings_checkbox" },
             react.createElement("input", { type: "checkbox", "aria-label": "Observer优先", checked: draft.observerPreferred, disabled: saving, onChange: (event) => editDraft((previous) => ({ ...previous, observerPreferred: event.target.checked })) }),
             react.createElement("span", { className: "deg_settings_label" }, "Observer优先")),
-          react.createElement("label", { className: "deg_settings_checkbox" },
-            react.createElement("input", {
-              type: "checkbox",
-              "aria-label": "任务管理",
-              checked: draft.taskManagementEnabled,
-              disabled: saving,
-              onChange: (event) => editDraft((previous) => ({ ...previous, taskManagementEnabled: event.target.checked })),
-            }),
-            react.createElement("span", { className: "deg_settings_label" }, "任务管理")),
-          // 「Auto」= 自动打开运行中的子代理右侧栏会话：与任务管理同一行的紧凑开关。
-          // 说明性文案只放在 title（悬浮提示）里，可见文字保持一个单词，不挤压既有控件。
-          react.createElement("label", { className: "deg_settings_checkbox", title: "自动打开运行中的子代理侧栏会话" },
-            react.createElement("input", {
-              type: "checkbox",
-              "aria-label": "Auto",
-              checked: draft.autoOpenSubagentSidebar,
-              disabled: saving,
-              onChange: (event) => editDraft((previous) => ({ ...previous, autoOpenSubagentSidebar: event.target.checked === true })),
-            }),
-            react.createElement("span", { className: "deg_settings_label" }, "Auto")),
+          react.createElement("div", { className: "deg_settings_limits" },
           react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-concurrency-limit" },
             react.createElement("span", { className: "deg_settings_label" }, "单个角色并发上限"),
             react.createElement("input", {
@@ -6527,7 +6558,35 @@ window.__ModuleLoader__.load({
                     : Number.isFinite(number) ? number : previous.roleConcurrencyLimit,
                 }));
               },
-            }))),
+            })),
+          // 角色级默认超时（票据 06）：设置页以**秒**展示与编辑（0 = 不启用），提交时换算成
+          // Host 的毫秒字段 roleTimeoutMs；与并发上限同一行的紧凑布局。
+          // 精度与边界由 Host 与管理器共同保证；这里只提供步进与可访问名称。
+          react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-timeout-ms" },
+            react.createElement("span", { className: "deg_settings_label" }, "角色默认超时 (s)"),
+            react.createElement("input", {
+              id: "deg-settings-role-timeout-ms",
+              type: "number",
+              "aria-label": "角色默认超时",
+              title: "默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
+              min: 0,
+              max: 86400,
+              step: 1,
+              inputMode: "numeric",
+              value: draft.roleTimeoutMs === "" ? "" : draft.roleTimeoutMs / 1000,
+              disabled: saving,
+              onChange: (event) => {
+                const raw = event.target.value;
+                const seconds = raw === "" ? null : Number(raw);
+                editDraft((previous) => ({
+                  ...previous,
+                  // 草稿与 Host 字段保持毫秒；UI 只做秒 ↔ 毫秒换算，整秒取整。
+                  roleTimeoutMs: raw === ""
+                    ? ""
+                    : Number.isFinite(seconds) ? Math.round(seconds) * 1000 : previous.roleTimeoutMs,
+                }));
+              },
+            })))),
         directoryState.error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, directoryState.error) : null,
         error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, error) : null,
         react.createElement("div", { className: "deg_settings_footer" },

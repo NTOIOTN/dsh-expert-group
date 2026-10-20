@@ -15,7 +15,7 @@
  * （MANAGER_CLOSED / manager_closed），不入队、不恢复、不新建 attempt。
  */
 import { createFanoutManager } from "./fanout.js";
-import { FANOUT_BUDGET, checkEventBudget, checkEventHistoryBudget, checkTaskInputBudget, measureJsonBytes } from "./resource-budget.js";
+import { FANOUT_BUDGET, checkEventBudget, checkEventHistoryBudget, checkTaskInputBudget, describeBudgetViolation, measureJsonBytes } from "./resource-budget.js";
 import { messageIdsOfTurn } from "./shared.js";
 
 export const FANOUT_MARKER = "__degFanout";
@@ -460,6 +460,15 @@ export function createFanoutRuntime(options = {}) {
   let eventsAscending = true;
   /** 最近一次 restoreEvents 预算拒绝的结构化违规（只读诊断）。 */
   let lastEventViolation = null;
+  /**
+   * 事件日志因保留窗口（FANOUT_EVENT_LOG_LIMIT）被 shift 掉的累计条数。
+   *
+   * 这是"客户端请求的 cursor 已经早于最早可用序号"的 gap 判定的另一半：
+   * earliestSequence 表示还能读到什么，dropped 表示已经永久缺失多少条。
+   */
+  let droppedEventCount = 0;
+  /** 最近一次 restoreEvents 是否被接受；undefined 表示本进程尚未尝试恢复。 */
+  let lastEventRestoreAccepted;
   let closed = false;
 
   // 终态/关闭后 record 会被删除，但 manager 的迟到 canceller、或 admission 恢复路径
@@ -598,6 +607,45 @@ export function createFanoutRuntime(options = {}) {
   const log = typeof options.log === "function" ? options.log : () => {};
 
   /**
+   * 归属老化（票据 07）：continuation attempt 的 turn 归属无法证明时，Host 记录首次
+   * 观察时间并在宽限到期后调用 manager 的精确 API 标记 needs_attention。
+   *
+   * 默认 60 秒：足够覆盖一次 session replacement/cold-resume 的归属恢复窗口，又能在
+   * 用户明显卡住时给出可操作结论。0 表示显式禁用（测试/极端配置）；非法值在构造期
+   * 显式失败，绝不静默回退——配置写错不能变成"永不老化"。
+   *
+   * 时钟可注入（options.clock 或等价的 now/setTimeout/clearTimeout）：老化只是 Host
+   * 侧观察窗口，不改变 manager 的状态机；测试用假时钟做确定性断言。
+   */
+  const ATTRIBUTION_AGING_DEFAULT_MS = 60000;
+  const rawAttributionAgingMs = options.attributionAgingMs;
+  if (rawAttributionAgingMs !== undefined && rawAttributionAgingMs !== null
+    && (typeof rawAttributionAgingMs !== "number" || !Number.isFinite(rawAttributionAgingMs) || rawAttributionAgingMs < 0)) {
+    throw new TypeError("fan-out attributionAgingMs 必须是 0 或正有限数");
+  }
+  const attributionAgingMs = rawAttributionAgingMs === undefined || rawAttributionAgingMs === null
+    ? ATTRIBUTION_AGING_DEFAULT_MS
+    : rawAttributionAgingMs;
+  const agingClock = isObject(options.clock) ? options.clock : undefined;
+  const agingNow = typeof agingClock?.now === "function"
+    ? agingClock.now
+    : (typeof options.now === "function" ? options.now : () => Date.now());
+  const agingSetTimeout = typeof agingClock?.setTimeout === "function"
+    ? agingClock.setTimeout
+    : (typeof options.setTimeout === "function" ? options.setTimeout : (fn, ms) => setTimeout(fn, ms));
+  const agingClearTimeout = typeof agingClock?.clearTimeout === "function"
+    ? agingClock.clearTimeout
+    : (typeof options.clearTimeout === "function" ? options.clearTimeout : (handle) => clearTimeout(handle));
+  /** 仍挂着老化定时器的 record 数（tombstone 不计入这里）。 */
+  let attributionAgingPending = 0;
+  /** 真正把 attempt 标记为 aged 的次数（manager changed=true）。 */
+  let attributionAgingAgedCount = 0;
+  /** 到期时已终态/身份不可读而被跳过的次数（只读诊断）。 */
+  let attributionAgingSkippedCount = 0;
+  /** 最近一次成功老化（只读诊断；只含身份与结果，不含 prompt/结果负载）。 */
+  let lastAttributionAged = null;
+
+  /**
    * continuation admission 期间暂存的终态事件上限。
    *
    * 为什么需要暂存：续作的 messageId 只有 `continueMessage()` resolve 之后才知道，而新轮的
@@ -718,7 +766,12 @@ export function createFanoutRuntime(options = {}) {
       if (Number.isSafeInteger(last) && Number.isSafeInteger(next) && next < last) eventsAscending = false;
     }
     events.push(normalized);
-    while (events.length > FANOUT_EVENT_LOG_LIMIT) events.shift();
+    while (events.length > FANOUT_EVENT_LOG_LIMIT) {
+      events.shift();
+      // 保留窗口之外的旧事件永久缺失：getEvents 用 dropped/earliestSequence 暴露这个事实，
+      // 客户端据此判断增量同步是否出现 gap（而不是把"读不到"误当成"没有新事件"）。
+      droppedEventCount += 1;
+    }
     try { onEvent?.(normalized); } catch (error) { log("fan-out event callback failed", error); }
   }
 
@@ -748,9 +801,148 @@ export function createFanoutRuntime(options = {}) {
     if (record.sessionId !== undefined && sessionRecords.get(record.sessionId) === record) sessionRecords.delete(record.sessionId);
   }
 
+  /**
+   * 清除 record 的归属老化定时器（生命周期终点：finish/close）。
+   *
+   * 必须在 record 生命周期结束时调用：否则已结算的 attempt 仍会在宽限到期时触发一次
+   * manager 调用（对已终态 attempt 是 no-op，但会留下无意义的诊断与悬挂句柄）。
+   *
+   * @returns {boolean} 是否真的清理了一个待决定时器。
+   */
+  function releaseAttributionAgingTimer(record) {
+    if (record?.attributionAgingTimer === undefined) return false;
+    try { agingClearTimeout(record.attributionAgingTimer); } catch (error) { log("fan-out attribution aging clear failed", error); }
+    record.attributionAgingTimer = undefined;
+    attributionAgingPending = Math.max(0, attributionAgingPending - 1);
+    return true;
+  }
+
+  /**
+   * 首次观察到"归属无法证明"时启动老化窗口（同一 record 只启动一次）。
+   *
+   * 语义边界：这只记录观察窗口，**不**改变 attempt 状态、不请求取消、不释放范围。
+   * 到期后由 runAttributionAging 调用 manager 的精确 API；在此之前任何合法 completion /
+   * disposal 仍按原路径收敛，并由 finishRecord 清掉定时器。
+   */
+  function scheduleAttributionAging(record) {
+    if (attributionAgingMs <= 0) return false;
+    if (record === undefined || record.finished === true) return false;
+    if (record.attributionAgingTimer !== undefined) return false;
+    const firstAt = agingNow();
+    record.attributionUnprovenFirstAt = firstAt;
+    record.attributionAgingDeadlineAt = firstAt + attributionAgingMs;
+    // 先记账再注册：注入的 setTimeout 若是同步执行（测试替身/极端实现），回调里的
+    // 递减必须能看到这一笔，否则 pending 会永久多 1。同步触发后不得再把句柄写回去。
+    attributionAgingPending += 1;
+    let firedSynchronously = false;
+    try {
+      const timer = agingSetTimeout(() => {
+        firedSynchronously = true;
+        // 假时钟可能在触发前不删除句柄；这里统一清账，保证 pending 计数不漂移。
+        record.attributionAgingTimer = undefined;
+        attributionAgingPending = Math.max(0, attributionAgingPending - 1);
+        runAttributionAging(record);
+      }, attributionAgingMs);
+      // null 表示"已注册但宿主未返回可清除句柄"：仍算 pending，release 时会清账。
+      record.attributionAgingTimer = firedSynchronously ? undefined : (timer === undefined ? null : timer);
+      // unref：归属老化只是 fail-closed 诊断，不应把测试/宿主进程按 60 秒钉住。
+      if (!firedSynchronously) timer?.unref?.();
+    } catch (error) {
+      // 定时器注册失败不能把事件处理打断：清账并保持 record 原状（等迟到证据/关闭）。
+      attributionAgingPending = Math.max(0, attributionAgingPending - 1);
+      record.attributionAgingTimer = undefined;
+      log("fan-out attribution aging schedule failed", error);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * 老化到期：用 manager 的权威身份把仍非终态的 attempt 标记为 needs_attention。
+   *
+   * 为什么不在到期时先 finishRecord：aging 只说明"归属无法证明且超过宽限"，**不**证明
+   * 执行已停止。因此 record 作为 tombstone 保留，等迟到 completion/disposal 证据到达后
+   * 再按正常路径收敛（manager 只会补证据、不改终态）。
+   */
+  function runAttributionAging(record) {
+    if (closed || record.finished === true) return false;
+    const input = isObject(record.input) ? record.input : {};
+    const parentTaskId = nonEmptyText(input.parentTaskId);
+    const shardId = nonEmptyText(input.shardId);
+    const attemptNumber = attemptValue(input.attempt);
+    if (parentTaskId === "" || shardId === "" || attemptNumber === undefined) {
+      attributionAgingSkippedCount += 1;
+      return false;
+    }
+    let identity = null;
+    try {
+      identity = typeof manager.attemptIdentityOf === "function"
+        ? manager.attemptIdentityOf(parentTaskId, shardId, attemptNumber)
+        : null;
+    } catch (error) {
+      log("fan-out attribution identity lookup failed", error);
+      identity = null;
+    }
+    if (identity === null) {
+      // 任务/分片/attempt 已不存在（例如被 close 清理）：没有可标记的对象，保持静默。
+      attributionAgingSkippedCount += 1;
+      record.attributionAgedSkipReason = "attempt_identity_unavailable";
+      return false;
+    }
+    let result;
+    try {
+      result = manager.markAttributionAged({
+        parentTaskId,
+        shardId,
+        attempt: attemptNumber,
+        attemptId: identity.attemptId,
+        executionGeneration: identity.executionGeneration,
+      }, { reason: "shard_attribution_unproven_aged" });
+    } catch (error) {
+      log("fan-out attribution aging failed", error);
+      attributionAgingSkippedCount += 1;
+      record.attributionAgedSkipReason = "manager_call_failed";
+      return false;
+    }
+    if (result?.changed !== true) {
+      // 已终态（迟到 completion 先到）或身份过期：no-op，不产生任何状态变更。
+      attributionAgingSkippedCount += 1;
+      record.attributionAgedSkipReason = typeof result?.reason === "string" ? result.reason : "not_changed";
+      return false;
+    }
+    attributionAgingAgedCount += 1;
+    const agedAt = agingNow();
+    record.attributionAgedAt = agedAt;
+    record.attributionAgedReason = typeof result.terminalReason === "string"
+      ? result.terminalReason
+      : "shard_attribution_unproven_aged";
+    lastAttributionAged = {
+      parentTaskId,
+      shardId,
+      attempt: attemptNumber,
+      attemptId: identity.attemptId,
+      executionGeneration: identity.executionGeneration,
+      at: agedAt,
+      status: result.status,
+      taskStatus: result.taskStatus,
+      reason: "shard_attribution_unproven_aged",
+      needsAttention: true,
+    };
+    log("fan-out attribution aged: " + JSON.stringify({
+      parentTaskId,
+      shardId,
+      attempt: attemptNumber,
+      status: result.status,
+      taskStatus: result.taskStatus,
+    }));
+    return true;
+  }
+
   function finishRecord(record, success, value) {
     if (record.finished) return false;
     record.finished = true;
+    // 生命周期终点：老化窗口一并关闭，绝不让定时器在结算之后仍触发 manager 调用。
+    releaseAttributionAgingTimer(record);
     // 生命周期终点：无论成功/失败/取消/关闭，admission 暂存与 disposal 待决标记都必须立刻
     // 释放（不持有 session 与终态事实，避免悬挂记录与内存泄漏）。
     takeAdmissionEvents(record);
@@ -1067,6 +1259,12 @@ export function createFanoutRuntime(options = {}) {
     allowOverlap: options.allowOverlap,
     concurrencyLimit: options.concurrencyLimit,
     roleLimits: options.roleLimits,
+    // 角色级默认超时（票据 06）：同 concurrencyLimit 一样支持解析函数，
+    // 由 manager 在每次新建 attempt 时读一次当前 settings。
+    roleTimeoutMs: options.roleTimeoutMs,
+    // 时钟注入：老化的 Host 定时器与 manager 的超时/停止看门狗共用同一时钟 seam，
+    // 测试可以用假时钟做确定性断言（两者互不改变对方的状态机）。
+    ...(isObject(options.clock) ? { clock: options.clock } : {}),
   });
   const unsubscribeManager = manager.subscribe((event) => rememberEvent(event));
 
@@ -1300,6 +1498,8 @@ export function createFanoutRuntime(options = {}) {
     } catch (error) {
       log("fan-out attribution diagnostic failed", error);
     }
+    // 首次无法证明归属即启动老化窗口：到期后只标记 needs_attention，不猜测停止。
+    scheduleAttributionAging(record);
     log("fan-out continuation attribution unproven: " + JSON.stringify(payload));
   }
 
@@ -1376,23 +1576,23 @@ export function createFanoutRuntime(options = {}) {
    * @returns {boolean} 接受并替换返回 true；非法输入或超预算返回 false。
    */
   function restoreEvents(restoredEvents) {
-    if (!Array.isArray(restoredEvents)) return false;
+    if (!Array.isArray(restoredEvents)) return finishRestoreEvents(false);
     // 1. 先看原始长度：超限立即拒绝，不进入任何逐元素处理。
     if (restoredEvents.length > FANOUT_EVENT_LOG_LIMIT) {
       lastEventViolation = describeRestoreEventsViolation(restoredEvents.length);
-      return false;
+      return finishRestoreEvents(false);
     }
     // 2. 单条事件：字节预算 + 可测量性（不可序列化不能当"未知体积"放过）。
     for (const event of restoredEvents) {
       if (!isObject(event)) continue;
       if (measureJsonBytes(event) === null) {
         lastEventViolation = describeRestoreEventsUnmeasurableViolation();
-        return false;
+        return finishRestoreEvents(false);
       }
       const single = checkEventBudget(event, { subject: "restoreEvents" });
       if (single.ok) continue;
       lastEventViolation = single.violation;
-      return false;
+      return finishRestoreEvents(false);
     }
     const normalized = restoredEvents
       .filter((event) => isObject(event) && Number.isSafeInteger(event.sequence) && event.sequence > 0)
@@ -1405,41 +1605,53 @@ export function createFanoutRuntime(options = {}) {
     });
     if (history.droppedCount > 0 || normalized.length > FANOUT_EVENT_LOG_LIMIT) {
       lastEventViolation = history.violation ?? describeRestoreEventsViolation(normalized.length);
-      return false;
+      return finishRestoreEvents(false);
     }
     events.splice(0, events.length, ...normalized);
     // 归一化后是整体按 sequence 升序的日志，快路径前提重新成立。
     eventsAscending = true;
     lastEventViolation = null;
-    return true;
+    return finishRestoreEvents(true);
   }
 
-  /** 恢复事件不可 JSON 序列化时的结构化违规（整体拒绝，不写原始负载）。 */
+  /**
+   * 记录 restoreEvents 的最终结果（供 index 冷启动消费 + 诊断读取）。
+   *
+   * 恢复失败的事实不再只藏在返回值里：lastEventRestoreAccepted 与 lastEventViolation
+   * 会随 eventLogStatus() 暴露，index.js 也会在冷启动时记录告警。
+   */
+  function finishRestoreEvents(accepted) {
+    lastEventRestoreAccepted = accepted === true;
+    return lastEventRestoreAccepted;
+  }
+
+  /**
+   * 恢复事件不可 JSON 序列化时的结构化违规（整体拒绝，不写原始负载）。
+   *
+   * 统一走 describeBudgetViolation：旧实现手写字段，缺 label/subject/hint，且把条数
+   * 上限塞进 maxBytes，诊断消费者无法与其它预算违规归一处理。
+   */
   function describeRestoreEventsUnmeasurableViolation() {
-    return Object.freeze({
-      code: "BUDGET_EXCEEDED",
+    return describeBudgetViolation({
       resource: "event_history",
-      limit: FANOUT_EVENT_LOG_LIMIT,
-      maxBytes: FANOUT_EVENT_LOG_LIMIT,
+      limit: FANOUT_BUDGET.maxEventHistory,
       receivedBytes: null,
-      unmeasurable: true,
-      complete: false,
+      measured: false,
       recoverable: false,
-      message: "超出预算: 恢复事件无法测量（不可 JSON 序列化）",
+      subject: "restoreEvents",
+      hint: "恢复事件含不可 JSON 序列化的负载，已整体拒绝（不改动现有事件历史）",
     });
   }
 
   /** 恢复事件条数超限时的结构化违规（与 history 字节违规共用同一 code/resource）。 */
   function describeRestoreEventsViolation(count) {
-    return Object.freeze({
-      code: "BUDGET_EXCEEDED",
+    return describeBudgetViolation({
       resource: "event_history",
-      limit: FANOUT_EVENT_LOG_LIMIT,
-      maxBytes: FANOUT_EVENT_LOG_LIMIT,
+      limit: FANOUT_BUDGET.maxEventHistory,
       receivedBytes: count,
-      complete: false,
       recoverable: false,
-      message: "超出预算: 恢复事件条数 " + String(count) + " > 上限 " + String(FANOUT_EVENT_LOG_LIMIT),
+      subject: "restoreEvents",
+      hint: "恢复事件条数超过事件历史预算，已整体拒绝；请先清理持久化快照中的事件",
     });
   }
 
@@ -1487,10 +1699,54 @@ export function createFanoutRuntime(options = {}) {
       if (parentTaskId !== undefined && event.parentTaskId !== parentTaskId) continue;
       batch.push(normalizeEvent(event));
     }
+    // gap 判定基于**全局**日志（与 parentTaskId 过滤无关）：过滤只减少本次返回条数，
+    // 不能改变"这段历史已经缺失"的事实。最早序号=1 时它前面不存在事件（sequence 从 1
+    // 开始），因此 cursor=0 也不算缺口；只有确实裁剪过队首（earliest > 1）才标记 gap。
+    const earliestSequence = earliestEventSequence();
+    const gap = earliestSequence !== null && earliestSequence > 1 && cursor < earliestSequence;
     return {
       events: batch,
       nextSequence: events.length === 0 ? cursor : Math.max(cursor, events[events.length - 1].sequence ?? cursor),
+      earliestSequence,
+      gap,
+      dropped: droppedEventCount,
     };
+  }
+
+  /** 当前事件日志中最早一条有效 sequence（日志为空/无有效序号时返回 null）。 */
+  function earliestEventSequence() {
+    if (eventsAscending) {
+      for (const event of events) {
+        if (Number.isSafeInteger(event?.sequence) && event.sequence > 0) return event.sequence;
+      }
+      return null;
+    }
+    // 乱序兜底路径：日志不再按到达顺序单调，必须全量取最小，否则 gap 会基于错误的
+    // "最早序号"判断（只在降级模式下付出 O(n)，正常路径仍是 O(1)）。
+    let earliest = null;
+    for (const event of events) {
+      const sequence = event?.sequence;
+      if (!Number.isSafeInteger(sequence) || sequence < 1) continue;
+      if (earliest === null || sequence < earliest) earliest = sequence;
+    }
+    return earliest;
+  }
+
+  /**
+   * 事件日志只读状态（诊断/契约测试用）。
+   *
+   * 与 getEvents 的区别：不触发差集扫描、不返回事件正文，只回答"保留窗口内最早能读到
+   * 什么、累计丢了多少、最近一次恢复事件是否被接受"。
+   */
+  function eventLogStatus() {
+    return Object.freeze({
+      count: events.length,
+      earliestSequence: earliestEventSequence(),
+      dropped: droppedEventCount,
+      ascending: eventsAscending,
+      restoreAccepted: lastEventRestoreAccepted === undefined ? null : lastEventRestoreAccepted,
+      lastViolation: lastEventViolation === null ? null : cloneJson(lastEventViolation),
+    });
   }
 
   /**
@@ -1513,6 +1769,8 @@ export function createFanoutRuntime(options = {}) {
     // requestChildInterrupt 吞并记录），最后用显式关闭错误一次性结算 completion。
     for (const record of records.values()) {
       record.cancelRequested = true;
+      // 关闭是老化窗口的终点：清除全部 Host 侧定时器，避免关闭后仍有回调进来。
+      releaseAttributionAgingTimer(record);
       try { record.controller?.abort(); } catch (error) { log("fan-out admission abort failed", error); }
       requestChildInterrupt(record, { ...record.input, reason: "runtime_closed" }, record.childId);
       // 还停在 buildRequest 的 launcher admission（phase=build）与还没拿到 messageId 的
@@ -1560,6 +1818,27 @@ export function createFanoutRuntime(options = {}) {
     handleAgentDisposed,
     restoreEvents,
     getEvents,
+    eventLogStatus,
+    /**
+     * 停止/归属诊断投影（票据 07）：manager 的未确认停止视图 + Host 侧归属老化窗口。
+     *
+     * 只读：不触发调度、不改状态、不清理定时器。关闭后仍可读取（manager 的终态与 Host
+     * 的计数都保留在内存里，供卸载前最后一次诊断/测试断言）。
+     */
+    stopDiagnostics() {
+      const managerState = typeof manager.stopDiagnostics === "function" ? manager.stopDiagnostics() : null;
+      return {
+        ...(managerState ?? {}),
+        aging: {
+          enabled: attributionAgingMs > 0,
+          windowMs: attributionAgingMs,
+          pending: attributionAgingPending,
+          aged: attributionAgingAgedCount,
+          skipped: attributionAgingSkippedCount,
+          lastAged: lastAttributionAged === null ? null : cloneJson(lastAttributionAged),
+        },
+      };
+    },
     close,
     /**
      * 只读预算视图：当前用量、冻结上限与最近一次违规。恢复事件（外部输入）的违规
@@ -1569,7 +1848,13 @@ export function createFanoutRuntime(options = {}) {
       const managerBudget = manager.budget();
       return lastEventViolation === null
         ? managerBudget
-        : { ...managerBudget, eventLog: events.length, lastViolation: lastEventViolation };
+        : {
+          ...managerBudget,
+          eventLog: events.length,
+          // 恢复事件历史属于 restore 阶段（manager 的 lastViolationPhase 不覆盖它）。
+          lastViolationPhase: "restore",
+          lastViolation: lastEventViolation,
+        };
     },
     get activeAttemptCount() { return records.size; },
     /**

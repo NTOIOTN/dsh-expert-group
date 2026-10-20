@@ -30,6 +30,8 @@
  *    饿死，而高任务级上限的父任务又能单任务越过 role 共享池。
  *    角色级/default 两层描述"该角色的共享并发池"，可以注入解析函数并按当前设置动态
  *    取值（设置页保存后立即约束后续派发）；任务级显式限制会随任务快照固化，恢复后不变。
+ *    并发来源优先级：当前设置解析值（live）> 快照中的显式角色级映射 > 安全默认值。
+ *    restore 不会把 live 来源冻结成快照值；只有读不到当前设置的进程才冻结并标注 source=snapshot。
  * 3. 公平性：多个父任务共享同一 role 槽位时，按父任务轮转（round-robin cursor）
  *    派发，避免大型父任务用排队 shard 饿死后来的小任务。
  * 4. 竞态：启动器可能同步返回、异步返回，也可能启动后永不结束（只能靠超时或取消
@@ -43,6 +45,40 @@
  *    全部有界，超限一律结构化拒绝或显式失败（见 resource-budget.js）。输入超限在
  *    submit 阶段整体拒绝；result/error 超限把该 shard 收敛为 failed 并携带
  *    complete=false 的违规元数据；快照超限不落盘。
+ * 7. 超时（票据 06）：三级来源 shard 显式 > 父任务默认 > 角色默认，含「0 = 显式禁用」
+ *    与「未设置 = 交给下一级」两种语义（合法启用值：1000~86,400,000 毫秒，精度 1 秒）。
+ *    超时只在**创建 attempt 时**解析一次并写入 attempt.timeoutMs，因此不会改写运行中的分片；
+ *    计时起点是 attempt 进入 running，超时把最新 attempt 收敛为 timed_out（可手工重试、
+ *    绝不自动重试）。
+ * 8. 真实停止边界（票据 07，manager 层）：**逻辑终态**与**执行确已停止**是两件事。
+ *    - 逻辑状态一旦进入 succeeded/failed/cancelled/timed_out/interrupted 就一定性且不可被
+ *      迟到结果改写；stopEvidence 只允许 unknown -> observed；
+ *    - 影响范围（affectedPaths 预留）按 **attempt** 建索引，从 queued 起就占用，只有
+ *      「attempt 已终态 且 stopEvidence 已 observed」才释放；
+ *    - 聚合 gate：任务只有在 counts.pending===0 且 counts.stop_pending===0 时才结算、
+ *      写 settledAt、发 task_settled；逻辑终态但停止未确认时任务保持 pending；
+ *    - 重试/续作/恢复续跑在创建新 attempt 前必须确认该 shard 的历史 attempt 全部 observed，
+ *      否则结构化拒绝 reason=stop_unconfirmed；
+ *    - 超时/取消只写逻辑终态并请求停止（stopRequestedAt/stopDeadlineAt + 看门狗），
+ *      宽限到期只记 stopWatchdogExpiredAt 并发布一次 attempt_stop_unconfirmed 诊断，
+ *      不释放范围、不重试、不聚合、不发完成通知；
+ *    - 权威停止证据由 Host 经 observeStopEvidence 提交（严格 attempt 身份匹配）；管理器
+ *      自身只承认「自己的完成回调」「admission 明确未创建 child」「queued 从未 admission」
+ *      与恢复边界（process-restart）。
+ * 9. 显式任务回收（票据 05）：根会话可以回收**已结算**的父任务，让容量不再被历史任务永久
+ *    占满。回收是两阶段提交：prepareReclaim 先按统一前置条件筛选、生成"排除待回收任务"的
+ *    候选快照并立起回收屏障（barrier）；Host 必须先把候选快照**真实落盘成功**，才允许
+ *    commitReclaim 从内存与索引中移除。落盘失败只能 abortReclaim，内存状态不变。
+ *    - 屏障期间所有公开写入口返回结构化 reclaim_in_progress（commit/abort 除外），
+ *      调度暂停但既有 child 的 completion/超时仍可收敛，绝不丢收敛事件；
+ *    - 回收不保留任务墓碑：快照/列表/查询只看得到 task_not_found，重启也不会复活；
+ *    - 关闭竞态：close 不清回收屏障、也不删除已结算任务；已 prepare 的回收在 close 后
+ *      仍可 commit/abort（token + 屏障是唯一门槛），关闭后的 commit 只做内存/索引移除，
+ *      不再 emit tasks_reclaimed、不 notifyPersistence、不 schedule；
+ *    - 已被回收任务对象上的迟到回调（completion/证据/归属老化）只做结构化 no-op
+ *      （reason=task_reclaimed），不改统计、不写事件与快照；
+ *    - 容量拒绝结构携带 current / reclaimable 与指向回收入口的可执行提示，
+ *      且 requestId 幂等判定先于容量判定（满额时重复 requestId 仍返回 duplicate）。
  *
  * @module dsh-expert-group/fanout
  */
@@ -51,10 +87,9 @@ import {
   FANOUT_BUDGET,
   checkAttemptPayloadBudget,
   checkBudget,
-  checkEventBudget,
-  checkEventHistoryBudget,
   checkRestoreBudget,
   checkTaskInputBudget,
+  createEventHistoryAccounting,
   describeBudgetViolation,
   measureJsonBytes,
   measureUtf8Bytes,
@@ -67,6 +102,174 @@ export const DEFAULT_CONCURRENCY_LIMIT = 10;
 export const MIN_CONCURRENCY_LIMIT = 1;
 /** per-role 并发上限的上界。 */
 export const MAX_CONCURRENCY_LIMIT = 64;
+
+/**
+ * 回收进行中的统一拒绝码（Host/RPC/客户端与测试共用，避免字符串漂移）。
+ *
+ * 语义：manager 正在等待一次回收的候选快照落盘，此时任何公开写入口都不得插入状态变化，
+ * 否则"落盘的候选"与"内存状态"会不一致。调用方拿到本码应稍后重试。
+ */
+export const RECLAIM_IN_PROGRESS_CODE = "RECLAIM_IN_PROGRESS";
+
+/** 已回收任务的迟到回调统一拒绝码（结构化 no-op，不复活任务）。 */
+export const TASK_RECLAIMED_CODE = "TASK_RECLAIMED";
+
+/** 单次显式回收的父任务数上限：与 maxTasks 同源（不允许一次回收超过容量本身）。 */
+export const MAX_RECLAIM_BATCH = FANOUT_BUDGET.maxTasks;
+
+/**
+ * shard / 父任务 / 角色默认超时（毫秒）的边界与精度（票据 06「超时能力暴露」）。
+ *
+ * 语义只有三种：
+ * - 未设置（undefined/null）：表示「这一层没有配置」，交给下一层优先级；
+ * - 0：显式禁用超时（可以用它覆盖上级默认值）；
+ * - 1000 ～ 86,400,000 且为 1000 的整数倍：真正启用。
+ *
+ * 上限 24 小时：足够覆盖长任务，同时避免把「超时」写成事实上的无限等待；
+ * 精度 1 秒的理由是设置页与工具参数都不应引入毫秒级噪声（超时肯定是人工决定的粗粒度阈值）。
+ */
+export const MIN_TIMEOUT_MS = 1000;
+export const MAX_TIMEOUT_MS = 86400000;
+export const TIMEOUT_STEP_MS = 1000;
+
+/**
+ * 校验超时取值并返回归一结果：工具层、settings 层与 manager 层共用同一语义。
+ *
+ * 返回 {ok:true, value} 时 value 可能是 undefined（未设置）或 0（显式禁用）：
+ * 两者都合法，但语义不同——前者把决定权交给下一层优先级，后者截断下层默认值。
+ *
+ * 非法输入（非数、NaN/Infinity、负数、1～999、超上限、非整秒）
+ * 一律返回同一个结构化错误 code=INVALID_TIMEOUT，并带准确字段路径。
+ *
+ * @param {unknown} value - 待校验值。
+ * @param {string} [field] - 出错时的字段路径（如 "shards[0].timeoutMs"）。
+ * @returns {{ok:true, value:(number|undefined)} | {ok:false, code:string, message:string, field:string}}
+ */
+export function validateTimeoutMs(value, field = "timeoutMs") {
+  if (value === undefined || value === null) return { ok: true, value: undefined };
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return { ok: false, code: "INVALID_TIMEOUT", message: field + " 必须是毫秒数", field };
+  }
+  if (value === 0) return { ok: true, value: 0 };
+  if (!Number.isInteger(value)) {
+    return { ok: false, code: "INVALID_TIMEOUT", message: field + " 必须是整数毫秒", field };
+  }
+  if (value < MIN_TIMEOUT_MS || value > MAX_TIMEOUT_MS) {
+    return {
+      ok: false,
+      code: "INVALID_TIMEOUT",
+      message: field + " 必须是 0（禁用）或 " + MIN_TIMEOUT_MS + "~" + MAX_TIMEOUT_MS + " 毫秒",
+      field,
+    };
+  }
+  if (value % TIMEOUT_STEP_MS !== 0) {
+    return {
+      ok: false,
+      code: "INVALID_TIMEOUT",
+      message: field + " 必须是 " + TIMEOUT_STEP_MS + " 毫秒的整数倍（精度 1 秒）",
+      field,
+    };
+  }
+  return { ok: true, value };
+}
+
+/**
+ * 把任意超时取值归一成可直接使用的值：非法/未设置 → undefined（不启用）。
+ *
+ * 只用于**读取面**（settings 归一、注入解析函数的返回值）：配置写错
+ * 不能让调度抛错，写入口仍必须走 validateTimeoutMs 拿到结构化拒绝。
+ * 注意 0 是显式禁用，会原样保留。
+ *
+ * @param {unknown} value - 待归一值。
+ * @returns {number|undefined}
+ */
+export function normalizeTimeoutMs(value) {
+  const check = validateTimeoutMs(value);
+  return check.ok ? check.value : undefined;
+}
+
+/**
+ * 恢复路径的超时校验：只要求「0 或正有限数」，**不**套用新写入的
+ * 精度 / 上下界规则（票据 06 的恢复兼容约束）。
+ *
+ * 为什么放宽：旧快照里的 timeoutMs 由旧版管理器的校验产生（任意正有限数，
+ * 例如 1500 毫秒）；1 秒精度与 24 小时上限只约束**新写入**。用新规则整体拒绝
+ * 一份历史快照，等于让升级后无法恢复任何旧任务。0（显式禁用）同样必须可恢复。
+ *
+ * @param {unknown} value - 快照中的超时值。
+ * @param {string} field - 出错时的字段路径。
+ * @returns {{ok:true, value:(number|undefined)} | {ok:false, code:string, message:string, field:string}}
+ */
+/**
+ * 恢复路径的停止证据字段校验（票据 07）。
+ *
+ * 结构非法必须整体拒绝，不能静默丢弃：把"已观察"降级成"未知"会让任务永远不结算，
+ * 把"未知"升级成"已观察"更危险——它会凭空释放影响范围。因此这里只做形状校验，
+ * 语义（unknown -> observed、进程重启边界）由 restore 的边界选项决定。
+ *
+ * @param {object} rawAttempt - 快照中的 attempt。
+ * @param {string} field - 字段路径（错误定位用）。
+ * @returns {{ok:true} | {ok:false, code:string, message:string, field:string}}
+ */
+function validateRestoredStopFields(rawAttempt, field) {
+  const fail = (message, at = field) => ({ ok: false, code: "INVALID_SNAPSHOT_STOP_EVIDENCE", message, field: at });
+  if (rawAttempt.attemptId !== undefined
+    && (typeof rawAttempt.attemptId !== "string" || rawAttempt.attemptId.trim().length === 0)) {
+    return fail("快照 attempt.attemptId 必须是非空字符串", field + ".attemptId");
+  }
+  if (rawAttempt.executionGeneration !== undefined
+    && (!Number.isSafeInteger(rawAttempt.executionGeneration) || rawAttempt.executionGeneration < 1)) {
+    return fail("快照 attempt.executionGeneration 必须是正整数", field + ".executionGeneration");
+  }
+  for (const key of ["stopRequestedAt", "stopDeadlineAt", "stopWatchdogExpiredAt"]) {
+    const value = rawAttempt[key];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      return fail("快照 attempt." + key + " 必须是非负有限数", field + "." + key);
+    }
+  }
+  if (rawAttempt.terminalReason !== undefined
+    && (typeof rawAttempt.terminalReason !== "string" || rawAttempt.terminalReason.length === 0)) {
+    return fail("快照 attempt.terminalReason 必须是非空字符串", field + ".terminalReason");
+  }
+  if (rawAttempt.legacy !== undefined && typeof rawAttempt.legacy !== "boolean") {
+    return fail("快照 attempt.legacy 必须是布尔值", field + ".legacy");
+  }
+  if (rawAttempt.stopEvidence === undefined) return { ok: true };
+  const evidence = rawAttempt.stopEvidence;
+  if (evidence === null || typeof evidence !== "object" || Array.isArray(evidence)) {
+    return fail("快照 attempt.stopEvidence 必须是对象", field + ".stopEvidence");
+  }
+  if (evidence.state !== STOP_EVIDENCE_STATE_UNKNOWN && evidence.state !== STOP_EVIDENCE_STATE_OBSERVED) {
+    return fail("快照 attempt.stopEvidence.state 必须是 unknown/observed", field + ".stopEvidence.state");
+  }
+  if (evidence.state === STOP_EVIDENCE_STATE_UNKNOWN) return { ok: true };
+  if (typeof evidence.source !== "string" || evidence.source.trim().length === 0) {
+    return fail("已观察的 stopEvidence 必须带 source", field + ".stopEvidence.source");
+  }
+  if (evidence.observedAt !== undefined
+    && (typeof evidence.observedAt !== "number" || !Number.isFinite(evidence.observedAt) || evidence.observedAt < 0)) {
+    return fail("stopEvidence.observedAt 必须是非负有限数", field + ".stopEvidence.observedAt");
+  }
+  for (const key of ["childId", "messageId", "sessionId"]) {
+    if (evidence[key] === undefined) continue;
+    if (typeof evidence[key] !== "string" || evidence[key].trim().length === 0) {
+      return fail("stopEvidence." + key + " 必须是非空字符串", field + ".stopEvidence." + key);
+    }
+  }
+  if (evidence.turn !== undefined && (!Number.isSafeInteger(evidence.turn) || evidence.turn < 0)) {
+    return fail("stopEvidence.turn 必须是非负整数", field + ".stopEvidence.turn");
+  }
+  return { ok: true };
+}
+
+function validateRestoredTimeoutMs(value, field) {
+  if (value === undefined || value === null) return { ok: true, value: undefined };
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return { ok: false, code: "INVALID_TIMEOUT", message: field + " 必须是 0 或正有限数", field };
+  }
+  return { ok: true, value };
+}
 
 /**
  * shard 可选任务名称的 UTF-8 字节上限。
@@ -91,6 +294,14 @@ export const SHARD_TERMINAL_STATUSES = Object.freeze([
   "interrupted",
 ]);
 
+/**
+ * 可手工重试的 shard 终态（与 retryShard 的判定同一集合）。
+ *
+ * 单独成表是为了让能力投影与真实写入口共用同一份词表：任何一侧新增/删减状态，
+ * 另一侧都不会悄悄漂移成「界面允许但 manager 拒绝」。
+ */
+const RETRYABLE_SHARD_STATUSES = new Set(["failed", "timed_out", "cancelled", "interrupted"]);
+
 /** 父任务聚合状态。pending 表示仍有未终态 shard。 */
 export const FANOUT_TASK_STATUSES = Object.freeze([
   "pending",
@@ -111,12 +322,155 @@ const SHARD_STATUS_KEYS = Object.freeze([
 ]);
 const SHARD_STATUS_SET = new Set(SHARD_STATUS_KEYS);
 
+/**
+ * 停止证据（stopEvidence）的状态与来源（票据 07）。
+ *
+ * 状态机只有两个状态：
+ * - unknown：默认。管理器知道"这个 attempt 逻辑上结束了/被要求停止了"，但**无法证明**
+ *   对应的执行体（child 进程/会话轮次）真的停了；
+ * - observed：收到了权威停止信号。只允许 unknown -> observed，永不可逆。
+ *
+ * source 的取值必须来自下面这张表。表分两层：
+ * - 管理器自己可判定的（child_completion / admission_not_created / not-started）：
+ *   child_completion 指该 attempt 自己绑定的 completion 回调落地（成功、失败或取消后的
+ *   迟到回调都算），它证明这一轮执行已经结束；admission_not_created 指启动器抛错/reject，
+ *   按既有契约等于没有创建 child；not-started 指 queued 阶段被取消、从未 admission。
+ * - Host 提交的权威信号（child_turn_end / child_disposal / admission_not_created /
+ *   fencing）：必须严格归属到该 attempt，由 observeStopEvidence 入口校验。
+ * - process-restart：只由 restore 的 stopEvidenceBoundary="process-restart" 使用。
+ *
+ * 管理器自己发出的 cancel/interrupt、超时到期、close、root 结束、代次更新都**不是**
+ * 停止证据，对应 attempt 的 stopEvidence 保持 unknown。
+ */
+export const STOP_EVIDENCE_STATE_UNKNOWN = "unknown";
+export const STOP_EVIDENCE_STATE_OBSERVED = "observed";
+export const STOP_EVIDENCE_SOURCES = Object.freeze([
+  "child_completion",
+  "admission_not_created",
+  "not-started",
+  "child_turn_end",
+  "child_disposal",
+  "fencing",
+  "process-restart",
+]);
+/** observeStopEvidence 接受的外部来源（管理器内部来源不允许由 Host 冒充）。 */
+export const HOST_STOP_EVIDENCE_SOURCES = Object.freeze([
+  "child_turn_end",
+  "child_disposal",
+  "admission_not_created",
+  "fencing",
+]);
+/**
+ * 停止宽限期（毫秒）：从"请求停止"到"看门狗判定未确认"的默认预算。
+ *
+ * 它不改变任何逻辑状态，只决定何时发布一次 attempt_stop_unconfirmed 诊断。15 秒足够覆盖
+ * 一次 interrupt 的进程清理，又远小于超时量级，避免诊断被无限推迟；可通过
+ * createFanoutManager({ stopGraceMs }) 注入（测试用假时钟驱动同一个定时器 seam）。
+ */
+export const STOP_GRACE_MS = 15000;
+/** restore 的停止证据边界取值。 */
+export const STOP_EVIDENCE_BOUNDARIES = Object.freeze(["unknown", "process-restart"]);
+
+/**
+ * 稳定进程身份（票据 07）：pid + 进程启动时间，用于自动判定恢复边界。
+ *
+ * 为什么需要它：restore 的默认边界不能靠猜——同一个进程内重建 manager（例如插件重载、
+ * defer 后再次 restore）时，旧 child 可能仍在写盘，此时必须保持 unknown；而新进程启动时，
+ * 上一个进程的执行体确实已随进程终止，这是规格允许的 process-restart 边界。
+ *
+ * 缓存策略：第一次计算后写进 globalThis 的 Symbol 槽位（同一进程内所有模块实例共享，
+ * Symbol.for 保证跨模块重载仍是同一个键）。因此模块被重新求值（插件热重载）时身份不变；
+ * 只有真正的进程重启才会得到新值。启动时间用 Date.now()-process.uptime()*1000 反推，
+ * 取整到毫秒；全局缓存避免了两次求值之间的时钟采样噪声。
+ */
+const PROCESS_INSTANCE_SYMBOL = Symbol.for("dsh-expert-group:process-instance");
+
+/**
+ * 解析当前进程身份（只计算一次并全局缓存）。
+ *
+ * @returns {string} "proc:<pid>@<startedAtMs>"；无法读取 process 时返回稳定占位值。
+ */
+export function resolveProcessInstance() {
+  const globalObject = typeof globalThis === "object" && globalThis !== null ? globalThis : undefined;
+  const cached = globalObject?.[PROCESS_INSTANCE_SYMBOL];
+  if (typeof cached === "string" && cached.length > 0) return cached;
+  let value;
+  try {
+    const startedAt = Math.round(Date.now() - process.uptime() * 1000);
+    value = "proc:" + process.pid + "@" + startedAt;
+  } catch {
+    // 退化值也必须稳定（模块重载不能改变它），否则会把同进程误判成重启。
+    value = "proc:unknown@0";
+  }
+  if (globalObject !== undefined) {
+    try {
+      Object.defineProperty(globalObject, PROCESS_INSTANCE_SYMBOL, {
+        value,
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      });
+    } catch {
+      try { globalObject[PROCESS_INSTANCE_SYMBOL] = value; } catch { /* 只读宿主：保持局部值 */ }
+    }
+  }
+  return value;
+}
+
+/** 当前进程身份（快照持久化与自动恢复边界的唯一来源）。 */
+export const PROCESS_INSTANCE = resolveProcessInstance();
+
 /** 快照格式版本；restore 只接受同版本快照。 */
 const SNAPSHOT_VERSION = 1;
+
+/**
+ * 超时投影版本（票据 06）：新快照会在分片上写入 shard.timeoutMs（仅显式值）。
+ *
+ * 为什么需要它：旧快照的 buildSnapshotPayload **从来没有**写过 shard.timeoutMs，
+ * 当年的恢复靠「最新 attempt 的 timeoutMs」反推分片覆盖（旧语义下两者恒等）。
+ * 新语义下 attempt.timeoutMs 可能来自父任务/角色默认值，再反推就会把默认值
+ * 伪造成分片覆盖。因此用一个显式标记区分两种投影：缺标记 = 旧快照（保持
+ * 反推兼容），标记匹配 = 新快照（只认 rawShard.timeoutMs）。
+ * 它不改变 SNAPSHOT_VERSION：两种快照都可恢复，不能因标记存在与否而整体拒绝。
+ */
+const TIMEOUT_PROJECTION_VERSION = 1;
 
 /** 判断 shard 是否已进入终态（含恢复态 interrupted）。 */
 export function isTerminalShardStatus(status) {
   return SHARD_TERMINAL_STATUSES.includes(status);
+}
+
+/**
+ * 确定性的 attempt 标识（旧快照缺字段时的派生规则，新 attempt 复用同一格式）。
+ *
+ * 为什么用确定性字符串而不是随机 id：attempt 身份必须跨进程重启稳定（快照里持久化），
+ * 并且旧快照（没有 attemptId 字段）也要能被 Host 用同一规则寻址——两套规则会让"恢复后
+ * 提交停止证据"永远对不上。三元组 parentTaskId+shardId+attempt 在管理器内天然唯一
+ * （parentTaskId 唯一、shardId 在任务内唯一、attempt 序号单调递增），因此派生是安全的。
+ *
+ * @param {string} parentTaskId - 父任务标识。
+ * @param {string} shardId - 分片标识。
+ * @param {number} attemptNumber - attempt 序号（从 1 开始）。
+ * @returns {string}
+ */
+export function deriveAttemptId(parentTaskId, shardId, attemptNumber) {
+  return "attempt:" + String(parentTaskId) + "/" + String(shardId) + "#" + String(attemptNumber);
+}
+
+/** attempt 的停止证据是否已确认为 observed（缺字段一律按 unknown 处理）。 */
+export function isStopObserved(attempt) {
+  return attempt?.stopEvidence?.state === STOP_EVIDENCE_STATE_OBSERVED;
+}
+
+/** 各逻辑终态对应的默认终止原因码（调用方可覆盖成更精确的原因）。 */
+function defaultTerminalReason(status) {
+  switch (status) {
+    case "succeeded": return "completed";
+    case "timed_out": return "timeout";
+    case "interrupted": return "restore";
+    case "cancelled": return "cancelled";
+    default: return "failed";
+  }
 }
 
 /** 结构化校验错误：调用方可用 code/field 做精确分支，不需要解析文案。 */
@@ -186,6 +540,26 @@ function cloneJson(value) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value : "";
+}
+
+/**
+ * 把可选的 id 集合归一成 Set（用于快照投影的排除集合）。
+ *
+ * 只接受数组或 Set；其它形态视为"没有排除集合"（null）。空集合同样归一成 null，
+ * 让热路径可以只做一次 null 判定，而不必区分"空集合"与"未提供"。
+ *
+ * @param {unknown} value - 数组 / Set / undefined。
+ * @returns {Set<string>|null}
+ */
+function normalizeIdSet(value) {
+  if (value === null || value === undefined) return null;
+  const source = value instanceof Set ? value : (Array.isArray(value) ? value : null);
+  if (source === null) return null;
+  const set = new Set();
+  for (const entry of source) {
+    if (typeof entry === "string" && entry.length > 0) set.add(entry);
+  }
+  return set.size === 0 ? null : set;
 }
 
 /**
@@ -334,7 +708,7 @@ function normalizeConflict(verdict) {
  * shardId）。非法 name 与非法 shardId/prompt 一样整体拒绝，避免把写错的输入静默降级。
  *
  * @param {object} input - submit() 的原始入参。
- * @returns {{ok:true, role:string, basePrompt:string, shards:object[], requestId?:string, concurrencyLimit?:number, allowOverlap:boolean} | {ok:false, code:string, message:string, field?:string, conflict?:object}}
+ * @returns {{ok:true, role:string, basePrompt:string, shards:object[], requestId?:string, concurrencyLimit?:number, timeoutMs?:number, allowOverlap:boolean} | {ok:false, code:string, message:string, field?:string, conflict?:object}}
  */
 export function validateSubmitInput(input) {
   const raw = input === null || typeof input !== "object" ? {} : input;
@@ -384,13 +758,11 @@ export function validateSubmitInput(input) {
       }
       affectedPaths = [...rawShard.affectedPaths];
     }
-    let timeoutMs;
-    if (rawShard.timeoutMs !== undefined && rawShard.timeoutMs !== null) {
-      if (typeof rawShard.timeoutMs !== "number" || !Number.isFinite(rawShard.timeoutMs) || rawShard.timeoutMs <= 0) {
-        return { ok: false, code: "INVALID_TIMEOUT", message: field + ".timeoutMs 必须是正有限数", field: field + ".timeoutMs" };
-      }
-      timeoutMs = rawShard.timeoutMs;
-    }
+    // 分片级超时覆盖（票据 06）：与父任务默认值/角色默认值共用同一校验语义。
+    // 0 是合法的「显式禁用」，不能被当成非法输入拒绝（否则无法用分片覆盖父任务的默认超时）。
+    const timeoutVerdict = validateTimeoutMs(rawShard.timeoutMs, field + ".timeoutMs");
+    if (!timeoutVerdict.ok) return timeoutVerdict;
+    const timeoutMs = timeoutVerdict.value;
     shards.push({
       shardId,
       prompt,
@@ -428,6 +800,12 @@ export function validateSubmitInput(input) {
     concurrencyLimit = check.value;
   }
 
+  // 父任务默认超时（票据 06）：只固化**显式**给出的值，未设置时
+  // 留给角色级默认值动态解析（快照里不出现该字段）。
+  const taskTimeoutVerdict = validateTimeoutMs(raw.timeoutMs, "timeoutMs");
+  if (!taskTimeoutVerdict.ok) return taskTimeoutVerdict;
+  const timeoutMs = taskTimeoutVerdict.value;
+
   let requestId;
   if (raw.requestId !== undefined && raw.requestId !== null) {
     if (typeof raw.requestId !== "string" || raw.requestId.trim().length === 0) {
@@ -443,6 +821,7 @@ export function validateSubmitInput(input) {
     shards,
     ...(requestId === undefined ? {} : { requestId }),
     ...(concurrencyLimit === undefined ? {} : { concurrencyLimit }),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
     allowOverlap: raw.allowOverlap === true,
   };
 }
@@ -454,17 +833,44 @@ function validationError(verdict) {
     ...(verdict.conflict === undefined ? {} : { conflict: verdict.conflict }),
     // 预算拒绝必须把结构化违规元数据一并带出（code/resource/receivedBytes/maxBytes）。
     ...(verdict.violation === undefined ? {} : { violation: verdict.violation }),
+    // 容量拒绝的可执行字段（当前任务数 / 可回收数）同样摊到错误顶层。
+    ...(verdict.current === undefined ? {} : { current: verdict.current }),
+    ...(verdict.reclaimable === undefined ? {} : { reclaimable: verdict.reclaimable }),
   });
 }
 
 /**
  * 把预算违规翻译成 submit 校验失败结果。
  * 输入超限不能截断后继续执行，因此这里走"整体拒绝"通道（不登记任务、不建 child）。
+ *
+ * @param {string} resource - 预算资源名（tasks / shards / attempts）。
+ * @param {number} limit - 上限。
+ * @param {number} receivedBytes - 本次实测数量/体积。
+ * @param {string} field - 出错的字段路径。
+ * @param {string} [hint] - 可执行提示。
+ * @param {object} [extra] - 额外合并进 violation 的结构化字段（例如容量拒绝的
+ *   current / reclaimable）。违规对象是冻结的，因此这里复制成新对象再合并。
  */
-function budgetVerdict(resource, limit, receivedBytes, field, hint) {
+function budgetVerdict(resource, limit, receivedBytes, field, hint, extra) {
   const check = checkBudget({ resource, limit, receivedBytes, subject: field, recoverable: true, hint });
   if (check.ok) return null;
-  return { ok: false, code: "INVALID_BUDGET", message: check.violation.message, field, violation: check.violation };
+  const violation = extra !== undefined && extra !== null && typeof extra === "object"
+    ? Object.freeze({ ...check.violation, ...extra })
+    : check.violation;
+  return {
+    ok: false,
+    code: "INVALID_BUDGET",
+    // 容量类拒绝把可执行提示并入顶层 message：工具调用方通常只展示 message，
+    // 提示必须在那里可见（hint 字段仍保留在 violation 中供结构化消费者使用）。
+    message: extra !== undefined && violation.hint !== undefined
+      ? violation.message + "（" + violation.hint + "）"
+      : violation.message,
+    field,
+    violation,
+    // 容量类拒绝同时把可执行字段摊到错误顶层：工具层/诊断面不必再解析 violation。
+    ...(violation.current === undefined ? {} : { current: violation.current }),
+    ...(violation.reclaimable === undefined ? {} : { reclaimable: violation.reclaimable }),
+  };
 }
 
 /**
@@ -496,6 +902,10 @@ function budgetVerdict(resource, limit, receivedBytes, field, hint) {
  * @param {Record<string, number>|Function} [options.roleLimits] - role 级并发上限覆盖；函数形式
  *   返回 {role: limit}，缺失 role 落到默认值。函数返回值里的非法条目一律回退默认值，
  *   绝不让 scheduler 拿到 NaN/负数/越界值。
+ * @param {number|Function} [options.roleTimeoutMs] - 角色级默认超时（毫秒，票据 06）。
+ *   传函数时按「每次新建 attempt 读一次当前 settings」动态解析（Host 用它接入
+ *   settings.roleTimeoutMs）；0 表示角色级显式禁用。优先级：shard 显式 > 父任务默认
+ *   > 本项 > 未启用；只影响之后创建的 attempt。
  * @param {number} [options.maxSnapshotBytes] - 单份快照字节上限覆盖（默认取 FANOUT_BUDGET）。
  * @returns {object} fan-out 管理器公共接口。
  */
@@ -513,6 +923,8 @@ export function createFanoutManager(options = {}) {
     conflictObserver,
     roleLimits: rawRoleLimits,
     concurrencyLimit: rawConcurrencyLimit,
+    roleTimeoutMs: rawRoleTimeoutMs,
+    stopGraceMs: rawStopGraceMs,
   } = options;
   if (typeof launcher !== "function") {
     throw new FanoutValidationError("INVALID_LAUNCHER", "必须注入 launcher 函数");
@@ -533,12 +945,33 @@ export function createFanoutManager(options = {}) {
   const setTimeoutFn = typeof clock?.setTimeout === "function" ? clock.setTimeout : (fn, ms) => setTimeout(fn, ms);
   const clearTimeoutFn = typeof clock?.clearTimeout === "function" ? clock.clearTimeout : (handle) => clearTimeout(handle);
 
-  // 默认并发上限既可以是静态整数，也可以是"每次新建父任务读取一次"的解析函数。
+  /**
+   * 停止宽限期（票据 07）：只驱动"停止未确认"看门狗，不改变逻辑状态。
+   *
+   * 非法值必须在构造期显式失败（配置写错不能静默回退），合法值为 0 或正有限数：
+   * 0 表示看门狗立即到期（仅测试/极端配置使用）。
+   */
+  const stopGraceMs = rawStopGraceMs === undefined || rawStopGraceMs === null
+    ? STOP_GRACE_MS
+    : (() => {
+        if (typeof rawStopGraceMs !== "number" || !Number.isFinite(rawStopGraceMs) || rawStopGraceMs < 0) {
+          throw new FanoutValidationError("INVALID_STOP_GRACE", "stopGraceMs 必须是 0 或正有限数", { field: "stopGraceMs" });
+        }
+        return rawStopGraceMs;
+      })();
+
+  // 默认并发上限既可以是静态整数，也可以是"每次解析都读取一次"的解析函数。
   // 函数形式接入插件 settings 的 roleConcurrencyLimit：静态非法值必须在构造期显式
   // 失败（配置写错不能静默降级），函数返回值则按归一化规则回退默认值——settings 里
   // 的旧配置/非法值不能污染调度器。
-  // 未被 settings 解析函数提供时先取静态默认值；之后 restore 若带来快照里的
-  // defaultConcurrencyLimit，则改由快照值驱动（见 roleLimitFor 的 resolverSource）。
+  //
+  // 来源模型（票据 03「并发来源修复」）：
+  // - 构造期注入函数 ⇒ live：**始终**跟随当前设置，restore 绝不允许把来源改成
+  //   snapshot。否则一次重启就会把"当前设置"永久旁路，设置页与真实并发脱节；
+  // - 没有注入函数 ⇒ snapshot：使用构造时的静态值或恢复出来的快照值。这类进程读不到
+  //   "当前设置"，只能冻结最后一次已知值，并在诊断里如实标注 snapshot。
+  // 任务级显式 concurrencyLimit 是另一层，始终优先且随任务快照固化，不受本条影响。
+  const hasLiveConcurrencyResolver = typeof rawConcurrencyLimit === "function";
   let defaultConcurrencyLimit = typeof rawConcurrencyLimit === "function"
     ? DEFAULT_CONCURRENCY_LIMIT
     : (rawConcurrencyLimit === undefined
@@ -549,17 +982,55 @@ export function createFanoutManager(options = {}) {
           return check.value;
         })());
   /**
-   * 默认并发上限的来源：live（读取注入的解析函数，接入 settings）或 snapshot
-   * （本快照自带 defaultConcurrencyLimit）。互斥，避免两套默认值互相覆盖。
+   * 角色级默认超时（票据 06）：number | 解析函数 | undefined。
    *
-   * 只有"快照确实带了 defaultConcurrencyLimit"时 restore 才切到 snapshot——旧快照与
-   * 不落盘全局配置的场景必须继续跟随注入的当前设置，否则恢复出来的 queued shard 会
-   * 使用请求时的临时 roleLimits 残值。任务级（快照固化）上限始终优先于本条。
+   * 与并发上限的模式一致：
+   * - 函数形式是「每次新建 attempt 时读一次当前 settings」的动态来源；
+   * - 静态值在构造期显式校验（配置写错必须立刻失败）；
+   * - 函数返回非法值/抛错时只能降级为「未启用」——超时配置
+   *   错误不能让派发抛错；
+   * - 0 是合法的「角色级显式禁用」，会原样作为解析结果传递。
    */
-  let resolverSource = typeof rawConcurrencyLimit === "function" ? "live" : "snapshot";
+  const staticRoleTimeoutMs = typeof rawRoleTimeoutMs === "function" || rawRoleTimeoutMs === undefined || rawRoleTimeoutMs === null
+    ? undefined
+    : (() => {
+        const check = validateTimeoutMs(rawRoleTimeoutMs, "roleTimeoutMs");
+        if (!check.ok) throw new FanoutValidationError(check.code, check.message, { field: "roleTimeoutMs" });
+        return check.value;
+      })();
+  /**
+   * 默认上限的权威来源：live（读取注入的解析函数）或 snapshot（冻结值）。
+   *
+   * live 一旦存在就永远是 live：restore 绝不会把 live 降级成 snapshot。snapshot 在
+   * restore 后仍然是 snapshot（可能换值，但来源不变）——没有解析函数的进程无法凭空
+   * 获得"当前设置"。快照里的 defaultConcurrencyLimit 因此只作为诊断负载保留（见
+   * buildSnapshotPayload 的 concurrencySource 标记），不再覆盖当前设置。
+   */
+  let resolverSource = hasLiveConcurrencyResolver ? "live" : "snapshot";
+  /**
+   * 最近一次解析得到的有效默认上限；从未解析时等于构造/恢复值。
+   *
+   * 写进快照用于诊断（让外部看到"上次解析出的值"），也用于没有 live resolver 的
+   * 消费者恢复到最后一次已知值。它不参与 live 调度决策——live 每次都重新解析，因此
+   * 真正的权威值始终由 concurrencyLimits()/调度读取，而不是这个诊断快照字段。
+   */
+  let lastResolvedDefaultConcurrencyLimit = defaultConcurrencyLimit;
   let roleLimits = normalizeRoleLimits(rawRoleLimits);
-  /** 解析函数返回非法值时的最近一次诊断（只读，不参与调度决策）。 */
-  let invalidLimitDiagnostic = null;
+  /**
+   * 恢复出来的显式角色级映射，仅当构造时 roleLimits 是 live 解析函数时作为第二层
+   * 回退：当前 settings 解析值 > 快照显式映射 > 安全默认值。静态 roleLimits 不走这里
+   * （restore 直接替换静态映射，保持既有语义）。
+   */
+  let restoredRoleLimitOverrides = Object.freeze({});
+  /**
+   * 解析函数返回非法值时的诊断：按 kind 分别保存，**解析成功后清除对应条目**。
+   *
+   * 用 Map 而不是单个变量：默认上限与角色级映射是两条独立解析路径，其中一条恢复
+   * 正常时不能抹掉另一条仍然有效的非法诊断。对外只暴露最近一次记录，保持既有单字段契约。
+   */
+  const invalidLimitDiagnostics = new Map();
+  /** 最近一次被记录的非法 kind；null 表示当前没有非法诊断。 */
+  let lastInvalidLimitKind = null;
   let writeRoles = normalizeWriteRoles(options.writeRoles);
   let defaultAllowOverlap = options.allowOverlap === true;
   /**
@@ -572,8 +1043,33 @@ export function createFanoutManager(options = {}) {
       ? { maxSnapshotBytes: options.maxSnapshotBytes }
       : {}),
   });
-  /** 最近一次预算违规（只读诊断；不参与调度决策）。 */
+  /**
+   * 最近一次预算违规（只读诊断；不参与调度决策）。
+   *
+   * 违规以"结构化描述 + 发生阶段"两部分保存：violation 与错误/事件/RPC 响应同源，
+   * phase 说明是哪条入口拒绝的（submit/retry/continue/attempt/event/snapshot/persist/
+   * serialize/restore/feedback），诊断消费者不需要解析文案就能分类。
+   */
   let lastBudgetViolation = null;
+  let lastBudgetViolationPhase = null;
+  /**
+   * budget_rejected 事件的递归闸：事件本身超预算时必须只发诊断事件，
+   * 绝不再为"预算事件超预算"继续发预算事件（否则就是无限反馈）。
+   */
+  let budgetEventDepth = 0;
+  /** 事件历史累计被裁剪的条数（进程生命周期内，供 gap 诊断）。 */
+  let droppedEventCount = 0;
+  /**
+   * 最近一次落盘结果（只读诊断）：saved / skipped(reason) / failed(category)。
+   *
+   * 失败分类的权威仍是 Host 的 persistence-health（容量/瞬态/代次/永久）；
+   * 这里只记录 manager 能直接观察到的事实（是否调用 save、跳过原因、实测字节），
+   * 两者在诊断面合并展示，不互相覆盖。
+   */
+  let lastPersistResult = null;
+  /** persistSnapshot 的调用序号：异步 save 的迟到结果不得覆盖更新的结果。 */
+  let persistSequence = 0;
+  let lastPersistResultTicket = 0;
   const usesDefaultConflictChecker = typeof injectedConflictChecker !== "function";
   let conflictChecker = usesDefaultConflictChecker
     ? createWriteRoleConflictChecker({ writeRoles })
@@ -596,6 +1092,31 @@ export function createFanoutManager(options = {}) {
    */
   const continuationRequestOwners = new Map();
   /**
+   * 显式回收的两阶段屏障状态（票据 05）：null 表示没有回收在途。
+   *
+   * 形状：{ token, parentTaskIds:Set<string>, candidate, bytes }。
+   * - prepareReclaim 设置它并生成候选快照；
+   * - Host 必须先 persist(candidate) 成功，再 commitReclaim；失败只能 abortReclaim；
+   * - 屏障期间公开写入口返回 reclaim_in_progress，调度暂停，因此"落盘的候选"与
+   *   commit 时的内存状态在任务集合上必然一致；
+   * - token 单调递增且不可复用，迟到的 commit/abort 不会命中新的回收；
+   * - close 不清空它：候选可能正在 Host 侧 await 落盘，只有保留屏障才能让关闭后的
+   *   commit/abort 继续按同一 token 生效（否则磁盘已排除任务、内存仍保留，二者分叉）。
+   */
+  let reclaimState = null;
+  let reclaimSequence = 0;
+  /**
+   * 已回收任务 id 的有界集合：**只**用于识别迟到回调，不是查询墓碑。
+   *
+   * 为什么需要它：回收后任务对象已从 tasks 删除，晚到的停止证据/归属老化按 id 查不到
+   * 任务；若直接返回 unknown_attempt，调用方无法区分"身份过期"与"任务已回收"。
+   * 这里只回答"这个 id 最近被回收过"，不携带任何任务数据、不参与任何查询/权限判定，
+   * 且同 id 被重新登记（显式 parentTaskId / restore）时立即移除，避免误伤新任务。
+   * 有界：只保留最近 RECLAIMED_TASK_MEMORY 个 id（插入序淘汰）。
+   */
+  const reclaimedTaskIds = new Set();
+  const RECLAIMED_TASK_MEMORY = 256;
+  /**
    * 调度热路径索引：保持 tasks Map 的注册顺序，同时避免每轮派发重新 filter 全部父任务。
    * 该索引是派生状态，restore 时从 tasks 重新构建，不写入快照。
    */
@@ -617,12 +1138,41 @@ export function createFanoutManager(options = {}) {
    */
   const runningCountsByTask = new Map();
   /**
-   * 活动 shard 索引：key 使用 shard 对象身份，避免 parentTaskId/shardId 中的任意字符
-   * 发生拼接碰撞；path index 只服务内置 affectedPaths checker。
+   * 影响范围索引（票据 07）：key 使用 **attempt 对象身份**，而不是 shard。
+   *
+   * 为什么必须按 attempt：超时/取消的旧 attempt 可能仍未停止，此时 shard 已经允许重试；
+   * 若按 shard 建索引，新 attempt 会覆盖旧 entry，旧 child 的迟到写入就失去了路径保护。
+   * 按 attempt 建索引后，每个未确认停止的 attempt 各自占位，直到它自己 observed。
+   *
+   * 条目标从 shard 进入 queued 起就登记（范围预留先于执行），释放条件只有一个：
+   * 该 attempt 已进入逻辑终态 **且** stopEvidence 已 observed。
+   * key 用对象身份而不是字符串拼接，避免 parentTaskId/shardId 中的任意字符发生碰撞。
    */
   const activeShardEntries = new Map();
   const activeShardsByPath = new Map();
   let nextActiveOrder = 0;
+  /**
+   * attempt 执行代次计数器（票据 07）。
+   *
+   * 每次新建 attempt 递增；它随快照持久化，恢复时取「快照计数器」与「全部 attempt 的最大
+   * 代次」中的较大值再加一，因此恢复后新建的代次一定大于所有历史代次。迟到/串代的停止
+   * 证据靠它做精确隔离（配合 attemptId，二者任一不匹配就拒绝，且不产生状态变更）。
+   */
+  let nextExecutionGeneration = 0;
+  /** 最近一次停止看门狗到期（只读诊断；不进快照、不影响调度）。 */
+  let lastStopWatchdog = null;
+  /**
+   * 最近一次 restore 使用的停止证据边界（只读诊断）。
+   *
+   * boundarySource 说明这个值是显式给出（explicit）还是按进程身份自动判定
+   * （process-instance），让诊断能区分"Host 明确选择了边界"与"自动推断"。
+   */
+  const stopDiagnosticsState = {
+    boundary: /** @type {"unknown"|"process-restart"} */ ("unknown"),
+    boundarySource: /** @type {"explicit"|"process-instance"} */ ("process-instance"),
+  };
+  /** 最近一次归属老化（只读诊断；不进快照、不影响调度）。 */
+  let lastAttributionAged = null;
   /** 事件订阅者。 */
   const subscribers = new Set();
   /** 每个 role 的派发轮转游标，用于父任务间公平轮转。 */
@@ -633,6 +1183,17 @@ export function createFanoutManager(options = {}) {
   // 事件与任务快照一起持久化，重启后仍可按 sequence 续读；仅保留 bounded 历史。
   // 条数上限（1000，既有契约）与字节上限都来自 budgetPolicy，见 trimEventHistory()。
   const eventHistory = [];
+  /**
+   * 事件历史的增量字节记账（与 eventHistory 同序、同长）。
+   *
+   * 每条事件只在进入历史时测量一次，裁剪时只丢弃最旧一端；不再像旧实现那样每次 emit
+   * 都对整段历史逐条 stringify（O(n²)）。判定规则完全复用 resource-budget 的记账器，
+   * 与 checkEventHistoryBudget 同源。
+   */
+  const eventAccounting = createEventHistoryAccounting({
+    maxCount: budgetPolicy.maxEventHistory,
+    maxBytes: budgetPolicy.maxEventHistoryBytes,
+  });
   // 调度器状态：
   // - workRequested：有派发请求还没被 drain 处理完；
   // - drainScheduled：已经排好一次 drain 微任务；
@@ -657,13 +1218,31 @@ export function createFanoutManager(options = {}) {
    *
    * 单事件字节预算：原始负载过大时只发布"不含负载"的诊断事件，既不让事件历史
    * 无界增长，也不静默丢失事实（诊断保留 type/subject/resource 与实测字节）。
-   * 事件进历史前先记录违规，调用方可通过 budget() 观察。
+   *
+   * 性能：内容与体积来自同一次 stringify；进入历史时把字节数交给增量记账器，
+   * 之后不再对整段历史重复测量（旧的 O(n²) 测量已在票据 04 移除）。
    */
   function emit(event) {
     const candidate = { ...event, sequence: ++sequence, at: now() };
-    const verdict = checkEventBudget(candidate, { subject: candidate.type });
+    // 单次序列化同时得到"内容"（parse 回来作为历史条目）与"体积"（单事件预算 +
+    // 事件历史增量记账）。serialized=null 表示不可 JSON 序列化。
+    let serialized;
+    try {
+      serialized = JSON.stringify(candidate);
+    } catch {
+      serialized = null;
+    }
+    const candidateBytes = serialized === null ? null : Buffer.byteLength(serialized, "utf8");
+    const verdict = checkBudget({
+      resource: "event",
+      limit: budgetPolicy.maxEventBytes,
+      receivedBytes: candidateBytes,
+      subject: candidate.type,
+    });
     if (!verdict.ok) {
-      noteBudgetViolation(verdict.violation);
+      // 事件超预算只发布不含原始负载的诊断事件。这里刻意**不**补发 budget_rejected：
+      // 事件预算是热路径，"为超预算事件再发一条事件"会递归放大历史。
+      noteBudgetViolation(verdict.violation, "event", { emitEvent: false });
       const diagnostic = {
         type: "event_budget_exceeded",
         subject: typeof candidate.type === "string" ? candidate.type : "event",
@@ -672,33 +1251,76 @@ export function createFanoutManager(options = {}) {
         sequence,
         at: now(),
       };
-      eventHistory.push(cloneJson(diagnostic));
-      trimEventHistory();
-      for (const listener of [...subscribers]) {
-        try {
-          listener(cloneJson(diagnostic));
-        } catch {
-          // 订阅者异常必须被隔离。
-        }
-      }
+      appendEvent(diagnostic);
+      notifyEventSubscribers(diagnostic);
       return diagnostic;
     }
-    eventHistory.push(cloneJson(candidate));
-    trimEventHistory();
+    const stored = JSON.parse(serialized);
+    appendEvent(stored, candidateBytes);
+    notifyEventSubscribers(stored);
+    return candidate;
+  }
+
+  /** 通知事件订阅者；单个订阅者异常必须被隔离，不能破坏调度。 */
+  function notifyEventSubscribers(event) {
     for (const listener of [...subscribers]) {
       try {
-        listener(cloneJson(candidate));
+        listener(cloneJson(event));
       } catch {
         // 订阅者异常必须被隔离：fan-out 的调度语义不依赖任何监听器。
       }
     }
-    return candidate;
   }
 
-  /** 记录预算违规（只读诊断，不改变调度状态）。 */
-  function noteBudgetViolation(violation) {
+  /**
+   * 追加事件并维护历史预算（条数 + 字节）。
+   *
+   * 事件对象进入历史后不再变更，因此 size 只测一次；trim 只从最旧一端丢弃，
+   * 成本与丢弃条数成正比。裁剪本身不发布 budget_rejected（它由每条新事件触发，
+   * 发事件会形成"事件→裁剪→事件"的无限反馈）；事实通过 dropped/最早序号暴露。
+   */
+  function appendEvent(event, knownBytes) {
+    const bytes = knownBytes === undefined ? (measureJsonBytes(event) ?? 0) : knownBytes;
+    eventHistory.push(event);
+    eventAccounting.push(bytes);
+    trimEventHistory();
+  }
+
+  /**
+   * 记录预算违规（只读诊断 + 可选的结构化 budget_rejected 事件）。
+   *
+   * 统一事件契约（所有运行期入口共用）：
+   * - type=budget_rejected、phase、violation（与错误/RPC 同源的结构化描述）；
+   * - parentTaskId/subject 可选；sequence/at 由 emit 统一补齐；
+   * - 事件只带元数据，绝不复述被拒绝的 prompt/result/error 原文或完整快照。
+   *
+   * @param {object} violation - describeBudgetViolation 产出的违规描述。
+   * @param {string} phase - submit/retry/continue/attempt/event/snapshot/persist/serialize/restore/feedback。
+   * @param {{emitEvent?:boolean, parentTaskId?:string}} [options]
+   */
+  function noteBudgetViolation(violation, phase = "runtime", { emitEvent = true, parentTaskId } = {}) {
     if (violation === null || violation === undefined) return;
     lastBudgetViolation = cloneJson(violation);
+    lastBudgetViolationPhase = phase;
+    if (!emitEvent) return;
+    emitBudgetRejected(violation, phase, parentTaskId);
+  }
+
+  /** 发布一条 budget_rejected 事件（带递归闸；裁剪/事件预算路径以 emitEvent:false 跳过）。 */
+  function emitBudgetRejected(violation, phase, parentTaskId) {
+    if (budgetEventDepth > 0) return;
+    budgetEventDepth += 1;
+    try {
+      emit({
+        type: "budget_rejected",
+        phase,
+        violation: cloneJson(violation),
+        ...(typeof parentTaskId === "string" && parentTaskId.length > 0 ? { parentTaskId } : {}),
+        ...(typeof violation?.subject === "string" && violation.subject.length > 0 ? { subject: violation.subject } : {}),
+      });
+    } finally {
+      budgetEventDepth -= 1;
+    }
   }
 
   /**
@@ -706,13 +1328,37 @@ export function createFanoutManager(options = {}) {
    * 记录。两条预算同时生效，结果取更小的保留集合。
    */
   function trimEventHistory() {
-    const verdict = checkEventHistoryBudget(eventHistory, {
-      maxCount: budgetPolicy.maxEventHistory,
-      maxBytes: budgetPolicy.maxEventHistoryBytes,
-    });
+    const verdict = eventAccounting.trim();
     if (verdict.droppedCount === 0) return;
     eventHistory.splice(0, verdict.droppedCount);
-    noteBudgetViolation(verdict.violation);
+    droppedEventCount += verdict.droppedCount;
+    noteBudgetViolation(verdict.violation, "event", { emitEvent: false });
+  }
+
+  /** 事件历史中最早仍可读的 sequence；空历史返回 null。 */
+  function earliestAvailableSequence() {
+    return eventHistory.length === 0 ? null : eventHistory[0].sequence ?? null;
+  }
+
+  /**
+   * 整体替换事件历史后重建增量记账（restore 冷路径）。
+   *
+   * 每条事件只在这里测量一次；此后 emit 的增量记账与预算判定仍走同一套记账器，
+   * 不会因为恢复而出现第二套字节口径。
+   */
+  function rebuildEventAccounting() {
+    eventAccounting.reset();
+    for (const event of eventHistory) eventAccounting.push(measureJsonBytes(event) ?? 0);
+  }
+
+  /** 事件历史只读状态：条数/字节/累计丢弃/最早可用序号（gap 判定用）。 */
+  function eventHistoryStatus() {
+    return Object.freeze({
+      count: eventHistory.length,
+      bytes: eventAccounting.bytes,
+      dropped: droppedEventCount,
+      earliestSequence: earliestAvailableSequence(),
+    });
   }
 
   function emitShardStatus(task, shard, status, attempt, extra = {}) {
@@ -781,13 +1427,52 @@ export function createFanoutManager(options = {}) {
    * 3. 字节预算超限：拒绝并记录违规；
    * 4. 没有 persistence：返回 no_persistence。
    *
-   * 所有拒绝路径只更新内存健康状态并返回 {saved:false, ...}，绝不抛异常、绝不改动内存
-   * 状态机，因此 notifyPersistence 不会被降级路径变成持久化反馈循环。
+   * 所有拒绝路径只更新内存健康状态并返回 {saved:false, reason, ...}，绝不抛异常、
+   * 绝不改动内存状态机，因此 notifyPersistence 不会被降级路径变成持久化反馈循环。
+   *
+   * 每次调用都会把结果写入 lastPersistResult（只读诊断）：
+   * - saved：bytes 为实测快照字节；
+   * - skipped：reason ∈ {degraded_snapshot, unmeasurable_snapshot, oversize_snapshot,
+   *   no_persistence}；
+   * - failed：save 抛错或异步落盘明确失败，category 取错误自带类别（缺失为 unknown，
+   *   Host persistence-health 才是分类权威）。
    *
    * @param {object} [snapshot] - 待落盘快照；缺省时序列化当前状态。
-   * @returns {{saved:boolean, bytes:number|null, reason?:string, violation?:object}}
+   * @returns {{saved:boolean, bytes:number|null, reason?:string, category?:string, violation?:object}}
    */
   function persistSnapshot(snapshot) {
+    return persistSnapshotInternal(snapshot, ++persistSequence);
+  }
+
+  /**
+   * 记录最近一次持久化结果（只读诊断）。
+   *
+   * status 三态固定为 saved / skipped / failed：skipped 必须带原因（degraded_snapshot /
+   * unmeasurable_snapshot / oversize_snapshot / no_persistence），failed 只来自 save 抛错
+   * 或异步落盘明确失败。ticket 单调：异步 save 的迟到回调不得覆盖更晚一次 persist 的结果。
+   * 分类的权威仍是 Host 的 persistence-health；这里只在错误自带 category 时透传。
+   */
+  function recordPersistResult(result, ticket) {
+    if (ticket < lastPersistResultTicket) return result;
+    lastPersistResultTicket = ticket;
+    lastPersistResult = Object.freeze({
+      status: result.saved === true ? "saved" : (result.reason === "save_failed" ? "failed" : "skipped"),
+      saved: result.saved === true,
+      reason: typeof result.reason === "string" ? result.reason : null,
+      category: typeof result.category === "string" ? result.category : null,
+      bytes: Number.isSafeInteger(result.bytes) ? result.bytes : null,
+      at: now(),
+    });
+    return result;
+  }
+
+  /** 从同步/异步落盘错误里提取稳定分类；缺失记 unknown（Host health 仍是分类权威）。 */
+  function persistenceCategoryOf(value) {
+    const category = value?.category;
+    return typeof category === "string" && category.length > 0 ? category : "unknown";
+  }
+
+  function persistSnapshotInternal(snapshot, ticket) {
     // 两条路径的差别只在"内容与体积怎么来"：
     // - 内部路径（缺省）：serializeSnapshotEnvelope 只做一次 stringify，payload 与 bytes
     //   同源，闸门不再为测量重复序列化；
@@ -808,8 +1493,8 @@ export function createFanoutManager(options = {}) {
         subject: "persist",
         hint: "快照不完整（degraded），拒绝落盘以避免覆盖已有的完整快照",
       });
-      noteBudgetViolation(violation);
-      return { saved: false, bytes: null, reason: "degraded_snapshot", violation };
+      noteBudgetViolation(violation, "persist");
+      return recordPersistResult({ saved: false, bytes: null, reason: "degraded_snapshot", violation }, ticket);
     }
     // 2. 不可测量：明确拒绝，不把"未知体积"当合法。
     if (measured === null) {
@@ -822,28 +1507,78 @@ export function createFanoutManager(options = {}) {
         subject: "persist",
         hint: "快照不可 JSON 序列化，拒绝落盘",
       });
-      noteBudgetViolation(violation);
-      return { saved: false, bytes: null, reason: "unmeasurable_snapshot", violation };
+      noteBudgetViolation(violation, "persist");
+      return recordPersistResult({ saved: false, bytes: null, reason: "unmeasurable_snapshot", violation }, ticket);
     }
     // 3. 字节预算（复用上面已量出的字节数，不再重新序列化）。
     const verdict = snapshotSizeVerdict(measured);
     if (!verdict.ok) {
-      noteBudgetViolation(verdict.violation);
-      return { saved: false, bytes: verdict.violation.receivedBytes, violation: verdict.violation };
+      noteBudgetViolation(verdict.violation, "snapshot");
+      // 旧实现漏掉 reason：超限跳过与其它 skipped 无法区分；这里补齐稳定原因码。
+      return recordPersistResult({
+        saved: false,
+        bytes: verdict.violation.receivedBytes,
+        reason: "oversize_snapshot",
+        violation: verdict.violation,
+      }, ticket);
     }
     // 4. 没有持久化目标。
     if (persistence === undefined || persistence === null) {
-      return { saved: false, bytes: measured, reason: "no_persistence" };
+      return recordPersistResult({ saved: false, bytes: measured, reason: "no_persistence" }, ticket);
     }
     try {
-      const result = persistence.save(payload);
-      if (result !== null && typeof result === "object" && typeof result.catch === "function") {
-        result.catch(() => {});
+      const pending = persistence.save(payload);
+      if (pending !== null && typeof pending === "object" && typeof pending.then === "function") {
+        /**
+         * 异步落盘：同步返回时只能确认"已提交"，真实结果以回调为准。
+         *
+         * - 失败不能变成未处理 rejection（旧实现 result.catch(() => {}) 把事实吞掉）；
+         * - 迟到结果不得覆盖更晚一次 persist 的结果（ticket 单调）；
+         * - 分类优先取错误自带的 category，Host 的 persistence-health 记录仍是权威。
+         */
+        pending.then(
+          (value) => {
+            if (value === false || (value !== null && typeof value === "object" && value.ok === false)) {
+              recordPersistResult({
+                saved: false,
+                bytes: measured,
+                reason: "save_failed",
+                category: persistenceCategoryOf(value?.ok === false ? value.error : value),
+              }, ticket);
+            }
+          },
+          (error) => {
+            recordPersistResult({
+              saved: false,
+              bytes: measured,
+              reason: "save_failed",
+              category: persistenceCategoryOf(error),
+            }, ticket);
+          },
+        );
+      } else if (pending !== null && typeof pending === "object" && typeof pending.catch === "function") {
+        // 兼容只有 catch 的 thenable（历史注入 seam 形态）：至少不能留下未处理 rejection。
+        pending.catch((error) => {
+          recordPersistResult({
+            saved: false,
+            bytes: measured,
+            reason: "save_failed",
+            category: persistenceCategoryOf(error),
+          }, ticket);
+        });
       }
-      return { saved: true, bytes: null };
+      return recordPersistResult({ saved: true, bytes: measured }, ticket);
     } catch (error) {
       // 持久化是旁路：落盘失败不改变内存状态机，由 Host 自行告警。
-      return { saved: false, bytes: null, reason: "save_failed", error };
+      // save 失败不是"预算拒绝"（可能只是 IO 错误），因此不伪造 BUDGET_EXCEEDED 事件；
+      // 它通过 lastPersistResult + Host persistence-health 进入诊断。
+      return recordPersistResult({
+        saved: false,
+        bytes: measured,
+        reason: "save_failed",
+        category: persistenceCategoryOf(error),
+        error,
+      }, ticket);
     }
   }
 
@@ -880,6 +1615,8 @@ export function createFanoutManager(options = {}) {
       // 重入只会重新置脏，由同一轮 flush 收敛。
       while (persistenceDirty) {
         persistenceDirty = false;
+        // 消费并保存落盘结果：persistSnapshot 内部把 saved/skipped(reason)/failed(category)
+        // 写入 lastPersistResult（旧实现直接丢弃返回值，跳过/失败因此完全不可见）。
         persistSnapshot();
       }
     } finally {
@@ -925,67 +1662,186 @@ export function createFanoutManager(options = {}) {
     }
     // pending 是「尚未终态」的派生计数，方便调用方直接读聚合进度。
     counts.pending = counts.queued + counts.running;
+    /**
+     * stop_pending（票据 07）：**已逻辑终态但停止未确认**的 attempt 数。
+     *
+     * 它和 pending 是两个独立的聚合阻塞源：pending 回答"还有分片在跑吗"，stop_pending
+     * 回答"有没有分片已经终态、但执行体可能还在写"。只有两者同时为 0 才允许聚合结算，
+     * 否则任务保持 pending（不写 settledAt、不发 task_settled）。
+     *
+     * 非终态 attempt 不计入这里——它们由 pending 覆盖；把两者混在一起会让"停止未确认"
+     * 这个诊断字段在正常运行时恒大于 0，失去意义。
+     */
+    counts.stop_pending = countStopPending(task);
     return counts;
+  }
+
+  /**
+   * 统计「逻辑终态 && 停止未确认」的 attempt 数。
+   *
+   * 遍历全部 attempt（不只最新一个）：旧 attempt 的迟到写入同样需要范围保护，因此它的
+   * 未确认状态也必须阻塞聚合。attempt 数受 maxAttemptsPerShard 约束，遍历成本有界。
+   */
+  function countStopPending(task) {
+    let total = 0;
+    for (const shard of task.shards) {
+      for (const attempt of shard.attempts) {
+        const status = attempt.status ?? "queued";
+        if (!isTerminalShardStatus(status)) continue;
+        if (isStopObserved(attempt)) continue;
+        total += 1;
+      }
+    }
+    return total;
   }
 
   function activeShard(shard) {
     return shard.attempts.find((attempt) => attempt.status === "running");
   }
 
-  /** 记录一次动态上限的非法返回（只读诊断：调度仍然按默认值安全降级）。 */
-  function noteInvalidDynamicLimit(kind, value) {
-    invalidLimitDiagnostic = {
+  /**
+   * 记录一次动态上限的非法返回：只读诊断 + 一次性结构化事件。
+   *
+   * 事件必须"一次性而不是每次派发都刷"：解析发生在调度热路径上，同一个坏设置会在每个
+   * drain 被反复读到。去重维度是 kind——只有从"没有该 kind 的诊断"进入非法状态时才发布，
+   * 解析成功后 clearInvalidDynamicLimit 清空，下一次再坏会重新发布（新的故障窗口）。
+   *
+   * 事件负载只含 kind / 来源 / 回退值：不含设置原文、原始返回值或任何会话数据，避免
+   * 把 journald/事件历史变成敏感信息泄露面。
+   *
+   * @param {"concurrencyLimit"|"roleLimits"} kind - 非法值的解析路径。
+   * @param {unknown} value - 原始返回值（只取类型，不落盘）。
+   * @param {string} [message] - 覆盖默认诊断文案（按 kind 或"含非法条目"区分）。
+   */
+  function noteInvalidDynamicLimit(kind, value, message) {
+    const firstObservation = !invalidLimitDiagnostics.has(kind);
+    invalidLimitDiagnostics.set(kind, {
       kind,
       valueType: value === null ? "null" : typeof value,
-      message: kind === "concurrencyLimit"
+      message: message ?? (kind === "concurrencyLimit"
         ? "settings 解析出的并发上限不是 1~" + MAX_CONCURRENCY_LIMIT + " 的整数，已回退默认值 " + DEFAULT_CONCURRENCY_LIMIT
-        : "settings 解析出的 roleLimits 不是 role -> limit 映射，已忽略全部角色级覆盖",
-    };
+        : "settings 解析出的 roleLimits 不是 role -> limit 映射，已忽略全部角色级覆盖"),
+    });
+    lastInvalidLimitKind = kind;
+    if (!firstObservation) return;
+    emit({
+      type: "concurrency_limit_fallback",
+      kind,
+      source: "fallback",
+      fallback: kind === "concurrencyLimit" ? DEFAULT_CONCURRENCY_LIMIT : "role-default",
+    });
   }
 
-  function resolveDefaultConcurrencyLimit() {
-    if (resolverSource !== "live" || typeof rawConcurrencyLimit !== "function") return defaultConcurrencyLimit;
+  /** 解析成功后清除对应 kind 的非法诊断；下次再出现非法值会重新发布一次性事件。 */
+  function clearInvalidDynamicLimit(kind) {
+    if (!invalidLimitDiagnostics.delete(kind)) return;
+    if (lastInvalidLimitKind !== kind) return;
+    const kinds = [...invalidLimitDiagnostics.keys()];
+    lastInvalidLimitKind = kinds.length === 0 ? null : kinds[kinds.length - 1];
+  }
+
+  /** 对外只读投影：最近一次非法诊断的拷贝（不暴露内部 Map）。 */
+  function invalidLimitSnapshot() {
+    if (lastInvalidLimitKind === null) return null;
+    const diagnostic = invalidLimitDiagnostics.get(lastInvalidLimitKind);
+    return diagnostic === undefined ? null : Object.freeze({ ...diagnostic });
+  }
+
+  /**
+   * 解析默认并发上限，并返回**这一次**解析的来源。
+   *
+   * source 取值：
+   * - live：注入的解析函数给出了合法值（当前设置权威）；
+   * - snapshot：没有 live resolver，使用冻结值（快照或构造期静态值）；
+   * - fallback：解析函数抛错或返回非法值，本次已回退安全默认值。诊断必须如实暴露
+   *   fallback，否则用户看到设置页=3、实际并发=10 却无从解释。
+   *
+   * @returns {{value:number, source:"live"|"snapshot"|"fallback"}}
+   */
+  function resolveDefaultConcurrencyLimitState() {
+    if (resolverSource !== "live" || typeof rawConcurrencyLimit !== "function") {
+      lastResolvedDefaultConcurrencyLimit = defaultConcurrencyLimit;
+      return { value: defaultConcurrencyLimit, source: "snapshot" };
+    }
     let raw;
     try {
       raw = rawConcurrencyLimit();
     } catch {
       // 解析函数读的是外部设置状态：异常只允许降级，不能让调度抛错。
       noteInvalidDynamicLimit("concurrencyLimit", undefined);
-      return DEFAULT_CONCURRENCY_LIMIT;
+      lastResolvedDefaultConcurrencyLimit = DEFAULT_CONCURRENCY_LIMIT;
+      return { value: DEFAULT_CONCURRENCY_LIMIT, source: "fallback" };
     }
     const check = validateConcurrencyLimit(raw);
-    if (check.ok) return check.value;
+    if (check.ok) {
+      clearInvalidDynamicLimit("concurrencyLimit");
+      lastResolvedDefaultConcurrencyLimit = check.value;
+      return { value: check.value, source: "live" };
+    }
     noteInvalidDynamicLimit("concurrencyLimit", raw);
-    return DEFAULT_CONCURRENCY_LIMIT;
+    lastResolvedDefaultConcurrencyLimit = DEFAULT_CONCURRENCY_LIMIT;
+    return { value: DEFAULT_CONCURRENCY_LIMIT, source: "fallback" };
+  }
+
+  /** 只取数值的便捷形式（调度热路径与角色池解析使用）。 */
+  function resolveDefaultConcurrencyLimit() {
+    return resolveDefaultConcurrencyLimitState().value;
   }
 
   /**
-   * 解析 role 级覆盖。
+   * 解析 role 级覆盖，按票据 03 的三级优先级：
+   * 当前 settings 解析值（live resolver）> 快照中的显式角色级映射 > 安全默认值。
    *
-   * 静态映射在构造/restore 时已完成校验（非法配置直接抛错）。函数形式读取的是
-   * "当前设置"，因此：
+   * 静态映射在构造/restore 时已完成校验（非法配置直接抛错），不需要第三层回退；
+   * 函数形式读取的是"当前设置"，因此：
    * - 每次调用都读一次最新值——设置可能在两次提交之间变化，缓存会把新设置吞掉；
    * - 调度热路径对每个父任务每轮只解析一次，任务级显式限制则完全不走这里；
-   * - 返回结构非法时整体忽略角色级覆盖，单个角色的非法值只回退该 role。
+   * - 返回结构非法时整体忽略 live 角色级覆盖，回退到快照映射/默认值；
+   * - 单个角色的非法值只让该 role 回退（live 未给出时由快照映射补位）。
    */
   function resolveRoleLimits() {
     if (typeof roleLimits !== "function") return roleLimits;
     let raw;
+    let liveUnavailable = false;
     try {
       raw = roleLimits();
     } catch {
+      // 解析函数读的是外部设置状态：异常只允许降级，不能让调度抛错。
       noteInvalidDynamicLimit("roleLimits", undefined);
-      return Object.freeze({});
-    }
-    if (raw === undefined || raw === null) return Object.freeze({});
-    if (typeof raw !== "object" || Array.isArray(raw)) {
-      noteInvalidDynamicLimit("roleLimits", raw);
-      return Object.freeze({});
+      liveUnavailable = true;
+      raw = undefined;
     }
     const normalized = {};
-    for (const [role, limit] of Object.entries(raw)) {
+    if (!liveUnavailable) {
+      if (raw === undefined || raw === null) {
+        // 没有 live 覆盖不是"非法值"：清除诊断，由快照映射/默认值兜底。
+        clearInvalidDynamicLimit("roleLimits");
+      } else if (typeof raw !== "object" || Array.isArray(raw)) {
+        noteInvalidDynamicLimit("roleLimits", raw);
+      } else {
+        let invalidEntry = false;
+        for (const [role, limit] of Object.entries(raw)) {
+          const check = validateConcurrencyLimit(limit);
+          if (check.ok) normalized[role] = check.value;
+          else invalidEntry = true;
+        }
+        if (invalidEntry) {
+          noteInvalidDynamicLimit(
+            "roleLimits",
+            raw,
+            "settings 解析出的 roleLimits 含非法条目，已忽略这些角色级覆盖",
+          );
+        } else {
+          clearInvalidDynamicLimit("roleLimits");
+        }
+      }
+    }
+    // 第二层：恢复出来的显式角色级映射。只在 live 没有给出合法值时补位，
+    // 因此 live 的合法值永远优先；live 整体不可用时这里给出稳定的快照回退。
+    for (const [role, limit] of Object.entries(restoredRoleLimitOverrides)) {
+      if (typeof normalized[role] === "number") continue;
       const check = validateConcurrencyLimit(limit);
-      if (check.ok) normalized[role] = limit;
+      if (check.ok) normalized[role] = check.value;
     }
     return Object.freeze(normalized);
   }
@@ -996,7 +1852,8 @@ export function createFanoutManager(options = {}) {
    * 三级优先级：任务级显式 concurrencyLimit（submit 入参，或快照恢复出来的任务级值）
    * > 角色级设置（roleLimits，即该角色的共享并发池，按当前设置解析，可增可减）
    * > 动态/静态默认值。恢复任务在 restore 时会带上快照里的任务级限制，因此重启不会改变
-   * 显式限制的语义。
+   * 显式限制的语义；角色级这一层由 resolveRoleLimits 按"live 解析值 > 快照显式映射 >
+   * 安全默认值"解析，不会被快照冻结（票据 03）。
    *
    * 注意：调度判定**不能**直接使用本函数。它给出的单值只适用于"某 role 只有一个父任务"
    * 的场景；多父任务并存时任务级上限与 role 共享池必须分别判定（见 rolePoolLimitFor /
@@ -1033,13 +1890,24 @@ export function createFanoutManager(options = {}) {
     return typeof task.concurrencyLimit === "number" ? task.concurrencyLimit : undefined;
   }
 
-  /** 只读并发视图：当前有效默认值与各 role 覆盖（诊断用，不暴露任务负载）。 */
+  /**
+   * 只读并发视图：当前有效默认值、各 role 覆盖、来源与最近一次非法值诊断。
+   *
+   * source 是**本次解析**的来源（live / snapshot / fallback），不是构造期的静态标记：
+   * 设置解析函数抛错或返回非法值时，用户必须能看到"这次回退到了安全默认值"。roles 的
+   * 解析同样可能刷新非法诊断，因此 invalid 在 roles 之后再取。
+   *
+   * 不暴露任务负载；invalid.message 只含插件自身固定文案，不含设置原文或原始返回值。
+   */
   function concurrencyLimits() {
+    const state = resolveDefaultConcurrencyLimitState();
+    const roles = resolveRoleLimits();
+    const invalid = invalidLimitSnapshot();
     return Object.freeze({
-      default: resolveDefaultConcurrencyLimit(),
-      roles: Object.freeze({ ...resolveRoleLimits() }),
-      source: resolverSource,
-      ...(invalidLimitDiagnostic === null ? {} : { invalid: Object.freeze({ ...invalidLimitDiagnostic }) }),
+      default: state.value,
+      roles: Object.freeze({ ...roles }),
+      source: state.source,
+      ...(invalid === null ? {} : { invalid }),
     });
   }
 
@@ -1069,56 +1937,74 @@ export function createFanoutManager(options = {}) {
     else parents.push(task);
   }
 
-  function removeActiveShardIndex(shard) {
-    const previous = activeShardEntries.get(shard);
+  /** 从 path index 中摘除一个 attempt entry（保留 order 语义由调用方决定）。 */
+  function removeAttemptScope(attempt) {
+    const previous = activeShardEntries.get(attempt);
     if (previous === undefined) return;
     for (const path of previous.affectedPaths) {
-      const shards = activeShardsByPath.get(path);
-      if (shards === undefined) continue;
-      shards.delete(shard);
-      if (shards.size === 0) activeShardsByPath.delete(path);
+      const attempts = activeShardsByPath.get(path);
+      if (attempts === undefined) continue;
+      attempts.delete(attempt);
+      if (attempts.size === 0) activeShardsByPath.delete(path);
     }
-    activeShardEntries.delete(shard);
+    activeShardEntries.delete(attempt);
   }
 
   /**
-   * 同步单个 shard 的活动视图、path index 与 role running 计数。
-   * 所有状态转移都经由 setShardStatus 进入，避免取消/超时/迟到完成漏掉索引更新。
+   * 同步单个 attempt 的影响范围索引（票据 07）。
+   *
+   * 登记条件：attempt 存在且 affectedPaths 非空——**queued 也登记**，范围预留必须早于执行，
+   * 否则两个分片可能在排队期间抢到同一路径。
+   *
+   * 释放条件（唯一）：attempt 已逻辑终态 **且** stopEvidence 已 observed。逻辑终态只说明
+   * 管理器不再改写状态，不说明执行体停止写盘；过早释放会让同路径新任务与未停止的旧 child
+   * 并发写。因此超时/取消但无证据的 attempt 会一直占位，直到 observeStopEvidence 到达。
+   *
+   * 所有状态转移都经由 setShardStatus / observeStopEvidence / restore 进入本函数，避免
+   * 取消、超时、迟到完成或证据补录漏掉索引更新。
    */
-  function syncActiveShardIndex(task, shard) {
-    const previous = activeShardEntries.get(shard);
-    if (previous !== undefined) {
-      for (const path of previous.affectedPaths) {
-        const shards = activeShardsByPath.get(path);
-        if (shards === undefined) continue;
-        shards.delete(shard);
-        if (shards.size === 0) activeShardsByPath.delete(path);
-      }
-    }
-    if (isTerminalShardStatus(shard.status)) {
-      activeShardEntries.delete(shard);
+  function syncAttemptScope(task, shard, attempt) {
+    const previous = activeShardEntries.get(attempt);
+    const affectedPaths = Array.isArray(attempt?.affectedPaths) ? attempt.affectedPaths : [];
+    const released = isTerminalShardStatus(attempt.status) && isStopObserved(attempt);
+    if (released) {
+      removeAttemptScope(attempt);
       return;
     }
-    const attempt = shard.attempts[shard.attempts.length - 1];
-    const affectedPaths = Array.isArray(attempt?.affectedPaths) ? [...attempt.affectedPaths] : [];
+    if (affectedPaths.length === 0) {
+      // 没有声明影响范围的 attempt 不占位（与旧语义一致：空路径不参与冲突判定）。
+      removeAttemptScope(attempt);
+      return;
+    }
     const entry = {
       parentTaskId: task.parentTaskId,
       role: task.role,
       shardId: shard.shardId,
-      attempt: attempt?.attempt ?? 1,
-      status: shard.status ?? "queued",
-      affectedPaths,
+      attempt: attempt.attempt,
+      attemptId: attempt.attemptId,
+      executionGeneration: attempt.executionGeneration,
+      status: attempt.status ?? "queued",
+      stopState: isStopObserved(attempt) ? STOP_EVIDENCE_STATE_OBSERVED : STOP_EVIDENCE_STATE_UNKNOWN,
+      affectedPaths: [...affectedPaths],
       order: previous?.order ?? nextActiveOrder++,
+      // 内部引用只用于"排除自己这个 shard"的冲突判定，绝不进入任何对外视图/快照。
+      task,
+      shard,
     };
-    activeShardEntries.set(shard, entry);
+    activeShardEntries.set(attempt, entry);
     for (const path of affectedPaths) {
-      let shards = activeShardsByPath.get(path);
-      if (shards === undefined) {
-        shards = new Set();
-        activeShardsByPath.set(path, shards);
+      let attempts = activeShardsByPath.get(path);
+      if (attempts === undefined) {
+        attempts = new Set();
+        activeShardsByPath.set(path, attempts);
       }
-      shards.add(shard);
+      attempts.add(attempt);
     }
+  }
+
+  /** 同步一个 shard 全部 attempt 的范围索引（状态转移后统一调用）。 */
+  function syncShardScopes(task, shard) {
+    for (const attempt of shard.attempts) syncAttemptScope(task, shard, attempt);
   }
 
   function setShardStatus(task, shard, status) {
@@ -1128,14 +2014,14 @@ export function createFanoutManager(options = {}) {
       if (status === "running") addRunningCount(task, 1);
     }
     shard.status = status;
-    syncActiveShardIndex(task, shard);
+    syncShardScopes(task, shard);
   }
 
   function indexTask(task, roleIndex) {
     addTaskToRoleIndex(task, roleIndex);
     for (const shard of task.shards) {
       if (shard.status === "running") addRunningCount(task, 1);
-      syncActiveShardIndex(task, shard);
+      syncShardScopes(task, shard);
     }
   }
 
@@ -1148,7 +2034,7 @@ export function createFanoutManager(options = {}) {
     }
     for (const shard of task.shards) {
       if (shard.status === "running") addRunningCount(task, -1);
-      removeActiveShardIndex(shard);
+      for (const attempt of shard.attempts) removeAttemptScope(attempt);
     }
     // 任务级计数以任务对象身份为 key，删除索引后必须回收该条目，否则被销毁的父子任务
     // 会以"零 running 的空条目"形式滞留在 Map 里直到 close。
@@ -1198,16 +2084,25 @@ export function createFanoutManager(options = {}) {
       role: entry.role,
       shardId: entry.shardId,
       attempt: entry.attempt,
+      attemptId: entry.attemptId,
       status: entry.status,
+      stopState: entry.stopState,
       ...(entry.affectedPaths.length === 0 ? {} : { affectedPaths: [...entry.affectedPaths] }),
     };
   }
 
-  /** 取当前所有活动（queued/running）shard 的公共视图，用于冲突判定。 */
+  /**
+   * 取当前所有**仍占用影响范围**的 attempt 公共视图，用于冲突判定。
+   *
+   * 这里不再是"queued/running 的 shard"，而是"逻辑未完成，或已终态但停止未确认"的
+   * attempt（票据 07）：超时/取消后未停止的旧 attempt 必须继续参与冲突判定。
+   * excludeShard 按 shard 身份排除（同一 shard 的多个历史 attempt 都不算冲突对象），
+   * 因为重试/续作复用同一个 child，天然不会与自己的旧 attempt 抢路径。
+   */
   function collectActiveShards(excludeShard) {
     const active = [];
-    for (const [shard, entry] of activeShardEntries) {
-      if (shard === excludeShard) continue;
+    for (const [, entry] of activeShardEntries) {
+      if (excludeShard !== undefined && entry.shard === excludeShard) continue;
       active.push(activeShardView(entry));
     }
     return active;
@@ -1225,12 +2120,15 @@ export function createFanoutManager(options = {}) {
     const candidates = new Set();
     for (const path of paths) {
       for (const candidate of activeShardsByPath.get(path) ?? []) {
-        if (candidate !== excludeShard) candidates.add(candidate);
+        const entry = activeShardEntries.get(candidate);
+        if (entry === undefined) continue;
+        // 按 shard 身份排除自己：同一 shard 的多个历史 attempt 都不算冲突对象
+        //（重试/续作复用同一 child，天然不会与自己的旧 attempt 抢路径）。
+        if (excludeShard !== undefined && entry.shard === excludeShard) continue;
+        candidates.add(entry);
       }
     }
     return [...candidates]
-      .map((candidate) => activeShardEntries.get(candidate))
-      .filter((entry) => entry !== undefined)
       .sort((left, right) => left.order - right.order)
       .map(activeShardView);
   }
@@ -1268,6 +2166,27 @@ export function createFanoutManager(options = {}) {
   // 快照序列化（内部与公共共用）
   // -------------------------------------------------------------------------
 
+  /**
+   * attempt 的停止证据投影（票据 07）：JSON 安全，且**绝不包含** timer/handle。
+   *
+   * timer 只活在内存里：把它写进快照会让恢复后的进程错误地"继承"一个不存在的定时器，
+   * 而恢复语义要求"没有执行句柄就没有计时"，未确认的停止只能靠观测/边界收敛。
+   */
+  function attemptStopSnapshot(attempt) {
+    return {
+      attemptId: attempt.attemptId,
+      executionGeneration: attempt.executionGeneration,
+      stopEvidence: attempt.stopEvidence === undefined
+        ? { state: STOP_EVIDENCE_STATE_UNKNOWN }
+        : cloneJson(attempt.stopEvidence),
+      ...(attempt.stopRequestedAt === undefined ? {} : { stopRequestedAt: attempt.stopRequestedAt }),
+      ...(attempt.stopDeadlineAt === undefined ? {} : { stopDeadlineAt: attempt.stopDeadlineAt }),
+      ...(attempt.stopWatchdogExpiredAt === undefined ? {} : { stopWatchdogExpiredAt: attempt.stopWatchdogExpiredAt }),
+      ...(attempt.terminalReason === undefined ? {} : { terminalReason: attempt.terminalReason }),
+      ...(attempt.legacy === true ? { legacy: true } : {}),
+    };
+  }
+
   function shardSnapshot(task, shard) {
     return {
       shardId: shard.shardId,
@@ -1281,6 +2200,9 @@ export function createFanoutManager(options = {}) {
       affectedPaths: [...shard.affectedPaths],
       ...(shard.cancelRequested === true ? { cancelRequested: true } : {}),
       ...(shard.timeoutMs === undefined ? {} : { timeoutMs: shard.timeoutMs }),
+      // 恢复续跑被 attempt 预算拦下时的稳定原因码（票据 08）。只在被拦下时出现，
+      // 不含 prompt/结果，供投影与 Host 提示"该分片需手工提交新父任务"。
+      ...(shard.resumeBlocked === undefined ? {} : { resumeBlocked: cloneJson(shard.resumeBlocked) }),
       attempts: shard.attempts.map((attempt) => ({
         attempt: attempt.attempt,
         status: attempt.status,
@@ -1293,6 +2215,7 @@ export function createFanoutManager(options = {}) {
         ...(attempt.messageId === undefined ? {} : { messageId: attempt.messageId }),
         ...(attempt.result === undefined ? {} : { result: attempt.result }),
         ...(attempt.error === undefined ? {} : { error: attempt.error }),
+        ...attemptStopSnapshot(attempt),
       })),
     };
   }
@@ -1315,6 +2238,9 @@ export function createFanoutManager(options = {}) {
       ...(continuationRequestCount(task) === 0 ? {} : { continuationRequests: cloneJson(task.continuationRequests) }),
       allowOverlap: task.allowOverlap,
       concurrencyLimit: roleLimitFor(task),
+      // 父任务级默认超时（票据 06）：只含**显式**值。它是「分片没有自己的
+      // timeoutMs 时用什么」的唯一依据，因此必须在任务视图里如实暴露。
+      ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
       settledAt: task.settledAt ?? null,
@@ -1343,19 +2269,42 @@ export function createFanoutManager(options = {}) {
    * 返回值仍然引用内部状态（result/error/配置对象都是原引用），因此绝不能直接交给
    * 外部：所有对外出口（snapshot() / 持久化）都经过 serializeSnapshotEnvelope() 取
    * 深拷贝。本函数只是把"快照应该长什么样"收敛到唯一一处，避免内容投影出现第二实现。
+   *
+   * @param {{omitParentTaskIds?: string[]|Set<string>}} [options] - 回收候选快照的排除集合
+   *   （票据 05）：命中的父任务不进入 tasks 数组。事件历史保持原样——回收不删除历史事件，
+   *   但回收后这些事件不再按 parentTaskId 可查询（查询返回 task_not_found）。
    */
-  function buildSnapshotPayload() {
+  function buildSnapshotPayload(options = {}) {
+    const omittedParentTaskIds = normalizeIdSet(options?.omitParentTaskIds);
     return {
       version: SNAPSHOT_VERSION,
       sequence,
       nextTaskNumber,
-      defaultConcurrencyLimit,
+      /**
+       * 进程身份（票据 07）：恢复时据此自动判定停止证据边界。
+       *
+       * 同一个进程内重建（值相同）只能得到 unknown——旧 child 可能仍然活着；
+       * 值不同或缺失（旧版本快照）说明快照来自另一个进程，才允许 process-restart。
+       */
+      processInstance: PROCESS_INSTANCE,
+      // 超时投影版本（票据 06）：告诉恢复路径「本快照的 shard.timeoutMs 是显式覆盖」，
+      // 而不是像旧快照那样只能从 attempt.timeoutMs 反推。
+      timeoutProjection: TIMEOUT_PROJECTION_VERSION,
+      // 写最近一次解析得到的默认上限（未解析时为构造/恢复值），并附带来源标记：
+      // - concurrencySource=live：该字段只是诊断，真实权威是恢复进程的当前设置；
+      // - concurrencySource=snapshot：本进程没有 live resolver，该字段是冻结值。
+      // restore 对有无标记的快照统一按"尽量 live"处理（有解析函数就 live，否则冻结），
+      // 标记只服务外部读者与诊断，不改变恢复决策（票据 03）。
+      defaultConcurrencyLimit: lastResolvedDefaultConcurrencyLimit,
+      concurrencySource: resolverSource,
       roleLimits,
       writeRoles,
       defaultAllowOverlap,
       parentRotation: Object.fromEntries(rotationCursors),
       events: eventHistory.map((event) => cloneJson(event)),
-      tasks: [...tasks.values()].map((task) => ({
+      tasks: [...tasks.values()]
+        .filter((task) => omittedParentTaskIds === null || !omittedParentTaskIds.has(task.parentTaskId))
+        .map((task) => ({
         parentTaskId: task.parentTaskId,
         ...(task.requestId === undefined ? {} : { requestId: task.requestId }),
         role: task.role,
@@ -1367,6 +2316,9 @@ export function createFanoutManager(options = {}) {
         ...(continuationRequestCount(task) === 0 ? {} : { continuationRequests: cloneJson(task.continuationRequests) }),
         allowOverlap: task.allowOverlap,
         ...(task.concurrencyLimit === undefined ? {} : { concurrencyLimit: task.concurrencyLimit }),
+        // 父任务级默认超时必须随快照持久化，否则重启后未显式给出超时的分片
+        // 会静默回到角色默认值（票据 06）。
+        ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
         settledAt: task.settledAt ?? null,
@@ -1379,6 +2331,12 @@ export function createFanoutManager(options = {}) {
           createdAt: shard.createdAt,
           updatedAt: shard.updatedAt,
           ...(shard.cancelRequested === true ? { cancelRequested: true } : {}),
+          // 分片级超时只写**显式覆盖**（票据 06）：父任务/角色默认值不能被写成
+          // 分片覆盖，否则恢复后的超时来源会被永久冻结。
+          ...(shard.timeoutMs === undefined ? {} : { timeoutMs: shard.timeoutMs }),
+          // 恢复续跑被 attempt 预算拦下的原因码必须随持久化快照落盘（票据 08），
+          // 否则重启后 UI 无法解释"为什么中断分片没有继续"。
+          ...(shard.resumeBlocked === undefined ? {} : { resumeBlocked: cloneJson(shard.resumeBlocked) }),
           attempts: shard.attempts.map((attempt) => ({
             attempt: attempt.attempt,
             status: attempt.status,
@@ -1391,9 +2349,15 @@ export function createFanoutManager(options = {}) {
             ...(attempt.messageId === undefined ? {} : { messageId: attempt.messageId }),
             ...(attempt.result === undefined ? {} : { result: attempt.result }),
             ...(attempt.error === undefined ? {} : { error: attempt.error }),
+            // 停止证据与 attempt 身份随快照持久化（票据 07）：重启后仍能回答"哪些 attempt
+            // 已逻辑终态但执行未确认"，并让恢复后的重试/续作 gate 保持同一判据。
+            ...attemptStopSnapshot(attempt),
           })),
         })),
       })),
+      // 执行代次计数器随快照持久化：恢复后新建 attempt 的代次必须大于全部历史代次，
+      // 否则迟到证据可能"恰好匹配"一个新 attempt。
+      nextExecutionGeneration,
     };
   }
 
@@ -1413,11 +2377,13 @@ export function createFanoutManager(options = {}) {
    * 只含存活终态的最小安全快照（bytes=null 表示不可测量）——绝不把未处理异常抛给
    * persistence / RPC 路径。
    *
+   * @param {{omitParentTaskIds?: string[]|Set<string>}} [options] - 透传给 buildSnapshotPayload
+   *   的排除集合（显式回收的候选快照）。
    * @returns {{payload:object, bytes:number|null, degraded:boolean}}
    */
-  function serializeSnapshotEnvelope() {
+  function serializeSnapshotEnvelope(options = {}) {
     try {
-      const text = JSON.stringify(buildSnapshotPayload());
+      const text = JSON.stringify(buildSnapshotPayload(options));
       return { payload: JSON.parse(text), bytes: Buffer.byteLength(text, "utf8"), degraded: false };
     } catch (error) {
       const violation = describeBudgetViolation({
@@ -1429,13 +2395,16 @@ export function createFanoutManager(options = {}) {
         subject: "serialize",
         hint: "快照含不可 JSON 序列化的负载，已退化为最小安全快照",
       });
-      noteBudgetViolation(violation);
+      // serialize 阶段：快照含不可 JSON 序列化负载。记录违规并发布 budget_rejected
+      // （事件本身只带 violation 元数据，不回显任何快照负载）。
+      noteBudgetViolation(violation, "serialize");
       warn("dsh-expert-group: fan-out snapshot is not JSON-serializable, degraded to minimal snapshot");
       return {
         payload: {
           version: SNAPSHOT_VERSION,
           sequence,
           nextTaskNumber,
+          processInstance: PROCESS_INSTANCE,
           degraded: true,
           violation,
           tasks: [],
@@ -1456,6 +2425,334 @@ export function createFanoutManager(options = {}) {
    */
   function serializeSnapshot() {
     return serializeSnapshotEnvelope().payload;
+  }
+
+  // -------------------------------------------------------------------------
+  // 显式任务回收（票据 05：两阶段，先落盘成功再移除）
+  // -------------------------------------------------------------------------
+
+  /** 回收屏障期间的统一写入口拒绝（结构固定，Host/RPC 直接透传）。 */
+  function reclaimInProgressResult() {
+    return {
+      accepted: false,
+      changed: false,
+      code: RECLAIM_IN_PROGRESS_CODE,
+      reason: "reclaim_in_progress",
+    };
+  }
+
+  /** 迟到回调的统一 no-op 结果（不复活、不改统计、不写事件/快照）。 */
+  function taskReclaimedResult(parentTaskId) {
+    return {
+      accepted: false,
+      changed: false,
+      code: TASK_RECLAIMED_CODE,
+      reason: "task_reclaimed",
+      ...(typeof parentTaskId === "string" && parentTaskId.length > 0 ? { parentTaskId } : {}),
+    };
+  }
+
+  /**
+   * 记一个已回收任务 id（有界，仅用于迟到回调识别）。
+   *
+   * 插入序淘汰最旧项：上限 256 远大于单次请求可回收的父任务数（maxTasks=64），
+   * 因此同一批回收的 id 不会被自己挤掉。
+   */
+  function rememberReclaimedTask(parentTaskId) {
+    if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return;
+    reclaimedTaskIds.delete(parentTaskId);
+    reclaimedTaskIds.add(parentTaskId);
+    while (reclaimedTaskIds.size > RECLAIMED_TASK_MEMORY) {
+      const oldest = reclaimedTaskIds.values().next().value;
+      reclaimedTaskIds.delete(oldest);
+    }
+  }
+
+  /**
+   * 同 id 被重新登记（submit 显式 parentTaskId / restore）时清除回收标记。
+   *
+   * 不清除会让新任务的迟到回调被误判成"任务已回收"（task_reclaimed no-op），
+   * 从而吞掉合法证据。因此回收标记的生命周期严格限制在"id 仍空缺"的窗口内。
+   */
+  function forgetReclaimedTask(parentTaskId) {
+    if (typeof parentTaskId === "string" && parentTaskId.length > 0) reclaimedTaskIds.delete(parentTaskId);
+  }
+
+  /**
+   * 单个任务的回收前置条件判定（prepareReclaim 与 reclaimable 计数共用唯一实现）。
+   *
+   * 返回 null 表示可回收；否则返回稳定原因码：
+   * - task_not_found：任务已不存在；
+   * - task_not_terminal：仍有 queued/running 分片，或任务尚未结算；
+   * - stop_unconfirmed：存在"已逻辑终态但停止未确认"的 attempt（执行体可能仍在写盘）。
+   *
+   * parentCancelRequested 不构成阻塞：cancelled 任务本来就是可回收的终态。
+   *
+   * @param {object|undefined} task - 内部任务状态。
+   * @returns {"task_not_found"|"task_not_terminal"|"stop_unconfirmed"|null}
+   */
+  function reclaimBlockReason(task) {
+    if (task === undefined) return "task_not_found";
+    // 仍有未终态分片：任务还会产生状态变化，绝不能在落盘候选里冻结它。
+    if (task.shards.some((shard) => shard.status === "queued" || shard.status === "running")) {
+      return "task_not_terminal";
+    }
+    // 停止未确认优先于"未结算"：原因更具体、处置方向明确（补证据或等待看门狗/老化）。
+    if (countStopPending(task) !== 0) return "stop_unconfirmed";
+    const terminalStatus = task.status === "completed"
+      || task.status === "completed_with_errors"
+      || task.status === "cancelled";
+    if (!terminalStatus || typeof task.settledAt !== "number") return "task_not_terminal";
+    return null;
+  }
+
+  /** 当前可回收任务数（容量拒绝的 reclaimable 字段与诊断共用）。 */
+  function countReclaimableTasks() {
+    let total = 0;
+    for (const task of tasks.values()) {
+      if (reclaimBlockReason(task) === null) total += 1;
+    }
+    return total;
+  }
+
+  /**
+   * 第一阶段：筛选可回收任务、立起屏障并生成候选快照。
+   *
+   * 返回结构（稳定契约）：
+   * - 接受：{ accepted:true, token, parentTaskIds, candidate, bytes, skipped }；
+   * - 拒绝：{ accepted:false, code, reason, message?, parentTaskIds:[], skipped }。
+   *
+   * 拒绝码：
+   * - RECLAIM_IN_PROGRESS：已有回收在途（同一临界区串行）；
+   * - MANAGER_CLOSED：manager 已关闭；
+   * - INVALID_RECLAIM_INPUT：入参不是非空字符串数组、含非法项、去重后为空或超过 maxTasks；
+   * - NO_RECLAIMABLE_TASKS：所有给定任务都进 skipped（不存在/未结算/停止未确认）；
+   * - RECLAIM_SNAPSHOT_DEGRADED / RECLAIM_SNAPSHOT_OVERSIZE：候选快照不过闸门。
+   *
+   * 任一项不满足前置条件时只进 skipped（逐个原因码），不阻断其它可回收任务；
+   * 但"一个都不能回收"时整体拒绝，且不留下屏障。
+   *
+   * @param {string[]} parentTaskIds - 待回收父任务 id（去重后按输入顺序）。
+   * @returns {object}
+   */
+  function prepareReclaim(parentTaskIds) {
+    if (closed) {
+      return { accepted: false, code: "MANAGER_CLOSED", reason: "manager_closed", parentTaskIds: [], skipped: [] };
+    }
+    if (reclaimState !== null) {
+      return { ...reclaimInProgressResult(), parentTaskIds: [], skipped: [] };
+    }
+    if (!Array.isArray(parentTaskIds)) {
+      return {
+        accepted: false,
+        code: "INVALID_RECLAIM_INPUT",
+        reason: "invalid_parent_task_ids",
+        message: "parentTaskIds 必须是非空字符串数组",
+        parentTaskIds: [],
+        skipped: [],
+      };
+    }
+    const ids = [];
+    const seen = new Set();
+    for (const raw of parentTaskIds) {
+      const id = typeof raw === "string" ? raw.trim() : "";
+      if (id.length === 0) {
+        return {
+          accepted: false,
+          code: "INVALID_RECLAIM_INPUT",
+          reason: "invalid_parent_task_ids",
+          message: "parentTaskIds 只能包含非空字符串",
+          parentTaskIds: [],
+          skipped: [],
+        };
+      }
+      if (seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    if (ids.length === 0) {
+      return {
+        accepted: false,
+        code: "INVALID_RECLAIM_INPUT",
+        reason: "invalid_parent_task_ids",
+        message: "parentTaskIds 不能为空",
+        parentTaskIds: [],
+        skipped: [],
+      };
+    }
+    if (ids.length > budgetPolicy.maxTasks) {
+      return {
+        accepted: false,
+        code: "INVALID_RECLAIM_INPUT",
+        reason: "invalid_parent_task_ids",
+        message: "单次最多回收 " + budgetPolicy.maxTasks + " 个父任务",
+        parentTaskIds: [],
+        skipped: [],
+      };
+    }
+    const skipped = [];
+    const eligible = [];
+    for (const id of ids) {
+      const blockReason = reclaimBlockReason(tasks.get(id));
+      if (blockReason === null) {
+        eligible.push(id);
+      } else {
+        skipped.push({ parentTaskId: id, reason: blockReason });
+      }
+    }
+    if (eligible.length === 0) {
+      return {
+        accepted: false,
+        code: "NO_RECLAIMABLE_TASKS",
+        reason: "no_reclaimable_tasks",
+        parentTaskIds: [],
+        skipped,
+      };
+    }
+    const token = "reclaim-" + (++reclaimSequence);
+    // 先立屏障再序列化：候选快照从这一刻起就是"唯一权威的待落盘状态"，
+    // 序列化期间不可能有公开写入口插入状态变化（同步临界区 + 屏障双重保证）。
+    reclaimState = { token, parentTaskIds: new Set(eligible), candidate: null, bytes: null };
+    const envelope = serializeSnapshotEnvelope({ omitParentTaskIds: eligible });
+    if (envelope.degraded === true || envelope.bytes === null) {
+      reclaimState = null;
+      return {
+        accepted: false,
+        code: "RECLAIM_SNAPSHOT_DEGRADED",
+        reason: "reclaim_snapshot_degraded",
+        message: "候选快照含不可 JSON 序列化负载，已中止回收",
+        parentTaskIds: [],
+        skipped,
+        ...(envelope.degraded === true && envelope.payload?.violation ? { violation: envelope.payload.violation } : {}),
+      };
+    }
+    const sizeVerdict = snapshotSizeVerdict(envelope.bytes);
+    if (!sizeVerdict.ok) {
+      reclaimState = null;
+      return {
+        accepted: false,
+        code: "RECLAIM_SNAPSHOT_OVERSIZE",
+        reason: "reclaim_snapshot_oversize",
+        message: sizeVerdict.violation.message,
+        parentTaskIds: [],
+        skipped,
+        violation: sizeVerdict.violation,
+      };
+    }
+    reclaimState.candidate = envelope.payload;
+    reclaimState.bytes = envelope.bytes;
+    return {
+      accepted: true,
+      token,
+      parentTaskIds: eligible,
+      candidate: envelope.payload,
+      bytes: envelope.bytes,
+      skipped,
+    };
+  }
+
+  /**
+   * 第二阶段：把已确认落盘的候选快照对应任务从内存与全部派生索引移除。
+   *
+   * 前置条件：token 必须与当前屏障一致（迟到的 commit 不得命中新的回收）。
+   * 移除范围：tasks / requestIndex / continuationRequestOwners / role 索引 /
+   * 影响范围索引 / 任务级计数 / 轮转游标；回收后的同 requestId 再提交视为新任务
+   * （去重索引随任务一起删除，不保留任何墓碑）。
+   *
+   * 关闭竞态（票据 05 修复）：**唯一门槛是 token 与回收屏障，不看 closed**。
+   * Host 的回收是「先 await 落盘候选成功、再 commit」，close 可能正好落在这次 await 里；
+   * 候选快照已经真实落盘（磁盘已排除待回收任务），此时拒绝 commit 会让磁盘与内存分叉，
+   * 重启后任务凭空“消失”。因此关闭后仍照常移除任务、清理索引、写迟到回调标记；
+   * 但关闭后没有调度/落盘/事件语义，所以 **不** emit tasks_reclaimed、
+   * **不** notifyPersistence、**不** schedule。
+   *
+   * 打开状态下完成后：清空屏障、发一条只含 id 与数量的 tasks_reclaimed 诊断事件、
+   * notifyPersistence 让"回收后的状态 + 屏障期间其它任务的事件"追平磁盘
+   * （Host 仍需自行清理归属索引），并恢复被屏障暂停的派发。
+   *
+   * @param {string} token - prepareReclaim 返回的 token。
+   * @returns {object} { accepted, reclaimed, count } 或结构化拒绝。
+   */
+  function commitReclaim(token) {
+    if (reclaimState === null) {
+      return { accepted: false, code: "RECLAIM_TOKEN_INVALID", reason: "reclaim_not_prepared", reclaimed: [], count: 0 };
+    }
+    if (typeof token !== "string" || token !== reclaimState.token) {
+      return { accepted: false, code: "RECLAIM_TOKEN_INVALID", reason: "reclaim_token_invalid", reclaimed: [], count: 0 };
+    }
+    const state = reclaimState;
+    const reclaimed = [...state.parentTaskIds];
+    for (const parentTaskId of reclaimed) {
+      const task = tasks.get(parentTaskId);
+      if (task === undefined) {
+        // 防御性路径：屏障期间公开写入口全部拒绝，任务不可能消失；真发生时只跳过，
+        // 不中断整批回收（其余任务的状态仍是权威的）。
+        rememberReclaimedTask(parentTaskId);
+        continue;
+      }
+      tasks.delete(parentTaskId);
+      // requestId 去重索引随任务删除：之后同 requestId 视为新任务（票据 05/09 裁决）。
+      if (task.requestId !== undefined && requestIndex.get(task.requestId) === parentTaskId) {
+        requestIndex.delete(task.requestId);
+      }
+      for (const [requestId, ownerId] of [...continuationRequestOwners]) {
+        if (ownerId === parentTaskId) continuationRequestOwners.delete(requestId);
+      }
+      removeTaskIndex(task);
+      // 迟到回调识别标记：任务对象上留标记，迟到回调持有的是这个对象引用。
+      task.reclaimed = true;
+      rememberReclaimedTask(parentTaskId);
+    }
+    // 轮转游标必须随 role 索引一起收敛：role 已被整批回收时删游标，否则取模夹紧，
+    // 保证下一次派发不会越界（dispatchAvailable 还会再兜一次，但索引本身应保持有效）。
+    for (const [role, cursor] of [...rotationCursors]) {
+      const parents = parentsByRole.get(role);
+      if (parents === undefined || parents.length === 0) {
+        rotationCursors.delete(role);
+      } else if (!Number.isInteger(cursor) || cursor < 0) {
+        rotationCursors.set(role, 0);
+      } else if (cursor >= parents.length) {
+        rotationCursors.set(role, cursor % parents.length);
+      }
+    }
+    reclaimState = null;
+    // 关闭后不再有调度/持久化/事件语义：任务移除已按磁盘候选完成，但补发事件、触发落盘
+    // 或重新调度都属于关闭之后的新语义，必须全部跳过（fail-closed，不伪造关闭后的活动）。
+    if (!closed) {
+      emit({
+        type: "tasks_reclaimed",
+        parentTaskIds: reclaimed,
+        count: reclaimed.length,
+      });
+      notifyPersistence();
+      // 屏障期间被暂停的排队工作恢复派发（被回收任务本身已不在索引里）。
+      schedule();
+    }
+    return { accepted: true, changed: true, reclaimed, count: reclaimed.length };
+  }
+
+  /**
+   * 中止回收：只清屏障，不改任何任务状态（落盘失败或候选快照被拒绝时的唯一出口）。
+   *
+   * 关闭竞态（票据 05 修复）：close() 不再清空屏障，因此关闭后调用方仍能（也必须能）
+   * 用同一 token abort；这里不因 closed 拒绝。但关闭后没有调度语义，所以不再 schedule
+   * （schedule 自身也会 no-op，这里显式跳过以表达关闭边界，而不是靠副作用兜底）。
+   *
+   * @param {string} token - prepareReclaim 返回的 token。
+   * @returns {{accepted:boolean, changed:false, reason?:string, code?:string}}
+   */
+  function abortReclaim(token) {
+    if (reclaimState === null) {
+      return { accepted: false, changed: false, code: "RECLAIM_TOKEN_INVALID", reason: "reclaim_not_prepared" };
+    }
+    if (typeof token !== "string" || token !== reclaimState.token) {
+      return { accepted: false, changed: false, code: "RECLAIM_TOKEN_INVALID", reason: "reclaim_token_invalid" };
+    }
+    reclaimState = null;
+    // 屏障期间调度被暂停：中止后必须恢复，否则排队任务会永久停摆。
+    // 关闭后没有调度语义：屏障仍要清（否则 token 永远悬挂），但绝不再排一次 drain。
+    if (!closed) schedule();
+    return { accepted: true, changed: false, reason: "reclaim_aborted" };
   }
 
   // -------------------------------------------------------------------------
@@ -1481,6 +2778,9 @@ export function createFanoutManager(options = {}) {
    */
   function dispatchAvailable() {
     if (closed || restoreDispatchSuppressed) return false;
+    // 回收屏障期间暂停**派发**（不暂停既有 child 的 completion/超时收敛）：
+    // 候选快照落盘窗口里不应再启动新的 child，否则候选与 commit 时的任务集合可能发散。
+    if (reclaimState !== null) return false;
     const roleActiveCounts = activeCountsByRole();
     const taskActiveCounts = activeCountsByTask();
     // parentsByRole 保持首次注册 role 的顺序，避免每轮遍历整个 tasks 表。
@@ -1622,24 +2922,105 @@ export function createFanoutManager(options = {}) {
   // -------------------------------------------------------------------------
 
   /**
+   * 解析角色级默认超时（票据 06 的第三级来源）。
+   *
+   * 这里只读、不缓存：设置页保存后，之后创建的 attempt 立即使用新值，
+   * 而已经在运行的 attempt 不会被改写（它们的超时在创建时已写进 attempt.timeoutMs）。
+   *
+   * 解析函数抛错或返回非法值一律按「未启用」处理：配置错误不能让派发失败。
+   *
+   * @returns {number|undefined} 0 表示角色级显式禁用；undefined 表示角色级未配置。
+   */
+  function resolveRoleTimeoutMs() {
+    if (typeof rawRoleTimeoutMs !== "function") return staticRoleTimeoutMs;
+    let raw;
+    try {
+      raw = rawRoleTimeoutMs();
+    } catch {
+      // 解析函数读的是外部 settings：异常只允许降级，不能让派发抛错。
+      return undefined;
+    }
+    return normalizeTimeoutMs(raw);
+  }
+
+  /**
+   * 单个 attempt 的超时解析（优先级的唯一实现，票据 06）：
+   * shard 显式（含 0）> 父任务默认（含 0）> 角色默认（含 0）> 未启用。
+   *
+   * 只在**创建 attempt 时**调用一次，结果写入 attempt.timeoutMs：
+   * 运行中的超时因此不会因后续设置/父任务默认变化而改变。
+   *
+   * @param {number|undefined} taskDefaultTimeoutMs - task.timeoutMs（只含显式值）。
+   * @param {number|undefined} shardTimeoutMs - shard.timeoutMs（只含显式值）。
+   * @returns {number|undefined}
+   */
+  function resolveAttemptTimeoutMs(taskDefaultTimeoutMs, shardTimeoutMs) {
+    if (typeof shardTimeoutMs === "number") return shardTimeoutMs;
+    if (typeof taskDefaultTimeoutMs === "number") return taskDefaultTimeoutMs;
+    return resolveRoleTimeoutMs();
+  }
+
+  /**
    * 新建一个 attempt。
    *
+   * 超时在这里解析一次并固化到 attempt.timeoutMs（三级优先级见 resolveAttemptTimeoutMs）。
+   *
+   * @param {object} task - 所属父任务（提供父任务级默认超时）。
    * @param {object} shard - 所属 shard（继承 affectedPaths/timeoutMs）。
    * @param {number} attemptNumber - attempt 序号（同一 shard 内单调递增，历史不可覆盖）。
    * @param {object} [extra] - 追加字段。多轮 continuation 用 `{ continuation: true, childId }`
    *   标记「复用既有 child」——该标记只存在于内存 attempt 上，**不进快照**：冷恢复后原
    *   child 可能已不存在，恢复派发一律走 launcher 新建 child（与既有 restore 语义一致）。
    */
-  function createAttempt(shard, attemptNumber, extra = {}) {
+  function createAttempt(task, shard, attemptNumber, extra = {}) {
+    const timeoutMs = resolveAttemptTimeoutMs(task.timeoutMs, shard.timeoutMs);
     return {
       attempt: attemptNumber,
       status: "queued",
+      /**
+       * attempt 身份（票据 07）：attemptId 跨重启稳定，executionGeneration 单调递增。
+       *
+       * 二者共同构成停止证据的寻址键：Host 只能提交"父任务 + 分片 + attempt 序号 +
+       * attemptId + executionGeneration"全部精确匹配的证据；任一不匹配就是 stale，
+       * 不产生任何状态变更。只有 attemptId 是不够的——同一个 attemptId 的旧执行代次
+       * 迟到回调仍可能携带旧代次，代次负责把这类迟到隔离在门外。
+       */
+      attemptId: deriveAttemptId(task.parentTaskId, shard.shardId, attemptNumber),
+      executionGeneration: ++nextExecutionGeneration,
+      // 默认 unknown：管理器不因为"自己发了取消"就假定执行已停止。
+      stopEvidence: { state: STOP_EVIDENCE_STATE_UNKNOWN },
       startedAt: undefined,
       finishedAt: undefined,
       affectedPaths: [...shard.affectedPaths],
-      ...(shard.timeoutMs === undefined ? {} : { timeoutMs: shard.timeoutMs }),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
       ...extra,
     };
+  }
+
+  /**
+   * attempt 预算的**唯一**判定入口（retry / continue / restore resume 共用）。
+   *
+   * 判定对象是「新建之后」的 attempt 数（attempts.length + 1）：因此恰好允许
+   * maxAttemptsPerShard 个 attempt 存在，只有再多一个才超限。三个入口必须复用本函数，
+   * 否则会出现「恢复续跑放宽一档」的语义漂移——一旦写进第 limit+1 个 attempt，
+   * 下次 restore 会被 checkRestoreBudget **整体**拒绝，整份快照从此不可恢复。
+   *
+   * 本函数只读：绝不修改 shard、attempt 或任务状态；拒绝的处置（事件/返回值/原因码）
+   * 由各入口按自己的契约决定。
+   *
+   * @param {object} shard - 目标 shard（读取 attempts.length 与预算上限）。
+   * @param {string} field - 违规定位的字段名（如 "attempt" 或 "shard <id>"）。
+   * @param {string} hint - 面向调用方的处置建议（不同入口的建议不同）。
+   * @returns {null|{reason:string, attempts:number, limit:number, violation:object}}
+   *   null 表示仍可新建 attempt；否则 reason 固定为 attempt_budget_exceeded，
+   *   attempts 是**当前已有**的 attempt 数（不是新建后的数量）。
+   */
+  function attemptBudgetVerdict(shard, field, hint) {
+    const attempts = shard.attempts.length;
+    const limit = budgetPolicy.maxAttemptsPerShard;
+    const violation = budgetVerdict("attempts", limit, attempts + 1, field, hint);
+    if (violation === null) return null;
+    return { reason: "attempt_budget_exceeded", attempts, limit, violation: violation.violation };
   }
 
   function updateShardStatus(task, shard, status) {
@@ -1664,11 +3045,225 @@ export function createFanoutManager(options = {}) {
     return ids;
   }
 
+  // -------------------------------------------------------------------------
+  // 停止证据（票据 07）
+  // -------------------------------------------------------------------------
+
+  /** 清除 attempt 的停止看门狗定时器（句柄只存内存，不进快照）。 */
+  function clearAttemptStopTimer(attempt) {
+    if (attempt?.stopTimer === undefined) return;
+    clearTimeoutFn(attempt.stopTimer);
+    attempt.stopTimer = undefined;
+  }
+
+  /**
+   * 归一化一条停止证据，校验来源白名单与证据摘要形状。
+   *
+   * 只接受 JSON 安全的摘要字段（childId/messageId/sessionId/turn），绝不接受任意自由文本：
+   * 证据会进事件历史与快照，无界负载会让诊断面变成第二个资源风险。
+   *
+   * @param {unknown} raw - 原始证据。
+   * @param {{allowedSources?: readonly string[], nowMs?: number}} [options]
+   * @returns {{ok:true, evidence:object} | {ok:false, code:string, reason:string, message:string}}
+   */
+  function normalizeStopEvidence(raw, { allowedSources = STOP_EVIDENCE_SOURCES, nowMs } = {}) {
+    const invalid = (message) => ({
+      ok: false,
+      code: "STOP_EVIDENCE_INVALID",
+      reason: "stop_evidence_invalid",
+      message,
+    });
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return invalid("停止证据必须是对象");
+    const source = typeof raw.source === "string" ? raw.source.trim() : "";
+    if (source.length === 0) return invalid("停止证据必须给出 source");
+    if (!allowedSources.includes(source)) return invalid("不接受的停止证据来源: " + source);
+    const observedAt = typeof raw.observedAt === "number" && Number.isFinite(raw.observedAt) && raw.observedAt >= 0
+      ? raw.observedAt
+      : (nowMs ?? now());
+    const evidence = { state: STOP_EVIDENCE_STATE_OBSERVED, source, observedAt };
+    for (const field of ["childId", "messageId", "sessionId"]) {
+      const value = raw[field];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "string" || value.trim().length === 0) return invalid("停止证据字段 " + field + " 必须是非空字符串");
+      evidence[field] = value.trim();
+    }
+    if (raw.turn !== undefined && raw.turn !== null) {
+      if (!Number.isSafeInteger(raw.turn) || raw.turn < 0) return invalid("停止证据字段 turn 必须是非负整数");
+      evidence.turn = raw.turn;
+    }
+    return { ok: true, evidence };
+  }
+
+  /**
+   * 应用停止证据（唯一写入口）：只允许 unknown -> observed。
+   *
+   * 明确**不**做的事：不改写 attempt.status/result/error，不发逻辑结算事件，不重复计数。
+   * 它只做三件事——写 evidence、清看门狗、刷新该 attempt 的影响范围索引。
+   * 聚合由调用方在合适时机触发（settle 路径在 emit 之后统一聚合；观测路径直接聚合），
+   * 这样「迟到证据补聚合」与「正常结算」共用同一条 gate。
+   *
+   * @returns {boolean} 是否真的从 unknown 变成 observed。
+   */
+  function applyStopEvidence(task, shard, attempt, evidence, { emitEvent = true } = {}) {
+    if (isStopObserved(attempt)) return false;
+    attempt.stopEvidence = { ...evidence, state: STOP_EVIDENCE_STATE_OBSERVED };
+    clearAttemptStopTimer(attempt);
+    syncAttemptScope(task, shard, attempt);
+    if (emitEvent && !restoringSnapshot) {
+      emit({
+        type: "attempt_stop_observed",
+        parentTaskId: task.parentTaskId,
+        shardId: shard.shardId,
+        role: task.role,
+        attempt: attempt.attempt,
+        attemptId: attempt.attemptId,
+        executionGeneration: attempt.executionGeneration,
+        status: attempt.status,
+        source: attempt.stopEvidence.source,
+        released: isTerminalShardStatus(attempt.status),
+      });
+    }
+    return true;
+  }
+
+  /**
+   * 记录"已请求停止"并挂看门狗（票据 07）。
+   *
+   * 只写时间戳，不写证据：管理器自己发出的 cancel/timeout 永远不是停止证据。宽限到期时
+   * 只由 expireStopWatchdog 记一次诊断，绝不自动释放范围/重试/聚合。
+   *
+   * @param {object} task - 父任务。
+   * @param {object} shard - 分片。
+   * @param {object} attempt - 目标 attempt。
+   * @param {{watch?:boolean}} [options] - watch=false 用于 close（关闭时清定时器，不留悬挂）。
+   */
+  function markStopRequested(task, shard, attempt, { watch = true } = {}) {
+    if (isStopObserved(attempt)) return;
+    if (typeof attempt.stopRequestedAt !== "number") attempt.stopRequestedAt = now();
+    attempt.stopDeadlineAt = attempt.stopRequestedAt + stopGraceMs;
+    if (!watch) return;
+    if (attempt.stopWatchdogExpiredAt !== undefined) return;
+    if (attempt.stopTimer !== undefined) return;
+    // 定时器回调是独立异步 tick，自成一个持久化批（诊断事件只序列化一次）。
+    attempt.stopTimer = setTimeoutFn(
+      () => withPersistenceBatch(() => expireStopWatchdog(task, shard, attempt)),
+      stopGraceMs,
+    );
+    // unref：停止宽限只是诊断/看门狗，不是业务 deadline；生产进程不该被它钉住，测试进程
+    // 也不该为每个未确认 attempt 多等 15 秒才退出。进程仍活跃时定时器照常触发。
+    attempt.stopTimer?.unref?.();
+  }
+
+  /**
+   * 停止宽限到期：只记 stopWatchdogExpiredAt 并发布**一次** attempt_stop_unconfirmed。
+   *
+   * 语义边界（票据 07 已裁决）：不释放影响范围、不重试、不聚合、不发完成通知、不改逻辑
+   * 状态。它只回答"管理器等了这么久仍未收到权威停止证据"，供 Host 诊断与人工处置。
+   */
+  function expireStopWatchdog(task, shard, attempt) {
+    attempt.stopTimer = undefined;
+    if (isStopObserved(attempt)) return;
+    if (attempt.stopWatchdogExpiredAt !== undefined) return;
+    attempt.stopWatchdogExpiredAt = now();
+    // 原因码区分超时与取消：两者的人工处置不同（超时通常重试，取消通常放弃）。
+    const reason = attempt.terminalReason === "timeout" ? "timeout" : "cancel";
+    lastStopWatchdog = {
+      parentTaskId: task.parentTaskId,
+      shardId: shard.shardId,
+      attempt: attempt.attempt,
+      attemptId: attempt.attemptId,
+      executionGeneration: attempt.executionGeneration,
+      reason,
+      at: attempt.stopWatchdogExpiredAt,
+    };
+    emit({
+      type: "attempt_stop_unconfirmed",
+      parentTaskId: task.parentTaskId,
+      shardId: shard.shardId,
+      role: task.role,
+      attempt: attempt.attempt,
+      attemptId: attempt.attemptId,
+      executionGeneration: attempt.executionGeneration,
+      status: attempt.status,
+      terminalReason: attempt.terminalReason,
+      reason,
+      stopRequestedAt: attempt.stopRequestedAt,
+      stopDeadlineAt: attempt.stopDeadlineAt,
+      stopWatchdogExpiredAt: attempt.stopWatchdogExpiredAt,
+    });
+    notifyPersistence();
+  }
+
+  /** 某 shard 中仍未确认停止的 attempt（重试/续作/恢复续跑 gate 的判定输入）。 */
+  function unconfirmedStopAttempts(shard) {
+    return shard.attempts.filter((attempt) => !isStopObserved(attempt));
+  }
+
+  /** 未确认停止 attempt 的结构化摘要（有界：attempt 预算封顶）。 */
+  function unconfirmedStopSummary(attempt) {
+    return {
+      attempt: attempt.attempt,
+      status: attempt.status,
+      attemptId: attempt.attemptId,
+      executionGeneration: attempt.executionGeneration,
+      stopRequestedAt: attempt.stopRequestedAt ?? null,
+      stopDeadlineAt: attempt.stopDeadlineAt ?? null,
+      stopWatchdogExpiredAt: attempt.stopWatchdogExpiredAt ?? null,
+      terminalReason: attempt.terminalReason ?? null,
+      legacy: attempt.legacy === true,
+    };
+  }
+
+  /**
+   * shard 级停止 gate：只要还有 attempt 未确认停止，就不允许创建新 attempt。
+   *
+   * 为什么必须 fail-closed：超时 attempt 未停止时重试会覆盖旧 entry（旧实现按 shard 索引
+   * 的真实缺陷），旧 child 的迟到写入将与新 attempt 并发写同一路径。因此拒绝时把未确认的
+   * attempt 摘要带给调用方，Host 可以据此提交证据或转人工。
+   *
+   * @returns {null|{reason:string, shardId:string, attempts:object[]}}
+   */
+  function stopGateVerdict(shard) {
+    const unconfirmed = unconfirmedStopAttempts(shard);
+    if (unconfirmed.length === 0) return null;
+    return {
+      reason: "stop_unconfirmed",
+      shardId: shard.shardId,
+      attempts: unconfirmed.map(unconfirmedStopSummary),
+    };
+  }
+
   /**
    * shard 终态写入入口。所有路径（启动失败、child 完成、取消、超时、恢复）都收敛到
    * 这里，保证终态一次性且幂等：已进入终态的 shard 只拒绝并记录诊断，不被改写。
+   *
+   * 停止证据（票据 07）：
+   * - 成功/失败路径由调用方传入可信 evidence（本模块的 completion/admission 回调就是
+   *   证据来源），先于终态判定落库，因此迟到 completion 可以"只补证据不改状态"；
+   * - 超时/取消路径不传证据，只写逻辑终态 + stopRequestedAt/stopDeadlineAt + 看门狗；
+   * - queued 阶段被取消（从未 admission）可直接记 not-started 证据并释放范围。
+   *
+   * @param {object} task - 父任务。
+   * @param {object} shard - 分片。
+   * @param {object} attempt - 目标 attempt。
+   * @param {string} status - 终态。
+   * @param {{result?:unknown, error?:object, violation?:object, evidence?:object, reason?:string, watchStop?:boolean, needsAttention?:boolean}} [options]
+   *   evidence：可信停止证据（source 必须在白名单内）；reason：结构化的终止原因码；
+   *   watchStop=false 只用于 close（清定时器、不挂看门狗，但保留 unknown 状态）；
+   *   needsAttention=true 只用于归属老化（事件带 needs_attention 标记，供 Host/UI 转人工）。
    */
-  function settleShard(task, shard, attempt, status, { result, error, violation: presetViolation } = {}) {
+  function settleShard(task, shard, attempt, status, {
+    result,
+    error,
+    violation: presetViolation,
+    evidence,
+    reason,
+    watchStop = true,
+    needsAttention = false,
+  } = {}) {
+    // 已回收任务：任何迟到结算/证据都只做结构化 no-op（不复活、不改统计、不写事件/快照）。
+    // 判定必须在预算/证据处理之前，否则迟到负载仍可能污染诊断与持久化。
+    if (task?.reclaimed === true) return taskReclaimedResult(task.parentTaskId);
     if (!SHARD_STATUS_SET.has(status) || !isTerminalShardStatus(status)) {
       return rejectSettlement(task, shard, attempt, status, "invalid_status");
     }
@@ -1685,28 +3280,84 @@ export function createFanoutManager(options = {}) {
       : { ok: true };
     if (!payloadVerdict.ok) {
       payloadViolation = payloadVerdict.violation;
-      noteBudgetViolation(payloadViolation);
+      noteBudgetViolation(payloadViolation, "attempt", { parentTaskId: task.parentTaskId });
       status = "failed";
       result = undefined;
       error = budgetShardError(payloadViolation);
     }
+    /**
+     * 迟到停止证据（票据 07）：attempt 已终态时先补证据、再走拒绝路径。
+     *
+     * 场景：超时/取消已写终态，child 的 completion 随后才到。状态必须原样保留（迟到的
+     * 成功/失败不得改写终态），但证据仍要落库——否则该 attempt 的影响范围永远占位、
+     * 任务永远不能聚合。证据应用幂等，重复回调不会重复计数。
+     */
+    const preStatus = attempt.status;
+    if (evidence !== undefined && isTerminalShardStatus(preStatus) && !isStopObserved(attempt)) {
+      const verdict = normalizeStopEvidence(evidence);
+      // 内部来源（completion/admission）形状异常按"没有证据"处理：不能因为一次归一化
+      // 失败就阻断正常的拒绝/诊断路径。
+      if (verdict.ok) applyStopEvidence(task, shard, attempt, verdict.evidence);
+    }
     if (isTerminalShardStatus(attempt.status)) {
-      return payloadViolation === null
+      const outcome = payloadViolation === null
         ? rejectSettlement(task, shard, attempt, status, "already_terminal")
         : rejectSettlement(task, shard, attempt, status, "attempt_budget_exceeded");
+      /**
+       * 迟到证据可能刚刚解除了聚合阻塞（该 attempt 的影响范围已释放）：补一次聚合，
+       * 让"取消/超时 + 迟到 completion"也能正常结算，且 task_settled 仍只发一次。
+       */
+      if (evidence !== undefined) {
+        aggregateTask(task);
+        schedule();
+      }
+      return outcome;
     }
-    if (attempt.status !== "running" && !(attempt.status === "queued" && status === "cancelled")) {
+    /**
+     * 合法转移：running -> 任意终态；queued -> cancelled（从未 admission）或
+     * interrupted（归属老化：这一轮从未真正开始，但也无法证明启动过）。
+     */
+    if (preStatus !== "running" && !(preStatus === "queued" && (status === "cancelled" || status === "interrupted"))) {
       return payloadViolation === null
         ? rejectSettlement(task, shard, attempt, status, "invalid_transition")
         : rejectSettlement(task, shard, attempt, status, "attempt_budget_exceeded");
     }
     attempt.status = status;
     attempt.finishedAt = now();
+    attempt.terminalReason = typeof reason === "string" && reason.length > 0 ? reason : defaultTerminalReason(status);
     if (result !== undefined) attempt.result = result;
     if (error !== undefined) attempt.error = error;
     if (attempt.timer !== undefined) {
       clearTimeoutFn(attempt.timer);
       attempt.timer = undefined;
+    }
+    /**
+     * 正常路径的停止证据（在终态写入之后应用，事件里的 status 才是真实的终态）：
+     * - 成功/失败：用调用方给的 completion/admission 证据；
+     * - queued 阶段取消：从未 admission，直接记 not-started 证据并释放范围。
+     */
+    if (!isStopObserved(attempt)) {
+      const notStarted = status === "cancelled"
+        && preStatus === "queued"
+        && attempt.childId === undefined
+        && attempt.handle === undefined;
+      const finalEvidence = evidence ?? (notStarted
+        ? { state: STOP_EVIDENCE_STATE_OBSERVED, source: "not-started", observedAt: now() }
+        : undefined);
+      if (finalEvidence !== undefined) {
+        const verdict = normalizeStopEvidence(finalEvidence);
+        if (verdict.ok) applyStopEvidence(task, shard, attempt, verdict.evidence);
+      }
+    }
+    /**
+     * 超时/取消进入"已请求停止、等待证据"的状态：
+     * - stopEvidence 保持 unknown（管理器自己的取消不算证据）；
+     * - 记录 stopRequestedAt/stopDeadlineAt 并按宽限挂看门狗；
+     * - close 传 watchStop=false：清内存定时器、保留 unknown（关闭后不再有调度）。
+     * 成功/失败路径不会走到这里——它们总能给出 completion/admission 证据。
+     */
+    if ((status === "timed_out" || status === "cancelled") && !isStopObserved(attempt)) {
+      markStopRequested(task, shard, attempt, { watch: watchStop && !closed });
     }
     // 多轮复用安全边界：同一 shard 可以有多个 attempt（手工 retry / continuation），
     // shard 的**当前状态**只能由最新 attempt 决定。非最新 attempt 的迟到结算仍然写入它
@@ -1714,11 +3365,19 @@ export function createFanoutManager(options = {}) {
     // 否则旧轮迟到结算会覆盖新轮状态，并可能重复发布旧轮 task_settled。
     const isLatestAttempt = shard.attempts[shard.attempts.length - 1] === attempt;
     if (isLatestAttempt) setShardStatus(task, shard, status);
+    // 非最新 attempt 不改变 shard.status，但它自己的范围索引仍要刷新（终态 + 证据决定释放）。
+    else syncAttemptScope(task, shard, attempt);
     shard.updatedAt = attempt.finishedAt;
     task.updatedAt = attempt.finishedAt;
     emitShardStatus(task, shard, status, attempt.attempt, {
       ...(isLatestAttempt ? {} : { staleAttempt: true, shardStatus: shard.status }),
       ...(task.round === undefined ? {} : { round: task.round }),
+      attemptId: attempt.attemptId,
+      executionGeneration: attempt.executionGeneration,
+      stopState: isStopObserved(attempt) ? STOP_EVIDENCE_STATE_OBSERVED : STOP_EVIDENCE_STATE_UNKNOWN,
+      ...(attempt.terminalReason === undefined ? {} : { terminalReason: attempt.terminalReason }),
+      // 归属老化：终态事件必须显式带"需要人工处理"标记，消费方不能把它当成普通失败。
+      ...(needsAttention === true ? { needs_attention: true } : {}),
       ...(result === undefined ? {} : { result: cloneJson(result) }),
       ...(error === undefined ? {} : { error: cloneJson(error) }),
       // 预算违规必须留下可检索的诊断（终态可观察，且不携带超限原始负载）。
@@ -1730,8 +3389,69 @@ export function createFanoutManager(options = {}) {
     return true;
   }
 
+  /**
+   * admission 未创建 child 的证据（启动器抛错/reject 的既有契约就是"没有 child"）。
+   *
+   * 这是管理器**能自己证明**的停止信号：没有 child 就没有执行体在写盘。注意它只覆盖
+   * admission 阶段；已经受理并返回句柄的 child 必须等 completion/disposal 证据。
+   */
+  function admissionEvidence(attempt) {
+    return {
+      source: "admission_not_created",
+      observedAt: now(),
+      ...(typeof attempt.childId === "string" && attempt.childId.length > 0 ? { childId: attempt.childId } : {}),
+    };
+  }
+
+  /**
+   * completion 回调证据：该 attempt 自己绑定的 completion 落地（成功或失败）。
+   *
+   * 为什么可以作为证据：completion 来自本次 admission 返回的句柄，天然严格归属到本
+   * attempt；它落地说明这一轮执行已经结束。取消路径不主动使用它（取消只是"请求停止"，
+   * 由 child 自己回报的"取消确认"不证明进程已退出），只有**迟到**的 completion 落到
+   * 已终态 attempt 上时才补录。
+   */
+  function completionEvidence(attempt) {
+    return {
+      source: "child_completion",
+      observedAt: now(),
+      ...(typeof attempt.childId === "string" && attempt.childId.length > 0 ? { childId: attempt.childId } : {}),
+      ...(typeof attempt.messageId === "string" && attempt.messageId.length > 0 ? { messageId: attempt.messageId } : {}),
+    };
+  }
+
+  /** 迟到的 completion 证据：只有 attempt 已逻辑终态时才补录（取消路径保持 unknown）。 */
+  function lateCompletionEvidence(attempt) {
+    return isTerminalShardStatus(attempt.status) ? completionEvidence(attempt) : undefined;
+  }
+
+  /**
+   * 关闭/卸载产生的 completion 错误是否属于"管理器不再等待"而不是"执行已停止"。
+   *
+   * 关闭路径（manager.close / runtime.close）会用统一错误拒绝所有在途 completion；这条
+   * 拒绝只说明本进程不再持有执行句柄，**不能**证明 child 已停止（它可能仍在另一个运行
+   * 实例里写盘）。因此这类错误绝不能附带 completionEvidence——否则 close 会把每个
+   * attempt 都误判成 observed，范围被提前释放、任务被错误聚合。
+   *
+   * @param {unknown} error - completion rejection 的原因。
+   * @returns {boolean} true 表示这是关闭/卸载错误，应抑制停止证据。
+   */
+  function isShutdownCompletionError(error) {
+    if (error === null || typeof error !== "object") return false;
+    const reason = typeof error.reason === "string" ? error.reason : "";
+    const code = typeof error.code === "string" ? error.code : "";
+    return reason === "runtime_closed"
+      || reason === "manager_closed"
+      || code === "RUNTIME_CLOSED"
+      || code === "MANAGER_CLOSED"
+      || error.name === "FanoutClosedError";
+  }
+
   function launchFailure(task, shard, attempt, error) {
-    settleLaunchFailure(task, shard, attempt, error);
+    settleLaunchFailure(task, shard, attempt, error, {
+      evidence: admissionEvidence(attempt),
+      reason: "launch_failure",
+    });
   }
 
   /**
@@ -1740,20 +3460,44 @@ export function createFanoutManager(options = {}) {
    * 先用未归一化的原始错误判定字节预算：normalizeLaunchError 会丢弃自定义字段
    * （如 error.detail），若只判定归一化后的结果，超限负载会被静默丢弃而不是显式报告。
    * 超限时改写成带完整元数据的 BudgetExceededError（complete=false + 实测/上限字节）。
+   *
+   * @param {object} task - 父任务。
+   * @param {object} shard - 分片。
+   * @param {object} attempt - 目标 attempt。
+   * @param {unknown} error - 原始错误。
+   * @param {{evidence?:object, reason?:string}} [options] - 停止证据与终止原因码
+   *   （admission 失败 = admission_not_created / launch_failure；child 失败 =
+   *   child_completion / failed）。
    */
-  function settleLaunchFailure(task, shard, attempt, error) {
+  function settleLaunchFailure(task, shard, attempt, error, { evidence, reason = "launch_failure" } = {}) {
+    if (task?.reclaimed === true) return;
     const rawVerdict = checkBudget({
       resource: "attempt_error",
       limit: budgetPolicy.maxAttemptErrorBytes,
       receivedBytes: measureJsonBytes(errorInstinctPayload(error)),
       subject: task.parentTaskId + "/" + shard.shardId + "#" + attempt.attempt,
+      // 与 checkAttemptPayloadBudget 的 attempt_error 分支保持同一契约：
+      // 完整错误仍留在子会话日志里（可恢复），并给出精简错误的可执行提示。
+      recoverable: true,
+      hint: "错误过大时请让专家回传精简摘要（name/message/关键 stack 帧），完整日志留在子会话",
     });
     if (!rawVerdict.ok) {
-      noteBudgetViolation(rawVerdict.violation);
-      settleShard(task, shard, attempt, "failed", { error: budgetShardError(rawVerdict.violation) });
+      noteBudgetViolation(rawVerdict.violation, "attempt", { parentTaskId: task.parentTaskId });
+      // violation 必须作为 preset 传进 settleShard：否则终态事件只带一个"小错误"，
+      // 丢失 attempt_error 的超限元数据（票据 04 的可见性缺口）。
+      settleShard(task, shard, attempt, "failed", {
+        error: budgetShardError(rawVerdict.violation),
+        violation: rawVerdict.violation,
+        evidence,
+        reason,
+      });
       return;
     }
-    settleShard(task, shard, attempt, "failed", { error: normalizeLaunchError(error) });
+    settleShard(task, shard, attempt, "failed", {
+      error: normalizeLaunchError(error),
+      evidence,
+      reason,
+    });
   }
 
   /**
@@ -1837,7 +3581,9 @@ export function createFanoutManager(options = {}) {
       ...(isContinuation ? { previousMessageIds: previousMessageIdsFor(shard) } : {}),
     };
 
-    if (attempt.timeoutMs !== undefined) {
+    // 0 = 显式禁用超时（票据 06）：只有真正启用的正数才挂定时器。
+    // 计时起点是 attempt 进入 running（上面已写入 startedAt），而不是队列等待时间。
+    if (typeof attempt.timeoutMs === "number" && attempt.timeoutMs > 0) {
       // 超时通过注入时钟触发取消并标记 timed_out；若在此之前已经终态，
       // settleShard 会因幂等直接忽略这次超时。
       // 定时器回调是独立的异步 tick，自成一个持久化批（取消请求 + 终态写入只序列化一次）。
@@ -1846,8 +3592,12 @@ export function createFanoutManager(options = {}) {
         requestShardCancellation(task, shard, attempt, "timeout");
         settleShard(task, shard, attempt, "timed_out", {
           error: toShardError({ name: "ShardTimeoutError", reason: "timeout", timeoutMs: attempt.timeoutMs }, "shard 超时"),
+          // 超时只落逻辑终态并请求停止：stopEvidence 保持 unknown，等 Host 的权威证据。
+          reason: "timeout",
         });
       }), attempt.timeoutMs);
+      // 超时定时器同样只是运行期看门狗：unref 避免测试/宿主进程被单个长超时钉住。
+      attempt.timer?.unref?.();
     }
 
     let launched;
@@ -1878,6 +3628,8 @@ export function createFanoutManager(options = {}) {
 
   /** 消费启动器返回值：登记句柄元数据，并订阅 completion 决定 shard 终态。 */
   function consumeLaunchResult(task, shard, attempt, value) {
+    // 回收后才落地的 admission：只丢弃，不登记 childId、不写快照、不订阅 completion。
+    if (task?.reclaimed === true) return;
     const handle = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
     if (typeof handle.childId === "string") attempt.childId = handle.childId;
     if (typeof handle.messageId === "string") attempt.messageId = handle.messageId;
@@ -1906,10 +3658,20 @@ export function createFanoutManager(options = {}) {
   }
 
   function completeShard(task, shard, attempt, result) {
+    if (task?.reclaimed === true) return;
     // 取消与完成竞态：取消请求先写入终态则完成被忽略，反之完成胜出。
     if (attempt.cancelRequested === true) {
+      /**
+       * 取消路径的证据边界（票据 07）：attempt 仍在 running 时，取消结算属于"请求停止"，
+       * 由 child 回的"我取消了"不证明执行体退出，因此不附带证据；
+       * 只有落在一个**已终态** attempt 上的迟到 completion 才补录证据（不改状态、不重复
+       * 计数），这正是"取消后 child 真的结束"的可观察收敛。
+       */
       settleShard(task, shard, attempt, "cancelled", {
         error: toShardError({ name: "ShardCancelledError", reason: "cancelled", message: "shard 已取消" }, "shard 已取消"),
+        // 关闭后到达的 completion 不能当作停止证据（见 isShutdownCompletionError）。
+        evidence: closed ? undefined : lateCompletionEvidence(attempt),
+        reason: "cancelled",
       });
       return;
     }
@@ -1928,34 +3690,68 @@ export function createFanoutManager(options = {}) {
         subject: task.parentTaskId + "/" + shard.shardId + "#" + attempt.attempt,
         hint: "结果没有 JSON 表示；请让专家只回传可序列化的文本/结构化结果",
       });
-      noteBudgetViolation(violation);
-      settleShard(task, shard, attempt, "failed", { error: budgetShardError(violation), violation });
-      return;
-    }
-    settleShard(task, shard, attempt, "succeeded", { result: rawResult === null ? null : cloneJson(rawResult) });
-  }
-
-  function failShard(task, shard, attempt, error) {
-    if (attempt.cancelRequested === true && !isTerminalShardStatus(attempt.status)) {
-      settleShard(task, shard, attempt, "cancelled", {
-        error: toShardError({ name: "ShardCancelledError", reason: "cancelled", message: "shard 已取消" }, "shard 已取消"),
+      noteBudgetViolation(violation, "attempt", { parentTaskId: task.parentTaskId });
+      // completion 已落地（只是结果不可序列化），因此这一轮执行确实结束了：
+      // 仍要带上完成证据，否则该 attempt 的影响范围会因"预算失败"而永远占位。
+      settleShard(task, shard, attempt, "failed", {
+        error: budgetShardError(violation),
+        violation,
+        // 关闭后的 completion 不证明执行停止；正常路径才是可信证据。
+        evidence: closed ? undefined : completionEvidence(attempt),
+        reason: "failed",
       });
       return;
     }
-    settleLaunchFailure(task, shard, attempt, error);
+    settleShard(task, shard, attempt, "succeeded", {
+      result: rawResult === null ? null : cloneJson(rawResult),
+      // 成功 = 该 attempt 自己的 completion 落地，这是"这一轮执行已经结束"的证据。
+      evidence: closed ? undefined : completionEvidence(attempt),
+      reason: "completed",
+    });
+  }
+
+  function failShard(task, shard, attempt, error) {
+    if (task?.reclaimed === true) return;
+    if (attempt.cancelRequested === true && !isTerminalShardStatus(attempt.status)) {
+      settleShard(task, shard, attempt, "cancelled", {
+        error: toShardError({ name: "ShardCancelledError", reason: "cancelled", message: "shard 已取消" }, "shard 已取消"),
+        reason: "cancelled",
+      });
+      return;
+    }
+    // completion 失败同样证明这一轮执行结束；若 attempt 已终态（超时/取消），
+    // settleShard 只补证据并保留原状态。
+    // 例外：close/runtime_closed/manager_closed 只是"本进程不再等待"，必须保持 unknown，
+    // 否则关闭会把所有未确认停止的 attempt 一次性"证明"为已停止。
+    const shutdown = closed || isShutdownCompletionError(error);
+    settleLaunchFailure(task, shard, attempt, error, {
+      evidence: shutdown ? undefined : completionEvidence(attempt),
+      reason: "failed",
+    });
   }
 
   // -------------------------------------------------------------------------
   // wait-all 聚合
   // -------------------------------------------------------------------------
 
+  /**
+   * 聚合 gate（票据 07）：任务结算需要**同时**满足两个条件。
+   *
+   * - counts.pending === 0：没有分片还在 queued/running（逻辑进度）；
+   * - counts.stop_pending === 0：没有"已终态但执行未确认"的 attempt（真实停止）。
+   *
+   * 只满足前者时任务保持 pending：不写 settledAt、不发 task_settled、不宣告完成。
+   * 迟到证据到达后由 observeStopEvidence 重新调用本函数补聚合，且 task_settled
+   * 只会发一次（下面的 wasSettled + previousStatus 判定保证幂等）。
+   */
   function aggregateTask(task) {
     const counts = computeCounts(task);
-    const allTerminal = counts.pending === 0;
+    const allTerminal = counts.pending === 0 && counts.stop_pending === 0;
     const previousStatus = task.status;
     const wasSettled = task.settledAt !== undefined;
     let status = task.status;
     if (!allTerminal) {
+      // 逻辑终态但停止未确认：保持 pending，避免"管理器已结算、执行还在写"。
       status = "pending";
     } else if (counts.succeeded === task.shards.length) {
       status = "completed";
@@ -1988,13 +3784,20 @@ export function createFanoutManager(options = {}) {
     });
   }
 
-  /** 是否每个 shard 的最新 attempt 都已终态（= 本轮 wait-all 已完成，可以复用续作）。 */
+  /**
+   * 本轮 wait-all 是否真正完成（= 可以复用续作）。
+   *
+   * 两个条件缺一不可：最新 attempt 全部逻辑终态 **且** 没有任何未确认停止的 attempt。
+   * 只按逻辑终态判定会让 UI/工具在 child 仍可能写盘时显示"可续作"，与 continueTask 的
+   * stop_unconfirmed 拒绝自相矛盾。
+   */
   function allShardsTerminal(task) {
     if (task === undefined || task === null) return false;
-    return task.shards.every((shard) => {
+    const latestAllTerminal = task.shards.every((shard) => {
       const latest = shard.attempts[shard.attempts.length - 1];
       return latest !== undefined && isTerminalShardStatus(latest.status);
     });
+    return latestAllTerminal && countStopPending(task) === 0;
   }
 
   // -------------------------------------------------------------------------
@@ -2015,20 +3818,22 @@ export function createFanoutManager(options = {}) {
         shardIds: [],
       };
     }
+    // 回收屏障：新增登记会破坏"候选快照 = 待落盘状态"的一致性，一律结构化拒绝。
+    if (reclaimState !== null) return { ...reclaimInProgressResult(), shardIds: [] };
     const verdict = validateSubmitInput(input);
-    if (!verdict.ok) throw validationError(verdict);
+    if (!verdict.ok) {
+      // 任务输入（basePrompt/shard prompt）与 shards 数量的预算拒绝属于 submit 阶段。
+      if (verdict.violation !== undefined) noteBudgetViolation(verdict.violation, "submit");
+      throw validationError(verdict);
+    }
 
-    // task 数量预算：快照里的 tasks 数组与内存表都按 task 线性增长，必须有上界。
-    // 判定的是"本候选登记后的数量"，因此 +1；requestId 去重命中时提前返回，不占新槽位。
-    const taskCountViolation = budgetVerdict(
-      "tasks",
-      budgetPolicy.maxTasks,
-      tasks.size + 1,
-      "tasks",
-      "先等待或取消已结算的父任务再提交新任务",
-    );
-    if (taskCountViolation !== null) throw validationError(taskCountViolation);
-
+    /**
+     * requestId 幂等判定**先于**容量判定（票据 05 验收项）。
+     *
+     * 为什么顺序重要：满额时重复提交同一个 requestId 是"重放已知请求"，不是"新增任务"。
+     * 若容量判定在前，调用方会收到容量错误并误以为需要先回收/等待——实际上它拿到的
+     * 会是与首次完全相同的任务句柄。去重命中永远不占新槽位，因此这里可以安全地提前返回。
+     */
     if (verdict.requestId !== undefined) {
       const existingId = requestIndex.get(verdict.requestId);
       if (existingId !== undefined && tasks.has(existingId)) {
@@ -2042,6 +3847,22 @@ export function createFanoutManager(options = {}) {
           requestId: verdict.requestId,
         };
       }
+    }
+
+    // task 数量预算：快照里的 tasks 数组与内存表都按 task 线性增长，必须有上界。
+    // 判定的是"本候选登记后的数量"，因此 +1。拒绝结构额外携带 current / reclaimable，
+    // 提示指向真实可执行入口（RPC fanout-reclaim），而不是含糊的"等待或取消"。
+    const taskCountViolation = budgetVerdict(
+      "tasks",
+      budgetPolicy.maxTasks,
+      tasks.size + 1,
+      "tasks",
+      "调用 fanout-reclaim 回收已结算的父任务，或等待尚未结算的任务收敛 / 调整 maxTasks 后再提交",
+      { current: tasks.size, reclaimable: countReclaimableTasks() },
+    );
+    if (taskCountViolation !== null) {
+      noteBudgetViolation(taskCountViolation.violation, "submit");
+      throw validationError(taskCountViolation);
     }
 
     const allowOverlap = verdict.allowOverlap || defaultAllowOverlap;
@@ -2077,6 +3898,8 @@ export function createFanoutManager(options = {}) {
     if (tasks.has(parentTaskId)) {
       throw new FanoutValidationError("DUPLICATE_PARENT_TASK_ID", "parentTaskId 已存在: " + parentTaskId, { field: "parentTaskId" });
     }
+    // 同 id 的旧回收标记必须清除：新任务的迟到回调不能被误判成"任务已回收"。
+    forgetReclaimedTask(parentTaskId);
     // 任务级限制只固化**显式**给出的值（submit 入参 / 快照里已有的 concurrencyLimit）。
     // 角色级设置与默认值不在创建时复制到任务上：它们描述的是"该角色的共享并发池"，必须
     // 继续按当前 settings 解析——否则快照生成时那次请求的临时配置（例如 roleLimits=1）
@@ -2091,29 +3914,46 @@ export function createFanoutManager(options = {}) {
       round: 1,
       allowOverlap,
       ...(verdict.concurrencyLimit === undefined ? {} : { concurrencyLimit: verdict.concurrencyLimit }),
+      // 父任务级默认超时（票据 06）：只写**显式**值，随任务快照固化。
+      // 未设置时不出现该字段，交给角色级默认值动态解析；0 是合法的「显式禁用」。
+      ...(verdict.timeoutMs === undefined ? {} : { timeoutMs: verdict.timeoutMs }),
       createdAt: timestamp,
       updatedAt: timestamp,
       settledAt: undefined,
       parentCancelRequested: false,
-      shards: verdict.shards.map((shard) => ({
-        shardId: shard.shardId,
-        // 任务名称进入运行时状态：快照投影与恢复都以它为唯一来源，不再从别处推导。
-        ...(shard.name === undefined ? {} : { name: shard.name }),
-        prompt: shard.prompt,
-        status: "queued",
-        affectedPaths: shard.affectedPaths ?? [],
-        ...(shard.timeoutMs === undefined ? {} : { timeoutMs: shard.timeoutMs }),
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        attempts: [{
-          attempt: 1,
+      shards: verdict.shards.map((shard) => {
+        // 实效超时在创建第一个 attempt 时解析一次：分片 > 父任务 > 角色（含 0）。
+        const attemptTimeoutMs = resolveAttemptTimeoutMs(verdict.timeoutMs, shard.timeoutMs);
+        return {
+          shardId: shard.shardId,
+          // 任务名称进入运行时状态：快照投影与恢复都以它为唯一来源，不再从别处推导。
+          ...(shard.name === undefined ? {} : { name: shard.name }),
+          prompt: shard.prompt,
           status: "queued",
-          startedAt: undefined,
-          finishedAt: undefined,
           affectedPaths: shard.affectedPaths ?? [],
+          // 分片快照只保留**显式覆盖**：不把父任务/角色默认值复制成分片覆盖，
+          // 否则恢复后的新 attempt 会拿到当年冻结的值而绕过当前角色设置。
           ...(shard.timeoutMs === undefined ? {} : { timeoutMs: shard.timeoutMs }),
-        }],
-      })),
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          attempts: [{
+            attempt: 1,
+            status: "queued",
+            /**
+             * 首个 attempt 同样携带身份与默认停止证据（票据 07）：
+             * 影响的路径从 queued 起就要预留，而预留条目按 attempt 建索引，
+             * 因此 attempt 身份必须在登记时就已经稳定存在。
+             */
+            attemptId: deriveAttemptId(parentTaskId, shard.shardId, 1),
+            executionGeneration: ++nextExecutionGeneration,
+            stopEvidence: { state: STOP_EVIDENCE_STATE_UNKNOWN },
+            startedAt: undefined,
+            finishedAt: undefined,
+            affectedPaths: shard.affectedPaths ?? [],
+            ...(attemptTimeoutMs === undefined ? {} : { timeoutMs: attemptTimeoutMs }),
+          }],
+        };
+      }),
     };
     tasks.set(parentTaskId, task);
     indexTask(task);
@@ -2163,8 +4003,15 @@ export function createFanoutManager(options = {}) {
    */
   function continueTask(input) {
     if (closed) return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+    if (reclaimState !== null) return reclaimInProgressResult();
     const verdict = validateSubmitInput(input);
-    if (!verdict.ok) throw validationError(verdict);
+    if (!verdict.ok) {
+      // 续作的输入/shard 数量拒绝与提交共用同一契约，但 phase 必须可区分（continue）。
+      if (verdict.violation !== undefined) {
+        noteBudgetViolation(verdict.violation, "continue", { parentTaskId: normalizeText(input?.parentTaskId).trim() || undefined });
+      }
+      throw validationError(verdict);
+    }
     const parentTaskId = normalizeText(input?.parentTaskId).trim();
     if (parentTaskId.length === 0) {
       return { accepted: false, changed: false, reason: "missing_parent_task_id" };
@@ -2227,20 +4074,43 @@ export function createFanoutManager(options = {}) {
         };
       }
     }
-    // attempt 预算：**整体**判定（任一分片超限即整体拒绝），保证不会出现半写。
+    /**
+     * 停止 gate（票据 07）：上一轮已有 attempt 逻辑终态但执行未确认时拒绝续作。
+     *
+     * 续作会把新 prompt 投递给**同一个 child**：如果上一轮的 turn 还没真正结束，新一轮
+     * 投递会与旧轮并发写同一路径。因此这里 fail-closed，并把未确认 attempt 摘要返回给
+     * 调用方（Host 可据此等待/提交证据）。
+     */
+    const stopBlocked = [];
     for (const shard of task.shards) {
-      const violation = budgetVerdict(
-        "attempts",
-        budgetPolicy.maxAttemptsPerShard,
-        shard.attempts.length + 1,
+      const stopGate = stopGateVerdict(shard);
+      if (stopGate !== null) stopBlocked.push(stopGate);
+    }
+    if (stopBlocked.length > 0) {
+      return {
+        accepted: false,
+        changed: false,
+        reason: "stop_unconfirmed",
+        parentTaskId,
+        shardId: stopBlocked[0].shardId,
+        attempts: stopBlocked[0].attempts,
+        shards: stopBlocked.map((entry) => ({ shardId: entry.shardId, attempts: entry.attempts })),
+      };
+    }
+    // attempt 预算：**整体**判定（任一分片超限即整体拒绝），保证不会出现半写。
+    // 判定走 attemptBudgetVerdict：retry / continue / restore resume 共用同一语义，
+    // 避免某个入口把边界写成"新建前 >= limit"而放宽一档。
+    for (const shard of task.shards) {
+      const budget = attemptBudgetVerdict(
+        shard,
         "shard " + shard.shardId,
         "该 shard 已耗尽多轮复用预算，请提交新的父任务或拆分工作",
       );
-      if (violation !== null) {
-        noteBudgetViolation(violation.violation);
+      if (budget !== null) {
+        noteBudgetViolation(budget.violation, "continue", { parentTaskId });
         return {
-          accepted: false, changed: false, reason: "attempt_budget_exceeded", parentTaskId,
-          shardId: shard.shardId, violation: violation.violation,
+          accepted: false, changed: false, reason: budget.reason, parentTaskId,
+          shardId: shard.shardId, violation: budget.violation,
         };
       }
     }
@@ -2248,13 +4118,19 @@ export function createFanoutManager(options = {}) {
     // 全部校验通过后才修改状态：先构造本轮的全部 attempt，再统一提交（无半写）。
     const round = Number.isSafeInteger(task.round) && task.round >= 1 ? task.round + 1 : 2;
     const timestamp = now();
+    // 本轮显式给出的父任务默认超时立即成为任务级默认（票据 06）。
+    // 它只影响本轮之后创建的 attempt；缺失时沿用既有默认值，绝不清空。
+    if (verdict.timeoutMs !== undefined) task.timeoutMs = verdict.timeoutMs;
     const prepared = task.shards.map((shard) => {
       const previous = shard.attempts[shard.attempts.length - 1];
       const next = provided.get(shard.shardId);
+      // 本轮分片规格里的显式超时成为该分片的新覆盖；缺失时保留原覆盖。
+      // 新 attempt 的超时在 createAttempt 里按三级优先级重新解析一次。
+      if (next.timeoutMs !== undefined) shard.timeoutMs = next.timeoutMs;
       return {
         shard,
         prompt: next.prompt,
-        attempt: createAttempt(shard, previous.attempt + 1, {
+        attempt: createAttempt(task, shard, previous.attempt + 1, {
           // 复用标记只存在于内存 attempt：冷恢复后原 child 可能已消失，恢复派发一律
           // 走 launcher 新建 child（既有 restore 语义）。
           continuation: true,
@@ -2340,6 +4216,37 @@ export function createFanoutManager(options = {}) {
   }
 
   /**
+   * 读取某个 attempt 的严格身份（只读、不克隆任务快照）。
+   *
+   * Host 在归属老化到期时必须用「manager 权威投影里的 attemptId + executionGeneration」
+   * 调用 markAttributionAged；自己按规则拼身份会绕过迟到隔离（旧代次的定时器可能命中新
+   * attempt）。因此这里提供一个只读的精确读取入口，语义与 attemptMessageIdOf 相同：
+   * 任务/分片/attempt 不存在时返回 null，由 Host fail-closed。
+   *
+   * @param {string} parentTaskId - 父任务标识。
+   * @param {string} shardId - 分片标识。
+   * @param {number} attemptNumber - attempt 序号。
+   * @returns {{parentTaskId:string, shardId:string, attempt:number, attemptId:string, executionGeneration:number, status:string, terminal:boolean}|null}
+   */
+  function attemptIdentityOf(parentTaskId, shardId, attemptNumber) {
+    const task = tasks.get(parentTaskId);
+    if (task === undefined) return null;
+    const shard = task.shards.find((entry) => entry.shardId === shardId);
+    if (shard === undefined) return null;
+    const attempt = shard.attempts.find((entry) => entry.attempt === attemptNumber);
+    if (attempt === undefined) return null;
+    return {
+      parentTaskId: task.parentTaskId,
+      shardId: shard.shardId,
+      attempt: attempt.attempt,
+      attemptId: attempt.attemptId,
+      executionGeneration: attempt.executionGeneration,
+      status: attempt.status,
+      terminal: isTerminalShardStatus(attempt.status),
+    };
+  }
+
+  /**
    * 记录一条「turn 归属无法证明」的结构化诊断（Host 观察到的竞态，不改变任何任务状态）。
    *
    * 语义边界：这不是结算失败（没有 attempt 状态写入），因此不能走 shard_settlement_rejected；
@@ -2349,6 +4256,9 @@ export function createFanoutManager(options = {}) {
   function recordAttributionViolation(input) {
     const parentTaskId = normalizeText(input?.parentTaskId).trim();
     if (parentTaskId.length === 0) return { accepted: false, changed: false, reason: "missing_parent_task_id" };
+    // 回收屏障/已回收任务都不得写事件：诊断事件同样会进快照，会打破回收的落盘一致性。
+    if (reclaimState !== null) return reclaimInProgressResult();
+    if (!tasks.has(parentTaskId) && reclaimedTaskIds.has(parentTaskId)) return taskReclaimedResult(parentTaskId);
     const shardId = normalizeText(input?.shardId).trim();
     const attemptNumber = Number.isSafeInteger(input?.attempt) && input.attempt > 0 ? input.attempt : undefined;
     const reason = normalizeText(input?.reason).trim();
@@ -2368,13 +4278,379 @@ export function createFanoutManager(options = {}) {
   }
 
   /**
+   * 归一化停止证据的寻址身份（Host 提交入口）。
+   *
+   * 五个字段缺一不可且必须精确匹配：parentTaskId + shardId + attempt 序号 +
+   * attemptId + executionGeneration。少任何一个都会让"旧 attempt 的证据"有机会命中
+   * 新 attempt（同一 shard 的 attempt 序号会递增、childId 会复用），因此这里 fail-closed。
+   *
+   * @param {unknown} identity - 原始身份。
+   * @returns {{ok:true, parentTaskId:string, shardId:string, attempt:number, attemptId:string, executionGeneration:number}
+   *   | {ok:false, code:string, reason:string, message:string}}
+   */
+  function normalizeStopIdentity(identity) {
+    const invalid = (message) => ({ ok: false, code: "STOP_EVIDENCE_INVALID", reason: "stop_evidence_invalid", message });
+    if (identity === null || typeof identity !== "object" || Array.isArray(identity)) {
+      return invalid("停止证据身份必须是对象");
+    }
+    const parentTaskId = typeof identity.parentTaskId === "string" ? identity.parentTaskId.trim() : "";
+    const shardId = typeof identity.shardId === "string" ? identity.shardId.trim() : "";
+    if (parentTaskId.length === 0) return invalid("身份缺少 parentTaskId");
+    if (shardId.length === 0) return invalid("身份缺少 shardId");
+    if (!Number.isSafeInteger(identity.attempt) || identity.attempt < 1) return invalid("身份中的 attempt 必须是正整数");
+    const attemptId = typeof identity.attemptId === "string" ? identity.attemptId.trim() : "";
+    if (attemptId.length === 0) return invalid("身份缺少 attemptId");
+    if (!Number.isSafeInteger(identity.executionGeneration) || identity.executionGeneration < 1) {
+      return invalid("身份中的 executionGeneration 必须是正整数");
+    }
+    return {
+      ok: true,
+      parentTaskId,
+      shardId,
+      attempt: identity.attempt,
+      attemptId,
+      executionGeneration: identity.executionGeneration,
+    };
+  }
+
+  /**
+   * 提交一条严格归属的停止证据（Host -> manager，票据 07）。
+   *
+   * 状态机约束：只允许 unknown -> observed。本入口**绝不**改写逻辑 status/result/error，
+   * 也不重复发布 shard 结算事件；它只写证据、清看门狗、刷新范围索引，然后重跑聚合
+   * （可能有资格补发 task_settled——恰好一次）。
+   *
+   * 拒绝路径全是结构化码且无副作用：
+   * - stop_evidence_unknown_attempt：任务/分片/attempt 不存在；
+   * - stop_evidence_stale：attempt 存在但 attemptId 或 executionGeneration 不匹配
+   *   （旧执行代次的迟到信号）；
+   * - stop_evidence_invalid：身份或证据形状非法 / 来源不在 Host 白名单；
+   * - manager_closed：管理器已关闭。
+   *
+   * @param {object} identity - {parentTaskId, shardId, attempt, attemptId, executionGeneration}
+   * @param {object} rawEvidence - {source, observedAt?, childId?, messageId?, sessionId?, turn?}
+   * @returns {object} 结构化结果（accepted/changed/reason/stopEvidence/taskStatus/counts）。
+   */
+  function observeStopEvidence(identity, rawEvidence) {
+    if (closed) {
+      return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+    }
+    if (reclaimState !== null) return reclaimInProgressResult();
+    const id = normalizeStopIdentity(identity);
+    if (!id.ok) {
+      return { accepted: false, changed: false, code: id.code, reason: id.reason, message: id.message };
+    }
+    // 已回收任务的迟到证据：结构化 no-op，绝不复活任务或写事件/快照。
+    if (!tasks.has(id.parentTaskId) && reclaimedTaskIds.has(id.parentTaskId)) {
+      return taskReclaimedResult(id.parentTaskId);
+    }
+    const task = tasks.get(id.parentTaskId);
+    const shard = task?.shards.find((entry) => entry.shardId === id.shardId);
+    const attempt = shard?.attempts.find((entry) => entry.attempt === id.attempt);
+    if (task === undefined || shard === undefined || attempt === undefined) {
+      return {
+        accepted: false,
+        changed: false,
+        code: "STOP_EVIDENCE_UNKNOWN_ATTEMPT",
+        reason: "stop_evidence_unknown_attempt",
+        parentTaskId: id.parentTaskId,
+        shardId: id.shardId,
+        attempt: id.attempt,
+      };
+    }
+    if (attempt.attemptId !== id.attemptId || attempt.executionGeneration !== id.executionGeneration) {
+      return {
+        accepted: false,
+        changed: false,
+        code: "STOP_EVIDENCE_STALE",
+        reason: "stop_evidence_stale",
+        parentTaskId: task.parentTaskId,
+        shardId: shard.shardId,
+        attempt: attempt.attempt,
+        expectedAttemptId: attempt.attemptId,
+        expectedExecutionGeneration: attempt.executionGeneration,
+        receivedAttemptId: id.attemptId,
+        receivedExecutionGeneration: id.executionGeneration,
+      };
+    }
+    const verdict = normalizeStopEvidence(rawEvidence, { allowedSources: HOST_STOP_EVIDENCE_SOURCES });
+    if (!verdict.ok) {
+      return {
+        accepted: false,
+        changed: false,
+        code: verdict.code,
+        reason: verdict.reason,
+        message: verdict.message,
+        parentTaskId: task.parentTaskId,
+        shardId: shard.shardId,
+        attempt: attempt.attempt,
+        attemptId: attempt.attemptId,
+      };
+    }
+    const base = {
+      parentTaskId: task.parentTaskId,
+      shardId: shard.shardId,
+      attempt: attempt.attempt,
+      attemptId: attempt.attemptId,
+      executionGeneration: attempt.executionGeneration,
+    };
+    if (isStopObserved(attempt)) {
+      return {
+        accepted: true,
+        changed: false,
+        reason: "stop_evidence_already_observed",
+        ...base,
+        stopEvidence: cloneJson(attempt.stopEvidence),
+        taskStatus: task.status,
+        counts: computeCounts(task),
+      };
+    }
+    applyStopEvidence(task, shard, attempt, verdict.evidence);
+    // 证据到达后补聚合：逻辑终态 + 全部 observed 的任务在这里才真正结算（task_settled 一次）。
+    aggregateTask(task);
+    notifyPersistence();
+    // 释放影响范围可能解开别的任务被冲突挡住的排队分片，因此重新请求一次派发。
+    schedule();
+    return {
+      accepted: true,
+      changed: true,
+      reason: "observed",
+      ...base,
+      source: attempt.stopEvidence.source,
+      stopEvidence: cloneJson(attempt.stopEvidence),
+      // released=true 表示该 attempt 的影响范围已释放（终态 + 证据齐备）。
+      released: isTerminalShardStatus(attempt.status),
+      taskStatus: task.status,
+      counts: computeCounts(task),
+    };
+  }
+
+  /**
+   * 归属老化到期（Host -> manager，票据 07）：把"归属无法证明且超过人工处理宽限"的
+   * attempt 收敛为 interrupted，并显式标记需要人工处理。
+   *
+   * 严格边界（与 observeStopEvidence 完全一致的身份规则）：
+   * - 身份必须精确匹配 parentTaskId + shardId + attempt + attemptId + executionGeneration；
+   * - **不**写停止证据：归属不明不等于执行已停止，影响范围必须继续占用（stopEvidence
+   *   保持 unknown），任务保持 pending，不聚合、不发完成通知、不自动重试；
+   * - 已终态 attempt 是 no-op（changed=false），绝不改写既有终态；
+   * - closed 后结构化拒绝。
+   *
+   * 为什么由 Host 驱动：只有 Host 知道"这一轮投递的 turn/end 归属无法证明"已经从何时
+   * 开始持续、以及是否存在可用的迟到回调；manager 不持有该观察窗口。
+   *
+   * @param {object} identity - {parentTaskId, shardId, attempt, attemptId, executionGeneration}
+   * @param {{reason?:string}} [options] - 可选诊断原因（缺省固定为 shard_attribution_unproven_aged）。
+   * @returns {object} 结构化结果（accepted/changed/reason/status/taskStatus/counts）。
+   */
+  function markAttributionAged(identity, options = {}) {
+    if (closed) {
+      return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+    }
+    if (reclaimState !== null) return reclaimInProgressResult();
+    const id = normalizeStopIdentity(identity);
+    if (!id.ok) {
+      return { accepted: false, changed: false, code: id.code, reason: id.reason, message: id.message };
+    }
+    if (!tasks.has(id.parentTaskId) && reclaimedTaskIds.has(id.parentTaskId)) {
+      return taskReclaimedResult(id.parentTaskId);
+    }
+    const task = tasks.get(id.parentTaskId);
+    const shard = task?.shards.find((entry) => entry.shardId === id.shardId);
+    const attempt = shard?.attempts.find((entry) => entry.attempt === id.attempt);
+    if (task === undefined || shard === undefined || attempt === undefined) {
+      return {
+        accepted: false,
+        changed: false,
+        code: "ATTRIBUTION_AGED_UNKNOWN_ATTEMPT",
+        reason: "attribution_aged_unknown_attempt",
+        parentTaskId: id.parentTaskId,
+        shardId: id.shardId,
+        attempt: id.attempt,
+      };
+    }
+    if (attempt.attemptId !== id.attemptId || attempt.executionGeneration !== id.executionGeneration) {
+      return {
+        accepted: false,
+        changed: false,
+        code: "ATTRIBUTION_AGED_STALE",
+        reason: "attribution_aged_stale",
+        parentTaskId: task.parentTaskId,
+        shardId: shard.shardId,
+        attempt: attempt.attempt,
+        expectedAttemptId: attempt.attemptId,
+        expectedExecutionGeneration: attempt.executionGeneration,
+        receivedAttemptId: id.attemptId,
+        receivedExecutionGeneration: id.executionGeneration,
+      };
+    }
+    const base = {
+      parentTaskId: task.parentTaskId,
+      shardId: shard.shardId,
+      attempt: attempt.attempt,
+      attemptId: attempt.attemptId,
+      executionGeneration: attempt.executionGeneration,
+    };
+    // 已终态：可能是迟到 completion 已先一步收敛，或证据已到达。老化绝不能改写它。
+    if (isTerminalShardStatus(attempt.status)) {
+      return {
+        accepted: true,
+        changed: false,
+        reason: "already_terminal",
+        ...base,
+        status: attempt.status,
+        ...(attempt.terminalReason === undefined ? {} : { terminalReason: attempt.terminalReason }),
+        stopState: isStopObserved(attempt) ? STOP_EVIDENCE_STATE_OBSERVED : STOP_EVIDENCE_STATE_UNKNOWN,
+        taskStatus: task.status,
+        counts: computeCounts(task),
+      };
+    }
+    // 原因码可由调用方覆盖，但默认固定值必须与诊断/测试契约一致。
+    const reason = typeof options?.reason === "string" && options.reason.length > 0
+      ? options.reason
+      : "shard_attribution_unproven_aged";
+    const settled = settleShard(task, shard, attempt, "interrupted", {
+      error: {
+        name: "ShardAttributionUnprovenError",
+        reason: "shard_attribution_unproven_aged",
+        message: "shard 归属无法证明且已超过人工处理宽限，需人工确认执行是否仍在写盘",
+      },
+      reason,
+      // 不给停止证据：范围继续占用，聚合继续被 stop_pending 挡住。
+      needsAttention: true,
+    });
+    if (settled !== true) {
+      return {
+        accepted: false,
+        changed: false,
+        reason: "invalid_transition",
+        ...base,
+        status: attempt.status,
+        taskStatus: task.status,
+      };
+    }
+    lastAttributionAged = {
+      ...base,
+      reason,
+      at: attempt.finishedAt ?? now(),
+      needsAttention: true,
+    };
+    return {
+      accepted: true,
+      changed: true,
+      reason: "aged",
+      ...base,
+      status: attempt.status,
+      terminalReason: attempt.terminalReason,
+      stopState: STOP_EVIDENCE_STATE_UNKNOWN,
+      needsAttention: true,
+      taskStatus: task.status,
+      counts: computeCounts(task),
+    };
+  }
+
+  /**
+   * 停止证据只读诊断（票据 07）：
+   * - 未确认停止的 attempt 数（按"逻辑终态但未观察"统计，这才是聚合阻塞源）；
+   * - 按任务/分片的摘要（只列有未确认/已请求/legacy 标记的条目，避免输出无界膨胀）；
+   * - legacy 标记（旧快照缺少身份/证据字段而派生出来的 attempt）；
+   * - 最近一次看门狗到期（谁在什么时候超过宽限仍未确认）。
+   *
+   * 不包含 prompt/result/error 等负载，供 Host 诊断投影直接透出。
+   */
+  function stopDiagnostics() {
+    let unconfirmed = 0;
+    let unobserved = 0;
+    let requested = 0;
+    let watchdogExpired = 0;
+    let legacyAttempts = 0;
+    /** 归属老化导致的 interrupted（理由码固定，独立计数便于诊断面直接展示）。 */
+    let attributedAged = 0;
+    /** 老化后仍未收到停止证据的 attempt 数（真正"需要人工处理"的活跃集合）。 */
+    let needsAttention = 0;
+    const summaries = [];
+    for (const task of tasks.values()) {
+      const attempts = [];
+      let taskUnconfirmed = 0;
+      for (const shard of task.shards) {
+        for (const attempt of shard.attempts) {
+          const observed = isStopObserved(attempt);
+          const terminal = isTerminalShardStatus(attempt.status);
+          if (!observed) unobserved += 1;
+          if (terminal && !observed) { unconfirmed += 1; taskUnconfirmed += 1; }
+          if (attempt.stopRequestedAt !== undefined) requested += 1;
+          if (attempt.stopWatchdogExpiredAt !== undefined) watchdogExpired += 1;
+          if (attempt.legacy === true) legacyAttempts += 1;
+          const aged = attempt.terminalReason === "shard_attribution_unproven_aged";
+          if (aged) attributedAged += 1;
+          const attention = aged && !observed;
+          if (attention) needsAttention += 1;
+          const interesting = !observed
+            || attempt.stopRequestedAt !== undefined
+            || attempt.stopWatchdogExpiredAt !== undefined
+            || attempt.legacy === true
+            || aged;
+          if (!interesting) continue;
+          attempts.push({
+            shardId: shard.shardId,
+            attempt: attempt.attempt,
+            attemptId: attempt.attemptId,
+            executionGeneration: attempt.executionGeneration,
+            status: attempt.status,
+            stopState: observed ? STOP_EVIDENCE_STATE_OBSERVED : STOP_EVIDENCE_STATE_UNKNOWN,
+            ...(observed ? { stopSource: attempt.stopEvidence.source } : {}),
+            ...(attempt.stopRequestedAt === undefined ? {} : { stopRequestedAt: attempt.stopRequestedAt }),
+            ...(attempt.stopDeadlineAt === undefined ? {} : { stopDeadlineAt: attempt.stopDeadlineAt }),
+            ...(attempt.stopWatchdogExpiredAt === undefined ? {} : { stopWatchdogExpiredAt: attempt.stopWatchdogExpiredAt }),
+            ...(attempt.terminalReason === undefined ? {} : { terminalReason: attempt.terminalReason }),
+            aged,
+            needsAttention: attention,
+            legacy: attempt.legacy === true,
+          });
+        }
+      }
+      if (attempts.length === 0) continue;
+      summaries.push({
+        parentTaskId: task.parentTaskId,
+        role: task.role,
+        status: task.status,
+        unconfirmed: taskUnconfirmed,
+        counts: { pending: computeCounts(task).pending, stop_pending: countStopPending(task) },
+        attempts,
+      });
+    }
+    return {
+      processInstance: PROCESS_INSTANCE,
+      boundary: stopDiagnosticsState.boundary,
+      boundarySource: stopDiagnosticsState.boundarySource,
+      // stopPending 是 unconfirmed 的对外别名（Host/meta 诊断按这个名字投影）。
+      stopPending: unconfirmed,
+      unconfirmed,
+      unobserved,
+      requested,
+      watchdogExpired,
+      legacyAttempts,
+      legacy: legacyAttempts,
+      attributedAged,
+      needsAttention,
+      lastWatchdog: lastStopWatchdog === null ? null : cloneJson(lastStopWatchdog),
+      lastAttributionAged: lastAttributionAged === null ? null : cloneJson(lastAttributionAged),
+      tasks: summaries,
+    };
+  }
+
+  /**
    * 取消单个 shard。立即返回接受结果：
-   * - queued：直接进入 cancelled，永不 admission；
-   * - running：调用注入取消器并标记取消请求，由 child completion 异步收敛；
+   * - queued：直接进入 cancelled，永不 admission（从未创建 child -> not-started 证据）；
+   * - running：调用注入取消器，**立即写逻辑终态 cancelled** 并请求停止（票据 07：
+   *   逻辑收敛不依赖 child 回调），stopEvidence 保持 unknown 并挂宽限看门狗；
    * - 已终态：不改写，changed=false（重复取消幂等）。
+   *
+   * 返回值里的 pending=true 表示"已接受取消且停止未确认"（不是"还在 running"）。
    */
   function cancelShard(parentTaskId, shardId) {
     if (closed) return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+    if (reclaimState !== null) return reclaimInProgressResult();
     const task = tasks.get(parentTaskId);
     if (task === undefined) return { accepted: false, changed: false, reason: "unknown_parent_task" };
     const shard = task.shards.find((entry) => entry.shardId === shardId);
@@ -2382,22 +4658,59 @@ export function createFanoutManager(options = {}) {
 
     const attempt = activeShard(shard) ?? shard.attempts[shard.attempts.length - 1];
     if (isTerminalShardStatus(attempt.status)) {
-      return { accepted: true, changed: false, shardStatus: shard.status, attempt: attempt.attempt };
+      return {
+        accepted: true,
+        changed: false,
+        shardStatus: shard.status,
+        attempt: attempt.attempt,
+        stopState: isStopObserved(attempt) ? STOP_EVIDENCE_STATE_OBSERVED : STOP_EVIDENCE_STATE_UNKNOWN,
+      };
     }
     if (attempt.cancelRequested === true) {
       // 已接受过取消请求：幂等返回，不重复调用取消器。
-      return { accepted: true, changed: false, shardStatus: shard.status, attempt: attempt.attempt, pending: true };
+      return {
+        accepted: true,
+        changed: false,
+        shardStatus: shard.status,
+        attempt: attempt.attempt,
+        pending: true,
+        stopState: isStopObserved(attempt) ? STOP_EVIDENCE_STATE_OBSERVED : STOP_EVIDENCE_STATE_UNKNOWN,
+        ...(attempt.stopDeadlineAt === undefined ? {} : { stopDeadlineAt: attempt.stopDeadlineAt }),
+      };
     }
     attempt.cancelRequested = true;
     if (attempt.status === "queued") {
       settleShard(task, shard, attempt, "cancelled", {
         error: toShardError({ name: "ShardCancelledError", reason: "cancelled", message: "shard 在排队阶段被取消" }, "shard 已取消"),
+        reason: "shard_cancelled",
       });
-      return { accepted: true, changed: true, shardStatus: shard.status, attempt: attempt.attempt };
+      return {
+        accepted: true,
+        changed: true,
+        shardStatus: shard.status,
+        attempt: attempt.attempt,
+        stopState: isStopObserved(attempt) ? STOP_EVIDENCE_STATE_OBSERVED : STOP_EVIDENCE_STATE_UNKNOWN,
+      };
     }
-    // running：立即接受取消，但不直接写终态；真正的收敛由 completion 完成。
+    // running：先请求停止（把取消意图送达 child），再写逻辑终态；证据保持 unknown。
     requestShardCancellation(task, shard, attempt, "shard_cancelled");
-    return { accepted: true, changed: true, shardStatus: shard.status, attempt: attempt.attempt, pending: true };
+    settleShard(task, shard, attempt, "cancelled", {
+      error: toShardError(
+        { name: "ShardCancelledError", reason: "cancelled", message: "shard 已取消，等待停止确认" },
+        "shard 已取消",
+      ),
+      reason: "shard_cancelled",
+    });
+    return {
+      accepted: true,
+      changed: true,
+      shardStatus: shard.status,
+      attempt: attempt.attempt,
+      pending: true,
+      stopState: isStopObserved(attempt) ? STOP_EVIDENCE_STATE_OBSERVED : STOP_EVIDENCE_STATE_UNKNOWN,
+      ...(attempt.stopRequestedAt === undefined ? {} : { stopRequestedAt: attempt.stopRequestedAt }),
+      ...(attempt.stopDeadlineAt === undefined ? {} : { stopDeadlineAt: attempt.stopDeadlineAt }),
+    };
   }
 
   /**
@@ -2406,11 +4719,19 @@ export function createFanoutManager(options = {}) {
    */
   function cancelParent(parentTaskId) {
     if (closed) return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+    if (reclaimState !== null) return reclaimInProgressResult();
     const task = tasks.get(parentTaskId);
     if (task === undefined) return { accepted: false, changed: false, reason: "unknown_parent_task" };
+    /**
+     * 只有"逻辑终态 **且** 停止已确认"才算真正结算。
+     *
+     * 旧判定只看逻辑终态，会把"终态但停止未确认"（任务仍是 pending、仍占着影响范围）
+     * 误判为已结算，从而吞掉取消意图；新判定让这类任务继续走下面的取消登记，等证据到达
+     * 后由聚合自然收敛为 cancelled。
+     */
     const allTerminal = task.shards.every((shard) => {
       const attempt = shard.attempts[shard.attempts.length - 1];
-      return attempt !== undefined && isTerminalShardStatus(attempt.status);
+      return attempt !== undefined && isTerminalShardStatus(attempt.status) && isStopObserved(attempt);
     });
     if (allTerminal) {
       // 已结算父任务的取消请求是幂等 no-op，不能再写入 parentCancelRequested 或重复发布聚合事件。
@@ -2446,11 +4767,26 @@ export function createFanoutManager(options = {}) {
         cancelledShardIds.push(shard.shardId);
         settleShard(task, shard, attempt, "cancelled", {
           error: toShardError({ name: "ShardCancelledError", reason: "cancelled", message: "父任务取消，排队 shard 未 admission" }, "shard 已取消"),
+          reason: "parent_cancelled",
         });
       } else {
-        // running 只能异步收敛：先接受取消请求，等 child completion 决定终态。
+        /**
+         * running：先请求停止，再立即写逻辑终态（票据 07）。
+         *
+         * 与旧实现的关键差异：旧实现只把取消意图传给 child，等 completion 回调才收敛；
+         * 一旦 child 永不回调（进程卡死/句柄丢失），父任务会永久停在 running。新语义下
+         * 逻辑状态立刻收敛为 cancelled + stopEvidence=unknown，父任务保持 pending 直到
+         * 权威停止证据到达——既不阻塞取消语义，也不谎称执行已停止。
+         */
         cancellingShardIds.push(shard.shardId);
         requestShardCancellation(task, shard, attempt, "parent_cancelled");
+        settleShard(task, shard, attempt, "cancelled", {
+          error: toShardError(
+            { name: "ShardCancelledError", reason: "cancelled", message: "父任务取消，等待停止确认" },
+            "shard 已取消",
+          ),
+          reason: "parent_cancelled",
+        });
       }
     }
     aggregateTask(task);
@@ -2472,6 +4808,7 @@ export function createFanoutManager(options = {}) {
    */
   function retryShard(parentTaskId, shardId) {
     if (closed) return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+    if (reclaimState !== null) return reclaimInProgressResult();
     const task = tasks.get(parentTaskId);
     if (task === undefined) return { accepted: false, reason: "unknown_parent_task" };
     const shard = task.shards.find((entry) => entry.shardId === shardId);
@@ -2483,30 +4820,54 @@ export function createFanoutManager(options = {}) {
       || previous.status === "interrupted";
     if (!retryable) return { accepted: false, reason: "not_retryable", shardStatus: shard.status, attempt: previous.attempt };
 
-    // attempt 数量预算：attempt 历史随重试无界增长（每个 attempt 都会进快照与事件），
-    // 因此超限必须结构化失败且不新建 attempt。判定的是"新建后的 attempt 数"（+1），
-    // 这样恰好允许 maxAttemptsPerShard 个 attempt 存在。
-    const attemptViolation = budgetVerdict(
-      "attempts",
-      budgetPolicy.maxAttemptsPerShard,
-      shard.attempts.length + 1,
-      "attempt",
-      "该 shard 已耗尽重试预算，请提交新的父任务或拆分工作",
-    );
-    if (attemptViolation !== null) {
-      noteBudgetViolation(attemptViolation.violation);
+    /**
+     * 停止 gate（票据 07）：只要该 shard 还有 attempt 未确认停止，就绝不创建新 attempt。
+     *
+     * 原因：超时/取消 attempt 未停止时重试，旧 child 仍可能在写同一批路径；新 attempt
+     * 一旦开始，两个执行体就会并发写。拒绝路径只读不写——不追加 attempt、不改状态、
+     * 不发事件，调用方拿到未确认 attempt 摘要后可以提交证据或转人工。
+     *
+     * 判定必须先于 attempt 预算：预算耗尽与"停止未确认"同时成立时，真正阻塞执行的是
+     * 后者（补预算不会让执行变安全），返回 stop_unconfirmed 才有可操作的处置方向。
+     */
+    const stopGate = stopGateVerdict(shard);
+    if (stopGate !== null) {
       return {
         accepted: false,
         changed: false,
-        reason: "attempt_budget_exceeded",
+        reason: "stop_unconfirmed",
+        shardId: shard.shardId,
         shardStatus: shard.status,
         attempt: previous.attempt,
-        violation: attemptViolation.violation,
+        attempts: stopGate.attempts,
+      };
+    }
+
+    // attempt 数量预算：attempt 历史随重试无界增长（每个 attempt 都会进快照与事件），
+    // 因此超限必须结构化失败且不新建 attempt。判定走 attemptBudgetVerdict（与
+    // continue / restore resume 同源），判定的是"新建后的 attempt 数"（+1），
+    // 这样恰好允许 maxAttemptsPerShard 个 attempt 存在。
+    const attemptBudget = attemptBudgetVerdict(
+      shard,
+      "attempt",
+      "该 shard 已耗尽重试预算，请提交新的父任务或拆分工作",
+    );
+    if (attemptBudget !== null) {
+      noteBudgetViolation(attemptBudget.violation, "retry", { parentTaskId });
+      return {
+        accepted: false,
+        changed: false,
+        reason: attemptBudget.reason,
+        shardStatus: shard.status,
+        attempt: previous.attempt,
+        violation: attemptBudget.violation,
       };
     }
 
     const nextAttempt = previous.attempt + 1;
-    const attempt = createAttempt(shard, nextAttempt);
+    // 重试沿用分片/任务级超时配置，并重新读取一次当前角色默认值（票据 06）：
+    // 新 attempt 按三级优先级解析，已经结束的旧 attempt 历史不受影响。
+    const attempt = createAttempt(task, shard, nextAttempt);
     shard.attempts.push(attempt);
     // 手工重试是对取消的显式复活：清除该 shard 的取消请求标记，允许重新 admission。
     // 父任务的 parentCancelRequested 保持不变，剩余 queued shard 仍然不会自动派发。
@@ -2520,6 +4881,153 @@ export function createFanoutManager(options = {}) {
     notifyPersistence();
     schedule();
     return { accepted: true, attempt: nextAttempt, shardStatus: shard.status, previousStatus: previous.status };
+  }
+
+  /**
+   * shard 级逐动作能力（票据 09）：只读、不改写任何状态、不发事件、不写持久化。
+   *
+   * 判定顺序刻意与真实写入口一致：先「是否终态/是否可重试终态」，再停止证据 gate，
+   * 最后 attempt 预算。这样界面上的按钮与 manager 真会接受的动作共用同一套规则，
+   * 不会出现「界面允许、点了却被拒绝」的第二套语义。
+   *
+   * @param {object} shard - manager 内部 shard（含 attempts 历史）。
+   * @returns {{shardId:string|null, cancel:{allowed:boolean,reason?:string}, retry:{allowed:boolean,reason?:string}}}
+   */
+  function shardCapabilities(shard) {
+    const attempts = Array.isArray(shard?.attempts) ? shard.attempts : [];
+    const latest = attempts.length === 0 ? undefined : attempts[attempts.length - 1];
+    const shardId = typeof shard?.shardId === "string" && shard.shardId.length > 0 ? shard.shardId : null;
+    // 取消：queued/running（含 stop 未确认但已逻辑终态之外的形态）可取消；终态不再提供入口。
+    const cancel = latest === undefined
+      ? { allowed: false, reason: "not_supported" }
+      : isTerminalShardStatus(latest.status)
+        ? { allowed: false, reason: "already_terminal" }
+        : { allowed: true };
+    /**
+     * 重试：只允许四类可重试终态。
+     * - 未终态 → task_not_terminal（还可能自然结束，不应引导重试）；
+     * - 成功 → no_retryable_shard（没有可重试的失败面）；
+     * - 停止未确认 → stop_unconfirmed（新 attempt 会与旧执行体并发写）；
+     * - attempt 预算耗尽 → attempt_limit（再点只会被 manager 拒绝）。
+     */
+    let retry;
+    if (latest === undefined) {
+      retry = { allowed: false, reason: "no_retryable_shard" };
+    } else if (!isTerminalShardStatus(latest.status)) {
+      retry = { allowed: false, reason: "task_not_terminal" };
+    } else if (!RETRYABLE_SHARD_STATUSES.has(latest.status)) {
+      retry = { allowed: false, reason: "no_retryable_shard" };
+    } else if (stopGateVerdict(shard) !== null) {
+      retry = { allowed: false, reason: "stop_unconfirmed" };
+    } else if (attemptBudgetVerdict(shard, "attempt", "该 shard 已耗尽重试预算") !== null) {
+      retry = { allowed: false, reason: "attempt_limit" };
+    } else {
+      retry = { allowed: true };
+    }
+    return { shardId, cancel, retry };
+  }
+
+  /**
+   * 父任务是否「全部逻辑终态且停止已确认」：与 cancelParent 的 allTerminal 同一判定。
+   * 只有这种任务才不需要取消入口；仍在等待停止确认的任务继续保持可取消（幂等 no-op）。
+   */
+  function taskFullySettled(task) {
+    if (task.shards.length === 0) return typeof task.settledAt === "number";
+    return task.shards.every((shard) => {
+      const attempt = shard.attempts[shard.attempts.length - 1];
+      return attempt !== undefined && isTerminalShardStatus(attempt.status) && isStopObserved(attempt);
+    });
+  }
+
+  /** 任务级取消能力：只有仍会被 manager 处理的父任务才暴露取消入口。 */
+  function taskCancelCapability(task) {
+    return taskFullySettled(task)
+      ? { allowed: false, reason: "already_terminal" }
+      : { allowed: true };
+  }
+
+  /**
+   * 任务级重试能力：任一分片可重试即可。
+   *
+   * 原因优先级固定（stop_unconfirmed > attempt_limit > task_not_terminal > no_retryable_shard），
+   * 保证同一份任务每次投影都得到同一个原因码，客户端不会因遍历顺序不同而抖动。
+   */
+  function taskRetryCapability(shardCaps) {
+    if (shardCaps.some((caps) => caps.retry.allowed === true)) return { allowed: true };
+    const reasons = new Set(shardCaps.map((caps) => caps.retry.reason));
+    for (const reason of ["stop_unconfirmed", "attempt_limit", "task_not_terminal", "no_retryable_shard"]) {
+      if (reasons.has(reason)) return { allowed: false, reason };
+    }
+    return { allowed: false, reason: "no_retryable_shard" };
+  }
+
+  /**
+   * 任务级续作能力：判定顺序与 continueTask 的前置条件一致
+   * （parent_cancelled → 任一分片未完成 → 停止未确认 → attempt 预算）。
+   * role/shard 结构一致性需要调用方输入，无法在这里投影，仍由 manager 在写入口校验。
+   */
+  function taskContinueCapability(task) {
+    if (task.parentCancelRequested === true) return { allowed: false, reason: "parent_cancelled" };
+    for (const shard of task.shards) {
+      const latest = shard.attempts[shard.attempts.length - 1];
+      if (latest === undefined || !isTerminalShardStatus(latest.status)) {
+        return { allowed: false, reason: "task_not_terminal" };
+      }
+    }
+    for (const shard of task.shards) {
+      if (stopGateVerdict(shard) !== null) return { allowed: false, reason: "stop_unconfirmed" };
+    }
+    for (const shard of task.shards) {
+      if (attemptBudgetVerdict(shard, "attempt", "该 shard 已耗尽多轮复用预算") !== null) {
+        return { allowed: false, reason: "attempt_limit" };
+      }
+    }
+    return { allowed: true };
+  }
+
+  /**
+   * 逐动作能力（票据 09）：manager 侧唯一的只读能力投影。
+   *
+   * 形状：任务级 { read, cancel, retry, continue } + 按 shard 的 { cancel, retry }；
+   * 每项都是 { allowed:boolean, reason?:string }。原因码只使用稳定机器 token：
+   * task_not_found / already_terminal / task_not_terminal / stop_unconfirmed /
+   * attempt_limit / no_retryable_shard / parent_cancelled / not_supported。
+   *
+   * 边界：
+   * - 不回答归属（归属由 Host 的 capabilitiesOf 先判定），只回答「假设这是你的任务，动作是否可执行」；
+   * - 任务不存在或 manager 已关闭 → 全部 task_not_found；
+   * - 纯读：不触发聚合、不发事件、不写持久化，可被客户端轮询路径高频调用。
+   *
+   * @param {string} parentTaskId - fan-out 父任务 id。
+   * @returns {object} 结构化能力投影（永远返回对象，不抛错）。
+   */
+  function taskCapabilities(parentTaskId) {
+    const taskId = typeof parentTaskId === "string" ? parentTaskId.trim() : "";
+    const missing = () => ({
+      parentTaskId: taskId,
+      read: { allowed: false, reason: "task_not_found" },
+      cancel: { allowed: false, reason: "task_not_found" },
+      retry: { allowed: false, reason: "task_not_found" },
+      continue: { allowed: false, reason: "task_not_found" },
+      shards: {},
+    });
+    if (closed || taskId.length === 0) return missing();
+    const task = tasks.get(taskId);
+    if (task === undefined) return missing();
+    const shardCaps = task.shards.map(shardCapabilities);
+    const shards = {};
+    for (const caps of shardCaps) {
+      if (caps.shardId === null) continue;
+      shards[caps.shardId] = { cancel: caps.cancel, retry: caps.retry };
+    }
+    return {
+      parentTaskId: taskId,
+      read: { allowed: true },
+      cancel: taskCancelCapability(task),
+      retry: taskRetryCapability(shardCaps),
+      continue: taskContinueCapability(task),
+      shards,
+    };
   }
 
   function getTask(parentTaskId) {
@@ -2569,8 +5077,13 @@ export function createFanoutManager(options = {}) {
    * affectedPaths 冲突判定），restore 不复制任何调度规则。
    *
    * @param {object} snapshot - serializeSnapshot() 产出的快照。
-   * @param {{resume?:boolean, merge?:boolean}} [restoreOptions] - resume=true 时显式触发一次重新派发；
-   *   merge=true 时保留当前任务并追加本次快照中的新任务，用于 deferred root 到达后的分批恢复；
+   * @param {{resume?:boolean, merge?:boolean, stopEvidenceBoundary?:"unknown"|"process-restart"}} [restoreOptions]
+   *   - resume=true 时显式触发一次重新派发；
+   *   - merge=true 时保留当前任务并追加本次快照中的新任务，用于 deferred root 到达后的分批恢复；
+   *   - stopEvidenceBoundary（票据 07）决定"快照里未确认停止的 attempt"如何恢复：
+   *     "unknown"（默认）保持未知、继续占用影响范围并拒绝自动续跑；
+   *     "process-restart" 把快照内 attempt 一律视为 observed(source=process-restart)，
+   *     只在"重启确实终止了执行体所属进程"时使用（Host 冷启动接线在后续任务）。
    *   默认（false）只重建状态并让队列在下次调度时机自然派发。
    * @returns {{restored:boolean, tasks:number}}
    */
@@ -2578,6 +5091,8 @@ export function createFanoutManager(options = {}) {
     if (closed) {
       return { accepted: false, restored: 0, tasks: 0, code: "MANAGER_CLOSED", reason: "manager_closed" };
     }
+    // 回收屏障期间恢复会重建/覆盖任务表，直接破坏候选快照的一致性。
+    if (reclaimState !== null) return { ...reclaimInProgressResult(), restored: 0, tasks: 0 };
     if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) {
       throw new FanoutValidationError("INVALID_SNAPSHOT", "restore 需要快照对象");
     }
@@ -2602,7 +5117,10 @@ export function createFanoutManager(options = {}) {
       maxBytes: budgetPolicy.maxSnapshotBytes,
     });
     if (!restoreBudget.ok) {
-      noteBudgetViolation(restoreBudget.violation);
+      // restore 发生在 manager 状态恢复之前，且既有契约要求"超预算恢复原子失败、
+      // 不写 eventHistory"。因此这里只记录 lastViolation（emitEvent:false），由 Host
+      // 捕获结构化错误后调用 recordBudgetViolation() 补发 budget_rejected(phase=restore)。
+      noteBudgetViolation(restoreBudget.violation, "restore", { emitEvent: false });
       throw validationError({
         ok: false,
         code: "INVALID_BUDGET",
@@ -2611,6 +5129,57 @@ export function createFanoutManager(options = {}) {
         violation: restoreBudget.violation,
       });
     }
+
+    /**
+     * 停止证据边界（票据 07）：决定"快照里未确认停止的 attempt"在恢复后怎么处理。
+     *
+     * 解析规则（显式优先，否则按进程身份自动判定）：
+     * - 显式 stopEvidenceBoundary：调用方明确知道恢复语义时使用；非法值结构化拒绝。
+     * - 自动：快照 processInstance 与当前进程相同 → unknown（进程内重建，不证明旧 child
+     *   已停止）；不同或缺失（旧版本/旧进程快照）→ process-restart（规格允许的唯一其他
+     *   释放边界）。缺失不能当成"同进程"：旧版本快照没有该字段，其执行体属于未知进程，
+     *   只能按进程已终止处理，否则恢复后的任务会永久 pending 且无法自动收敛。
+     *
+     * 两种边界的语义：
+     * - unknown：running -> interrupted/unknown，历史终态但无证据的一律保持 unknown 并
+     *   标记 legacy；影响范围继续占用，任务保持 pending，重试/续作/续跑全部被
+     *   stop_unconfirmed 挡住，直到 Host 提交证据。
+     * - process-restart：快照内 attempt 一律 observed(source="process-restart")。
+     */
+    const explicitStopEvidenceBoundary = restoreOptions?.stopEvidenceBoundary === undefined
+      || restoreOptions?.stopEvidenceBoundary === null
+      ? undefined
+      : restoreOptions.stopEvidenceBoundary;
+    if (explicitStopEvidenceBoundary !== undefined
+      && !STOP_EVIDENCE_BOUNDARIES.includes(explicitStopEvidenceBoundary)) {
+      throw new FanoutValidationError(
+        "INVALID_STOP_EVIDENCE_BOUNDARY",
+        "stopEvidenceBoundary 必须是 " + STOP_EVIDENCE_BOUNDARIES.join(" / ") + " 之一",
+        { field: "stopEvidenceBoundary" },
+      );
+    }
+    const snapshotProcessInstance = typeof snapshot.processInstance === "string" && snapshot.processInstance.length > 0
+      ? snapshot.processInstance
+      : undefined;
+    const stopEvidenceBoundary = explicitStopEvidenceBoundary ?? (
+      snapshotProcessInstance !== undefined && snapshotProcessInstance === PROCESS_INSTANCE
+        ? "unknown"
+        : "process-restart"
+    );
+    const stopEvidenceBoundarySource = explicitStopEvidenceBoundary !== undefined
+      ? "explicit"
+      : "process-instance";
+    /**
+     * 本次恢复实际落到各任务上的边界集合。
+     *
+     * 大多数快照的任务边界一致；但 Host 会把"root 未到达"的任务延迟恢复，并在持久化
+     * 投影里把旧任务与新进程快照合并。这类被延迟的任务会携带**来源进程**的
+     * task.processInstance（见 Host 的 deferTask 投影），因此边界必须按任务解析：
+     * 同一个快照里可能同时存在"本进程重建的任务"和"上一进程遗留的任务"。
+     */
+    const resolvedBoundaries = new Set();
+    // 恢复后新建 attempt 的代次必须大于全部历史代次（迟到证据隔离）。
+    let restoredMaxGeneration = 0;
 
     for (const task of snapshot.tasks) {
       if (task === null || typeof task !== "object" || typeof task.parentTaskId !== "string" || task.parentTaskId.length === 0) {
@@ -2630,6 +5199,12 @@ export function createFanoutManager(options = {}) {
         const check = validateConcurrencyLimit(task.concurrencyLimit);
         if (!check.ok) throw new FanoutValidationError(check.code, check.message, { field: "tasks.concurrencyLimit" });
       }
+      // 超时（票据 06）：恢复路径对历史正有限值兼容（不做整秒收紧），
+      // 但结构上必须是「0 或正有限数」——否则就是一份无法解释的快照。
+      if (task.timeoutMs !== undefined) {
+        const check = validateRestoredTimeoutMs(task.timeoutMs, "tasks.timeoutMs");
+        if (!check.ok) throw new FanoutValidationError(check.code, check.message, { field: "tasks.timeoutMs" });
+      }
       // continuation 幂等记录（外部持久化输入）：结构必须严格合法，否则整体拒绝——
       // 静默丢弃会让「曾经续作过的 requestId」在恢复后被当成新请求而重复追加 attempt。
       if (task.continuationRequests !== undefined) {
@@ -2639,10 +5214,21 @@ export function createFanoutManager(options = {}) {
         }
         const keys = Object.keys(requests);
         if (keys.length > budgetPolicy.maxAttemptsPerShard) {
+          // 这条也是预算拒绝：补齐结构化 violation（旧实现只给 code/field），
+          // 让 Host 能像其它恢复超限一样补发统一 budget 事件。
+          const violation = describeBudgetViolation({
+            resource: "attempts",
+            limit: budgetPolicy.maxAttemptsPerShard,
+            receivedBytes: keys.length,
+            recoverable: false,
+            subject: task.parentTaskId,
+            hint: "快照中的 continuationRequests 条数超过 attempt 预算，请清理该任务的历史请求",
+          });
+          noteBudgetViolation(violation, "restore", { emitEvent: false });
           throw new FanoutValidationError(
             "INVALID_BUDGET",
             "快照 continuationRequests 条数超过预算: " + task.parentTaskId,
-            { field: "tasks.continuationRequests" },
+            { field: "tasks.continuationRequests", violation },
           );
         }
         for (const requestId of keys) {
@@ -2672,6 +5258,11 @@ export function createFanoutManager(options = {}) {
             { field: shardField + ".status", status: shard.status },
           );
         }
+        // 分片级超时同样按恢复语义校验：旧快照的任意正有限值必须可恢复。
+        if (shard.timeoutMs !== undefined) {
+          const check = validateRestoredTimeoutMs(shard.timeoutMs, shardField + ".timeoutMs");
+          if (!check.ok) throw new FanoutValidationError(check.code, check.message, { field: shardField + ".timeoutMs" });
+        }
         for (let attemptIndex = 0; attemptIndex < shard.attempts.length; attemptIndex += 1) {
           const rawAttempt = shard.attempts[attemptIndex];
           const attemptField = shardField + ".attempts[" + attemptIndex + "]";
@@ -2695,12 +5286,31 @@ export function createFanoutManager(options = {}) {
               { field: attemptField + ".status", status: rawAttempt.status },
             );
           }
+          // 停止证据字段（票据 07）：结构非法整体拒绝，绝不静默降级。
+          const stopFieldsVerdict = validateRestoredStopFields(rawAttempt, attemptField);
+          if (!stopFieldsVerdict.ok) throw validationError(stopFieldsVerdict);
+          // 代次种子：即使 attemptId/generation 缺失（旧快照）也要把派生值计入上界，
+          // 保证恢复后新建的 attempt 代次严格大于所有历史值。
+          const candidateGeneration = Number.isSafeInteger(rawAttempt.executionGeneration)
+            ? rawAttempt.executionGeneration
+            : (Number.isInteger(rawAttempt.attempt) && rawAttempt.attempt > 0 ? rawAttempt.attempt : attemptIndex + 1);
+          if (candidateGeneration > restoredMaxGeneration) restoredMaxGeneration = candidateGeneration;
         }
       }
     }
 
     // 配置必须沿用创建 manager 时的校验边界；所有字段先完成校验，再一次性替换，
     // 避免半个快照生效后把当前 manager 留在不可用状态。
+    //
+    // 并发来源模型（票据 03「并发来源修复」）：
+    // - 构造期注入了 live 解析函数：resolverSource 永远是 live。快照里的
+    //   defaultConcurrencyLimit 只是诊断负载，**不得**覆盖当前设置——否则一次重启就会
+    //   把 live settings 永久旁路（本票据修复的缺陷）；
+    // - 没有 live resolver：进程读不到"当前设置"，冻结快照值（或构造默认值）并在诊断
+    //   里标注 snapshot；
+    // - 旧快照没有 concurrencySource 标记时按同一规则"尽量 live"：有 resolver 就 live，
+    //   没有才冻结。标记只服务外部读者/诊断，不改变恢复决策。
+    // 任务级 concurrencyLimit 不受这里影响：它始终优先，且由 task.concurrencyLimit 固化。
     const restoredDefaultConcurrencyLimit = snapshot.defaultConcurrencyLimit === undefined
       ? defaultConcurrencyLimit
       : (() => {
@@ -2734,18 +5344,25 @@ export function createFanoutManager(options = {}) {
 
     // 校验全部通过后才修改内存状态：非法快照不得破坏现有任务或配置。
     //
-    // 全局配置的恢复边界（与任务级上限区分）：
-    // - 快照**自带** defaultConcurrencyLimit 时切到 snapshot 来源，恢复出来的任务按快照
-    //   值驱动（重启不改变既有任务语义）；
-    // - 快照**没有**这两个字段（旧快照 / 不落盘全局配置）时必须保留构造时注入的解析
-    //   函数与 role 覆盖：否则恢复出来的 queued shard 会卡在快照生成时那次请求的临时
-    //   配置上（例如 roleLimits=1），而当前 settings 明明允许更多并发。
-    // 任务级 concurrencyLimit 不受这里影响：它始终优先，且由 task.concurrencyLimit 固化。
-    if (snapshot.defaultConcurrencyLimit !== undefined) {
+    // 默认上限：只有"没有当前设置可读"时才冻结快照值；有 live resolver 时保持 live，
+    // 快照值完全不参与调度（它最后一次生效值仍写回快照作诊断）。
+    if (!hasLiveConcurrencyResolver) {
       defaultConcurrencyLimit = restoredDefaultConcurrencyLimit;
+      lastResolvedDefaultConcurrencyLimit = restoredDefaultConcurrencyLimit;
       resolverSource = "snapshot";
     }
-    if (snapshot.roleLimits !== undefined) roleLimits = restoredRoleLimits;
+    // 角色级映射：静态映射沿用既有语义（快照替换构造配置）；live 解析函数优先，
+    // 快照显式映射只作为第二层回退（见 resolveRoleLimits）。
+    if (snapshot.roleLimits !== undefined) {
+      if (typeof roleLimits === "function") {
+        restoredRoleLimitOverrides = Object.freeze({ ...restoredRoleLimits });
+      } else {
+        roleLimits = restoredRoleLimits;
+      }
+    } else if (typeof roleLimits === "function") {
+      // 快照没有角色级映射：清空上一轮的第二层回退，避免跨快照残留旧覆盖。
+      restoredRoleLimitOverrides = Object.freeze({});
+    }
     writeRoles = restoredWriteRoles;
     defaultAllowOverlap = restoredDefaultAllowOverlap;
     if (typeof injectedConflictChecker !== "function") {
@@ -2753,6 +5370,14 @@ export function createFanoutManager(options = {}) {
     }
     const resume = restoreOptions.resume === true;
     const merge = restoreOptions.merge === true;
+    /**
+     * 超时投影兼容（票据 06）：
+     * - 新快照带 timeoutProjection 标记：分片覆盖只认 rawShard.timeoutMs（缺失 = 无覆盖）；
+     * - 旧快照无标记：继续用最新 attempt 的 timeoutMs 反推分片覆盖。
+     *   旧语义下 attempt.timeoutMs 恒等于 shard.timeoutMs，因此这是一致的历史恢复；
+     *   新语义下 attempt.timeoutMs 可能来自父任务/角色默认值，所以新快照必须禁止反推。
+     */
+    const projectsShardTimeout = snapshot.timeoutProjection === TIMEOUT_PROJECTION_VERSION;
     if (!merge) {
       tasks.clear();
       requestIndex.clear();
@@ -2762,6 +5387,13 @@ export function createFanoutManager(options = {}) {
     const restoredEvents = Array.isArray(snapshot.events)
       ? snapshot.events.slice(-budgetPolicy.maxEventHistory).map((event) => cloneJson(event))
       : [];
+    // 快照事件数超过条数预算时，slice 丢掉的最旧记录同样属于 gap 事实（不是静默丢失）。
+    if (Array.isArray(snapshot.events) && snapshot.events.length > restoredEvents.length) {
+      droppedEventCount += snapshot.events.length - restoredEvents.length;
+    }
+    // 恢复输入可能是乱序（外部磁盘/旧版本）：按 sequence 升序落历史，既保证
+    // earliestAvailableSequence 是真正的最旧一条，也让裁剪可以安全地从队首丢弃。
+    restoredEvents.sort((left, right) => left.sequence - right.sequence);
     const highestEventSequence = restoredEvents.reduce((highest, event) => Math.max(highest, event.sequence), 0);
     sequence = merge
       ? Math.max(sequence, Number.isInteger(snapshot.sequence) ? snapshot.sequence : 0, highestEventSequence)
@@ -2772,9 +5404,14 @@ export function createFanoutManager(options = {}) {
         if (!knownSequences.has(event.sequence)) eventHistory.push(event);
       }
       eventHistory.sort((left, right) => left.sequence - right.sequence);
+      rebuildEventAccounting();
       trimEventHistory();
     } else {
       eventHistory.splice(0, eventHistory.length, ...restoredEvents);
+      rebuildEventAccounting();
+      // 快照已由 checkRestoreBudget 校验过条数/字节，这里仍走同一条裁剪路径：
+      // 防御旧快照/直接调用 restore 的输入，同时保持 dropped 统计与运行时一致。
+      trimEventHistory();
     }
     nextTaskNumber = merge
       ? Math.max(nextTaskNumber, Number.isInteger(snapshot.nextTaskNumber) ? snapshot.nextTaskNumber : 0)
@@ -2786,6 +5423,23 @@ export function createFanoutManager(options = {}) {
     }
     restoreDispatchSuppressed = !resume;
     workRequested = false;
+    // 代次种子：恢复后新建 attempt 的代次必须严格大于全部历史值（见 restoredMaxGeneration）。
+    nextExecutionGeneration = Math.max(
+      Number.isSafeInteger(snapshot.nextExecutionGeneration) ? snapshot.nextExecutionGeneration : 0,
+      restoredMaxGeneration,
+      nextExecutionGeneration,
+    );
+    // 记录本次恢复使用的停止证据边界（只读诊断；不写入快照——边界属于恢复进程的决定）。
+    // 多任务混合边界（延迟恢复的旧任务 + 本进程任务）显式投影为 "mixed"。
+    const effectiveBoundary = explicitStopEvidenceBoundary !== undefined
+      ? explicitStopEvidenceBoundary
+      : resolvedBoundaries.size === 0
+        ? stopEvidenceBoundary
+        : resolvedBoundaries.size === 1
+          ? [...resolvedBoundaries][0]
+          : "mixed";
+    stopDiagnosticsState.boundary = effectiveBoundary;
+    stopDiagnosticsState.boundarySource = stopEvidenceBoundarySource;
     const rolesToSchedule = new Set();
     restoringSnapshot = true;
     for (const rawTask of snapshot.tasks) {
@@ -2794,6 +5448,20 @@ export function createFanoutManager(options = {}) {
       // 此时 `task` 仍处于 TDZ，任何对 task.role 的引用都会抛 ReferenceError
       // （整个 restore 因此静默失败）。用已校验的 rawTask.role 作为本任务的 role 源。
       const taskRole = rawTask.role;
+      /**
+       * 任务级边界：显式边界优先；否则任务自身携带的来源进程身份优先于快照顶层值。
+       * Host 延迟恢复的旧任务靠 task.processInstance 保留真实来源，避免被合并后的
+       * 顶层"当前进程"身份误判为同进程重建。
+       */
+      const taskProcessInstance = typeof rawTask.processInstance === "string" && rawTask.processInstance.length > 0
+        ? rawTask.processInstance
+        : snapshotProcessInstance;
+      const taskBoundary = explicitStopEvidenceBoundary ?? (
+        taskProcessInstance !== undefined && taskProcessInstance === PROCESS_INSTANCE
+          ? "unknown"
+          : "process-restart"
+      );
+      resolvedBoundaries.add(taskBoundary);
       const task = {
         parentTaskId: rawTask.parentTaskId,
         ...(typeof rawTask.requestId === "string" ? { requestId: rawTask.requestId } : {}),
@@ -2809,28 +5477,64 @@ export function createFanoutManager(options = {}) {
           : { continuationRequests: cloneJson(rawTask.continuationRequests) }),
         allowOverlap: rawTask.allowOverlap === true,
         ...(typeof rawTask.concurrencyLimit === "number" ? { concurrencyLimit: rawTask.concurrencyLimit } : {}),
+        // 父任务级默认超时随快照恢复；缺字段（旧快照）等于「未设置」，
+        // 之后创建的 attempt 依然能取到当前角色默认值。
+        ...(typeof rawTask.timeoutMs === "number" ? { timeoutMs: rawTask.timeoutMs } : {}),
         createdAt: typeof rawTask.createdAt === "number" ? rawTask.createdAt : now(),
         updatedAt: typeof rawTask.updatedAt === "number" ? rawTask.updatedAt : now(),
         settledAt: typeof rawTask.settledAt === "number" ? rawTask.settledAt : undefined,
         parentCancelRequested,
         shards: rawTask.shards.map((rawShard) => {
-          const attempts = (rawShard.attempts.length === 0 ? [{ attempt: 1, status: "queued" }] : rawShard.attempts).map((rawAttempt, index) => ({
-            attempt: Number.isInteger(rawAttempt.attempt) ? rawAttempt.attempt : index + 1,
-            status: typeof rawAttempt.status === "string" ? rawAttempt.status : "queued",
-            startedAt: typeof rawAttempt.startedAt === "number" ? rawAttempt.startedAt : undefined,
-            finishedAt: typeof rawAttempt.finishedAt === "number" ? rawAttempt.finishedAt : undefined,
-            affectedPaths: Array.isArray(rawAttempt.affectedPaths) ? [...rawAttempt.affectedPaths] : [],
-            ...(rawAttempt.cancelRequested === true ? { cancelRequested: true } : {}),
-            ...(typeof rawAttempt.timeoutMs === "number" ? { timeoutMs: rawAttempt.timeoutMs } : {}),
-            ...(typeof rawAttempt.childId === "string" ? { childId: rawAttempt.childId } : {}),
-            ...(typeof rawAttempt.messageId === "string" ? { messageId: rawAttempt.messageId } : {}),
-            ...(rawAttempt.result === undefined ? {} : { result: cloneJson(rawAttempt.result) }),
-            ...(rawAttempt.error === undefined ? {} : { error: cloneJson(rawAttempt.error) }),
-          }));
+          const attempts = (rawShard.attempts.length === 0 ? [{ attempt: 1, status: "queued" }] : rawShard.attempts).map((rawAttempt, index) => {
+            const attemptNumber = Number.isInteger(rawAttempt.attempt) ? rawAttempt.attempt : index + 1;
+            /**
+             * attempt 身份与停止证据恢复（票据 07）：
+             * - 字段存在则原样使用（身份必须跨重启稳定，否则 Host 无法提交证据）；
+             * - 旧快照缺字段时按确定性规则派生（attemptId = 父任务/分片/序号，
+             *   executionGeneration = 序号），并标记 legacy=true，让诊断能区分
+             *   "派生身份"与"创建身份"。
+             */
+            const hasAttemptId = typeof rawAttempt.attemptId === "string" && rawAttempt.attemptId.trim().length > 0;
+            const hasGeneration = Number.isSafeInteger(rawAttempt.executionGeneration) && rawAttempt.executionGeneration >= 1;
+            const hasStopEvidence = rawAttempt.stopEvidence !== undefined;
+            const legacy = !hasAttemptId || !hasGeneration || !hasStopEvidence;
+            return {
+              attempt: attemptNumber,
+              status: typeof rawAttempt.status === "string" ? rawAttempt.status : "queued",
+              attemptId: hasAttemptId
+                ? rawAttempt.attemptId.trim()
+                : deriveAttemptId(rawTask.parentTaskId, rawShard.shardId, attemptNumber),
+              executionGeneration: hasGeneration ? rawAttempt.executionGeneration : attemptNumber,
+              stopEvidence: hasStopEvidence
+                ? cloneJson(rawAttempt.stopEvidence)
+                : { state: STOP_EVIDENCE_STATE_UNKNOWN },
+              ...(typeof rawAttempt.stopRequestedAt === "number" ? { stopRequestedAt: rawAttempt.stopRequestedAt } : {}),
+              ...(typeof rawAttempt.stopDeadlineAt === "number" ? { stopDeadlineAt: rawAttempt.stopDeadlineAt } : {}),
+              ...(typeof rawAttempt.stopWatchdogExpiredAt === "number" ? { stopWatchdogExpiredAt: rawAttempt.stopWatchdogExpiredAt } : {}),
+              ...(typeof rawAttempt.terminalReason === "string" ? { terminalReason: rawAttempt.terminalReason } : {}),
+              ...(legacy || rawAttempt.legacy === true ? { legacy: true } : {}),
+              startedAt: typeof rawAttempt.startedAt === "number" ? rawAttempt.startedAt : undefined,
+              finishedAt: typeof rawAttempt.finishedAt === "number" ? rawAttempt.finishedAt : undefined,
+              affectedPaths: Array.isArray(rawAttempt.affectedPaths) ? [...rawAttempt.affectedPaths] : [],
+              ...(rawAttempt.cancelRequested === true ? { cancelRequested: true } : {}),
+              // attempt 级超时是创建时已解析的**实效值**，恢复后原样使用（不重算）。
+              // 对旧快照的非法字段保持旧行为：静默丢弃（不因它整体拒绝快照）。
+              ...(typeof rawAttempt.timeoutMs === "number" && Number.isFinite(rawAttempt.timeoutMs) && rawAttempt.timeoutMs >= 0
+                ? { timeoutMs: rawAttempt.timeoutMs }
+                : {}),
+              ...(typeof rawAttempt.childId === "string" ? { childId: rawAttempt.childId } : {}),
+              ...(typeof rawAttempt.messageId === "string" ? { messageId: rawAttempt.messageId } : {}),
+              ...(rawAttempt.result === undefined ? {} : { result: cloneJson(rawAttempt.result) }),
+              ...(rawAttempt.error === undefined ? {} : { error: cloneJson(rawAttempt.error) }),
+            };
+          });
           // 恢复语义：running 的运行时句柄已经不存在，统一记为 interrupted。
+          // 注意：这**不**代表执行已停止——unknown 边界下 stopEvidence 保持 unknown，
+          // 影响范围继续占用，等 Host 证据或人工处置。
           for (const attempt of attempts) {
             if (attempt.status === "running") {
               attempt.status = "interrupted";
+              attempt.terminalReason = attempt.terminalReason ?? "restore";
               attempt.finishedAt = attempt.finishedAt ?? now();
               attempt.error = attempt.error ?? toShardError(
                 { name: "ShardInterruptedError", reason: "restore", message: "运行时恢复后丢失原 child，需手工重试" },
@@ -2838,8 +5542,34 @@ export function createFanoutManager(options = {}) {
               );
             }
           }
+          /**
+           * 停止证据边界（票据 07）：
+           * - process-restart：重启确实终止了执行体所属进程，快照内 attempt 一律 observed；
+           * - unknown：保留快照里的证据（新快照可能是 observed，也可能真的是 unknown）。
+           *   绝不为"让恢复好看一点"而伪造证据。
+           */
+          if (taskBoundary === "process-restart") {
+            for (const attempt of attempts) {
+              if (isStopObserved(attempt)) continue;
+              attempt.stopEvidence = {
+                state: STOP_EVIDENCE_STATE_OBSERVED,
+                source: "process-restart",
+                observedAt: now(),
+              };
+            }
+          }
+          /**
+           * 恢复不重新挂停止看门狗：快照里没有执行句柄，恢复进程无法观察"这次停止是否
+           * 在宽限内完成"（宽限属于上一条执行生命线）。未确认的停止交给 Host 证据或
+           * 人工处置；stopDeadlineAt 仍随快照恢复，供诊断判断"早已超期"。
+           */
           const last = attempts[attempts.length - 1];
           const latestTerminal = isTerminalShardStatus(last.status);
+          // 分片覆盖的来源见 projectsShardTimeout：新快照只信 rawShard.timeoutMs，
+          // 旧快照才用最新 attempt 的实效值反推（当年两者恒等）。
+          const restoredShardTimeoutMs = typeof rawShard.timeoutMs === "number"
+            ? rawShard.timeoutMs
+            : (projectsShardTimeout ? undefined : last.timeoutMs);
           const shard = {
             shardId: rawShard.shardId,
             // 使用恢复阶段已校验并归一化的名称；旧快照没有该字段时保持"无名称"，
@@ -2849,7 +5579,7 @@ export function createFanoutManager(options = {}) {
             status: latestTerminal ? last.status : "queued",
             affectedPaths: last.affectedPaths.length > 0 ? [...last.affectedPaths] : (Array.isArray(rawShard.affectedPaths) ? [...rawShard.affectedPaths] : []),
             ...(rawShard.cancelRequested === true || (parentCancelRequested && rawShard.status === "queued") ? { cancelRequested: true } : {}),
-            ...(last.timeoutMs === undefined ? {} : { timeoutMs: last.timeoutMs }),
+            ...(restoredShardTimeoutMs === undefined ? {} : { timeoutMs: restoredShardTimeoutMs }),
             createdAt: typeof rawShard.createdAt === "number" ? rawShard.createdAt : now(),
             updatedAt: typeof rawShard.updatedAt === "number" ? rawShard.updatedAt : now(),
             attempts,
@@ -2864,12 +5594,57 @@ export function createFanoutManager(options = {}) {
       // 原来的 attempt 已经写成 interrupted 终态，调度器只派发 queued attempt。
       // 这里复用 retryShard 的语义（追加 attempt、保留历史、清取消标记），但只在
       // resume 时执行，且不触发 per-shard 事件重放（恢复期不发布实时事件）。
+      const blockedResume = [];
       if (resume) {
         for (const shard of task.shards) {
           const last = shard.attempts[shard.attempts.length - 1];
           if (last === undefined || last.status !== "interrupted") continue;
           if (shard.cancelRequested === true) continue;
-          const attempt = createAttempt(shard, last.attempt + 1);
+          /**
+           * 恢复续跑的停止 gate（票据 07）：unknown 边界下无法证明原执行体已停止，
+           * 绝不自动追加新 attempt——否则旧 child（若仍在另一个进程/会话里）与新 attempt
+           * 会并发写同一路径。这里只记录原因，由 Host 用 process-restart 边界或补交证据。
+           */
+          if (!isStopObserved(last)) {
+            const unconfirmed = unconfirmedStopAttempts(shard).map((attempt) => unconfirmedStopSummary(attempt));
+            shard.resumeBlocked = { reason: "stop_unconfirmed", attempts: unconfirmed };
+            blockedResume.push({ shardId: shard.shardId, reason: "stop_unconfirmed", unconfirmed });
+            continue;
+          }
+          /**
+           * 恢复续跑必须先过 attempt 预算（票据 08），判定与 retry/continue 同源。
+           *
+           * 语义：新建后的 attempt 数超过 maxAttemptsPerShard 就不追加、不派发；
+           * 保持最后一个 attempt 的 interrupted 终态与 shard 的终态视图，不自动重试。
+           * 绝不能为"让恢复成功"而放宽——写入第 limit+1 个 attempt 后，下次 restore
+           * 会被 checkRestoreBudget 整体拒绝，整份快照将永久不可恢复。
+           * 原因码放在 shard.resumeBlocked（随 shard 快照持久化），同时发一条结构化
+           * 诊断事件，供 Host/UI 提示"需手工提交新父任务"。
+           */
+          const budget = attemptBudgetVerdict(
+            shard,
+            "shard " + shard.shardId,
+            "该 shard 已耗尽恢复续跑预算，请提交新的父任务或拆分工作",
+          );
+          if (budget !== null) {
+            shard.resumeBlocked = {
+              reason: budget.reason,
+              attempts: budget.attempts,
+              limit: budget.limit,
+            };
+            // 事件延后到任务登记 + 聚合之后再发（见下方 emit 循环）：订阅者收到
+            // shard_resume_blocked 时 getTask() 必须已经能读到一致的终态。
+            blockedResume.push({
+              shardId: shard.shardId,
+              attempts: budget.attempts,
+              limit: budget.limit,
+              reason: budget.reason,
+            });
+            continue;
+          }
+          // 恢复续跑的新 attempt 同样按三级优先级解析超时：快照里的分片/任务级显式值
+          // 优先，否则取**当前** settings 的角色默认值（恢复不冻结角色级配置）。
+          const attempt = createAttempt(task, shard, last.attempt + 1);
           shard.attempts.push(attempt);
           delete attempt.cancelRequested;
           shard.cancelRequested = false;
@@ -2880,8 +5655,24 @@ export function createFanoutManager(options = {}) {
         }
       }
       tasks.set(task.parentTaskId, task);
+      // 快照里重新出现的同 id 任务覆盖旧的回收标记（迟到回调必须归新任务判定）。
+      forgetReclaimedTask(task.parentTaskId);
       if (task.requestId !== undefined) requestIndex.set(task.requestId, task.parentTaskId);
       aggregateTask(task);
+      // 恢复续跑被预算拦下的诊断事件：只带元数据（不含 prompt/结果），
+      // 且必须在任务登记与聚合之后发布——订阅者读 getTask() 时状态已一致。
+      for (const blocked of blockedResume) {
+        emit({
+          type: "shard_resume_blocked",
+          parentTaskId: task.parentTaskId,
+          shardId: blocked.shardId,
+          role: task.role,
+          // 预算拒绝带 attempts(数)+limit；停止 gate 带未确认 attempt 摘要（unconfirmed）。
+          ...(blocked.limit === undefined ? {} : { attempts: blocked.attempts, limit: blocked.limit }),
+          ...(blocked.unconfirmed === undefined ? {} : { unconfirmed: blocked.unconfirmed }),
+          reason: blocked.reason,
+        });
+      }
     }
     rebuildIndexes();
     restoringSnapshot = false;
@@ -2897,12 +5688,27 @@ export function createFanoutManager(options = {}) {
    * 关闭 manager：先封锁调度入口，再让所有未终态 attempt 以 manager_closed 收敛。
    * running attempt 先调用取消器，随后立即写入 cancelled，避免 whenIdle/关闭流程等待
    * 永不完成的 child；迟到的 admission 或 completion 仍只能走拒绝诊断路径。
+   *
+   * 关闭**不**删除已结算任务：回收（commitReclaim）是唯一会移除已结算任务的入口，
+   * close 只收敛未终态 attempt，任务表与事件历史保持可读（关闭后的诊断/快照仍完整）。
    */
   function close() {
     if (closed) return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "already_closed" };
     closed = true;
     restoreDispatchSuppressed = true;
     workRequested = false;
+    /**
+     * 关闭竞态（票据 05 修复）：**不得**在这里清空回收屏障，也不得删除待回收任务。
+     *
+     * Host 的回收顺序是「prepare（生成排除待回收任务的候选）→ await 落盘成功 → commit」；
+     * close 完全可能落在那次 await 里。候选快照已经把任务从磁盘排除，只有让同一 token 的
+     * commit/abort 在关闭后继续生效，内存状态才能与磁盘一致；清空屏障会让 commit 得到
+     * token 失效，磁盘/内存永久分叉（重启后任务“消失”，或被重新恢复出来）。
+     *
+     * 关闭后不会因此开启新的回收：prepareReclaim 仍先判 closed 并返回 MANAGER_CLOSED；
+     * commit/abort 自身已跳过关闭后的 emit/notifyPersistence/schedule。
+     */
+    // （保持 reclaimState 原样，见上。）
     let changed = false;
     for (const task of tasks.values()) {
       const activeShards = task.shards.filter((shard) => {
@@ -2921,15 +5727,37 @@ export function createFanoutManager(options = {}) {
         if (attempt.status === "running" && !cancellationAlreadyRequested) {
           requestShardCancellation(task, shard, attempt, "manager_closed");
         }
+        /**
+         * close 的停止语义（票据 07）：逻辑终态写 cancelled，但**不**假定执行已停止
+         * （watchStop=false：不再挂看门狗，因为 manager 已关闭、不会再有调度与聚合）。
+         * stopEvidence 保持 unknown，影响范围随任务一起消失（进程即将结束）。
+         */
         settleShard(task, shard, attempt, "cancelled", {
           error: toShardError(
             { name: "FanoutClosedError", reason: "manager_closed", message: "fan-out manager 已关闭" },
             "fan-out manager 已关闭",
           ),
+          reason: "manager_closed",
+          watchStop: false,
         });
       }
       aggregateTask(task);
       notifyPersistence();
+    }
+    /**
+     * 关闭时清除全部内存定时器（超时 + 停止看门狗），但保留 unknown 状态。
+     * 不清理会让进程退出前仍有悬挂句柄（测试用假时钟能直接观察到）。
+     */
+    for (const task of tasks.values()) {
+      for (const shard of task.shards) {
+        for (const attempt of shard.attempts) {
+          if (attempt.timer !== undefined) {
+            clearTimeoutFn(attempt.timer);
+            attempt.timer = undefined;
+          }
+          clearAttemptStopTimer(attempt);
+        }
+      }
     }
     // 关闭后不再保留实时订阅者；历史诊断仍保留在 eventHistory/快照中。
     subscribers.clear();
@@ -2947,13 +5775,43 @@ export function createFanoutManager(options = {}) {
     cancelParent: (parentTaskId) => withPersistenceBatch(() => cancelParent(parentTaskId)),
     retryShard: (parentTaskId, shardId) => withPersistenceBatch(() => retryShard(parentTaskId, shardId)),
     continueTask: (input) => withPersistenceBatch(() => continueTask(input)),
+    /**
+     * 显式回收第一阶段（票据 05）：筛选 + 立屏障 + 生成候选快照。
+     *
+     * Host 的职责是先把 candidate **真实落盘成功**再调用 commitReclaim；失败必须
+     * abortReclaim。manager 不自行落盘（它只有 persistence.save 旁路，无法等待真实结果），
+     * 因此"先落盘成功再移除"的判定点必须在 Host。
+     */
+    prepareReclaim: (parentTaskIds) => prepareReclaim(parentTaskIds),
+    /** 显式回收第二阶段：确认落盘后从内存与索引移除（只接受先 prepare 拿到的 token）。 */
+    commitReclaim: (token) => withPersistenceBatch(() => commitReclaim(token)),
+    /** 放弃一次回收（只清屏障，状态不变）。 */
+    abortReclaim: (token) => abortReclaim(token),
+    /** 只读：当前满足回收前置条件的任务数（容量拒绝的 reclaimable 与诊断共用）。 */
+    reclaimableCount: () => countReclaimableTasks(),
     /** 只读：某 attempt 当前绑定的 messageId（严格 turn 归属校验用，不克隆任务快照）。 */
     attemptMessageIdOf,
+    /** 只读：某 attempt 的严格身份（Host 归属老化必须用 manager 权威投影）。 */
+    attemptIdentityOf,
     /** Host 观察到的「turn 归属无法证明」结构化诊断（只写事件，不改变任务状态）。 */
     recordAttributionViolation: (input) => withPersistenceBatch(() => recordAttributionViolation(input)),
+    /**
+     * 提交严格归属的停止证据（票据 07，Host 接线在后续任务）。
+     * 只允许 unknown -> observed；不改写逻辑状态、不重复计数；可能补发一次 task_settled。
+     */
+    observeStopEvidence: (identity, evidence) => withPersistenceBatch(() => observeStopEvidence(identity, evidence)),
+    /**
+     * 归属老化到期（票据 07，Host 接线）。只把仍非终态的 attempt 收敛为 interrupted 并
+     * 标记 needs_attention；绝不写停止证据、不释放范围、不自动重试。
+     */
+    markAttributionAged: (identity, options) => withPersistenceBatch(() => markAttributionAged(identity, options)),
+    /** 停止证据只读诊断：未确认停止的 attempt 数、按任务/分片摘要、legacy 标记与最近看门狗/老化。 */
+    stopDiagnostics,
     getTask,
     listTasks,
     getCounts,
+    /** 逐动作能力只读投影（票据 09）；不改变任何调度状态。 */
+    taskCapabilities,
     subscribe,
     whenIdle,
     isIdle,
@@ -2961,6 +5819,43 @@ export function createFanoutManager(options = {}) {
     snapshot: () => serializeSnapshot(),
     restore: (snapshot, restoreOptions) => withPersistenceBatch(() => restore(snapshot, restoreOptions)),
     persistSnapshot,
+    /**
+     * Host 在 manager 状态尚未恢复（restore 抛错）时补发统一预算事件。
+     *
+     * 为什么需要公开入口：manager.restore 的既有契约是"超预算/非法快照原子失败且
+     * 不写 eventHistory"，所以 restore 内部只记录 lastViolation，不自行 emit。
+     * Host 捕获结构化错误后调用本方法，把同一条 violation 补发成 budget_rejected。
+     * 事件只含元数据；重复调用是幂等的（每次仍是一条可审计事件）。
+     *
+     * @param {object} violation - describeBudgetViolation 产出的结构化描述。
+     * @param {string} phase - 发生阶段（Host 恢复路径传 restore）。
+     * @param {{parentTaskId?:string}} [options] - 可选归属（RPC 按根过滤事件时需要）。
+     * @returns {{recorded:boolean, phase?:string, reason?:string}}
+     */
+    recordBudgetViolation: (violation, phase, options = {}) => withPersistenceBatch(() => {
+      if (closed) return { recorded: false, reason: "manager_closed" };
+      if (violation === null || typeof violation !== "object" || Array.isArray(violation)) {
+        return { recorded: false, reason: "invalid_violation" };
+      }
+      const normalizedPhase = typeof phase === "string" && phase.length > 0 ? phase : "restore";
+      noteBudgetViolation(violation, normalizedPhase, {
+        ...(typeof options?.parentTaskId === "string" && options.parentTaskId.length > 0
+          ? { parentTaskId: options.parentTaskId }
+          : {}),
+      });
+      // 事件写入历史后触发一次落盘（Host 若已 fail-closed，会跳过并记录 restore_failed）。
+      notifyPersistence();
+      return { recorded: true, phase: normalizedPhase };
+    }),
+    /**
+     * 最近一次落盘结果的只读投影：saved / skipped(reason) / failed(category)。
+     * 失败分类的权威仍是 Host 的 persistence-health；本视图只回答"manager 观察到了什么"。
+     */
+    persistenceStatus: () => Object.freeze({
+      lastResult: lastPersistResult === null ? null : cloneJson(lastPersistResult),
+    }),
+    /** 事件历史只读状态：条数/字节/累计丢弃/最早可用序号（gap 判定用）。 */
+    eventHistoryStatus,
     /** 只读并发视图：有效默认值 + 各 role 覆盖 + 解析来源（诊断，不泄露任务负载）。 */
     concurrencyLimits,
     /**
@@ -2971,11 +5866,11 @@ export function createFanoutManager(options = {}) {
       limits: Object.freeze({ ...budgetPolicy }),
       tasks: tasks.size,
       events: eventHistory.length,
-      eventBytes: checkEventHistoryBudget(eventHistory, {
-        maxCount: budgetPolicy.maxEventHistory,
-        maxBytes: budgetPolicy.maxEventHistoryBytes,
-      }).bytes,
+      // 增量记账维护的总字节（不再为读诊断重算整段历史）。
+      eventBytes: eventAccounting.bytes,
+      eventHistory: eventHistoryStatus(),
       lastViolation: lastBudgetViolation === null ? null : cloneJson(lastBudgetViolation),
+      lastViolationPhase: lastBudgetViolationPhase,
     }),
   });
 }

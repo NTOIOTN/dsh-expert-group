@@ -300,6 +300,10 @@ export function checkAttemptPayloadBudget({ result, error, subject } = {}) {
     limit: FANOUT_BUDGET.maxAttemptErrorBytes,
     receivedBytes: errorBytes,
     subject,
+    // 错误正文超限同样是"可恢复"的：完整错误仍留在子会话日志里，主代理可自行读取；
+    // 但**不得**把超限错误原样写入 attempt/snapshot（否则事件与落盘都会跟着无界增长）。
+    recoverable: true,
+    hint: "错误过大时请让专家回传精简摘要（name/message/关键 stack 帧），完整日志留在子会话",
   });
   return { ...errorVerdict, resultBytes, errorBytes };
 }
@@ -459,31 +463,71 @@ export function checkRestoreBudget(snapshot, options = {}) {
  *
  * @param {{parentTaskId?:string, text:string}} input
  * @param {{maxBytes?:number}} [limits]
- * @returns {{text:string, bytes:number, receivedBytes:number, maxBytes:number,
- *   complete:boolean, recoverable:boolean, truncated:boolean}}
+ * @returns {{text:string, bytes:number, receivedBytes:number|null, maxBytes:number,
+ *   complete:boolean, recoverable:boolean, truncated:boolean, violation:object|null}}
+ *   violation 在截断或输入不可测量时非空（resource=feedback），供调用方补发统一的
+ *   budget_rejected 事件；完整输入时显式为 null。
  */
 export function truncateFeedbackText({ parentTaskId, text } = {}, limits = {}) {
   const maxBytes = Number.isSafeInteger(limits.maxBytes) && limits.maxBytes > 0
     ? limits.maxBytes
     : FANOUT_BUDGET.maxFeedbackBytes;
+  const subject = typeof parentTaskId === "string" && parentTaskId.length > 0 ? parentTaskId : undefined;
+  /**
+   * 非字符串输入视为"不可测量"而不是静默当成空串：聚合反馈是拼接产物，类型错误通常
+   * 意味着 buildFeedback 实现有 bug，必须留下结构化违规而不是让用户看到一份空反馈。
+   * 返回值仍给出可安全注入的空文本，避免把异常抛进父会话的反馈通道。
+   */
+  if (text !== undefined && typeof text !== "string") {
+    const violation = describeBudgetViolation({
+      resource: "feedback",
+      limit: maxBytes,
+      receivedBytes: null,
+      measured: false,
+      recoverable: true,
+      subject,
+      hint: "聚合反馈必须是字符串；请检查 buildFeedback 的返回值",
+    });
+    return {
+      text: "",
+      bytes: 0,
+      receivedBytes: null,
+      maxBytes,
+      complete: false,
+      recoverable: true,
+      truncated: true,
+      violation,
+    };
+  }
   const source = typeof text === "string" ? text : "";
   const receivedBytes = Buffer.byteLength(source, "utf8");
   const hint = "\n[结果已截断，请按 parentTaskId 查询完整快照]" + (typeof parentTaskId === "string" && parentTaskId.length > 0 ? "：" + parentTaskId : "：");
   if (receivedBytes + Buffer.byteLength(hint, "utf8") <= maxBytes) {
     return {
-      text: source + (receivedBytes === 0 ? "" : ""),
+      text: source,
       bytes: receivedBytes,
       receivedBytes,
       maxBytes,
       complete: true,
       recoverable: true,
       truncated: false,
+      violation: null,
     };
   }
   const hintBytes = Buffer.byteLength(hint, "utf8");
   const budget = Math.max(maxBytes - hintBytes, 0);
   // 用 Buffer 解码保证落在字符边界上（不会把一个多字节字符切成半个）。
   const truncatedText = Buffer.from(source, "utf8").subarray(0, budget).toString("utf8").replace(/\uFFFD+$/u, "");
+  // 截断本身是预算拒绝：返回与事件/诊断同源的 violation，调用方（index.js 的反馈装配）
+  // 可以直接把它补发为 budget_rejected(phase=feedback)，不再只取 .text 丢掉事实。
+  const violation = describeBudgetViolation({
+    resource: "feedback",
+    limit: maxBytes,
+    receivedBytes,
+    recoverable: true,
+    subject,
+    hint: "聚合反馈已按 UTF-8 字节预算截断；完整结果可按 parentTaskId 查询快照",
+  });
   return {
     text: truncatedText + hint,
     bytes: Buffer.byteLength(truncatedText + hint, "utf8"),
@@ -492,49 +536,115 @@ export function truncateFeedbackText({ parentTaskId, text } = {}, limits = {}) {
     complete: false,
     recoverable: true,
     truncated: true,
+    violation,
   };
+}
+
+/**
+ * 事件历史增量字节记账器。
+ *
+ * 为什么需要它：运行时每发布一条事件都要重算整段历史预算。旧实现对 eventHistory
+ * 逐条 measureJsonBytes（每次 emit 都是 O(n) 次 stringify，合计 O(n²)），在 1000 条
+ * 上限附近会把续作/LRU 用例拖到秒级。这里改为"事件进入历史时测量一次"，之后只维护
+ * 总字节：JSON 数组序列化恰好是 `[e1,e2,...]`，因此
+ *   arrayBytes = 2 + sum(entryBytes) + (n - 1)
+ * 与逐条 sum 的判定口径完全一致（条数预算与字节预算同时生效，先按条数、再按字节
+ * 从最旧一端丢弃）。裁剪成本只与本次丢弃条数成正比。
+ *
+ * 语义与 checkEventHistoryBudget 逐字段等价（后者内部也复用本记账器，只是不保留状态）。
+ * 事件对象进入历史后不再变更，因此缓存的 size 不会失效；reset() 用于 restore 整体替换。
+ *
+ * @param {{maxCount?:number, maxBytes?:number}} [limits]
+ * @returns {{
+ *   readonly count:number, readonly bytes:number,
+ *   push:(size:number)=>void, reset:()=>void,
+ *   trim:()=>{count:number, bytes:number, retainedBytes:number, droppedCount:number,
+ *     droppedBytes:number, violation:object|null}
+ * }}
+ */
+export function createEventHistoryAccounting(limits = {}) {
+  const maxCount = Number.isSafeInteger(limits.maxCount) ? limits.maxCount : FANOUT_BUDGET.maxEventHistory;
+  const maxBytes = Number.isSafeInteger(limits.maxBytes) ? limits.maxBytes : FANOUT_BUDGET.maxEventHistoryBytes;
+  const sizes = [];
+  let bytes = 0;
+
+  function normalizedSize(size) {
+    // 不可测量条目按 0 计（与 checkEventHistoryBudget 的 `?? 0` 一致）；负数/非整数同样归零。
+    return Number.isSafeInteger(size) && size >= 0 ? size : 0;
+  }
+
+  return Object.freeze({
+    get count() { return sizes.length; },
+    get bytes() { return bytes; },
+    push(size) {
+      const value = normalizedSize(size);
+      sizes.push(value);
+      bytes += value;
+    },
+    /** 整体替换（restore 冷路径）：清空后由调用方按顺序重新 push。 */
+    reset() {
+      sizes.splice(0, sizes.length);
+      bytes = 0;
+    },
+    /** 裁剪到双预算内并返回本次丢弃结果；没有超限时 droppedCount=0、violation=null。 */
+    trim() {
+      const bytesBefore = bytes;
+      let droppedCount = 0;
+      let droppedBytes = 0;
+      // 先按条数裁剪，再按字节裁剪；两条预算同时生效（与既有判定逐字段一致）。
+      while (sizes.length - droppedCount > maxCount) {
+        droppedBytes += sizes[droppedCount];
+        droppedCount += 1;
+      }
+      let remainingBytes = bytesBefore - droppedBytes;
+      let cursor = droppedCount;
+      while (remainingBytes > maxBytes && cursor < sizes.length) {
+        remainingBytes -= sizes[cursor];
+        droppedBytes += sizes[cursor];
+        cursor += 1;
+        droppedCount += 1;
+      }
+      if (droppedCount > 0) {
+        sizes.splice(0, droppedCount);
+        bytes -= droppedBytes;
+      }
+      const violation = droppedCount > 0
+        ? describeBudgetViolation({
+          resource: "event_history",
+          limit: maxBytes,
+          receivedBytes: bytesBefore,
+          recoverable: false,
+          subject: "event_history",
+          hint: "事件历史已按条数/字节预算裁剪最旧记录",
+        })
+        : null;
+      return {
+        count: sizes.length,
+        // 保留旧契约：bytes 是裁剪前的总字节（调用方可以据此判断"为什么裁"）。
+        bytes: bytesBefore,
+        retainedBytes: bytes,
+        droppedCount,
+        droppedBytes,
+        violation,
+      };
+    },
+  });
 }
 
 /**
  * 校验事件历史（条数 + 字节）并给出需要丢弃的最旧事件数。
  *
+ * 该函数是"无状态版本"：逐条测量一次后交给增量记账器裁剪，因此与运行时热路径使用
+ * 完全同一套判定逻辑（不会出现两套边界条件各自漂移）。
+ *
  * @param {object[]} events
  * @param {{maxCount?:number, maxBytes?:number}} [limits]
- * @returns {{count:number, bytes:number, droppedCount:number, droppedBytes:number, violation:object|null}}
+ * @returns {{count:number, bytes:number, retainedBytes:number, droppedCount:number,
+ *   droppedBytes:number, violation:object|null}} bytes 是裁剪前总字节。
  */
 export function checkEventHistoryBudget(events, limits = {}) {
   const list = Array.isArray(events) ? events : [];
-  const maxCount = Number.isSafeInteger(limits.maxCount) ? limits.maxCount : FANOUT_BUDGET.maxEventHistory;
-  const maxBytes = Number.isSafeInteger(limits.maxBytes) ? limits.maxBytes : FANOUT_BUDGET.maxEventHistoryBytes;
-  const sizes = list.map((event) => measureJsonBytes(event) ?? 0);
-  const bytes = sizes.reduce((total, size) => total + size, 0);
-  let keep = list.length;
-  let droppedCount = 0;
-  let droppedBytes = 0;
-  // 先按条数裁剪，再按字节裁剪；两条预算同时生效。
-  while (keep > maxCount) {
-    keep -= 1;
-    droppedBytes += sizes[droppedCount];
-    droppedCount += 1;
-  }
-  let remainingBytes = bytes - droppedBytes;
-  let cursor = droppedCount;
-  while (remainingBytes > maxBytes && cursor < list.length) {
-    remainingBytes -= sizes[cursor];
-    droppedBytes += sizes[cursor];
-    cursor += 1;
-    keep -= 1;
-  }
-  const trimmed = droppedCount > 0;
-  const violation = trimmed
-    ? describeBudgetViolation({
-      resource: "event_history",
-      limit: maxBytes,
-      receivedBytes: bytes,
-      recoverable: false,
-      subject: "event_history",
-      hint: "事件历史已按条数/字节预算裁剪最旧记录",
-    })
-    : null;
-  return { count: Math.max(keep, 0), bytes, droppedCount, droppedBytes, violation };
+  const accounting = createEventHistoryAccounting(limits);
+  for (const event of list) accounting.push(measureJsonBytes(event) ?? 0);
+  return accounting.trim();
 }

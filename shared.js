@@ -54,7 +54,12 @@ export const EXPERT_DELEGATION_DENY = [
  * 所有专家 child 还需过滤仅属于当前 live root 的工具。此处独立于历史
  * EXPERT_DELEGATION_DENY，避免破坏外部对旧再委派清单的兼容契约。
  */
-export const ROOT_ONLY_TOOL_DENY = ["dsh_expert_group_finalize", "dsh_expert_group_release_scope"];
+export const ROOT_ONLY_TOOL_DENY = [
+  "dsh_expert_group_finalize",
+  "dsh_expert_group_release_scope",
+  // 票据 11：人工逃生只属于 root；专家 child 绝不能关闭等待账本。
+  "dsh_expert_group_abandon_wait",
+];
 
 /**
  * 只读角色（explorer/librarian/oracle/observer）禁止的写操作与命令，
@@ -1092,11 +1097,35 @@ export function createDelegationTracker(options = {}) {
   const activeTasks = new Map();
   let activeTaskSeq = 0;
 
+  /**
+   * 复制活动项快照。
+   *
+   * 副本**不携带** parentAgent：它是 live root Agent 的强引用，只用于内部 owner 过滤
+   * （completeActiveTasksForChild），不得经 listActiveTasks / 诊断 / 工具回执外泄。
+   * detached 统一归一为布尔值，保证「是否已脱离 root」在快照里始终可读。
+   */
   function copyActiveTask(task) {
+    const { parentAgent: _parentAgent, ...rest } = task;
     return {
-      ...task,
+      ...rest,
+      detached: task.detached === true,
       affectedPaths: task.affectedPaths.map((path) => ({ ...path })),
     };
+  }
+
+  /**
+   * 把某 parent 的活动项标记为 detached：root 销毁/代际退休不是停止证据（票据 07），
+   * 活动项必须继续按同一 parentId 阻塞同路径任务。
+   *
+   * 只移除 parentAgent 强引用，保留 parentId/role/taskKey/childId/messageId/affectedPaths：
+   * - 同一 parentId 的后续 generation 仍会看到这条保护（不得继承释放）；
+   * - 该 child 自己的权威停止信号仍能按 childId + messageId 精确命中；
+   * - 已销毁 root 对象不会被 tracker 长期持有。
+   * @param {object} task - 内部活动项。
+   */
+  function detachActiveTask(task) {
+    task.detached = true;
+    delete task.parentAgent;
   }
 
   function activeTasksForParent(parentId) {
@@ -1253,6 +1282,9 @@ export function createDelegationTracker(options = {}) {
         description: typeof description === "string" ? description : "",
         affectedPaths: normalizeAffectedPaths(affectedPaths),
         ...(typeof childId === "string" && childId.length > 0 ? { childId } : {}),
+        // 新登记的活动项仍由当前 root generation 持有；只有 dropParent（root 销毁/
+        // 代际退休）会把它转为 detached，且转换本身**不**释放保护。
+        detached: false,
       };
       activeTasks.set(task.id, task);
       return copyActiveTask(task);
@@ -1327,13 +1359,81 @@ export function createDelegationTracker(options = {}) {
       return count;
     },
 
-    /** child 或其恢复记录被确定清理时移除该 child 的全部活动登记。 */
+    /**
+     * child 或其恢复记录被确定清理时移除该 child 的全部活动登记。
+     *
+     * owner 过滤语义（票据 07）：只有当两边都能给出 owner 且**不是同一个**时才拒绝。
+     * detached 活动项的 parentAgent 已被移除，它表示「原 root 已销毁/退休，但该 child
+     * 未必停止」，绝不能据此当成「属于别的 generation」而永久拒绝释放——否则权威
+     * child 停止证据（disposal）到达后保护永远无法解除。
+     */
     completeActiveTasksForChild(childId, parentId, parentAgent) {
       let count = 0;
       for (const [activityId, task] of activeTasks) {
         if (task.childId !== childId || (parentId !== void 0 && task.parentId !== String(parentId))) continue;
-        // owner 已知时，不删除旧版/无 owner 的 activity；childId 可能跨 root generation 复用。
-        if (parentAgent !== void 0 && task.parentAgent !== parentAgent) continue;
+        if (parentAgent !== void 0 && task.parentAgent !== void 0 && task.parentAgent !== parentAgent) continue;
+        activeTasks.delete(activityId);
+        count += 1;
+      }
+      return count;
+    },
+
+    /**
+     * 只读计数：活动范围总数与其中已脱离 root 的数量（运行时诊断用）。
+     * @returns {{total:number, detached:number}}
+     */
+    activeTaskCounts() {
+      let detached = 0;
+      for (const task of activeTasks.values()) {
+        if (task.detached === true) detached += 1;
+      }
+      return { total: activeTasks.size, detached };
+    },
+
+    /**
+     * 只读诊断：列出已脱离 root 的活动范围。
+     *
+     * 刻意不返回 parentAgent、description、prompt 或 affectedPaths 原文：这里只回答
+     * 「哪个 child/角色/任务仍持有保护、是否已脱离 root」，供诊断与人工排查使用。
+     * @returns {Array<object>} 脱挂活动项摘要（含 activityId / parentId / role / taskKey / childId / messageId）。
+     */
+    listDetachedActiveTasks() {
+      const result = [];
+      for (const task of activeTasks.values()) {
+        if (task.detached !== true) continue;
+        result.push({
+          activityId: task.id,
+          parentId: task.parentId,
+          role: task.role,
+          taskKey: task.taskKey,
+          ...(typeof task.childId === "string" ? { childId: task.childId } : {}),
+          ...(typeof task.messageId === "string" ? { messageId: task.messageId } : {}),
+          detached: true,
+        });
+      }
+      return result;
+    },
+
+    /**
+     * 释放「已脱离 root」的活动范围——root 销毁/代际退休后唯一可用的证据入口。
+     *
+     * 证据边界（票据 07）：
+     * - 提供非空 turnMsgIds：只释放该 child 本 turn 稳定 messageId 命中的活动项
+     *   （child turn/end 证据）；
+     * - 省略/空 turnMsgIds：释放该 child 的全部 detached 活动项（权威 child disposal）。
+     * 未绑定 messageId 的活动项（admission 竞态）不会被 turn/end 误删，只在 disposal
+     * 或后续 turn 的 messageId 命中时释放。
+     * @param {string} childId - exact child session id。
+     * @param {{turnMsgIds?: Iterable<string>}} [options] - 本 turn 的稳定消息 id 集合。
+     * @returns {number} 实际释放条数。
+     */
+    completeDetachedActiveTasksForChild(childId, { turnMsgIds } = {}) {
+      if (typeof childId !== "string" || childId.length === 0) return 0;
+      const messageIds = stringSet(turnMsgIds);
+      let count = 0;
+      for (const [activityId, task] of activeTasks) {
+        if (task.detached !== true || task.childId !== childId) continue;
+        if (messageIds.size > 0 && (typeof task.messageId !== "string" || !messageIds.has(task.messageId))) continue;
         activeTasks.delete(activityId);
         count += 1;
       }
@@ -1507,15 +1607,27 @@ export function createDelegationTracker(options = {}) {
       return entry.tasks.delete(taskKey);
     },
 
-    /** 父代理销毁时清理其全部 scope、活动登记和短队列，防止内存泄漏。 */
+    /**
+     * 父代理销毁/root 代际退休时清理 scope 与短队列，但**不释放**影响范围保护（票据 07）。
+     *
+     * root 结束、代际更新都不是停止证据：活动项保留并标记 detached、移除 parentAgent
+     * 强引用（parentId 保留），继续按同一 parentId 阻塞同路径新任务，直到该 child 自己的
+     * 权威停止信号（child turn/end 或 child disposal）经 completeActiveTasksForTurn /
+     * completeActiveTasksForChild / completeDetachedActiveTasksForChild 删除。
+     *
+     * 这样做避免「root 结束即释放」把仍在运行的 child 写入范围暴露给 root 的结构化文件
+     * 工具；保护可观测性由 listDetachedActiveTasks / activeTaskCounts 提供。
+     * @param {string} parentId - 正在销毁/退休的父代理 id（同 id 新 generation 不继承释放）。
+     */
     dropParent(parentId) {
       const id = String(parentId);
       const prefix = `${id}::`;
       for (const scope of scopes.keys()) {
         if (scope.startsWith(prefix)) scopes.delete(scope);
       }
-      for (const [activityId, task] of activeTasks) {
-        if (task.parentId === id) activeTasks.delete(activityId);
+      for (const task of activeTasks.values()) {
+        if (task.parentId !== id) continue;
+        detachActiveTask(task);
       }
       parentQueues.delete(id);
     },

@@ -40,6 +40,75 @@ function safeCall(callback, fallback = undefined) {
 }
 
 /**
+ * 恢复失败的**永久性**原因码集合（票据 04）。
+ *
+ * 判定语义只服务两处**纯展示**用途：快照 recovery 块里的 retryable 标志、
+ * fanout-restore-retry RPC 回执里的 retryable。它**不**限制重试：重试 RPC 对任何原因码
+ * 都允许执行（重试会重新读取当前持久化快照，磁盘内容可能已被外部修复）。这里把
+ * 「同一份磁盘数据重试也不会变好」的结构性缺陷标成不可自动恢复，客户端据此给出
+ * 不同提示；其余（IO/读取失败、未知异常）都可以通过重试自愈。
+ */
+const PERMANENT_RESTORE_CODES = new Set([
+  "INVALID_SNAPSHOT",
+  "INVALID_SNAPSHOT_STATUS",
+  "INVALID_SNAPSHOT_TRANSITION",
+  "UNSUPPORTED_SNAPSHOT_VERSION",
+  "INVALID_BUDGET",
+  "INVALID_CONCURRENCY_LIMIT",
+  "INVALID_SHARD_NAME",
+  "INVALID_WRITE_ROLES",
+  "INVALID_ALLOW_OVERLAP",
+]);
+
+/**
+ * 恢复失败原因码 → 是否值得重试（未知/缺失按可重试处理）。
+ *
+ * 参数是 Host 归一后的稳定 code（大写 token）；非字符串、空串与未登记 code 都返回 true，
+ * 因为「不知道原因」永远不能等价于「永久不可恢复」。
+ */
+export function restoreFailureRetryable(code) {
+  const token = nonEmpty(code);
+  return token === null ? true : !PERMANENT_RESTORE_CODES.has(token);
+}
+
+/**
+ * 把 fanoutHost.restoreStatus() 的只读结果归一成快照 recovery 块的候选输入。
+ *
+ * 投影边界（只读、无副作用）：
+ * - lastRestore 为 null ⇒ status "none"（本进程从未执行过恢复）；
+ * - lastRestore.ok === true ⇒ status "ok"，**清空** code/message（不残留历史失败细节）；
+ * - 其余 ⇒ status "failed"，原因码优先取结构化 error.code，其次取 fail-closed 闸门
+ *   记录的 code，最后退化为 RESTORE_FAILED；message 只取 error.message（Host 的
+ *   describeRestoreFailure 已保证它不是堆栈），长度与控制字符由快照投影再收敛一次；
+ * - persistenceBlocked 如实投影 fail-closed 闸门是否生效（诊断用，不参与渲染判定）。
+ *
+ * 任何异常/缺字段都收敛为 "none"，绝不影响快照构建本身。
+ */
+function recoveryInputFromRestoreStatus(restoreStatus) {
+  const source = restoreStatus !== null && typeof restoreStatus === "object" ? restoreStatus : {};
+  const blocked = source.blocked !== null && typeof source.blocked === "object" ? source.blocked : null;
+  const last = source.lastRestore !== null && typeof source.lastRestore === "object" ? source.lastRestore : null;
+  const persistenceBlocked = blocked !== null;
+  if (last === null) {
+    return { status: "none", code: null, message: null, at: null, retryable: false, persistenceBlocked };
+  }
+  const at = typeof last.at === "number" && Number.isFinite(last.at) ? last.at : null;
+  if (last.ok === true) {
+    return { status: "ok", code: null, message: null, at, retryable: false, persistenceBlocked };
+  }
+  const error = last.error !== null && typeof last.error === "object" ? last.error : null;
+  const code = nonEmpty(error?.code) ?? nonEmpty(blocked?.code) ?? "RESTORE_FAILED";
+  return {
+    status: "failed",
+    code,
+    message: nonEmpty(error?.message),
+    at,
+    retryable: restoreFailureRetryable(code),
+    persistenceBlocked,
+  };
+}
+
+/**
  * live Session 不暴露 events 数组，只能通过 snapshotEvents 读取已提交事件；
  * cold session 则由 sessionQuery 直接返回 events。一次快照只读取一次，避免标题、
  * 最近命令和状态分别读取时跨提交撕裂。
@@ -538,6 +607,20 @@ export function createExpertGroupRuntime({
     return Array.isArray(fromLineage) ? fromLineage : [];
   }
 
+  /**
+   * 逐动作能力（票据 09）：唯一来源是 fanoutHost.capabilitiesOf（归属 + manager 能力）。
+   *
+   * 返回 undefined 表示**旧 Host 或测试替身没有该读面**：投影层据此完全省略 capabilities
+   * 字段，客户端回退既有状态推导，绝不伪造一个「全部拒绝」的能力对象。
+   */
+  function fanoutCapabilitiesFor(rootId, parentTaskId) {
+    if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return undefined;
+    if (typeof fanoutHost?.capabilitiesOf !== "function") return undefined;
+    const capabilities = safeCall(() => fanoutHost.capabilitiesOf(rootId, parentTaskId), undefined);
+    if (capabilities === null || typeof capabilities !== "object" || Array.isArray(capabilities)) return undefined;
+    return capabilities;
+  }
+
   function isMissingSessionError(error) {
     const code = firstText(error?.code, error?.name)?.toLowerCase();
     const message = typeof error?.message === "string" ? error.message.toLowerCase() : "";
@@ -906,7 +989,35 @@ export function createExpertGroupRuntime({
     const settled = await Promise.allSettled(shards.map((shard) => projectFanoutShard(shard, task, deps)));
     const failure = firstRejection(settled);
     if (failure !== null) throw failure.reason;
-    return { ...task, shards: settled.map((result) => result.value) };
+    const projectedShards = settled.map((result) => result.value);
+    /**
+     * 逐动作能力（票据 09）：父任务与每个 shard 都带上 Host 的权威能力投影。
+     *
+     * 能力只由 fanoutHost.capabilitiesOf 产生（归属 + manager 规则），快照层不做二次判定：
+     * - 旧 Host/测试替身没有该读面时整个字段省略（客户端回退旧行为）；
+     * - shard 能力按 shardId 对齐，缺失条目的 shard 不带字段，绝不补一个假的 allowed。
+     * 这里写的是**投影副本**（projectFanoutShard 每次都返回新对象），不会改动 manager 的输入。
+     */
+    const capabilities = fanoutCapabilitiesFor(deps.rootId, task?.parentTaskId);
+    if (capabilities !== undefined) {
+      const shardCapabilities = capabilities.shards !== null && typeof capabilities.shards === "object"
+        && !Array.isArray(capabilities.shards)
+        ? capabilities.shards
+        : {};
+      for (const projected of projectedShards) {
+        const shardId = firstText(projected?.shardId);
+        if (shardId === null) continue;
+        const shardCapability = shardCapabilities[shardId];
+        if (shardCapability !== null && typeof shardCapability === "object" && !Array.isArray(shardCapability)) {
+          projected.capabilities = shardCapability;
+        }
+      }
+    }
+    return {
+      ...task,
+      shards: projectedShards,
+      ...(capabilities === undefined ? {} : { capabilities }),
+    };
   }
 
   /**
@@ -1063,9 +1174,16 @@ export function createExpertGroupRuntime({
     // 修复 A：轻量路径用排序锚点补 createdAt，让同一节点在 partial / full 下拿到同一个排序键。
     // 完整路径不传锚点（它的 createdAt 本来就是权威值），因此这里只影响 fast。
     if (fast === true) applySortAnchor([...experts, ...fanoutTasks], sortAnchor);
+    /**
+     * 恢复状态（票据 04）：两条构建路径都投影同一份只读状态，且**不做任何冷读**——
+     * 它来自 fanoutHost 内存里的 restoreStatus()，因此轻量快照也能立刻反映恢复失败，
+     * 用户不必等完整快照就能看到错误横幅与重试入口。
+     */
+    const recovery = recoveryInputFromRestoreStatus(safeCall(() => fanoutHost?.restoreStatus?.(), null));
     return buildExpertGroupSnapshot({
       sessionId: id,
       generatedAt: now(),
+      recovery,
       root: {
         id,
         kind: "root",

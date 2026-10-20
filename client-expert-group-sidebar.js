@@ -702,6 +702,21 @@
   }
 
   /**
+   * 逐动作能力读取（票据 09）：只有 Host 明确给出 allowed 布尔时才作为权威。
+   *
+   * 返回 true/false/null：
+   * - true/false：严格按能力渲染（Host 是唯一判定来源）；
+   * - null：旧 Host/旧快照没有该字段（或形状非法）→ 调用方回退既有的
+   *   ACTIVE_STATUSES / RETRY_STATUSES 推导，兼容未升级的 Host。
+   * 这里刻意不把「有 capabilities 但缺该动作」当成允许：缺项与缺失整块同义，都回退。
+   */
+  function capabilityAllowed(node, action) {
+    const capabilities = object(object(node).capabilities);
+    const entry = object(capabilities[action]);
+    return typeof entry.allowed === "boolean" ? entry.allowed : null;
+  }
+
+  /**
    * 规范运行状态（展示与图标唯一使用的状态）。
    * 模型可用时由模型按官方源字段归一，模型缺失时才退回可证明的 running 布尔。
    */
@@ -980,6 +995,9 @@
       // partial 必须参与比较：任务树内容恰好一致时（轻量快照与完整快照投影结果相同），
       // 从 partial→完整 的升级仍要上屏，否则中性渲染会一直留在界面上。
       && (left.partial === true) === (right.partial === true)
+      // recovery 必须参与比较：恢复成功/失败切换时任务树可能一字未变，但错误横幅必须
+      // 立刻出现或消失——漏掉它会让「重试成功」停在旧横幅上（反之亦然）。
+      && snapshotContentEquals(left.recovery ?? null, right.recovery ?? null)
       && snapshotContentEquals(left.root, right.root);
   }
 
@@ -1078,6 +1096,18 @@
       ".deg_expert_group_header_auto_input{margin:0;cursor:pointer}",
       ".deg_expert_group_header_auto_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
       ".deg_expert_group_header_auto_label{font-size:12px;line-height:16px}",
+      // 恢复失败横幅（票据 04）：与标题栏的「快照读取失败」错误面完全独立，位于头部之下、
+      // 任务树之上；失败原因码与一行 message 同排，重试按钮固定右侧。整块用 flex-wrap：
+      // 窄右栏时补充行自动换到第二排，绝不挤压任务树的可点击区域。
+      ".deg_expert_group_recovery{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin:6px 0 0;padding:6px 8px;border:1px solid var(--dsw-alias-state-error-primary,var(--dsw-alias-state-warning-primary,#f59e0b));border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-primary));font-weight:600}",
+      // 主文案严格一行：超长 message 用省略号收束，完整内容在 title 里（Host 已限长 200 字符）。
+      ".deg_expert_group_recovery_text{flex:1 1 140px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      // 补充行（重试动作本身失败）：次级颜色、可换行，绝不覆盖主原因码。
+      ".deg_expert_group_recovery_retry_error{flex:1 1 100%;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-weight:400}",
+      ".deg_expert_group_recovery_retry{flex:0 0 auto;box-sizing:border-box;height:24px;padding:0 8px;border:0;border-radius:5px;background:transparent;color:inherit;font-weight:600;cursor:pointer}",
+      ".deg_expert_group_recovery_retry:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}",
+      ".deg_expert_group_recovery_retry:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+      ".deg_expert_group_recovery_retry:disabled{cursor:default;opacity:.7}",
       ".deg_expert_group_header_action:hover,.deg_expert_group_chevron:hover,.deg_expert_group_action:hover:not(:disabled),.deg_expert_group_sidebar_action:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
       ".deg_expert_group_header_action:focus-visible,.deg_expert_group_chevron:focus-visible,.deg_expert_group_action:focus-visible,.deg_expert_group_sidebar_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
       ".deg_expert_group_tree{min-width:0;padding-top:5px}",
@@ -7057,6 +7087,20 @@
 
       const pendingSet = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };
       /**
+       * 恢复重试的本地状态（票据 04）：{ rootSessionId, inFlight, error }。
+       *
+       * 为什么用 ref 而不是 state：与 pendingSet 同一模式——重试期间要立刻禁用按钮并显示
+       * 进度，只靠 Host 快照（2.5s 轮询 + 完整快照缓存）会有明显延迟；这里用 ref + bump
+       * 驱动一次同步重渲染。rootSessionId 绑定发起时的 root：同一实例切换 root 后，
+       * 旧请求的迟到结果绝不会显示在新会话的横幅上（也不会把新 root 的按钮标成处理中）。
+       *
+       * error 只保存**重试动作本身**的失败细节（业务失败返回的 error 块或传输/校验异常），
+       * 它是补充信息；恢复失败的主原因码始终来自 snapshot.recovery（Host 权威投影）。
+       */
+      const recoveryRetryRef = typeof react.useRef === "function"
+        ? react.useRef({ rootSessionId: null, inFlight: false, error: null })
+        : { current: { rootSessionId: null, inFlight: false, error: null } };
+      /**
        * 任务管理动作（取消分片 / 重试分片 / 取消父任务）的唯一入口。三条并发边界：
        *
        * 1) 去重锁覆盖「确认弹窗 await + RPC 发送 + 尾随刷新」全程：占位发生在**发起确认之前**，
@@ -7115,6 +7159,59 @@
         }
       };
 
+      /**
+       * 恢复重试入口（票据 04）：调用 fanout-restore-retry，成功后刷新快照。
+       *
+       * 失败语义（与既有动作错误面完全隔离）：
+       * - RPC 业务失败（restored:false）不是异常：Host 会把稳定原因码放在回执的 error 块里，
+       *   这里记录到横幅的补充行，**不**写入 title 区的「快照读取失败」槽；
+       * - 传输/校验异常（404 根会话不存在、网络失败）同样只记录补充行；横幅本身继续由
+       *   snapshot.recovery 驱动，因此「失败保持错误态与原因码」不依赖一次成功的快照刷新；
+       * - 成功（restored:true）后无论刷新是否成功，下一次成功快照都会把 recovery 变成 ok，
+       *   横幅随之消失（快照不再含 failed 块）。
+       *
+       * 并发边界与 runAction 一致：卸载后不写状态；切换 root 后旧结果只落回旧 root 的账本
+       * 而不污染当前 surface；同一 root 的在途重试直接忽略重复点击。
+       */
+      const retryRecovery = async () => {
+        if (mountedRef.current !== true) return;
+        const targetSessionId = typeof currentRootRef.current === "string" ? currentRootRef.current : "";
+        if (targetSessionId === "") return;
+        const previous = recoveryRetryRef.current;
+        if (previous.rootSessionId === targetSessionId && previous.inFlight === true) return;
+        recoveryRetryRef.current = { rootSessionId: targetSessionId, inFlight: true, error: null };
+        bump((value) => value + 1);
+        let failure = null;
+        try {
+          const result = await callRpc(config, contextRef.current, {
+            action: "fanout-restore-retry",
+            sessionId: targetSessionId,
+          });
+          if (result?.restored !== true) {
+            const error = object(result?.error);
+            const code = text(error.code, null);
+            // restored:false 且没有 error 块 = 磁盘上没有可恢复快照（Host 的既有早退语义）：
+            // 这不是失败，但也没有清除错误态，保持横幅并让用户知道重试没有恢复任何任务。
+            failure = code === null
+              ? { code: "NO_RESTORABLE_SNAPSHOT", message: "当前没有可恢复的持久化任务" }
+              : { code, message: text(error.message, "") };
+          }
+        } catch (error) {
+          failure = {
+            code: "RETRY_FAILED",
+            message: error instanceof Error ? error.message : String(error),
+          };
+        }
+        const stillCurrent = mountedRef.current === true && currentRootRef.current === targetSessionId;
+        recoveryRetryRef.current = { rootSessionId: targetSessionId, inFlight: false, error: stillCurrent ? failure : null };
+        // 卸载或已切走：迟到结果不触发刷新/重渲染（新 surface 自己维护状态）。
+        if (stillCurrent !== true) return;
+        bump((value) => value + 1);
+        // 无论成功还是失败都刷新：成功让横幅随 recovery=ok 消失，失败则把 Host 重新记录的
+        // 原因码/任务树取回来（失败原因码仍以 snapshot.recovery 为权威）。
+        await refreshRef.current();
+      };
+
       const renderAction = (label, Icon, onClick, pending) => react.createElement("button", {
         type: "button", className: "deg_expert_group_action", title: pending ? label + "（处理中）" : label,
         "aria-label": pending ? label + "（处理中）" : label, "aria-busy": pending || undefined, disabled: pending, onClick,
@@ -7142,8 +7239,15 @@
         const cancelKey = "cancel:" + task.parentTaskId + ":" + shardKey;
         const retryKey = "retry:" + task.parentTaskId + ":" + shardKey;
         const actions = [];
-        if (ACTIVE_STATUSES.has(status)) actions.push(renderAction("取消分片 " + shardKey, "IconStopFillRegular", () => runAction({ action: "fanout-cancel-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, cancelKey, true, "确认取消分片 " + shardKey + "？"), pendingSet.current.has(cancelKey)));
-        if (RETRY_STATUSES.has(status)) actions.push(renderAction("重试分片 " + shardKey, "IconRefreshOutlineRegular", () => runAction({ action: "fanout-retry-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, retryKey, false, ""), pendingSet.current.has(retryKey)));
+        // 票据 09：能力字段存在时严格按能力渲染；缺失时回退既有状态推导（旧 Host 兼容）。
+        // 拒绝原因不再由界面解释——Host 已把「为什么不可用」收敛成稳定原因码，
+        // 按钮的有无就是唯一可见结论，绝不给用户一个点了只会被拒绝的入口。
+        const cancelCapability = capabilityAllowed(shard, "cancel");
+        const retryCapability = capabilityAllowed(shard, "retry");
+        const showCancel = cancelCapability === null ? ACTIVE_STATUSES.has(status) : cancelCapability === true;
+        const showRetry = retryCapability === null ? RETRY_STATUSES.has(status) : retryCapability === true;
+        if (showCancel) actions.push(renderAction("取消分片 " + shardKey, "IconStopFillRegular", () => runAction({ action: "fanout-cancel-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, cancelKey, true, "确认取消分片 " + shardKey + "？"), pendingSet.current.has(cancelKey)));
+        if (showRetry) actions.push(renderAction("重试分片 " + shardKey, "IconRefreshOutlineRegular", () => runAction({ action: "fanout-retry-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, retryKey, false, ""), pendingSet.current.has(retryKey)));
         // 展示状态用规范运行状态，证据与第三行同源（最新 attempt 的 childId 查目录项）；
         // status 仍保留给取消/重试判定（管理语义不变）。
         const runtimeStatus = runtimeStatusOfNode(shardNode, rootSessionId, latestChildId);
@@ -7159,7 +7263,12 @@
         const open = expand(task);
         const incomplete = shards.filter((shard) => ACTIVE_STATUSES.has(statusOf(shard))).length;
         const parentKey = "cancel-parent:" + task.parentTaskId;
-        const actions = ACTIVE_STATUSES.has(statusOf(task)) || incomplete > 0
+        // 父任务取消同样以 Host 能力为准；能力缺失时保留「有活跃分片或父任务仍活跃」的旧判定。
+        const cancelCapability = capabilityAllowed(task, "cancel");
+        const showCancel = cancelCapability === null
+          ? (ACTIVE_STATUSES.has(statusOf(task)) || incomplete > 0)
+          : cancelCapability === true;
+        const actions = showCancel
           ? [renderAction("取消父任务（未完成 " + incomplete + " 个分片）", "IconStopFillRegular", () => runAction({ action: "fanout-cancel-parent", parentTaskId: task.parentTaskId }, parentKey, true, "确认取消父任务？未完成 " + incomplete + " 个分片。"), pendingSet.current.has(parentKey))]
           : [];
         // data-status 是对外的规范运行状态；管理状态改由 data-task-status 暴露，
@@ -7195,6 +7304,66 @@
       // 根行的圆点走与专家行同一条 partial 规则：轻量快照里没有活动证据的根会话渲染中性圆点，
       // 而不是「已结束」的绿色圆点；完整快照与旧宿主下与既有渲染逐字一致。
       const rootStatus = runtimeStatusOf(root, null, { partial: partialSnapshot });
+      /**
+       * 恢复失败横幅（票据 04）：**独立**于标题栏的「快照读取失败」错误面。
+       *
+       * 两者语义不同，绝不合并：
+       * - 快照读取失败 = 这次 RPC 没拿到任务树（viewState.error + 重试按钮）；
+       * - 恢复失败 = 任务树读得到，但持久化恢复失败（磁盘快照可能不完整，fail-closed 生效），
+       *   需要重新读取持久化快照并重跑恢复。
+       *
+       * 横幅只由 Host 的权威投影 snapshot.recovery 驱动（旧 Host 缺失该块 ⇒ 不渲染）；
+       * 本地 retry 状态只补充「重试中/重试失败」这一行，不替代原因码。
+       */
+      const recovery = snapshot?.recovery ?? null;
+      const recoveryFailed = recovery !== null && recovery.status === "failed";
+      const recoveryRetry = recoveryRetryRef.current;
+      // rootSessionId 绑定：切换 root 后旧请求的 in-flight/error 不属于当前 surface。
+      const recoveryRetryPending = recoveryRetry.inFlight === true && recoveryRetry.rootSessionId === rootSessionId;
+      const recoveryCode = recovery === null ? null : text(recovery.code, "RESTORE_FAILED");
+      // 补充行只在「当前仍是失败态，且重试失败与当前原因码同一来源」时显示：
+      // Host 后来换了原因码（例如先 INVALID_SNAPSHOT、修复后变 BUDGET_EXCEEDED）时，
+      // 旧重试的文案不再适用，必须让位给新的主原因码（两个稳定本地码始终保留）。
+      const recoveryRetryError = recoveryFailed === true
+        && recoveryRetry.rootSessionId === rootSessionId
+        && recoveryRetry.error !== null
+        && (recoveryRetry.error.code === recoveryCode
+          || recoveryRetry.error.code === "RETRY_FAILED"
+          || recoveryRetry.error.code === "NO_RESTORABLE_SNAPSHOT")
+        ? recoveryRetry.error
+        : null;
+      const recoveryMessage = recovery === null ? null : text(recovery.message, null);
+      const recoveryBanner = recoveryFailed !== true
+        ? null
+        : react.createElement("div", {
+          className: "deg_expert_group_recovery",
+          role: "alert",
+          "data-recovery-status": "failed",
+          "data-recovery-code": recoveryCode,
+          // title 提供完整文案：可见行按一行省略，悬停仍可读到全部（仍受 Host 200 字上限约束）。
+          title: recoveryMessage === null ? "恢复失败（" + recoveryCode + "）" : recoveryMessage,
+        },
+        react.createElement("span", { className: "deg_expert_group_recovery_text" },
+          "任务恢复失败（" + recoveryCode + "）" + (recoveryMessage === null ? "" : "：" + recoveryMessage)),
+        recoveryRetryError === null
+          ? null
+          : react.createElement("span", { className: "deg_expert_group_recovery_retry_error", role: "status" },
+            "重试未恢复（" + text(recoveryRetryError.code, "RETRY_FAILED") + "）"
+            + (text(recoveryRetryError.message, "") === "" ? "" : "：" + text(recoveryRetryError.message, ""))),
+        react.createElement("button", {
+          type: "button",
+          className: "deg_expert_group_recovery_retry",
+          // retryable=false 只影响提示语（结构性快照缺陷）；按钮仍保留：重试会重读磁盘，
+          // 外部修复后仍可能成功，入口绝不隐藏。
+          title: recovery.retryable === false
+            ? "该原因通常需要修复持久化快照后才能恢复；点击会重新读取当前持久化快照"
+            : "重新读取当前持久化快照并重跑恢复",
+          "aria-label": "重试恢复",
+          "aria-busy": recoveryRetryPending || undefined,
+          disabled: recoveryRetryPending,
+          onClick: retryRecovery,
+          // 文字按钮：进度态把文案换成「重试中…」，可见且可被辅助技术读到。
+        }, recoveryRetryPending ? "重试中…" : "重试恢复"));
       const body = viewState.loading && snapshot === null
         ? react.createElement("div", { className: "deg_expert_group_tree", "aria-busy": "true" }, react.createElement("div", { className: "deg_expert_group_skeleton" }), react.createElement("div", { className: "deg_expert_group_skeleton" }))
         : snapshot === null
@@ -7233,7 +7402,7 @@
           react.createElement("span", { className: "deg_expert_group_header_title" }, "Expert Group"),
           autoOpenToggle,
           viewState.error !== null ? react.createElement("span", { className: "deg_expert_group_error", title: viewState.error }, "快照读取失败") : null,
-          viewState.error !== null ? react.createElement("button", { type: "button", className: "deg_expert_group_header_action", title: "重试", "aria-label": "重试", onClick: retry }, makeIcon(primitives, "IconRefreshOutlineRegular", { size: 14 })) : null), body);
+          viewState.error !== null ? react.createElement("button", { type: "button", className: "deg_expert_group_header_action", title: "重试", "aria-label": "重试", onClick: retry }, makeIcon(primitives, "IconRefreshOutlineRegular", { size: 14 })) : null), recoveryBanner, body);
     }
     Panel.displayName = "ExpertGroupPanel";
     return Panel;

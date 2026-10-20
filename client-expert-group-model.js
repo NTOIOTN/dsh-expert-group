@@ -14,9 +14,27 @@
     error: "failed", errored: "failed", active: "running", in_progress: "running", "in-progress": "running",
     working: "running", pending: "queued", scheduled: "queued", wait: "waiting",
   });
+  /**
+   * 逐动作能力（票据 09）的动作词表与原因码上限。
+   *
+   * 客户端只接受声明过的动作与布尔 allowed；reason 只作为稳定机器 token 展示/诊断，
+   * 超长内容截断，绝不把任意自由文本原样渲染进 UI。
+   */
+  const CAPABILITY_ACTIONS = Object.freeze(["read", "cancel", "retry", "continue"]);
+  const SHARD_CAPABILITY_ACTIONS = Object.freeze(["cancel", "retry"]);
+  const CAPABILITY_REASON_MAX_LENGTH = 64;
+
   const COUNT_FIELDS = Object.freeze([
     "queued", "waiting", "running", "succeeded", "failed", "cancelled", "timed_out", "interrupted", "pending",
   ]);
+  /**
+   * 恢复失败原因码的合法形态与文案上限（与 Host 投影同一契约，各自持有一份常量）。
+   *
+   * 客户端不 import Host 模块（浏览器侧只加载装配后的 bundle），因此这里保留同值副本；
+   * 任何形态不符的 code 都退化为 RESTORE_FAILED，绝不在 UI 上渲染自由文本。
+   */
+  const RECOVERY_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+  const RECOVERY_MESSAGE_MAX_LENGTH = 200;
   /**
    * 右侧栏对外的**代理运行状态**只有这两个规范值。
    *
@@ -202,6 +220,69 @@
     return { command: text(value.command), mode, activity };
   }
 
+  /**
+   * 恢复状态（recovery）块归一（票据 04）。
+   *
+   * Host 已在投影出口做了白名单与长度收敛；客户端仍做一次**只读、无猜测**的归一：
+   * - 缺字段 / 非对象 ⇒ null（旧 Host 兼容：没有 recovery 就当作没有恢复错误，不渲染横幅）；
+   * - status 只接受 ok/failed/none，其余落回 none；
+   * - failed 才保留原因码；形态不符时用稳定兜底码 RESTORE_FAILED（与 Host 同一 fallback）；
+   * - message 剔除控制字符并限制为一行（防御旧 Host / 第三方注入的负载）；
+   * - retryable 只认明确 true，persistenceBlocked 同理（展示层不用它做判定）。
+   */
+  function normalizeRecovery(value) {
+    if (!isObject(value)) return null;
+    const status = value.status === "failed" || value.status === "ok" ? value.status : "none";
+    const rawCode = text(value.code);
+    const code = status === "failed"
+      ? (rawCode !== null && RECOVERY_CODE_PATTERN.test(rawCode) ? rawCode : "RESTORE_FAILED")
+      : null;
+    const rawMessage = text(value.message);
+    const message = status === "failed" && rawMessage !== null
+      ? rawMessage.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, RECOVERY_MESSAGE_MAX_LENGTH) || null
+      : null;
+    return {
+      status,
+      code,
+      message,
+      at: numberOrNull(value.at),
+      retryable: status === "failed" && value.retryable === true,
+      persistenceBlocked: value.persistenceBlocked === true,
+    };
+  }
+
+  /**
+   * 单项能力归一（客户端侧的严格白名单）。
+   *
+   * Host 已做过一次收敛，但浏览器仍不能信任任意负载：
+   * - 只有 allowed 是布尔才产生有效项，其它形状一律丢弃（旧 Host/第三方注入不获得按钮）；
+   * - allowed=true 时丢弃 reason；allowed=false 时 reason 必须是字符串并截断，
+   *   缺失时回退稳定 token not_supported（绝不渲染空原因）。
+   */
+  function normalizeCapabilityEntry(value) {
+    if (!isObject(value) || typeof value.allowed !== "boolean") return null;
+    if (value.allowed === true) return { allowed: true };
+    const reason = text(value.reason);
+    return {
+      allowed: false,
+      reason: reason === null ? "not_supported" : reason.slice(0, CAPABILITY_REASON_MAX_LENGTH),
+    };
+  }
+
+  /** 按动作词表归一能力对象；没有任何有效动作时返回 null（调用方省略字段并回退旧行为）。 */
+  function normalizeCapabilities(value, actions) {
+    if (!isObject(value)) return null;
+    const normalized = {};
+    let any = false;
+    for (const action of actions) {
+      const entry = normalizeCapabilityEntry(value[action]);
+      if (entry === null) continue;
+      normalized[action] = entry;
+      any = true;
+    }
+    return any ? normalized : null;
+  }
+
   function normalizeAttempt(value) {
     const source = isObject(value) ? value : {};
     return {
@@ -236,6 +317,11 @@
       running: runningOf(status, source.running),
       runSummary: normalizeRunSummary(source.runSummary),
       continuable: typeof source.continuable === "boolean" ? source.continuable : null,
+      // shard 能力（票据 09）：只有 Host 给出可判定项时才存在；缺失时渲染层回退状态推导。
+      ...(() => {
+        const capabilities = normalizeCapabilities(source.capabilities, SHARD_CAPABILITY_ACTIONS);
+        return capabilities === null ? {} : { capabilities };
+      })(),
       childId: latest?.childId ?? text(source.childId),
       createdAt: numberOrNull(source.createdAt),
       attempts,
@@ -272,6 +358,11 @@
       running: runningOf(status, source.running),
       createdAt: numberOrNull(source.createdAt),
       counts: normalizeCounts(source.counts),
+      // 父任务能力：Host 权威投影；缺失（旧 Host）时省略字段，侧栏回退 ACTIVE/RETRY 状态推导。
+      ...(() => {
+        const capabilities = normalizeCapabilities(source.capabilities, CAPABILITY_ACTIONS);
+        return capabilities === null ? {} : { capabilities };
+      })(),
       shards: rawShards.map((shard) => normalizeShard(shard, source)),
     };
   }
@@ -295,6 +386,12 @@
       running: runningOf(status, source.running),
       runSummary: normalizeRunSummary(source.runSummary),
       continuable: typeof source.continuable === "boolean" ? source.continuable : null,
+      // 会话节点（root/普通专家）的能力对象：只描述 read/写动作是否适用，
+      // 侧栏不会在这些节点上渲染 fan-out 管理按钮。
+      ...(() => {
+        const capabilities = normalizeCapabilities(source.capabilities, CAPABILITY_ACTIONS);
+        return capabilities === null ? {} : { capabilities };
+      })(),
       createdAt: numberOrNull(source.createdAt),
       children: [],
     };
@@ -348,6 +445,9 @@
       rootSessionId,
       generatedAt: numberOrNull(raw.generatedAt),
       partial: raw.partial === true,
+      // recovery 是 Host 新增的**可选**顶层块：缺失/非法时为 null（旧 Host 行为逐字不变，
+      // 侧栏据此不渲染任何恢复错误横幅）。
+      recovery: normalizeRecovery(raw.recovery),
       root,
     };
   }
@@ -446,6 +546,7 @@
     RUNTIME_STATUSES,
     UNKNOWN_RUNTIME_STATUS,
     normalizeExpertGroupSnapshot,
+    normalizeCapabilities,
     normalizeStatus,
     runtimeStatusOf,
     formatAgentSummary,

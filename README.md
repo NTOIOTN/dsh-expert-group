@@ -54,7 +54,7 @@ DEG 在 DSH Web 界面上的可见面只有三处，彼此独立、互不重叠�
 
 | 界面 | 位置 | 能做什么 | 详细说明 |
 | --- | --- | --- | --- |
-| **dsh-expert-group 设置页** | 设置 → `dsh-expert-group` | 维护全局 provider、六类专家的默认模型与思考深度，以及通知偏好、`Observer优先`、`任务管理`、`Auto` 与单个角色并发上限 | [设置页功能详解](#设置页功能详解dsh-expert-group) |
+| **dsh-expert-group 设置页** | 设置 → `dsh-expert-group` | 维护全局 provider、六类专家的默认模型与思考深度，以及通知偏好、`Observer优先`、`任务管理`、`Auto`、单个角色并发上限与角色默认超时 | [设置页功能详解](#设置页功能详解dsh-expert-group) |
 | **Expert Group 任务侧边栏** | 右侧栏（原生右栏，或装有 better-sidebar 时的独立页） | 查看当前根会话的任务树与运行状态；用 `>>` / `<<` 在右栏打开或关闭某个子代理会话；取消 / 重试 fan-out 任务 | [Expert Group 任务侧边栏](#expert-group-任务侧边栏) |
 | **运行状态行与系统通知** | 主视图左下角 / Windows 桌面右下角 | 运行中显示 `Orchestrator running`、`Explorer running` 等运行词；任务进入终态时由 Windows Toast 提醒 | Web 状态提示 |
 
@@ -205,6 +205,7 @@ DEG 没有模型可调用的通知工具，也不在会话标题栏或右侧栏�
 | `任务管理` | 开启 | `taskManagementEnabled` | 控制 DEG 是否把 Expert Group 注册到侧边栏：关闭并保存后调用当前 install 返回的 disposer 释放注册（原生右栏与 better-sidebar 的默认侧栏保持不变），重新开启并保存后重新注册；字段缺失或读取失败一律按开启处理 |
 | `Auto` | 关闭 | `autoOpenSubagentSidebar` | 开启后，子代理运行期间自动在右栏打开它的会话页，并在子代理结束、资源空闲后自动收回；只关闭本次运行中由 Auto 亲自打开的 tab，用户手动打开的 tab 不会被自动关闭。关闭后可用 `>>` / `<<` 手动打开或关闭 |
 | `单个角色并发上限` | `10` | `roleConcurrencyLimit` | 取值范围 `1–64` 的整数。**不是即时生效**，点保存后才应用；非法值由 Host 拒绝（`设置 roleConcurrencyLimit 无效`） |
+| `角色默认超时 (s)` | `36000`（10 小时） | `roleTimeoutMs` | 设置页以秒输入；默认 10 小时，`0` = 显式不启用，设置页启用值为 `1–86400` 秒的整数（精度 1 秒），保存时换算为 Host 的毫秒字段（`1000–86400000`，1000 的整数倍）。**不是即时生效**：只影响保存之后创建的尝试，运行中的分片不改写；分片级 `timeoutMs` 与父任务级 `timeoutMs` 优先于它。超时把最新一次尝试收敛为可手工重试的 `timed_out`，绝不自动重试；非法值由 Host 拒绝（`设置 roleTimeoutMs 无效`） |
 
 ### 13. 页脚与保存
 
@@ -329,3 +330,11 @@ Expert Group 是 DEG 注册在右侧栏的任务视图：它把**当前会话所
 - 首次从「只有 Expert Group」的单 pane 分栏时，打开事务会先临时把右栏写到约 50%，目标 tab 确认落到返回的 pane 后保留 50% 的可调模式；分栏失败则恢复原来的 20% 锁定宽度。
 - 日常在已有子代理 pane 里打开 / 关闭 tab 不改宽度。
 - 首次形成两个 pane 后：Expert Group 占右栏 40%（视口约 20%），子代理 pane 占右栏 60%（视口约 30%）；最后一个被跟踪的 pane 关闭后恢复约 20% 的默认宽度。
+
+## 运行时保护、回收与等待
+
+- **影响范围保护**：专家任务声明 `affectedPaths` 后，保护只在 child 的权威停止信号（turn/end、disposal、admission 明确未创建）、可验证的写入隔离证据或进程重启边界释放。root 结束、代际替换和人工动作都不会提前释放；未确认停止的任务保持 pending，也不会发送完成通知。
+- **`dsh_expert_group_release_scope` 已收紧为只读诊断**：它不再删除保护，只返回 `scope-release-refused` 与当前活动项摘要。保护应在专家真正停止后由正常生命周期自动释放。
+- **显式回收**：root 可通过 RPC `fanout-reclaim`（`sessionId` + `parentTaskIds`）回收**已结算、无活动 attempt、未被等待账本引用**的父任务。回收先落盘成功再从内存与侧栏移除；持久化失败时状态不变。回收不保留墓碑：之后同一 `requestId` 视为新任务，旧 id 的查询返回 `task_not_found`。容量拒绝会返回 `current`、`reclaimable` 与可执行 `hint`，且 requestId 幂等判定先于容量判定。
+- **人工逃生**：`dsh_expert_group_abandon_wait`（root-only，参数 `reason`）仅在权威后代查询明确「没有运行中的后代」时关闭当前等待批次；它不会取消 child、不会释放影响范围、也不会改变 fan-out 状态。查询失败、降级或状态未知时一律拒绝并返回稳定原因码。root turn 等待本身没有自动超时释放。
+- **可观测性**：`meta.diagnostics.rootTurnWait` 暴露未结算数、最早等待时长、后代查询能力等级、最近一次收口投递结果与人工关闭次数。等待超过 30 分钟、后代查询降级或收口投递失败会产生一次性系统通知（仍受通知开关约束）。
