@@ -259,22 +259,24 @@ How it is registered depends on the host: without `dsh-better-sidebar` installed
 | fan-out aggregate branch | `<角色> · <N> shards · running｜ready` (`<角色>` is the role name) | One fan-out submission creates a parent node, and its shards are its child nodes |
 | Idle subagent group | `空闲子代理（N）`(Idle subagents (N)) | Appears when a ready ordinary expert or a settled fan-out parent task exists; collapsible |
 
-### Three-Line Structure of a Task Row
+### Two-Line Structure of a Task Row
 
-Except for fan-out shards, every agent node has a fixed three lines, and their content does not depend on the collapsed state:
+Except for fan-out shards, every agent node has a fixed two lines, and their content does not depend on the collapsed state:
 
 ![Parent agent root node](docs/assets/sidebar/02-root-row.png)
 
+> Note: the sidebar screenshots in this document were taken with the previous three-line layout. The third status-summary line has since been removed at the user's request; the images have not been regenerated in this round.
+
 1. **Task name**: the root node always shows `主代理`; expert nodes show the latest dispatch description; fan-out shard rows show `分片代号  任务名称`(shard code, then task name) (shard rows wrap by content instead of being ellipsized onto a single line). The full text doubles as the tooltip and the accessible label.
 2. **Model metadata**: `角色 · provider · model · 思考深度`(role · provider · model · reasoning depth) (provider and model names in this document's screenshots are redacted). Missing values use the stable placeholders `未知供应商`(Unknown provider) / `未知模型`(Unknown model) / `默认`(Default).
-3. **Status summary**: `标题 · 可继续｜一次性 · 正在运行｜当前未运行`(title · continuable | one-shot · running | not running), for example, verbatim `修复 DSH 运行状态文字 Animations · 正在运行`(fixing the DSH run-status text animations · running) and `你是 oracle 子代理。任务内容 · 可继续 · 当前未运行`(you are an oracle subagent. Task content · continuable · currently not running). The root node keeps only the dynamic title and the activity state and does not show the continuation mode.
 
-- `可继续`(Continuable) is shown only when the session catalog explicitly proves the subagent is continuable; anything unknown degrades to not continuable, and unknown is never described as continuable.
-- The state dot is DSH's native `primitives.StateDot` (`running` / `ready`); when the official component is missing it degrades to a static dot.
+- Run state is expressed only by the leading state dot: DSH's native `primitives.StateDot` (`running` / `ready`), which degrades to a static dot when the official component is missing.
+- The continuation mode and the authoritative session title no longer occupy a separate line, and they do not appear in the task name or the metadata either.
+- The **usage glance** next to the task name always follows the same order: `用时1h5m · 208tok/s · 109M tok · 命中97% · context 32%` (duration, output speed, total tokens, cache-hit rate, and context occupancy). The data comes **from DSH's authoritative session projections first** — `sessionStats.llmMs` (model time; the tooltip also shows tool-call time) → duration, `decodeTokens / decodeMs` → tok/s, the four `tokenUsage` fields → tok and cache-hit rate, and `contextPressure` → context; only when those projections are missing (old host / not loaded yet) does it fall back to the DEG usage ledger and session timestamps. `sessionStats` is an on-demand client projection: DSH's sessions list snapshot carries only the list-projection subset, so the panel calls the public `sessions.refreshProjections(sessionId)` once for every child session in the tree that has not loaded it yet (one request per session, no retry on failure). The first frame may therefore briefly show DEG fallback values; once loading completes the sessions subscription re-renders the row with DSH authoritative values. Any segment whose data cannot be proven is omitted entirely — never written as 0 or a placeholder; context is read from a single session only, so a fan-out parent task does not show it. Start time, retry count and last activity no longer appear in the summary bar, and the old `用量 —`(usage unknown) badge is replaced by the `tok` segment; the `多次重试`(many retries) warning and the bounded failure summary remain.
 
 ### Interaction
 
-- Clicking the **task name** or the **third line**: the main view switches to that subagent session; when the host provides no workspace navigation capability the whole row stops being clickable, so no dead button is left behind.
+- Clicking the **task name**: the main view switches to that subagent session; when the host provides no workspace navigation capability the whole row stops being clickable, so no dead button is left behind.
 - Clicking the **chevron**: only collapses / expands that node (`aria-expanded`; titles `折叠`(Collapse) / `展开`(Expand)) without navigating.
 - Clicking **`>>` / `<<`**: affects only the right sidebar; see the next section.
 - A fan-out branch offers `取消父任务（未完成 N 个分片）`(Cancel parent task (N shards unfinished)) while active shards remain; a shard row offers `取消分片`(Cancel shard) in the active state and `重试分片`(Retry shard) in the retryable state. Destructive operations ask the host for confirmation first (for example `确认取消父任务？未完成 N 个分片。`(Cancel the parent task? N shards are unfinished.)); when the plugin cannot obtain confirmation capability the whole operation is not executed — it never runs silently.
@@ -294,7 +296,8 @@ Except for fan-out shards, every agent node has a fixed three lines, and their c
 ![fan-out shard row](docs/assets/sidebar/04-shard-row.png)
 
 - The parent node's title is `<角色> · <N> shards · running｜ready`, and its dot takes its colour from the canonical run state of the whole fan-out.
-- The first line of a shard row is `分片代号  任务名称`, followed by the same model metadata and status summary.
+- The parent task no longer shows an aggregated attempt timeline; expanding a shard shows that shard's own attempt history (index, status, duration, time, usage/cost, and structured result).
+- The first line of a shard row is `分片代号  任务名称`, followed by the same model metadata.
 - A shard whose latest attempt succeeded is displayed as successful (even if earlier attempts failed); cancel and retry always act on the **latest attempt's childId**.
 - While a cancel / retry request is in flight the button is disabled and marked `aria-busy`, so repeated clicks do not send a second request.
 

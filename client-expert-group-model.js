@@ -92,9 +92,6 @@
    * running|ready：只有「明确运行」才是 running，其余一律 ready。
    */
   const RUNTIME_STATUSES = Object.freeze(["running", "ready"]);
-  /** 原生代理行的本地化文案（与 DSH ui-subagent locales 同源）。 */
-  const MODE_LABELS = Object.freeze({ continuable: "可继续", "one-shot": "一次性" });
-  const ACTIVITY_LABELS = Object.freeze({ running: "正在运行", inactive: "当前未运行" });
   /**
    * 默认折叠的状态词表：这四个状态代表「没有正在进行的工作」，默认收起。
    *
@@ -351,55 +348,6 @@
     if (signal === "running") return "running";
     if (isObject(options) && options.partial === true && signal === null) return UNKNOWN_RUNTIME_STATUS;
     return "ready";
-  }
-
-  /** 只有精确命中词表的 mode 才能映射文案；未知/非法值返回 null（不猜）。 */
-  function modeLabelOf(value) {
-    const mode = text(value);
-    if (mode === null) return null;
-    return Object.prototype.hasOwnProperty.call(MODE_LABELS, mode) ? MODE_LABELS[mode] : null;
-  }
-
-  /**
-   * 目录项是否显式声明「可续接性未知」（0.1.7-alpha.2 新增的 `unknown`）。
-   *
-   * unknown 与 one-shot 一样属于**不可续接**：它明确表示宿主尚未解析出可续接性，
-   * 因此绝不能回退到节点 continuable 把它显示成「可继续」。
-   */
-  function isUnknownMode(value) {
-    return text(value) === "unknown";
-  }
-
-  /**
-   * 第三行的动态摘要：与 DSH 原生代理行同源，组合为 `title · mode · activity`。
-   *
-   * - title 只接受调用方从 sessions 快照读出的**权威 title**（byId[id].title）；
-   * - mode：只有目录项 mode 明确为 continuable/one-shot 才显示「可继续/一次性」；
-   *   非法或未知 mode 不映射（绝不当成 continuable），仅在 node.continuable 是
-   *   boolean 时才回退对应文案，否则整段省略。目录项显式为 0.1.7-alpha.2 新增的
-   *   `unknown` 时，它已表达「可续接性未知」的权威判定，因此**禁止**回退到节点证据：
-   *   按不可续接降级，既不显示「可继续」，也不显示占位词；
-   * - activity：与圆点共用 activitySignalOf 证据链，因此圆点 ready 时绝不会显示
-   *   「正在运行」；只有明确 running/inactive 才映射原生文案，其余省略。
-   * 实际存在的值用 " · " 连接；都不可证明时返回空串——绝不输出
-   * 「无活动 / 模式未知 / 状态未知」这类占位词。
-   *
-   * @param {{title?: string|null, entry?: object|null, node?: object|null}} input
-   * @returns {string}
-   */
-  function formatAgentSummary(input) {
-    const source = isObject(input) ? input : {};
-    const catalog = isObject(source.entry) ? source.entry : {};
-    const node = isObject(source.node) ? source.node : {};
-    let modeText = modeLabelOf(catalog.mode);
-    // 目录项显式给出 unknown：这是「可续接性未知」的权威判定，按不可续接降级，
-    // 不再回退节点 continuable（否则会把未知说成「可继续」）。
-    if (modeText === null && typeof node.continuable === "boolean" && isUnknownMode(catalog.mode) !== true) {
-      modeText = node.continuable ? MODE_LABELS.continuable : MODE_LABELS["one-shot"];
-    }
-    const activitySignal = activitySignalOf(node, catalog);
-    const activityText = activitySignal === null ? null : ACTIVITY_LABELS[activitySignal];
-    return [text(source.title), modeText, activityText].filter((value) => value !== null).join(" · ");
   }
 
   function normalizeRunSummary(value) {
@@ -714,6 +662,120 @@
     }
     const millions = count / 1000000;
     return (millions < 10 ? millions.toFixed(1) : String(Math.round(millions))) + "M";
+  }
+
+  /**
+   * 紧凑运行时长（用量速览行）：<1s、1.2s、1m、28m27s、1h、1h2m。
+   *
+   * 与 formatDuration 的区别是「更短、更贴近摘要条」：不插入空格；整分不补 "0s"、
+   * 整点不补 "0m"；小时级忽略秒。缺失返回 null（调用方整段省略，绝不写 0/占位词）。
+   */
+  function formatDurationCompact(value) {
+    const ms = numberOrNull(value);
+    if (ms === null) return null;
+    const clamped = Math.max(0, ms);
+    if (clamped < 1000) return "<1s";
+    if (clamped < 60000) {
+      const seconds = (clamped / 1000).toFixed(1);
+      return (seconds.endsWith(".0") ? seconds.slice(0, -2) : seconds) + "s";
+    }
+    if (clamped < 3600000) {
+      const minutes = Math.floor(clamped / 60000);
+      const seconds = Math.floor((clamped % 60000) / 1000);
+      // 整分只写 "1m"：补 "0s" 只会让窄右栏多占两个字符而不增加信息。
+      return seconds === 0 ? minutes + "m" : minutes + "m" + seconds + "s";
+    }
+    const hours = Math.floor(clamped / 3600000);
+    const minutes = Math.floor((clamped % 3600000) / 60000);
+    // 整点只写 "1h"；有分钟才是 "1h2m"。
+    return minutes === 0 ? hours + "h" : hours + "h" + minutes + "m";
+  }
+
+  /** 平均吞吐文本：≥10 取整，<10 保留一位小数并去掉 .0，统一追加 tok/s。 */
+  function formatThroughputText(value) {
+    const rounded = value >= 10 ? String(Math.round(value)) : value.toFixed(1);
+    return (rounded.endsWith(".0") ? rounded.slice(0, -2) : rounded) + "tok/s";
+  }
+
+  /**
+   * 任务行「用量速览」的纯函数投影（用时 · tok/s · tok · 命中 · context）。
+   *
+   * 所有数值与文本都在模型层完成，渲染层只按顺序摆放；任何缺失项返回 null，
+   * 由调用方整段省略——绝不写 0 或占位词。百分比统一四舍五入并封顶 100。
+   *
+   * - 用时：调用方已解析好的 durationMs（DSH 模型用时优先，其次节点字段 → usage.runMs → 会话时间）；
+   * - tok/s：measuredTokensPerSecond（DSH 输出速度）优先；其次 outputTokens ÷（durationMs/1000）。
+   *   两种情况都要求吞吐 ≥0.1，且回退算法还要求运行时间 ≥1s、输出 token >0；
+   * - tok：总 token（计费输入 + 输出），复用 formatTokenCount；
+   * - 命中：cacheReadTokens ÷ billedInputTokens（cacheRead 为 0 是有效事实）；
+   * - context：(projectedTokens ?? pressureTokens) ÷ contextWindow。
+   *
+   * @param {object|null} usage - normalizeUsage 的结果（DEG usage ledger 投影）。
+   * @param {{durationMs?: number|null, contextPressure?: object|null, measuredTokensPerSecond?: number|null}} options
+   * @returns {{durationMs:number|null, durationText:string|null, tokensPerSecond:number|null,
+   *   throughputText:string|null, totalTokens:number|null, totalTokensText:string|null,
+   *   cacheHitPercent:number|null, cacheHitText:string|null, contextPercent:number|null,
+   *   contextText:string|null, contextUsedTokens:number|null, contextWindow:number|null}}
+   */
+  function summarizeUsageMetrics(usage, options) {
+    const source = isObject(usage) ? usage : {};
+    const settings = isObject(options) ? options : {};
+    const durationMs = countOrNull(settings.durationMs);
+    const durationText = formatDurationCompact(durationMs);
+    const outputTokens = countOrNull(source.outputTokens);
+    const billedInput = countOrNull(source.billedInputTokens);
+    // 总 token：优先用 normalizeUsage 已重算的 totalTokens，其次在两端齐备时自行相加。
+    let totalTokens = countOrNull(source.totalTokens);
+    if (totalTokens === null && billedInput !== null && outputTokens !== null) {
+      totalTokens = billedInput + outputTokens;
+    }
+    const totalTokensText = totalTokens === null ? null : (formatTokenCount(totalTokens) ?? null) + " tok";
+    // 平均吞吐：DSH 输出速度（decodeTokens/decodeMs）优先，不再受 durationMs ≥1s 的限制；
+    // 缺失时才回退 outputTokens/duration。两种情况都要求吞吐 ≥0.1
+    // （一位小数会把更小的值四舍五入成 0，等于伪造「没有产出」）。
+    let tokensPerSecond = null;
+    let throughputText = null;
+    const measured = numberOrNull(settings.measuredTokensPerSecond);
+    if (measured !== null && measured >= 0.1) {
+      tokensPerSecond = measured;
+      throughputText = formatThroughputText(measured);
+    } else if (durationMs !== null && durationMs >= 1000 && outputTokens !== null && outputTokens > 0) {
+      const value = outputTokens / (durationMs / 1000);
+      if (Number.isFinite(value) && value >= 0.1) {
+        tokensPerSecond = value;
+        throughputText = formatThroughputText(value);
+      }
+    }
+    // 缓存命中：cacheRead 缺失不显示；0 是有效值（显示 命中0%）。
+    const cacheRead = countOrNull(source.cacheReadTokens);
+    let cacheHitPercent = null;
+    if (cacheRead !== null && billedInput !== null && billedInput > 0) {
+      cacheHitPercent = Math.min(100, Math.round((cacheRead / billedInput) * 100));
+    }
+    const cacheHitText = cacheHitPercent === null ? null : "命中" + cacheHitPercent + "%";
+    // 上下文占用：projectedTokens 优先，其次 pressureTokens；窗口非正时整段省略。
+    const pressure = isObject(settings.contextPressure) ? settings.contextPressure : {};
+    const contextUsedTokens = countOrNull(pressure.projectedTokens) ?? countOrNull(pressure.pressureTokens);
+    const contextWindow = countOrNull(pressure.contextWindow);
+    let contextPercent = null;
+    if (contextUsedTokens !== null && contextWindow !== null && contextWindow > 0) {
+      contextPercent = Math.min(100, Math.round((contextUsedTokens / contextWindow) * 100));
+    }
+    const contextText = contextPercent === null ? null : "context " + contextPercent + "%";
+    return {
+      durationMs,
+      durationText,
+      tokensPerSecond,
+      throughputText,
+      totalTokens,
+      totalTokensText,
+      cacheHitPercent,
+      cacheHitText,
+      contextPercent,
+      contextText,
+      contextUsedTokens,
+      contextWindow,
+    };
   }
 
   /**
@@ -1536,7 +1598,7 @@ const MESSAGE_CATALOG = Object.freeze({
   },
   "sidebar.idleGroup": { zh: "空闲子代理（{count}）", en: "Idle subagents ({count})" },
   "sidebar.idleGroup.name": { zh: "空闲子代理", en: "Idle subagents" },
-  "sidebar.search.label": { zh: "任务过滤与导出", en: "Filter and export tasks" },
+  "sidebar.search.label": { zh: "任务过滤", en: "Filter tasks" },
   "sidebar.search.aria": { zh: "搜索任务", en: "Search tasks" },
   "sidebar.search.placeholder": { zh: "搜索任务名 / 角色 / 模型", en: "Search task name / role / model" },
   "sidebar.filter.role": { zh: "按角色筛选", en: "Filter by role" },
@@ -1544,8 +1606,6 @@ const MESSAGE_CATALOG = Object.freeze({
   "sidebar.filter.allRoles": { zh: "全部角色", en: "All roles" },
   "sidebar.filter.allStatuses": { zh: "全部状态", en: "All statuses" },
   "sidebar.filter.empty": { zh: "没有匹配的任务", en: "No matching tasks" },
-  "sidebar.export.markdown": { zh: "导出 Markdown", en: "Export Markdown" },
-  "sidebar.export.json": { zh: "导出 JSON", en: "Export JSON" },
   "sidebar.collapse": { zh: "收起", en: "Collapse" },
   "sidebar.expand": { zh: "展开", en: "Expand" },
   "sidebar.timeline.showAll": { zh: "查看全部", en: "Show all" },
@@ -1792,7 +1852,9 @@ const MESSAGE_CATALOG = Object.freeze({
     filterSnapshot,
     serializeSnapshot,
     runtimeStatusOf,
-    formatAgentSummary,
+    // 用量速览行（用户要求）：紧凑时长与「用时 · tok/s · tok · 命中 · context」五段投影。
+    formatDurationCompact,
+    summarizeUsageMetrics,
     formatExpertMetadata,
     defaultExpanded,
     createExpansionStore,

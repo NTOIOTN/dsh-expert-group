@@ -38,8 +38,6 @@ const ACTIVE_STATUS_SET=new Set(["queued","waiting","running"]);
 const RECOVERY_CODE_PATTERN=/^[A-Z][A-Z0-9_]{0,63}$/;
 const RECOVERY_MESSAGE_MAX_LENGTH=200;
 const RUNTIME_STATUSES=Object.freeze(["running","ready"]);
-const MODE_LABELS=Object.freeze({continuable:"可继续","one-shot":"一次性"});
-const ACTIVITY_LABELS=Object.freeze({running:"正在运行",inactive:"当前未运行"});
 const DEFAULT_COLLAPSED_STATUSES=new Set(["idle","ready","succeeded","cancelled"]);
 function isObject(value){
 return value!==null&&typeof value==="object"&&!Array.isArray(value);
@@ -188,26 +186,6 @@ const signal=activitySignalOf(node,entry);
 if(signal==="running")return"running";
 if(isObject(options)&&options.partial===true&&signal===null)return UNKNOWN_RUNTIME_STATUS;
 return"ready";
-}
-function modeLabelOf(value){
-const mode=text(value);
-if(mode===null)return null;
-return Object.prototype.hasOwnProperty.call(MODE_LABELS,mode)?MODE_LABELS[mode]:null;
-}
-function isUnknownMode(value){
-return text(value)==="unknown";
-}
-function formatAgentSummary(input){
-const source=isObject(input)?input:{};
-const catalog=isObject(source.entry)?source.entry:{};
-const node=isObject(source.node)?source.node:{};
-let modeText=modeLabelOf(catalog.mode);
-if(modeText===null&&typeof node.continuable==="boolean"&&isUnknownMode(catalog.mode)!==true){
-modeText=node.continuable?MODE_LABELS.continuable:MODE_LABELS["one-shot"];
-}
-const activitySignal=activitySignalOf(node,catalog);
-const activityText=activitySignal===null?null:ACTIVITY_LABELS[activitySignal];
-return[text(source.title),modeText,activityText].filter((value)=>value!==null).join(" · ");
 }
 function normalizeRunSummary(value){
 if(!isObject(value))return null;
@@ -425,6 +403,82 @@ return(thousands<10?thousands.toFixed(1):String(Math.round(thousands)))+"k";
 }
 const millions=count/1000000;
 return(millions<10?millions.toFixed(1):String(Math.round(millions)))+"M";
+}
+function formatDurationCompact(value){
+const ms=numberOrNull(value);
+if(ms===null)return null;
+const clamped=Math.max(0,ms);
+if(clamped<1000)return"<1s";
+if(clamped<60000){
+const seconds=(clamped/1000).toFixed(1);
+return(seconds.endsWith(".0")?seconds.slice(0,-2):seconds)+"s";
+}
+if(clamped<3600000){
+const minutes=Math.floor(clamped/60000);
+const seconds=Math.floor((clamped%60000)/1000);
+return seconds===0?minutes+"m":minutes+"m"+seconds+"s";
+}
+const hours=Math.floor(clamped/3600000);
+const minutes=Math.floor((clamped%3600000)/60000);
+return minutes===0?hours+"h":hours+"h"+minutes+"m";
+}
+function formatThroughputText(value){
+const rounded=value>=10?String(Math.round(value)):value.toFixed(1);
+return(rounded.endsWith(".0")?rounded.slice(0,-2):rounded)+"tok/s";
+}
+function summarizeUsageMetrics(usage,options){
+const source=isObject(usage)?usage:{};
+const settings=isObject(options)?options:{};
+const durationMs=countOrNull(settings.durationMs);
+const durationText=formatDurationCompact(durationMs);
+const outputTokens=countOrNull(source.outputTokens);
+const billedInput=countOrNull(source.billedInputTokens);
+let totalTokens=countOrNull(source.totalTokens);
+if(totalTokens===null&&billedInput!==null&&outputTokens!==null){
+totalTokens=billedInput+outputTokens;
+}
+const totalTokensText=totalTokens===null?null:(formatTokenCount(totalTokens)??null)+" tok";
+let tokensPerSecond=null;
+let throughputText=null;
+const measured=numberOrNull(settings.measuredTokensPerSecond);
+if(measured!==null&&measured>=0.1){
+tokensPerSecond=measured;
+throughputText=formatThroughputText(measured);
+}else if(durationMs!==null&&durationMs>=1000&&outputTokens!==null&&outputTokens>0){
+const value=outputTokens/(durationMs/1000);
+if(Number.isFinite(value)&&value>=0.1){
+tokensPerSecond=value;
+throughputText=formatThroughputText(value);
+}
+}
+const cacheRead=countOrNull(source.cacheReadTokens);
+let cacheHitPercent=null;
+if(cacheRead!==null&&billedInput!==null&&billedInput>0){
+cacheHitPercent=Math.min(100,Math.round((cacheRead/billedInput)*100));
+}
+const cacheHitText=cacheHitPercent===null?null:"命中"+cacheHitPercent+"%";
+const pressure=isObject(settings.contextPressure)?settings.contextPressure:{};
+const contextUsedTokens=countOrNull(pressure.projectedTokens)??countOrNull(pressure.pressureTokens);
+const contextWindow=countOrNull(pressure.contextWindow);
+let contextPercent=null;
+if(contextUsedTokens!==null&&contextWindow!==null&&contextWindow>0){
+contextPercent=Math.min(100,Math.round((contextUsedTokens/contextWindow)*100));
+}
+const contextText=contextPercent===null?null:"context "+contextPercent+"%";
+return{
+durationMs,
+durationText,
+tokensPerSecond,
+throughputText,
+totalTokens,
+totalTokensText,
+cacheHitPercent,
+cacheHitText,
+contextPercent,
+contextText,
+contextUsedTokens,
+contextWindow,
+};
 }
 function redactDisplayText(value,maxLength){
 const raw=typeof value==="string"?value:(value instanceof Error?value.message:"");
@@ -1078,7 +1132,7 @@ en:"Last update time (when this data was rendered)",
 },
 "sidebar.idleGroup":{zh:"空闲子代理（{count}）",en:"Idle subagents ({count})"},
 "sidebar.idleGroup.name":{zh:"空闲子代理",en:"Idle subagents"},
-"sidebar.search.label":{zh:"任务过滤与导出",en:"Filter and export tasks"},
+"sidebar.search.label":{zh:"任务过滤",en:"Filter tasks"},
 "sidebar.search.aria":{zh:"搜索任务",en:"Search tasks"},
 "sidebar.search.placeholder":{zh:"搜索任务名 / 角色 / 模型",en:"Search task name / role / model"},
 "sidebar.filter.role":{zh:"按角色筛选",en:"Filter by role"},
@@ -1086,8 +1140,6 @@ en:"Last update time (when this data was rendered)",
 "sidebar.filter.allRoles":{zh:"全部角色",en:"All roles"},
 "sidebar.filter.allStatuses":{zh:"全部状态",en:"All statuses"},
 "sidebar.filter.empty":{zh:"没有匹配的任务",en:"No matching tasks"},
-"sidebar.export.markdown":{zh:"导出 Markdown",en:"Export Markdown"},
-"sidebar.export.json":{zh:"导出 JSON",en:"Export JSON"},
 "sidebar.collapse":{zh:"收起",en:"Collapse"},
 "sidebar.expand":{zh:"展开",en:"Expand"},
 "sidebar.timeline.showAll":{zh:"查看全部",en:"Show all"},
@@ -1308,7 +1360,8 @@ createTaskFilter,
 filterSnapshot,
 serializeSnapshot,
 runtimeStatusOf,
-formatAgentSummary,
+formatDurationCompact,
+summarizeUsageMetrics,
 formatExpertMetadata,
 defaultExpanded,
 createExpansionStore,
@@ -1506,6 +1559,34 @@ if(snapshotHasUsageFact(attempt,depth+1))return true;
 }
 }
 return false;
+}
+function latestShardChildIdOf(shard){
+const source=object(shard);
+const attempts=Array.isArray(source.attempts)?source.attempts:[];
+const latest=attempts.length===0?null:object(attempts[attempts.length-1]);
+return text(latest?.childId,text(source.childId,null));
+}
+function collectSnapshotSessionIds(snapshot){
+const ids=[];
+const seen=new Set();
+let visited=0;
+const push=(value)=>{
+const id=text(value,null);
+if(id===null||seen.has(id))return;
+seen.add(id);
+ids.push(id);
+};
+const visit=(node,depth)=>{
+if(depth>12||visited>=4096)return;
+const source=object(node);
+if(Object.keys(source).length===0)return;
+visited+=1;
+push(source.sessionId);
+for(const shard of Array.isArray(source.shards)?source.shards:[])push(latestShardChildIdOf(shard));
+for(const child of Array.isArray(source.children)?source.children:[])visit(child,depth+1);
+};
+visit(object(snapshot).root,0);
+return ids;
 }
 function viewportWidthOf(){
 let value=null;
@@ -1785,28 +1866,10 @@ const running=sessionRunningOf(snapshot,sessionId);
 if(running===null)return entry;
 return{...entry,activity:running?"running":"inactive"};
 }
-function authoritativeTitleOf(snapshot,sessionId){
-if(sessionId===null)return null;
-const summary=object(object(object(snapshot).byId)[sessionId]);
-return text(summary.title,null);
-}
 function sessionRunningOf(snapshot,sessionId){
 if(sessionId===null)return null;
 const summary=object(object(object(snapshot).byId)[sessionId]);
 return typeof summary.running==="boolean"?summary.running:null;
-}
-function agentSummaryOf(node,entry,title){
-const model=modelApi();
-if(typeof model.formatAgentSummary==="function"){
-const source=object(node);
-if(source.kind==="root"){
-const rootEntry=entry===null||entry===undefined?entry:{...object(entry),mode:undefined};
-const rootNode={...source,continuable:undefined};
-return model.formatAgentSummary({title,entry:rootEntry,node:rootNode});
-}
-return model.formatAgentSummary({title,entry,node});
-}
-return text(title,"");
 }
 function metadataOf(node,roleLabels){
 const model=modelApi();
@@ -1922,41 +1985,6 @@ if(kind===null)continue;
 events.push({kind,name:next.name});
 }
 return events;
-}
-function downloadExportFile(result){
-if(!result||typeof result.content!=="string")return false;
-try{
-const BlobCtor=globalThis.Blob;
-const urlApi=globalThis.URL;
-const doc=globalThis.document;
-if(typeof BlobCtor!=="function"
-||urlApi===null||urlApi===undefined||typeof urlApi.createObjectURL!=="function"
-||doc===null||doc===undefined||typeof doc.createElement!=="function")return false;
-const blob=new BlobCtor([result.content],{type:typeof result.mimeType==="string"?result.mimeType:"text/plain"});
-const objectUrl=urlApi.createObjectURL(blob);
-try{
-const anchor=doc.createElement("a");
-anchor.href=objectUrl;
-anchor.download=typeof result.filename==="string"?result.filename:"expert-group-export";
-anchor.rel="noopener";
-anchor.style.display="none";
-try{doc.body?.appendChild?.(anchor);}catch{/* 没有 body 的宿主也允许 click 兜底。 */}
-try{anchor.click?.();}catch{/* 下载被宿主拒绝：序列化已完成，静默降级。 */}
-try{anchor.remove?.();}catch{try{doc.body?.removeChild?.(anchor);}catch{/* 清理失败不影响导出。 */}}
-}finally{
-const release=()=>{
-try{urlApi.revokeObjectURL(objectUrl);}catch{/* 释放失败不改变导出结果。 */}
-};
-if(typeof urlApi.revokeObjectURL==="function"){
-if(typeof globalThis.setTimeout==="function"){
-try{globalThis.setTimeout(release,0);}catch{release();}
-}else{
-release();
-}
-}
-}
-return true;
-}catch{return false;}
 }
 function safeNormalize(raw){
 const model=modelApi();
@@ -2241,14 +2269,14 @@ tag.textContent=[
 ".deg_expert_group_tree{min-width:0;padding-top:5px}",
 ".deg_expert_group_tree_items{min-width:0}",
 ".deg_expert_group_announcer{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}",
-".deg_expert_group_task:focus-visible,.deg_expert_group_content:focus-visible,.deg_expert_group_fanout_title>.deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
+".deg_expert_group_task:focus-visible,.deg_expert_group_fanout_title>.deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
 ".deg_expert_group_resizer{position:absolute;top:0;left:0;bottom:0;width:6px;cursor:col-resize;touch-action:none;background:transparent;z-index:2}",
 ".deg_expert_group_resizer:hover,.deg_expert_group_resizer[data-dragging=true]{background:var(--dsw-alias-interactive-bg-hover)}",
 ".deg_expert_group_resizer:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:-2px}",
 ".deg_expert_group_node{position:relative;min-width:0;padding-left:16px}",
 ".deg_expert_group_node_root{padding-left:0}",
-".deg_expert_group_row{box-sizing:border-box;display:grid;grid-template-columns:20px 20px minmax(0,1fr);min-width:0;min-height:60px;padding:4px 0}",
-".deg_expert_group_row_main{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto 16px 16px;min-width:0}",
+".deg_expert_group_row{box-sizing:border-box;display:grid;grid-template-columns:20px 20px minmax(0,1fr);min-width:0;min-height:44px;padding:4px 0}",
+".deg_expert_group_row_main{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto 16px;min-width:0}",
 ".deg_expert_group_task_line{grid-area:1 / 1;display:flex;align-items:center;min-width:0;gap:2px}",
 ".deg_expert_group_meta{grid-area:2 / 1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:11px}",
 ".deg_expert_group_sidebar_action{flex:0 0 30px;width:30px;height:20px;margin:-2px 0;padding:0;color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
@@ -2261,8 +2289,7 @@ tag.textContent=[
 ".deg_expert_group_line{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 ".deg_expert_group_task{min-width:0;flex:0 1 auto;font-weight:600;cursor:pointer}",
 ".deg_expert_group_shard_task{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere}",
-".deg_expert_group_task:hover,.deg_expert_group_content:hover{text-decoration:underline}",
-".deg_expert_group_content{grid-area:3 / 1;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));cursor:pointer}",
+".deg_expert_group_task:hover{text-decoration:underline}",
 ".deg_expert_group_chevron{width:20px;height:20px;padding:0;align-self:start}",
 ".deg_expert_group_fanout_header>.deg_expert_group_chevron{align-self:center}",
 ".deg_expert_group_chevron_placeholder{display:inline-block;width:20px;height:20px}",
@@ -2280,7 +2307,7 @@ tag.textContent=[
 ".deg_expert_group_sidebar_batch_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
 ".deg_expert_group_sidebar_batch_action:disabled{opacity:.45;cursor:wait}",
 ".deg_expert_group_sidebar_batch_zero{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary,#22d3ee))}",
-".deg_expert_group_children{position:relative;min-width:0;margin:0;padding:0;--deg-parent-row-height:60px}",
+".deg_expert_group_children{position:relative;min-width:0;margin:0;padding:0;--deg-parent-row-height:44px}",
 ".deg_expert_group_children>.deg_expert_group_node,.deg_expert_group_children>.deg_expert_group_fanout,.deg_expert_group_children>.deg_expert_group_idle_group{--deg-tree-anchor:14px;position:relative}",
 ".deg_expert_group_children>.deg_expert_group_fanout{--deg-tree-anchor:14px}",
 ".deg_expert_group_children>:first-child:before{position:absolute;top:calc(var(--deg-tree-anchor) - var(--deg-parent-row-height));bottom:calc(100% - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
@@ -2323,18 +2350,9 @@ tag.textContent=[
 ".deg_expert_group_attempt_usage_tokens{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
 ".deg_expert_group_attempt_cost{min-width:0;overflow-wrap:anywhere}",
 ".deg_expert_group_attempt_cost[data-cost-configured=false]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
-".deg_expert_group_usage{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
-".deg_expert_group_usage[data-usage=missing]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
 ".deg_expert_group_structured{min-width:0;margin:2px 0 0;padding:2px 4px;border-inline-start:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:15px;overflow-wrap:anywhere;max-height:84px;overflow:auto}",
 ".deg_expert_group_structured[data-fallback=true]{border-inline-start-color:var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
 ".deg_expert_group_shard_extra{display:flex;flex-direction:column;min-width:0}",
-".deg_expert_group_diagnostics{margin:4px 0 0;padding:5px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);font-size:11px}",
-".deg_expert_group_diagnostics_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
-".deg_expert_group_diagnostics_rows{display:flex;flex-direction:column;gap:2px;margin-top:3px}",
-".deg_expert_group_diag_row{display:flex;flex-wrap:wrap;gap:0 6px;min-width:0}",
-".deg_expert_group_diag_name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}",
-".deg_expert_group_diag_values{flex:1 1 160px;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary)}",
-".deg_expert_group_diagnostics_empty,.deg_expert_group_diagnostics_usage{margin-top:3px;color:var(--dsw-alias-label-secondary)}",
 ".deg_expert_group_dispatch{margin:4px 0 0;padding:6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);font-size:11px}",
 ".deg_expert_group_dispatch_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
 ".deg_expert_group_dispatch_row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:4px 8px;margin-top:4px}",
@@ -2365,7 +2383,6 @@ tag.textContent=[
 ".deg_expert_group_attempt[data-status=failed] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=timed_out] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=interrupted] .deg_expert_group_attempt_status{color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
 ".deg_expert_group_attempt_duration{flex:0 0 auto;font-variant-numeric:tabular-nums}",
 ".deg_expert_group_attempt_time{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
-".deg_expert_group_attempt_shard{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 ".deg_expert_group_attempts_toggle{flex:0 0 auto;align-self:flex-start;box-sizing:border-box;height:20px;margin:1px 0 0;padding:0 4px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
 ".deg_expert_group_attempts_toggle:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
 ".deg_expert_group_attempts_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
@@ -2373,9 +2390,10 @@ tag.textContent=[
 ".deg_expert_group_fanout_title>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
 ".deg_expert_group_toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:5px 0 2px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
 ".deg_expert_group_search{flex:1 1 120px;min-width:0;box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px}",
-".deg_expert_group_filter{flex:0 1 auto;min-width:0;box-sizing:border-box;height:24px;padding:0 2px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px}",
+".deg_expert_group_filter{flex:0 1 auto;min-width:0;box-sizing:border-box;height:24px;padding:0 2px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px;color-scheme:light}",
+"body[data-ds-dark-theme] .deg_expert_group_filter{color-scheme:dark}",
+".deg_expert_group_filter option{background-color:var(--dsw-alias-bg-layer-2,Canvas);color:var(--dsw-alias-label-primary,CanvasText)}",
 ".deg_expert_group_search:focus-visible,.deg_expert_group_filter:focus-visible,.deg_expert_group_export_button:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_export{display:flex;flex:0 0 auto;gap:4px;margin-left:auto}",
 ".deg_expert_group_export_button{box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
 ".deg_expert_group_export_button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
 ".deg_expert_group_filter_empty{padding:8px 2px;color:var(--dsw-alias-label-secondary);font-size:11px}",
@@ -3370,9 +3388,6 @@ const templatesPair=typeof react.useState==="function"
 :[{status:"idle",templates:[],count:0,limit:32,message:null},()=>{}];
 const templatesState=templatesPair[0];
 const setTemplatesState=templatesPair[1];
-const diagnosticsOpenPair=typeof react.useState==="function"?react.useState(false):[false,()=>{}];
-const diagnosticsOpen=diagnosticsOpenPair[0];
-const setDiagnosticsOpen=diagnosticsOpenPair[1];
 const announcerRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
 const announcementPair=typeof react.useState==="function"?react.useState(""):["",()=>{}];
 const announcement=announcementPair[0];
@@ -5912,6 +5927,10 @@ const formatDurationText=(value)=>{
 const fn=modelFunction("formatDuration");
 return fn===null?null:fn(value);
 };
+const formatCompactDuration=(value)=>{
+const fn=modelFunction("formatDurationCompact");
+return fn===null?null:fn(value);
+};
 const formatClockText=(value)=>{
 const fn=modelFunction("formatClockTime");
 return fn===null?null:fn(value);
@@ -6002,28 +6021,6 @@ const duration=formatDurationText(source.runMs);
 if(duration!==null)parts.push("运行时长 "+duration);
 return parts.length===0?"用量：—":"用量："+parts.join(" · ");
 };
-const renderUsageBadge=(value,options)=>{
-const usage=usageOf({usage:value});
-const kind=text(object(options).kind,"expert");
-if(usage===null){
-return react.createElement("span",{
-key:"usage",
-className:"deg_expert_group_usage",
-"data-usage":"missing",
-"data-kind":kind,
-title:"用量：—",
-},"用量 —");
-}
-const tokens=finiteToken(usage.totalTokens)??finiteToken(usage.inputTokens);
-const requests=finiteToken(usage.requests);
-return react.createElement("span",{
-key:"usage",
-className:"deg_expert_group_usage",
-"data-usage":"present",
-"data-kind":kind,
-title:usageTitleOf(usage),
-},"tok "+(tokenText(tokens)??"—")+" · 请求 "+(requests===null?"—":String(requests)));
-};
 const renderAttemptUsage=(entry,options)=>{
 const source=object(entry);
 const usage=usageOf(source);
@@ -6106,12 +6103,197 @@ role:"status",
 title:content,
 },content);
 };
+const sessionSummaryOf=(sessionId)=>{
+if(sessionId===null)return null;
+const summary=object(object(sessionsSnapshot.byId)[sessionId]);
+return Object.keys(summary).length===0?null:summary;
+};
+const projectionValueOf=(sessionId,key)=>{
+if(sessionId===null||key===null)return null;
+const summary=object(sessionSummaryOf(sessionId));
+const fromSummary=object(summary.projectionValues)[key];
+if(fromSummary!==undefined&&fromSummary!==null)return fromSummary;
+const projection=object(object(object(sessionsSnapshot.projectionsBySession)[sessionId]).values);
+const fromProjection=projection[key];
+if(fromProjection!==undefined&&fromProjection!==null)return fromProjection;
+const readProjection=config.sessions?.projectionValues;
+if(typeof readProjection!=="function")return null;
+try{
+const value=readProjection.call(config.sessions,sessionId);
+const container=object(value);
+if(container[key]!==undefined&&container[key]!==null)return container[key];
+return value===undefined?null:value;
+}catch{
+return null;
+}
+};
+const contextPressureOfValue=(value)=>{
+const source=object(value);
+for(const field of["projectedTokens","pressureTokens","contextWindow"]){
+if(finiteNumber(source[field])!==null)return source;
+}
+return null;
+};
+const contextPressureOf=(sessionId)=>contextPressureOfValue(projectionValueOf(sessionId,"contextPressure"));
+const projectionNumber=(value)=>(typeof value==="number"&&Number.isFinite(value)&&value>=0?value:null);
+const DSH_STATS_FIELDS=Object.freeze(["llmMs","toolMs","decodeMs","decodeTokens"]);
+const DSH_TOKEN_FIELDS=Object.freeze([
+"uncachedInputTokens","cacheReadTokens","cacheWriteTokens","outputTokens",
+]);
+const dshMetricsOf=(sessionIds)=>{
+const ids=Array.isArray(sessionIds)?sessionIds:[];
+const stats={};
+const tokens={};
+let contributors=0;
+for(const rawId of ids){
+const sessionId=text(rawId,null);
+if(sessionId===null)continue;
+const statsValue=object(projectionValueOf(sessionId,"sessionStats"));
+const tokensValue=object(projectionValueOf(sessionId,"tokenUsage"));
+let touched=false;
+for(const field of DSH_STATS_FIELDS){
+const value=projectionNumber(statsValue[field]);
+if(value===null)continue;
+stats[field]=(stats[field]??0)+value;
+touched=true;
+}
+for(const field of DSH_TOKEN_FIELDS){
+const value=projectionNumber(tokensValue[field]);
+if(value===null)continue;
+tokens[field]=(tokens[field]??0)+value;
+touched=true;
+}
+if(touched)contributors+=1;
+}
+if(contributors===0)return null;
+const valueOf=(bag,field)=>(bag[field]===undefined?null:bag[field]);
+return{
+sessionCount:contributors,
+llmMs:valueOf(stats,"llmMs"),
+toolMs:valueOf(stats,"toolMs"),
+decodeMs:valueOf(stats,"decodeMs"),
+decodeTokens:valueOf(stats,"decodeTokens"),
+uncachedInputTokens:valueOf(tokens,"uncachedInputTokens"),
+cacheReadTokens:valueOf(tokens,"cacheReadTokens"),
+cacheWriteTokens:valueOf(tokens,"cacheWriteTokens"),
+outputTokens:valueOf(tokens,"outputTokens"),
+};
+};
+const dshUsageOf=(metrics)=>{
+if(metrics===null)return null;
+const{uncachedInputTokens,cacheReadTokens,cacheWriteTokens,outputTokens}=metrics;
+if(uncachedInputTokens===null&&cacheReadTokens===null&&cacheWriteTokens===null&&outputTokens===null){
+return null;
+}
+const complete=uncachedInputTokens!==null&&cacheReadTokens!==null&&cacheWriteTokens!==null;
+const billedInputTokens=complete?uncachedInputTokens+cacheReadTokens+cacheWriteTokens:null;
+return{
+inputTokens:uncachedInputTokens,
+cacheReadTokens,
+cacheWriteTokens,
+outputTokens,
+billedInputTokens,
+totalTokens:billedInputTokens!==null&&outputTokens!==null?billedInputTokens+outputTokens:null,
+};
+};
+const dshThroughputOf=(metrics)=>{
+if(metrics===null||metrics.decodeMs===null||metrics.decodeTokens===null)return null;
+if(metrics.decodeMs<=0||metrics.decodeTokens<=0)return null;
+return metrics.decodeTokens/(metrics.decodeMs/1000);
+};
+const fanoutSessionIdsOf=(task)=>{
+const ids=[];
+const seen=new Set();
+const source=object(task);
+for(const shard of Array.isArray(source.shards)?source.shards:[]){
+const childId=latestShardChildIdOf(shard);
+if(childId===null||seen.has(childId))continue;
+seen.add(childId);
+ids.push(childId);
+}
+return ids;
+};
+const sessionStatsPresentOf=(sessionId)=>{
+const value=object(projectionValueOf(sessionId,"sessionStats"));
+for(const field of DSH_STATS_FIELDS){
+if(projectionNumber(value[field])!==null)return true;
+}
+return false;
+};
+const projectionRefreshRequestedRef=typeof react.useRef==="function"
+?react.useRef(new Set())
+:{current:new Set()};
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(snapshot===null||snapshot===undefined)return;
+let service=null;
+let refreshProjections=null;
+try{
+service=config.sessions??ctx?.sessions??null;
+refreshProjections=service===null||service===undefined?null:service.refreshProjections;
+}catch{
+service=null;
+refreshProjections=null;
+}
+if(typeof refreshProjections!=="function")return;
+const requested=projectionRefreshRequestedRef.current;
+for(const sessionId of collectSnapshotSessionIds(snapshot)){
+if(requested.has(sessionId))continue;
+if(sessionStatsPresentOf(sessionId)===true)continue;
+requested.add(sessionId);
+try{
+const pending=refreshProjections.call(service,sessionId);
+if(pending!==null&&typeof pending==="object"&&typeof pending.catch==="function"){
+pending.catch(()=>{});
+}
+}catch{
+}
+}
+},[snapshot,rootSessionId]);
+}
+const durationOfNode=(source,runtimeStatus,sessionId)=>{
+const direct=finiteNumber(source.durationMs);
+if(direct!==null)return direct;
+const usage=usageOf(source);
+const runMs=finiteNumber(usage===null?null:usage.runMs);
+if(runMs!==null)return runMs;
+const summary=object(sessionSummaryOf(sessionId));
+const startedAt=finiteNumber(source.startedAt)??finiteNumber(summary.createdAt);
+if(startedAt===null)return null;
+const endedAt=runtimeStatus==="running"
+?(finiteNumber(object(snapshot).generatedAt)??finiteNumber(sessionsSnapshot.generatedAt))
+:(finiteNumber(summary.updatedAt)??finiteNumber(source.lastActivityAt));
+if(endedAt===null)return null;
+const elapsed=endedAt-startedAt;
+return elapsed>0?elapsed:null;
+};
 const renderMetrics=(node,options={})=>{
 const source=object(node);
 const status=statusOf(source);
 const kind=text(options.kind,text(source.kind,"expert"));
+const runtimeStatus=text(options.runtimeStatus,null);
+const sessionId=text(options.sessionId,null);
+const sessionIds=Array.isArray(options.sessionIds)
+?options.sessionIds
+:(sessionId===null?[]:[sessionId]);
+const api=modelApi();
+const dsh=dshMetricsOf(sessionIds);
+const dshUsage=dshUsageOf(dsh);
+const usage=dshUsage!==null?dshUsage:usageOf(source);
+const measuredTps=dshThroughputOf(dsh);
+const dshLlmMs=dsh===null?null:dsh.llmMs;
+const dshDuration=dshLlmMs!==null&&dshLlmMs>0?dshLlmMs:null;
+const durationMs=dshDuration!==null?dshDuration:durationOfNode(source,runtimeStatus,sessionId);
+const summary=typeof api?.summarizeUsageMetrics==="function"
+?api.summarizeUsageMetrics(usage,{
+durationMs,
+contextPressure:contextPressureOf(sessionId),
+measuredTokensPerSecond:measuredTps,
+})
+:null;
 const segments=[];
 const pushSegment=(key,textValue,titleValue)=>{
+if(typeof textValue!=="string"||textValue.length===0)return;
 if(segments.length>0){
 segments.push(react.createElement("span",{
 key:key+"-separator",
@@ -6125,16 +6307,25 @@ className:"deg_expert_group_metrics_part",
 title:typeof titleValue==="string"?titleValue:textValue,
 },textValue));
 };
-const startedAt=finiteNumber(source.startedAt);
-const startedClock=formatClockText(startedAt);
-if(startedClock!==null)pushSegment("started","开始 "+startedClock,formatIsoText(startedAt)??("开始 "+startedClock));
-const durationText=formatDurationText(source.durationMs);
-if(durationText!==null)pushSegment("duration","耗时 "+durationText);
+if(summary!==null){
+const toolDurationText=dsh===null||dsh.toolMs===null?null:formatCompactDuration(dsh.toolMs);
+const durationTitle=summary.durationText===null?null
+:dshDuration!==null
+?"模型用时 "+summary.durationText+(toolDurationText===null?"":" · 工具调用用时 "+toolDurationText)
+:"运行时间 "+summary.durationText;
+pushSegment("duration",summary.durationText===null?null:"用时"+summary.durationText,durationTitle);
+pushSegment("throughput",summary.throughputText,
+summary.throughputText===null?null:(measuredTps===null?"平均吞吐 ":"输出速度 ")+summary.throughputText);
+const usageTitle=usage===null?null:usageTitleOf(usage);
+pushSegment("tokens",summary.totalTokensText,
+usageTitle===null?summary.totalTokensText:usageTitle.slice(0,400));
+pushSegment("cache-hit",summary.cacheHitText,
+summary.cacheHitPercent===null?null:"缓存命中率 "+summary.cacheHitPercent+"%（缓存读 ÷ 计费输入）");
+pushSegment("context",summary.contextText,
+summary.contextPercent===null?null
+:"上下文占用 "+summary.contextPercent+"%（已用 "+summary.contextUsedTokens+" / 窗口 "+summary.contextWindow+"）");
+}
 const retryCount=finiteNumber(source.retryCount);
-if(retryCount!==null)pushSegment("retry","重试 "+retryCount+" 次","已重试 "+retryCount+" 次");
-const lastActivityAt=finiteNumber(source.lastActivityAt);
-const lastActivityClock=formatClockText(lastActivityAt);
-if(lastActivityClock!==null)pushSegment("activity","最近活动 "+lastActivityClock,formatIsoText(lastActivityAt)??("最近活动 "+lastActivityClock));
 const retryWarning=retryCount!==null&&retryCount>=retryWarningThreshold()
 ?react.createElement("span",{
 key:"retry-warning",
@@ -6145,13 +6336,13 @@ title:"已重试 "+retryCount+" 次",
 },"多次重试")
 :null;
 const failure=isFailureStatusOf(status)?renderFailureSummary(source.failure):null;
-const usageBadge=renderUsageBadge(source.usage,{kind});
+if(segments.length===0&&retryWarning===null&&failure===null)return null;
 return react.createElement("div",{
 className:"deg_expert_group_metrics",
 "data-metrics-kind":kind,
 role:"group",
-"aria-label":"任务时间信息",
-},...segments,usageBadge,retryWarning,failure);
+"aria-label":"任务用量摘要",
+},...segments,retryWarning,failure);
 };
 const renderAttemptTimeline=(node,options={})=>{
 const timelineOf=modelFunction("attemptTimelineOf");
@@ -6191,21 +6382,12 @@ className:"deg_expert_group_attempt_time",
 title:formatIsoText(timestamp)??clock,
 },clock));
 }
-const shardId=text(entry.shardId,null);
-if(shardId!==null){
-cells.push(react.createElement("span",{
-key:"shard",
-className:"deg_expert_group_attempt_shard",
-title:text(entry.shardTaskName,shardId),
-},shardId));
-}
 return react.createElement("div",{
-key:key+":"+(shardId??"single")+":"+attemptNumber+":"+index,
+key:key+":"+attemptNumber+":"+index,
 className:"deg_expert_group_attempt",
 role:"listitem",
 "data-status":attemptStatus,
 "data-attempt":String(attemptNumber),
-...(shardId===null?{}:{"data-shard-id":shardId}),
 },
 react.createElement("div",{className:"deg_expert_group_attempt_row"},...cells),
 renderAttemptUsage(entry,{
@@ -6247,15 +6429,7 @@ role:"list",
 "data-expanded":expanded,
 },...rows,toggle);
 };
-const exportSnapshotAs=(format)=>{
-if(snapshot===null)return false;
-const serialize=modelFunction("serializeSnapshot");
-if(serialize===null)return false;
-let result=null;
-try{result=serialize(snapshot,{format});}catch{return false;}
-return downloadExportFile(result);
-};
-const renderThreeLines=(node,options={})=>{
+const renderRowMain=(node,options={})=>{
 const source=object(node);
 const fullName=titleOf(source);
 const oneLine=options.oneLine!==false;
@@ -6277,14 +6451,6 @@ tabIndex:0,
 "aria-label":taskLabel,
 onKeyDown,
 };
-const entry=catalogEntryOf(parentId,clickableId);
-const summary=agentSummaryOf(source,entry,authoritativeTitleOf(sessionsSnapshot,clickableId));
-const summaryProps=onNavigate===undefined?{}:{
-role:"button",
-tabIndex:0,
-"aria-label":"打开任务会话："+(summary===""?fullName:summary),
-onKeyDown,
-};
 const metadata=metadataOf(source,mergedRoleLabels);
 const taskClassName="deg_expert_group_line deg_expert_group_task"
 +(oneLine?"":" deg_expert_group_shard_task");
@@ -6299,8 +6465,7 @@ className:"deg_expert_group_task_line"+(trailing===null?"":" deg_expert_group_ta
 },...taskChildren);
 const rowMain=react.createElement("div",{className:"deg_expert_group_row_main","data-kind":source.kind||"expert","data-expanded":true},
 taskLine,
-react.createElement("div",{className:"deg_expert_group_meta",title:metadata},metadata),
-react.createElement("div",{className:"deg_expert_group_line deg_expert_group_content",title:summary,onClick:onNavigate,...summaryProps},summary));
+react.createElement("div",{className:"deg_expert_group_meta",title:metadata},metadata));
 const extras=[];
 if(options.metrics!==undefined&&options.metrics!==null)extras.push(options.metrics);
 if(options.footer!==undefined&&options.footer!==null)extras.push(options.footer);
@@ -6338,10 +6503,10 @@ role:"treeitem",
 },
 statusIcon(react,primitives,runtimeStatus),
 chevron,
-react.createElement("div",null,renderThreeLines(node,{
+react.createElement("div",null,renderRowMain(node,{
 sessionId:node.sessionId,
 parentId,
-metrics:renderMetrics(node,{kind:node.kind||"expert"}),
+metrics:renderMetrics(node,{kind:node.kind||"expert",runtimeStatus,sessionId:node.sessionId,sessionIds:[node.sessionId]}),
 footer:renderStructuredBlock(node.structured,node.outputSchemaRequested,{kind:node.kind||"expert"}),
 }))),
 hasChildren&&expertOpen
@@ -6764,11 +6929,11 @@ role:"treeitem",
 },
 statusIcon(react,primitives,runtimeStatus),
 renderChevron(shardNode,shardOpen),
-renderThreeLines(shardNode,{
+renderRowMain(shardNode,{
 sessionId:latestChildId,
 parentId:rootSessionId,
 oneLine:false,
-metrics:renderMetrics(shard,{kind:"shard"}),
+metrics:renderMetrics(shard,{kind:"shard",runtimeStatus,sessionId:latestChildId,sessionIds:[latestChildId]}),
 footer:shardFooter,
 }),
 react.createElement("div",{className:"deg_expert_group_actions"},actions));
@@ -6788,8 +6953,6 @@ const actions=showCancel
 ?[renderAction("取消父任务（未完成 "+incomplete+" 个分片）","IconStopFillRegular",()=>runAction({action:"fanout-cancel-parent",parentTaskId:task.parentTaskId},parentKey,true,"确认取消父任务？未完成 "+incomplete+" 个分片。"),pendingSet.current.has(parentKey))]
 :[];
 const runtimeStatus=runtimeStatusOf(task,null);
-const timelineSource=filterActive===true&&taskFilter!==null?{...task,shards:visibleShards}:task;
-const fanoutTimeline=open?renderAttemptTimeline(timelineSource,{key:"fanout:"+rootSessionId+":"+task.parentTaskId}):null;
 const meta=treeMeta!==undefined&&treeMeta!==null
 ?treeMeta
 :{level:2,posinset:index+1,setsize:index+1};
@@ -6835,14 +6998,13 @@ title:fanoutTitle,
 ...(fanoutNavigable?{role:"button",tabIndex:0,"aria-label":"打开任务会话："+fanoutTitle,onKeyDown:onFanoutKeyDown}:{}),
 onClick:fanoutNavigable?()=>handleOpen(fanoutNavigationId):undefined,
 },fanoutTitle),
-renderMetrics(task,{kind:"fanout"})),
+renderMetrics(task,{kind:"fanout",runtimeStatus,sessionIds:fanoutSessionIdsOf(task)})),
 react.createElement("div",{className:"deg_expert_group_actions"},actions)),
 open?react.createElement("div",{className:"deg_expert_group_fanout_shards deg_expert_group_tree_children",role:"group"},visibleShards.map((shard,shardIndex)=>renderShard(task,shard,shardIndex,{
 level:meta.level+1,
 posinset:shardIndex+1,
 setsize:visibleShards.length,
-}))):null,
-fanoutTimeline);
+}))):null);
 };
 const children=Array.isArray(snapshot?.root?.children)?snapshot.root.children:[];
 const filterSource=filterState.rootSessionId===rootSessionId?filterState:emptyFilter;
@@ -6862,64 +7024,6 @@ const visibleIdleChildren=filterActive===true?idleChildren.filter((node)=>passes
 const rootBatchSlot=filterActive===true?null:renderSidebarBatchSlot(runningSidebarResourceAddresses(),"运行中的子代理");
 const idleBatchSlot=filterActive===true?null:renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren),t("sidebar.idleGroup.name"));
 const root=snapshot?.root;
-const renderDiagnostics=()=>{
-if(diagnosticsOpen!==true)return null;
-const metaThrottle=meta===null?null:meta.throttle;
-const rows=[];
-const pushRows=(kind,list)=>{
-for(const value of Array.isArray(list)?list:[]){
-const row=object(value);
-const key=text(kind==="role"?row.role:row.provider,null);
-if(key===null)continue;
-const limit=finiteNumber(row.limit);
-const running=finiteNumber(row.running);
-const queued=finiteNumber(row.queued);
-const etaMs=finiteNumber(row.etaMs);
-const etaText=etaMs===null?"未知":(formatDurationText(etaMs)??"未知");
-const limitText=limit===null?"—":(limit===0?"不限":String(limit));
-const nameText=kind==="role"?(roleLabelFor(key,null)??key):key;
-rows.push(react.createElement("div",{
-key:kind+":"+key,
-className:"deg_expert_group_diag_row",
-"data-kind":kind,
-"data-key":key,
-"data-eta-source":text(row.etaSource,"unknown"),
-},
-react.createElement("span",{className:"deg_expert_group_diag_name",title:key},nameText+(kind==="role"?"（角色）":"（provider）")),
-react.createElement("span",{className:"deg_expert_group_diag_values"},
-"运行 "+(running===null?"—":String(running))
-+" · 排队 "+(queued===null?"—":String(queued))
-+" · 上限 "+limitText
-+" · 预计等待 "+etaText)));
-}
-};
-if(metaThrottle!==null){
-pushRows("role",metaThrottle.roles);
-pushRows("provider",metaThrottle.providers);
-}
-const totals=meta===null?null:object(object(meta.usage).totals);
-return react.createElement("section",{
-className:"deg_expert_group_diagnostics",
-role:"region",
-"aria-label":"排队与限流诊断",
-},
-react.createElement("div",{className:"deg_expert_group_diagnostics_head"},
-react.createElement("span",null,"排队与限流诊断"),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":"收起排队与限流诊断",
-onClick:()=>setDiagnosticsOpen(false),
-},"收起")),
-meta===null
-?react.createElement("div",{className:"deg_expert_group_diagnostics_empty"},"诊断读取中…")
-:(rows.length===0
-?react.createElement("div",{className:"deg_expert_group_diagnostics_empty"},"暂无排队/限流诊断（宿主未提供）")
-:react.createElement("div",{className:"deg_expert_group_diagnostics_rows",role:"list"},...rows)),
-totals===null
-?null
-:react.createElement("div",{className:"deg_expert_group_diagnostics_usage"},renderUsageBadge(totals,{kind:"totals"})));
-};
 const renderDispatchField=(label,control)=>react.createElement("label",{className:"deg_expert_group_dispatch_field"},
 react.createElement("span",{className:"deg_expert_group_dispatch_label"},label),
 control);
@@ -7157,17 +7261,6 @@ for(const shard of Array.isArray(node.shards)?node.shards:[])addRole(shard.role)
 };
 collectRoles(root?.children);
 roles.sort();
-const exportButton=(format,label,visibleText)=>react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":label,
-title:label,
-onClick:(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-exportSnapshotAs(format);
-},
-},visibleText);
 return react.createElement("div",{className:"deg_expert_group_toolbar",role:"search","aria-label":t("sidebar.search.label")},
 react.createElement("input",{
 type:"search",
@@ -7219,23 +7312,7 @@ event?.preventDefault?.();
 event?.stopPropagation?.();
 void replayLastDispatch();
 },
-},"重放上次"),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":"排队与限流诊断",
-"aria-expanded":diagnosticsOpen,
-onClick:(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-const next=diagnosticsOpen!==true;
-setDiagnosticsOpen(next);
-if(next&&metaStateRef.current===null)void loadMeta();
-},
-},"诊断"),
-react.createElement("div",{className:"deg_expert_group_export"},
-exportButton("markdown",t("sidebar.export.markdown"),"MD"),
-exportButton("json",t("sidebar.export.json"),"JSON")));
+},"重放上次"));
 };
 const rootOpen=root===null?true:expand(root);
 const idleGroupVisible=!(filterActive===true&&visibleIdleChildren.length===0);
@@ -7299,7 +7376,6 @@ const body=viewState.loading&&snapshot===null
 ?react.createElement("div",{className:"deg_expert_group_empty"},t("sidebar.empty"))
 :react.createElement("div",{className:"deg_expert_group_tree"},
 renderToolbar(),
-renderDiagnostics(),
 renderDispatchForm(),
 renderDispatchReceipt(),
 react.createElement("div",{className:"deg_expert_group_tree_items",role:"tree","aria-label":"专家任务树"},
@@ -7313,12 +7389,12 @@ role:"treeitem",
 "aria-expanded":rootOpen,
 "data-status":rootStatus,
 "data-expanded":rootOpen,
-},statusIcon(react,primitives,rootStatus),renderChevron(root,rootOpen),react.createElement("div",null,renderThreeLines(root,{
+},statusIcon(react,primitives,rootStatus),renderChevron(root,rootOpen),react.createElement("div",null,renderRowMain(root,{
 sessionId:root.sessionId,
 parentId:null,
 expanded:true,
 trailing:rootBatchSlot,
-metrics:renderMetrics(root,{kind:"root"}),
+metrics:renderMetrics(root,{kind:"root",runtimeStatus:rootStatus,sessionId:root.sessionId,sessionIds:[root.sessionId]}),
 }))),
 rootOpen?react.createElement("div",{className:"deg_expert_group_children",role:"group"},[
 ...visibleChildren.map((node,index)=>node.kind==="fanout"

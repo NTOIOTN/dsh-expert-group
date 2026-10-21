@@ -64,7 +64,7 @@
    * 20% 只是**默认值**：用户拖拽手柄或按方向键调整之后，比例写进 localStorage，之后每次
    * 挂载、视口变化与「宿主夺回宽度」的恢复写入都按这份偏好重算（见 resolveExpertRightbarWidthRatio）。
    * 边界取舍：
-   * - 下限 15%：再窄时间线条（开始/耗时/重试）与批量控件会挤成不可读的一列；
+   * - 下限 15%：再窄用量摘要条（用时/tok/s/tok/命中/context）与批量控件会挤成不可读的一列；
    * - 上限 50%：与宿主「其它右侧分页」的可调上限一致，Expert Group 页绝不比宿主自己的分栏模式更宽；
    * - 比例是**视口比例**，写进宿主 layout store 的仍是取整后的像素值。
    */
@@ -485,6 +485,59 @@
       }
     }
     return false;
+  }
+
+  /**
+   * 分片「最新 attempt 的 childId」，缺失时回退分片自身的 childId（两者都没有返回 null）。
+   *
+   * 分片每次重试都会换一个 child 会话，只有最新 attempt 才代表这一行**当前**对应的 DSH 会话；
+   * 读旧 attempt 的投影会拿到历史会话的数字（用户会看到与状态矛盾的用量）。摘要条聚合与
+   * 按需投影加载必须共用这一条归属规则，避免两处各判一次而漂移。
+   */
+  function latestShardChildIdOf(shard) {
+    const source = object(shard);
+    const attempts = Array.isArray(source.attempts) ? source.attempts : [];
+    const latest = attempts.length === 0 ? null : object(attempts[attempts.length - 1]);
+    return text(latest?.childId, text(source.childId, null));
+  }
+
+  /**
+   * 收集当前 DEG 树里所有「可投影会话」的 id（按首次出现顺序去重）。
+   *
+   * 用途：sessionStats 属于客户端按需投影，只有会话被打开过或经公开的
+   * sessions.refreshProjections(sessionId) 显式刷新后才会进入 sessions 快照；未打开过的 child
+   * 不会自动加载，旧专家行因此只能回退 DEG（出现「用时<1s」与缺 TPS）。面板需要在拿到 DEG
+   * 快照后按需请求一次，因此先要有这份「树里出现了哪些会话」的纯读清单。
+   *
+   * 归属规则与摘要条同源：
+   * - root：根节点的 sessionId；
+   * - 普通专家（可嵌套）：node.sessionId；
+   * - 分片：最新 attempt 的 childId，缺失回退 shard.childId；
+   * - fan-out 父任务没有单一会话，只贡献各 shard 的最新 childId；
+   * - children 递归（深度与节点数都有界，坏数据/手工构造的超大树不会把渲染期卡死）。
+   * 缺失或非字符串的 id 直接跳过，绝不猜一个 id 去请求投影。
+   */
+  function collectSnapshotSessionIds(snapshot) {
+    const ids = [];
+    const seen = new Set();
+    let visited = 0;
+    const push = (value) => {
+      const id = text(value, null);
+      if (id === null || seen.has(id)) return;
+      seen.add(id);
+      ids.push(id);
+    };
+    const visit = (node, depth) => {
+      if (depth > 12 || visited >= 4096) return;
+      const source = object(node);
+      if (Object.keys(source).length === 0) return;
+      visited += 1;
+      push(source.sessionId);
+      for (const shard of Array.isArray(source.shards) ? source.shards : []) push(latestShardChildIdOf(shard));
+      for (const child of Array.isArray(source.children) ? source.children : []) visit(child, depth + 1);
+    };
+    visit(object(snapshot).root, 0);
+    return ids;
   }
 
   /**
@@ -981,16 +1034,6 @@
   }
 
   /**
-   * 权威会话标题：只接受 sessions 快照的 byId[id].title。
-   * displayTitle 会在没有标题时回落到 session id，因此绝不拿它当标题文案。
-   */
-  function authoritativeTitleOf(snapshot, sessionId) {
-    if (sessionId === null) return null;
-    const summary = object(object(object(snapshot).byId)[sessionId]);
-    return text(summary.title, null);
-  }
-
-  /**
    * byId 投影里的会话运行状态（官方活动轴）。
    *
    * 0.1.7-alpha.2 的子代理目录投影只保证身份类字段（id/createdAt/mode/label），不再携带
@@ -1001,25 +1044,6 @@
     if (sessionId === null) return null;
     const summary = object(object(object(snapshot).byId)[sessionId]);
     return typeof summary.running === "boolean" ? summary.running : null;
-  }
-
-  /**
-   * 第三行动态摘要：模型可用时复用 DSH 原生代理行的同源组合，否则只保留权威标题。
-   * 根节点是导航树入口，不代表可恢复的专家执行，因此明确省略 mode，只保留 title/activity。
-   */
-  function agentSummaryOf(node, entry, title) {
-    const model = modelApi();
-    if (typeof model.formatAgentSummary === "function") {
-      const source = object(node);
-      if (source.kind === "root") {
-        // 不改变普通专家的 mode 语义；root-only 副本同时屏蔽目录 mode 与 continuable 回退。
-        const rootEntry = entry === null || entry === undefined ? entry : { ...object(entry), mode: undefined };
-        const rootNode = { ...source, continuable: undefined };
-        return model.formatAgentSummary({ title, entry: rootEntry, node: rootNode });
-      }
-      return model.formatAgentSummary({ title, entry, node });
-    }
-    return text(title, "");
   }
 
   function metadataOf(node, roleLabels) {
@@ -1035,7 +1059,7 @@
    * 第一行文案。
    *
    * - 根节点固定为中文「主代理」：绝不显示 root taskName/title/displayTitle/session id，
-   *   也不接受任何 session- 前缀回退；根会话的权威标题只出现在第三行摘要里。
+   *   也不接受任何 session- 前缀回退；侧栏精简后根会话的权威标题不再出现在任何一行。
    * - 普通专家节点继续显示 Host 投影的最新 dispatch 短描述（context.label /
    *   lastDispatch.description / 冷会话标题），重复 dispatch 后即为最新描述。
    * - fan-out 分支标题保留 role、分片数与规范运行状态词。
@@ -1225,52 +1249,6 @@
       events.push({ kind, name: next.name });
     }
     return events;
-  }
-
-  /**
-   * 把序列化结果交给浏览器下载（票据 12 的导出交付面）。
-   *
-   * 纯客户端：Blob + object URL + 一个临时 <a download>，不接触宿主状态、不发 RPC。
-   * 任何一步不可用（Node 测试、无 document/Blob/URL 的宿主、隐私模式拒绝）都返回 false，
-   * 绝不抛错——调用方据此保留「序列化本身已完成」的事实，界面不会因为下载失败而崩。
-   *
-   * object URL 在 click 之后立即 revoke：临时锚点不再需要这份句柄，早释放避免长会话泄漏。
-   */
-  function downloadExportFile(result) {
-    if (!result || typeof result.content !== "string") return false;
-    try {
-      const BlobCtor = globalThis.Blob;
-      const urlApi = globalThis.URL;
-      const doc = globalThis.document;
-      if (typeof BlobCtor !== "function"
-        || urlApi === null || urlApi === undefined || typeof urlApi.createObjectURL !== "function"
-        || doc === null || doc === undefined || typeof doc.createElement !== "function") return false;
-      const blob = new BlobCtor([result.content], { type: typeof result.mimeType === "string" ? result.mimeType : "text/plain" });
-      const objectUrl = urlApi.createObjectURL(blob);
-      try {
-        const anchor = doc.createElement("a");
-        anchor.href = objectUrl;
-        anchor.download = typeof result.filename === "string" ? result.filename : "expert-group-export";
-        anchor.rel = "noopener";
-        anchor.style.display = "none";
-        try { doc.body?.appendChild?.(anchor); } catch { /* 没有 body 的宿主也允许 click 兜底。 */ }
-        try { anchor.click?.(); } catch { /* 下载被宿主拒绝：序列化已完成，静默降级。 */ }
-        try { anchor.remove?.(); } catch { try { doc.body?.removeChild?.(anchor); } catch { /* 清理失败不影响导出。 */ } }
-      } finally {
-        // 延迟一帧再释放：部分浏览器在 click 后的当前宏任务里还需要这个 object URL 才能开始下载。
-        const release = () => {
-          try { urlApi.revokeObjectURL(objectUrl); } catch { /* 释放失败不改变导出结果。 */ }
-        };
-        if (typeof urlApi.revokeObjectURL === "function") {
-          if (typeof globalThis.setTimeout === "function") {
-            try { globalThis.setTimeout(release, 0); } catch { release(); }
-          } else {
-            release();
-          }
-        }
-      }
-      return true;
-    } catch { return false; }
   }
 
   function safeNormalize(raw) {
@@ -1811,8 +1789,8 @@
       // 用 1px 裁剪而不是 display:none —— display:none 的内容不会被播报。
       ".deg_expert_group_announcer{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}",
       // 可导航行的明确焦点轮廓（票据 18）：不再依赖浏览器默认（宿主 reset 有时会把它抹掉）。
-      // 任务名与第三行摘要都是 role=button 的 div，键盘焦点必须一眼可见。
-      ".deg_expert_group_task:focus-visible,.deg_expert_group_content:focus-visible,.deg_expert_group_fanout_title>.deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
+      // 任务名是 role=button 的 div，键盘焦点必须一眼可见。
+      ".deg_expert_group_task:focus-visible,.deg_expert_group_fanout_title>.deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
       // 右栏宽度拖拽手柄（票据 18）：贴在面板左缘的 6px 竖条，拖拽改变视口比例。
       // touch-action:none 让触控板/触摸屏的拖拽不会被浏览器滚动吃掉；透明背景只在 hover/拖拽时显形。
       ".deg_expert_group_resizer{position:absolute;top:0;left:0;bottom:0;width:6px;cursor:col-resize;touch-action:none;background:transparent;z-index:2}",
@@ -1820,15 +1798,16 @@
       ".deg_expert_group_resizer:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:-2px}",
       ".deg_expert_group_node{position:relative;min-width:0;padding-left:16px}",
       ".deg_expert_group_node_root{padding-left:0}",
-      // 票据 12：任务行从固定 60px 改为最小高度——开始时间/耗时/重试/失败摘要作为三行主体的
+      // 票据 12：任务行从固定高度改为最小高度——开始时间/耗时/重试/失败摘要作为两行主体的
       // 相邻块（.deg_expert_group_metrics），行高按内容增长而不是把内容挤出固定行盒。
-      // 树线锚点仍以 60px 的主行高度为参照（--deg-parent-row-height），新增块只向下延伸。
-      ".deg_expert_group_row{box-sizing:border-box;display:grid;grid-template-columns:20px 20px minmax(0,1fr);min-width:0;min-height:60px;padding:4px 0}",
+      // 侧栏精简后主行只剩「任务名 + 模型元数据」两行，主行高度随之收敛到 44px；
+      // 树线锚点仍以 44px 的主行高度为参照（--deg-parent-row-height），新增块只向下延伸。
+      ".deg_expert_group_row{box-sizing:border-box;display:grid;grid-template-columns:20px 20px minmax(0,1fr);min-width:0;min-height:44px;padding:4px 0}",
       // 第一行必须是 auto：默认单行 16px 时与旧布局逐像素相同；分片第一行换行时按内容撑高，
-      // 绝不把多行文本压进 16px 行盒而与第二行重叠——它没有省略号语义（见 .deg_expert_group_shard_task）。
-      // 第二、三行保持 16px 是因为省略号只在单行行盒上生效：行盒被内容撑开时 WebKit/Blink 会退化成
-      // 裁切而不是显示 "…"，原生右栏与项目既有行为都以 "…" 结尾。
-      ".deg_expert_group_row_main{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto 16px 16px;min-width:0}",
+      // 绝不把多行文本压进 16px 行盒而与元数据行重叠——它没有省略号语义（见 .deg_expert_group_shard_task）。
+      // 第二行（模型元数据）保持 16px 是因为省略号只在单行行盒上生效：行盒被内容撑开时
+      // WebKit/Blink 会退化成裁切而不是显示 "…"，原生右栏与项目既有行为都以 "…" 结尾。
+      ".deg_expert_group_row_main{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto 16px;min-width:0}",
       // 第一行使用独立的内联容器：任务文字按内容宽度收缩，箭头紧跟在文字后方；名称过长时文字
       // 只在箭头前的可用空间内省略，不会把箭头推出右栏视口。第一行仍由内容撑高，兼容分片任务名换行。
       ".deg_expert_group_task_line{grid-area:1 / 1;display:flex;align-items:center;min-width:0;gap:2px}",
@@ -1850,11 +1829,10 @@
       // fan-out 分片第一行是「分片代号  任务名称」：代号已经占掉单行相当一部分宽度，
       // 继续按单行省略会让任务名称几乎不可读。这里改成可换行：完整文本按行折行展示，
       // overflow-wrap:anywhere 让超长且无分隔符的名称（中文长句、长英文标识）也能折行，
-      // 绝不溢出到第二、三行或右侧的取消/重试按钮下面。行高由内容撑开（.deg_expert_group_shard
+      // 绝不溢出到第二行或右侧的取消/重试按钮下面。行高由内容撑开（.deg_expert_group_shard
       // 只设 min-height），因此名称越长行越高而不是被裁掉。
       ".deg_expert_group_shard_task{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere}",
-      ".deg_expert_group_task:hover,.deg_expert_group_content:hover{text-decoration:underline}",
-      ".deg_expert_group_content{grid-area:3 / 1;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));cursor:pointer}",
+      ".deg_expert_group_task:hover{text-decoration:underline}",
       ".deg_expert_group_chevron{width:20px;height:20px;padding:0;align-self:start}",
       ".deg_expert_group_fanout_header>.deg_expert_group_chevron{align-self:center}",
       ".deg_expert_group_chevron_placeholder{display:inline-block;width:20px;height:20px}",
@@ -1881,7 +1859,7 @@
       // 没有 button / hover / tabindex，不进入键盘与可访问性交互面。
       ".deg_expert_group_sidebar_batch_zero{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary,#22d3ee))}",
       // 树线锚点固定在每一级父行的 20px 状态列中心，避免依赖窗口测量。
-      ".deg_expert_group_children{position:relative;min-width:0;margin:0;padding:0;--deg-parent-row-height:60px}",
+      ".deg_expert_group_children{position:relative;min-width:0;margin:0;padding:0;--deg-parent-row-height:44px}",
       ".deg_expert_group_children>.deg_expert_group_node,.deg_expert_group_children>.deg_expert_group_fanout,.deg_expert_group_children>.deg_expert_group_idle_group{--deg-tree-anchor:14px;position:relative}",
       ".deg_expert_group_children>.deg_expert_group_fanout{--deg-tree-anchor:14px}",
       ".deg_expert_group_children>:first-child:before{position:absolute;top:calc(var(--deg-tree-anchor) - var(--deg-parent-row-height));bottom:calc(100% - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
@@ -1923,10 +1901,10 @@
       ".deg_expert_group_error{display:flex;align-items:center;gap:4px;padding:6px 0;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));font-size:11px}",
       ".deg_expert_group_count{margin-left:auto;color:var(--dsw-alias-label-secondary);font-size:11px;font-weight:400}",
       // ── 票据 12：任务时间线 / 搜索过滤 / 导出 ──────────────────────────────
-      // 三行主体的相邻块容器：时间线条与 attempt 时间线都放在第三列里纵向排列，
+      // 两行主体的相邻块容器：用量摘要条与 attempt 时间线都放在第三列里纵向排列，
       // 不占额外的 grid 列（不会挤压状态圆点/折叠箭头/操作按钮）。
       ".deg_expert_group_cell{display:flex;flex-direction:column;min-width:0}",
-      // 任务行时间线条：开始时间 / 耗时 / 重试次数 / 最近活动 / 多次重试徽标 / 失败摘要。
+      // 任务行用量摘要条：用时 / tok/s / tok / 命中 / context + 多次重试徽标 / 失败摘要。
       // 窄右栏时按 flex-wrap 换行；每一段自身单行省略，完整文本仍在 tooltip 里。
       ".deg_expert_group_metrics{display:flex;flex-wrap:wrap;align-items:center;gap:2px 6px;min-width:0;padding:2px 0 0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
       ".deg_expert_group_metrics_part{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
@@ -1945,21 +1923,11 @@
       ".deg_expert_group_attempt_usage_tokens{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
       ".deg_expert_group_attempt_cost{min-width:0;overflow-wrap:anywhere}",
       ".deg_expert_group_attempt_cost[data-cost-configured=false]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
-      // 行内用量徽标（任务/专家/分片）：等宽数字，窄栏可省略但 title 保留完整值。
-      ".deg_expert_group_usage{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
-      ".deg_expert_group_usage[data-usage=missing]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
       // 结构化结果区：有界 JSON 预览按可读前缀展示，超长换行而不是横向滚动/溢出右栏。
       ".deg_expert_group_structured{min-width:0;margin:2px 0 0;padding:2px 4px;border-inline-start:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:15px;overflow-wrap:anywhere;max-height:84px;overflow:auto}",
       ".deg_expert_group_structured[data-fallback=true]{border-inline-start-color:var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
       ".deg_expert_group_shard_extra{display:flex;flex-direction:column;min-width:0}",
-      // ── 票据 26/28：诊断区、新建任务表单、模板库与回执 ──────────────────────
-      ".deg_expert_group_diagnostics{margin:4px 0 0;padding:5px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);font-size:11px}",
-      ".deg_expert_group_diagnostics_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
-      ".deg_expert_group_diagnostics_rows{display:flex;flex-direction:column;gap:2px;margin-top:3px}",
-      ".deg_expert_group_diag_row{display:flex;flex-wrap:wrap;gap:0 6px;min-width:0}",
-      ".deg_expert_group_diag_name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}",
-      ".deg_expert_group_diag_values{flex:1 1 160px;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary)}",
-      ".deg_expert_group_diagnostics_empty,.deg_expert_group_diagnostics_usage{margin-top:3px;color:var(--dsw-alias-label-secondary)}",
+      // ── 票据 28：新建任务表单、模板库与回执 ────────────────────────────────
       ".deg_expert_group_dispatch{margin:4px 0 0;padding:6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);font-size:11px}",
       ".deg_expert_group_dispatch_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
       ".deg_expert_group_dispatch_row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:4px 8px;margin-top:4px}",
@@ -1990,8 +1958,6 @@
       ".deg_expert_group_attempt[data-status=failed] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=timed_out] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=interrupted] .deg_expert_group_attempt_status{color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
       ".deg_expert_group_attempt_duration{flex:0 0 auto;font-variant-numeric:tabular-nums}",
       ".deg_expert_group_attempt_time{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
-      // fan-out 聚合时间线里的分片归属：只在聚合视图出现，分片自己的时间线不带这段。
-      ".deg_expert_group_attempt_shard{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
       // 「查看全部 / 收起」：时间线唯一的交互控件（只切换展示条数，不改数据）。
       ".deg_expert_group_attempts_toggle{flex:0 0 auto;align-self:flex-start;box-sizing:border-box;height:20px;margin:1px 0 0;padding:0 4px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
       ".deg_expert_group_attempts_toggle:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
@@ -1999,12 +1965,17 @@
       // fan-out 标题列：标题 + 时间线/计数/失败摘要纵向排列，标题行仍可点击导航。
       ".deg_expert_group_fanout_title{display:flex;flex-direction:column;min-width:0}",
       ".deg_expert_group_fanout_title>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
-      // 搜索/过滤/导出工具条：位于任务树顶部，只在快照已上屏时出现。
+      // 搜索/过滤/手动派发工具条：位于任务树顶部，只在快照已上屏时出现。
       ".deg_expert_group_toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:5px 0 2px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
       ".deg_expert_group_search{flex:1 1 120px;min-width:0;box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px}",
-      ".deg_expert_group_filter{flex:0 1 auto;min-width:0;box-sizing:border-box;height:24px;padding:0 2px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px}",
+      ".deg_expert_group_filter{flex:0 1 auto;min-width:0;box-sizing:border-box;height:24px;padding:0 2px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px;color-scheme:light}",
+      // 原生 <select> 的弹出列表由浏览器按 color-scheme 绘制，不跟随页面文字的 CSS color：
+      // DSH 深色主题下必须显式切到 dark，否则会出现「白底 + 浅色字」的低对比度列表。
+      "body[data-ds-dark-theme] .deg_expert_group_filter{color-scheme:dark}",
+      // 选项背景与文字显式使用 DSH 主题令牌：浅色主题白底深字、深色主题深底浅字；
+      // 令牌缺失的旧宿主回退到系统控件色（Canvas / CanvasText 会随 color-scheme 解析）。
+      ".deg_expert_group_filter option{background-color:var(--dsw-alias-bg-layer-2,Canvas);color:var(--dsw-alias-label-primary,CanvasText)}",
       ".deg_expert_group_search:focus-visible,.deg_expert_group_filter:focus-visible,.deg_expert_group_export_button:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-      ".deg_expert_group_export{display:flex;flex:0 0 auto;gap:4px;margin-left:auto}",
       ".deg_expert_group_export_button{box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
       ".deg_expert_group_export_button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
       ".deg_expert_group_filter_empty{padding:8px 2px;color:var(--dsw-alias-label-secondary);font-size:11px}",
@@ -3754,7 +3725,7 @@
       }
       const tabParams = object(tabInfo?.tab?.navigation?.params);
       // 每次渲染只读一次 sessions 快照：官方目录项（mode/activity）与权威 title 都来自它，
-      // 会话订阅触发的重渲染因此能刷新第三行。0.1.7-alpha.2 的目录改为按会话 id 索引的
+      // 会话订阅触发的重渲染因此能刷新行内状态与圆点。0.1.7-alpha.2 的目录改为按会话 id 索引的
       // 会话投影（projectionsBySession[sessionId].values.subagentCatalog）。
       const sessionsSnapshot = listSnapshot(config, ctx);
       // 目录查找表与快照同一帧只建一次：每行渲染都用它取官方目录项（mode/activity），
@@ -3868,9 +3839,6 @@
         : [{ status: "idle", templates: [], count: 0, limit: 32, message: null }, () => {}];
       const templatesState = templatesPair[0];
       const setTemplatesState = templatesPair[1];
-      const diagnosticsOpenPair = typeof react.useState === "function" ? react.useState(false) : [false, () => {}];
-      const diagnosticsOpen = diagnosticsOpenPair[0];
-      const setDiagnosticsOpen = diagnosticsOpenPair[1];
 
       /**
        * 任务状态播报（票据 18）：{ rootSessionId, tasks }。
@@ -4843,12 +4811,12 @@
           refreshState.pending = false;
           void refresh();
           /**
-           * sessions 通知：快照本身是**渲染输入**（第三行的权威 title、mode、activity 与目录项
+           * sessions 通知：快照本身是**渲染输入**（运行状态圆点、目录项的活动证据与目录项
            * 都来自 sessions 快照，且是在渲染期现读的），因此这条通知必须显式 bump 一次版本号
            * 触发一次重新渲染，不能只依赖 refresh 的状态写入。
            *
            * 原因：轮询空转时 refresh 会因「内容深度相等」直接 bail out（不再产生新状态），
-           * 若这里不 bump，sessions 驱动的第三行更新就会跟着一起停掉。bump 与轮询无关：
+           * 若这里不 bump，sessions 驱动的行内状态更新就会跟着一起停掉。bump 与轮询无关：
            * 它只在宿主真的发布了新 sessions 快照时才发生，是事件驱动的必要重渲染。
            */
           const unsubscribe = subscribeSessions(config, contextRef.current, () => {
@@ -5306,7 +5274,7 @@
        * 事务会在 split() 前临时写入 50%，目标 tab 确认落到返回 pane 后保留可调的 50% 模式，
        * 失败则恢复 20% 锁定。其余 tab 操作只使用精确 tabId 记录/释放，不制造浮窗。
        * 只在右侧栏打开该子代理会话页，绝不切换主视图。preventDefault + stopPropagation
-       * 必须同时存在：鼠标事件不得冒泡到任务名/第三行的导航处理器，键盘 Enter/Space 在按钮上的
+       * 必须同时存在：鼠标事件不得冒泡到任务名的导航处理器，键盘 Enter/Space 在按钮上的
        * 默认行为也要拦下（否则会触发最近的导航祖先）。宿主暂时无法打开该地址（seat 尚未 mint）
        * 时抛错由插件吞掉：既不影响主视图，也不影响同一行其它按钮。
        */
@@ -5587,10 +5555,10 @@
       /**
        * 当前 root 专家树里的「运行中」资源地址（普通专家、嵌套专家与最新 fan-out 分片）。
        *
-       * 与 renderThreeLines 使用**同一个**规范地址 helper（subagentAddressOfChild + subagentChatAddress），
+       * 与 renderRowMain 使用**同一个**规范地址 helper（subagentAddressOfChild + subagentChatAddress），
        * 因此批量候选与单会话箭头指向的是同一个 contentId，绝不存在第二套地址推导。
        *
-       * 纳入条件只有一条：runtimeStatusOfNode(...) === "running"（与行内圆点、第三行摘要同源）。
+       * 纳入条件只有一条：runtimeStatusOfNode(...) === "running"（与行内圆点同源）。
        * ready/unknown 一律不纳入——未知状态绝不混进「可以关闭」的集合，空闲专家由空闲分组单独负责。
        *
        * parent 证据缺失或非法时 fail-closed：subagentAddressOfChild 会返回 null，该节点直接跳过，
@@ -5640,7 +5608,7 @@
        * - 完整快照（partial:false）到达后不会再出现 unknown，规则自动回到既有行为，不留永久性差异；
        * - running 与 unknown 一样被排除，保守方向不变。
        *
-       * partial 证据规则通过 options 一路传到模型的活动证据链，与行内圆点、第三行文案同源；
+       * partial 证据规则通过 options 一路传到模型的活动证据链，与行内圆点同源；
        * 这里只读当前渲染的 partialSnapshot，切换 root 或快照换代都会随闭包一起更新。
        */
       const sidebarNodeIsIdleReady = (node, parentId, childId) =>
@@ -8567,7 +8535,7 @@
        * 事务会在 split() 前临时写入 50%，目标 tab 确认落到返回 pane 后保留可调的 50% 模式，
        * 失败则恢复 20% 锁定。其余 tab 操作只使用精确 tabId 记录/释放，不制造浮窗。
        * 只在右侧栏打开该子代理会话页，绝不切换主视图。preventDefault + stopPropagation
-       * 必须同时存在：鼠标事件不得冒泡到任务名/第三行的导航处理器，键盘 Enter/Space 在按钮上的
+       * 必须同时存在：鼠标事件不得冒泡到任务名的导航处理器，键盘 Enter/Space 在按钮上的
        * 默认行为也要拦下（否则会触发最近的导航祖先）。宿主暂时无法打开该地址（seat 尚未 mint）
        * 时抛错由插件吞掉：既不影响主视图，也不影响同一行其它按钮。
        */
@@ -8623,7 +8591,7 @@
       };
 
       /**
-       * 票据 12 的时间线渲染助手（任务时间线条 / attempt 时间线 / 失败摘要）。
+       * 票据 12 的时间线渲染助手（任务用量摘要条 / attempt 时间线 / 失败摘要）。
        *
        * 所有格式化、脱敏、截断与排序都走模型层纯函数（可单测、Host/客户端同一契约）。
        * 模型版本较旧（缺函数）时这些块整体降级为不渲染——绝不在这里复制一份算法，
@@ -8641,6 +8609,11 @@
       const finiteNumber = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
       const formatDurationText = (value) => {
         const fn = modelFunction("formatDuration");
+        return fn === null ? null : fn(value);
+      };
+      /** 摘要条用的紧凑时长（<1s / 1.2s / 1m / 28m27s / 1h / 1h2m），与模型层同一实现。 */
+      const formatCompactDuration = (value) => {
+        const fn = modelFunction("formatDurationCompact");
         return fn === null ? null : fn(value);
       };
       const formatClockText = (value) => {
@@ -8743,32 +8716,6 @@
         return parts.length === 0 ? "用量：—" : "用量：" + parts.join(" · ");
       };
       /**
-       * 任务/专家/分片行的紧凑用量（票据 25）：有界 token 数 + 请求数。
-       * 没有任何用量事实时只显示「用量 —」，绝不把缺失显示成 0。
-       */
-      const renderUsageBadge = (value, options) => {
-        const usage = usageOf({ usage: value });
-        const kind = text(object(options).kind, "expert");
-        if (usage === null) {
-          return react.createElement("span", {
-            key: "usage",
-            className: "deg_expert_group_usage",
-            "data-usage": "missing",
-            "data-kind": kind,
-            title: "用量：—",
-          }, "用量 —");
-        }
-        const tokens = finiteToken(usage.totalTokens) ?? finiteToken(usage.inputTokens);
-        const requests = finiteToken(usage.requests);
-        return react.createElement("span", {
-          key: "usage",
-          className: "deg_expert_group_usage",
-          "data-usage": "present",
-          "data-kind": kind,
-          title: usageTitleOf(usage),
-        }, "tok " + (tokenText(tokens) ?? "—") + " · 请求 " + (requests === null ? "—" : String(requests)));
-      };
-      /**
        * attempt 详情（票据 25）：input/output/cache/reasoning tokens 与 requests/retries/fallbacks/runMs，
        * 以及按 meta.modelPrices 计算的估算成本；缺失字段显示「—」，无单价显示「未配置单价，不估算」。
        */
@@ -8860,19 +8807,279 @@
           title: content,
         }, content);
       };
+      /** 会话摘要（sessions 快照 byId 投影）：只读、缺失返回 null（绝不造空对象）。 */
+      const sessionSummaryOf = (sessionId) => {
+        if (sessionId === null) return null;
+        const summary = object(object(sessionsSnapshot.byId)[sessionId]);
+        return Object.keys(summary).length === 0 ? null : summary;
+      };
       /**
-       * 任务行的紧凑时间信息：开始时间 / 耗时 / 重试次数 / 最近活动 / 多次重试徽标 / 失败摘要。
+       * 通用 DSH 会话投影读取（contextPressure / sessionStats / tokenUsage 共用）。
        *
-       * 字段全部来自 Host 投影（会话节点只有 startedAt/lastActivityAt；fanout/shard 另有
-       * attemptCount/retryCount/failure）。缺失的片段直接省略，不用「—」把每一行都填满占位；
-       * 只有时间线项在耗时与时间都缺失时才退化为「—」，避免出现空白的列表项。
+       * 读面顺序与 contextPressure 完全一致，避免每种投影各写一套回退链：
+       * 1. sessions 快照 byId[sessionId].projectionValues[key]（新宿主）；
+       * 2. sessions 快照 projectionsBySession[sessionId].values[key]（目录投影容器）；
+       * 3. config.sessions.projectionValues(sessionId)（旧宿主/注入式读面，try/catch）；
+       *    该读面可能返回整个投影容器，也可能直接返回该投影值本身，两种形状都接受。
+       * 三条都缺失时返回 null；形状与数值校验由调用方完成（绝不伪造）。
+       */
+      const projectionValueOf = (sessionId, key) => {
+        if (sessionId === null || key === null) return null;
+        const summary = object(sessionSummaryOf(sessionId));
+        const fromSummary = object(summary.projectionValues)[key];
+        if (fromSummary !== undefined && fromSummary !== null) return fromSummary;
+        const projection = object(object(object(sessionsSnapshot.projectionsBySession)[sessionId]).values);
+        const fromProjection = projection[key];
+        if (fromProjection !== undefined && fromProjection !== null) return fromProjection;
+        const readProjection = config.sessions?.projectionValues;
+        if (typeof readProjection !== "function") return null;
+        try {
+          const value = readProjection.call(config.sessions, sessionId);
+          const container = object(value);
+          if (container[key] !== undefined && container[key] !== null) return container[key];
+          return value === undefined ? null : value;
+        } catch {
+          return null;
+        }
+      };
+      /** contextPressure 投影的形状校验：至少一个数值字段才是合法形状，否则返回 null。 */
+      const contextPressureOfValue = (value) => {
+        const source = object(value);
+        for (const field of ["projectedTokens", "pressureTokens", "contextWindow"]) {
+          if (finiteNumber(source[field]) !== null) return source;
+        }
+        return null;
+      };
+      /**
+       * 子会话的 contextPressure（上下文占用率的唯一来源）。
+       * 三条读面统一走 projectionValueOf；缺失/非法时返回 null —— 摘要条整段省略，绝不伪造。
+       */
+      const contextPressureOf = (sessionId) => contextPressureOfValue(projectionValueOf(sessionId, "contextPressure"));
+      /** DSH 投影里的有限数（允许 0，负数/非有限数一律 null）。 */
+      const projectionNumber = (value) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null);
+      /** DSH sessionStats 里参与「用时/输出速度」的字段。 */
+      const DSH_STATS_FIELDS = Object.freeze(["llmMs", "toolMs", "decodeMs", "decodeTokens"]);
+      /** DSH tokenUsage 的四项口径。 */
+      const DSH_TOKEN_FIELDS = Object.freeze([
+        "uncachedInputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens",
+      ]);
+      /**
+       * DSH 权威会话指标的聚合读取（sessionStats + tokenUsage）。
+       *
+       * - 单会话行传 [node.sessionId]；分片传最新 attempt 的 childId；
+       * - fan-out 父任务传各 shard 最新 attempt 的 childId（按 childId 去重）；
+       * - 同名字段逐会话相加，只有真的出现过数值才保留（缺失保持 null，绝不补 0）；
+       * - 一条有效字段都没有时返回 null，调用方回退 DEG usage/duration。
+       */
+      const dshMetricsOf = (sessionIds) => {
+        const ids = Array.isArray(sessionIds) ? sessionIds : [];
+        const stats = {};
+        const tokens = {};
+        let contributors = 0;
+        for (const rawId of ids) {
+          const sessionId = text(rawId, null);
+          if (sessionId === null) continue;
+          const statsValue = object(projectionValueOf(sessionId, "sessionStats"));
+          const tokensValue = object(projectionValueOf(sessionId, "tokenUsage"));
+          let touched = false;
+          for (const field of DSH_STATS_FIELDS) {
+            const value = projectionNumber(statsValue[field]);
+            if (value === null) continue;
+            stats[field] = (stats[field] ?? 0) + value;
+            touched = true;
+          }
+          for (const field of DSH_TOKEN_FIELDS) {
+            const value = projectionNumber(tokensValue[field]);
+            if (value === null) continue;
+            tokens[field] = (tokens[field] ?? 0) + value;
+            touched = true;
+          }
+          if (touched) contributors += 1;
+        }
+        if (contributors === 0) return null;
+        const valueOf = (bag, field) => (bag[field] === undefined ? null : bag[field]);
+        return {
+          sessionCount: contributors,
+          llmMs: valueOf(stats, "llmMs"),
+          toolMs: valueOf(stats, "toolMs"),
+          decodeMs: valueOf(stats, "decodeMs"),
+          decodeTokens: valueOf(stats, "decodeTokens"),
+          uncachedInputTokens: valueOf(tokens, "uncachedInputTokens"),
+          cacheReadTokens: valueOf(tokens, "cacheReadTokens"),
+          cacheWriteTokens: valueOf(tokens, "cacheWriteTokens"),
+          outputTokens: valueOf(tokens, "outputTokens"),
+        };
+      };
+      /**
+       * 把 DSH tokenUsage 转成 summarizeUsageMetrics 认识的 usage 形状。
+       *
+       * billedInput / total 只在分母可证明（uncached/cacheRead/cacheWrite 全部存在）时计算：
+       * 任何一项缺失都保持 null，让「命中」「tok」整段省略，绝不用部分和冒充总量。
+       */
+      const dshUsageOf = (metrics) => {
+        if (metrics === null) return null;
+        const { uncachedInputTokens, cacheReadTokens, cacheWriteTokens, outputTokens } = metrics;
+        if (uncachedInputTokens === null && cacheReadTokens === null && cacheWriteTokens === null && outputTokens === null) {
+          return null;
+        }
+        const complete = uncachedInputTokens !== null && cacheReadTokens !== null && cacheWriteTokens !== null;
+        const billedInputTokens = complete ? uncachedInputTokens + cacheReadTokens + cacheWriteTokens : null;
+        return {
+          inputTokens: uncachedInputTokens,
+          cacheReadTokens,
+          cacheWriteTokens,
+          outputTokens,
+          billedInputTokens,
+          totalTokens: billedInputTokens !== null && outputTokens !== null ? billedInputTokens + outputTokens : null,
+        };
+      };
+      /** DSH 输出速度（tok/s）：decodeTokens ÷ (decodeMs/1000)，两端都必须是正数。 */
+      const dshThroughputOf = (metrics) => {
+        if (metrics === null || metrics.decodeMs === null || metrics.decodeTokens === null) return null;
+        if (metrics.decodeMs <= 0 || metrics.decodeTokens <= 0) return null;
+        return metrics.decodeTokens / (metrics.decodeMs / 1000);
+      };
+      /** fan-out 父任务的会话集合：每个 shard 最新 attempt 的 childId（按 childId 去重）。 */
+      const fanoutSessionIdsOf = (task) => {
+        const ids = [];
+        const seen = new Set();
+        const source = object(task);
+        for (const shard of Array.isArray(source.shards) ? source.shards : []) {
+          const childId = latestShardChildIdOf(shard);
+          if (childId === null || seen.has(childId)) continue;
+          seen.add(childId);
+          ids.push(childId);
+        }
+        return ids;
+      };
+      /**
+       * 该会话是否已经拿到了「可用的 sessionStats 投影」。
+       *
+       * 判定口径与 dshMetricsOf 的「有效字段」一致：至少一个数值字段才算存在。不能只判
+       * 「非 null」——第三读面（旧宿主 config.sessions.projectionValues）可能返回整个投影容器，
+       * 那样会把容器误当成 sessionStats，从而永远不触发按需加载。
+       */
+      const sessionStatsPresentOf = (sessionId) => {
+        const value = object(projectionValueOf(sessionId, "sessionStats"));
+        for (const field of DSH_STATS_FIELDS) {
+          if (projectionNumber(value[field]) !== null) return true;
+        }
+        return false;
+      };
+      /**
+       * 按需加载子会话的 sessionStats 投影（一次性副作用，服务用量速览的 DSH 权威数据）。
+       *
+       * 根因：DSH 的 sessions 列表快照只带列表投影子集（tokenUsage / contextPressure 等），
+       * sessionStats 是客户端按需投影，必须经公开的 sessions.refreshProjections(sessionId)
+       * 加载；未打开过的 child 会话不会自动加载，于是旧专家行只能回退 DEG，出现「用时<1s」
+       * 假用时并缺 TPS。这里在拿到 DEG 快照后，为树里出现但还没有 sessionStats 的会话各请求一次。
+       *
+       * 边界（不阻塞首帧、不自转、不改变请求契约）：
+       * - 首帧仍可显示 DEG 回退值；刷新成功后 sessions 订阅会 bump 一次重渲染，
+       *   sessionStats / tokenUsage 自然进入 projectionValueOf 读面并替换回退值；
+       * - useRef 的集合跨渲染保留：同一会话只请求一次，刷新失败也不重试（不写错误槽）；
+       * - 公开方法缺失、同步抛错、Promise 拒绝一律吞掉——投影刷新只是体验优化，绝不让面板崩；
+       * - 快照为空（skeleton/空态）时直接跳过，不产生任何请求。
+       * hook 无条件调用（位于渲染助手区之前）：每次渲染的 hook 顺序稳定，不改变其余 hook 的调用语义。
+       */
+      const projectionRefreshRequestedRef = typeof react.useRef === "function"
+        ? react.useRef(new Set())
+        : { current: new Set() };
+      if (typeof react.useEffect === "function") {
+        react.useEffect(() => {
+          if (snapshot === null || snapshot === undefined) return;
+          // 生产装配里 sessions 挂在 tab 的 ctx 上；单测/旧宿主经 createExpertGroupPanel 直接注入。
+          // 方法读取本身也可能抛错（服务代理对未声明属性会抛），同样按「没有这个入口」处理。
+          let service = null;
+          let refreshProjections = null;
+          try {
+            service = config.sessions ?? ctx?.sessions ?? null;
+            refreshProjections = service === null || service === undefined ? null : service.refreshProjections;
+          } catch {
+            service = null;
+            refreshProjections = null;
+          }
+          if (typeof refreshProjections !== "function") return;
+          const requested = projectionRefreshRequestedRef.current;
+          for (const sessionId of collectSnapshotSessionIds(snapshot)) {
+            if (requested.has(sessionId)) continue;
+            if (sessionStatsPresentOf(sessionId) === true) continue;
+            requested.add(sessionId);
+            try {
+              const pending = refreshProjections.call(service, sessionId);
+              // 拒绝也吞掉：刷新失败只是继续显示 DEG 回退值，绝不无限重试。
+              if (pending !== null && typeof pending === "object" && typeof pending.catch === "function") {
+                pending.catch(() => {});
+              }
+            } catch {
+              /* 同步抛错：本会话已记账，绝不再请求第二次。 */
+            }
+          }
+        }, [snapshot, rootSessionId]);
+      }
+      /**
+       * 运行时间（毫秒）的唯一解析顺序：节点 durationMs → 用量 runMs → 起止时间差。
+       *
+       * 起止时间差（任何行都适用，包括没有 sessionId 的 fan-out 父任务）：
+       * - 起点：节点 startedAt 优先（分片跨 attempt 时以分片起点为准），其次会话 createdAt；
+       * - 运行中终点：**DEG Host 快照** snapshot.generatedAt 优先——生产环境的 sessions 列表
+       *   快照（DSH getListSnapshot）只有 items/state/phase/error/projectionsBySession，没有
+       *   generatedAt，因此 sessionsSnapshot.generatedAt 仅作旧宿主兼容兜底；
+       * - 非运行中终点：会话 updatedAt，其次节点 lastActivityAt（fan-out/分片没有会话时用它）；
+       * - 差值必须 > 0，否则 null（摘要条省略「用时」，绝不写 0）。
+       */
+      const durationOfNode = (source, runtimeStatus, sessionId) => {
+        const direct = finiteNumber(source.durationMs);
+        if (direct !== null) return direct;
+        const usage = usageOf(source);
+        const runMs = finiteNumber(usage === null ? null : usage.runMs);
+        if (runMs !== null) return runMs;
+        const summary = object(sessionSummaryOf(sessionId));
+        const startedAt = finiteNumber(source.startedAt) ?? finiteNumber(summary.createdAt);
+        if (startedAt === null) return null;
+        const endedAt = runtimeStatus === "running"
+          ? (finiteNumber(object(snapshot).generatedAt) ?? finiteNumber(sessionsSnapshot.generatedAt))
+          : (finiteNumber(summary.updatedAt) ?? finiteNumber(source.lastActivityAt));
+        if (endedAt === null) return null;
+        const elapsed = endedAt - startedAt;
+        return elapsed > 0 ? elapsed : null;
+      };
+      /**
+       * 任务行的用量摘要条：用时 · tok/s · tok · 命中 · context 五段（异常提示另算）。
+       *
+       * 数字与文本全部由模型层 summarizeUsageMetrics 生成，这里只负责按固定顺序摆放：
+       * 缺失段整段省略（不写 0/占位词）；五段全空且没有「多次重试」/失败摘要时整行不渲染。
+       * 每段都带一个有界 title tooltip，tok 段复用 usageTitleOf 的完整用量摘要。
        */
       const renderMetrics = (node, options = {}) => {
         const source = object(node);
         const status = statusOf(source);
         const kind = text(options.kind, text(source.kind, "expert"));
+        const runtimeStatus = text(options.runtimeStatus, null);
+        const sessionId = text(options.sessionId, null);
+        const sessionIds = Array.isArray(options.sessionIds)
+          ? options.sessionIds
+          : (sessionId === null ? [] : [sessionId]);
+        const api = modelApi();
+        // DSH 权威投影优先：sessionStats（模型用时 / 输出速度）+ tokenUsage（tok / 命中）。
+        // 投影缺失（旧宿主或尚未加载）时逐项回退 DEG usage 与 durationOfNode，绝不伪造。
+        const dsh = dshMetricsOf(sessionIds);
+        const dshUsage = dshUsageOf(dsh);
+        const usage = dshUsage !== null ? dshUsage : usageOf(source);
+        const measuredTps = dshThroughputOf(dsh);
+        const dshLlmMs = dsh === null ? null : dsh.llmMs;
+        const dshDuration = dshLlmMs !== null && dshLlmMs > 0 ? dshLlmMs : null;
+        const durationMs = dshDuration !== null ? dshDuration : durationOfNode(source, runtimeStatus, sessionId);
+        const summary = typeof api?.summarizeUsageMetrics === "function"
+          ? api.summarizeUsageMetrics(usage, {
+            durationMs,
+            contextPressure: contextPressureOf(sessionId),
+            measuredTokensPerSecond: measuredTps,
+          })
+          : null;
         const segments = [];
         const pushSegment = (key, textValue, titleValue) => {
+          if (typeof textValue !== "string" || textValue.length === 0) return;
           if (segments.length > 0) {
             segments.push(react.createElement("span", {
               key: key + "-separator",
@@ -8886,16 +9093,27 @@
             title: typeof titleValue === "string" ? titleValue : textValue,
           }, textValue));
         };
-        const startedAt = finiteNumber(source.startedAt);
-        const startedClock = formatClockText(startedAt);
-        if (startedClock !== null) pushSegment("started", "开始 " + startedClock, formatIsoText(startedAt) ?? ("开始 " + startedClock));
-        const durationText = formatDurationText(source.durationMs);
-        if (durationText !== null) pushSegment("duration", "耗时 " + durationText);
+        if (summary !== null) {
+          // 用时 tooltip：DSH 显示「模型用时」，并补充工具调用用时；回退 DEG 时仍写「运行时间」。
+          const toolDurationText = dsh === null || dsh.toolMs === null ? null : formatCompactDuration(dsh.toolMs);
+          const durationTitle = summary.durationText === null ? null
+            : dshDuration !== null
+              ? "模型用时 " + summary.durationText + (toolDurationText === null ? "" : " · 工具调用用时 " + toolDurationText)
+              : "运行时间 " + summary.durationText;
+          pushSegment("duration", summary.durationText === null ? null : "用时" + summary.durationText, durationTitle);
+          pushSegment("throughput", summary.throughputText,
+            summary.throughputText === null ? null : (measuredTps === null ? "平均吞吐 " : "输出速度 ") + summary.throughputText);
+          // tok 段的 tooltip 用完整用量摘要（输入/输出/缓存/请求等），并做与结构化预览同级的 400 字符上限。
+          const usageTitle = usage === null ? null : usageTitleOf(usage);
+          pushSegment("tokens", summary.totalTokensText,
+            usageTitle === null ? summary.totalTokensText : usageTitle.slice(0, 400));
+          pushSegment("cache-hit", summary.cacheHitText,
+            summary.cacheHitPercent === null ? null : "缓存命中率 " + summary.cacheHitPercent + "%（缓存读 ÷ 计费输入）");
+          pushSegment("context", summary.contextText,
+            summary.contextPercent === null ? null
+              : "上下文占用 " + summary.contextPercent + "%（已用 " + summary.contextUsedTokens + " / 窗口 " + summary.contextWindow + "）");
+        }
         const retryCount = finiteNumber(source.retryCount);
-        if (retryCount !== null) pushSegment("retry", "重试 " + retryCount + " 次", "已重试 " + retryCount + " 次");
-        const lastActivityAt = finiteNumber(source.lastActivityAt);
-        const lastActivityClock = formatClockText(lastActivityAt);
-        if (lastActivityClock !== null) pushSegment("activity", "最近活动 " + lastActivityClock, formatIsoText(lastActivityAt) ?? ("最近活动 " + lastActivityClock));
         const retryWarning = retryCount !== null && retryCount >= retryWarningThreshold()
           ? react.createElement("span", {
             key: "retry-warning",
@@ -8907,22 +9125,21 @@
           }, "多次重试")
           : null;
         const failure = isFailureStatusOf(status) ? renderFailureSummary(source.failure) : null;
-        // 票据 25：任务/专家/分片行必须有界的 token 数与请求数；缺失显示「—」而不是省略
-        // （用户需要区分「没有用量」与「还没读到」）。用量段独立于时间片段：时间信息缺失
-        // 时它仍然渲染，因此这里不再有「整块返回 null」的分支。
-        const usageBadge = renderUsageBadge(source.usage, { kind });
+        // 五段全空且没有异常提示时整行不渲染：旧快照不会留下一条空白的摘要线。
+        if (segments.length === 0 && retryWarning === null && failure === null) return null;
         return react.createElement("div", {
           className: "deg_expert_group_metrics",
           "data-metrics-kind": kind,
           role: "group",
-          "aria-label": "任务时间信息",
-        }, ...segments, usageBadge, retryWarning, failure);
+          "aria-label": "任务用量摘要",
+        }, ...segments, retryWarning, failure);
       };
       /**
        * attempt 时间线（只读）：默认最近 N 条，可切换「查看全部 / 收起」。
        *
-       * key 由调用方给出稳定节点键（fanout:<id> / shard:<parent>:<shard>）：
-       * 同一个分片在轮询刷新后仍复用同一份展开状态，切换 root 后不会污染别的会话。
+       * 只由展开的分片渲染（key 形如 shard:<root>:<parentTask>:<shard>）：同一个分片在轮询
+       * 刷新后仍复用同一份展开状态，切换 root 后不会污染别的会话。父任务不再渲染跨分片聚合
+       * 视图，因此条目不再携带分片归属单元格。
        * 时间线本体没有任何按钮/链接，只有条数切换按钮。
        */
       const renderAttemptTimeline = (node, options = {}) => {
@@ -8964,23 +9181,14 @@
               title: formatIsoText(timestamp) ?? clock,
             }, clock));
           }
-          const shardId = text(entry.shardId, null);
-          if (shardId !== null) {
-            cells.push(react.createElement("span", {
-              key: "shard",
-              className: "deg_expert_group_attempt_shard",
-              title: text(entry.shardTaskName, shardId),
-            }, shardId));
-          }
           return react.createElement("div", {
-            key: key + ":" + (shardId ?? "single") + ":" + attemptNumber + ":" + index,
+            key: key + ":" + attemptNumber + ":" + index,
             className: "deg_expert_group_attempt",
             role: "listitem",
             "data-status": attemptStatus,
             "data-attempt": String(attemptNumber),
-            ...(shardId === null ? {} : { "data-shard-id": shardId }),
           },
-          // 第一行保持既有的序号/状态/耗时/时间/分片单元格（文本顺序与旧结构逐字一致）。
+          // 第一行保持既有的序号/状态/耗时/时间单元格（文本顺序与旧结构逐字一致）。
           react.createElement("div", { className: "deg_expert_group_attempt_row" }, ...cells),
           // 票据 25/30：attempt 详情（用量/成本 + 结构化结果）。只读、无按钮，
           // 时间线唯一的交互仍是「查看全部/收起」。
@@ -9027,25 +9235,12 @@
         }, ...rows, toggle);
       };
       /**
-       * 导出当前快照（客户端本地序列化 + Blob 下载）。
-       *
-       * 只读 normalized 快照：不写宿主状态、不发 RPC；下载能力缺失时返回 false（序列化本身
-       * 由模型层的 serializeSnapshot 覆盖测试）。两个格式共用同一条纯函数路径。
-       */
-      const exportSnapshotAs = (format) => {
-        if (snapshot === null) return false;
-        const serialize = modelFunction("serializeSnapshot");
-        if (serialize === null) return false;
-        let result = null;
-        try { result = serialize(snapshot, { format }); } catch { return false; }
-        return downloadExportFile(result);
-      };
-
-      /**
-       * 每个代理节点固定三行；行内容与折叠状态无关，永不因展开状态隐藏任何一行。
+       * 每个代理节点固定两行；行内容与折叠状态无关，永不因展开状态隐藏任何一行。
        * 第一行：任务名（根节点是固定「主代理」，专家是最新 dispatch 短描述）；
-       * 第二行：角色 · provider · model · effort 元数据；
-       * 第三行：普通代理是 DSH 原生同源的 title · mode · activity；根节点只保留动态 title/activity。
+       * 第二行：角色 · provider · model · effort 元数据。
+       *
+       * 用户精简侧栏后，「标题 · 可继续｜一次性 · 正在运行｜当前未运行」摘要行已整体移除：
+       * 运行状态仍由行首圆点表达，续接模式与权威标题不再单独占一行。
        *
        * 第一行文案完整交给 CSS 处理，渲染层不做任何 grapheme 硬截断——完整文本同时是
        * React 文本、title（悬浮提示）与无障碍标签的来源，用户始终能读到全名。
@@ -9055,13 +9250,13 @@
        * - false：fan-out 分片第一行是「分片代号  任务名称」的组合文本，代号会占满单行额度，
        *   因此改用可换行样式（见 .deg_expert_group_shard_task），在右栏窄宽度下完整展示多行名称。
        *
-       * 可导航的第一行与第三行是 role=button 的 div（不是嵌套 <button>，避免无效 HTML）：
+       * 可导航的第一行是 role=button 的 div（不是嵌套 <button>，避免无效 HTML）：
        * 鼠标点击行为不变，同时支持键盘 Enter/Space，并带 tabIndex 与 aria-label。
        *
        * 标题后的侧栏箭头是**独立**的 <button>（任务标题行的内联位置，绝不包在可导航 div 里）：
        * 它只打开右侧栏的 subagentchat 页，不参与主视图导航，因此点击必须拦下冒泡。
        */
-      const renderThreeLines = (node, options = {}) => {
+      const renderRowMain = (node, options = {}) => {
         const source = object(node);
         const fullName = titleOf(source);
         const oneLine = options.oneLine !== false;
@@ -9088,14 +9283,6 @@
           "aria-label": taskLabel,
           onKeyDown,
         };
-        const entry = catalogEntryOf(parentId, clickableId);
-        const summary = agentSummaryOf(source, entry, authoritativeTitleOf(sessionsSnapshot, clickableId));
-        const summaryProps = onNavigate === undefined ? {} : {
-          role: "button",
-          tabIndex: 0,
-          "aria-label": "打开任务会话：" + (summary === "" ? fullName : summary),
-          onKeyDown,
-        };
         const metadata = metadataOf(source, mergedRoleLabels);
         const taskClassName = "deg_expert_group_line deg_expert_group_task"
           + (oneLine ? "" : " deg_expert_group_shard_task");
@@ -9110,12 +9297,11 @@
         }, ...taskChildren);
         // 主代理批量控件作为标题行的相邻 flex 项，标题收缩省略时控件仍固定在标题末尾。
         // 其它专家 / 分片 / 空闲成员不传 trailing，单会话箭头结构保持不变。
-        // 三行主体必须保持恰好 3 个子节点（既有 DOM 契约）：时间线条/attempt 时间线放在
-        // 相邻块（.deg_expert_group_cell）里纵向排列，绝不改变三行网格的行数与顺序。
+        // 两行主体必须保持恰好 2 个子节点（DOM 契约）：用量摘要条/attempt 时间线放在
+        // 相邻块（.deg_expert_group_cell）里纵向排列，绝不改变两行网格的行数与顺序。
         const rowMain = react.createElement("div", { className: "deg_expert_group_row_main", "data-kind": source.kind || "expert", "data-expanded": true },
           taskLine,
-          react.createElement("div", { className: "deg_expert_group_meta", title: metadata }, metadata),
-          react.createElement("div", { className: "deg_expert_group_line deg_expert_group_content", title: summary, onClick: onNavigate, ...summaryProps }, summary));
+          react.createElement("div", { className: "deg_expert_group_meta", title: metadata }, metadata));
         const extras = [];
         if (options.metrics !== undefined && options.metrics !== null) extras.push(options.metrics);
         if (options.footer !== undefined && options.footer !== null) extras.push(options.footer);
@@ -9168,11 +9354,11 @@
           },
             statusIcon(react, primitives, runtimeStatus),
             chevron,
-            react.createElement("div", null, renderThreeLines(node, {
+            react.createElement("div", null, renderRowMain(node, {
               sessionId: node.sessionId,
               parentId,
               // 会话节点只有 startedAt/lastActivityAt（Host 不发布完成时间），缺失片段自动省略。
-              metrics: renderMetrics(node, { kind: node.kind || "expert" }),
+              metrics: renderMetrics(node, { kind: node.kind || "expert", runtimeStatus, sessionId: node.sessionId, sessionIds: [node.sessionId] }),
               // 票据 30：专家自己的结构化结果区（有 value / 回退 / 已请求但未返回三种形态）。
               footer: renderStructuredBlock(node.structured, node.outputSchemaRequested, { kind: node.kind || "expert" }),
             }))),
@@ -9683,7 +9869,7 @@
         // shardId 只在 parentTaskId 内唯一；折叠存储必须使用复合 id，避免不同 fan-out
         // 中同名 shard 互相覆盖。最新 attempt childId 仍是唯一导航目标。
         // 第一行文本：有任务名称时是"分片代号  任务名称"，没有名称的旧数据只有分片代号。
-        // 拼接结果作为完整文本进入 renderThreeLines，并以 oneLine:false 走分片专用的可换行
+        // 拼接结果作为完整文本进入 renderRowMain，并以 oneLine:false 走分片专用的可换行
         // 第一行样式：渲染层不再做 grapheme 截断，分片代号因此不会挤掉任务名称的显示额度。
         // shardId 仍是 key、data-shard-id 与取消/重试请求的唯一标识，
         // 展示文本绝不参与任何管理动作定位。名字为空白时按缺失处理，不显示悬空分隔符。
@@ -9707,7 +9893,7 @@
         const showRetry = retryCapability === null ? RETRY_STATUSES.has(status) : retryCapability === true;
         if (showCancel) actions.push(renderAction("取消分片 " + shardKey, "IconStopFillRegular", () => runAction({ action: "fanout-cancel-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, cancelKey, true, "确认取消分片 " + shardKey + "？"), pendingSet.current.has(cancelKey)));
         if (showRetry) actions.push(renderAction("重试分片 " + shardKey, "IconRefreshOutlineRegular", () => runAction({ action: "fanout-retry-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, retryKey, false, ""), pendingSet.current.has(retryKey)));
-        // 展示状态用规范运行状态，证据与第三行同源（最新 attempt 的 childId 查目录项）；
+        // 展示状态用规范运行状态，证据与行内圆点同源（最新 attempt 的 childId 查目录项）；
         // status 仍保留给取消/重试判定（管理语义不变）。
         const runtimeStatus = runtimeStatusOfNode(shardNode, rootSessionId, latestChildId);
         // 分片的展开状态复用既有 chevron 机制：默认规则沿用 defaultExpanded（运行/等待/失败展开，
@@ -9741,12 +9927,12 @@
         },
           statusIcon(react, primitives, runtimeStatus),
           renderChevron(shardNode, shardOpen),
-          renderThreeLines(shardNode, {
+          renderRowMain(shardNode, {
             sessionId: latestChildId,
             parentId: rootSessionId,
             oneLine: false,
-            // 时间线条常驻（开始/耗时/重试/最近活动/失败摘要），attempt 时间线只在展开时渲染。
-            metrics: renderMetrics(shard, { kind: "shard" }),
+            // 用量摘要条常驻（用时/tok/s/tok/命中/context + 异常提示），attempt 时间线只在展开时渲染。
+            metrics: renderMetrics(shard, { kind: "shard", runtimeStatus, sessionId: latestChildId, sessionIds: [latestChildId] }),
             footer: shardFooter,
           }),
           react.createElement("div", { className: "deg_expert_group_actions" }, actions));
@@ -9772,18 +9958,15 @@
         // data-status 是对外的规范运行状态；管理状态改由 data-task-status 暴露，
         // 供了解 fan-out 内部结算的消费方读取，展示层不再出现 succeeded/failed 等词。
         const runtimeStatus = runtimeStatusOf(task, null);
-        // 父任务的时间线条（开始/耗时/尝试与重试次数/最近活动/失败摘要）与标题同列纵向排列：
-        // 标题仍可点击导航，时间线条不参与导航、不拦截点击。
-        // 展开后的 attempt 聚合时间线放在分片之后：它是「最近发生的尝试」的日志视图，
-        // 不插入标题与首个分片之间，树线锚点与既有布局保持一致。
-        // 过滤期间聚合时间线只统计可见分片：与分片列表保持同一份过滤视图，避免「过滤后仍显示被隐藏分片的尝试」。
-        const timelineSource = filterActive === true && taskFilter !== null ? { ...task, shards: visibleShards } : task;
-        const fanoutTimeline = open ? renderAttemptTimeline(timelineSource, { key: "fanout:" + rootSessionId + ":" + task.parentTaskId }) : null;
+        // 父任务的用量摘要条（用时/tok/s/tok/命中；无单一会话因此没有 context）与标题同列纵向排列：
+        // 标题仍可点击导航，摘要条不参与导航、不拦截点击。
+        // 用户精简侧栏后，父任务不再显示跨分片的聚合 attempt 时间线；分片展开后仍可查看
+        // 该分片自己的 attempt 历史（见 renderShard 的 shardTimeline），渐进披露语义不变。
         // 树语义：fan-out 头部是第 2 层 treeitem，分片容器是它的 group（位置只算可见分片）。
         const meta = treeMeta !== undefined && treeMeta !== null
           ? treeMeta
           : { level: 2, posinset: index + 1, setsize: index + 1 };
-        // fan-out 标题（票据 18）：可聚焦 + Enter/Space 跳转会话，与任务名/第三行同一套键盘契约。
+        // fan-out 标题（票据 18）：可聚焦 + Enter/Space 跳转会话，与任务名同一套键盘契约。
         // 只有真的能导航（宿主提供 uiWorkspace.openSession 且任务有 sessionId）时才挂 role/tabIndex，
         // 绝不留下一个「可聚焦但按了没反应」的标题；它是 div，不是嵌套 button。
         // 票据 27：fan-out 标题的角色段优先使用显示名（含自定义角色），没有显示名时
@@ -9839,7 +10022,7 @@
                 ...(fanoutNavigable ? { role: "button", tabIndex: 0, "aria-label": "打开任务会话：" + fanoutTitle, onKeyDown: onFanoutKeyDown } : {}),
                 onClick: fanoutNavigable ? () => handleOpen(fanoutNavigationId) : undefined,
               }, fanoutTitle),
-              renderMetrics(task, { kind: "fanout" })),
+              renderMetrics(task, { kind: "fanout", runtimeStatus, sessionIds: fanoutSessionIdsOf(task) })),
             react.createElement("div", { className: "deg_expert_group_actions" }, actions)),
           // 箭头函数按 (shard, index, array) 收到与旧 `renderShard.bind(null, task)` 完全相同的实参
           // （renderShard 只用前两个），但不再每次渲染都新建一个绑定函数。
@@ -9847,8 +10030,7 @@
             level: meta.level + 1,
             posinset: shardIndex + 1,
             setsize: visibleShards.length,
-          }))) : null,
-          fanoutTimeline);
+          }))) : null);
       };
 
       const children = Array.isArray(snapshot?.root?.children) ? snapshot.root.children : [];
@@ -9888,78 +10070,12 @@
       const idleBatchSlot = filterActive === true ? null : renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren), t("sidebar.idleGroup.name"));
       const root = snapshot?.root;
       /**
-       * 顶部工具条（票据 12）：搜索输入 + 角色筛选 + 状态筛选 + Markdown/JSON 导出。
+       * 顶部工具条（票据 12）：搜索输入 + 角色筛选 + 状态筛选 + 手动派发入口。
        *
-       * 只在快照已上屏时渲染（skeleton/空态没有可过滤/可导出的内容）；所有交互都在本地完成：
-       * 输入/下拉只改内存过滤状态，导出只读 normalized 快照并交给浏览器下载。
-       * 角色候选从当前快照里现算（普通专家、fan-out 父任务与分片），而不是写死词表。
+       * 只在快照已上屏时渲染（skeleton/空态没有可过滤的内容）；输入/下拉只改内存过滤状态，
+       * 手动派发只读本地表单或调用既有 RPC。角色候选从当前快照里现算
+       * （普通专家、fan-out 父任务与分片），而不是写死词表。
        */
-      /**
-       * 票据 26：排队/限流诊断区（只读）。
-       *
-       * 数据只来自 meta.diagnostics.fanout.concurrency.throttle（Host 的同一套 running/queued
-       * 计数）。etaMs 缺失时显示「未知」，**绝不**用任务耗时或猜测值算一个 ETA；
-       * limit=0 在 provider 维度表示「不限制」。meta 未加载时只显示读取中，不伪造零值。
-       */
-      const renderDiagnostics = () => {
-        if (diagnosticsOpen !== true) return null;
-        const metaThrottle = meta === null ? null : meta.throttle;
-        const rows = [];
-        const pushRows = (kind, list) => {
-          for (const value of Array.isArray(list) ? list : []) {
-            const row = object(value);
-            const key = text(kind === "role" ? row.role : row.provider, null);
-            if (key === null) continue;
-            const limit = finiteNumber(row.limit);
-            const running = finiteNumber(row.running);
-            const queued = finiteNumber(row.queued);
-            const etaMs = finiteNumber(row.etaMs);
-            const etaText = etaMs === null ? "未知" : (formatDurationText(etaMs) ?? "未知");
-            const limitText = limit === null ? "—" : (limit === 0 ? "不限" : String(limit));
-            const nameText = kind === "role" ? (roleLabelFor(key, null) ?? key) : key;
-            rows.push(react.createElement("div", {
-              key: kind + ":" + key,
-              className: "deg_expert_group_diag_row",
-              "data-kind": kind,
-              "data-key": key,
-              "data-eta-source": text(row.etaSource, "unknown"),
-            },
-            react.createElement("span", { className: "deg_expert_group_diag_name", title: key }, nameText + (kind === "role" ? "（角色）" : "（provider）")),
-            react.createElement("span", { className: "deg_expert_group_diag_values" },
-              "运行 " + (running === null ? "—" : String(running))
-              + " · 排队 " + (queued === null ? "—" : String(queued))
-              + " · 上限 " + limitText
-              + " · 预计等待 " + etaText)));
-          }
-        };
-        if (metaThrottle !== null) {
-          pushRows("role", metaThrottle.roles);
-          pushRows("provider", metaThrottle.providers);
-        }
-        const totals = meta === null ? null : object(object(meta.usage).totals);
-        return react.createElement("section", {
-          className: "deg_expert_group_diagnostics",
-          role: "region",
-          "aria-label": "排队与限流诊断",
-        },
-        react.createElement("div", { className: "deg_expert_group_diagnostics_head" },
-          react.createElement("span", null, "排队与限流诊断"),
-          react.createElement("button", {
-            type: "button",
-            className: "deg_expert_group_export_button",
-            "aria-label": "收起排队与限流诊断",
-            onClick: () => setDiagnosticsOpen(false),
-          }, "收起")),
-        meta === null
-          ? react.createElement("div", { className: "deg_expert_group_diagnostics_empty" }, "诊断读取中…")
-          : (rows.length === 0
-            ? react.createElement("div", { className: "deg_expert_group_diagnostics_empty" }, "暂无排队/限流诊断（宿主未提供）")
-            : react.createElement("div", { className: "deg_expert_group_diagnostics_rows", role: "list" }, ...rows)),
-        totals === null
-          ? null
-          : react.createElement("div", { className: "deg_expert_group_diagnostics_usage" }, renderUsageBadge(totals, { kind: "totals" })));
-      };
-
       /** 表单字段容器（label + 控件）；控件自身负责 aria-label 与受控值。 */
       const renderDispatchField = (label, control) => react.createElement("label", { className: "deg_expert_group_dispatch_field" },
         react.createElement("span", { className: "deg_expert_group_dispatch_label" }, label),
@@ -10213,17 +10329,6 @@
         // 对用户没有意义。候选只来自真正会被过滤的子节点。
         collectRoles(root?.children);
         roles.sort();
-        const exportButton = (format, label, visibleText) => react.createElement("button", {
-          type: "button",
-          className: "deg_expert_group_export_button",
-          "aria-label": label,
-          title: label,
-          onClick: (event) => {
-            event?.preventDefault?.();
-            event?.stopPropagation?.();
-            exportSnapshotAs(format);
-          },
-        }, visibleText);
         return react.createElement("div", { className: "deg_expert_group_toolbar", role: "search", "aria-label": t("sidebar.search.label") },
           react.createElement("input", {
             type: "search",
@@ -10253,8 +10358,8 @@
             react.createElement("option", { key: "__all_statuses", value: "" }, t("sidebar.filter.allStatuses")),
             ...STATUS_FILTER_OPTIONS.map((option) => react.createElement("option", { key: option.value, value: option.value }, option.label)),
           ]),
-          // 票据 28：手动派发入口（新建任务 / 重放上次）与票据 26 的诊断入口都在工具条上；
-          // 三者都只读本地状态或调用已有 RPC，导出按钮的既有行为不变。
+          // 票据 28：手动派发入口（新建任务 / 重放上次）在工具条上；
+          // 两者都只读本地状态或调用已有 RPC。
           react.createElement("button", {
             type: "button",
             className: "deg_expert_group_export_button",
@@ -10279,24 +10384,7 @@
                 event?.stopPropagation?.();
                 void replayLastDispatch();
               },
-            }, "重放上次"),
-          react.createElement("button", {
-            type: "button",
-            className: "deg_expert_group_export_button",
-            "aria-label": "排队与限流诊断",
-            "aria-expanded": diagnosticsOpen,
-            onClick: (event) => {
-              event?.preventDefault?.();
-              event?.stopPropagation?.();
-              const next = diagnosticsOpen !== true;
-              setDiagnosticsOpen(next);
-              // 打开诊断时才读取 meta（挂载/轮询路径不新增请求）；已加载则直接复用。
-              if (next && metaStateRef.current === null) void loadMeta();
-            },
-          }, "诊断"),
-          react.createElement("div", { className: "deg_expert_group_export" },
-            exportButton("markdown", t("sidebar.export.markdown"), "MD"),
-            exportButton("json", t("sidebar.export.json"), "JSON")));
+            }, "重放上次"));
       };
       const rootOpen = root === null ? true : expand(root);
       // 根层的可见兄弟集合（票据 18）：普通/空闲成员之外，空闲分组本身也是根的一个可见子项。
@@ -10391,9 +10479,8 @@
           ? react.createElement("div", { className: "deg_expert_group_empty" }, t("sidebar.empty"))
           : react.createElement("div", { className: "deg_expert_group_tree" },
             renderToolbar(),
-            // 票据 26/28：诊断区、新建任务表单与派发回执都在工具条之下、任务树之上；
-            // 三者只在对应显式状态打开时渲染，默认（没有交互）DOM 与既有面板一致。
-            renderDiagnostics(),
+            // 票据 28：新建任务表单与派发回执都在工具条之下、任务树之上；
+            // 两者只在对应显式状态打开时渲染，默认（没有交互）DOM 与既有面板一致。
             renderDispatchForm(),
             renderDispatchReceipt(),
             // 树语义（票据 18）：role=tree 只包住真正的树项，工具条（role=search）留在树外，
@@ -10409,13 +10496,13 @@
                 "aria-expanded": rootOpen,
                 "data-status": rootStatus,
                 "data-expanded": rootOpen,
-              }, statusIcon(react, primitives, rootStatus), renderChevron(root, rootOpen), react.createElement("div", null, renderThreeLines(root, {
+              }, statusIcon(react, primitives, rootStatus), renderChevron(root, rootOpen), react.createElement("div", null, renderRowMain(root, {
                 sessionId: root.sessionId,
                 parentId: null,
                 expanded: true,
                 trailing: rootBatchSlot,
                 // 会话节点只有 startedAt/lastActivityAt（Host 不发布会话完成时间，durationMs 为 null）。
-                metrics: renderMetrics(root, { kind: "root" }),
+                metrics: renderMetrics(root, { kind: "root", runtimeStatus: rootStatus, sessionId: root.sessionId, sessionIds: [root.sessionId] }),
               }))),
               rootOpen ? react.createElement("div", { className: "deg_expert_group_children", role: "group" }, [
                 ...visibleChildren.map((node, index) => node.kind === "fanout"
