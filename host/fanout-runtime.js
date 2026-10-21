@@ -138,10 +138,30 @@ export function createFanoutRuntimeModule({
   /** 动态有效的 per-role 默认并发上限（settings 解析函数）；缺省时沿用 runtimeOptions。 */
   concurrencyLimit,
   /**
+   * 动态有效的角色级并发映射（票据 26）：settings.roleLimits 的解析函数。
+   *
+   * 与 concurrencyLimit 是两层关系，不是替代关系：concurrencyLimit 是「没有逐角色
+   * 覆盖时」的默认值，roleLimits 是逐角色覆盖。两者都必须接线，否则设置页的映射
+   * 会变成永不生效的配置项。
+   */
+  roleLimits,
+  /**
+   * 动态有效的 provider 级并发映射（票据 26）：settings.providerLimits 的解析函数。
+   * {provider: 0..64}，0/未设置表示不限制；只约束真正进入 running 的分片数。
+   */
+  providerLimits,
+  /**
    * 动态有效的角色级默认超时（settings 解析函数或静态毫秒数，票据 06）。
    * manager 在每次新建 attempt 时读一次；0 表示不启用。
    */
   roleTimeoutMs,
+  /**
+   * manager 事件只读观察钩子（票据 26）：每个 shard/task 事件都会回调一次。
+   *
+   * 组合根用它把「排队 shard」登记进 root turn 等待账本并在 running/终态时精确结算；
+   * 钩子异常只记日志，绝不影响事件投递或调度状态机。
+   */
+  onFanoutEvent,
   buildRequest,
   startContinuable,
   continueMessage,
@@ -314,6 +334,15 @@ export function createFanoutRuntimeModule({
   const dynamicRoleTimeoutMs = typeof roleTimeoutMs === "function" || typeof roleTimeoutMs === "number"
     ? roleTimeoutMs
     : undefined;
+  /**
+   * 动态角色级/provider 级并发映射（票据 26）。
+   *
+   * 两者都只接受函数：静态映射无法表达「设置页保存后立即生效」，而本票据的核心语义
+   * 正是这一点。非法类型直接忽略（装配错误不能变成调度异常）；manager 侧还有一道
+   * 归一与诊断兜底（非法条目回退默认值/不限制并产生一次性诊断）。
+   */
+  const dynamicRoleLimits = typeof roleLimits === "function" ? roleLimits : undefined;
+  const dynamicProviderLimits = typeof providerLimits === "function" ? providerLimits : undefined;
 
   const warn = (message) => {
     try { logger?.warn?.(message); } catch { /* 日志失败不影响调度 */ }
@@ -1670,11 +1699,19 @@ export function createFanoutRuntimeModule({
       stop: typeof runtime?.stopDiagnostics === "function"
         ? runtime.stopDiagnostics()
         : (typeof runtime?.manager?.stopDiagnostics === "function" ? runtime.manager.stopDiagnostics() : null),
-      // 只读并发视图（有效默认值 / 各 role 覆盖 / 解析来源）：让"设置页显示的并发上限"
-      // 与实际调度值在同一处可诊断，不暴露任务负载。
+      // 只读并发视图（有效默认值 / 各 role 与 provider 覆盖 / 解析来源）：让"设置页
+      // 显示的并发上限"与实际调度值在同一处可诊断，不暴露任务负载。
       ...(typeof runtime?.manager?.concurrencyLimits === "function"
         ? { concurrencyLimits: runtime.manager.concurrencyLimits() }
         : {}),
+      /**
+       * 限流/排队诊断（票据 26）：按 role 与 provider 的 limit/running/queued/
+       * lastThrottledAt/etaMs。数据源是 manager 的同一套 running 计数与 shard 状态，
+       * Host 不复制计数器；旧 manager 缺能力时为 null（消费方必须视为不可用）。
+       */
+      throttle: typeof runtime?.manager?.throttleDiagnostics === "function"
+        ? runtime.manager.throttleDiagnostics()
+        : null,
       // 只读预算视图（用量 / 冻结上限 / 最近一次违规）；关闭后不再有意义。
       ...(typeof runtime?.manager?.budget === "function" ? { budget: runtime.manager.budget() } : {}),
     }),
@@ -1754,6 +1791,10 @@ export function createFanoutRuntimeModule({
     // 模块级解析函数（settings 接线）优先于 runtimeOptions.concurrencyLimit 的静态默认值：
     // 静态值只是"没有动态来源时"的兜底，不能让组合根的历史常量把 settings 压住。
     ...(dynamicConcurrencyLimit === undefined ? {} : { concurrencyLimit: dynamicConcurrencyLimit }),
+    // 角色级映射（逐角色覆盖）与 provider 级映射（票据 26）同属「实时读取设置」层：
+    // 只有动态解析函数才会接线，静态值继续由 runtimeOptions 表达（测试/静态部署）。
+    ...(dynamicRoleLimits === undefined ? {} : { roleLimits: dynamicRoleLimits }),
+    ...(dynamicProviderLimits === undefined ? {} : { providerLimits: dynamicProviderLimits }),
     // 角色级默认超时走同一优先级（票据 06）。
     ...(dynamicRoleTimeoutMs === undefined ? {} : { roleTimeoutMs: dynamicRoleTimeoutMs }),
     buildRequest,
@@ -1771,7 +1812,28 @@ export function createFanoutRuntimeModule({
     // 多轮复用的父权限解析：continueMessage 需要 exact parent Agent 才能投递给同一 child。
     parentAgentOf: (parentTaskId) => lineage.parentAgentOf(parentTaskId),
     persistence: { save: (snapshot) => api.persist(snapshot) },
-    onEvent: (event) => api.parentSettled(event),
+    /**
+     * 事件双消费入口（票据 26）。
+     *
+     * 顺序固定为「先账本、后父任务结算」：
+     * 1. onFanoutEvent：组合根的 per-shard 等待账本。shard 进入 running 或任一终态时
+     *    精确结算该 shard 的排队工作，task_settled 时兜底结算剩余工作；
+     * 2. api.parentSettled：任务级等待原因释放、回收排除集合维护与父会话反馈。
+     *
+     * 钩子必须**在关闭/恢复早退之外**执行：关闭时 manager 会把未终态分片收敛为
+     * cancelled，这些事件同样需要结算账本，否则 root 会在卸载前永久悬挂一个排队工作。
+     * 钩子异常只记日志——等待账本的问题不能反过来打断事件投递。
+     */
+    onEvent: (event) => {
+      if (typeof onFanoutEvent === "function") {
+        try {
+          onFanoutEvent(event);
+        } catch (error) {
+          warn("dsh-expert-group: fan-out event observer failed: " + describeError(error));
+        }
+      }
+      return api.parentSettled(event);
+    },
     log: (message, error) => warn("dsh-expert-group: " + message + (error instanceof Error ? ": " + error.message : "")),
   });
   return Object.freeze(api);

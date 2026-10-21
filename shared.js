@@ -75,6 +75,76 @@ export const READONLY_DENY = [
 ];
 
 /**
+ * 运行期角色工具名扩展：自定义角色把 id 同时用作工具名，因此所有专家 child（无论
+ * 内置还是自定义、只读还是可写）都必须把「自定义角色工具」与「Harness 外层入口
+ * subagent_<id>」加入自己的委派 deny，否则新增角色会成为一个可绕过 parent 的入口。
+ *
+ * 只接受注册表记录（而不是设置原始值）：调用方必须先走 createRoleRegistry 归一。
+ * @param {object[]} [records] - 运行期注册表记录。
+ * @returns {string[]} 需要并入委派 deny 的额外工具名（未去重，交给最终 Set 收敛）。
+ */
+export function customRoleDenyExtensions(records) {
+  const names = [];
+  for (const entry of Array.isArray(records) ? records : []) {
+    if (entry?.custom !== true || typeof entry.id !== "string" || entry.id.length === 0) continue;
+    names.push(typeof entry.toolName === "string" && entry.toolName.length > 0 ? entry.toolName : entry.id);
+    names.push("subagent_" + entry.id);
+  }
+  return names;
+}
+
+/**
+ * 单个角色的完整 deny 候选（票据 27）。
+ *
+ * 组合规则与内置角色完全同源，绝不为自定义角色新增「默认放开」路径：
+ * - 只读角色：READONLY_DENY（已含委派与 root-only） + 自身 toolDeny + 运行期扩展；
+ * - 可写角色：EXPERT_DELEGATION_DENY + ROOT_ONLY_TOOL_DENY + 自身 toolDeny + 运行期扩展。
+ * 未知角色由调用方按只读处理（fail-closed），这里不提供默认分支。
+ *
+ * @param {object|undefined} entry - 注册表记录。
+ * @param {string[]} [extensions] - customRoleDenyExtensions() 的结果。
+ * @returns {string[]} 去重后的 deny 候选（仍需按宿主可见性过滤）。
+ */
+export function expertDenyCandidates(entry, extensions = []) {
+  // 未知/缺失记录一律按只读处理（fail-closed）：绝不能因为查询不到角色就给出更宽的集合。
+  const base = entry === void 0 || entry === null || entry.readOnly === true
+    ? READONLY_DENY
+    : [...EXPERT_DELEGATION_DENY, ...ROOT_ONLY_TOOL_DENY];
+  const own = Array.isArray(entry?.toolDeny) ? entry.toolDeny : [];
+  return [...new Set([...base, ...own, ...(Array.isArray(extensions) ? extensions : [])])];
+}
+
+/** 注册表记录 → 显示名映射（冻结副本）；自定义角色与内置角色同源投影。 */
+export function roleLabelsOf(records) {
+  const map = {};
+  for (const entry of Array.isArray(records) ? records : []) {
+    if (typeof entry?.id !== "string") continue;
+    map[entry.id] = entry.label;
+  }
+  return Object.freeze(map);
+}
+
+/** 注册表记录 → 状态标签映射（冻结副本，供页面 "Xxx running" 文案）。 */
+export function roleStatusLabelsOf(records) {
+  const map = {};
+  for (const entry of Array.isArray(records) ? records : []) {
+    if (typeof entry?.id !== "string") continue;
+    map[entry.id] = entry.statusLabel;
+  }
+  return Object.freeze(map);
+}
+
+/** 注册表记录 → 职责描述映射（冻结副本）。 */
+export function roleDescriptionsOf(records) {
+  const map = {};
+  for (const entry of Array.isArray(records) ? records : []) {
+    if (typeof entry?.id !== "string") continue;
+    map[entry.id] = entry.description;
+  }
+  return Object.freeze(map);
+}
+
+/**
  * PTC 的 run_code 是展示传输，不是可交给 tools.restrict() 的全局工具。
  * 过滤器保留静态 deny 清单的完整性，同时只返回当前视图中真正可限制的名称。
  * @param {string[]} denyList - 静态候选 deny 工具名。
@@ -2760,13 +2830,16 @@ export function countPromptGraphemes(text) {
  * - 超过 grapheme 上限的文本被丢弃（Host 在写入边界会显式拒绝，这里只保证读取安全）。
  *
  * @param {unknown} value - settings 文档里的 promptOverrides 原始值。
+ * @param {readonly string[]} [allowedRoles] - 允许的角色集合；运行期目录（内置 + 自定义）
+ *   由调用方传入，缺省为内置六角色。自定义角色的提示词覆盖因此走同一条读取归一。
  * @returns {Record<string,string>} 归一后的普通对象（含 0 个键表示无覆盖）。
  */
-export function normalizePromptOverrides(value) {
+export function normalizePromptOverrides(value, allowedRoles = STATUS_ROLE_IDS) {
   const result = {};
   if (value === null || typeof value !== "object" || Array.isArray(value)) return result;
+  const allowed = new Set(Array.isArray(allowedRoles) ? allowedRoles : STATUS_ROLE_IDS);
   for (const [role, text] of Object.entries(value)) {
-    if (!STATUS_ROLE_IDS.includes(role)) continue;
+    if (!allowed.has(role)) continue;
     if (typeof text !== "string") continue;
     if (text.trim().length === 0) continue;
     if (countPromptGraphemes(text) > PROMPT_OVERRIDE_MAX_GRAPHEMES) continue;
@@ -2800,12 +2873,15 @@ export const STATUS_ROLE_LABELS = roleStatusLabels({ enableObserver: true });
  * 归一化插件角色元数据；未知、空值和外部角色都返回 undefined，避免客户端
  * 猜测历史/外部会话的身份。大小写归一只用于可靠匹配，不改变持久化数据。
  * @param {unknown} role - RPC/marker 提供的角色值。
+ * @param {readonly string[]} [allowedRoles] - 允许的角色集合；运行期目录（内置 + 自定义）
+ *   由 Host 传入，缺省为内置六角色（客户端 bundle 的静态副本与之一致）。
  * @returns {string|undefined} 已验证的英文 role id。
  */
-export function normalizeStatusRole(role) {
+export function normalizeStatusRole(role, allowedRoles = STATUS_ROLE_IDS) {
   if (typeof role !== "string") return void 0;
   const normalized = role.trim().toLowerCase();
-  return STATUS_ROLE_IDS.includes(normalized) ? normalized : void 0;
+  const allowed = Array.isArray(allowedRoles) ? allowedRoles : STATUS_ROLE_IDS;
+  return allowed.includes(normalized) ? normalized : void 0;
 }
 
 /**
@@ -3264,21 +3340,301 @@ export function resolveRunningStatusText({ sessionId, currentSessionId, running,
 }
 
 /**
- * 原生运行状态文案里唯一可替换的精确子串。
+ * 文案层（票据 19）：集中消息表 + locale 解析。
  *
- * DSH 0.2.0-rc1 在输入区上方渲染宿主自己的运行状态行，中文 locale 的可见文案形如
- * 「深度求索中，用时8分12秒...」（前面还可能挂着鲸鱼尾巴节点与独立的 aria-hidden 计时器）。
- * 插件只拥有这一段前缀：替换它就能把当前会话的角色投影到宿主原生行上，而逗号、用时、
- * 末尾省略号以及前后兄弟节点/动画全部保持宿主原样——既不重建整行，也不创建覆盖层。
+ * 设计边界：
+ * - 本文件是 Host 与客户端共享语义的**权威副本**；浏览器无法 import 本模块，因此
+ *   client-expert-group-model.js 里有一份逐键同值的投影（构建期由装配脚本排在其前执行）。
+ *   两份漂移由 test/expert-group-model.test.mjs 的键值对比守住。
+ * - 默认语言是 zh；支持 zh / en 两种语言。缺失键回退 zh，zh 也缺失时返回中性占位符，
+ *   绝不让空串或键名出现在界面上。
+ * - 变量插值只支持 {name} 形式；缺失变量保留原占位符（便于发现调用方漏传），绝不输出 undefined。
  */
-export const NATIVE_RUNNING_STATUS_PREFIX = "深度求索中";
+export const SUPPORTED_LOCALES = Object.freeze(["zh", "en"]);
+export const DEFAULT_LOCALE = "zh";
+/** 两份语言表都缺键时的唯一中性占位：绝不显示空串，也绝不把内部键名暴露给用户。 */
+export const MISSING_MESSAGE_TEXT = "—";
+
+/**
+ * 消息表：扁平点分键 → 各语言文案。
+ *
+ * 覆盖面（票据 19 范围）：侧栏关键路径、设置页核心控件、系统通知标题/正文、运行状态播报。
+ * 角色 persona/提示词与长诊断行不在本表范围（不在本期翻译范围）。
+ */
+export const MESSAGE_CATALOG = Object.freeze({
+  "sidebar.title": { zh: "Expert Group", en: "Expert Group" },
+  "sidebar.empty": { zh: "暂无 Expert Group 任务", en: "No Expert Group tasks yet" },
+  "sidebar.error.snapshot": { zh: "快照读取失败", en: "Snapshot read failed" },
+  "sidebar.error.action": { zh: "操作失败", en: "Action failed" },
+  "sidebar.error.rpc": { zh: "请求失败", en: "Request failed" },
+  "sidebar.refresh": { zh: "刷新", en: "Refresh" },
+  "sidebar.retry": { zh: "重试", en: "Retry" },
+  "sidebar.partial": { zh: "数据不完整", en: "Incomplete data" },
+  "sidebar.partial.title": {
+    zh: "数据不完整：轻量快照已先上屏，状态与任务名可能尚未读取完整",
+    en: "Incomplete data: a lightweight snapshot is shown first; statuses and task names may not be fully loaded yet",
+  },
+  "sidebar.updated": { zh: "更新于 {time}", en: "Updated {time}" },
+  "sidebar.updated.title": {
+    zh: "最后更新时间（本次数据上屏的时刻）",
+    en: "Last update time (when this data was rendered)",
+  },
+  "sidebar.idleGroup": { zh: "空闲子代理（{count}）", en: "Idle subagents ({count})" },
+  "sidebar.idleGroup.name": { zh: "空闲子代理", en: "Idle subagents" },
+  "sidebar.search.label": { zh: "任务过滤与导出", en: "Filter and export tasks" },
+  "sidebar.search.aria": { zh: "搜索任务", en: "Search tasks" },
+  "sidebar.search.placeholder": { zh: "搜索任务名 / 角色 / 模型", en: "Search task name / role / model" },
+  "sidebar.filter.role": { zh: "按角色筛选", en: "Filter by role" },
+  "sidebar.filter.status": { zh: "按状态筛选", en: "Filter by status" },
+  "sidebar.filter.allRoles": { zh: "全部角色", en: "All roles" },
+  "sidebar.filter.allStatuses": { zh: "全部状态", en: "All statuses" },
+  "sidebar.filter.empty": { zh: "没有匹配的任务", en: "No matching tasks" },
+  "sidebar.export.markdown": { zh: "导出 Markdown", en: "Export Markdown" },
+  "sidebar.export.json": { zh: "导出 JSON", en: "Export JSON" },
+  "sidebar.collapse": { zh: "收起", en: "Collapse" },
+  "sidebar.expand": { zh: "展开", en: "Expand" },
+  "sidebar.timeline.showAll": { zh: "查看全部", en: "Show all" },
+  "sidebar.recovery.retry": { zh: "重试恢复", en: "Retry recovery" },
+  "sidebar.recovery.retrying": { zh: "重试中…", en: "Retrying…" },
+  "sidebar.recovery.failed": { zh: "任务恢复失败（{code}）", en: "Task recovery failed ({code})" },
+  "sidebar.recovery.retryFailed": { zh: "重试未恢复（{code}）", en: "Retry did not recover ({code})" },
+  "settings.title": { zh: "dsh-expert-group", en: "dsh-expert-group" },
+  "settings.hint": {
+    zh: "专家模型使用 DSH 当前已配置的 provider 和模型目录。",
+    en: "Expert models use the providers and model catalog configured in DSH.",
+  },
+  "settings.taskManagement": { zh: "任务管理", en: "Task management" },
+  "settings.auto": { zh: "Auto", en: "Auto" },
+  "settings.autoTitle": {
+    zh: "自动打开运行中的子代理侧栏会话",
+    en: "Automatically open running subagent sidebar sessions",
+  },
+  "settings.notifications": { zh: "通知弹窗", en: "Notifications" },
+  "settings.notificationVolume": { zh: "通知音量", en: "Notification volume" },
+  "settings.notificationEvents": { zh: "通知事件", en: "Notification events" },
+  "settings.notificationVolume.range": { zh: "通知音量滑块", en: "Notification volume slider" },
+  "settings.notificationVolume.number": { zh: "通知音量数值", en: "Notification volume value" },
+  "settings.notificationEvent.completed": { zh: "任务完成", en: "Task completed" },
+  "settings.roleTimeout.aria": { zh: "角色默认超时", en: "Default role timeout" },
+  "settings.notificationEvent.completed.aria": { zh: "通知任务完成", en: "Notify on task completed" },
+  "settings.notificationEvent.waiting.aria": { zh: "通知等待用户", en: "Notify on waiting for user" },
+  "settings.notificationEvent.failed.aria": { zh: "通知任务失败", en: "Notify on task failed" },
+
+  "settings.notificationEvent.waiting": { zh: "等待用户", en: "Waiting for user" },
+  "settings.notificationEvent.failed": { zh: "任务失败", en: "Task failed" },
+
+  "settings.unifiedProvider": { zh: "统一供应商", en: "Unified provider" },
+  "settings.noProvider": { zh: "无", en: "None" },
+  "settings.observerPreferred": { zh: "Observer优先", en: "Prefer Observer" },
+  "settings.concurrencyLimit": { zh: "单个角色并发上限", en: "Per-role concurrency limit" },
+  "settings.roleTimeout": { zh: "角色默认超时 (s)", en: "Default role timeout (s)" },
+  "settings.roleTimeout.title": {
+    zh: "默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
+    en: "Defaults to 10 hours (36000 s); 0 disables it; enabled values are 1–86400 s (integer, 1 s precision). Applies only to attempts created after saving; running shards are unchanged.",
+  },
+  "settings.save": { zh: "保存", en: "Save" },
+  "settings.saving": { zh: "保存中…", en: "Saving…" },
+  "settings.discard": { zh: "放弃修改", en: "Discard changes" },
+  "settings.saved": { zh: "已保存", en: "Saved" },
+  "settings.unsaved": { zh: "有未保存的修改", en: "Unsaved changes" },
+  "settings.diagnostics.title": { zh: "诊断与通知状态", en: "Diagnostics and notification status" },
+  "settings.diagnostics.capabilities": { zh: "能力矩阵", en: "Capabilities" },
+  "settings.diagnostics.runtime": { zh: "运行时诊断", en: "Runtime diagnostics" },
+  "settings.diagnostics.budget": { zh: "预算用量与最近违规", en: "Budget usage and latest violation" },
+  "settings.diagnostics.persistence": { zh: "持久化与恢复", en: "Persistence and recovery" },
+  "settings.diagnostics.notifications": { zh: "通知投递", en: "Notification delivery" },
+  "settings.diagnostics.loading": { zh: "正在读取宿主诊断…", en: "Loading host diagnostics…" },
+  "settings.diagnostics.unavailable": {
+    zh: "宿主诊断不可用；以下只显示客户端能力。",
+    en: "Host diagnostics are unavailable; only client capabilities are shown below.",
+  },
+  "settings.diagnostics.absent": {
+    zh: "宿主未提供诊断数据；以下只显示客户端能力。",
+    en: "The host provided no diagnostics; only client capabilities are shown below.",
+  },
+  "settings.testNotification": { zh: "发送测试通知", en: "Send test notification" },
+  "settings.testNotification.sending": { zh: "发送中…", en: "Sending…" },
+  "settings.testNotification.sent": { zh: "已发送测试通知", en: "Test notification sent" },
+  "settings.testNotification.disabled": { zh: "通知已关闭，未发送测试通知", en: "Notifications are off; test notification not sent" },
+  "settings.sessionOverride.title": { zh: "仅本会话模型覆盖", en: "Session-only model overrides" },
+  "settings.sessionOverride.hint": {
+    zh: "只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
+    en: "Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the global default again.",
+  },
+  "settings.sessionOverride.noSession": {
+    zh: "未打开会话：打开一个会话后可在此临时覆盖角色模型。",
+    en: "No open session: open a session to temporarily override role models here.",
+  },
+  "settings.sessionOverride.child": {
+    zh: "当前是子代理会话，会话级模型覆盖只读。",
+    en: "This is a subagent session; session model overrides are read-only.",
+  },
+  "settings.sessionOverride.loading": { zh: "正在读取本会话覆盖…", en: "Loading session overrides…" },
+  "settings.sessionOverride.unavailable": {
+    zh: "本会话覆盖读取失败，请稍后重试。",
+    en: "Failed to read session overrides; please retry later.",
+  },
+  "settings.sessionOverride.unsupported": {
+    zh: "当前宿主版本不支持会话级模型覆盖。",
+    en: "This host version does not support session model overrides.",
+  },
+  "settings.sessionOverride.offline": {
+    zh: "会话未运行：会话级覆盖只读。",
+    en: "The session is not running; session overrides are read-only.",
+  },
+  "settings.sessionOverride.followGlobal": { zh: "跟随全局默认", en: "Follow global default" },
+  "settings.sessionOverride.override": { zh: "本会话覆盖", en: "Session override" },
+  "settings.sessionOverride.revision": { zh: "代次 {revision}", en: "Revision {revision}" },
+  "settings.sessionOverride.provider": { zh: "供应商", en: "Provider" },
+  "settings.sessionOverride.model": { zh: "模型", en: "Model" },
+  "settings.sessionOverride.effort": { zh: "思考深度", en: "Reasoning effort" },
+  "settings.sessionOverride.effortDefault": { zh: "模型默认", en: "Model default" },
+  "settings.sessionOverride.save": { zh: "保存覆盖", en: "Save override" },
+  "settings.sessionOverride.clear": { zh: "清除", en: "Clear" },
+  "settings.sessionOverride.saving": { zh: "保存中…", en: "Saving…" },
+  "settings.sessionOverride.saved": { zh: "已保存本会话覆盖", en: "Session override saved" },
+  "settings.sessionOverride.cleared": { zh: "已清除，恢复全局默认", en: "Cleared; global default restored" },
+  "settings.sessionOverride.conflict": {
+    zh: "其他页面已修改本会话覆盖（当前代次 {revision}）；你的输入已保留，请确认后重试。",
+    en: "Another page changed this session's overrides (current revision {revision}); your input was kept, please review and retry.",
+  },
+  "settings.sessionOverride.failed": { zh: "保存失败：{message}", en: "Save failed: {message}" },
+  "settings.sessionOverride.retry": { zh: "重新读取", en: "Reload" },
+  "settings.sessionOverride.globalSummary": { zh: "全局：{provider} / {model}", en: "Global: {provider} / {model}" },
+  "settings.sessionOverride.emptyGlobal": { zh: "未配置全局默认", en: "No global default configured" },
+  "announce.start": { zh: "任务开始：{name}", en: "Task started: {name}" },
+  "announce.finish": { zh: "任务完成：{name}", en: "Task finished: {name}" },
+  "announce.fail": { zh: "任务失败：{name}", en: "Task failed: {name}" },
+  "announce.cancel": { zh: "任务取消：{name}", en: "Task cancelled: {name}" },
+  "announce.more": { zh: "等 {count} 项", en: "and {count} more" },
+  "notify.termination.title": { zh: "Expert Group", en: "Expert Group" },
+  "notify.termination.completed": { zh: "任务已完成。", en: "Task completed." },
+  "notify.termination.blocked": { zh: "任务被阻塞，需要你处理。", en: "Task blocked; your input is needed." },
+  "notify.termination.error": { zh: "任务因错误终止。", en: "Task terminated with an error." },
+  "notify.termination.aborted": { zh: "任务已中止。", en: "Task aborted." },
+  "notify.termination.interrupted": { zh: "任务被中断。", en: "Task interrupted." },
+  "notify.termination.max-tokens": { zh: "任务达到 token 上限。", en: "Task reached the token limit." },
+  "notify.termination.unknown": { zh: "任务已终止。", en: "Task terminated." },
+  "notify.test.title": { zh: "Expert Group", en: "Expert Group" },
+  "notify.wait.title": { zh: "Expert Group", en: "Expert Group" },
+  "notify.wait.body": { zh: "需要你操作", en: "Your action is required" },
+  "notify.test.body": {
+    zh: "测试通知：系统通知通道可用。",
+    en: "Test notification: the system notification channel is available.",
+  },
+  "notify.waitLong.body": {
+    zh: "专家任务已等待超过 30 分钟仍未结算。若权威查询确认没有运行中的后代，可用 dsh_expert_group_abandon_wait 手动关闭等待账本；它不会终止专家，也不会释放影响范围保护。",
+    en: "The expert task has been waiting more than 30 minutes without settling. If an authoritative query confirms no running descendants, use dsh_expert_group_abandon_wait to close the wait ledger manually; it neither stops experts nor releases impact-scope protection.",
+  },
+  "notify.waitQueryDegraded.body": {
+    zh: "无法确认专家后代的运行状态（后代查询降级或失败），root turn 会继续等待；未知状态不等于专家已完成。",
+    en: "The running state of expert descendants cannot be confirmed (descendant query degraded or failed); the root turn keeps waiting. Unknown is not the same as completed.",
+  },
+  "notify.waitDeliveryFailed.body": {
+    zh: "专家批次已静止，但收口结论投递失败；批次保持待收口，插件会在后续 root turn 重试。",
+    en: "The expert batch is quiescent but delivering the finalization result failed; the batch remains pending and the plugin retries on later root turns.",
+  },
+});
+
+/**
+ * 语言标识归一：`zh-CN` / `zh_TW` / `EN-us` 都归一为主语言子标签；不支持的返回 null。
+ * @param {unknown} value
+ * @returns {"zh"|"en"|null}
+ */
+export function normalizeLocale(value) {
+  if (typeof value !== "string") return null;
+  const primary = value.trim().toLowerCase().split(/[-_]/)[0];
+  if (primary === "zh") return "zh";
+  if (primary === "en") return "en";
+  return null;
+}
+
+/**
+ * 按候选顺序解析语言：返回第一个受支持的 locale，全部不可识别时回退默认 zh。
+ * 纯函数（不读环境），便于测试注入。
+ */
+export function resolveLocale(candidates) {
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const normalized = normalizeLocale(candidate);
+    if (normalized !== null) return normalized;
+  }
+  return DEFAULT_LOCALE;
+}
+
+/**
+ * 取一条文案并做变量插值（缺失键回退 zh；两份都缺失返回中性占位，绝不显示空串或键名）。
+ * @param {string} locale - zh / en（其它值按默认 zh 处理）。
+ * @param {string} key - 消息表键。
+ * @param {Record<string, unknown>} [vars] - {name} 形式的插值变量。
+ */
+export function translateMessage(locale, key, vars = {}) {
+  const normalized = normalizeLocale(locale) ?? DEFAULT_LOCALE;
+  const entry = MESSAGE_CATALOG[key];
+  if (entry === void 0 || entry === null) return MISSING_MESSAGE_TEXT;
+  const template = typeof entry[normalized] === "string" && entry[normalized].length > 0
+    ? entry[normalized]
+    : (typeof entry[DEFAULT_LOCALE] === "string" ? entry[DEFAULT_LOCALE] : "");
+  if (template.length === 0) return MISSING_MESSAGE_TEXT;
+  const values = vars !== null && typeof vars === "object" ? vars : {};
+  return template.replace(/\{([a-z][a-z0-9_]*)\}/gi, (match, name) => {
+    const value = values[name];
+    return value === void 0 || value === null ? match : String(value);
+  });
+}
+
+/**
+ * Host 侧 locale 解析顺序：config.locale → 环境 LANG/LC_ALL/LC_MESSAGES → Intl 运行时 locale → zh。
+ *
+ * 「无法可靠获取」= 所有候选都无法归一成受支持语言（缺失、空串、fr 等）。此时回退 zh 并调用
+ * onFallback（组合根用它记一条 warn），绝不静默切换到 en 或抛出。
+ * @param {{configLocale?:unknown, env?:Record<string,unknown>, intl?:{DateTimeFormat?:Function}, onFallback?:Function}} [options]
+ */
+export function resolveHostLocale(options = {}) {
+  const env = options.env ?? {};
+  const candidates = [options.configLocale, env.LC_ALL, env.LC_MESSAGES, env.LANG];
+  const recognized = candidates.filter((candidate) => normalizeLocale(candidate) !== null);
+  if (recognized.length === 0) {
+    let intlLocale = null;
+    try {
+      const intl = options.intl ?? (typeof Intl !== "undefined" ? Intl : null);
+      intlLocale = intl?.DateTimeFormat?.().resolvedOptions?.().locale ?? null;
+    } catch { intlLocale = null; }
+    if (normalizeLocale(intlLocale) === null) {
+      try { options.onFallback?.({ reason: "locale-unresolved" }); } catch { /* 记录失败不影响通知。 */ }
+      return DEFAULT_LOCALE;
+    }
+    return normalizeLocale(intlLocale);
+  }
+  return resolveLocale(recognized);
+}
+
+/**
+ * 原生运行状态行的可替换前缀候选（票据 19：中文/英文 locale 都生效）。
+ *
+ * 顺序即匹配优先级：中文宿主用「深度求索中」，英文宿主可能是 "Deep diving" / "Deep thinking" /
+ * "Thinking"。只替换原文中**最早出现**的候选中第一个（同一位置优先更长的候选），未知前缀仍
+ * fail-closed（返回 null，保持宿主原文）。
+ */
+export const NATIVE_RUNNING_STATUS_PREFIXES = Object.freeze([
+  "深度求索中",
+  "Deep diving",
+  "Deep thinking",
+  "Thinking",
+]);
+
+/**
+ * 向后兼容的单一前缀导出：保留旧名字给既有消费方读取，值仍是中文主前缀。
+ * 新代码必须使用 NATIVE_RUNNING_STATUS_PREFIXES（中英文都生效）。
+ */
+export const NATIVE_RUNNING_STATUS_PREFIX = NATIVE_RUNNING_STATUS_PREFIXES[0];
 
 /**
  * 只替换原生运行前缀的纯函数（fail-closed）。
  *
  * 边界语义：
- * - 原文里没有该精确子串时返回 null：调用方必须保持宿主原文案，绝不猜测或整行重建；
- * - 只替换**第一处**出现，其余内容逐字节保留（分隔逗号、用时、末尾省略号、空白与大小写）；
+ * - 原文里没有任何候选前缀时返回 null：调用方必须保持宿主原文案，绝不猜测或整行重建；
+ * - 只替换**第一处**出现（中英文候选混排时取原文中最靠前的那个；同位置优先更长的候选），
+ *   其余内容逐字节保留（分隔逗号、用时、末尾省略号、空白与大小写）；
  * - 原文或替换文案不是非空字符串时返回 null。
  * @param {unknown} currentText - 宿主当前渲染的原生文案。
  * @param {unknown} replacementText - 角色文案（例如 "Explorer running"，不带省略号）。
@@ -3287,9 +3643,16 @@ export const NATIVE_RUNNING_STATUS_PREFIX = "深度求索中";
 export function replaceNativeStatusPrefix(currentText, replacementText) {
   if (typeof currentText !== "string" || currentText.length === 0) return null;
   if (typeof replacementText !== "string" || replacementText.length === 0) return null;
-  const at = currentText.indexOf(NATIVE_RUNNING_STATUS_PREFIX);
-  if (at === -1) return null;
-  return currentText.slice(0, at) + replacementText + currentText.slice(at + NATIVE_RUNNING_STATUS_PREFIX.length);
+  let match = null;
+  for (const prefix of NATIVE_RUNNING_STATUS_PREFIXES) {
+    const at = currentText.indexOf(prefix);
+    if (at === -1) continue;
+    if (match === null || at < match.at || (at === match.at && prefix.length > match.prefix.length)) {
+      match = { at, prefix };
+    }
+  }
+  if (match === null) return null;
+  return currentText.slice(0, match.at) + replacementText + currentText.slice(match.at + match.prefix.length);
 }
 
 /**
@@ -3544,4 +3907,483 @@ export function snapshotRunningRootDescendants(list, rootId, options = {}) {
   } catch {
     return { known: false, blocked: true, reason: "runtime-child-query-unknown", runningDescendants: [] };
   }
+}
+
+// ── 模型候选与启动前 fallback（票据 24）────────────────────────────────────
+//
+// 这一节只放**纯函数/常量**：设置归一、候选计划与错误分类都不依赖 Host 服务，
+// 因此组合根、Host 投影模块与测试可以共用同一套判定，避免出现第二份实现。
+// 任何函数都不得读取凭据或 prompt；错误分类只返回稳定 code，绝不返回原始 message。
+
+/** 自动降级默认上限（每任务每角色最多 2 次降级）。 */
+export const DEFAULT_MODEL_FALLBACK_LIMIT = 2;
+/** 自动降级上限的硬上限：防止链式降级放大成本。 */
+export const MAX_MODEL_FALLBACK_LIMIT = 4;
+/** 每个角色允许配置的候选模型数量上限。 */
+export const MAX_MODEL_CANDIDATES_PER_ROLE = 8;
+
+/** 全部候选都不可用时使用的稳定错误码（ValidationError.code）。 */
+export const MODEL_CANDIDATES_EXHAUSTED = "MODEL_CANDIDATES_EXHAUSTED";
+/** 预检成功的稳定状态码（只用于 RPC 投影，不写入子代理快照）。 */
+export const MODEL_ROUTE_OK = "OK";
+/** 角色尚未配置主模型时预检 RPC 的状态码。 */
+export const MODEL_ROUTE_NOT_CONFIGURED = "NOT_CONFIGURED";
+
+/**
+ * 模型解析失败的稳定分类码。
+ *
+ * 只有预检类失败允许触发启动前 fallback；运行期错误（429/5xx/超时/取消）绝不进入
+ * 这里的分类集合，必须原样上抛。
+ */
+export const MODEL_ROUTE_ERROR_CODES = Object.freeze({
+  INVALID_SELECTION: "INVALID_SELECTION",
+  MODEL_NOT_FOUND: "MODEL_NOT_FOUND",
+  PROVIDER_NOT_FOUND: "PROVIDER_NOT_FOUND",
+  CREDENTIAL_UNAVAILABLE: "CREDENTIAL_UNAVAILABLE",
+  CATALOG_UNAVAILABLE: "CATALOG_UNAVAILABLE",
+  UNSUPPORTED_REASONING_EFFORT: "UNSUPPORTED_REASONING_EFFORT",
+  UNSUPPORTED_CAPABILITY: "UNSUPPORTED_CAPABILITY",
+  /**
+   * 提供方限流（HTTP 429 / rate limit / 配额）的稳定原因码（票据 26）。
+   *
+   * 为什么单独一个码：429 在「派发前」与「运行中」两个阶段都**不得**触发自动换模型
+   * ——派发前由 provider 名额排队承担，运行中由宿主请求级退避重试承担。因此它必须
+   * 与 ROUTE_RESOLUTION_FAILED（未知解析失败）区分开，才能让诊断、快照
+   * （lastRouteErrorCode）与 shard 错误投影如实说明「这是限流，不是模型不可用」。
+   *
+   * 它**不在** PRECHECK_MODEL_ROUTE_ERROR_CODE_SET 里：isPrecheckModelRouteFailure()
+   * 对它恒为 false，executeModelRoutePlan 因此立即上抛、绝不尝试下一个候选。
+   */
+  PROVIDER_RATE_LIMITED: "PROVIDER_RATE_LIMITED",
+  ROUTE_RESOLUTION_FAILED: "ROUTE_RESOLUTION_FAILED",
+});
+
+const MODEL_ROUTE_ERROR_CODE_SET = new Set(Object.values(MODEL_ROUTE_ERROR_CODES));
+
+/** 允许在启动前触发降级的错误码集合（模型/provider/凭据/目录/能力/形状）。 */
+const PRECHECK_MODEL_ROUTE_ERROR_CODE_SET = new Set([
+  MODEL_ROUTE_ERROR_CODES.INVALID_SELECTION,
+  MODEL_ROUTE_ERROR_CODES.MODEL_NOT_FOUND,
+  MODEL_ROUTE_ERROR_CODES.PROVIDER_NOT_FOUND,
+  MODEL_ROUTE_ERROR_CODES.CREDENTIAL_UNAVAILABLE,
+  MODEL_ROUTE_ERROR_CODES.CATALOG_UNAVAILABLE,
+  MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_REASONING_EFFORT,
+  MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_CAPABILITY,
+]);
+
+/**
+ * agentOptions 上的实际路由 marker。
+ *
+ * 与其它 marker 一样只存在于 agent options / child_models，不进入任务 prompt；
+ * 冷恢复时 Host 不还原 agentOptions，因此真正权威的来源仍是 child_models 的扁平字段。
+ */
+export const EXPERT_ROUTE_MARKER = "__degExpertRoute";
+
+/**
+ * agentOptions 上的目标 subagent provider marker（票据 29）。
+ *
+ * 记录本次 child 实际使用的 subagent provider 名（"spawn" 或继承型 fork provider）。
+ * 与其它 marker 一样只存在于 agent options / child_models，不进入任务 prompt；
+ * 冷恢复时 Host 不还原 agentOptions，因此权威来源仍是 child_models 的扁平字段
+ * `subagentProvider`。它的作用有二：
+ * 1. agent/created 在持久化前就能读到本次派发选择的 provider；
+ * 2. 恢复/重建路径只读该快照，不按当前设置重新选择（绝不把继承型 child 静默改回 spawn）。
+ */
+export const EXPERT_SUBAGENT_PROVIDER_MARKER = "__degExpertSubagentProvider";
+
+/**
+ * agentOptions 上的上下文继承 marker（票据 29）。
+ *
+ * 只有布尔值才是合法快照：true 表示该 child 使用继承型 provider（seed 来自父日志的
+ * 已完成 turn 前缀），false/缺失表示普通 spawn。投影侧缺失时省略字段，绝不伪造 false。
+ */
+export const EXPERT_INHERIT_CONTEXT_MARKER = "__degExpertInheritContext";
+
+/**
+ * 上下文继承的稳定错误码（票据 29）。
+ *
+ * - `UNAVAILABLE`：宿主没有可用的继承型 provider（未注册、缺 prepareContinuable、
+ *   inheritsParentContext !== true 或能力位不足），或 legacy 路径不支持 fork；
+ * - `EMPTY`：父会话日志可读但没有任何已完成 turn，无法构造继承 seed。
+ *
+ * 两者都必须显式失败，绝不静默回退 spawn（那会把“继承上下文”降级成“无上下文”）。
+ */
+export const CONTEXT_INHERITANCE_ERROR_CODES = Object.freeze({
+  UNAVAILABLE: "CONTEXT_INHERITANCE_UNAVAILABLE",
+  EMPTY: "CONTEXT_INHERITANCE_EMPTY",
+});
+
+/**
+ * 允许开启上下文继承的内置角色集合（票据 29）。
+ *
+ * 只包含内置非 Observer 角色：Observer 的安全边界是“只接收视觉任务、不接收用户上下文”，
+ * 自定义角色也必须显式走后续票据的权限模型，因此二者一律不允许出现在设置映射里。
+ */
+export const CONTEXT_INHERITANCE_ROLE_IDS = Object.freeze(ROLES.slice());
+
+/** 自动降级上限归一：只接受 0..4 的安全整数，非法/缺失回退默认 2。 */
+export function normalizeModelFallbackLimit(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= MAX_MODEL_FALLBACK_LIMIT
+    ? value
+    : DEFAULT_MODEL_FALLBACK_LIMIT;
+}
+
+/**
+ * 单条模型选择的严格形状归一。
+ *
+ * provider/model 必须是非空字符串；reasoningEffort 只接受字符串或缺省（undefined/null/
+ * 空串都表示未指定）。非法形状返回 undefined，由调用方决定是拒绝保存还是跳过候选。
+ * 该函数**不做 trim**：与既有 settings/defaults 语义保持一致，模型名逐字匹配。
+ */
+export function normalizeModelSelection(selection) {
+  if (selection === null || typeof selection !== "object" || Array.isArray(selection)) return undefined;
+  if (typeof selection.provider !== "string" || selection.provider.length === 0) return undefined;
+  if (typeof selection.model !== "string" || selection.model.length === 0) return undefined;
+  const rawEffort = selection.reasoningEffort;
+  if (rawEffort !== undefined && rawEffort !== null && rawEffort !== "" && typeof rawEffort !== "string") return undefined;
+  const effort = typeof rawEffort === "string" && rawEffort.length > 0 ? rawEffort : undefined;
+  return {
+    provider: selection.provider,
+    model: selection.model,
+    ...(effort === undefined ? {} : { reasoningEffort: effort }),
+  };
+}
+
+/**
+ * 单条模型选择的比较键：provider + model + 规范化 effort。
+ *
+ * 规范化 effort 指 undefined/null/空串视为同一档“未指定”；这样重复候选判定不会因为
+ * 旧配置里的空串 effort 与缺省字段不同而漏判。非对象/缺 provider/model 返回空串。
+ */
+export function modelSelectionKeyOf(selection) {
+  const normalized = normalizeModelSelection(selection);
+  if (normalized === undefined) return "";
+  return normalized.provider + "\u0000" + normalized.model + "\u0000" + (normalized.reasoningEffort ?? "");
+}
+
+/** 稳定错误码准入：只接受本模块声明的枚举，拒绝把任意字符串写进快照。 */
+export function normalizeModelRouteErrorCode(value) {
+  if (typeof value !== "string") return undefined;
+  return MODEL_ROUTE_ERROR_CODE_SET.has(value) ? value : undefined;
+}
+
+/**
+ * 把一次模型解析错误分类为稳定 code。
+ *
+ * 分类顺序：显式 causeCode → code/name 枚举 → HTTP 状态 → 保守的消息模式。
+ * 只有明确的预检类失败会被归类为可降级 code；未知错误、5xx、超时一律是
+ * ROUTE_RESOLUTION_FAILED（非预检），限流是 PROVIDER_RATE_LIMITED（同样非预检），
+ * 调用方必须原样抛出而不是切换候选。
+ */
+export function classifyModelRouteError(error) {
+  const explicit = normalizeModelRouteErrorCode(error?.causeCode);
+  if (explicit !== undefined) return explicit;
+  const rawCode = typeof error?.code === "string" ? error.code.trim() : "";
+  const rawName = typeof error?.name === "string" ? error.name.trim() : "";
+  const token = (rawCode || rawName).toUpperCase().replace(/[\s-]+/g, "_");
+  if (token.length > 0) {
+    // 限流（票据 26）：单独归类为 PROVIDER_RATE_LIMITED，既保留“非预检、绝不换候选”
+    // 的既有判定，又能让诊断区分「provider 限流」与「未知解析失败」。
+    if (["RATE_LIMIT", "RATE_LIMIT_EXCEEDED", "RATE_LIMITED", "TOO_MANY_REQUESTS", "PROVIDER_RATE_LIMITED", "QUOTA_EXCEEDED"].includes(token)) {
+      return MODEL_ROUTE_ERROR_CODES.PROVIDER_RATE_LIMITED;
+    }
+    if (["OVERLOADED", "ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "TIMEOUT", "ABORT_ERR"].includes(token)) {
+      return MODEL_ROUTE_ERROR_CODES.ROUTE_RESOLUTION_FAILED;
+    }
+    if (["UNSUPPORTED_REASONING_EFFORT", "UNSUPPORTEDREASONINGEFFORTERROR"].includes(token)) {
+      return MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_REASONING_EFFORT;
+    }
+    if (["MODEL_NOT_FOUND", "ERR_MODEL_NOT_FOUND", "MODELNOTFOUNDERROR", "UNKNOWN_MODEL"].includes(token)) {
+      return MODEL_ROUTE_ERROR_CODES.MODEL_NOT_FOUND;
+    }
+    if (["PROVIDER_NOT_FOUND", "PROVIDERNOTFOUNDERROR", "UNKNOWN_PROVIDER"].includes(token)) {
+      return MODEL_ROUTE_ERROR_CODES.PROVIDER_NOT_FOUND;
+    }
+    if (["CREDENTIAL_UNAVAILABLE", "MISSING_CREDENTIAL", "MISSING_API_KEY", "NO_API_KEY", "AUTH_FAILED", "AUTHENTICATIONERROR", "CREDENTIALERROR", "UNAUTHORIZED", "INVALID_API_KEY"].includes(token)) {
+      return MODEL_ROUTE_ERROR_CODES.CREDENTIAL_UNAVAILABLE;
+    }
+    if (["CATALOG_UNAVAILABLE", "MODEL_DIRECTORY_UNAVAILABLE", "DIRECTORY_UNAVAILABLE", "ENOENT"].includes(token)) {
+      return MODEL_ROUTE_ERROR_CODES.CATALOG_UNAVAILABLE;
+    }
+    if (["UNSUPPORTED_CAPABILITY", "CAPABILITY_INCOMPATIBLE", "UNSUPPORTED_INPUT", "UNSUPPORTED_IMAGE", "UNSUPPORTEDTOOLERROR"].includes(token)) {
+      return MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_CAPABILITY;
+    }
+    if (["INVALID_SELECTION", "INVALID_MODEL_SELECTION", "INVALIDSELECTIONERROR"].includes(token)) {
+      return MODEL_ROUTE_ERROR_CODES.INVALID_SELECTION;
+    }
+  }
+  const status = Number(error?.statusCode ?? error?.status ?? error?.httpStatus ?? error?.response?.status);
+  if (Number.isInteger(status)) {
+    if (status === 401 || status === 403) return MODEL_ROUTE_ERROR_CODES.CREDENTIAL_UNAVAILABLE;
+    if (status === 404) return MODEL_ROUTE_ERROR_CODES.MODEL_NOT_FOUND;
+    if (status === 400 || status === 422) return MODEL_ROUTE_ERROR_CODES.INVALID_SELECTION;
+    // 429 是限流（票据 26 的稳定原因码），5xx 仍是未知解析失败；两者都不可降级。
+    if (status === 429) return MODEL_ROUTE_ERROR_CODES.PROVIDER_RATE_LIMITED;
+    if (status >= 500) return MODEL_ROUTE_ERROR_CODES.ROUTE_RESOLUTION_FAILED;
+  }
+  const message = typeof error?.message === "string" ? error.message : "";
+  if (message.length > 0) {
+    // 限流文本（429 / rate limit / 限流 / 配额）归 PROVIDER_RATE_LIMITED；
+    // 超时与 overload 仍按未知解析失败处理（它们是不同的运行期失败形态）。
+    if (/rate.?limit|too many requests|\b429\b|限流|配额/i.test(message)) {
+      return MODEL_ROUTE_ERROR_CODES.PROVIDER_RATE_LIMITED;
+    }
+    if (/overload|超时|timed?\s*out/i.test(message)) {
+      return MODEL_ROUTE_ERROR_CODES.ROUTE_RESOLUTION_FAILED;
+    }
+    if (/(model|模型).{0,24}(not found|does not exist|unknown|不存在|未找到|已移除)/i.test(message)) {
+      return MODEL_ROUTE_ERROR_CODES.MODEL_NOT_FOUND;
+    }
+    if (/(provider|提供方).{0,24}(not found|unknown|不存在|未找到)/i.test(message)) {
+      return MODEL_ROUTE_ERROR_CODES.PROVIDER_NOT_FOUND;
+    }
+    if (/credential|api.?key|unauthor|authenticat|missing key|凭据|密钥|鉴权/i.test(message)) {
+      return MODEL_ROUTE_ERROR_CODES.CREDENTIAL_UNAVAILABLE;
+    }
+    if (/catalog|directory|模型目录|目录不可用/i.test(message)) {
+      return MODEL_ROUTE_ERROR_CODES.CATALOG_UNAVAILABLE;
+    }
+    if (/unsupported.{0,24}(reasoning|effort|capabilit|input|image)|not support|不支持.{0,24}(档位|能力|思考|输入)/i.test(message)) {
+      return /effort|reasoning|档位|思考/i.test(message)
+        ? MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_REASONING_EFFORT
+        : MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_CAPABILITY;
+    }
+    if (/invalid.{0,16}(selection|model)|模型选择/i.test(message)) {
+      return MODEL_ROUTE_ERROR_CODES.INVALID_SELECTION;
+    }
+  }
+  return MODEL_ROUTE_ERROR_CODES.ROUTE_RESOLUTION_FAILED;
+}
+
+/** 读取错误上的稳定 code：优先显式 causeCode，否则按分类器推断。 */
+export function modelRouteErrorCodeOf(error) {
+  return normalizeModelRouteErrorCode(error?.causeCode) ?? classifyModelRouteError(error);
+}
+
+/** 该错误是否属于启动前可降级的预检类失败。 */
+export function isPrecheckModelRouteFailure(error) {
+  return PRECHECK_MODEL_ROUTE_ERROR_CODE_SET.has(modelRouteErrorCodeOf(error));
+}
+
+/** 预检类错误码的只读判定（供投影层拒绝任意字符串进入快照）。 */
+export function isModelRouteErrorCode(value) {
+  return MODEL_ROUTE_ERROR_CODE_SET.has(value);
+}
+
+/** 稳定 code 的中文可读原因（不包含原始 message/凭据/prompt）。 */
+export function modelRouteErrorMessage(code) {
+  switch (code) {
+    case MODEL_ROUTE_OK: return "可用";
+    case MODEL_ROUTE_NOT_CONFIGURED: return "尚未配置模型";
+    case MODEL_ROUTE_ERROR_CODES.INVALID_SELECTION: return "模型选择不完整或类型无效";
+    case MODEL_ROUTE_ERROR_CODES.MODEL_NOT_FOUND: return "模型不存在或已被移除";
+    case MODEL_ROUTE_ERROR_CODES.PROVIDER_NOT_FOUND: return "provider 不存在";
+    case MODEL_ROUTE_ERROR_CODES.CREDENTIAL_UNAVAILABLE: return "provider 凭据不可用";
+    case MODEL_ROUTE_ERROR_CODES.CATALOG_UNAVAILABLE: return "模型目录不可用";
+    case MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_REASONING_EFFORT: return "模型不支持该思考档位";
+    case MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_CAPABILITY: return "模型能力不兼容";
+    case MODEL_ROUTE_ERROR_CODES.PROVIDER_RATE_LIMITED: return "提供方限流（429/配额），需要退避重试";
+    case MODEL_CANDIDATES_EXHAUSTED: return "所有模型候选均不可用";
+    default: return "模型解析失败";
+  }
+}
+
+/**
+ * 构造有序路由计划：[primary, candidate1, candidate2, ...]。
+ *
+ * - 最多 1 + fallbackLimit 个可尝试项；fallbackLimit=0 时只有 primary；
+ * - 与 primary 或更早候选完全重复（同一 provider+model+规范化 effort）的候选项被跳过，
+ *   且不占用降级次数；
+ * - candidateIndex 保留候选在**原始配置里的位置**（primary=0，第一个候选=1），
+ *   因此重复项被跳过后，实际使用的候选索引仍然可解释。
+ *
+ * @param {unknown} primary - 生效主选择（可能是会话覆盖）。
+ * @param {unknown[]} candidates - 全局候选列表（有序）。
+ * @param {unknown} fallbackLimit - 自动降级上限。
+ * @returns {{plan: Array<{selection: unknown, candidateIndex: number}>, requestedPrimary: object|undefined, fallbackLimit: number}}
+ */
+export function buildModelRoutePlan(primary, candidates, fallbackLimit) {
+  const limit = normalizeModelFallbackLimit(fallbackLimit);
+  const normalizedPrimary = normalizeModelSelection(primary);
+  const plan = [{ selection: normalizedPrimary ?? primary, candidateIndex: 0 }];
+  const seen = new Set();
+  if (normalizedPrimary !== undefined) seen.add(modelSelectionKeyOf(normalizedPrimary));
+  const list = Array.isArray(candidates) ? candidates.slice(0, MAX_MODEL_CANDIDATES_PER_ROLE) : [];
+  let added = 0;
+  for (let index = 0; index < list.length && added < limit; index += 1) {
+    const normalized = normalizeModelSelection(list[index]);
+    const key = normalized === undefined ? "" : modelSelectionKeyOf(normalized);
+    if (key.length > 0 && seen.has(key)) continue;
+    if (key.length > 0) seen.add(key);
+    plan.push({ selection: normalized ?? list[index], candidateIndex: index + 1 });
+    added += 1;
+  }
+  return { plan, requestedPrimary: normalizedPrimary, fallbackLimit: limit };
+}
+
+/**
+ * 从子代理持久化记录/运行期 marker 投影实际路由字段（票据 24）。
+ *
+ * 缺失字段直接省略，绝不补 0：只有真正记录过 candidateIndex=0（primary）时才会输出 0。
+ * lastRouteErrorCode 只接受本模块声明的稳定码，避免任意字符串进入快照。
+ */
+export function projectModelRouteFields(source) {
+  if (source === null || typeof source !== "object" || Array.isArray(source)) return {};
+  const projected = {};
+  if (Number.isSafeInteger(source.candidateIndex) && source.candidateIndex >= 0) projected.candidateIndex = source.candidateIndex;
+  if (Number.isSafeInteger(source.fallbackCount) && source.fallbackCount >= 0) projected.fallbackCount = source.fallbackCount;
+  const code = normalizeModelRouteErrorCode(source.lastRouteErrorCode);
+  if (code !== undefined) projected.lastRouteErrorCode = code;
+  return projected;
+}
+
+/**
+ * 校验并归一 agentOptions 上的路由 marker。
+ *
+ * candidateIndex/fallbackCount 必须是非负安全整数；requestedPrimary 可选但出现时必须是
+ * 合法选择；lastRouteErrorCode 可选但只接受稳定码。形状不合法返回 undefined，调用方
+ * 应退回 child_models 记录或干脆不写路由字段（绝不写入半截/malformed marker）。
+ */
+export function normalizeModelRouteMarker(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (!Number.isSafeInteger(value.candidateIndex) || value.candidateIndex < 0) return undefined;
+  if (!Number.isSafeInteger(value.fallbackCount) || value.fallbackCount < 0) return undefined;
+  const requestedPrimary = normalizeModelSelection(value.requestedPrimary);
+  const lastRouteErrorCode = normalizeModelRouteErrorCode(value.lastRouteErrorCode);
+  if (value.lastRouteErrorCode !== undefined && lastRouteErrorCode === undefined) return undefined;
+  return {
+    ...(requestedPrimary === undefined ? {} : { requestedPrimary }),
+    candidateIndex: value.candidateIndex,
+    fallbackCount: value.fallbackCount,
+    ...(lastRouteErrorCode === undefined ? {} : { lastRouteErrorCode }),
+  };
+}
+
+/**
+ * 从持久化记录（child_models 的扁平字段）读取路由字段。
+ *
+ * 与 normalizeModelRouteMarker 不同：这里允许只有部分字段（旧记录/旧进程快照），
+ * 投影时缺失字段省略；恢复路由时由调用方再要求 provider/model 存在。
+ */
+export function modelRouteFieldsFromRecord(record) {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) return {};
+  const requestedPrimary = normalizeModelSelection(record.requestedPrimary);
+  const projected = projectModelRouteFields(record);
+  return {
+    ...(requestedPrimary === undefined ? {} : { requestedPrimary }),
+    ...projected,
+  };
+}
+
+// ── 结构化交付（票据 30） ──────────────────────────────────────────────────
+
+/**
+ * 结构化输出声明（outputSchema）序列化后的 UTF-8 字节上限。
+ *
+ * 宿主本身没有这个上限（见 docs/specs/03-host-contract-report.md §4.4），这是 DEG
+ * 在派发前自管的策略：超限拒绝派发，且 schema 原文永远不进入事件历史/快照。
+ */
+export const OUTPUT_SCHEMA_MAX_BYTES = 64 * 1024;
+
+/** 结构化声明被拒绝时的稳定错误码（工具回执/RPC 都只回传这些 token）。 */
+export const OUTPUT_SCHEMA_ERROR_CODES = Object.freeze({
+  INVALID: "OUTPUT_SCHEMA_INVALID",
+  TOO_LARGE: "OUTPUT_SCHEMA_TOO_LARGE",
+  UNSUPPORTED: "OUTPUT_SCHEMA_UNSUPPORTED",
+});
+
+/**
+ * 「本次 activation 请求了结构化输出」的内部 marker。
+ *
+ * 它只存在于内存里的 request.agentOptions（Host 不持久化 agentOptions），值只是布尔，
+ * 绝不携带 schema 原文；child_models 只据此保存 outputSchemaRequested。
+ */
+export const OUTPUT_SCHEMA_REQUESTED_MARKER = "__degOutputSchemaRequested";
+
+/**
+ * 结构化结果回退原因（稳定枚举）。
+ *
+ * - missing_structured：请求了 schema，但宿主结果没有 structured（通常 stopReason=error，
+ *   文本 output 仍在）；不得因此把已结束的 child/task 判为失败。
+ * - result_unavailable：activation.result 拒绝，或 structured 不是无损 JSON。
+ * - result_too_large：结构化结果序列化后超过 64 KiB，只记录字节数，不保存值。
+ * - schema_not_restored：冷恢复/重建创建了新 activation，但宿主 descriptor 不保存
+ *   outputSchema，本轮没有重新声明契约。
+ */
+export const STRUCTURED_RESULT_FALLBACK_REASONS = Object.freeze({
+  MISSING_STRUCTURED: "missing_structured",
+  RESULT_UNAVAILABLE: "result_unavailable",
+  RESULT_TOO_LARGE: "result_too_large",
+  SCHEMA_NOT_RESTORED: "schema_not_restored",
+});
+
+const STRUCTURED_FALLBACK_REASON_SET = new Set(Object.values(STRUCTURED_RESULT_FALLBACK_REASONS));
+
+/** UTF-8 字节数：schema 与 structured 结果共用的唯一口径。 */
+export function utf8ByteLength(text) {
+  return typeof text === "string" ? new TextEncoder().encode(text).byteLength : 0;
+}
+
+/**
+ * 归一结构化结果投影（只读、有界）。
+ *
+ * 输入是 child_models.structured 或 runtime 组装出的同形对象；输出只保留白名单字段：
+ * - value：仅当它仍是无损 JSON 且序列化后 <= 64 KiB 时保留；
+ * - bytes/receivedAt：安全非负整数；
+ * - fallback：布尔；reason：本模块声明的稳定枚举。
+ *
+ * 旧记录/被篡改的记录即使携带超大或非 JSON 的值，也不会原样进入快照/RPC：此时降级为
+ * fallback=true + result_too_large/result_unavailable，并且不输出 value。
+ */
+export function projectStructuredResult(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  let projectedValue;
+  let bytes = Number.isSafeInteger(value.bytes) && value.bytes >= 0 ? value.bytes : undefined;
+  let fallback = value.fallback === true;
+  let reason = STRUCTURED_FALLBACK_REASON_SET.has(value.reason) ? value.reason : undefined;
+  if (Object.prototype.hasOwnProperty.call(value, "value")) {
+    let serialized;
+    try {
+      serialized = JSON.stringify(value.value);
+    } catch {
+      serialized = undefined;
+    }
+    if (serialized === undefined) {
+      fallback = true;
+      if (reason === undefined) reason = STRUCTURED_RESULT_FALLBACK_REASONS.RESULT_UNAVAILABLE;
+    } else {
+      const measured = utf8ByteLength(serialized);
+      if (measured > OUTPUT_SCHEMA_MAX_BYTES) {
+        fallback = true;
+        reason = STRUCTURED_RESULT_FALLBACK_REASONS.RESULT_TOO_LARGE;
+        bytes = measured;
+      } else {
+        // 深拷贝一份纯 JSON 值，避免投影把调用方对象引用带进快照。
+        try { projectedValue = JSON.parse(serialized); } catch { projectedValue = undefined; }
+        bytes = measured;
+      }
+    }
+  }
+  const projected = {
+    ...(projectedValue === undefined ? {} : { value: projectedValue }),
+    ...(bytes === undefined ? {} : { bytes }),
+    ...(Number.isSafeInteger(value.receivedAt) && value.receivedAt >= 0 ? { receivedAt: value.receivedAt } : {}),
+    ...(fallback ? { fallback: true } : {}),
+    ...(reason === undefined ? {} : { reason }),
+  };
+  return Object.keys(projected).length === 0 ? null : projected;
+}
+
+/**
+ * child_models/attempt 记录上的结构化投影字段。
+ *
+ * 缺失时整体省略（不伪造 false）；outputSchemaRequested 只在记录真的写了布尔值时输出。
+ */
+export function structuredProjectionFields(source) {
+  if (source === null || typeof source !== "object" || Array.isArray(source)) return {};
+  const structured = projectStructuredResult(source.structured);
+  return {
+    ...(structured === null ? {} : { structured }),
+    ...(typeof source.outputSchemaRequested === "boolean" ? { outputSchemaRequested: source.outputSchemaRequested } : {}),
+  };
 }

@@ -160,12 +160,15 @@ This row also carries two cross-section constraints:
 | Control | Default | Values | Stored field |
 | --- | --- | --- | --- |
 | `通知弹窗`(Notification popup) (checkbox) | On | On / Off | `dsh-expert-group.notificationEnabled` |
-| `弹窗停留时间`(Popup duration) (dropdown) | `5s` | `5s / 10s / 30s / 60s / 5min / 10min / 永久`(forever) | `dsh-expert-group.notificationHoldMs` |
+| `通知事件`(Notification events) (checkbox group) | All on | Task completed / Waiting for you / Task failed | `dsh-expert-group.notificationEvents.{completed,waiting,failed}` |
 | `通知音量`(Notification volume) (slider + number box) | `100` | `0 – 100`, step `1` | `dsh-expert-group.notificationVolume` |
 
 - Once `通知弹窗` is turned off, the Host **sends no notifications at all** and does not backfill them either; it only affects delivery and does not affect task snapshots, root-turn waiting, or recovery semantics.
+- `通知事件`(Notification events) are filtered by the Host **before delivery**: `completed` covers a normally finished task; `waiting` covers waiting for the user (`ask_user_question` / `exit_plan_mode`); `failed` covers every non-completed termination (`blocked` / `error` / `max-tokens` / `aborted` / `interrupted` / unknown kinds). Turning one category off changes neither task snapshots, waiting, nor recovery semantics, and never backfills historical conclusions.
+- The "Diagnostics and notification status" block on the settings page shows the capability matrix, runtime diagnostics, budget usage and the latest violation, persistence/recovery status, and system-notification delivery counters (sent / failed / dropped / last reason, platform, and adapter version). It reads the same `meta` response and adds no polling.
+- `发送测试通知`(Send test notification) (inside the diagnostics block) verifies the chain through the real system-notification channel only: it creates no task and fakes no task state. Real desktop display and sound remain a manual acceptance step.
 - A volume of `100` means no attenuation at all, with only the Windows master volume applying; the slider and the number box are two-way bound to the same value.
-- All three use deferred saving: after changing them you must click "Save" in the footer; invalid values fall back to the defaults (duration → `5s`, volume → `100`).
+- Notification fields use deferred saving: after changing them you must click "Save" in the footer; invalid values fall back to the defaults (volume → `100`). The legacy `notificationHoldMs` field in old configuration is ignored at the read boundary (no migration, no error).
 
 ### 10. Unified Provider
 

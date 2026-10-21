@@ -5,11 +5,61 @@ import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assembleClientBundle } from "./assemble-client.mjs";
+import {
+  BUNDLE_SIZE_BASELINE,
+  BUNDLE_SIZE_LIMITS,
+  assertBundleSizeGate,
+  assembleClientBundle,
+  measureBundleSizes,
+} from "./assemble-client.mjs";
+
+/**
+ * 装配源与构建脚本的显式语法覆盖清单（ticket 17）。
+ *
+ * 背景：package.json files 不再发布 client.js / client-*.js 这些**装配输入**（体积收敛，
+ * 安装面只需要装配产物），但"没发布"不等于"可以不检查"——它们仍然是构建的输入。
+ * 之前 node --check 的覆盖面来自 files+exports+bin 的并集，收敛 files 后覆盖面会悄悄缩水，
+ * 所以这里把不发布、但必须保持可解析的文件显式列出来。
+ */
+const CLIENT_SOURCE_FILES = Object.freeze([
+  "client.js",
+  "client-notifications.js",
+  "client-expert-group-model.js",
+  "client-expert-group-sidebar.js",
+  "client-model-config.js",
+  // client-freshness.js 仍是公开导出的运行时模块（exports["./client-freshness"]），
+  // 出现在这里是为了让"装配源全集"只有一处清单，避免再按 files 推断。
+  "client-freshness.js",
+]);
+
+/** 构建脚本自身：不发布进 tarball，但每次构建都被执行，必须保持语法有效。 */
+const BUILD_SCRIPT_FILES = Object.freeze([
+  "scripts/assemble-client.mjs",
+  "scripts/build.mjs",
+  "scripts/measure-bundle.mjs",
+]);
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 // client-bundle.js 是发布入口；先从独立源文件确定性生成，再执行发布面和语法门禁。
-await assembleClientBundle();
+const assembled = await assembleClientBundle();
+
+// ── 体积门禁（ticket 17）────────────────────────────────────────────────────
+// 每次构建都把三个数值打出来；未压缩/gzip 是硬门槛，brotli 只做参考。
+// 复测命令：node scripts/measure-bundle.mjs（读 checked-in 产物，压缩参数与门禁一致）。
+// 装配器不再内建体积测量（它被测试反复调用，brotli q11 每次约 850ms）；构建这里显式测一次。
+const bundleSizes = measureBundleSizes(assembled.content);
+console.log("client bundle 体积：raw=" + bundleSizes.raw + "B（上限 " + BUNDLE_SIZE_LIMITS.raw + "B）"
+  + " / gzip=" + bundleSizes.gzip + "B（上限 " + BUNDLE_SIZE_LIMITS.gzip + "B）"
+  + " / brotli=" + bundleSizes.brotli + "B（仅参考）");
+console.log("体积基线 v" + BUNDLE_SIZE_BASELINE.version + "：raw=" + BUNDLE_SIZE_BASELINE.raw
+  + "B / gzip=" + BUNDLE_SIZE_BASELINE.gzip + "B；整行注释剥离 " + assembled.stripStats.removedLines
+  + " 行，" + assembled.stripStats.originalBytes + "B → " + assembled.stripStats.strippedBytes + "B；"
+  + "代码区空白压缩（行首缩进 " + assembled.stripStats.removedIndentCharacters + " 字符 / 纯空白行 "
+  + assembled.stripStats.removedBlankLines + " 行 / token 边界 " + assembled.stripStats.removedTokenSpaces
+  + " 字符）→ " + assembled.stripStats.compactedBytes + "B");
+console.log("体积复测命令：node scripts/measure-bundle.mjs");
+assertBundleSizeGate(bundleSizes);
+
 const packagePath = join(root, "package.json");
 const packageJson = JSON.parse(await readFile(packagePath, "utf8"));
 
@@ -37,6 +87,8 @@ for (const [name, target] of Object.entries(packageJson.exports ?? {})) addExpor
 for (const [name, target] of Object.entries(packageJson.bin ?? {})) addTarget(targets, target, "bin[" + name + "]");
 
 const sourceTargets = [];
+/** 已排入语法检查的绝对路径：发布目标与显式清单可能重叠（client-freshness.js），只查一次。 */
+const syntaxChecked = new Set();
 for (const target of [...targets].sort()) {
   const absolute = resolve(root, target);
   const backToRoot = relative(root, absolute);
@@ -44,7 +96,19 @@ for (const target of [...targets].sort()) {
     throw new Error("解析后的发布路径越界: " + target);
   }
   await access(absolute, constants.R_OK);
-  if (/\.(?:js|mjs|cjs)$/i.test(target)) sourceTargets.push(absolute);
+  if (/\.(?:js|mjs|cjs)$/i.test(target) && !syntaxChecked.has(absolute)) {
+    syntaxChecked.add(absolute);
+    sourceTargets.push(absolute);
+  }
+}
+// 不发布、但参与构建的输入（装配源 + 构建脚本）同样要过 node --check：
+// files 收敛后语法覆盖面必须靠显式清单保持，而不是靠"碰巧还被发布"。
+for (const extra of [...CLIENT_SOURCE_FILES, ...BUILD_SCRIPT_FILES]) {
+  const absolute = resolve(root, extra);
+  await access(absolute, constants.R_OK);
+  if (syntaxChecked.has(absolute)) continue;
+  syntaxChecked.add(absolute);
+  sourceTargets.push(absolute);
 }
 
 for (const source of sourceTargets) {
@@ -120,5 +184,6 @@ if (dshPeers.length === 0 || new Set(dshPeers).size !== 1) {
   throw new Error("所有 DSH peerDependencies 必须保持同一版本范围");
 }
 
-console.log("DEG build verification passed: " + sourceTargets.length + " JavaScript files, "
+console.log("DEG build verification passed: " + sourceTargets.length + " JavaScript files (含 "
+  + (CLIENT_SOURCE_FILES.length + BUILD_SCRIPT_FILES.length) + " 个不发布的装配源/构建脚本), "
   + targets.size + " published targets, prompt-inspector CLI smoke verified=" + cliSummary.verified);

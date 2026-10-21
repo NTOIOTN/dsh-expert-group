@@ -38,10 +38,22 @@ function evictOldest(store, limit) {
  * @param {number} [options.limit] - 自动恢复上限。
  * @param {number} [options.taskBindingLimit] - 每个 record 保留的任务上下文上限。
  * @param {string} [options.effortMarker] - child.options 上的推理深度 marker 名。
+ * @param {string} [options.subagentProviderMarker] - child.options 上的目标 subagent
+ *   provider marker 名（票据 29）。给出时把本次请求选择的 provider 一并保存进恢复
+ *   上下文，供重建路径在持久化记录尚未落地时仍能按原 provider 重建。
+ * @param {string} [options.inheritContextMarker] - child.options 上的上下文继承 marker 名
+ *   （票据 29）。只有布尔 true 才记为继承型；缺失/false 记为普通 spawn。
  * @param {Function[]} [options.disposeHooks] - 释放回调（timer 清理、AbortController
  *   取消、pending operation 与绑定释放）；按注册逆序执行，异步回调会被等待。
  */
-export function createRecoveryModule({ limit = 5, taskBindingLimit = 64, effortMarker = "__degExpertEffort", disposeHooks = [] } = {}) {
+export function createRecoveryModule({
+  limit = 5,
+  taskBindingLimit = 64,
+  effortMarker = "__degExpertEffort",
+  subagentProviderMarker = void 0,
+  inheritContextMarker = void 0,
+  disposeHooks = [],
+} = {}) {
   if (!Number.isSafeInteger(limit) || limit < 0) throw new TypeError("recovery limit 必须是非负整数");
   if (!Number.isSafeInteger(taskBindingLimit) || taskBindingLimit <= 0) throw new TypeError("taskBindingLimit 必须是正整数");
   if (!Array.isArray(disposeHooks) || disposeHooks.some((hook) => typeof hook !== "function")) {
@@ -64,6 +76,17 @@ export function createRecoveryModule({ limit = 5, taskBindingLimit = 64, effortM
       if (disposed || !isRecord(record) || request === void 0 || request === null) return undefined;
       const promptText = request.prompt?.[0]?.text;
       if (typeof promptText !== "string" || promptText.length === 0) return undefined;
+      // 目标 subagent provider（票据 29）：优先取请求上的内部字段（调用方在组装
+      // 请求时写入），其次取同源 agentOptions marker。重建路径只把它当作持久化
+      // child_models 记录缺失时的兜底，绝不在这里重新做选择。
+      const markerProvider = typeof subagentProviderMarker === "string"
+        ? request.agentOptions?.[subagentProviderMarker]
+        : void 0;
+      const targetProvider = typeof request.subagentProvider === "string" && request.subagentProvider.length > 0
+        ? request.subagentProvider
+        : (typeof markerProvider === "string" && markerProvider.length > 0 ? markerProvider : void 0);
+      const inheritContext = typeof inheritContextMarker === "string"
+        && request.agentOptions?.[inheritContextMarker] === true;
       const context = {
         routeKey,
         label,
@@ -74,6 +97,9 @@ export function createRecoveryModule({ limit = 5, taskBindingLimit = 64, effortM
         persona: request.persona,
         toolFilter: request.toolFilter,
         maxDepth: request.maxDepth,
+        // 缺失时省略而不是写 undefined，保持旧恢复上下文的形状不变（旧记录不受影响）。
+        ...(targetProvider === void 0 ? {} : { subagentProvider: targetProvider }),
+        ...(inheritContext === true ? { inheritContext: true } : {}),
       };
       let store = contexts.get(record);
       if (store === undefined) {

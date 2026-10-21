@@ -4,15 +4,20 @@ import { randomUUID } from "node:crypto";
 import { defineDomain, domainTable } from "@deepseek-ai/dsh-storage-domain";
 import {
   CHILD_LRU_LIMIT,
+  FANOUT_TEMPLATE_LIMIT,
+  FANOUT_TEMPLATE_STORE_KEY,
+  FANOUT_TEMPLATE_VERSION,
   createBindingController,
   createInitializationGate,
+  normalizeTemplateDocumentEntries,
   persistDomainEntry,
   persistLruEntry,
   readDomainSnapshot,
+  removeDomainEntry,
 } from "./storage.js";
-import { defineTool } from "@deepseek-ai/dsh-tools";
+import { assertObjectJsonSchema, defineTool } from "@deepseek-ai/dsh-tools";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
-import { buildObserverVisualTask, buildRoleToolDescription, DEFAULT_EXPERT_PERSONA, resolveExpertPersona } from "./prompt-contracts.js";
+import { buildObserverVisualTask, buildRoleToolDescription, DEFAULT_EXPERT_PERSONA, defaultExpertPersonaOf, resolveExpertPersona } from "./prompt-contracts.js";
 import {
   createFanoutRuntime,
   FANOUT_MARKER,
@@ -43,8 +48,37 @@ import {
   STATUS_ROLE_IDS, PROMPT_OVERRIDES_SETTINGS_KEY, PROMPT_OVERRIDE_MAX_GRAPHEMES,
   PROMPT_OVERRIDE_INVALID_CODE, PROMPT_OVERRIDE_UNKNOWN_ROLE_CODE,
   normalizePromptOverrides, promptOverrideFor, countPromptGraphemes,
+  // 自定义角色（票据 27）：deny 组合与角色显示名投影只来自 shared.js 的纯函数，
+  // 保证工具面、guard 与 RPC 元数据使用同一套规则。
+  expertDenyCandidates, customRoleDenyExtensions, roleLabelsOf, roleDescriptionsOf, roleStatusLabelsOf,
+  resolveHostLocale, translateMessage,
+  // 模型候选与启动前 fallback（票据 24）：纯函数/常量只来自 shared.js，组合根与
+  // Host 投影模块共用同一套判定，避免出现两份候选顺序与错误分类实现。
+  DEFAULT_MODEL_FALLBACK_LIMIT, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_CANDIDATES_PER_ROLE,
+  MODEL_CANDIDATES_EXHAUSTED, MODEL_ROUTE_OK, MODEL_ROUTE_NOT_CONFIGURED, MODEL_ROUTE_ERROR_CODES,
+  EXPERT_ROUTE_MARKER, normalizeModelFallbackLimit, normalizeModelSelection, modelSelectionKeyOf,
+  normalizeModelRouteErrorCode, classifyModelRouteError, modelRouteErrorCodeOf,
+  isPrecheckModelRouteFailure, isModelRouteErrorCode, modelRouteErrorMessage, buildModelRoutePlan,
+  projectModelRouteFields, normalizeModelRouteMarker, modelRouteFieldsFromRecord,
+  // 上下文继承（票据 29）：marker 名、稳定错误码与允许角色集合都来自 shared.js，
+  // 组合根、恢复模块与快照投影共用同一份字面量，避免出现第二套拼写。
+  EXPERT_SUBAGENT_PROVIDER_MARKER, EXPERT_INHERIT_CONTEXT_MARKER,
+  CONTEXT_INHERITANCE_ERROR_CODES, CONTEXT_INHERITANCE_ROLE_IDS,
+  // 结构化交付（票据 30）：64KiB 口径、稳定错误码、回退原因与只读投影都来自
+  // shared.js；schema 原文不进入快照/事件，只有是否声明与结果本身可读。
+  OUTPUT_SCHEMA_MAX_BYTES, OUTPUT_SCHEMA_ERROR_CODES, OUTPUT_SCHEMA_REQUESTED_MARKER,
+  STRUCTURED_RESULT_FALLBACK_REASONS, utf8ByteLength, projectStructuredResult,
+  structuredProjectionFields,
 } from "./shared.js";
-import { getRole, listEnabledRoles, listRoles, requireRole } from "./role-registry.js";
+import {
+  createRoleRegistry,
+  customRoleRecords,
+  normalizeCustomRoleDefinitions,
+  assertCustomRoleDefinitions,
+  customRoleDefinitionsDocument,
+  ROLE_REGISTRY,
+  RoleRegistryError,
+} from "./role-registry.js";
 import {
   channelEndpointFromPath,
   createConnectionRpcHandler,
@@ -59,11 +93,90 @@ import { createRootTurnWaitRegistry } from "./host/turn-wait.js";
 import { createFanoutRuntimeModule } from "./host/fanout-runtime.js";
 import { createExpertGroupRuntime, restoreFailureRetryable, rootNotificationLabel } from "./host/expert-group-runtime.js";
 import { createPersistenceHealth } from "./host/persistence-health.js";
-import { DEFAULT_NOTIFICATION_VOLUME, SYSTEM_TOAST_REASONS, createSystemToastModule, normalizeToastVolume, terminationToastText, userWaitToastText } from "./host/system-toast.js";
+import {
+  DEFAULT_NOTIFICATION_VOLUME,
+  SYSTEM_TOAST_REASONS,
+  createSystemToastModule,
+  normalizeToastVolume,
+  userWaitToastText,
+} from "./host/system-toast.js";
+// 用量账本（票据 25）：纯函数与有界状态机只来自 host/usage-ledger.js，组合根只做
+// 事件接线、归属解析与持久化桥接，避免出现第二套 token 归一/聚合实现。
+import {
+  MAX_RECENT_USAGE_TASKS,
+  assertModelPrices,
+  createUsageLedger,
+  hasUsageMetrics,
+  normalizeModelPrices,
+  projectUsage,
+  summarizeUsage,
+} from "./host/usage-ledger.js";
 import { FANOUT_BUDGET, truncateFeedbackText } from "./resource-budget.js";
-import { MAX_RECLAIM_BATCH, MAX_TIMEOUT_MS, TIMEOUT_STEP_MS, validateTimeoutMs } from "./fanout.js";
+import {
+  MAX_CONCURRENCY_LIMIT,
+  MAX_PROVIDER_LIMIT,
+  MAX_RECLAIM_BATCH,
+  MAX_TIMEOUT_MS,
+  MIN_CONCURRENCY_LIMIT,
+  MIN_PROVIDER_LIMIT,
+  PROVIDER_ROUTE_CHANGED,
+  SHARD_TERMINAL_STATUSES,
+  TIMEOUT_STEP_MS,
+  validateSubmitInput,
+  validateTimeoutMs,
+} from "./fanout.js";
 import { buildOrchestratorPrompt, isRootAgentContext } from "./orchestrator.js";
 import { buildImageContent, decideImageRoute, effectiveModelRoute, imageCapability, normalizeImageToPng, pngCopyName, toPngBytes } from "./image-routing.js";
+/**
+ * Host 通知文案的纯构造函数（票据 19）。
+ *
+ * locale 由调用方解析后传入（见 resolveHostLocale），这里只做「固定类别 → 消息表键」的映射，
+ * 因此可以在 node:test 里直接注入 zh/en 验证，不需要驱动真实终止事件或桌面通知。
+ * 结构契约保持不变：{ title, body, taskName? }，taskName 仍作为独立的第二行。
+ */
+export function buildTerminationNotificationText(locale, reason, taskName) {
+  const raw = typeof reason === "string" ? reason.trim() : "";
+  const known = ["completed", "blocked", "error", "aborted", "interrupted", "max-tokens"].indexOf(raw) === -1 ? "unknown" : raw;
+  const label = typeof taskName === "string" ? taskName.trim() : "";
+  return {
+    title: translateMessage(locale, "notify.test.title"),
+    body: translateMessage(locale, "notify.termination." + known),
+    ...(label.length > 0 ? { taskName: label } : {}),
+  };
+}
+
+/** 用户等待通知：只认 host/system-toast 声明的两种工具名；未知工具返回 null（宁可不提示）。 */
+export function buildUserWaitNotificationText(locale, tool, taskName) {
+  const base = userWaitToastText(tool, taskName);
+  if (base === null) return null;
+  return {
+    ...base,
+    title: translateMessage(locale, "notify.wait.title"),
+    body: translateMessage(locale, "notify.wait.body"),
+  };
+}
+
+/** 「发送测试通知」文案：只描述通道可用，不伪造任务状态。 */
+export function buildTestNotificationText(locale) {
+  return {
+    title: translateMessage(locale, "notify.test.title"),
+    body: translateMessage(locale, "notify.test.body"),
+  };
+}
+
+/** 长等待/查询降级/投递失败提示：固定类别 → 消息表键（body 里含人工逃生入口说明）。 */
+export function buildRootWaitNotificationText(locale, kind) {
+  const key = kind === "long"
+    ? "notify.waitLong.body"
+    : kind === "queryDegraded"
+      ? "notify.waitQueryDegraded.body"
+      : kind === "deliveryFailed"
+        ? "notify.waitDeliveryFailed.body"
+        : null;
+  if (key === null) return null;
+  return { title: translateMessage(locale, "notify.test.title"), body: translateMessage(locale, key) };
+}
+
 /**
  * 为 RPC 请求创建可传给公开 subagents.startContinuable 的 AbortSignal。
  * 请求 body 读完后仍保留响应断开监听；正常完成时由 handleRpc 的 finally 移除监听。
@@ -327,6 +440,60 @@ function diagnosticCount(value) {
 /** 只接受非负安全整数时间戳；缺失/非法返回 null（区分"从未发生"与 1970）。 */
 function diagnosticTime(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * 限流诊断的行数上限（票据 26）：role/provider 映射来自设置，诊断投影必须有界。
+ * 超出部分按对象插入序截断——它们是低频配置项，不是需要完整分页的数据面。
+ */
+const THROTTLE_DIAGNOSTIC_ROW_LIMIT = 16;
+
+/**
+ * 限流/排队诊断的只读投影（票据 26）。
+ *
+ * 输入是 manager.throttleDiagnostics() 的形状：
+ *   { roles: {role: row}, providers: {provider: row}, etaMinSamples }
+ * 输出改写成有界数组，便于客户端直接渲染，且所有标量都过诊断白名单：
+ * - 键名（role/provider）是公开配置，仍截断到 64 字符；
+ * - 时间戳/计数/etaMs 用非负安全整数，缺失时显式 null；
+ * - etaSource 只接受固定枚举（unknown / historical-average）。
+ *
+ * 绝不包含任务负载、prompt 或任何会话数据。
+ *
+ * @param {unknown} value - manager 的限流诊断。
+ * @returns {{roles: object[], providers: object[], etaMinSamples: number}}
+ */
+function projectThrottleDiagnostics(value) {
+  const source = value !== null && typeof value === "object" ? value : {};
+  const projectRow = (keyField, key, row) => {
+    const entry = row !== null && typeof row === "object" ? row : {};
+    return Object.freeze({
+      [keyField]: key.slice(0, 64),
+      // limit 0 表示不限制（provider 维度）；role 维度总是 >= 1 的生效默认值。
+      limit: diagnosticCount(entry.limit),
+      running: diagnosticCount(entry.running),
+      queued: diagnosticCount(entry.queued),
+      samples: diagnosticCount(entry.samples),
+      lastThrottledAt: diagnosticTime(entry.lastThrottledAt),
+      etaMs: diagnosticTime(entry.etaMs),
+      etaSource: entry.etaSource === "historical-average" ? "historical-average" : "unknown",
+    });
+  };
+  const projectMap = (map, keyField) => {
+    if (map === null || typeof map !== "object") return Object.freeze([]);
+    const rows = [];
+    for (const key of Object.keys(map)) {
+      if (rows.length >= THROTTLE_DIAGNOSTIC_ROW_LIMIT) break;
+      if (typeof key !== "string" || key.length === 0) continue;
+      rows.push(projectRow(keyField, key, map[key]));
+    }
+    return Object.freeze(rows);
+  };
+  return Object.freeze({
+    roles: projectMap(source.roles, "role"),
+    providers: projectMap(source.providers, "provider"),
+    etaMinSamples: diagnosticCount(source.etaMinSamples),
+  });
 }
 
 /**
@@ -601,18 +768,45 @@ function ensureExpertSendMessageDenied(toolFilter) {
 }
 
 /**
- * 角色元数据投影：中文显示名与职责摘要来自统一角色注册表，默认 persona 来自
- * prompt-contracts 的专家专属 persona 表（不含固定执行纪律）。注册表新增角色却
- * 缺少 persona 时在模块加载期显式失败，避免用空人格启动专家。
+ * 运行期角色目录（票据 27）：内置 6 角色 + 设置里声明的自定义角色。
  *
- * persona 字段保留为"默认专家专属 persona"的兼容投影；需要真正启动 child 的调用点
- * 必须使用 resolveExpertPersona(...) 解析当前 settings 覆盖。
+ * 为什么不是模块级常量：自定义角色来自 settings，只有插件实例在 settings 读源绑定后
+ * 才知道完整集合。这里用一个**实例栈**暴露「当前运行期目录」给模块级的 guard 与
+ * 身份判定函数（它们不持有 apply 闭包），同时在插件卸载时精确出栈，避免测试/多实例
+ * 场景互相污染。栈为空时一律回落到内置注册表（绝不出现「没有目录 = 放开权限」）。
+ *
+ * 目录只由 createRoleRegistry 构造：内置记录在前、自定义记录按 id 字典序追加，
+ * 两边都走同一条 fail-closed 归一，因此不存在第二套角色校验。
  */
-const ROLE_META = Object.fromEntries(listRoles().map((entry) => [entry.id, {
-  label: entry.label,
-  description: entry.description,
-  persona: DEFAULT_EXPERT_PERSONA[entry.id],
-}]));
+const runtimeRoleCatalogStack = [];
+
+/** 当前生效的运行期角色目录（栈顶；空栈回落到内置注册表）。 */
+function currentRoleCatalog() {
+  return runtimeRoleCatalogStack.length === 0
+    ? ROLE_REGISTRY
+    : runtimeRoleCatalogStack[runtimeRoleCatalogStack.length - 1].registry;
+}
+
+/** 注册一个实例级目录持有者（apply 时调用；卸载时精确出栈）。 */
+function pushRuntimeRoleCatalog(holder) {
+  runtimeRoleCatalogStack.push(holder);
+}
+
+/** 注销目录持有者：只移除同一个对象，迟到的其它实例不会误删当前栈顶。 */
+function popRuntimeRoleCatalog(holder) {
+  const index = runtimeRoleCatalogStack.lastIndexOf(holder);
+  if (index !== -1) runtimeRoleCatalogStack.splice(index, 1);
+}
+
+/** 角色记录查询（内置与自定义同源）；未知角色返回 undefined。 */
+function roleCatalogEntry(role) {
+  return currentRoleCatalog().get(role);
+}
+
+/** 运行期自定义角色的工具名扩展（角色工具 + subagent_<id>），供委派 deny 使用。 */
+function runtimeCustomRoleToolNames() {
+  return customRoleDenyExtensions(currentRoleCatalog().records());
+}
 
 /** 子代理 child.options 上携带的推理深度 marker，避免依赖未公开的 AgentOptions.reasoningEffort。 */
 const EFFORT_MARKER = "__degExpertEffort";
@@ -668,8 +862,31 @@ function validPersonaMarker(value) {
     : void 0;
 }
 
-/** 只有同时带插件角色与父会话 marker 的有效专家 child 才安装 report/send_message guard。 */
-const EXPERT_ROLES = new Set(listRoles().map((entry) => entry.id));
+/**
+ * 角色是否是当前运行期目录里的专家角色。
+ *
+ * 内置与自定义角色同源：目录由 createRoleRegistry 构造，因此这里既不会把未知角色
+ * 当成专家（避免为无关 child 安装 guard），也不会漏掉自定义角色。
+ */
+function isRegisteredExpertRole(role) {
+  return typeof role === "string" && role.length > 0 && currentRoleCatalog().has(role);
+}
+
+/**
+ * 持久化 child_models 记录上的插件 admission 证据。
+ *
+ * 用途（票据 27）：自定义角色可能在 child 创建后被删除；此时角色已不在运行期目录里，
+ * 但该 child 的恢复/guard 不能因此失去人格与 deny 边界。只有**插件写入**的 deny/persona
+ * 快照才能作为证据（live marker 上的任意 role 字符串不算），因此 spoof metadata 仍然无效。
+ *
+ * @param {unknown} record - child_models 快照记录。
+ * @returns {boolean} 该记录是否带有 DEG admission 写入的边界快照。
+ */
+function hasPluginAdmissionProof(record) {
+  return record !== null
+    && typeof record === "object"
+    && (Array.isArray(record[DENY_MARKER]) || validPersonaMarker(record[PERSONA_MARKER]) !== void 0);
+}
 const EXPERT_REPORT_GUARD_REASON = "插件专家 child 不允许调用 report；请在最终 assistant 输出中按五个固定标题交付结果。";
 const EXPERT_SEND_MESSAGE_GUARD_REASON = "插件专家 child 不允许调用 send_message；最终结果由 DSH subagent-settled 自动交付，请仅在最终 assistant 输出中按五个固定标题交付结果。";
 
@@ -689,7 +906,7 @@ function isPluginExpertChildOptions(options) {
   const role = options?.[ROLE_MARKER];
   const parentId = options?.[PARENT_MARKER];
   return typeof role === "string"
-    && EXPERT_ROLES.has(role)
+    && isRegisteredExpertRole(role)
     && typeof parentId === "string"
     && parentId.length > 0;
 }
@@ -699,7 +916,9 @@ function isPluginExpertChildRecord(record) {
     && typeof record === "object"
     && !Array.isArray(record)
     && typeof record.role === "string"
-    && EXPERT_ROLES.has(record.role)
+    // 角色仍在运行期目录，或记录带有插件 admission 写入的 deny/persona 快照
+    // （自定义角色创建后被删除的冷恢复路径）。两者都不满足时不是插件专家身份。
+    && (isRegisteredExpertRole(record.role) || hasPluginAdmissionProof(record))
     && typeof record.parentId === "string"
     && record.parentId.length > 0
     && record.continuable === true;
@@ -723,13 +942,22 @@ export function resolveExpertReportIdentity(options, childId, readChildModel) {
     return void 0;
   }
   if (!isPluginExpertChildRecord(record)) return void 0;
-  return { role: record.role, parentId: record.parentId, source: "snapshot" };
+  return {
+    role: record.role,
+    parentId: record.parentId,
+    source: "snapshot",
+    // 自定义角色被删除后的冷恢复：记录里的 deny/persona 快照证明它曾通过 DEG
+    // admission。只有 true 才写入，保持既有身份形状（历史测试逐键断言）。
+    ...(hasPluginAdmissionProof(record) ? { admissionProof: true } : {}),
+  };
 }
 
 function isPluginExpertChildIdentity(identity) {
+  // admissionProof 只由插件写入的快照派生（见 resolveExpertReportIdentity），
+  // live marker 上的任意 role 字符串仍然必须命中运行期目录。
   return identity !== null
     && typeof identity === "object"
-    && EXPERT_ROLES.has(identity.role)
+    && (isRegisteredExpertRole(identity.role) || identity.admissionProof === true)
     && typeof identity.parentId === "string"
     && identity.parentId.length > 0;
 }
@@ -752,6 +980,31 @@ export function shouldBlockExpertSendMessage(options, execution, identity) {
   return EXPERT_SEND_MESSAGE_GUARD_REASON;
 }
 
+/**
+ * 恢复重建 child 时的 persona 选择（纯函数，导出供契约测试）。
+ *
+ * 设计约束（票据 27）：
+ * - 角色仍在运行期目录：与历史行为一致，使用**当前** admission 解析结果——恢复是新建
+ *   child 的一条路径，不能跳过用户覆盖与固定纪律的分层；
+ * - 角色已被删除（不在目录）：使用 child 创建时持久化的 persona 快照，保住人格，绝不
+ *   因为角色消失而变成未知角色或通用人格；
+ * - 两者都没有：返回 undefined，调用方必须 fail-closed（未注册角色连默认 persona 都没有，
+ *   重建出来的 child 会失去全部角色约束）。
+ *
+ * @param {object} input
+ * @param {boolean} input.roleKnown - 角色是否仍在运行期目录。
+ * @param {string|undefined} input.currentPersona - 当前 admission 解析结果（含固定纪律）。
+ * @param {string|undefined} input.recordedPersona - child 创建时持久化的 persona 快照。
+ * @returns {string|undefined} 重建使用的 persona；不可证明时 undefined。
+ */
+export function resolveRecoveryPersona({ roleKnown, currentPersona, recordedPersona } = {}) {
+  const recorded = typeof recordedPersona === "string" && recordedPersona.length > 0 ? recordedPersona : void 0;
+  if (roleKnown === true) {
+    return typeof currentPersona === "string" && currentPersona.length > 0 ? currentPersona : recorded;
+  }
+  return recorded;
+}
+
 const MAX_EXPERT_DENY_MARKER_ENTRIES = 512;
 
 /**
@@ -766,11 +1019,15 @@ const MAX_EXPERT_DENY_MARKER_ENTRIES = 512;
  * report/delegation/root-only 工具。run_code 是 Code Mode 展示传输，保持既有放行语义。
  */
 function expertGuardDenyNames(options, identity) {
-  const roleEntry = getRole(identity?.role);
+  // 只读性来自运行期目录；未知角色（含已删除的自定义角色）按只读处理（fail-closed）。
+  const roleEntry = roleCatalogEntry(identity?.role);
   const fallback = roleEntry === void 0 || roleEntry.readOnly === true
     ? READONLY_DENY
     : [...EXPERT_DELEGATION_DENY, ...ROOT_ONLY_TOOL_DENY];
-  const denyNames = new Set(ensureExpertSendMessageDenied(fallback).filter((name) => name !== "run_code"));
+  // 自定义角色（票据 27）：自身 toolDeny 与运行期角色工具名始终叠加，
+  // 因此只读自定义角色仍被写工具拒绝，可写自定义角色也不能再委派/调用 root-only 工具。
+  const ownDeny = Array.isArray(roleEntry?.toolDeny) ? roleEntry.toolDeny : [];
+  const denyNames = new Set(ensureExpertSendMessageDenied([...fallback, ...ownDeny]).filter((name) => name !== "run_code"));
   const marked = options?.[DENY_MARKER];
   if (marked === void 0) return denyNames;
   const policyNames = new Set([
@@ -778,13 +1035,21 @@ function expertGuardDenyNames(options, identity) {
     ...ROOT_ONLY_TOOL_DENY,
     ...READONLY_DENY,
     "send_message",
+    // marker 里可能合法地包含自定义角色的 toolDeny 与运行期角色工具名：
+    // 它们是 admission 时由同一套规则算出的候选，不能因"不在静态清单里"被判成伪造。
+    ...ownDeny,
+    ...runtimeCustomRoleToolNames(),
   ]);
   if (!Array.isArray(marked) || marked.length === 0 || marked.length > MAX_EXPERT_DENY_MARKER_ENTRIES) return void 0;
+  // 自定义角色删除后的恢复：角色已不在目录，它自己的非 MCP toolDeny 名称无法再用当前目录
+  // 证明合法。此时只接受带 admission 证据的身份（插件写入的 deny/persona 快照），并且仍然
+  // 只**追加** deny —— 多一个拒绝名称不会放大权限，缺少名称也不会绕过下面的静态 fallback。
+  const trustedMarker = identity?.admissionProof === true;
   for (const name of marked) {
     // 动态 MCP 名称由 readonly admission 的 schema 快照产生；其余名称必须属于
     // DEG 已知策略，避免任意未知字符串伪造“合法 marker”并绕过形状审查。
     if (typeof name !== "string" || name.length === 0 || name === "run_code"
-      || (!policyNames.has(name) && !isReadonlyDynamicMcpName(name))) return void 0;
+      || (!policyNames.has(name) && !isReadonlyDynamicMcpName(name) && trustedMarker !== true)) return void 0;
     denyNames.add(name);
   }
   return denyNames;
@@ -1367,9 +1632,9 @@ function installExpertReportGuard(childCtx, readChildModel, resolvedIdentity, ch
     if (reportReason !== void 0) return reportReason;
     const sendMessageReason = shouldBlockExpertSendMessage(options, execution, identity);
     if (sendMessageReason !== void 0) return sendMessageReason;
-    // 只读性来自注册表；未知角色按只读处理（fail-closed），避免历史/外部角色
-    // 因注册表缺项而获得动态 MCP 访问权。
-    const roleEntry = getRole(identity.role);
+    // 只读性来自运行期目录（内置 + 自定义）；未知/已删除角色按只读处理（fail-closed），
+    // 避免历史/外部角色因目录缺项而获得动态 MCP 访问权。
+    const roleEntry = roleCatalogEntry(identity.role);
     if ((roleEntry === void 0 || roleEntry.readOnly === true) && isReadonlyDynamicMcpName(execution?.name)) {
       return "只读专家 child 禁止调用动态 MCP 工具";
     }
@@ -1384,8 +1649,16 @@ const ROLE_SELECTION = z.object({
 });
 
 /** settings 保存统一 provider、各专家 defaults 和通知偏好；插件运行数据仍属于 storage domain。 */
-const NOTIFICATION_HOLD_MS_OPTIONS = Object.freeze([5000, 10000, 30000, 60000, 300000, 600000, 0]);
-const DEFAULT_NOTIFICATION_HOLD_MS = 5000;
+/**
+ * 通知事件类型（票据 14）：设置页只允许这三种语义化类别，Host 在**投递前**按设置过滤。
+ *
+ * 为什么不是直接暴露 turn/end 的 reason.kind：reason.kind 是宿主生命周期枚举
+ * （completed/blocked/error/aborted/interrupted/max-tokens/unknown），对用户没有稳定意义，
+ * 且未来可能新增 kind。这里把它收口成三个用户能决策的选项，默认全部开启以保持既有行为。
+ */
+const NOTIFICATION_EVENT_TYPES = Object.freeze(["completed", "waiting", "failed"]);
+/** 默认全部开启：旧配置缺字段、旧客户端不提交该字段时行为与历史完全一致。 */
+const DEFAULT_NOTIFICATION_EVENTS = Object.freeze({ completed: true, waiting: true, failed: true });
 /**
  * 默认通知音量（0..100）：100 = 不做任何衰减，只受 Windows 主音量影响。
  * 常量与归一函数都来自 host/system-toast.js，保证设置读取面与投递面用的是同一套规则。
@@ -1408,6 +1681,83 @@ function normalizeRoleConcurrencyLimit(value) {
 }
 
 /**
+ * 读取面诊断条数上限（票据 26）：非法 roleLimits/providerLimits 条目只保留有界摘要，
+ * 诊断面因此不随用户写坏多少键而增长。
+ */
+const LIMIT_DIAGNOSTIC_LIMIT = 16;
+
+/**
+ * 读取面归一：roleLimits（逐角色并发上限映射，票据 26）。
+ *
+ * 语义与其它设置读取面一致（票据 27 的自定义角色同款）：
+ * - 缺字段（旧配置/旧客户端）= 空映射，不是错误；
+ * - 非法/越界值、未知角色键**丢弃并诊断**，绝不让设置页因一份坏文档打不开；
+ * - 写入面（settings-commit）仍严格拒绝整份候选，读取面的宽容只服务历史文档
+ *   与宿主通用写入路径。
+ *
+ * @param {unknown} value - settings.roleLimits 原始值。
+ * @param {readonly string[]} allowedRoles - 当前候选设置自己的角色集（内置 + 自定义）。
+ * @returns {{limits: Record<string, number>, diagnostics: Array<object>}}
+ */
+function normalizeRoleLimitsForRead(value, allowedRoles) {
+  const limits = {};
+  const diagnostics = [];
+  if (value === undefined || value === null) return { limits, diagnostics };
+  if (typeof value !== "object" || Array.isArray(value)) {
+    diagnostics.push({ field: "roleLimits", reason: "invalid_shape" });
+    return { limits, diagnostics };
+  }
+  const allowed = new Set(Array.isArray(allowedRoles) ? allowedRoles : STATUS_ROLE_IDS);
+  for (const [role, limit] of Object.entries(value)) {
+    // 先判值的合法性再判键：一个"未知角色 + 非法值"的条目最需要说明的是值坏了
+    // （invalid_limit 是可操作的提示），而不是角色表里没有它。
+    if (!Number.isSafeInteger(limit) || limit < MIN_CONCURRENCY_LIMIT || limit > MAX_CONCURRENCY_LIMIT) {
+      if (diagnostics.length < LIMIT_DIAGNOSTIC_LIMIT) diagnostics.push({ field: "roleLimits", role: role.slice(0, 64), reason: "invalid_limit" });
+      continue;
+    }
+    if (role.trim().length === 0 || !allowed.has(role)) {
+      if (diagnostics.length < LIMIT_DIAGNOSTIC_LIMIT) diagnostics.push({ field: "roleLimits", role: role.slice(0, 64), reason: "unknown_role" });
+      continue;
+    }
+    limits[role] = limit;
+  }
+  return { limits, diagnostics };
+}
+
+/**
+ * 读取面归一：providerLimits（逐 provider 并发上限映射，票据 26）。
+ *
+ * 与 roleLimits 的区别（都是刻意的）：
+ * - 键只要求非空字符串：provider 集合来自模型目录，插件不应在读取面替用户判定
+ *   "这个 provider 是否存在"（目录可能暂时不可用）；
+ * - 0 是合法值（显式不限制），只有越界/非整数才丢弃。
+ *
+ * @param {unknown} value - settings.providerLimits 原始值。
+ * @returns {{limits: Record<string, number>, diagnostics: Array<object>}}
+ */
+function normalizeProviderLimitsForRead(value) {
+  const limits = {};
+  const diagnostics = [];
+  if (value === undefined || value === null) return { limits, diagnostics };
+  if (typeof value !== "object" || Array.isArray(value)) {
+    diagnostics.push({ field: "providerLimits", reason: "invalid_shape" });
+    return { limits, diagnostics };
+  }
+  for (const [provider, limit] of Object.entries(value)) {
+    if (provider.trim().length === 0) {
+      if (diagnostics.length < LIMIT_DIAGNOSTIC_LIMIT) diagnostics.push({ field: "providerLimits", reason: "invalid_key" });
+      continue;
+    }
+    if (!Number.isSafeInteger(limit) || limit < MIN_PROVIDER_LIMIT || limit > MAX_PROVIDER_LIMIT) {
+      if (diagnostics.length < LIMIT_DIAGNOSTIC_LIMIT) diagnostics.push({ field: "providerLimits", provider: provider.slice(0, 64), reason: "invalid_limit" });
+      continue;
+    }
+    limits[provider] = limit;
+  }
+  return { limits, diagnostics };
+}
+
+/**
  * 角色默认超时归一：需与 fanout.js 的 validateTimeoutMs 同源（只接受 0 或
  * 1000~86,400,000 的整秒毫秒数）。缺失/非法值回退默认 10 小时，保证读取面与
  * 调度器永远拿不到越界值；写入面仍由 validateSettingsCandidate 严格拒绝。
@@ -1420,17 +1770,28 @@ function normalizeRoleTimeoutMs(value) {
   return check.ok && typeof check.value === "number" ? check.value : DEFAULT_ROLE_TIMEOUT_MS;
 }
 
-/** 只接受设置页提供的固定停留时长；旧配置或非法值回退到 10 秒。 */
-function normalizeNotificationHoldMs(value) {
-  const number = typeof value === "number" ? value : NaN;
-  return NOTIFICATION_HOLD_MS_OPTIONS.includes(number) ? number : DEFAULT_NOTIFICATION_HOLD_MS;
+/**
+ * 通知事件开关归一：只读取三个声明过的类别，缺失/非法一律按开启处理。
+ *
+ * 为什么非法值按开启而不是按关闭：该字段只影响"要不要打扰用户"，历史行为是全部投递；
+ * 读到一个坏值就静默关闭通知会让用户更难发现通知链路问题。写入面仍由
+ * normalizeNotificationEventCandidate 严格拒绝非法候选，读取面的宽容只服务旧配置。
+ *
+ * @param {unknown} value - settings 里的 notificationEvents。
+ * @returns {{completed: boolean, waiting: boolean, failed: boolean}} 冻结前的普通对象。
+ */
+function normalizeNotificationEvents(value) {
+  const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const normalized = {};
+  for (const type of NOTIFICATION_EVENT_TYPES) normalized[type] = source[type] !== false;
+  return normalized;
 }
 
 /**
  * 插件组合 Config。
  *
  * 前两个字段是插件启停配置（普通 Config）：它们是部署期行为，不是设置页的即时偏好。
- * 其余十个字段是设置页可即时修改的偏好，必须标记 `.volatile()`：DSH 0.1.7 的
+ * 其余十一个字段是设置页可即时修改的偏好，必须标记 `.volatile()`：DSH 0.1.7 的
  * `ctx.settings` 只把「本条目 Config 上的 volatile 字段」投影成可编辑表单，并且
  * **只有声明了 volatile 字段的条目才会出现在 `describe()` 中**；写入非 volatile
  * 路径会被宿主直接拒绝。
@@ -1438,7 +1799,7 @@ function normalizeNotificationHoldMs(value) {
  * 字段语义与默认值必须与设置页的读取面一致：`describe()` 返回的 value 是
  * defaults resolved 后的结果（provider 空字符串表示用户尚未选择 provider，
  * promptOverrides 空对象表示全部跟随代码默认 persona）。运行期读源由
- * host/settings-source 从 describe() 取得，提交端点只写这十个字段。
+ * host/settings-source 从 describe() 取得，提交端点只写这十一个字段。
  */
 const Config = z.object({
   // 主代理能力默认启用；false 可用于仅使用专家工具的兼容部署。
@@ -1449,11 +1810,48 @@ const Config = z.object({
   defaults: z.dict(ROLE_SELECTION).default({}).volatile(),
   notificationEnabled: z.boolean().default(true).volatile(),
   notificationVolume: z.number().step(1).min(0).max(100).default(100).volatile(),
-  notificationHoldMs: z.number().step(1).min(0).max(600000).default(DEFAULT_NOTIFICATION_HOLD_MS).volatile(),
+  // 通知事件类型（票据 14）：三个类别默认全部开启；缺字段的旧文档读取面按全开归一。
+  // 这里用嵌套对象而不是三个顶层布尔：它是一组"要通知哪些事件"的集合，未来新增类别
+  // 不需要再改提交端点/设置页的字段命名规则。
+  notificationEvents: z.object({
+    completed: z.boolean().default(true),
+    waiting: z.boolean().default(true),
+    failed: z.boolean().default(true),
+  }).default({}).volatile(),
   roleConcurrencyLimit: z.number().step(1).min(1).max(64).default(DEFAULT_ROLE_CONCURRENCY_LIMIT).volatile(),
+  /**
+   * 逐角色并发上限覆盖（票据 26）：roleId -> 1..64。未出现的角色落到 roleConcurrencyLimit。
+   *
+   * 这里只声明类型层（角色键/范围由 DEG 自有提交端点严格校验，见
+   * assertRoleLimitsCandidate）。缺字段 = 旧配置/旧客户端：读取为空映射，保存时保持
+   * 已有映射（不写 patch），因此不会把用户已配置的逐角色上限一次无关保存清空。
+   */
+  roleLimits: z.dict(z.number().step(1).min(1).max(64)).default({}).volatile(),
+  /**
+   * 逐 provider 并发上限（票据 26）：providerId -> 0..64。
+   *
+   * 0 或未设置表示不限制（规则见 docs/specs/03 §3）；provider 键只要求非空字符串，
+   * 保存时不调用模型目录校验，避免目录暂时不可用时连限流配置都无法保存。
+   */
+  providerLimits: z.dict(z.number().step(1).min(0).max(64)).default({}).volatile(),
   // 角色级默认超时（毫秒，票据 06）：0 = 不启用；启用值为 1000~86,400,000 且为 1000 的整数倍。
   // 它只影响保存之后创建的 attempt，不会改写运行中的分片（三级优先级见 fanout.js）。
   roleTimeoutMs: z.number().step(TIMEOUT_STEP_MS).min(0).max(MAX_TIMEOUT_MS).default(DEFAULT_ROLE_TIMEOUT_MS).volatile(),
+  // 模型候选与启动前 fallback（票据 24）：候选是全局配置，按角色有序排列；
+  // 会话覆盖只替换主选择（defaults/session_overrides），绝不修改这里。
+  // 读取面把非法值归一为空映射/默认 2，不阻塞设置读取；严格拒绝落在 DEG 提交端点。
+  candidates: z.dict(z.array(ROLE_SELECTION)).default({}).volatile(),
+  fallbackLimit: z.number().step(1).min(0).max(MAX_MODEL_FALLBACK_LIMIT).default(DEFAULT_MODEL_FALLBACK_LIMIT).volatile(),
+  /**
+   * 每模型输入/输出单价（每百万 token，票据 25）：数组，最多 64 项。
+   *
+   * 这里只声明类型层（任意值数组）：字段/范围/未知键/重复条目的 fail-closed 校验由
+   * DEG 自有提交端点调用 assertModelPrices 完成；读取面由 normalizeModelPrices 丢弃
+   * 非法条目并给出有界诊断。
+   * - 缺字段 = 旧配置/旧客户端：读取为空数组，保存时保持已有单价（不写 patch）；
+   * - 显式空数组 = 清空全部单价（与缺字段语义不同）。
+   */
+  modelPrices: z.array(z.any()).default([]).volatile(),
   // 旧 settings 文档可能没有该字段；schema 与归一边界都提供关闭默认值。
   observerPreferred: z.boolean().default(false).volatile(),
   // 「任务管理」开关默认开启：旧文档缺字段时维持 Expert Group 注册到侧边栏的历史行为。
@@ -1465,6 +1863,22 @@ const Config = z.object({
   // 使用代码里的默认 persona；这里只做类型层（角色键与长度）校验，写入边界的
   // 语义校验在 DEG 自有提交端点内（宿主新契约没有 validate 钩子）。
   promptOverrides: z.dict(z.string()).default({}).volatile(),
+  // 自定义角色（票据 27）：roleId -> definition。
+  // - 这里只声明「任意值字典」：字段级 fail-closed 校验（readOnly 必须布尔、toolDeny 必须
+  //   显式字符串数组、未知字段拒绝、id/长度/数量上限、不得覆盖内置与保留名）由 DEG 自有
+  //   提交端点调用 role-registry 的 assertCustomRoleDefinitions 完成；读取面由
+  //   normalizeCustomRoleDefinitions 丢弃非法条目并诊断。
+  // - 缺字段 = 旧配置/旧客户端：读取为空，保存时保持已有自定义角色（不删除）。
+  customRoles: z.dict(z.any()).default({}).volatile(),
+  /**
+   * 角色级上下文继承开关（票据 29）：roleId -> boolean。
+   *
+   * - 只有内置非 Observer 角色可开启；Observer/未知/自定义角色由 DEG 自有提交端点
+   *   整次拒绝（fail-closed），读取面对外部坏值丢弃并诊断；
+   * - 缺字段 = 旧配置/旧客户端：读取为空映射（全部关闭），保存时保持已有映射；
+   * - 显式空对象 = 全部关闭（与缺字段语义不同）。volatile 是设置页可即时修改的前提。
+   */
+  inheritContext: z.dict(z.boolean()).default({}).volatile(),
 });
 
 /** settings namespace 仅保存全局 defaults；session 与 child 运行数据属于 storage domain。 */
@@ -1475,16 +1889,51 @@ export const DOMAIN_ROLE_SELECTION = domainZ.object({
   model: domainZ.string(),
   reasoningEffort: domainZ.string().optional(),
 });
+/**
+ * child_models 的实际路由字段（票据 24）。
+ *
+ * requestedPrimary 记录本次派发时生效的主选择（可能是会话覆盖），candidateIndex 使用
+ * 原始候选位置（0=primary），fallbackCount 是实际降级次数，lastRouteErrorCode 只允许
+ * 稳定分类码。字段全部可选：旧记录/旧进程快照继续可读，投影侧缺失即省略，绝不补 0。
+ */
+const DOMAIN_MODEL_ROUTE_FIELDS = {
+  requestedPrimary: DOMAIN_ROLE_SELECTION.optional(),
+  candidateIndex: domainZ.number().int().nonnegative().optional(),
+  fallbackCount: domainZ.number().int().nonnegative().optional(),
+  lastRouteErrorCode: domainZ.enum(Object.values(MODEL_ROUTE_ERROR_CODES)).optional(),
+};
 /** session_overrides 的 value 是“角色名 -> selection”字典，不是单个 selection。 */
 export const DOMAIN_SESSION_OVERRIDES = domainZ.record(domainZ.string(), DOMAIN_ROLE_SELECTION);
+/**
+ * session_override_meta：会话覆盖的**代次**（票据 21）。
+ *
+ * 为什么不把 revision 塞进 session_overrides：那张表的 value 是“角色名 -> selection”
+ * 的平铺字典，混入 revision 这类保留键会让旧读者（以及客户端读取面）把元数据当成
+ * 一个角色名泄漏出去。独立表让旧记录继续按原形状可读（缺 meta = revision 0），
+ * 也让代次栅栏与内容写入各自有明确的 durable schema。
+ *
+ * 只保存单调递增的代次；不保存作者、时间戳或任何决策依据。
+ */
+export const DOMAIN_SESSION_OVERRIDE_META = domainZ.object({
+  revision: domainZ.number().int().nonnegative(),
+});
 /** child_models 的公开 schema seam：测试用它验证 domain adapter round-trip 不会 strip deny marker。 */
 export const DOMAIN_CHILD_MODEL_RECORD = domainZ.object({
   provider: domainZ.string(),
   model: domainZ.string(),
   reasoningEffort: domainZ.string().optional(),
+  // 实际路由元数据（票据 24）：与 provider/model 同层持久化，冷恢复/侧栏只读。
+  ...DOMAIN_MODEL_ROUTE_FIELDS,
   role: domainZ.string().optional(),
   parentId: domainZ.string().optional(),
   continuable: domainZ.boolean().optional(),
+  // 目标 subagent provider（票据 29）：记录本次 child 实际使用的 provider 名
+  // （"spawn" 或继承型 fork provider 的注册名）。恢复/重建只读该字段，绝不按当前
+  // 设置重新选择；旧记录缺字段时按 "spawn" 处理（兼容升级前的 child）。
+  subagentProvider: domainZ.string().min(1).max(128).optional(),
+  // 是否继承了父会话上下文（票据 29）：true 表示该 child 必须用继承型 provider 恢复；
+  // 旧记录缺字段时按 false（普通 spawn）处理。投影侧缺失时省略，绝不伪造 false。
+  inheritContext: domainZ.boolean().optional(),
   // RC1 agentOptions 不由 Host recovery 持久化；保存 DEG admission 的完整 deny 边界，
   // 供 scoped guard 在 cold-resume 时恢复。长度上限与运行期校验保持一致。
   [DENY_MARKER]: domainZ.array(domainZ.string()).max(MAX_EXPERT_DENY_MARKER_ENTRIES).optional(),
@@ -1509,6 +1958,58 @@ export const DOMAIN_CHILD_MODEL_RECORD = domainZ.object({
     messageId: domainZ.string().optional(),
     acceptedAt: domainZ.number().int().nonnegative().optional(),
   }).optional(),
+  // 角色显示名快照（票据 27）：自定义角色被删除后历史任务仍能显示标签；
+  // 与 role 同层持久化，投影只读不改写。缺失时投影回落运行期目录或 null。
+  roleLabel: domainZ.string().optional(),
+  /**
+   * 用量账本（票据 25）：可选、有界、只读持久化值。
+   *
+   * - 字段全部可选：旧记录/旧进程快照继续可读，缺失即省略，投影绝不补 0；
+   * - token/计数只接受安全非负整数，时间只接受安全非负整数，标识字符串有长度上限；
+   * - 未知字段由 domain 记录归一（zod 默认剥离），不会把任意负载写进快照；
+   * - 不保存 prompt/response/凭据/逐请求明细：账本只写聚合值。
+   */
+  usage: domainZ.object({
+    inputTokens: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    outputTokens: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    cacheReadTokens: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    cacheWriteTokens: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    reasoningTokens: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    billedInputTokens: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    totalTokens: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    requests: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    retries: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    fallbacks: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    provider: domainZ.string().max(128).optional(),
+    model: domainZ.string().max(128).optional(),
+    role: domainZ.string().max(128).optional(),
+    roleLabel: domainZ.string().max(128).optional(),
+    // 时间/时长允许非整数：事件 time 与派生 runMs 由宿主时钟给出，不能因为一个
+    // 亚毫秒时间戳就让整条 child_models 记录在严格 domain schema 上被拒绝。
+    startedAt: domainZ.number().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    finishedAt: domainZ.number().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    runMs: domainZ.number().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    updatedAt: domainZ.number().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    sampleCount: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    invalidSamples: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  }).optional(),
+  /**
+   * 结构化交付（票据 30）：可选、有界、只读持久化值。
+   *
+   * - value 只在结果 <= 64 KiB 时保存；回退时只保留 fallback/reason/bytes，不保存值；
+   * - reason 只允许 shared.js 声明的稳定枚举，未知值会让整条记录被 domain 拒绝，
+   *   因此写入边界必须先经过 projectStructuredResult 归一；
+   * - 旧记录缺失该字段时继续可读，投影侧整体省略，绝不补一个空对象。
+   */
+  structured: domainZ.object({
+    value: domainZ.unknown().optional(),
+    bytes: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    receivedAt: domainZ.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    fallback: domainZ.boolean().optional(),
+    reason: domainZ.enum(Object.values(STRUCTURED_RESULT_FALLBACK_REASONS)).optional(),
+  }).optional(),
+  // 是否在派发时声明过 outputSchema；只保存布尔，绝不保存 schema 原文。
+  outputSchemaRequested: domainZ.boolean().optional(),
   // fan-out child 必须持久化完整来源身份；普通 child 只有 role/parentId 时不能被误路由。
   fanout: domainZ.boolean().optional(),
   fanoutParentTaskId: domainZ.string().optional(),
@@ -1524,14 +2025,31 @@ const DOMAIN_FANOUT_SNAPSHOT = domainZ.object({
   version: domainZ.number().int().nonnegative(),
   tasks: domainZ.array(domainZ.unknown()),
 }).passthrough();
+/**
+ * 手动派发模板（票据 28）的独立表文档。
+ *
+ * 形状刻意保持最小：只校验版本与“模板是对象数组”，单模板字段由组合根在写入前做
+ * 严格校验（名称长度、prompt 预算、schema 64KiB、时间/并发取值）。storage domain
+ * 的职责是持久化与版本化，不复制业务规则；读取面再按 {@link normalizeTemplateDocumentEntries}
+ * 做有界归一，因此外部篡改不会把无界数据带进 RPC/侧栏。
+ */
+const DOMAIN_FANOUT_TEMPLATES = domainZ.object({
+  version: domainZ.number().int().nonnegative(),
+  templates: domainZ.array(domainZ.unknown()),
+}).passthrough();
 const EXPERT_STORAGE_DOMAIN_SPEC = defineDomain({
   // storage-domain 0.1.0-rc.8 的 unit 名称约束使用下划线；domain 格式保持 version 1。
   name: "dsh_expert_group",
   version: 1,
   tables: {
     session_overrides: domainTable(DOMAIN_SESSION_OVERRIDES),
+    // 会话覆盖代次（票据 21 CAS 栅栏）：独立表，绝不混进 session_overrides 的角色键空间。
+    session_override_meta: domainTable(DOMAIN_SESSION_OVERRIDE_META),
     child_models: domainTable(DOMAIN_CHILD_MODEL_RECORD),
     fanout_tasks: domainTable(DOMAIN_FANOUT_SNAPSHOT),
+    // 手动派发模板（票据 28）：与运行数据同域、独立表，绝不把模板塞进 settings
+    // 或 fanout_tasks 快照。domain version 保持 1（新增表不是破坏性变更）。
+    fanout_templates: domainTable(DOMAIN_FANOUT_TEMPLATES),
   },
 });
 
@@ -1544,16 +2062,239 @@ const EXPERT_STORAGE_DOMAIN_SPEC = defineDomain({
  *
  * 比较是**逐字精确比较**，不做 trim 或空白折叠：首尾空白不同的文本仍算自定义覆盖。
  *
+ * 自定义角色（票据 27）的默认 persona 是 persona ?? description，由调用方传入同一解析
+ * 函数，因此「覆盖恰好等于自定义角色默认值」同样折算成没有覆盖。
+ *
  * @param {Record<string,string>} overrides - 已归一（角色键合法、非空白、未超上限）的覆盖映射。
+ * @param {(role: string) => string|undefined} [defaultPersonaOf] - 角色默认 persona 解析。
  * @returns {Record<string,string>} 删除默认副本后的映射。
  */
-function pruneDefaultPromptOverrides(overrides) {
+function pruneDefaultPromptOverrides(overrides, defaultPersonaOf = (role) => DEFAULT_EXPERT_PERSONA[role]) {
   const result = {};
   for (const [role, text] of Object.entries(overrides)) {
-    if (text === DEFAULT_EXPERT_PERSONA[role]) continue;
+    if (text === defaultPersonaOf(role)) continue;
     result[role] = text;
   }
   return result;
+}
+
+/**
+ * 模型候选的读取归一（票据 24）。
+ *
+ * 设置读取面必须对所有历史/外部写入保持宽容：非对象、未知角色、非数组、非法
+ * selection 一律丢弃；单角色候选截到上限 8。写入面的严格拒绝不在这里，而在
+ * DEG 自有 settings-commit 内——读坏值不得让设置页打不开。
+ */
+function normalizeModelCandidatesForRead(value, allowedRoles = STATUS_ROLE_IDS) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  const candidates = {};
+  const allowed = new Set(Array.isArray(allowedRoles) ? allowedRoles : STATUS_ROLE_IDS);
+  for (const [role, list] of Object.entries(value)) {
+    if (!allowed.has(role) || !Array.isArray(list)) continue;
+    const selections = [];
+    for (const entry of list) {
+      const selection = normalizeModelSelection(entry);
+      if (selection === undefined) continue;
+      selections.push(selection);
+      if (selections.length >= MAX_MODEL_CANDIDATES_PER_ROLE) break;
+    }
+    candidates[role] = selections;
+  }
+  return candidates;
+}
+
+/**
+ * 自定义角色读取归一（fail-soft）：非法条目丢弃并返回诊断。
+ *
+ * 读取面绝不因为一个坏定义阻塞整份设置；写入面（assertCustomRoleDefinitions）对同一批
+ * 规则显式拒绝。诊断只含角色 id、稳定 code 与人类可读消息，不含用户正文。
+ *
+ * @param {unknown} value - settings 里的 customRoles 原始值。
+ * @returns {{definitions: Record<string, object>, diagnostics: Array<object>}} 归一结果。
+ */
+function normalizeCustomRolesForRead(value) {
+  return normalizeCustomRoleDefinitions(value);
+}
+
+/**
+ * 上下文继承映射的读取归一（票据 29，fail-soft）。
+ *
+ * 读取面必须对历史文档、外部写入与旧客户端保持宽容：非法键（Observer、未知角色、
+ * 自定义角色）与非布尔值一律丢弃并返回稳定诊断；合法值只保留显式 true（显式 false
+ * 与缺失同义，都是“关闭”）。缺字段 = 空映射 = 全部关闭（旧配置兼容）。
+ *
+ * 写入面（assertInheritContextCandidate）对同一批规则显式拒绝，绝不静默丢键。
+ *
+ * @param {unknown} value - settings 里的 inheritContext 原始值。
+ * @returns {{value: Record<string, boolean>, diagnostics: Array<object>}} 归一结果。
+ */
+function normalizeInheritContextForRead(value) {
+  const allowed = new Set(CONTEXT_INHERITANCE_ROLE_IDS);
+  const diagnostics = [];
+  const normalized = {};
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    if (value !== void 0) diagnostics.push({ role: "", code: "INVALID_INHERIT_CONTEXT", message: "inheritContext 必须是角色到布尔值的映射" });
+    return { value: normalized, diagnostics };
+  }
+  for (const [role, enabled] of Object.entries(value)) {
+    if (!allowed.has(role)) {
+      diagnostics.push({
+        role,
+        code: "INHERIT_CONTEXT_ROLE_NOT_ALLOWED",
+        message: "只有内置非 Observer 角色可以开启上下文继承",
+      });
+      continue;
+    }
+    if (typeof enabled !== "boolean") {
+      diagnostics.push({
+        role,
+        code: "INVALID_INHERIT_CONTEXT_VALUE",
+        message: "上下文继承开关必须是布尔值",
+      });
+      continue;
+    }
+    if (enabled === true) normalized[role] = true;
+  }
+  return { value: normalized, diagnostics };
+}
+
+/**
+ * 上下文继承读取诊断的有界投影（meta 用）。
+ *
+ * 只保留角色 id、稳定 code 与截断后的人类可读消息；不含原始值或任何会话正文。
+ *
+ * @param {unknown} value - normalizeSnapshot 的 inheritContextDiagnostics。
+ * @returns {ReadonlyArray<object>} 冻结的只读诊断（最多 32 条）。
+ */
+function projectInheritContextDiagnostics(value) {
+  const projected = [];
+  for (const entry of (Array.isArray(value) ? value : []).slice(0, 32)) {
+    if (entry === null || typeof entry !== "object") continue;
+    projected.push(Object.freeze({
+      ...(typeof entry.role === "string" && entry.role.length > 0 ? { role: entry.role.slice(0, 64) } : {}),
+      code: typeof entry.code === "string" ? entry.code : "INVALID_INHERIT_CONTEXT",
+      message: typeof entry.message === "string" ? entry.message.slice(0, 240) : "",
+    }));
+  }
+  return Object.freeze(projected);
+}
+
+/**
+ * 上下文继承映射的写入面校验（票据 29，fail-closed）。
+ *
+ * 规则：
+ * - 值必须是普通对象（数组/null 都拒绝）；
+ * - 键必须是内置非 Observer 角色：Observer 的安全边界、未知角色与自定义角色一律拒绝；
+ * - 值必须是布尔；显式 false 被接受并归一成“关闭”（不写入映射）；
+ * - 空对象是合法的“清空全部”，与缺字段（保持原值）语义不同。
+ *
+ * @param {unknown} value - candidate.inheritContext。
+ * @returns {Record<string, true>} 只含已开启角色的归一映射（用于整份 replace 写入）。
+ */
+function assertInheritContextCandidate(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new ValidationError("设置 inheritContext 无效");
+  }
+  const allowed = new Set(CONTEXT_INHERITANCE_ROLE_IDS);
+  const normalized = {};
+  for (const [role, enabled] of Object.entries(value)) {
+    if (!allowed.has(role)) {
+      throw new ValidationError(
+        role === "observer"
+          ? "Observer 不允许继承上下文：该角色只接收视觉任务，必须保持隔离"
+          : "设置 inheritContext 含不允许的角色: " + role + "（只允许内置非 Observer 角色）",
+      );
+    }
+    if (typeof enabled !== "boolean") {
+      throw new ValidationError("设置 inheritContext." + role + " 必须是布尔值");
+    }
+    if (enabled === true) normalized[role] = true;
+  }
+  return normalized;
+}
+
+/**
+ * 读取期自定义角色诊断的有界投影（meta 用）。
+ *
+ * 只保留角色 id、稳定 code 与截断后的人类可读消息：不含用户正文、不随条目数无界增长。
+ * @param {unknown} value - normalizeSnapshot 的 customRoleDiagnostics。
+ * @returns {object[]} 冻结的只读诊断数组（最多 32 条）。
+ */
+function projectCustomRoleDiagnostics(value) {
+  const list = Array.isArray(value) ? value : [];
+  const projected = [];
+  for (const entry of list.slice(0, 32)) {
+    if (entry === null || typeof entry !== "object") continue;
+    projected.push(Object.freeze({
+      role: typeof entry.role === "string" ? entry.role : "",
+      code: typeof entry.code === "string" ? entry.code : "INVALID_CUSTOM_ROLE",
+      message: typeof entry.message === "string" ? entry.message.slice(0, 240) : "",
+    }));
+  }
+  return Object.freeze(projected);
+}
+
+/**
+ * 读取期并发映射诊断的有界投影（meta 用，票据 26）。
+ *
+ * 只保留字段名、角色/provider 键（截断）与稳定原因码：不包含原始值、用户正文或
+ * 任何会话数据；条数由读取面归一器限制在 LIMIT_DIAGNOSTIC_LIMIT 内，这里再兜一次。
+ *
+ * @param {unknown} value - normalizeSnapshot 的 limitDiagnostics。
+ * @returns {{roleLimits: object[], providerLimits: object[]}} 冻结的只读诊断。
+ */
+function projectLimitDiagnostics(value) {
+  const project = (list) => {
+    const projected = [];
+    for (const entry of (Array.isArray(list) ? list : []).slice(0, LIMIT_DIAGNOSTIC_LIMIT)) {
+      if (entry === null || typeof entry !== "object") continue;
+      projected.push(Object.freeze({
+        field: entry.field === "providerLimits" ? "providerLimits" : "roleLimits",
+        ...(typeof entry.role === "string" && entry.role.length > 0 ? { role: entry.role.slice(0, 64) } : {}),
+        ...(typeof entry.provider === "string" && entry.provider.length > 0 ? { provider: entry.provider.slice(0, 64) } : {}),
+        reason: typeof entry.reason === "string" ? entry.reason : "invalid_limit",
+      }));
+    }
+    return Object.freeze(projected);
+  };
+  const source = value !== null && typeof value === "object" ? value : {};
+  return Object.freeze({
+    roleLimits: project(source.roleLimits),
+    providerLimits: project(source.providerLimits),
+  });
+}
+
+/**
+ * 单价读取期丢弃诊断的有界投影（票据 25，meta 用）。
+ *
+ * 只保留条目下标、稳定原因码与被截断的 provider/model 标识；不含原始数值、用户正文
+ * 或任何路径。读取面本身已限制条数，这里再兜一次，保证 meta 有界。
+ *
+ * @param {unknown} value - normalizeSnapshot 的 modelPriceDiagnostics。
+ * @returns {ReadonlyArray<object>} 冻结的只读诊断（最多 16 条）。
+ */
+function projectModelPriceDiagnostics(value) {
+  const projected = [];
+  for (const entry of (Array.isArray(value) ? value : []).slice(0, 16)) {
+    if (entry === null || typeof entry !== "object") continue;
+    projected.push(Object.freeze({
+      index: Number.isSafeInteger(entry.index) ? entry.index : -1,
+      reason: typeof entry.reason === "string" ? entry.reason.slice(0, 64) : "invalid_price",
+      ...(typeof entry.provider === "string" && entry.provider.length > 0 ? { provider: entry.provider.slice(0, 128) } : {}),
+      ...(typeof entry.model === "string" && entry.model.length > 0 ? { model: entry.model.slice(0, 128) } : {}),
+    }));
+  }
+  return Object.freeze(projected);
+}
+
+/** 取第一个非空白字符串（trim 后非空），全部缺失返回 null。 */
+function firstNonEmptyText(...values) {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const text = value.trim();
+    if (text.length > 0) return text;
+  }
+  return null;
 }
 
 /** 把一份 settings 快照归一为普通对象（不回填任何内置默认模型）。 */
@@ -1598,6 +2339,24 @@ function normalizeSnapshot(snapshot, visibleRoles) {
     ? inferredProvider
     : legacyProvider;
   const volume = Number(snapshot?.notificationVolume);
+  // 自定义角色（票据 27）：读取面先归一，非法条目丢弃并诊断；这里的 definitions 也是
+  // 运行期目录的唯一来源（activeRoles/describeRolePrompts/RPC meta 全部基于它重建）。
+  const customRoleRead = normalizeCustomRolesForRead(snapshot?.customRoles);
+  // 对外投影使用「文档形状」（不含派生 id）：设置页编辑器读到的就是它保存时的字段集合。
+  const customRoles = customRoleDefinitionsDocument(customRoleRead.definitions);
+  const knownRoleIds = Object.freeze([...STATUS_ROLE_IDS, ...Object.keys(customRoles)]);
+  /**
+   * 并发映射读取面（票据 26）：角色键按**本快照自己的角色集**校验（含自定义角色），
+   * provider 键只要求非空字符串。非法条目丢弃并诊断，缺字段 = 空映射（旧配置兼容）。
+   */
+  const roleLimitsRead = normalizeRoleLimitsForRead(snapshot?.roleLimits, knownRoleIds);
+  const providerLimitsRead = normalizeProviderLimitsForRead(snapshot?.providerLimits);
+  // 上下文继承（票据 29）：只允许内置非 Observer 角色的显式 true；非法键丢弃并诊断。
+  // 缺字段（旧配置）=> 空映射 => 全部关闭，内置角色的行为逐字节不变。
+  const inheritContextRead = normalizeInheritContextForRead(snapshot?.inheritContext);
+  // 单价（票据 25）：读取面丢弃非法/重复/超量条目并诊断；缺字段 = 空数组（旧配置兼容）。
+  // 读取面绝不因坏值阻塞设置页；保存面的严格拒绝在 assertModelPrices。
+  const modelPricesRead = normalizeModelPrices(snapshot?.modelPrices);
   return {
     provider,
     defaults,
@@ -1608,13 +2367,62 @@ function normalizeSnapshot(snapshot, visibleRoles) {
     // 通用写入的读取安全网，正常提交路径不会走到它。
     // 与默认逐字相同的覆盖进一步折算为"没有覆盖"（等价删除键）。
     // 用户文本保留原始首尾空白与换行：归一绝不 trim 已接受的覆盖。
-    promptOverrides: pruneDefaultPromptOverrides(normalizePromptOverrides(snapshot?.[PROMPT_OVERRIDES_SETTINGS_KEY])),
+    promptOverrides: pruneDefaultPromptOverrides(
+      normalizePromptOverrides(snapshot?.[PROMPT_OVERRIDES_SETTINGS_KEY], knownRoleIds),
+      (role) => {
+        const definition = customRoles[role];
+        if (definition !== undefined) {
+          return typeof definition.persona === "string" && definition.persona.length > 0
+            ? definition.persona
+            : definition.description;
+        }
+        return DEFAULT_EXPERT_PERSONA[role];
+      },
+    ),
     notificationEnabled: snapshot?.notificationEnabled !== false,
     notificationVolume: Number.isFinite(volume) ? Math.min(100, Math.max(0, Math.round(volume))) : 100,
-    notificationHoldMs: normalizeNotificationHoldMs(snapshot?.notificationHoldMs),
+    // 通知事件类型（票据 14）：旧文档缺字段 => 三个类别全开（历史行为）。
+    notificationEvents: normalizeNotificationEvents(snapshot?.notificationEvents),
     roleConcurrencyLimit: normalizeRoleConcurrencyLimit(snapshot?.roleConcurrencyLimit),
+    /**
+     * 逐角色并发上限（票据 26）：旧配置缺字段 => 空映射（全部落到 roleConcurrencyLimit
+     * 默认值），读取面非法条目已被丢弃，调度器因此永远拿不到越界值。
+     */
+    roleLimits: roleLimitsRead.limits,
+    /**
+     * 逐 provider 并发上限（票据 26）：0 或缺失 = 不限制。读取面只做结构/范围归一，
+     * 不查模型目录（provider 是否存在属于模型配置的职责，不是限流配置的前置条件）。
+     */
+    providerLimits: providerLimitsRead.limits,
+    // 读取期被丢弃条目的只读诊断（有界；RPC meta 投影，客户端只读展示）。
+    limitDiagnostics: Object.freeze({
+      roleLimits: Object.freeze(roleLimitsRead.diagnostics.map((entry) => Object.freeze({ ...entry }))),
+      providerLimits: Object.freeze(providerLimitsRead.diagnostics.map((entry) => Object.freeze({ ...entry }))),
+    }),
+    /**
+     * 角色级上下文继承开关（票据 29）：只含内置非 Observer 角色的显式 true。
+     * 缺字段（旧配置）/显式 false 都归一为关闭；空对象表示全部关闭。
+     * 是否真正可继承还要看宿主是否有合格的 fork provider（派发时 fail-closed 校验）。
+     */
+    inheritContext: inheritContextRead.value,
+    // 读取期被丢弃键的有界诊断（meta 投影；不是配置，不进入设置响应）。
+    inheritContextDiagnostics: Object.freeze(inheritContextRead.diagnostics.map((entry) => Object.freeze({ ...entry }))),
     // 角色默认超时：旧配置/非法值归一为 0（不启用），不阻断读取。
     roleTimeoutMs: normalizeRoleTimeoutMs(snapshot?.roleTimeoutMs),
+    // 模型候选（票据 24）：非法读取值回退为空映射；缺字段的旧配置同样为空。
+    // 角色集合含自定义角色（票据 27）：新角色的候选不会被读取面丢弃。
+    candidates: normalizeModelCandidatesForRead(snapshot?.candidates, knownRoleIds),
+    // 自定义角色定义（票据 27）：空对象表示没有自定义角色（旧配置天然兼容）。
+    customRoles,
+    // 读取期丢弃的自定义角色诊断（只读；RPC meta 投影有界副本）。
+    customRoleDiagnostics: Object.freeze(customRoleRead.diagnostics.slice()),
+    // 自动降级上限：缺失/非法回退默认 2，读取面永远给出 0..4 的合法整数。
+    fallbackLimit: normalizeModelFallbackLimit(snapshot?.fallbackLimit),
+    // 单价（票据 25）：只读归一后的数组（每项 provider/model/inputPerMillion/
+    // outputPerMillion/currency）；meta 只回传原始单价，估算成本属于客户端展示层。
+    modelPrices: modelPricesRead.prices,
+    // 读取期被丢弃条目的有界诊断（RPC meta 投影；不是配置，不进入设置响应）。
+    modelPriceDiagnostics: Object.freeze(modelPricesRead.diagnostics.map((entry) => Object.freeze({ ...entry }))),
     observerPreferred: snapshot?.observerPreferred === true,
     // 只有显式 false 才关闭侧边栏注册；缺字段（旧配置/旧客户端）按历史行为保持开启。
     taskManagementEnabled: snapshot?.taskManagementEnabled !== false,
@@ -1681,13 +2489,42 @@ export default {
     ctx.effect(() => () => rpcErrorTracker.clear(), "dsh-expert-group: rpc error diagnostics");
 
     /**
-     * 当前已启用的角色名：默认角色 + 显式启用的可选角色，单一来源是统一角色注册表。
-     * Observer 的裸 Config 默认禁用（Config.enableObserver 默认 false），
-     * bundle patch 可以把它覆盖为 true。
+     * 运行期角色目录持有者（票据 27）：内置 6 角色 + 设置里的自定义角色。
+     *
+     * 目录在 settings 读源绑定后由 settingsSource().customRoles 重建，并在每次成功保存后
+     * 立即重建；工具面、fan-out 枚举、RPC meta、编排提示词、persona 与权限判定全部读
+     * 这一份 registry，因此新增/删除角色无需重启，也不会出现第二份角色清单。
+     * 卸载时精确出栈：模块级 guard 随即回落到内置注册表（fail-closed）。
      */
-    const activeRoles = () => listEnabledRoles({ enableObserver: config.enableObserver === true }).map((entry) => entry.id);
-    /** 只读性来自注册表；未注册角色显式失败，绝不默认按可写放宽权限。 */
-    const readOnly = (role) => requireRole(role).readOnly;
+    const runtimeCatalog = { registry: ROLE_REGISTRY, diagnostics: [] };
+    // 工具面装配完成标记：settings 注入回调可能早于 apply 末尾的工具挂载，因此
+    // 目录重建只在标记为 true 后同步工具/提示词；否则由 apply 末尾统一按新目录挂载。
+    let roleToolsReady = false;
+    // 角色目录变化会改变侧栏快照里的 roleLabels：装配完成后由这里触发一次全量失效，
+    // 避免新增/删除角色后 ≤5s 的缓存把旧标签继续返回给客户端。
+    let invalidateAllRoleSnapshots = null;
+    pushRuntimeRoleCatalog(runtimeCatalog);
+    ctx.effect(() => () => {
+      popRuntimeRoleCatalog(runtimeCatalog);
+      // 出栈后运行期目录只服务本次实例；保留内置注册表，绝不把自定义角色泄漏给后续实例。
+      runtimeCatalog.registry = ROLE_REGISTRY;
+    }, "dsh-expert-group: runtime role catalog");
+
+    /** 当前运行期角色目录（本次插件实例的唯一角色来源）。 */
+    const roleCatalog = () => runtimeCatalog.registry;
+
+    /**
+     * 当前已启用的角色名：默认角色 + 显式启用的可选角色 + 全部自定义角色。
+     * Observer 的裸 Config 默认禁用（Config.enableObserver 默认 false），
+     * bundle patch 可以把它覆盖为 true；自定义角色不可选，恒启用。
+     */
+    const activeRoles = () => roleCatalog().enabledIds({ enableObserver: config.enableObserver === true });
+    /** 角色是否在当前启用集合内（fan-out 派发、模型预检、设置保存共用）。 */
+    const isActiveRole = (role) => activeRoles().includes(role);
+    /** 运行期目录的角色显示名映射（含自定义角色，供快照与 RPC 只读投影）。 */
+    const roleLabelsProjection = () => roleLabelsOf(roleCatalog().records());
+    /** 单个角色显示名；未知/已删除角色返回 undefined（历史标签由持久化快照提供）。 */
+    const roleLabelOfRole = (role) => roleCatalog().get(role)?.label;
 
     /** 同父代理 + 同角色的委派跟踪器：串行临界区 / child 复用 / 任务去重（LRU 32）。 */
     const delegationTracker = createDelegationTracker({ taskLimit: 32 });
@@ -1796,6 +2633,34 @@ export default {
       return normalizeToastVolume(value);
     }
 
+    /**
+     * 某一类通知事件当前是否启用（票据 14）。
+     *
+     * 读取面与投递面共用同一份归一规则：缺失字段/读取异常一律按开启处理（历史行为），
+     * 只有显式 false 才跳过。过滤只发生在**投递前**，不改变任何快照、admission 或等待语义；
+     * 关闭某一类事件也不会补发历史结论。
+     */
+    function systemToastEventEnabled(eventType) {
+      let events;
+      try {
+        events = normalizeNotificationEvents(settingsSource()?.notificationEvents);
+      } catch {
+        return true;
+      }
+      return events[eventType] !== false;
+    }
+
+    /**
+     * 终止原因到通知事件类别的稳定映射（票据 14）。
+     *
+     * 只有 completed 归"任务完成"；其余终止原因（blocked/error/max-tokens/aborted/
+     * interrupted/unknown）都没有"正常完成"语义，统一归"任务失败"，让用户可以用一个
+     * 开关抑制所有非完成终态。未知/扩展 kind 因此也按失败处理，绝不冒充完成。
+     */
+    function terminationNotificationEventType(reason) {
+      return reason === "completed" ? "completed" : "failed";
+    }
+
     /** 失败只记固定类别与错误名：通知正文、命令行与路径绝不出现在日志里。 */
     function logSystemToastFailure(error) {
       const name = typeof error?.name === "string" && error.name.length > 0 ? error.name : "Error";
@@ -1807,10 +2672,15 @@ export default {
      *
      * 适配器自身绝不抛出（失败收口为固定 reason），这里再兜一层同步异常与 rejected
      * promise：通知失败绝不能影响快照、handoff 或任务语义，也绝不回退成应用内卡片。
+     *
+     * @param {{title?: string, taskName?: string, body?: string}|null} text - 固定文案对象。
+     * @param {"completed"|"waiting"|"failed"|null} [eventType] - 事件类别；null/缺省表示
+     *   不走事件过滤（等待账本的健康提示不属于任务完成/等待用户/失败三类）。
      */
-    function sendSystemToast(text) {
+    function sendSystemToast(text, eventType = null) {
       if (text === null || text === void 0) return;
       if (systemToastEnabled() !== true) return;
+      if (eventType !== null && systemToastEventEnabled(eventType) !== true) return;
       let pending;
       try {
         pending = systemToast.show({
@@ -1826,6 +2696,60 @@ export default {
       }
       Promise.resolve(pending).catch((error) => { logSystemToastFailure(error); });
     }
+
+    /**
+     * 通知文案的宿主语言（票据 19）。
+     *
+     * 解析顺序：config.locale（组合根可注入）→ 环境 LC_ALL/LC_MESSAGES/LANG → Intl 运行时 locale
+     * → 默认 zh。全部不可识别时回退 zh 并由 onFallback 记一条日志（不抛错、不影响通知投递）。
+     * 组合期解析一次：语言在进程生命周期内不会变化，逐次通知重读环境只会放大日志与开销。
+     */
+    /** 安全读一个宿主角色的可选属性：Cordis 对未声明属性会抛，读不到一律当缺失。 */
+    const readLocaleCandidate = (target, key) => {
+      try { return target?.[key]; } catch { return undefined; }
+    };
+    const notificationLocale = resolveHostLocale({
+      configLocale: readLocaleCandidate(config, "locale")
+        ?? readLocaleCandidate(config, "language")
+        ?? readLocaleCandidate(ctx, "locale"),
+      env: (() => { try { return typeof process !== "undefined" ? process.env : {}; } catch { return {}; } })(),
+      onFallback: () => {
+        try {
+          ctx.logger?.warn?.("dsh-expert-group: 无法解析宿主语言，通知文案回退默认 zh");
+        } catch { /* 日志面不可用不影响通知。 */ }
+      },
+    });
+    /** 终止通知文案：纯构造函数 + 组合期解析出的 locale（见 buildTerminationNotificationText）。 */
+    const localizedTerminationToast = (reason, taskName) =>
+      buildTerminationNotificationText(notificationLocale, reason, taskName);
+
+    /**
+     * 「等待用户」通知文案：只认 host/system-toast 声明过的两种工具名（userWaitToastText 是
+     * 同一份判据）；未知工具返回 null，宁可不提示也不编造提示。
+     */
+    const localizedUserWaitToast = (tool, taskName) =>
+      buildUserWaitNotificationText(notificationLocale, tool, taskName);
+
+    /**
+     * 系统通知通道的平台分类：固定枚举，绝不复述适配器返回的自由文本。
+     * 用于「发送测试通知」回执与诊断面同一套 token（windows / unsupported）。
+     */
+    function systemToastPlatformToken() {
+      try {
+        const state = typeof systemToast?.describe === "function" ? systemToast.describe() : null;
+        return state?.platform === "windows" ? "windows" : "unsupported";
+      } catch {
+        return "unsupported";
+      }
+    }
+
+    /**
+     * 「发送测试通知」的文案（票据 14 / 19）。
+     *
+     * 只描述"这是一条测试通知"，绝不伪造任务完成/失败等状态，也不携带任务名称；
+     * 该动作不创建任务、不写快照、不影响等待账本。标题/正文都来自消息表，跟随宿主语言。
+     */
+    const testNotificationToast = () => buildTestNotificationText(notificationLocale);
 
     const storageBinding = host.storage;
     /**
@@ -2406,26 +3330,17 @@ export default {
 
 
     /**
-     * 固定中文提示：长等待提醒（票据 11）。
+     * 长等待提醒（票据 11 / 19）。
      *
      * 文案刻意保持固定：提醒只表达「等待很久」与「人工逃生入口存在」，绝不包含 root id、
      * 任务正文或任何专家输出；是否真的可以逃生仍由工具的权威查询判定，提示本身不授权、
-     * 也不释放任何等待。
+     * 也不释放任何等待。标题/正文来自消息表，跟随宿主语言（缺失键回退 zh）。
      */
-    const ROOT_WAIT_LONG_TOAST = Object.freeze({
-      title: "Expert Group",
-      body: "专家任务已等待超过 30 分钟仍未结算。若权威查询确认没有运行中的后代，可用 dsh_expert_group_abandon_wait 手动关闭等待账本；它不会终止专家，也不会释放影响范围保护。",
-    });
-    /** 固定中文提示：后代查询降级/失败（未知不等于已完成）。 */
-    const ROOT_WAIT_QUERY_DEGRADED_TOAST = Object.freeze({
-      title: "Expert Group",
-      body: "无法确认专家后代的运行状态（后代查询降级或失败），root turn 会继续等待；未知状态不等于专家已完成。",
-    });
-    /** 固定中文提示：收口结论投递失败（批次保持待收口）。 */
-    const ROOT_WAIT_DELIVERY_FAILED_TOAST = Object.freeze({
-      title: "Expert Group",
-      body: "专家批次已静止，但收口结论投递失败；批次保持待收口，插件会在后续 root turn 重试。",
-    });
+    const rootWaitLongToast = () => buildRootWaitNotificationText(notificationLocale, "long");
+    /** 后代查询降级/失败（未知不等于已完成）。 */
+    const rootWaitQueryDegradedToast = () => buildRootWaitNotificationText(notificationLocale, "queryDegraded");
+    /** 收口结论投递失败（批次保持待收口）。 */
+    const rootWaitDeliveryFailedToast = () => buildRootWaitNotificationText(notificationLocale, "deliveryFailed");
 
     /**
      * 唯一的 root turn 等待登记表：finalize 与 agent/turn-stopping 兜底共用。
@@ -2450,11 +3365,11 @@ export default {
       onKnownSnapshot: (agent, snapshot) => settleFinishedChildTurnWaits(agent, snapshot),
       onError: (error) => logTurnWaitError("check", error),
       ...(waitLedgerNotificationsEnabled ? {
-        onLongWait: () => { sendSystemToast(ROOT_WAIT_LONG_TOAST); },
+        onLongWait: () => { sendSystemToast(rootWaitLongToast()); },
         onIssue: (issue) => {
           // kind 由账本固定枚举；未知 kind 静默忽略（绝不猜测文案）。
-          if (issue?.kind === "descendant-query-degraded") sendSystemToast(ROOT_WAIT_QUERY_DEGRADED_TOAST);
-          else if (issue?.kind === "finalization-delivery-failed") sendSystemToast(ROOT_WAIT_DELIVERY_FAILED_TOAST);
+          if (issue?.kind === "descendant-query-degraded") sendSystemToast(rootWaitQueryDegradedToast());
+          else if (issue?.kind === "finalization-delivery-failed") sendSystemToast(rootWaitDeliveryFailedToast());
         },
       } : {}),
     });
@@ -2580,7 +3495,11 @@ export default {
       // 文案只用固定 reason 类别（completed/blocked/error/aborted/interrupted/
       // max-tokens/unknown），异常正文与工具输出永不进入通知。
       if (published?.published === true) {
-        sendSystemToast(terminationToastText(published.snapshot?.reason, rootNotificationLabel(session)));
+        const reason = published.snapshot?.reason;
+        sendSystemToast(
+          localizedTerminationToast(reason, rootNotificationLabel(session)),
+          terminationNotificationEventType(reason),
+        );
       }
     }
     for (const root of typeof agents?.roots === "function" ? agents.roots() : []) {
@@ -3833,7 +4752,7 @@ export default {
       });
       // 同一次等待里重复进入 guard（重试/重复调用）不重复提示；等待被清理后再次登记才再提示一次。
       if (previousWait === void 0 || previousWait.tool !== execution.name) {
-        sendSystemToast(userWaitToastText(execution.name, rootNotificationLabel(agent.session)));
+        sendSystemToast(localizedUserWaitToast(execution.name, rootNotificationLabel(agent.session)), "waiting");
       }
       return void 0;
     }
@@ -4335,7 +5254,7 @@ export default {
 
     ctx.effect(() => tools.register(defineTool({
       name: "dsh_expert_group_finalize",
-      description: "Finalize the current root turn only after every result of the current admission batch has returned, the root agent has completed its summary and integration/review/verification check, and no safe non-overlapping parallel work remains. The batch is located by the current root/run plus admissionEpoch alone: the server enumerates the complete effective admission set for that epoch, so admissionTokens is an optional diagnostic argument, and missing, extra, duplicate, unknown, discarded, or non-string tokens never block finalization (they are only reported back in tokenDiagnostics). This root-only action registers every accepted expert task on the root turn wait ledger, and returns immediately with a non-terminal waiting receipt carrying admissionEpoch, acceptedCount, and tokenDiagnostics: it never waits inside the tool call, because the root turn lifecycle keeps waiting at the agent/turn-stopping boundary on that same ledger, with no timeout, as an expert may legitimately run for hours. A waiting receipt means the wait is registered, not that any expert finished; it is not an asynchronous task handle and there is no status to poll. Do not call finalize again for that batch and do not poll for status: once every accepted task has actually finished, the plugin closes the batch and steers one DEG-sourced finalization message into your next step automatically. Do not call it while safe parallel work remains; a pure continue_parent_turn batch has no accepted admission to finalize, while a later ordinary admission may finalize the same open batch. Every rejected receipt carries a stable reason code and an actionable message.",
+      description: "Finalize the current root turn only after every result of the current admission batch has returned, the root summary and integration/review/verification check is done, and no safe non-overlapping parallel work remains. The batch is located by the current root/run plus admissionEpoch alone: the server enumerates the complete effective admission set, so admissionTokens is an optional diagnostic argument and missing, extra, duplicate, unknown, discarded, or non-string tokens never block finalization (they are only reported in tokenDiagnostics). This root-only action registers every accepted expert task on the root turn wait ledger and returns immediately with a non-terminal waiting receipt carrying admissionEpoch, acceptedCount, and tokenDiagnostics: it never waits inside the tool call, because the root turn lifecycle keeps waiting at the agent/turn-stopping boundary on that same ledger, with no timeout. A waiting receipt means the wait is registered, not that any expert finished; it is not an asynchronous task handle and there is no status to poll. After that receipt, do not call finalize again for that batch and do not poll for status: once every accepted task has actually finished, the plugin closes the batch and steers one DEG-sourced finalization message into your next step automatically. Do not call it while safe parallel work remains; a pure continue_parent_turn batch has no accepted admission to finalize. Every rejected receipt carries a stable reason code and an actionable message.",
       parameters: {
         admissionEpoch: {
           type: "number",
@@ -4404,15 +5323,14 @@ export default {
           if (value.kind === "waiting") {
             const diagnostics = value.tokenDiagnostics;
             // 诊断只回显计数与有界数组长度：渲染文本不展开 token 明细，避免把内部凭据
-            // 刷进模型上下文；需要具体条目时读回执 JSON。
+            // 刷进模型上下文；需要具体条目时读回执 JSON（票据 22：渲染文案保持最短）。
             const summary = diagnostics === void 0 ? ""
-              : " — token diagnostics: provided " + diagnostics.provided
-                + ", expected " + diagnostics.expected
-                + ", missing " + diagnostics.missing.length
+              : " — tokens " + diagnostics.provided + "/" + diagnostics.expected
+                + " (missing " + diagnostics.missing.length
                 + ", unknown " + diagnostics.unknown.length
                 + ", duplicates " + diagnostics.duplicates.length
                 + ", invalid " + diagnostics.invalid
-                + ", ignored " + diagnostics.ignored;
+                + ", ignored " + diagnostics.ignored + ")";
             return [{ type: "text", text: base
               + " — waiting registered for " + value.acceptedCount + " accepted expert task(s) in admissionEpoch "
               + value.admissionEpoch + summary
@@ -4865,11 +5783,20 @@ export default {
         || expertReportGuardDisposers.has(agent)) return;
       // 先在安装函数外确认身份，避免 installExpertReportGuard 返回的 no-op 被当成
       // 已安装并永久记录；身份监听器稍后可用已解析 role/parentId 重试。
-      const identity = resolvedIdentity ?? resolveExpertReportIdentity(
+      const resolvedOrRecorded = resolvedIdentity ?? resolveExpertReportIdentity(
         agent?.options,
         agent?.id,
         (childId) => source().childModels?.[childId],
       );
+      // 自定义角色被删除后的冷恢复（票据 27）：身份来自调用方快照时补上 admission 证据，
+      // 否则 guard 会因运行期目录已无该角色而整体跳过，等于丢掉 deny/persona 边界。
+      const persistedRecord = typeof agent?.id === "string" ? source().childModels?.[agent.id] : void 0;
+      const identity = resolvedOrRecorded !== void 0
+        && resolvedOrRecorded !== null
+        && resolvedOrRecorded.admissionProof !== true
+        && hasPluginAdmissionProof(persistedRecord)
+        ? { ...resolvedOrRecorded, admissionProof: true }
+        : resolvedOrRecorded;
       if (!isPluginExpertChildIdentity(identity)) return;
       const disposers = [];
       if (typeof agent?.ctx?.tools?.guard === "function") {
@@ -4894,7 +5821,7 @@ export default {
         : void 0;
       const childPersona = validPersonaMarker(agent?.options?.[PERSONA_MARKER])
         ?? recordedPersona
-        ?? resolvePersonaForAdmission(identity.role);
+        ?? resolvePersonaForAdmissionOrRecorded(identity.role);
       // 兼容层独立于 tools.guard：精简替身缺少 guard 时仍按可用能力补 composition。
       const compositionDispose = installExpertChildComposition(agent?.ctx, {
         deny: [...(expertGuardDenyNames(denyOptions, identity) ?? [])],
@@ -4955,7 +5882,14 @@ export default {
      * 普通专家自动恢复的上下文存储、重建意图队列、失败文案与预算判定由
      * host/recovery 持有；recovery record 本身仍由组合根按事件路径读写。
      */
-    const recovery = createRecoveryModule({ limit: AUTO_RECOVERY_LIMIT, taskBindingLimit: TASK_BINDING_LIMIT });
+    const recovery = createRecoveryModule({
+      limit: AUTO_RECOVERY_LIMIT,
+      taskBindingLimit: TASK_BINDING_LIMIT,
+      // 上下文继承（票据 29）：恢复上下文额外保存目标 subagent provider 与继承标记，
+      // 供持久化记录尚未落地时按原通道重建；缺失时保持旧上下文形状。
+      subagentProviderMarker: EXPERT_SUBAGENT_PROVIDER_MARKER,
+      inheritContextMarker: EXPERT_INHERIT_CONTEXT_MARKER,
+    });
     // recovery 自己持有重建上下文，但恢复 op 的 timer/controller 仍由入口调度层创建；
     // 通过统一 hook 在插件卸载时先取消这些外部资源，再让迟到 promise 观察到 disposed。
     recovery.addDisposeHook(() => {
@@ -5026,7 +5960,9 @@ export default {
       const isPluginChildRecord = record !== null
         && typeof record === "object"
         && typeof record.role === "string"
-        && EXPERT_ROLES.has(record.role)
+        // 运行期目录（内置 + 自定义）与持久化 admission 证据都算插件专家身份，
+        // 角色删除后 recovery record 仍可参与请求级重试（票据 27）。
+        && (isRegisteredExpertRole(record.role) || hasPluginAdmissionProof(record))
         && typeof record.parentId === "string"
         && record.parentId.length > 0
         && (agent?.options?.[CONTINUABLE_MARKER] === true || record.continuable === true);
@@ -5195,8 +6131,28 @@ export default {
     }
     function roleAdmissionFailure(phase, error) {
       const message = error instanceof Error ? error.message : String(error);
+      // 上下文继承（票据 29）：显式失败必须保留稳定 code，供主代理区分“宿主没有继承
+      // provider”“父会话还没有已完成 turn”与普通 admission 失败；绝不归成泛化错误。
+      if (error?.code === CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE
+        || error?.code === CONTEXT_INHERITANCE_ERROR_CODES.EMPTY) {
+        return { reason: "context", code: error.code, message };
+      }
+      // 结构化声明（票据 30）：非法/超限/不支持都必须保留稳定 code，
+      // 不能归成泛化的 ADMISSION_FAILED；schema 原文不在 message 里。
+      if (error?.code === OUTPUT_SCHEMA_ERROR_CODES.INVALID
+        || error?.code === OUTPUT_SCHEMA_ERROR_CODES.TOO_LARGE
+        || error?.code === OUTPUT_SCHEMA_ERROR_CODES.UNSUPPORTED) {
+        return { reason: "schema", code: error.code, message };
+      }
       if (phase === "provider") return { reason: "provider", code: "PROVIDER_UNAVAILABLE", message };
-      if (phase === "selection") return { reason: "selection", code: "MODEL_SELECTION_INVALID", message };
+      if (phase === "selection") {
+        // 候选耗尽保留稳定 code，便于主代理区分“没有可用候选”与普通输入错误。
+        return {
+          reason: "selection",
+          code: error?.code === MODEL_CANDIDATES_EXHAUSTED ? MODEL_CANDIDATES_EXHAUSTED : "MODEL_SELECTION_INVALID",
+          message,
+        };
+      }
       // 容量耗尽：结构化 code 优先于文案启发式（它已由 DEG 翻译成可读提示，不再匹配
       // steer/messageId 等英文关键词），归入可重试的 steer 失败并保留可读文案。
       if (isSubagentCapacityError(error)) {
@@ -5255,15 +6211,25 @@ export default {
     let settingsSource = () => ({
       provider: "",
       defaults: {},
+      candidates: {},
+      fallbackLimit: DEFAULT_MODEL_FALLBACK_LIMIT,
       promptOverrides: {},
       notificationEnabled: true,
       notificationVolume: 100,
-      notificationHoldMs: DEFAULT_NOTIFICATION_HOLD_MS,
+      notificationEvents: { ...DEFAULT_NOTIFICATION_EVENTS },
       roleConcurrencyLimit: DEFAULT_ROLE_CONCURRENCY_LIMIT,
+      // 并发映射（票据 26）：默认空映射 = 全部落到 roleConcurrencyLimit / 不限制。
+      roleLimits: {},
+      providerLimits: {},
       roleTimeoutMs: DEFAULT_ROLE_TIMEOUT_MS,
       observerPreferred: false,
       taskManagementEnabled: true,
       autoOpenSubagentSidebar: false,
+      customRoles: {},
+      // 单价（票据 25）：旧配置/未配置 => 空数组（不估算成本）。
+      modelPrices: [],
+      // 上下文继承（票据 29）：旧配置/未配置 => 空映射（全部关闭）。
+      inheritContext: {},
     });
     // binding 生成器由 host/storage-binding 持有；storageBinding.* 调用为兼容投影。
     // ready 前和服务重载期间保留最后一次成功读取的快照，避免空快照覆盖已加载数据。
@@ -5292,14 +6258,26 @@ export default {
 
     /** source() 只读最后一次成功读取的 domain；没有 ready domain 时不覆盖既有快照。 */
     function readStorageSnapshot() {
-      const settingsSnapshot = normalizeSnapshot(settingsSource(), activeRoles());
+      // 读源本身已经是归一快照（含读取期丢弃诊断）；这里再归一是为了对旧结构做一次
+      // 防御性收敛，但 limitDiagnostics 这类"一次性事实"必须在第二次归一前取出，
+      // 否则合法值重新归一后诊断会被清空，设置页就再也看不到"哪些条目被丢弃"。
+      const rawSettingsSnapshot = settingsSource();
+      const settingsSnapshot = normalizeSnapshot(rawSettingsSnapshot, activeRoles());
       const binding = host.storage.active();
       if (binding !== void 0) {
         const sessionEntries = tableEntries(binding.sessionTable);
+        // 会话覆盖代次（票据 21）：读面必须与内容同源；缺表/读失败按“binding 不可用”
+        // 处理（invalidate），绝不用空代次静默降级——那会让 CAS 永远从 0 通过。
+        const sessionOverrideMetaEntries = tableEntries(binding.sessionOverrideMetaTable);
         const childEntries = tableEntries(binding.childTable);
         const fanoutEntries = tableEntries(binding.fanoutTable);
-        if (sessionEntries !== void 0 && childEntries !== void 0 && fanoutEntries !== void 0) {
-          storageBinding.setDomainSnapshot(readDomainSnapshot(sessionEntries, childEntries));
+        // 模板表（票据 28）与运行数据同源读取：缺表/读失败与其它表同样按 binding
+        // 不可用处理，绝不用空模板静默降级——那会让保存后的模板在读取面上“消失”。
+        const templateEntries = tableEntries(binding.fanoutTemplateTable);
+        if (sessionEntries !== void 0 && sessionOverrideMetaEntries !== void 0
+          && childEntries !== void 0 && fanoutEntries !== void 0
+          && templateEntries !== void 0) {
+          storageBinding.setDomainSnapshot(readDomainSnapshot(sessionEntries, childEntries, sessionOverrideMetaEntries, templateEntries));
           storageBinding.setFanoutSnapshot(fanoutEntries.find(([key]) => key === "current")?.[1]);
         } else {
           host.storage.invalidate(binding);
@@ -5308,13 +6286,27 @@ export default {
       return {
         provider: settingsSnapshot.provider,
         defaults: settingsSnapshot.defaults,
+        // 模型候选/自动降级上限（票据 24）：与 defaults 同属全局 settings，必须随
+        // 同一份快照进入 source()，否则运行期会静默退回“没有候选/默认 2”。
+        candidates: settingsSnapshot.candidates,
+        fallbackLimit: settingsSnapshot.fallbackLimit,
         // 自定义专家提示词属于全局 settings，必须随同一份快照进入 source()：
         // restore/重载期间缺失它会让运行时静默回落到默认 persona。
         promptOverrides: settingsSnapshot.promptOverrides,
         notificationEnabled: settingsSnapshot.notificationEnabled,
         notificationVolume: settingsSnapshot.notificationVolume,
-        notificationHoldMs: settingsSnapshot.notificationHoldMs,
+        notificationEvents: settingsSnapshot.notificationEvents,
         roleConcurrencyLimit: settingsSnapshot.roleConcurrencyLimit,
+        // 并发映射（票据 26）同理：缺少它们会让调度器悄悄退回「只有默认值」，
+        // 设置页显示的逐角色/provider 上限与实际调度脱节。
+        roleLimits: settingsSnapshot.roleLimits,
+        providerLimits: settingsSnapshot.providerLimits,
+        limitDiagnostics: rawSettingsSnapshot?.limitDiagnostics ?? settingsSnapshot.limitDiagnostics,
+        // 上下文继承（票据 29）：必须随同一份快照进入 source()，否则 meta/get 与派发
+        // 判定会悄悄退回“全部关闭”。诊断与 limitDiagnostics 同理使用原始快照的一次性事实。
+        inheritContext: settingsSnapshot.inheritContext,
+        inheritContextDiagnostics: rawSettingsSnapshot?.inheritContextDiagnostics
+          ?? settingsSnapshot.inheritContextDiagnostics,
         // 角色默认超时属于全局 settings：必须随同一份快照进入 source()，
         // 否则冷恢复/服务重载之后读到的值会悄悄退回“不启用”。
         roleTimeoutMs: settingsSnapshot.roleTimeoutMs,
@@ -5323,6 +6315,16 @@ export default {
         // 自动打开属于全局 settings：必须随同一份快照进入 source()，否则冷恢复/服务重载
         // 之后 client 读到的值会悄悄退回默认关闭。
         autoOpenSubagentSidebar: settingsSnapshot.autoOpenSubagentSidebar,
+        // 自定义角色定义与读取诊断（票据 27）：与 settings 同源，供 RPC meta/get 投影；
+        // 运行期目录的重建读 settingsSource()，这里只保证读面一致。
+        customRoles: settingsSnapshot.customRoles,
+        customRoleDiagnostics: settingsSnapshot.customRoleDiagnostics,
+        // 单价（票据 25）：与 settings 同源进入运行期读源，RPC meta/get 与客户端设置页
+        // 读到同一份归一值；诊断只服务 meta，不进入设置响应。
+        modelPrices: settingsSnapshot.modelPrices,
+        // 与 limitDiagnostics 同理：读取期丢弃诊断是“一次性事实”，必须在第二次归一前
+        // 从原始快照取出，否则合法值重新归一后诊断会被清空，meta 再也看不到哪些条目被丢弃。
+        modelPriceDiagnostics: rawSettingsSnapshot?.modelPriceDiagnostics ?? settingsSnapshot.modelPriceDiagnostics,
         ...storageBinding.snapshots(),
       };
     }
@@ -5391,21 +6393,40 @@ export default {
     installSettingsSection(host.settings, ctx, SETTINGS_NAMESPACE, Config, {
       provider: "",
       defaults: {},
+      candidates: {},
+      fallbackLimit: DEFAULT_MODEL_FALLBACK_LIMIT,
       promptOverrides: {},
       notificationEnabled: true,
       notificationVolume: 100,
-      notificationHoldMs: DEFAULT_NOTIFICATION_HOLD_MS,
+      notificationEvents: { ...DEFAULT_NOTIFICATION_EVENTS },
       roleConcurrencyLimit: DEFAULT_ROLE_CONCURRENCY_LIMIT,
+      // 并发映射（票据 26）：宿主条目默认值与运行期读源保持同一形状。
+      roleLimits: {},
+      providerLimits: {},
       roleTimeoutMs: DEFAULT_ROLE_TIMEOUT_MS,
       observerPreferred: false,
       taskManagementEnabled: true,
       autoOpenSubagentSidebar: false,
+      // 旧配置没有自定义角色：默认空映射，读取面因此天然兼容。
+      customRoles: {},
+      // 旧配置没有单价：默认空数组；读取面因此不会估算任何成本。
+      modelPrices: [],
+      // 旧配置没有上下文继承：默认空映射 = 全部关闭。
+      inheritContext: {},
     }, {
       setSource(next) {
+        // 先按原始值重建运行期目录，再建立归一读源：activeRoles()/defaults 归一/自定义角色
+        // 过滤都必须基于**新的**候选集合，否则新角色第一次保存时会被当成未启用。
+        rebuildRoleCatalog(next()?.customRoles);
         settingsSource = () => normalizeSnapshot(next(), activeRoles());
         source = readStorageSnapshot;
       },
-      onChange() {},
+      onChange() {
+        // 三个观察点收敛到同一入口（host/settings-source）：目录跟随最新设置，
+        // 并在工具面已装配后同步角色工具/fanout/提示词。
+        rebuildRoleCatalog(settingsSource()?.customRoles);
+        syncRoleTools();
+      },
     });
 
     /**
@@ -5423,13 +6444,16 @@ export default {
      *   entries: Array<{role: string, defaultPersona: string, override: (string|undefined), customized: boolean}>}}
      */
     function describeRolePrompts(snapshot) {
-      const roles = listRoles();
+      // 角色集合 = 运行期目录（内置 + 自定义）；设置页因此可以为自定义角色编辑提示词，
+      // 「恢复默认」使用与内置角色同一条 defaultExpertPersonaOf 解析（自定义缺失 persona
+      // 时回落到 description）。
+      const roles = roleCatalog().records();
       const overrides = snapshot?.[PROMPT_OVERRIDES_SETTINGS_KEY];
       const entries = roles.map((entry) => {
         const override = promptOverrideFor(overrides, entry.id);
         return {
           role: entry.id,
-          defaultPersona: DEFAULT_EXPERT_PERSONA[entry.id],
+          defaultPersona: defaultExpertPersonaOf(entry),
           ...(override === void 0 ? {} : { override }),
           customized: override !== void 0,
         };
@@ -5459,7 +6483,92 @@ export default {
      * @returns {string} 最终 persona（固定纪律恰好追加一次）。
      */
     function resolvePersonaForAdmission(role) {
-      return resolveExpertPersona(role, promptOverrideFor(settingsSource()?.[PROMPT_OVERRIDES_SETTINGS_KEY], role));
+      return resolveExpertPersona(role, promptOverrideFor(settingsSource()?.[PROMPT_OVERRIDES_SETTINGS_KEY], role), roleCatalog());
+    }
+
+    /**
+     * 解析 admission 时的 persona；角色已不在运行期目录时返回 undefined。
+     *
+     * 只服务「自定义角色创建后被删除」的恢复路径：调用方必须先尝试 child 创建时持久化
+     * 的 persona 快照，只有快照缺失时才回落到当前目录；目录也没有该角色时由调用方
+     * fail-closed（绝不用通用人格启动专家）。
+     *
+     * @param {string} role - 专家角色 id。
+     * @returns {string|undefined} 完整 persona；未知角色返回 undefined。
+     */
+    function resolvePersonaForAdmissionOrRecorded(role) {
+      if (!roleCatalog().has(role)) return void 0;
+      return resolvePersonaForAdmission(role);
+    }
+
+    /**
+     * 角色可编辑默认 persona（不抛错；未知角色返回 undefined）。
+     *
+     * 提示词覆盖的「与默认逐字相同 = 删除键」规则对自定义角色同样成立：它们的默认
+     * persona 是 persona ?? description，因此用户显式保存一份默认副本时仍会被折算成
+     * 「没有覆盖」，继续跟随未来的定义更新。
+     *
+     * @param {string} role - 角色 id。
+     * @returns {string|undefined} 默认 persona；未知角色返回 undefined。
+     */
+    function defaultPersonaForRole(role) {
+      const entry = roleCatalog().get(role);
+      return entry === void 0 ? void 0 : defaultExpertPersonaOf(entry);
+    }
+
+    /**
+     * 用一份 customRoles 原始值重建运行期角色目录（内置 + 自定义）。
+     *
+     * 失败语义：读取归一从不抛错（非法条目丢弃并诊断），因此这里总能得到一份可用目录；
+     * 唯一可能抛错的是 createRoleRegistry 对**内置记录**的校验（模块常量，不会在运行期变化）。
+     * 写入边界的严格拒绝在 commitSettingsCandidate 调用 assertCustomRoleDefinitions 时发生。
+     *
+     * @param {unknown} rawCustomRoles - settingsSource()/候选设置里的 customRoles。
+     * @returns {object} 新的运行期注册表。
+     */
+    function rebuildRoleCatalog(rawCustomRoles) {
+      const normalized = normalizeCustomRolesForRead(rawCustomRoles);
+      const next = createRoleRegistry([...ROLE_REGISTRY.records(), ...customRoleRecords(normalized.definitions)]);
+      runtimeCatalog.registry = next;
+      runtimeCatalog.diagnostics = normalized.diagnostics;
+      if (invalidateAllRoleSnapshots !== null) {
+        try { invalidateAllRoleSnapshots(); } catch { /* 失效只是缓存优化，绝不影响保存 */ }
+      }
+      return next;
+    }
+
+    /**
+     * 让工具面与提示词跟随运行期目录：新增角色挂载 role 工具，删除角色卸载，
+     * fanout 工具按新的 role 枚举重挂载，routing/orchestrator 提示词重建。
+     *
+     * 幂等：mountRole 按 toolDisposers 去重，unmountRole 对已卸载角色是 no-op，
+     * fanout 只在已挂载时重挂载（provider 不可用时不制造空工具）。
+     */
+    function syncRoleTools() {
+      if (!roleToolsReady) return;
+      const desired = new Set(activeRoles());
+      // 定义变更先卸载：工具描述/静态元数据只在注册时生成，已有角色改了
+      // label/description/persona/toolDeny 时 mountRole 的"已挂载"短路会让工具面陈旧。
+      // 角色集增删仍由下面的循环处理（desired 已包含新增角色）。
+      for (const role of desired) {
+        if (!toolDisposers.has(role)) continue;
+        const entry = roleCatalog().get(role);
+        if (entry === undefined) continue;
+        if (mountedRoleSignatures.get(role) === roleDefinitionSignature(entry)) continue;
+        unmountRole(role);
+      }
+      for (const role of [...toolDisposers.keys()]) {
+        if (role === "fanout" || desired.has(role)) continue;
+        unmountRole(role);
+      }
+      for (const role of desired) mountRole(role);
+      // fanout 的 role 枚举与描述在注册时生成：角色集变化必须重挂载，否则新角色无法派发、
+      // 已删除角色仍会出现在枚举里。
+      if (toolDisposers.has("fanout")) {
+        unmountFanoutTool();
+        mountFanoutTool();
+      }
+      refreshRoutingPrompt();
     }
 
     /**
@@ -5507,22 +6616,36 @@ export default {
           throw new Error("storage domain binding was replaced before ready");
         }
         const sessionTable = domain.table("session_overrides");
+        // 会话覆盖代次（票据 21）：与覆盖内容同代持久化；缺失表由 storage domain 按
+        // EXPERT_STORAGE_DOMAIN_SPEC 创建，旧数据只意味着 revision 从 0 开始。
+        const sessionOverrideMetaTable = domain.table("session_override_meta");
         const childTable = domain.table("child_models");
         const fanoutTable = domain.table("fanout_tasks");
+        // 手动派发模板（票据 28）：与运行数据同域、独立表；domain version 保持 1。
+        const fanoutTemplateTable = domain.table("fanout_templates");
         const sessionEntries = tableEntries(sessionTable);
+        const sessionOverrideMetaEntries = tableEntries(sessionOverrideMetaTable);
         const childEntries = tableEntries(childTable);
         const fanoutEntries = tableEntries(fanoutTable);
-        if (sessionEntries === void 0 || childEntries === void 0 || fanoutEntries === void 0) throw new Error("storage domain table read failed");
+        const templateEntries = tableEntries(fanoutTemplateTable);
+        if (sessionEntries === void 0 || sessionOverrideMetaEntries === void 0
+          || childEntries === void 0 || fanoutEntries === void 0
+          || templateEntries === void 0) throw new Error("storage domain table read failed");
         if (!storageBinding.isCurrent(binding)) {
           await closeOpened();
           throw new Error("storage domain binding was replaced before ready");
         }
-        const installed = storageBinding.install(binding, { domain, sessionTable, childTable, fanoutTable, sessionAuthoritative: true, childAuthoritative: true, fanoutAuthoritative: true });
+        const installed = storageBinding.install(binding, {
+          domain, sessionTable, sessionOverrideMetaTable, childTable, fanoutTable, fanoutTemplateTable,
+          sessionAuthoritative: true, sessionOverrideMetaAuthoritative: true,
+          childAuthoritative: true, fanoutAuthoritative: true,
+          fanoutTemplateAuthoritative: true,
+        });
         if (!installed) {
           await closeOpened();
           throw new Error("storage domain binding was replaced before ready");
         }
-        storageBinding.setDomainSnapshot(readDomainSnapshot(sessionEntries, childEntries));
+        storageBinding.setDomainSnapshot(readDomainSnapshot(sessionEntries, childEntries, sessionOverrideMetaEntries, templateEntries));
         storageBinding.setFanoutSnapshot(fanoutEntries.find(([key]) => key === "current")?.[1]);
         const persistedFanoutSnapshot = storageBinding.fanoutSnapshot();
         // 事件历史与任务快照同代持久化；Host 自有查询缓存也必须先水合，避免冷启动 cursor 从 0 重置。
@@ -5683,8 +6806,15 @@ export default {
 
     let dispatchAcceptedClock = 0;
 
-    /** 在同一 domain 写临界区内合并 child_models 当前记录，避免迟到写入覆盖模型字段。 */
-    function writeChildModelPatch(childId, patch) {
+    /**
+     * 在同一 domain 写临界区内合并 child_models 当前记录，避免迟到写入覆盖模型字段。
+     *
+     * options.rethrow=true 只给需要感知失败的调用方（用量账本的重试、结构化结果的
+     * 有界重试）使用：默认仍是"记录健康度 + 告警后吞掉"，不允许旁路持久化失败升级成
+     * child/task 生命周期异常。
+     */
+    function writeChildModelPatch(childId, patch, options) {
+      const rethrow = options?.rethrow === true;
       return enqueueWrite(async () => {
         const binding = host.storage.active();
         if (binding?.childAuthoritative !== true) throw new Error("storage domain is not ready for child model write");
@@ -5697,8 +6827,213 @@ export default {
         observeStorageWrite(true, void 0, "child_models");
       }, (error) => {
         observeStorageWrite(false, error, "child_models");
+        // 需要感知失败的调用方（usage ledger / structured retry）走 rethrow；它们
+        // 负责保留 dirty 或重新排队，绝不让旁路持久化失败升级成调用方异常。
+        if (rethrow) throw error;
         ctx.logger.warn("dsh-expert-group: child dispatch persistence failed: " + (error instanceof Error ? error.message : String(error)));
       });
+    }
+
+    /**
+     * 用量归属解析（票据 25）。
+     *
+     * 归属只从 DEG 自己的记录读取，绝不从事件负载猜测：
+     * - 首选 child_models（重启后仍可读，含 role/roleLabel/provider/model/fallbackCount）；
+     * - 其次 recoveryRecords（live/可续作 child 的进程内记录）；
+     * - 最后用 live Agent 的 role/parent marker 与 requestHeader.config 兜底。
+     *
+     * 返回 undefined 表示“这不是 DEG 的 child 会话”：root、普通会话、真正未知的会话都
+     * 不计入账本，避免把父会话或宿主其它会话的用量记到专家任务上。
+     * 返回对象只含归属字段，不含 prompt/response/凭据/路径。
+     *
+     * @param {string} sessionId - 事件所属会话 id。
+     * @returns {{role?:string, roleLabel?:string, provider?:string, model?:string, fallbackCount?:number}|undefined}
+     */
+    function usageAttributionOf(sessionId) {
+      if (typeof sessionId !== "string" || sessionId.length === 0) return undefined;
+      // 快路径：storage-binding 已缓存 domain 快照（与 source() 的 childModels 同一份事实），
+      // 但读取是 O(1) Map 查表；绝不能在每个 assistant 事件上重跑 readStorageSnapshot。
+      let persisted;
+      try { persisted = storageBinding.domainSnapshot()?.childModels?.[sessionId]; } catch { persisted = undefined; }
+      const record = recoveryRecords.get(sessionId);
+      let agent;
+      try { agent = agents?.get?.(sessionId); } catch { agent = void 0; }
+      let role = firstNonEmptyText(
+        persisted?.role,
+        record?.role,
+        agent?.options?.[ROLE_MARKER],
+      );
+      let parentId = firstNonEmptyText(
+        persisted?.parentId,
+        record?.parentId,
+        agent?.options?.[PARENT_MARKER],
+      );
+      // fan-out child 的身份可能只有 fan-out marker（role/parentId 仍会写入 child_models，
+      // 但 cold/异常记录不一定完整）：任何 fan-out 证据都视为 DEG child。
+      let fanoutChild = persisted?.fanout === true
+        || isFanoutAgent(agent)
+        || isFanoutIdentity(persisted)
+        || isFanoutIdentity(record);
+      const hasEvidence = persisted !== undefined || record !== undefined || fanoutChild
+        || role !== null || parentId !== null;
+      if (!hasEvidence) {
+        // live root 的 assistant 事件不属于任何 expert child：先用 lineage 的 O(1) 查询
+        // 排除，避免每个 root 消息都触发一次 storage 快照读取。
+        let currentRoot;
+        try { currentRoot = host.lineage.activeRoot(sessionId); } catch { currentRoot = undefined; }
+        if (currentRoot !== undefined) return undefined;
+        // 还没有任何进程内证据的会话（典型是 live agent 尚未登记、或测试替身没有把 child
+        // 放进 agents registry）：读一次权威 domain 快照确认它是否是已知 child。
+        // 这条路径只对“非 root 且无 marker”的会话生效，root 已在上面提前返回。
+        try { persisted = source()?.childModels?.[sessionId]; } catch { persisted = undefined; }
+        if (persisted === undefined) return undefined;
+        fanoutChild = persisted?.fanout === true || isFanoutIdentity(persisted);
+        role = firstNonEmptyText(role, persisted?.role);
+        parentId = firstNonEmptyText(parentId, persisted?.parentId);
+      } else if (persisted === undefined) {
+        // 已证明是 child、但缓存里还没有它的记录：补一次权威快照。
+        try { persisted = source()?.childModels?.[sessionId]; } catch { persisted = undefined; }
+        role = firstNonEmptyText(role, persisted?.role);
+        parentId = firstNonEmptyText(parentId, persisted?.parentId);
+      }
+      let header;
+      try { header = agent?.session?.requestHeader?.(); } catch { header = undefined; }
+      const config = header?.config;
+      const roleLabel = firstNonEmptyText(persisted?.roleLabel, role === null ? null : roleLabelOfRole(role));
+      const provider = firstNonEmptyText(persisted?.provider, config?.provider, agent?.options?.provider);
+      const model = firstNonEmptyText(persisted?.model, config?.model, agent?.options?.model);
+      return {
+        ...(role === null ? {} : { role }),
+        ...(roleLabel === null ? {} : { roleLabel }),
+        ...(provider === null ? {} : { provider }),
+        ...(model === null ? {} : { model }),
+        ...(Number.isSafeInteger(persisted?.fallbackCount) && persisted.fallbackCount >= 0
+          ? { fallbackCount: persisted.fallbackCount }
+          : {}),
+      };
+    }
+
+    /**
+     * 用量账本实例（票据 25）。
+     *
+     * 只订阅 live session/event，不在任何路径上从快照/投影回填：fork 子会话的继承前缀
+     * 不会重新发布事件，种子/恢复也不会，因此不会重复计数。刷盘通过既有
+     * writeChildModelPatch 合并写 child_models.usage（turn/end、agent/disposed 立即写，
+     * 普通事件按 200ms 去抖合并），写失败只告警，不影响 child 生命周期。
+     */
+    const usageLedger = createUsageLedger({
+      // rethrow=true：账本必须能感知失败，才能保留 dirty 并在有界预算内重试；
+      // writeChildModelPatch 默认吞掉失败，会让账本误以为样本已落盘。
+      persist: (childId, usage) => writeChildModelPatch(childId, { usage }, { rethrow: true }),
+      logger: ctx.logger,
+    });
+    ctx.effect(() => () => {
+      // 卸载时清定时器并尽量把最后一个脏条目写出去；返回的 promise 不阻塞卸载。
+      void usageLedger.dispose();
+    }, "dsh-expert-group: usage ledger");
+
+    /**
+     * 专用 session/event 监听（票据 25）。
+     *
+     * 与既有 fanout/recovery/快照失效监听**并列**，不替换、不改变它们的语义：
+     * - assistant/message：请求数 + usage（data.usage 优先，其次 stream 最后一个 usage chunk）；
+     * - assistant/attempt：重试数 + stream usage；
+     * - llm/retry-started（可选宿主能力）：与 attempt 按 (turn, step) 合并，避免双计；
+     * - turn/end：补 finishedAt 并立即刷盘。
+     * 只处理能被 DEG 归属证明为 child 的会话；root 与陌生会话直接跳过。
+     */
+    ctx.on("session/event", (session, event) => {
+      const type = event?.type;
+      if (type !== "assistant/message" && type !== "assistant/attempt"
+        && type !== "llm/retry-started" && type !== "turn/end") return;
+      if (typeof session?.id !== "string" || session.id.length === 0) return;
+      try {
+        const attribution = usageAttributionOf(session.id);
+        if (attribution === undefined) return;
+        usageLedger.observe(session, event, attribution);
+      } catch (error) {
+        // 账本是旁路统计：任何异常都不得影响 session 事件派发或 child 生命周期。
+        ctx.logger.warn("dsh-expert-group: usage ledger observe failed: "
+          + (error instanceof Error ? error.message : String(error)));
+      }
+    });
+
+    // agent/disposed 是 child 的稳定结束边界：补 finishedAt 并立即刷盘。
+    // 只对账本里已有的 session 生效（restore 出来的旧 child 没有 live 事件，不写空值）。
+    ctx.on("agent/disposed", ({ agent } = {}) => {
+      if (typeof agent?.id !== "string") return;
+      try { void usageLedger.finish(agent.id); } catch (error) {
+        ctx.logger.warn("dsh-expert-group: usage ledger finish failed: "
+          + (error instanceof Error ? error.message : String(error)));
+      }
+    });
+
+    /**
+     * 收集某个 root（或全局）的用量条目（票据 25，只读）。
+     *
+     * 数据源以 child_models.usage 为准（重启/恢复后可读），再用 live 账本覆盖同一 child
+     * 的最新值（去抖窗口内尚未落盘的样本也能被 RPC 读到）。归属（role/provider/model）
+     * 取持久化记录优先，缺失时回落到进程内 recovery record；不读取 prompt/response。
+     *
+     * @param {string|null} rootId - 限定 root；null/空表示全局（RPC meta）。
+     * @returns {Array<{childId:string, role?:string, roleLabel?:string, provider?:string, model?:string, usage:object}>}
+     */
+    function collectUsageEntries(rootId = null) {
+      const scope = typeof rootId === "string" && rootId.length > 0 ? rootId : null;
+      const persisted = (() => {
+        try { return source()?.childModels ?? {}; } catch { return {}; }
+      })();
+      const entries = new Map();
+      for (const [childId, record] of Object.entries(persisted)) {
+        if (scope !== null && record?.parentId !== scope) continue;
+        const usage = projectUsage(record?.usage);
+        if (usage === null || hasUsageMetrics(usage) === false) continue;
+        entries.set(childId, {
+          childId,
+          role: record?.role,
+          roleLabel: record?.roleLabel,
+          provider: record?.provider,
+          model: record?.model,
+          usage,
+        });
+      }
+      // live 账本覆盖：同一 child 只保留最新累积值；按 parentId 做 root 过滤。
+      for (const entry of usageLedger.entries()) {
+        const record = persisted[entry.childId];
+        const recordParent = record?.parentId ?? recoveryRecords.get(entry.childId)?.parentId;
+        if (scope !== null && recordParent !== scope) continue;
+        const usage = projectUsage(entry.usage);
+        if (usage === null || hasUsageMetrics(usage) === false) continue;
+        entries.set(entry.childId, {
+          childId: entry.childId,
+          role: record?.role ?? recoveryRecords.get(entry.childId)?.role,
+          roleLabel: record?.roleLabel,
+          provider: record?.provider,
+          model: record?.model,
+          usage,
+        });
+      }
+      return [...entries.values()];
+    }
+
+    /**
+     * 有界用量摘要（票据 25）。
+     *
+     * 输出固定四块：totals / byRole / byProvider / byModel / recentTasks（最多 16）。
+     * 没有有效样本时 totals 为 null、分组为空、recentTasks 为空——绝不补 0。
+     * recentTasks 只含角色/模型与 usage，不含 childId、prompt、response、凭据或路径。
+     *
+     * @param {string|null} rootId - 限定 root；null = 全局（meta）。
+     * @returns {{totals:object|null, byRole:object, byProvider:object, byModel:object, recentTasks:object[]}}
+     */
+    function usageSummaryFor(rootId = null) {
+      try {
+        return summarizeUsage(collectUsageEntries(rootId), { recentLimit: MAX_RECENT_USAGE_TASKS });
+      } catch (error) {
+        ctx.logger.warn("dsh-expert-group: usage summary projection failed: "
+          + (error instanceof Error ? error.message : String(error)));
+        return { totals: null, byRole: {}, byProvider: {}, byModel: {}, recentTasks: [] };
+      }
     }
 
     /**
@@ -5721,12 +7056,45 @@ export default {
       const prompt = request?.prompt?.[0]?.text;
       const acceptedAt = Math.max(Date.now(), dispatchAcceptedClock + 1);
       dispatchAcceptedClock = acceptedAt;
+      // 实际路由元数据来自 admission 请求上的 marker：它与 agentOptions 同一份值，
+      // 保证 agent/created 与后续 dispatch patch 都不会丢掉 candidateIndex/fallbackCount。
+      const routeFields = routeFieldsOfMarker(request?.agentOptions?.[EXPERT_ROUTE_MARKER]);
+      // 目标 subagent provider 与继承开关（票据 29）：请求上的内部字段 / marker 优先，
+      // 其次已持久化记录或 live agent options。缺失时省略，绝不伪造 false。
+      const subagentProvider = pickText(
+        validSubagentProviderName(request?.subagentProvider),
+        validSubagentProviderName(request?.agentOptions?.[EXPERT_SUBAGENT_PROVIDER_MARKER]),
+        validSubagentProviderName(record?.subagentProvider),
+        validSubagentProviderName(agent?.options?.[EXPERT_SUBAGENT_PROVIDER_MARKER]),
+      );
+      const inheritContext = (() => {
+        for (const value of [
+          request?.agentOptions?.[EXPERT_INHERIT_CONTEXT_MARKER],
+          record?.inheritContext,
+          agent?.options?.[EXPERT_INHERIT_CONTEXT_MARKER],
+        ]) {
+          if (typeof value === "boolean") return value;
+        }
+        return void 0;
+      })();
       writeChildModelPatch(childId, {
         provider,
         model,
+        ...routeFields,
         ...(typeof agent?.options?.[EFFORT_MARKER] === "string" ? { reasoningEffort: agent.options[EFFORT_MARKER] } : {}),
         ...(pickText(record?.role, agent?.options?.[ROLE_MARKER]) !== null ? { role: pickText(record?.role, agent?.options?.[ROLE_MARKER]) } : {}),
+        // 角色显示名（票据 27）：续作/恢复补写时保持历史标签可读；未知角色不写。
+        ...(pickText(roleLabelOfRole(pickText(record?.role, agent?.options?.[ROLE_MARKER]))) !== null
+          ? { roleLabel: roleLabelOfRole(pickText(record?.role, agent?.options?.[ROLE_MARKER])) }
+          : {}),
         ...(pickText(record?.parentId, agent?.options?.[PARENT_MARKER]) !== null ? { parentId: pickText(record?.parentId, agent?.options?.[PARENT_MARKER]) } : {}),
+        ...(subagentProvider === null ? {} : { subagentProvider }),
+        ...(inheritContext === void 0 ? {} : { inheritContext }),
+        // 结构化交付（票据 30）：保留“本次/历史声明过 outputSchema”的布尔；
+        // schema 原文与 structured 结果都不在这里重写（结果由后台捕获 patch 写入）。
+        ...(structuredRequestedOfRequest(request) || record?.outputSchemaRequested === true
+          ? { outputSchemaRequested: true }
+          : {}),
         continuable: true,
         // shadow 生效性判定快照（与 deny/persona 同层 marker）：只在有判定结果时写入，
         // 该 child 的进程内状态映射被释放后不再补写（durable 记录保留最后一次判定）。
@@ -5737,7 +7105,54 @@ export default {
           messageId: typeof messageId === "string" ? messageId : void 0,
           acceptedAt,
         },
-      });
+      }).then(() => flushPendingStructuredPatch(childId));
+    }
+
+    /**
+     * 会话级模型覆盖的只读投影与代次读取（票据 21）。
+     *
+     * 一次 source() 同时给出内容与代次，避免读面两次读 domain 时看到不同代的状态。
+     * 只投影**当前启用角色**：与 get root 的 overrides 投影同源，已停用角色（例如关闭
+     * Observer 之后的 observer）的历史覆盖不进入设置页，也不会被误当成可编辑项。
+     * 选择字段只保留 provider/model/可选的 reasoningEffort；历史坏值缺 provider 或
+     * model 时整条丢弃（读取面绝不回传半个选择）。
+     *
+     * @param {object} snap - 已归一的 source() 快照。
+     * @param {string} sessionId - 根会话 id。
+     * @param {Iterable<string>} [allowedRoles] - 允许投影的角色集合。
+     * @returns {{overrides: object, revision: number}}
+     */
+    function sessionOverrideProjectionOf(snap, sessionId, allowedRoles = activeRoles()) {
+      const allowed = new Set(allowedRoles);
+      const overrides = {};
+      for (const [role, selection] of Object.entries(snap?.sessionOverrides?.[sessionId] ?? {})) {
+        if (!allowed.has(role)) continue;
+        if (selection === null || typeof selection !== "object" || Array.isArray(selection)) continue;
+        if (typeof selection.provider !== "string" || selection.provider.length === 0
+          || typeof selection.model !== "string" || selection.model.length === 0) continue;
+        overrides[role] = {
+          provider: selection.provider,
+          model: selection.model,
+          ...(typeof selection.reasoningEffort === "string" ? { reasoningEffort: selection.reasoningEffort } : {}),
+        };
+      }
+      const rawRevision = snap?.sessionOverrideRevisions?.[sessionId];
+      const revision = Number.isSafeInteger(rawRevision) && rawRevision >= 0 ? rawRevision : 0;
+      return { overrides, revision };
+    }
+
+    /**
+     * 构造带代次的会话覆盖冲突（409）。
+     *
+     * 与 settings 冲突同一语义：客户端保留自己的输入，只把权威 revision/覆盖推进到
+     * 本地状态并提示重试；绝不自动以 Host 值覆盖用户正在编辑的草稿。
+     */
+    function sessionOverrideConflictError(currentRevision, overrides) {
+      const error = new Error("本会话的模型覆盖已被其他页面修改，请刷新后重试");
+      error.code = "SESSION_OVERRIDE_CONFLICT";
+      error.currentRevision = currentRevision;
+      error.overrides = overrides;
+      return error;
     }
 
     /** 读取某会话某角色解析后的模型选择：会话覆盖优先，其次全局默认；均未配置返回 null。 */
@@ -5761,15 +7176,35 @@ export default {
       return validateSelectionWithSignal(selection, arguments[1]);
     }
 
+    /**
+     * 构造一条带稳定 causeCode 的模型选择错误（票据 24）。
+     *
+     * 外层保持 ValidationError（RPC 仍映射 400 invalid-selection），causeCode 只用于
+     * 启动前 fallback 的预检分类与设置预检 RPC；message 只包含模型名与固定原因，
+     * 绝不携带原始错误正文、凭据或 prompt。
+     */
+    function modelSelectionError(message, code, cause) {
+      const error = new ValidationError(message);
+      error.causeCode = code;
+      if (cause !== void 0) error.cause = cause;
+      return error;
+    }
+
     async function validateSelectionWithSignal(selection, signal) {
       if (!selection || typeof selection !== "object" || Array.isArray(selection)
         || typeof selection.provider !== "string" || selection.provider.length === 0
         || typeof selection.model !== "string" || selection.model.length === 0) {
-        throw new ValidationError("模型选择不完整或类型无效：需要字符串 provider 与 model");
+        throw modelSelectionError(
+          "模型选择不完整或类型无效：需要字符串 provider 与 model",
+          MODEL_ROUTE_ERROR_CODES.INVALID_SELECTION,
+        );
       }
       const rawEffort = selection.reasoningEffort;
       if (rawEffort !== void 0 && rawEffort !== null && rawEffort !== "" && typeof rawEffort !== "string") {
-        throw new ValidationError("reasoningEffort 必须是字符串，或使用 undefined/null/空字符串表示未指定");
+        throw modelSelectionError(
+          "reasoningEffort 必须是字符串，或使用 undefined/null/空字符串表示未指定",
+          MODEL_ROUTE_ERROR_CODES.INVALID_SELECTION,
+        );
       }
       const explicitEffort = rawEffort === void 0 || rawEffort === null || rawEffort === "" ? void 0 : rawEffort;
       // provider/model catalog 只用于提示；目录缺项、延迟或查询失败不能替代精确解析。
@@ -5796,13 +7231,24 @@ export default {
         if (signal?.aborted === true || error?.name === "AbortError" || error?.code === "ABORT_ERR") {
           throw error?.name === "AbortError" || error?.code === "ABORT_ERR" ? error : createAbortError();
         }
-        if (error?.code === "UNSUPPORTED_REASONING_EFFORT") {
-          throw new ValidationError(`reasoningEffort "${explicitEffort}" 不受 model "${selection.model}" 支持`);
+        // 原始错误码必须在包装时保留：启动前 fallback 只对预检类失败降级，
+        // 运行期错误（429/5xx/超时）与未知错误不得被误判成"换个模型再试"。
+        const causeCode = classifyModelRouteError(error);
+        if (causeCode === MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_REASONING_EFFORT) {
+          throw modelSelectionError(
+            `reasoningEffort "${explicitEffort}" 不受 model "${selection.model}" 支持`,
+            causeCode,
+            error,
+          );
         }
-        throw new ValidationError("当前模型不接受该 reasoningEffort");
+        throw modelSelectionError(
+          modelRouteErrorMessage(causeCode) + "（" + selection.provider + "/" + selection.model + "）",
+          causeCode,
+          error,
+        );
       }
       if (!resolved || typeof resolved !== "object" || typeof resolved.provider !== "string" || typeof resolved.model !== "string") {
-        throw new ValidationError("模型解析结果无效");
+        throw modelSelectionError("模型解析结果无效", MODEL_ROUTE_ERROR_CODES.INVALID_SELECTION);
       }
       return {
         provider: resolved.provider,
@@ -5811,6 +7257,263 @@ export default {
       };
     }
 
+    /**
+     * 读取一条**已解析**模型选择的输入能力（票据 24：候选级 image/输入类型预检）。
+     *
+     * 刻意独立于 validateSelectionWithSignal：设置保存、会话覆盖、Observer 自动路由等
+     * 既有调用方的返回形状保持不变，只有显式需要能力信息的预检与 image 路由才调用这里。
+     *
+     * - resolveModelInfo 不存在（旧宿主/测试替身）→ 空输入类型 + image:"unknown"；
+     * - inputModalities 只保留 "text"/"image" 并去重（其它值忽略，未知形态归一为空数组）；
+     * - image 三态复用 image-routing.js 的 imageCapability（缺失/异常 => unknown）；
+     * - 取消错误不在这里吞掉：调用方必须用 abortErrorFor 判定并原样上抛。
+     *
+     * @param {{provider:string, model:string}} selection - 已通过 validateSelectionWithSignal 的选择。
+     * @param {AbortSignal} [signal] - 请求级取消信号。
+     * @returns {Promise<{inputModalities:string[], image:"supported"|"unsupported"|"unknown"}>}
+     */
+    async function readSelectionCapabilities(selection, signal) {
+      if (typeof llm.resolveModelInfo !== "function") {
+        return { inputModalities: [], image: "unknown" };
+      }
+      const info = await llm.resolveModelInfo(selection.provider, selection.model, signal);
+      const inputModalities = [];
+      if (Array.isArray(info?.inputModalities)) {
+        for (const modality of info.inputModalities) {
+          if (modality !== "text" && modality !== "image") continue;
+          if (!inputModalities.includes(modality)) inputModalities.push(modality);
+        }
+      }
+      return { inputModalities, image: imageCapability(info) };
+    }
+
+    /**
+     * 全部候选都不可用时的结构化错误（票据 24）。
+     *
+     * message 只列 provider/model 与稳定错误码，绝不包含凭据、完整 prompt 或原始错误
+     * 正文；attempts 作为结构化字段供 RPC/测试断言，code 固定为 MODEL_CANDIDATES_EXHAUSTED。
+     */
+    function modelCandidatesExhaustedError(attempts, lastRouteErrorCode) {
+      const rendered = attempts
+        .map((attempt) => attempt.provider + "/" + attempt.model + "（" + attempt.code + "）")
+        .join("、");
+      const error = new ValidationError(
+        "所有模型候选均不可用（已尝试 " + attempts.length + " 个："
+        + (rendered.length === 0 ? "无" : rendered) + "）；最后错误码："
+        + (lastRouteErrorCode ?? MODEL_ROUTE_ERROR_CODES.ROUTE_RESOLUTION_FAILED),
+      );
+      error.code = MODEL_CANDIDATES_EXHAUSTED;
+      error.causeCode = lastRouteErrorCode ?? MODEL_ROUTE_ERROR_CODES.ROUTE_RESOLUTION_FAILED;
+      error.attempts = attempts.map((attempt) => ({ ...attempt }));
+      error.validation = true;
+      return error;
+    }
+
+    /** 读取当前设置里的全局候选列表（会话覆盖不参与候选顺序）。 */
+    function candidateSelectionsOfRole(role) {
+      const candidates = source()?.candidates?.[role];
+      return Array.isArray(candidates) ? candidates : [];
+    }
+
+    /** 当前生效的自动降级上限（读取面已归一为 0..4）。 */
+    function currentModelFallbackLimit() {
+      return normalizeModelFallbackLimit(source()?.fallbackLimit);
+    }
+
+    /** 按角色构造有序路由计划：primary 来自 resolveRole（可含会话覆盖），候选来自全局设置。 */
+    function buildRoleModelRoutePlan(role, primary) {
+      return buildModelRoutePlan(primary, candidateSelectionsOfRole(role), currentModelFallbackLimit());
+    }
+
+    /** 路由元数据 -> agentOptions marker（只含 JSON 安全、可审计字段）。 */
+    function routeMarkerOf(route) {
+      return {
+        ...(route.requestedPrimary === undefined ? {} : { requestedPrimary: { ...route.requestedPrimary } }),
+        ...(Number.isSafeInteger(route.candidateIndex) && route.candidateIndex >= 0 ? { candidateIndex: route.candidateIndex } : {}),
+        ...(Number.isSafeInteger(route.fallbackCount) && route.fallbackCount >= 0 ? { fallbackCount: route.fallbackCount } : {}),
+        ...(route.lastRouteErrorCode === undefined ? {} : { lastRouteErrorCode: route.lastRouteErrorCode }),
+      };
+    }
+
+    /** 从 agentOptions marker 读取扁平路由字段（形状不合法时返回空对象）。 */
+    function routeFieldsOfMarker(value) {
+      const marker = normalizeModelRouteMarker(value);
+      return marker === undefined ? {} : marker;
+    }
+    /**
+     * 执行一次启动前路由计划（票据 24 的唯一 fallback 实现）。
+     *
+     * 只对预检类失败继续下一个候选；取消原样上抛；429/5xx/超时/未知错误立即上抛，
+     * 绝不做透明换模型。全部失败时抛 MODEL_CANDIDATES_EXHAUSTED，消息只含尝试过的
+     * provider/model 与最后错误码。
+     *
+     * 第三参 requirements 描述本次派发对输入类型的要求（当前只有
+     * { inputModalities: ["image"] }）：
+     * - 只有要求 image 时才探测能力，纯文本派发不调用 resolveModelInfo；
+     * - image 必须是 "supported" 才继续，"unsupported"/"unknown" 都按
+     *   UNSUPPORTED_CAPABILITY 预检失败跳过该候选（unknown 绝不当成支持）；
+     * - 能力查询本身失败时：取消原样上抛；预检类错误包装成同 code 的
+     *   modelSelectionError 后继续降级；非预检（429/5xx/超时/未知）原样上抛；
+     * - 成功的 route 带 capabilities，供 role tool 的 image admission 复用，避免二次查询。
+     *   未要求 image 时 capabilities 是 { inputModalities: [], image: "unknown" }，
+     *   表示“本次没有探测”，绝不伪造成 supported。
+     *
+     * @param {{plan:Array<{selection:unknown,candidateIndex:number}>, requestedPrimary?:object}} planInfo
+     * @param {AbortSignal} [signal]
+     * @param {{inputModalities?:string[]}} [requirements]
+     */
+    async function executeModelRoutePlan(planInfo, signal, requirements) {
+      const requiresImage = Array.isArray(requirements?.inputModalities)
+        && requirements.inputModalities.includes("image");
+      const attempts = [];
+      for (const item of planInfo.plan) {
+        try {
+          const selection = await validateSelectionWithSignal(item.selection, signal);
+          let capabilities = { inputModalities: [], image: "unknown" };
+          if (requiresImage) {
+            try {
+              capabilities = await readSelectionCapabilities(selection, signal);
+            } catch (error) {
+              const abort = abortErrorFor(error, signal);
+              if (abort !== undefined) throw abort;
+              const code = classifyModelRouteError(error);
+              // 只有预检类失败可以换候选；429/5xx/超时/未知必须原样上抛，等待调用方退避。
+              if (!isPrecheckModelRouteFailure({ causeCode: code })) throw error;
+              throw modelSelectionError(
+                modelRouteErrorMessage(code) + "（" + selection.provider + "/" + selection.model + "）",
+                code,
+                error,
+              );
+            }
+            if (capabilities.image !== "supported") {
+              // 固定中文原因，只含 provider/model；不携带底层错误正文。
+              throw modelSelectionError(
+                "模型未明确声明 image 输入能力（" + selection.provider + "/" + selection.model + "）",
+                MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_CAPABILITY,
+              );
+            }
+          }
+          const lastRouteErrorCode = attempts.length === 0 ? undefined : attempts[attempts.length - 1].code;
+          return {
+            selection,
+            capabilities,
+            ...(planInfo.requestedPrimary === undefined ? {} : { requestedPrimary: planInfo.requestedPrimary }),
+            candidateIndex: item.candidateIndex,
+            fallbackCount: attempts.length,
+            ...(lastRouteErrorCode === undefined ? {} : { lastRouteErrorCode }),
+          };
+        } catch (error) {
+          const abort = abortErrorFor(error, signal);
+          if (abort !== undefined) throw abort;
+          const shape = normalizeModelSelection(item.selection);
+          const provider = shape?.provider ?? (typeof item.selection?.provider === "string" ? item.selection.provider : "");
+          const model = shape?.model ?? (typeof item.selection?.model === "string" ? item.selection.model : "");
+          const code = modelRouteErrorCodeOf(error);
+          attempts.push({ provider, model, code });
+          if (!isPrecheckModelRouteFailure(error)) throw error;
+        }
+      }
+      const lastCode = attempts.length === 0 ? undefined : attempts[attempts.length - 1].code;
+      throw modelCandidatesExhaustedError(attempts, lastCode);
+    }
+
+    /**
+     * 解析角色实际路由：会话覆盖只替换 primary，全局候选顺序不变。
+     * 返回 null 表示该角色尚未配置主模型（调用方保留既有文案）。
+     * requirements 原样透传给 executeModelRoutePlan（fanout/纯文本派发不传）。
+     */
+    async function resolveRoleModelRoute(role, sessionId, signal, requirements) {
+      const primary = resolveRole(sessionId, role);
+      if (primary === null) return null;
+      return executeModelRoutePlan(buildRoleModelRoutePlan(role, primary), signal, requirements);
+    }
+
+    /**
+     * 单条 selection 的只读预检（票据 24 的 model-preflight RPC）。
+     *
+     * 复用真实 validateSelectionWithSignal 与同一错误分类；只返回稳定 code 与固定
+     * 可读原因，绝不返回原始错误正文/凭据。取消仍原样上抛（由 RPC 映射为 499）。
+     */
+    async function preflightSelectionEntry(selection, signal) {
+      const shape = normalizeModelSelection(selection);
+      const provider = shape?.provider ?? (typeof selection?.provider === "string" ? selection.provider : "");
+      const model = shape?.model ?? (typeof selection?.model === "string" ? selection.model : "");
+      const reasoningEffort = shape?.reasoningEffort ?? (typeof selection?.reasoningEffort === "string" && selection.reasoningEffort.length > 0
+        ? selection.reasoningEffort
+        : null);
+      try {
+        const normalized = await validateSelectionWithSignal(selection, signal);
+        let capabilities = { inputModalities: [], image: "unknown" };
+        try {
+          capabilities = await readSelectionCapabilities(normalized, signal);
+        } catch (error) {
+          // 能力查询失败不得把可用模型误报为不可用：预检仍返回 ok:true，image 保持 unknown。
+          // 取消是唯一例外——必须原样上抛，由 RPC 层映射为 499。
+          const abort = abortErrorFor(error, signal);
+          if (abort !== undefined) throw abort;
+        }
+        return {
+          provider: normalized.provider,
+          model: normalized.model,
+          reasoningEffort: normalized.reasoningEffort ?? null,
+          ok: true,
+          code: MODEL_ROUTE_OK,
+          message: modelRouteErrorMessage(MODEL_ROUTE_OK),
+          inputModalities: capabilities.inputModalities,
+          image: capabilities.image,
+        };
+      } catch (error) {
+        const abort = abortErrorFor(error, signal);
+        if (abort !== undefined) throw abort;
+        const code = modelRouteErrorCodeOf(error);
+        return {
+          provider,
+          model,
+          reasoningEffort,
+          ok: false,
+          code,
+          message: modelRouteErrorMessage(code),
+          // 失败/无效 selection 没有可探测的目标：空能力 + unknown，绝不补成 supported。
+          inputModalities: [],
+          image: "unknown",
+        };
+      }
+    }
+
+    /**
+     * fan-out 恢复/续跑的实际路由提示（票据 24）。
+     *
+     * 只有「上一 attempt 是恢复产生的 interrupted，且 child_models 里仍有该 shard 的
+     * 实际 provider/model」时才返回持久化路由；此时 buildRequest **不得**重新跑
+     * resolveCallConfig 选择候选。普通新派发（无中断历史）继续走正常路由计划。
+     */
+    function restoredFanoutModelRoute(input) {
+      if (!Number.isSafeInteger(input?.attempt) || input.attempt <= 1) return null;
+      const task = typeof fanoutHost?.getTask === "function" ? fanoutHost.getTask(input.parentTaskId) : null;
+      const shard = Array.isArray(task?.shards)
+        ? task.shards.find((entry) => entry?.shardId === input.shardId)
+        : undefined;
+      const previous = Array.isArray(shard?.attempts)
+        ? shard.attempts.find((entry) => entry?.attempt === input.attempt - 1)
+        : undefined;
+      if (previous?.status !== "interrupted" || typeof previous.childId !== "string") return null;
+      const record = source().childModels?.[previous.childId];
+      if (record === undefined || record === null) return null;
+      // 身份反证：只有同一个父任务/分片的记录才能作为本 attempt 的路由依据。
+      if (record.fanoutParentTaskId !== input.parentTaskId || record.fanoutShardId !== input.shardId) return null;
+      const selection = normalizeModelSelection(record);
+      if (selection === undefined) return null;
+      // 目标 provider/继承开关（票据 29）同样只读快照：恢复出来的 attempt 必须延续
+      // 原 child 的通道，不能按当前设置重新选择（继承开关变化不得静默改变 seed 语义）。
+      return {
+        selection,
+        ...modelRouteFieldsFromRecord(record),
+        ...(validSubagentProviderName(record.subagentProvider) === void 0
+          ? {}
+          : { subagentProvider: validSubagentProviderName(record.subagentProvider) }),
+        ...(typeof record.inheritContext === "boolean" ? { inheritContext: record.inheritContext } : {}),
+      };
+    }
     /**
      * 构造一条提示词覆盖校验错误。
      *
@@ -5847,11 +7550,12 @@ export default {
      * @param {unknown} value - candidate.promptOverrides。
      * @returns {Record<string,string>} 归一后的覆盖映射（含 0 个键表示清空全部覆盖）。
      */
-    function normalizePromptOverrideCandidate(value) {
+    function normalizePromptOverrideCandidate(value, allowedRoles = STATUS_ROLE_IDS) {
       if (value === null || typeof value !== "object" || Array.isArray(value)) {
         throw promptOverrideError("设置 promptOverrides 无效", PROMPT_OVERRIDE_INVALID_CODE);
       }
-      const unknownRole = Object.keys(value).find((role) => !STATUS_ROLE_IDS.includes(role));
+      const allowed = new Set(Array.isArray(allowedRoles) ? allowedRoles : STATUS_ROLE_IDS);
+      const unknownRole = Object.keys(value).find((role) => !allowed.has(role));
       if (unknownRole !== void 0) {
         throw promptOverrideError("未知专家角色: " + unknownRole, PROMPT_OVERRIDE_UNKNOWN_ROLE_CODE);
       }
@@ -5867,8 +7571,9 @@ export default {
           throw promptOverrideError(role + " 提示词超过 " + PROMPT_OVERRIDE_MAX_GRAPHEMES + " 字符上限", PROMPT_OVERRIDE_INVALID_CODE);
         }
         // 逐字相同 => 删除键（不保存冗余覆盖）；只要有一个字符不同就必须保留，
-        // 包括只差首尾空白这种用户有意保留的格式。
-        if (text === DEFAULT_EXPERT_PERSONA[role]) continue;
+        // 包括只差首尾空白这种用户有意保留的格式。自定义角色没有静态默认表，其默认
+        // persona 来自记录（persona ?? description），因此用同一个解析函数比较。
+        if (text === defaultPersonaForRole(role)) continue;
         normalized[role] = text;
       }
       return normalized;
@@ -5884,14 +7589,297 @@ export default {
      * 可校验的映射，保持兼容、不拒绝写入。
      *
      * @param {unknown} value - 解析后 settings 值里的 promptOverrides。
+     * @param {readonly string[]} [allowedRoles] - 候选设置自己的角色集合（含新增自定义角色）。
      */
-    function assertPromptOverridesCandidate(value) {
+    function assertPromptOverridesCandidate(value, allowedRoles = STATUS_ROLE_IDS) {
       if (value === void 0) return;
-      normalizePromptOverrideCandidate(value);
+      normalizePromptOverrideCandidate(value, allowedRoles);
     }
 
-    /** 使用当前 Host 目录校验完整候选；串行提交边界负责最后的代次检查。 */
-    async function validateSettingsCandidate(candidate, signal) {
+    /**
+     * 通知事件开关候选的严格校验（票据 14）。
+     *
+     * 与读取面的宽容归一不同，写入面必须拒绝未声明类别与非布尔值：静默丢弃未知键会让
+     * 用户以为"我设置了某些通知"却没有任何效果，而 truthy 值会把显式关闭悄悄改回开启。
+     * 缺失的类别按开启补齐（旧客户端只提交一个类别时，其余两类保持历史行为）。
+     *
+     * @param {unknown} value - candidate.notificationEvents。
+     * @returns {{completed: boolean, waiting: boolean, failed: boolean}} 归一后的完整集合。
+     */
+    function normalizeNotificationEventCandidate(value) {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new ValidationError("设置 notificationEvents 无效");
+      }
+      for (const key of Object.keys(value)) {
+        if (!NOTIFICATION_EVENT_TYPES.includes(key)) throw new ValidationError("设置 notificationEvents 无效");
+      }
+      for (const type of NOTIFICATION_EVENT_TYPES) {
+        const flag = value[type];
+        if (flag !== void 0 && typeof flag !== "boolean") throw new ValidationError("设置 notificationEvents 无效");
+      }
+      return normalizeNotificationEvents(value);
+    }
+
+    // 单条模型选择的比较键来自 shared.js 的 modelSelectionKeyOf（票据 20/24）：
+    // 只有 provider/model/规范化 effort 参与比较，历史多余字段与键顺序不会误判成模型变更。
+
+    /**
+     * 写入边界上的「当前已保存值」：优先直接读宿主 describe()。
+     *
+     * 提交串行链内 describe() 就是最新已落盘值，用它做「候选 vs 已保存」差异推导
+     * 比读源快照更准（读源快照依赖 document-updated 事件刷新，且在外部静默写入的
+     * 窗口里会滞后）。describe 不可读 / 条目缺失 / value 非对象时回落到 settingsSource()
+     * 的最近一次归一快照，两者都没有时返回空对象（差异推导因此只认候选自身）。
+     *
+     * @returns {object} 已保存的 settings 值（未归一，交给 normalizeSnapshot 处理）。
+     */
+    function readSavedSettingsValue() {
+      try {
+        if (typeof settings?.describe === "function") {
+          const descriptors = settings.describe();
+          const descriptor = Array.isArray(descriptors)
+            ? descriptors.find((entry) => entry?.ns === SETTINGS_NAMESPACE)
+            : undefined;
+          if (descriptor !== undefined && descriptor.value !== null && typeof descriptor.value === "object") {
+            return descriptor.value;
+          }
+        }
+      } catch { /* describe 不可读：回落到读源快照。 */ }
+      return settingsSource() ?? {};
+    }
+
+    /**
+     * 解析客户端上报的变更集（协议字段 `changed`，票据 20/24）。
+     *
+     * 兼容两种形状：
+     * - 未携带 / 非数组（旧客户端）：返回 null，调用方退回「已保存值 vs 候选」的差异推导；
+     * - 字符串数组：顶层字段名、`defaults.<role>` 与 `candidates.<role>` 角色级路径；
+     *   `defaults` / `candidates` 分别表示整份默认映射/整份候选映射。
+     * 非字符串条目一律忽略：多版本客户端混合时，多一个未知字段不能变成保存失败。
+     *
+     * @param {unknown} value - RPC body.changed。
+     * @returns {{roles: Set<string>, allRoles: boolean, candidateRoles: Set<string>, allCandidates: boolean}|null}
+     */
+    function declaredChangedModelRolesOf(value) {
+      if (!Array.isArray(value)) return null;
+      const roles = new Set();
+      const candidateRoles = new Set();
+      let allRoles = false;
+      let allCandidates = false;
+      for (const entry of value) {
+        if (typeof entry !== "string") continue;
+        const field = entry.trim();
+        if (field === "defaults") { allRoles = true; continue; }
+        if (field === "candidates") { allCandidates = true; continue; }
+        if (field.startsWith("defaults.")) {
+          const role = field.slice("defaults.".length);
+          if (role.length > 0) roles.add(role);
+          continue;
+        }
+        if (field.startsWith("candidates.")) {
+          const role = field.slice("candidates.".length);
+          if (role.length > 0) candidateRoles.add(role);
+        }
+      }
+      return { roles, allRoles, candidateRoles, allCandidates };
+    }
+
+    /**
+     * 本次提交需要做模型解析的角色集合（票据 20 的核心判定）。
+     *
+     * 解析范围 = 客户端声明的变更集 ∪ 与已保存值的实际差异：
+     * - 只改通知/提示词等无关字段时两者都为空，**不会**因为存量失效模型阻塞保存；
+     * - 声明了 `defaults.<role>` 或该角色的模型字段确实变了，才调用
+     *   validateSelectionWithSignal 做真实目录解析；其余角色一律沿用已保存值；
+     * - 差异兜底保证「任何真实模型写入都不会绕过目录校验」，即使客户端漏报变更集；
+     * - 删除角色默认行（候选里没有该角色）不需要解析：没有可解析的选择，删除守卫
+     *   由客户端在模型配置区承担。
+     *
+     * @param {object} candidate - 完整候选（replace 语义不变）。
+     * @param {unknown} changed - RPC body.changed。
+     * @param {object} savedSnapshot - 已归一的最新生效设置快照。
+     * @returns {Set<string>} 需要真实目录解析的角色 id。
+     */
+    function modelRolesToResolve(candidate, changed, savedSnapshot) {
+      const declared = declaredChangedModelRolesOf(changed);
+      const savedDefaults = savedSnapshot?.defaults ?? {};
+      const roles = new Set();
+      for (const [role, selection] of Object.entries(candidate?.defaults ?? {})) {
+        const candidateKey = modelSelectionKeyOf(selection);
+        const savedKey = modelSelectionKeyOf(savedDefaults[role]);
+        // 比较键为空 = 候选不是一条合法选择（缺 provider/model 或不是对象）：这种值
+        // 必须走真实解析并以同样的结构化错误被拒绝，绝不能被"看起来没变"放过去。
+        const differs = candidateKey !== savedKey || candidateKey.length === 0;
+        const declaredChanged = declared !== null && (declared.allRoles || declared.roles.has(role));
+        if (!differs && !declaredChanged) continue;
+        roles.add(role);
+      }
+      return roles;
+    }
+
+    /**
+     * 候选列表的稳定比较键（票据 24）：只比较 provider/model/规范化 effort 的顺序序列。
+     * 任一条形状非法时用固定哨兵，保证非法候选一定会进入真实校验并被拒绝。
+     */
+    function modelSelectionListKey(list) {
+      if (!Array.isArray(list)) return "\u0000invalid-list";
+      return list.map((entry) => {
+        const key = modelSelectionKeyOf(entry);
+        return key.length === 0 ? "\u0000invalid" : key;
+      }).join("\u0001");
+    }
+
+    /**
+     * 本次提交需要校验的候选角色集合：声明了 candidates.<role> 或候选列表确实变化。
+     * 未变更角色的存量失效候选不得阻塞保存（沿用票据 20 语义）。
+     */
+    function modelCandidateRolesToResolve(candidate, changed, savedSnapshot, rawSavedCandidates) {
+      const declared = declaredChangedModelRolesOf(changed);
+      const savedCandidates = savedSnapshot?.candidates ?? {};
+      const roles = new Set();
+      const sourceCandidates = candidate?.candidates;
+      if (sourceCandidates === null || typeof sourceCandidates !== "object" || Array.isArray(sourceCandidates)) return roles;
+      const rawCandidates = rawSavedCandidates !== null && typeof rawSavedCandidates === "object" && !Array.isArray(rawSavedCandidates)
+        ? rawSavedCandidates
+        : {};
+      for (const [role, list] of Object.entries(sourceCandidates)) {
+        if (!Array.isArray(list)) continue;
+        const candidateKey = modelSelectionListKey(list);
+        // 读取归一为了安全会丢弃非法候选；若客户端原样提交旧文档里的非法项，
+        // 不能因此把「未变更」误判成变更并阻塞无关保存。这里同时接受原始已保存键
+        // 与归一后键，任一相同即视为未变更。
+        const savedKey = modelSelectionListKey(savedCandidates[role] ?? []);
+        const rawSavedKey = modelSelectionListKey(Array.isArray(rawCandidates[role]) ? rawCandidates[role] : []);
+        const differs = candidateKey !== savedKey && candidateKey !== rawSavedKey;
+        const declaredChanged = declared !== null && (declared.allCandidates || declared.candidateRoles.has(role));
+        if (differs || declaredChanged) roles.add(role);
+      }
+      return roles;
+    }
+
+    /**
+     * 候选映射的结构校验（票据 24）：普通对象、已知角色、数组、最多 8 条。
+     * 单条 selection 的形状/目录解析在 validateModelCandidatesCandidate 内逐条执行；
+     * 只有变更中的角色才走真实解析，未变更角色的存量失效值不阻塞保存。
+     */
+    function assertModelCandidatesCandidate(value, allowedRoles = STATUS_ROLE_IDS) {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new ValidationError("设置 candidates 无效");
+      }
+      const allowed = new Set(Array.isArray(allowedRoles) ? allowedRoles : STATUS_ROLE_IDS);
+      for (const [role, list] of Object.entries(value)) {
+        if (!allowed.has(role)) throw new ValidationError("未知专家角色候选: " + role);
+        if (!Array.isArray(list)) throw new ValidationError("角色 " + role + " 的模型候选必须是数组");
+        if (list.length > MAX_MODEL_CANDIDATES_PER_ROLE) {
+          throw new ValidationError("角色 " + role + " 的模型候选最多 " + MAX_MODEL_CANDIDATES_PER_ROLE + " 个");
+        }
+      }
+    }
+
+    /**
+     * 逐角色并发映射的写入面校验（票据 26）。
+     *
+     * 规则（保存时**只**做结构/范围校验，不调用模型目录、不解析模型）：
+     * - 值必须是普通对象（数组/null 都拒绝）；
+     * - 角色键必须属于**候选设置自己的角色集**（内置 + 本次声明的自定义角色）：
+     *   否则一次保存就会写进一个永远不会被调度读到的键，用户看到配置却永不生效；
+     * - 值必须是 1..64 的安全整数（与 roleConcurrencyLimit/任务级上限同界）。
+     *
+     * 非法条目**整次保存拒绝**：并发上限是安全/成本边界，静默丢弃会让用户以为
+     * 限制已生效。读取面对历史坏值另有一套宽容归一（normalizeRoleLimitsForRead）。
+     *
+     * @param {unknown} value - candidate.roleLimits。
+     * @param {readonly string[]} allowedRoles - 候选设置自己的角色 id 集合。
+     * @returns {Record<string, number>} 归一后的映射（用于写入 patch）。
+     */
+    function assertRoleLimitsCandidate(value, allowedRoles) {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new ValidationError("设置 roleLimits 无效");
+      }
+      const allowed = new Set(Array.isArray(allowedRoles) ? allowedRoles : STATUS_ROLE_IDS);
+      const normalized = {};
+      for (const [role, limit] of Object.entries(value)) {
+        if (role.trim().length === 0 || !allowed.has(role)) {
+          throw new ValidationError("设置 roleLimits 含未知角色: " + role);
+        }
+        if (!Number.isSafeInteger(limit) || limit < MIN_CONCURRENCY_LIMIT || limit > MAX_CONCURRENCY_LIMIT) {
+          throw new ValidationError("设置 roleLimits." + role + " 必须是 " + MIN_CONCURRENCY_LIMIT + "~" + MAX_CONCURRENCY_LIMIT + " 的整数");
+        }
+        normalized[role] = limit;
+      }
+      return normalized;
+    }
+
+    /**
+     * 逐 provider 并发映射的写入面校验（票据 26）。
+     *
+     * 规则：
+     * - 值必须是普通对象；
+     * - provider 键只要求非空字符串（**不查模型目录**：目录不可用不应阻塞限流配置保存，
+     *   provider 是否真实存在由模型配置负责）；
+     * - 值是 0..64 的安全整数；0 = 显式不限制（与未设置等价，但语义更明确）。
+     *
+     * @param {unknown} value - candidate.providerLimits。
+     * @returns {Record<string, number>} 归一后的映射。
+     */
+    function assertProviderLimitsCandidate(value) {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new ValidationError("设置 providerLimits 无效");
+      }
+      const normalized = {};
+      for (const [provider, limit] of Object.entries(value)) {
+        if (provider.trim().length === 0) {
+          throw new ValidationError("设置 providerLimits 的 provider 键必须是非空字符串");
+        }
+        if (!Number.isSafeInteger(limit) || limit < MIN_PROVIDER_LIMIT || limit > MAX_PROVIDER_LIMIT) {
+          throw new ValidationError("设置 providerLimits." + provider + " 必须是 " + MIN_PROVIDER_LIMIT + "~" + MAX_PROVIDER_LIMIT + " 的整数");
+        }
+        normalized[provider] = limit;
+      }
+      return normalized;
+    }
+
+    /**
+     * 逐条校验变更角色的候选模型，并拒绝重复（同一 provider+model+规范化 effort）。
+     * 返回值写入设置 patch；未变更角色沿用已保存的归一候选，绝不重新解析目录。
+     */
+    async function validateModelCandidatesCandidate(value, rolesToResolve, savedCandidates, signal) {
+      const validated = {};
+      for (const [role, list] of Object.entries(value)) {
+        if (!rolesToResolve.has(role)) {
+          const saved = Array.isArray(savedCandidates[role]) ? savedCandidates[role] : [];
+          validated[role] = saved.map((selection) => ({ ...selection }));
+          continue;
+        }
+        const seen = new Set();
+        const selections = [];
+        for (const choice of list) {
+          const selection = await validateSelectionWithSignal(choice, signal);
+          const key = modelSelectionKeyOf(selection);
+          if (seen.has(key)) {
+            throw new ValidationError("模型候选重复：" + selection.provider + "/" + selection.model
+              + (selection.reasoningEffort === undefined ? "" : "（" + selection.reasoningEffort + "）"));
+          }
+          seen.add(key);
+          selections.push(selection);
+        }
+        validated[role] = selections;
+      }
+      return validated;
+    }
+    /**
+     * 使用当前 Host 目录校验完整候选；串行提交边界负责最后的代次检查。
+     *
+     * 模型解析只覆盖变更集（票据 20）：未变更角色沿用已保存值，绝不再用真实目录
+     * 重新解析——否则一次「只改通知开关」的保存会被某个存量失效模型整体阻塞。
+     * 返回的 `modelRoles` 供调用方记录/测试观察「这次到底解析了哪些角色」。
+     *
+     * @param {unknown} candidate - 完整 settings 候选（replace 语义）。
+     * @param {AbortSignal} [signal] - 请求生命周期信号。
+     * @param {unknown} [changed] - 客户端上报的变更集（可选，旧客户端不携带）。
+     * @returns {Promise<{value: object, modelRoles: string[]}>} 归一后的候选与已解析角色。
+     */
+    async function validateSettingsCandidate(candidate, signal, changed) {
       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
         throw new ValidationError("设置候选值无效");
       }
@@ -5903,11 +7891,12 @@ export default {
       if (!Number.isSafeInteger(candidate.notificationVolume) || candidate.notificationVolume < 0 || candidate.notificationVolume > 100) {
         throw new ValidationError("设置 notificationVolume 无效");
       }
-      const hasNotificationHoldMs = candidate.notificationHoldMs !== void 0;
-      const notificationHoldMs = hasNotificationHoldMs ? normalizeNotificationHoldMs(candidate.notificationHoldMs) : void 0;
-      if (hasNotificationHoldMs && notificationHoldMs !== candidate.notificationHoldMs) {
-        throw new ValidationError("设置 notificationHoldMs 无效");
-      }
+      // 通知事件类型（票据 14）：缺字段（旧客户端/旧文档）不写 patch；显式提供时严格校验
+      // 只含声明过的三个类别且值必须是布尔，绝不用 truthy 值隐式关闭/开启某一类通知。
+      const hasNotificationEvents = candidate.notificationEvents !== void 0;
+      const notificationEvents = hasNotificationEvents
+        ? normalizeNotificationEventCandidate(candidate.notificationEvents)
+        : void 0;
       // 旧客户端没有该字段时保持缺省语义，并在提交 patch 中省略它；显式提供时严格要求安全整数。
       const hasRoleConcurrencyLimit = candidate.roleConcurrencyLimit !== void 0;
       const roleConcurrencyLimit = hasRoleConcurrencyLimit
@@ -5939,32 +7928,126 @@ export default {
       if (hasAutoOpenSubagentSidebar && typeof candidate.autoOpenSubagentSidebar !== "boolean") {
         throw new ValidationError("设置 autoOpenSubagentSidebar 无效");
       }
+      // 自定义角色（票据 27）：缺字段 = 旧客户端/旧文档，不写 patch 且保持已有角色；
+      // 显式提供时按 role-registry 的 fail-closed 规则严格校验（缺 readOnly/toolDeny、
+      // 未知字段、非法 id、覆盖内置/保留名、超数量都拒绝），绝不为新角色默认放开权限。
+      const hasCustomRoles = candidate.customRoles !== void 0;
+      const customRoleDefinitionsCandidate = hasCustomRoles
+        ? assertCustomRolesCandidate(candidate.customRoles)
+        : void 0;
+      // **候选设置自己的角色集合**：新增角色必须在本次保存内就被视为已声明，否则校验会
+      // 读旧的 runs-time 目录并把新角色当作未启用而跳过模型/提示词校验（票据 27 的联动要求）。
+      const candidateRoleRegistry = hasCustomRoles
+        ? createRoleRegistry([...ROLE_REGISTRY.records(), ...customRoleRecords(customRoleDefinitionsCandidate)])
+        : roleCatalog();
+      const candidateRoleIds = Object.freeze([
+        ...STATUS_ROLE_IDS,
+        ...(hasCustomRoles ? Object.keys(customRoleDefinitionsCandidate) : roleCatalog().customIds()),
+      ]);
+      /**
+       * 并发映射（票据 26）：缺字段 = 旧客户端/旧文档，不写 patch、保持已有映射；
+       * 显式提供时只做结构/范围校验（不触碰模型目录），非法条目整次保存拒绝。
+       * 判定在任何 await 之前完成，避免半个候选进入后续模型解析。
+       */
+      const hasRoleLimits = candidate.roleLimits !== void 0;
+      const roleLimits = hasRoleLimits ? assertRoleLimitsCandidate(candidate.roleLimits, candidateRoleIds) : void 0;
+      const hasProviderLimits = candidate.providerLimits !== void 0;
+      const providerLimits = hasProviderLimits ? assertProviderLimitsCandidate(candidate.providerLimits) : void 0;
+      /**
+       * 上下文继承映射（票据 29）：缺字段 = 旧客户端/旧文档，不写 patch、保持已有映射；
+       * 显式提供时 fail-closed：Observer、未知/自定义角色与非布尔值整次保存拒绝。
+       * 判定与限流映射一样在任何 await 之前完成。
+       */
+      const hasInheritContext = candidate.inheritContext !== void 0;
+      const inheritContext = hasInheritContext ? assertInheritContextCandidate(candidate.inheritContext) : void 0;
       // 提示词覆盖沿用同一"缺字段即不覆盖"兼容语义：旧客户端提交的候选被原样放行，
       // 已有的自定义提示词不会被一次无关的通知设置保存清空。
       const hasPromptOverrides = candidate[PROMPT_OVERRIDES_SETTINGS_KEY] !== void 0;
       const promptOverrides = hasPromptOverrides
-        ? normalizePromptOverrideCandidate(candidate[PROMPT_OVERRIDES_SETTINGS_KEY])
+        ? normalizePromptOverrideCandidate(candidate[PROMPT_OVERRIDES_SETTINGS_KEY], candidateRoleIds)
         : void 0;
-      // provider catalog 是 advisory；每个启用角色的默认模型最终由 resolveCallConfig 精确验证。
+      // 候选映射（票据 24）：缺字段 = 旧客户端，不写 patch、保持原值；显式提供时先做
+      // 结构校验（unknown role/非数组/超过 8 条），再只解析变更中的角色。
+      const hasCandidates = candidate.candidates !== void 0;
+      if (hasCandidates) assertModelCandidatesCandidate(candidate.candidates, candidateRoleIds);
+      // 自动降级上限：缺字段不写 patch；显式提供时只接受 0..4 的安全整数。
+      const hasFallbackLimit = candidate.fallbackLimit !== void 0;
+      const fallbackLimit = hasFallbackLimit ? normalizeModelFallbackLimit(candidate.fallbackLimit) : void 0;
+      if (hasFallbackLimit && fallbackLimit !== candidate.fallbackLimit) {
+        throw new ValidationError("设置 fallbackLimit 无效");
+      }
+      // 单价（票据 25）：缺字段 = 旧客户端/旧文档，不写 patch、保持已有单价；
+      // 显式提供时 fail-closed 校验（结构/范围/未知键/重复 provider+model），
+      // 空数组是合法的“清空全部”。判定在任何 await 之前完成。
+      const hasModelPrices = candidate.modelPrices !== void 0;
+      const modelPrices = hasModelPrices ? assertModelPricesCandidate(candidate.modelPrices) : void 0;
+      // provider catalog 是 advisory；每个"变更中"的启用角色默认模型最终由 resolveCallConfig
+      // 精确验证。解析范围见 modelRolesToResolve：只覆盖变更集（声明 ∪ 实际差异），
+      // 未变更角色沿用已保存值，绝不再用真实目录重新解析——一次「只改通知开关」的保存
+      // 因此不会被某个存量失效模型整体阻塞（票据 20）。
       // 未启用角色（尤其是关闭 Observer 后遗留的 defaults.observer）按原值保留，
       // 避免无关的通知设置保存因已失效的隐藏运行配置失败。
+      const rawSavedSettings = readSavedSettingsValue();
+      const savedSnapshot = normalizeSnapshot(rawSavedSettings, activeRoles());
+      const savedDefaults = savedSnapshot.defaults;
+      const modelRoles = modelRolesToResolve(candidate, changed, savedSnapshot);
+      const candidateRoles = hasCandidates
+        ? modelCandidateRolesToResolve(candidate, changed, savedSnapshot, rawSavedSettings?.candidates)
+        : new Set();
+      // 候选逐条解析放在 defaults 之前：非法候选应在进入默认模型解析前被拒绝。
+      const candidates = hasCandidates
+        ? await validateModelCandidatesCandidate(candidate.candidates, candidateRoles, savedSnapshot.candidates ?? {}, signal)
+        : void 0;
       const defaults = {};
-      const enabledRoles = new Set(activeRoles());
+      // 启用集合来自**候选设置自己的**目录（含本次新增/删除的自定义角色），
+      // 不读旧的运行期目录。
+      const enabledRoles = new Set(candidateRoleRegistry.enabledIds({ enableObserver: config.enableObserver === true }));
+      const resolvedRoles = [];
       for (const [role, selection] of Object.entries(candidate.defaults)) {
-        defaults[role] = enabledRoles.has(role)
-          ? await validateSelectionWithSignal(selection, signal)
+        if (!enabledRoles.has(role)) {
+          defaults[role] = selection;
+          continue;
+        }
+        if (modelRoles.has(role)) {
+          defaults[role] = await validateSelectionWithSignal(selection, signal);
+          resolvedRoles.push(role);
+          continue;
+        }
+        // 未变更：沿用已保存值（与候选的模型字段相同），不做任何目录解析。
+        const savedSelection = savedDefaults[role];
+        defaults[role] = savedSelection !== undefined && typeof savedSelection === "object"
+          ? { ...savedSelection }
           : selection;
       }
       return {
-        ...candidate,
-        defaults,
-        ...(hasNotificationHoldMs ? { notificationHoldMs } : {}),
-        ...(hasPromptOverrides ? { [PROMPT_OVERRIDES_SETTINGS_KEY]: promptOverrides } : {}),
-        observerPreferred: candidate.observerPreferred === true,
-        // 缺字段（旧客户端/旧文档）按开启归一：默认必须维持侧边栏注册的历史行为。
-        taskManagementEnabled: candidate.taskManagementEnabled !== false,
-        // 缺字段（旧客户端/旧文档）按关闭归一：默认必须维持「无自动 open/close」的历史行为。
-        autoOpenSubagentSidebar: candidate.autoOpenSubagentSidebar === true,
+        value: {
+          ...candidate,
+          defaults,
+          ...(hasCandidates ? { candidates } : {}),
+          ...(hasFallbackLimit ? { fallbackLimit } : {}),
+          ...(hasNotificationEvents ? { notificationEvents } : {}),
+          ...(hasPromptOverrides ? { [PROMPT_OVERRIDES_SETTINGS_KEY]: promptOverrides } : {}),
+          // 自定义角色按整份映射 replace（与 defaults/candidates 同语义）：空对象显式删除全部。
+          // 写入形状剥离派生 id：id 就是映射键，文档里再出现 id 会在下次读取时被判成未知字段。
+          ...(hasCustomRoles ? { customRoles: customRoleDefinitionsDocument(customRoleDefinitionsCandidate) } : {}),
+          // 并发映射按整份映射 replace（票据 26）：空对象 = 显式清空全部覆盖，
+          // 与「缺字段 = 保持原值」是两种不同语义。
+          ...(hasRoleLimits ? { roleLimits } : {}),
+          ...(hasProviderLimits ? { providerLimits } : {}),
+          // 上下文继承按整份映射 replace（票据 29）：空对象 = 显式清空全部继承开关。
+          ...(hasInheritContext ? { inheritContext } : {}),
+          // 单价按整份数组 replace（票据 25）：空数组 = 显式清空全部单价；
+          // 缺字段仍由调用方决定不写 patch（保持已有值）。
+          ...(hasModelPrices ? { modelPrices } : {}),
+          observerPreferred: candidate.observerPreferred === true,
+          // 缺字段（旧客户端/旧文档）按开启归一：默认必须维持侧边栏注册的历史行为。
+          taskManagementEnabled: candidate.taskManagementEnabled !== false,
+          // 缺字段（旧客户端/旧文档）按关闭归一：默认必须维持「无自动 open/close」的历史行为。
+          autoOpenSubagentSidebar: candidate.autoOpenSubagentSidebar === true,
+        },
+        // 本次真正调用过真实目录解析的角色（测试与诊断据此证明"只解析变更项"）。
+        modelRoles: resolvedRoles,
+        modelCandidateRoles: [...candidateRoles],
       };
     }
 
@@ -5976,7 +8059,7 @@ export default {
      * 1. 提示词覆盖的完整语义校验（未知角色键、非字符串、纯空白、超 grapheme 上限）
      *    ——在任何 await 之前同步执行，非法候选绝不进入宿主写入；
      * 2. `validateSettingsCandidate`：provider/defaults/通知/并发/开关的类型与范围校验，
-     *    以及每个启用角色的模型目录解析；
+     *    以及**变更集中**启用角色的模型目录解析（未变更角色沿用已保存值，票据 20）；
      * 3. 目录代次复核：校验完成到写入之间目录代次变化则拒绝；
      * 4. `updateAtGeneration` 在串行链内带 expectedRevision 写入宿主配置，并在调用
      *    宿主写入前再复核一次代次。
@@ -5992,8 +8075,129 @@ export default {
      * 读取面语义：0.1.7 的 `describe().value` 是 defaults resolved 结果，因此
      * provider 空串、promptOverrides 空对象等“未配置”值都会出现；归一逻辑按
      * 缺失字段回退默认值处理，与旧 `scope.get()` 的解析结果同形。
+     *
+     * @param {object} candidate - 完整 settings 候选（replace 语义不变）。
+     * @param {number} expectedRevision - 客户端观察到的 settings revision。
+     * @param {AbortSignal} [signal] - 请求生命周期信号。
+     * @param {unknown} [changed] - 客户端上报的变更集（`string[]`；旧客户端不携带）。
+     *   仅用于决定「哪些角色要做真实模型解析」，**不改变** replace 写入语义：
+     *   候选仍是完整值，patch 仍按顶层键整值写入。
      */
-    function commitSettingsCandidate(candidate, expectedRevision, signal) {
+    /**
+     * 自定义角色候选的严格校验（票据 27）。
+     *
+     * 复用 role-registry 的 assertCustomRoleDefinitions 作为唯一规则来源，只把错误类型
+     * 换成 RPC 层能映射成 400 的 ValidationError；绝不在组合根复制第二套字段校验。
+     *
+     * @param {unknown} value - candidate.customRoles。
+     * @returns {Record<string, object>} 冻结的定义映射。
+     */
+    function assertCustomRolesCandidate(value) {
+      try {
+        return assertCustomRoleDefinitions(value);
+      } catch (error) {
+        if (error instanceof RoleRegistryError) throw new ValidationError(error.message);
+        throw error;
+      }
+    }
+
+    /**
+     * 单价候选的严格校验（票据 25）。
+     *
+     * 复用 host/usage-ledger.js 的 assertModelPrices 作为唯一规则来源，只把错误类型
+     * 换成 RPC 层能映射成 400 的 ValidationError；绝不在组合根复制第二套字段校验。
+     * 单价是成本展示的输入，非法条目必须整次保存拒绝，不能像读取面那样静默丢弃。
+     *
+     * @param {unknown} value - candidate.modelPrices。
+     * @returns {object[]} 归一后的完整数组（用于 replace 写入）。
+     */
+    function assertModelPricesCandidate(value) {
+      try {
+        return assertModelPrices(value);
+      } catch (error) {
+        throw new ValidationError(error instanceof Error ? error.message : "设置 modelPrices 无效");
+      }
+    }
+
+    /**
+     * 候选设置的角色集合（内置 + 该候选声明的自定义角色）。
+     *
+     * 用于在任何 await 之前的同步校验（提示词覆盖/候选模型）：此时读取旧的运行期目录
+     * 会把新角色误判成未知或未启用，因此必须基于候选自身的声明。
+     *
+     * @param {object} candidate - 完整 settings 候选。
+     * @returns {readonly string[]} 角色 id 集合。
+     */
+    function customRoleIdsOfCandidate(candidate) {
+      const raw = candidate?.customRoles;
+      if (raw === void 0) return Object.freeze([...STATUS_ROLE_IDS, ...roleCatalog().customIds()]);
+      const definitions = assertCustomRolesCandidate(raw);
+      return Object.freeze([...STATUS_ROLE_IDS, ...Object.keys(definitions)]);
+    }
+
+    /**
+     * 删除自定义角色前的使用中检查（fail-closed，票据 27）。
+     *
+     * 只有能**证明**没有活动使用时才允许删除：
+     * 1. fan-out：manager 的 listTasks() 是唯一权威任务源；非终态任务的 role 或任一 shard
+     *    的 role 命中被删角色即拒绝。读不到 listTasks 时同样拒绝，绝不假设"没有任务"。
+     * 2. live agents：agents.list() 是唯一权威运行视图；任一 live Agent 的专家 marker
+     *    命中即拒绝；读不到列表（宿主未提供/不是数组）同样拒绝。
+     * 3. 本进程仍持有、且可续作的 recovery record：它代表一个会被恢复路径继续使用的 child，
+     *    同样算使用中。
+     * 历史任务不受影响：它们的 roleLabel 已随 child_models 持久化。
+     *
+     * @param {Set<string>} removedIds - 本次保存要删除的自定义角色 id。
+     */
+    function assertCustomRoleRemovalsUnused(removedIds) {
+      if (!(removedIds instanceof Set) || removedIds.size === 0) return;
+      const names = [...removedIds].join(", ");
+      const reject = (reason) => {
+        throw new ValidationError("自定义角色仍在使用中，已拒绝删除（" + reason + "）：" + names);
+      };
+      if (typeof fanoutHost?.listTasks !== "function") reject("无法确认没有活动 fan-out 任务");
+      let tasks;
+      try {
+        tasks = fanoutHost.listTasks();
+      } catch {
+        reject("fan-out 任务列表读取失败");
+      }
+      if (!Array.isArray(tasks)) reject("无法确认没有活动 fan-out 任务");
+      for (const task of tasks) {
+        if (fanoutTaskIsTerminal(task)) continue;
+        const roles = [task?.role, ...(Array.isArray(task?.shards) ? task.shards.map((shard) => shard?.role) : [])];
+        for (const role of roles) {
+          if (typeof role === "string" && removedIds.has(role)) reject("存在活动 fan-out 任务");
+        }
+      }
+      const liveAgents = typeof agents?.list === "function" ? agents.list() : void 0;
+      if (!Array.isArray(liveAgents)) reject("无法读取 live agents");
+      for (const agent of liveAgents) {
+        const role = agent?.options?.[ROLE_MARKER];
+        if (typeof role === "string" && removedIds.has(role)) reject("存在 live 专家 child");
+      }
+      for (const record of recoveryRecords.values()) {
+        if (record?.continuable !== true) continue;
+        if (typeof record.role === "string" && removedIds.has(record.role)) reject("存在可续作专家 child");
+      }
+    }
+
+    /**
+     * 计算本次保存要删除的自定义角色（已保存 − 候选），用于删除守卫。
+     *
+     * @param {Record<string, object>} nextDefinitions - 候选的完整自定义角色定义。
+     * @returns {Set<string>} 被删除的角色 id。
+     */
+    function removedCustomRoleIds(nextDefinitions) {
+      const saved = normalizeCustomRolesForRead(readSavedSettingsValue()?.customRoles).definitions;
+      const removed = new Set();
+      for (const id of Object.keys(saved)) {
+        if (!Object.prototype.hasOwnProperty.call(nextDefinitions, id)) removed.add(id);
+      }
+      return removed;
+    }
+
+    function commitSettingsCandidate(candidate, expectedRevision, signal, changed) {
       // 旧客户端缺少任务管理字段时既不写 patch，也不在响应里新增字段（保持历史形状）。
       const hasTaskManagementEnabled = candidate?.taskManagementEnabled !== void 0;
       // 自动打开同理：缺字段不写 patch，也不在响应里新增字段——一次无关的通知设置保存
@@ -6001,34 +8205,81 @@ export default {
       const hasAutoOpenSubagentSidebar = candidate?.autoOpenSubagentSidebar !== void 0;
       // 提示词覆盖同理：缺字段不写 patch，避免旧客户端的保存顺带清空已有自定义提示词。
       const hasPromptOverrides = candidate?.[PROMPT_OVERRIDES_SETTINGS_KEY] !== void 0;
+      // 通知事件类型（票据 14）同样是显式字段才写 patch / 才回传：旧客户端的响应形状不变。
+      const hasNotificationEvents = candidate?.notificationEvents !== void 0;
+      // 模型候选/降级上限（票据 24）同样只写显式提供的字段：旧客户端不传时保持原值，
+      // 响应也维持历史形状（不新增字段）。
+      const hasCandidates = candidate?.candidates !== void 0;
+      const hasFallbackLimit = candidate?.fallbackLimit !== void 0;
+      // 自定义角色（票据 27）同样只写显式提供的字段：缺字段 = 保持已有角色，绝不删除。
+      const hasCustomRoles = candidate?.customRoles !== void 0;
+      // 并发映射（票据 26）同一规则：缺字段 = 旧客户端，不写 patch、不在响应里新增字段；
+      // 显式空对象则表示「清空全部逐角色/provider 覆盖」（与缺字段语义不同）。
+      const hasRoleLimits = candidate?.roleLimits !== void 0;
+      const hasProviderLimits = candidate?.providerLimits !== void 0;
+      // 上下文继承（票据 29）同一规则：缺字段 = 保持已有映射且响应保持历史形状；
+      // 显式空对象表示全部关闭（与缺字段语义不同）。
+      const hasInheritContext = candidate?.inheritContext !== void 0;
+      // 单价（票据 25）同一规则：缺字段 = 旧客户端，不写 patch、不在响应里新增字段；
+      // 显式空数组表示清空全部单价（与缺字段语义不同）。
+      const hasModelPrices = candidate?.modelPrices !== void 0;
       return settingsRuntime.enqueueCommit(async () => {
         const generation = settingsRuntime.generation;
         // 写入前的第一道语义边界：与 validateSettingsCandidate 内部同一批规则，
         // 但这里先于任何 await 运行，保证非法覆盖不会在异步校验期间进入宿主写入路径。
-        assertPromptOverridesCandidate(candidate?.[PROMPT_OVERRIDES_SETTINGS_KEY]);
-        const validated = await validateSettingsCandidate(candidate, signal);
-        if (!settingsRuntime.isCurrentGeneration(generation)) {
+        // 角色集合取**候选自己的声明**（新增自定义角色的第一次保存必须被当作已启用）。
+        assertPromptOverridesCandidate(candidate?.[PROMPT_OVERRIDES_SETTINGS_KEY], customRoleIdsOfCandidate(candidate));
+        const validated = await validateSettingsCandidate(candidate, signal, changed);
+        const validatedSettings = validated.value;
+        // 删除守卫（fail-closed）：被活动 fan-out 任务、live agents 或可续作 recovery record
+        // 引用的自定义角色不允许删除。历史任务的 roleLabel 已随 child_models 持久化。
+        if (hasCustomRoles) assertCustomRoleRemovalsUnused(removedCustomRoleIds(validatedSettings.customRoles));
+        // 目录代次栅栏只保护「这次真的要写模型字段」的提交（票据 20）：与模型无关的保存
+        // 不依赖目录，用写入时刻的代次参与复核，因此不会被提交期间到达的目录事件误判成
+        // 过期；确有模型变更时仍用提交起始代次，语义与票据 03 完全一致。
+        const hasModelChanges = validated.modelRoles.length > 0 || validated.modelCandidateRoles.length > 0;
+        const generationForWrite = hasModelChanges ? generation : settingsRuntime.generation;
+        if (!settingsRuntime.isCurrentGeneration(generationForWrite)) {
           throw new ValidationError("模型目录在保存期间发生变化，请刷新目录后重试");
         }
         const patch = {
-          provider: validated.provider,
-          defaults: validated.defaults,
-          notificationEnabled: validated.notificationEnabled,
-          notificationVolume: validated.notificationVolume,
-          ...(candidate.notificationHoldMs === void 0 ? {} : { notificationHoldMs: validated.notificationHoldMs }),
-          ...(candidate.roleConcurrencyLimit === void 0 ? {} : { roleConcurrencyLimit: validated.roleConcurrencyLimit }),
+          provider: validatedSettings.provider,
+          defaults: validatedSettings.defaults,
+          // 候选/降级上限只在显式提供时写入；候选按整份映射 replace（与 defaults 同语义）。
+          ...(hasCandidates ? { candidates: validatedSettings.candidates } : {}),
+          ...(hasFallbackLimit ? { fallbackLimit: validatedSettings.fallbackLimit } : {}),
+          notificationEnabled: validatedSettings.notificationEnabled,
+          notificationVolume: validatedSettings.notificationVolume,
+          // 通知事件类型同样「缺字段即不覆盖」：旧客户端保存通知开关不得重置事件过滤。
+          ...(candidate.notificationEvents === void 0 ? {} : { notificationEvents: validatedSettings.notificationEvents }),
+          ...(candidate.roleConcurrencyLimit === void 0 ? {} : { roleConcurrencyLimit: validatedSettings.roleConcurrencyLimit }),
           // 角色默认超时同样「缺字段即不覆盖」：旧客户端保存通知设置不得把它重置为 0。
-          ...(candidate.roleTimeoutMs === void 0 ? {} : { roleTimeoutMs: validated.roleTimeoutMs }),
+          ...(candidate.roleTimeoutMs === void 0 ? {} : { roleTimeoutMs: validatedSettings.roleTimeoutMs }),
           // 旧客户端缺失该字段时不覆盖已有值；新客户端显式提交 true/false。
-          ...(candidate.observerPreferred === void 0 ? {} : { observerPreferred: validated.observerPreferred }),
+          ...(candidate.observerPreferred === void 0 ? {} : { observerPreferred: validatedSettings.observerPreferred }),
           // 任务管理同样是「缺字段即不覆盖」：旧客户端保存通知设置不得顺带重置侧边栏注册。
-          ...(hasTaskManagementEnabled ? { taskManagementEnabled: validated.taskManagementEnabled } : {}),
+          ...(hasTaskManagementEnabled ? { taskManagementEnabled: validatedSettings.taskManagementEnabled } : {}),
           // 自动打开沿用同一写面规则：只有显式提供该字段的候选才能改写它。
-          ...(hasAutoOpenSubagentSidebar ? { autoOpenSubagentSidebar: validated.autoOpenSubagentSidebar } : {}),
+          ...(hasAutoOpenSubagentSidebar ? { autoOpenSubagentSidebar: validatedSettings.autoOpenSubagentSidebar } : {}),
           // 提示词覆盖按整份映射提交（不做键级合并）：空对象显式清空全部自定义提示词。
-          ...(hasPromptOverrides ? { [PROMPT_OVERRIDES_SETTINGS_KEY]: validated[PROMPT_OVERRIDES_SETTINGS_KEY] } : {}),
+          ...(hasPromptOverrides ? { [PROMPT_OVERRIDES_SETTINGS_KEY]: validatedSettings[PROMPT_OVERRIDES_SETTINGS_KEY] } : {}),
+          // 自定义角色按整份映射 replace：空对象显式删除全部自定义角色。
+          ...(hasCustomRoles ? { customRoles: validatedSettings.customRoles } : {}),
+          // 并发映射按整份映射 replace（票据 26）：空对象显式清空覆盖，回到默认值/不限制。
+          ...(hasRoleLimits ? { roleLimits: validatedSettings.roleLimits } : {}),
+          ...(hasProviderLimits ? { providerLimits: validatedSettings.providerLimits } : {}),
+          // 上下文继承按整份映射 replace（票据 29）：空对象显式关闭全部继承。
+          ...(hasInheritContext ? { inheritContext: validatedSettings.inheritContext } : {}),
+          // 单价按整份数组 replace：空数组显式清空；缺字段保持已有值。
+          ...(hasModelPrices ? { modelPrices: validatedSettings.modelPrices } : {}),
         };
-        await updateSettingsAtGeneration({ ...patch }, expectedRevision, generation);
+        await updateSettingsAtGeneration({ ...patch }, expectedRevision, generationForWrite);
+        // 保存成功后立即同步运行期目录与工具面：新增角色在本次响应返回前就可派发，
+        // 删除角色即时卸载；onChange 观察点随后会做一次幂等重建。
+        if (hasCustomRoles) {
+          rebuildRoleCatalog(validatedSettings.customRoles);
+          syncRoleTools();
+        }
         const descriptor = settings.describe().find((entry) => entry.ns === SETTINGS_NAMESPACE);
         // 提交后基线改从 describe() 读取（旧 settings.get 已从宿主删除）；value 是
         // defaults resolved 结果，与读取面同一份权威值。
@@ -6040,6 +8291,25 @@ export default {
         if (!hasTaskManagementEnabled) delete committedSettings.taskManagementEnabled;
         if (!hasAutoOpenSubagentSidebar) delete committedSettings.autoOpenSubagentSidebar;
         if (!hasPromptOverrides) delete committedSettings[PROMPT_OVERRIDES_SETTINGS_KEY];
+        if (!hasNotificationEvents) delete committedSettings.notificationEvents;
+        if (!hasCandidates) delete committedSettings.candidates;
+        if (!hasFallbackLimit) delete committedSettings.fallbackLimit;
+        if (!hasCustomRoles) delete committedSettings.customRoles;
+        // 并发映射同上：旧客户端不传时响应保持历史形状（不新增字段）。
+        if (!hasRoleLimits) delete committedSettings.roleLimits;
+        if (!hasProviderLimits) delete committedSettings.providerLimits;
+        // 上下文继承同理：旧客户端不传时响应保持历史形状（不新增字段）。
+        if (!hasInheritContext) delete committedSettings.inheritContext;
+        // 单价同理：旧客户端不传时响应保持历史形状（不新增字段）。
+        if (!hasModelPrices) delete committedSettings.modelPrices;
+        // 读取诊断只服务 RPC meta 的有界投影，绝不进入设置响应（它不是配置）。
+        delete committedSettings.customRoleDiagnostics;
+        // 并发映射的读取期丢弃诊断同理：它是诊断，不是可回写的配置。
+        delete committedSettings.limitDiagnostics;
+        // 上下文继承的读取期丢弃诊断同样只是诊断，不是可回写的配置。
+        delete committedSettings.inheritContextDiagnostics;
+        // 单价读取期丢弃诊断同样只是诊断，不是可回写的配置。
+        delete committedSettings.modelPriceDiagnostics;
         return {
           settings: committedSettings,
           // 保存成功后直接回传最新只读投影：客户端据此更新基线、dirty 与"已自定义"
@@ -6106,6 +8376,9 @@ export default {
         record.state = "released";
         fanoutTurnWaitRecords.delete(parentTaskId);
       }
+      // per-shard 排队镜像同样随代际退休丢弃（票据 26）：账本本身由
+      // rootTurnWaits.retire 整体收口，这里只清理组合根侧的本地镜像。
+      dropFanoutShardWaitsForRoot(previous);
     }
 
     function retireRootGeneration(previous) {
@@ -6340,6 +8613,19 @@ export default {
       // child_models 记录在真实 storage-domain 写入边界被拒绝（连带丢掉 provider/model）。
       const personaMarkerSnapshot = validPersonaMarker(agent.options?.[PERSONA_MARKER])
         ?? validPersonaMarker(recordedExpert?.[PERSONA_MARKER]);
+      // 实际路由快照（票据 24）：优先当前 agentOptions marker；cold-resume 的 Host 不还原
+      // agentOptions，因此回落到 DEG 自有 child_models 记录里的扁平字段，避免恢复写回擦除。
+      const recordedRouteFields = modelRouteFieldsFromRecord(recordedExpert);
+      const routeMarkerSnapshot = normalizeModelRouteMarker(agent.options?.[EXPERT_ROUTE_MARKER])
+        ?? (Object.keys(recordedRouteFields).length === 0 ? undefined : recordedRouteFields);
+      // 上下文继承快照（票据 29）：优先本次派发写入的 agentOptions marker；cold-resume
+      // 的 Host 不还原 agentOptions，回落到 DEG 自有 child_models 记录，避免恢复写回
+      // 把“该 child 是继承型”擦成普通 spawn。
+      const subagentProviderSnapshot = validSubagentProviderName(agent.options?.[EXPERT_SUBAGENT_PROVIDER_MARKER])
+        ?? validSubagentProviderName(recordedExpert?.subagentProvider);
+      const inheritContextSnapshot = typeof agent.options?.[EXPERT_INHERIT_CONTEXT_MARKER] === "boolean"
+        ? agent.options[EXPERT_INHERIT_CONTEXT_MARKER]
+        : (typeof recordedExpert?.inheritContext === "boolean" ? recordedExpert.inheritContext : void 0);
       if (pluginChildAuthenticated) registerPluginExpertChildAgent(agent);
       if (isExpertChild) {
         // 该监听器在早期 guard listener 之后运行；此时 role/parentId 已从 marker、
@@ -6347,12 +8633,14 @@ export default {
         installExpertReportGuardForAgent(agent, { role, parentId, source: recordedExpert === void 0 ? "marker" : "snapshot" });
       }
       if (typeof agent?.options?.provider === "string" && typeof agent?.options?.model === "string" && (isExpertChild || effort !== void 0)) {
-        writeChildModel(agent.id, {
+        void writeChildModel(agent.id, {
           provider: agent.options.provider,
           model: agent.options.model,
           reasoningEffort: effort === void 0 ? void 0 : String(effort),
           ...(isExpertChild ? {
             role,
+            // 角色显示名快照（票据 27）：自定义角色删除后历史任务仍能显示标签。
+            ...(typeof roleLabelOfRole(role) === "string" ? { roleLabel: roleLabelOfRole(role) } : {}),
             parentId,
             ...(isContinuable ? { continuable: true } : {}),
             // Host recovery 不持久化 RC1 agentOptions；把 admission deny 快照放入
@@ -6365,11 +8653,25 @@ export default {
             // 同一份 admission persona 快照：cold-resume 恢复写回不得擦除记录值；
             // malformed 值在写入前已被过滤，不会污染 durable schema。
             ...(personaMarkerSnapshot === void 0 ? {} : { [PERSONA_MARKER]: personaMarkerSnapshot }),
+            // 实际路由元数据（票据 24）：与 provider/model 同层落盘，恢复/续作只读不重选。
+            ...(routeMarkerSnapshot === undefined ? {} : routeMarkerSnapshot),
+            // 目标 subagent provider 与继承开关（票据 29）：恢复/重建只读这两个字段，
+            // 绝不按当前设置重新选择。旧记录缺失时按 spawn/false 处理。
+            ...(subagentProviderSnapshot === void 0 ? {} : { subagentProvider: subagentProviderSnapshot }),
+            ...(inheritContextSnapshot === void 0 ? {} : { inheritContext: inheritContextSnapshot }),
+            // 结构化交付（票据 30）：只保留“声明过”的布尔与已捕获的只读结果；
+            // cold-resume 不重新声明 schema，但既有结果/标记必须原样保留，不能被
+            // 基础记录写回擦掉。
+            ...(agent?.options?.[OUTPUT_SCHEMA_REQUESTED_MARKER] === true
+              || recordedExpert?.outputSchemaRequested === true
+              ? { outputSchemaRequested: true }
+              : {}),
+            ...(recordedExpert?.structured === undefined ? {} : { structured: recordedExpert.structured }),
             // shadow 生效性判定快照：composition 已在本监听器之前安装并判定，
             // 因此这里能写出 verified/absent 等实际结果（foreign 会让本监听器不会被执行）。
             ...shadowMarkerFields(agent.id),
           } : {}),
-        });
+        }).then(() => flushPendingStructuredPatch(agent.id));
       }
       installEffortInjection(agent, effort);
     });
@@ -7180,24 +9482,63 @@ export default {
       if (typeof source.provider !== "string" || typeof source.model !== "string") {
         throw new Error("cannot rebuild recovery child because its original model route is unavailable");
       }
-      // 角色必须已注册：未注册角色连默认 persona 都没有，重建出来的 child 会失去
-      // 全部角色约束，因此这里 fail-closed，而不是回落到某个通用人格。
-      if (ROLE_META[record.role] === void 0) throw new Error("cannot rebuild recovery child because its expert role is unavailable");
+      // 角色元数据（票据 27）：自定义角色可能在 child 创建后被删除，此时必须使用 child
+      // 创建时持久化的 persona，而不是把角色变成未知或回落到通用人格；两者都没有时
+      // fail-closed（未注册角色连默认 persona 都没有，重建出来的 child 会失去全部约束）。
+      // 注意：本函数内的 `source` 是 recovery 上下文，child_models 读源必须显式走 storage 读源。
+      const persistedChild = typeof record.childId === "string" ? readStorageSnapshot()?.childModels?.[record.childId] : void 0;
+      const recordedPersona = validPersonaMarker(persistedChild?.[PERSONA_MARKER])
+        ?? validPersonaMarker(source?.[PERSONA_MARKER])
+        ?? validPersonaMarker(source?.persona);
       const oldChildId = record.childId;
       // recovery record 仍保存旧 request.toolFilter；新版本若已保存 marker，优先沿用
       // admission 的完整结果，再用旧字段兼容历史记录。
       const recoveryDeny = ensureExpertSendMessageDenied(
         source?.[DENY_MARKER] ?? source?.agentOptions?.[DENY_MARKER] ?? source.toolFilter,
       );
-      // 路由仍沿用 source 的 provider/model，但 persona 必须在 admission 边界重新解析：
-      // 恢复是"新建 child"的一条路径，因此既不能复用旧快照，也不能跳过用户覆盖
-      // 与固定纪律的分层（纪律升级后同样必须立刻生效）。解析结果除交给宿主 composition
-      // 外同时写入内部 marker，让 agent/created 的持久化看到同一个值。
-      const childPersona = resolvePersonaForAdmission(record.role);
+      // 路由仍沿用 source 的 provider/model。persona 的优先级（票据 27）：
+      // 1. 角色**仍在运行期目录**：与历史行为一致，在 admission 边界重新解析——恢复是
+      //    "新建 child"的一条路径，不能跳过用户覆盖与固定纪律的分层（纪律升级后立刻生效）；
+      // 2. 角色**已被删除**（不在目录）：使用 child 创建时持久化的 persona 快照，保住人格，
+      //    绝不因为角色消失而变成未知角色或通用人格；
+      // 3. 两者都没有 → fail-closed（见上）。
+      // 解析结果除交给宿主 composition 外同时写入内部 marker，让 agent/created 看到同一个值。
+      const childPersona = resolveRecoveryPersona({
+        roleKnown: roleCatalog().has(record.role),
+        currentPersona: roleCatalog().has(record.role) ? resolvePersonaForAdmission(record.role) : void 0,
+        recordedPersona,
+      });
+      if (typeof childPersona !== "string" || childPersona.length === 0) {
+        throw new Error("cannot rebuild recovery child because its expert role is unavailable");
+      }
+      // 目标 subagent provider（票据 29）：只读原 child_models 快照（缺失字段时回落到
+      // 本进程保存的恢复上下文）。原继承型 child 的 fork provider 已不可用、或父日志
+      // 不再有已完成 turn 时，明确失败并提示重新派发；绝不静默改成 spawn 丢失上下文。
+      // 消息以 Cannot rebuild 开头，让恢复分类器把它当作终止性错误，不无限重试。
+      const persistedTarget = {
+        subagentProvider: persistedChild?.subagentProvider ?? source?.subagentProvider,
+        inheritContext: typeof persistedChild?.inheritContext === "boolean"
+          ? persistedChild.inheritContext
+          : source?.inheritContext,
+      };
+      let subagentTarget;
+      try {
+        subagentTarget = resolvePersistedSubagentTarget(record.role, parent, persistedTarget);
+      } catch (error) {
+        throw contextInheritanceError(
+          "cannot rebuild recovery child because " + (error instanceof Error ? error.message : String(error))
+            + "；请重新派发该任务",
+          error?.code === CONTEXT_INHERITANCE_ERROR_CODES.EMPTY
+            ? CONTEXT_INHERITANCE_ERROR_CODES.EMPTY
+            : CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE,
+        );
+      }
       const request = {
         label: source.label,
         prompt: [{ type: "text", text: buildExpertTaskPrompt(record.role, promptText) }],
         parent,
+        // 内部字段：只供 startExpertActivation 选择宿主 provider，调用宿主前剥离。
+        subagentProvider: subagentTarget.provider,
         agentOptions: {
           provider: source.provider,
           model: source.model,
@@ -7207,11 +9548,19 @@ export default {
           [CONTINUABLE_MARKER]: true,
           [DENY_MARKER]: recoveryDeny,
           [PERSONA_MARKER]: childPersona,
+          [EXPERT_SUBAGENT_PROVIDER_MARKER]: subagentTarget.provider,
+          [EXPERT_INHERIT_CONTEXT_MARKER]: subagentTarget.inheritContext,
         },
         persona: childPersona,
         toolFilter: { deny: recoveryDeny },
         maxDepth: source.maxDepth ?? 1,
       };
+      // 结构化交付（票据 30）：冷恢复/重建会创建新 activation，但宿主 descriptor
+      // 不保存 outputSchema，本轮无法重新声明；只保留“曾声明过”的事实并标记回退。
+      if (persistedChild?.outputSchemaRequested === true && request.outputSchema === undefined) {
+        request.agentOptions[OUTPUT_SCHEMA_REQUESTED_MARKER] = true;
+        markStructuredRequest(request, { requested: true, notRestored: true });
+      }
       const pending = { parent: record.parentAgent, parentId: record.parentId, role: record.role, record, op };
       recovery.queueRebuild(pending);
       let childId;
@@ -7701,6 +10050,14 @@ export default {
       rootTurnWaits.dispose();
       rootWaitInvalidators.clear();
       fanoutTurnWaitRecords.clear();
+      // 结构化声明映射只服务本进程派发；卸载时没有可复用的 activation 契约。
+      clearAllFanoutOutputSchemas();
+      clearAllFanoutRoutes();
+      pendingStructuredPatches.clear();
+      // 结构化结果的有界重试定时器必须随卸载清除，避免关闭后仍有回调写已失效的 storage。
+      clearAllStructuredRetries();
+      // per-shard 排队镜像随账本一起丢弃（票据 26）：dispose 已收口全部 waiter 与 works。
+      fanoutShardWaitRecords.clear();
       pendingChildTurnEnds.clear();
       // pendingHandoffAdmissions 只是 host 索引；cohort 另外持有 root/entry 引用，
       // 卸载时必须先遍历所有 known root 并清空共享 entries，再丢弃数组索引。
@@ -7722,6 +10079,37 @@ export default {
     // ── 专家委派工具 ────────────────────────────────────────────────────────
     /** 已挂载角色对应的工具注销器；注册必须归当前 ctx Fiber 所有。 */
     const toolDisposers = new Map();
+    /**
+     * 已挂载角色工具的「有效定义指纹」（票据 27 补强）。
+     *
+     * mountRole 以 toolDisposers 去重，因此同一 role 已挂载时不会重新注册；但角色的
+     * label/description/statusLabel/persona/toolDeny/readOnly 都可能在设置页被修改，
+     * 而工具描述与静态元数据只在注册时生成。目录重建/同步时用本表比较有效定义：
+     * 实质变化 → 先卸载再挂载，让下一次工具列表/描述立即反映新定义。
+     *
+     * 指纹按逐字比较（含 toolDeny 顺序）：只影响是否多重挂一次，不改变任何权限语义；
+     * 权限与 persona 在 admission 边界本就现算，指纹只是工具面的刷新触发器。
+     */
+    const mountedRoleSignatures = new Map();
+
+    /**
+     * 角色有效定义的稳定指纹（只覆盖影响工具描述/静态元数据的字段）。
+     *
+     * @param {object|undefined} entry - 运行期目录里的角色记录。
+     * @returns {string} 可逐字比较的 JSON 指纹；未知角色返回空串。
+     */
+    function roleDefinitionSignature(entry) {
+      if (entry === null || typeof entry !== "object") return "";
+      return JSON.stringify([
+        entry.id ?? "",
+        entry.label ?? "",
+        entry.statusLabel ?? "",
+        entry.description ?? "",
+        entry.persona ?? "",
+        entry.readOnly === true,
+        Array.isArray(entry.toolDeny) ? entry.toolDeny : [],
+      ]);
+    }
 
     /**
      * spawn provider 是否具备本工具用到的全部能力。
@@ -7750,6 +10138,555 @@ export default {
     }
 
     /**
+     * 构造结构化声明错误：稳定 code + 有界 violations/字节数，绝不回显 schema 原文。
+     *
+     * 三种错误都带 validation=true，角色工具会把它映射成无凭据的 rejected 回执，
+     * fanout 工具则直接抛出并保留 code；错误消息只包含固定文案与路径/字节数。
+     */
+    function outputSchemaError(code, message, details = {}) {
+      const error = new Error(message);
+      error.name = "OutputSchemaError";
+      error.code = code;
+      error.validation = true;
+      error.details = details;
+      return error;
+    }
+
+    /**
+     * 校验并归一调用方给出的 outputSchema（票据 30）。
+     *
+     * 顺序固定：形状 -> 宿主同一套 assertObjectJsonSchema -> 深拷贝 -> UTF-8 64KiB。
+     * 深拷贝保证后续派发使用的是此刻校验过的纯 JSON 对象，调用方之后修改原对象不会
+     * 改变实际 schema；同时让字节数口径与真正发给宿主的内容一致。
+     *
+     * @param {unknown} raw - 工具入参上的 outputSchema。
+     * @param {string} label - 错误消息里的调用点标签（角色名/分片）。
+     * @returns {{schema: object, bytes: number}|undefined} 未声明时 undefined。
+     */
+    function normalizeOutputSchemaDeclaration(raw, label) {
+      if (raw === undefined || raw === null) return undefined;
+      if (typeof raw !== "object" || Array.isArray(raw)) {
+        throw outputSchemaError(
+          OUTPUT_SCHEMA_ERROR_CODES.INVALID,
+          label + " 的 outputSchema 必须是 JSON Schema 对象",
+          { violations: ["schema must be an object"] },
+        );
+      }
+      try {
+        assertObjectJsonSchema(raw);
+      } catch (error) {
+        const violations = Array.isArray(error?.violations) && error.violations.length > 0
+          ? error.violations.slice(0, 32).map((entry) => String(entry).slice(0, 256))
+          : ["schema is not a supported object-rooted JSON Schema"];
+        throw outputSchemaError(
+          OUTPUT_SCHEMA_ERROR_CODES.INVALID,
+          label + " 的 outputSchema 不合法：" + violations.join("; "),
+          { violations },
+        );
+      }
+      let schema;
+      try {
+        schema = JSON.parse(JSON.stringify(raw));
+      } catch {
+        throw outputSchemaError(
+          OUTPUT_SCHEMA_ERROR_CODES.INVALID,
+          label + " 的 outputSchema 不是无损 JSON",
+          { violations: ["schema must be lossless JSON"] },
+        );
+      }
+      const bytes = utf8ByteLength(JSON.stringify(schema));
+      if (bytes > OUTPUT_SCHEMA_MAX_BYTES) {
+        throw outputSchemaError(
+          OUTPUT_SCHEMA_ERROR_CODES.TOO_LARGE,
+          label + " 的 outputSchema 序列化后为 " + bytes + " bytes，超过 " + OUTPUT_SCHEMA_MAX_BYTES + " 上限",
+          { bytes, maxBytes: OUTPUT_SCHEMA_MAX_BYTES },
+        );
+      }
+      return { schema, bytes };
+    }
+
+    /**
+     * 目标 subagent provider 必须显式声明 capabilities.outputSchema === true。
+     *
+     * 宿主在 assertCapabilities 阶段会拒绝不支持该能力的请求且不会创建 child；DEG 在
+     * 派发前先做同一判定，返回自己的稳定 code，绝不静默把结构化请求降级成纯文本。
+     * legacy startContinuable 没有 outputSchema 契约，同样视为不支持。
+     */
+    function assertOutputSchemaProviderSupport(providerName, label) {
+      if (typeof subagents?.startActivation !== "function") {
+        throw outputSchemaError(
+          OUTPUT_SCHEMA_ERROR_CODES.UNSUPPORTED,
+          label + " 的 outputSchema 无法声明：当前宿主只有 legacy startContinuable，没有结构化输出契约",
+        );
+      }
+      let provider;
+      try { provider = subagents.getProvider(providerName); } catch { provider = undefined; }
+      if (provider === undefined || provider === null || provider.capabilities?.outputSchema !== true) {
+        throw outputSchemaError(
+          OUTPUT_SCHEMA_ERROR_CODES.UNSUPPORTED,
+          label + " 的 outputSchema 无法声明：subagent provider \"" + String(providerName)
+            + "\" 不支持结构化输出；请移除 schema 或改用支持 outputSchema 的 provider",
+        );
+      }
+    }
+
+    /**
+     * request -> 结构化派发元数据的进程内映射（绝不写入 request 字段）。
+     *
+     * request.outputSchema 会原样透传给宿主；notRestored 只用于恢复路径：本轮新建
+     * activation 时无法重新声明 schema，结果标记为 schema_not_restored。
+     */
+    const structuredRequestMeta = new WeakMap();
+
+    function markStructuredRequest(request, meta) {
+      if (request !== null && typeof request === "object") structuredRequestMeta.set(request, meta);
+    }
+
+    /** request 是否声明过结构化输出（schema 本身或布尔 marker）。 */
+    function structuredRequestedOfRequest(request) {
+      if (request === null || typeof request !== "object") return false;
+      if (request.outputSchema !== undefined) return true;
+      const marker = request.agentOptions?.[OUTPUT_SCHEMA_REQUESTED_MARKER];
+      return marker === true;
+    }
+
+    /** 待写 structured 补丁：child_models 记录尚未建立 provider/model 时先留在内存。 */
+    const pendingStructuredPatches = new Map();
+    const PENDING_STRUCTURED_LIMIT = 256;
+    /**
+     * 结构化结果落盘失败后的有界重试状态（票据 30 × 25 的持久化健壮性）。
+     *
+     * - retryTimers：childId -> 定时器；同一 child 只保留一个，失败风暴不会线性放大；
+     * - retryPatches：childId -> 合并后的最新补丁；重试成功/放弃时一起清掉。
+     *
+     * 上限与 pending 表同阶：childId 来自 DEG 自己的 child 记录，不会无限增长。
+     */
+    const structuredRetryTimers = new Map();
+    const structuredRetryPatches = new Map();
+    const STRUCTURED_WRITE_RETRY_LIMIT = 3;
+    const STRUCTURED_WRITE_RETRY_DELAY_MS = 200;
+
+    function childModelRecordOf(childId) {
+      if (typeof childId !== "string" || childId.length === 0) return undefined;
+      try { return source()?.childModels?.[childId]; } catch { return undefined; }
+    }
+
+    /** 清掉某 child 的重试定时器与待重试补丁（成功、放弃、卸载时调用）。 */
+    function clearStructuredRetry(childId) {
+      const timer = structuredRetryTimers.get(childId);
+      if (timer !== undefined) {
+        try { clearTimeout(timer); } catch { /* 清理失败不影响后续流程 */ }
+        structuredRetryTimers.delete(childId);
+      }
+      structuredRetryPatches.delete(childId);
+    }
+
+    function clearAllStructuredRetries() {
+      for (const timer of structuredRetryTimers.values()) {
+        try { clearTimeout(timer); } catch { /* 同上 */ }
+      }
+      structuredRetryTimers.clear();
+      structuredRetryPatches.clear();
+    }
+
+    /**
+     * 安排一次有界重试（指数退避，200ms 起、封顶 2s，最多 3 次）。
+     *
+     * 预算用尽后只告警并放弃自动重试；补丁本身已经写到内存/磁盘的其他入口，
+     * 下一次同 child 的新结果仍会重新尝试。绝不无限高频重试同一条失败写入。
+     */
+    function scheduleStructuredRetry(childId, patch, attempt) {
+      if (attempt > STRUCTURED_WRITE_RETRY_LIMIT) {
+        clearStructuredRetry(childId);
+        ctx.logger.warn("dsh-expert-group: structured result persistence retry budget exhausted for child " + childId);
+        return;
+      }
+      // 合并同一 child 的最新补丁；旧补丁已被新结果替代，没必要分别重试。
+      if (!structuredRetryPatches.has(childId) && structuredRetryPatches.size >= PENDING_STRUCTURED_LIMIT) {
+        const oldest = structuredRetryPatches.keys().next().value;
+        if (oldest !== undefined) clearStructuredRetry(oldest);
+      }
+      structuredRetryPatches.set(childId, { ...(structuredRetryPatches.get(childId) ?? {}), ...patch });
+      if (structuredRetryTimers.has(childId)) return;
+      const delay = STRUCTURED_WRITE_RETRY_DELAY_MS * 2 ** (attempt - 1);
+      const timer = setTimeout(() => {
+        structuredRetryTimers.delete(childId);
+        const pending = structuredRetryPatches.get(childId);
+        if (pending === undefined) return;
+        structuredRetryPatches.delete(childId);
+        writeStructuredPatch(childId, pending, attempt);
+      }, delay);
+      try { timer?.unref?.(); } catch {}
+      structuredRetryTimers.set(childId, timer);
+    }
+
+    /**
+     * 写入结构化结果补丁（与 usage/route 共用同一合并写入口）。
+     *
+     * - 记录已存在 provider/model：直接合并写 child_models.structured/outputSchemaRequested；
+     * - 记录尚未落盘：先放有界内存表，等 agent/created / persistChildDispatch 完成基础记录
+     *   写入后再补，避免写出缺少 provider/model 的非法 domain 记录；
+     * - 写失败：保留补丁并在有界预算内退避重试（而不是像旧实现那样只告警一次就丢失），
+     *   但绝不把失败升级成 child/task 结算异常；
+     * - attempt 只由重试路径传入：>0 表示这是重试，不再重复清零既有重试状态。
+     */
+    function writeStructuredPatch(childId, patch, attempt = 0) {
+      if (typeof childId !== "string" || childId.length === 0) return;
+      if (attempt === 0) clearStructuredRetry(childId);
+      const record = childModelRecordOf(childId);
+      if (typeof record?.provider === "string" && record.provider.length > 0
+        && typeof record?.model === "string" && record.model.length > 0) {
+        void writeChildModelPatch(childId, patch, { rethrow: true }).then(
+          () => { clearStructuredRetry(childId); },
+          (error) => {
+            ctx.logger.warn("dsh-expert-group: structured result persistence failed: " + (error instanceof Error ? error.message : String(error)));
+            scheduleStructuredRetry(childId, patch, attempt + 1);
+          },
+        ).catch((error) => {
+          // 兜底：重试调度自身抛错也不能产生未处理 rejection（旁路持久化绝不升级异常）。
+          ctx.logger.warn("dsh-expert-group: structured result retry scheduling failed: " + (error instanceof Error ? error.message : String(error)));
+        });
+        return;
+      }
+      if (!pendingStructuredPatches.has(childId) && pendingStructuredPatches.size >= PENDING_STRUCTURED_LIMIT) {
+        const oldest = pendingStructuredPatches.keys().next().value;
+        if (oldest !== undefined) pendingStructuredPatches.delete(oldest);
+      }
+      pendingStructuredPatches.set(childId, { ...(pendingStructuredPatches.get(childId) ?? {}), ...patch });
+    }
+
+    /** 基础 child_models 记录写入完成后补写待处理的 structured 补丁。 */
+    function flushPendingStructuredPatch(childId) {
+      if (!pendingStructuredPatches.has(childId)) return;
+      const record = childModelRecordOf(childId);
+      if (typeof record?.provider !== "string" || record.provider.length === 0
+        || typeof record?.model !== "string" || record.model.length === 0) return;
+      const patch = pendingStructuredPatches.get(childId);
+      pendingStructuredPatches.delete(childId);
+      // 复写入口而不是直接写：基础记录已存在 → 走带重试的直接写入分支。
+      writeStructuredPatch(childId, patch);
+    }
+
+    /** 结构化结果回退补丁（只带 fallback/reason/可选 bytes，不保存 value）。 */
+    function structuredFallbackPatch(reason, bytes) {
+      return {
+        structured: {
+          fallback: true,
+          reason,
+          ...(Number.isSafeInteger(bytes) && bytes >= 0 ? { bytes } : {}),
+        },
+        outputSchemaRequested: true,
+      };
+    }
+
+    /**
+     * 把 activation.result 归一成持久化补丁（票据 30）。
+     *
+     * - 无 structured：missing_structured（宿主可能把 stopReason 改 error，但文本仍有效）；
+     * - structured 非无损 JSON：result_unavailable；
+     * - 序列化 > 64KiB：result_too_large，只记字节数；
+     * - 正常：value + bytes + receivedAt。
+     */
+    function structuredPatchFromActivationResult(result) {
+      if (result === null || typeof result !== "object" || !Object.prototype.hasOwnProperty.call(result, "structured")
+        || result.structured === undefined) {
+        return structuredFallbackPatch(STRUCTURED_RESULT_FALLBACK_REASONS.MISSING_STRUCTURED);
+      }
+      let serialized;
+      try {
+        serialized = JSON.stringify(result.structured);
+      } catch {
+        serialized = undefined;
+      }
+      if (serialized === undefined) {
+        return structuredFallbackPatch(STRUCTURED_RESULT_FALLBACK_REASONS.RESULT_UNAVAILABLE);
+      }
+      const bytes = utf8ByteLength(serialized);
+      if (bytes > OUTPUT_SCHEMA_MAX_BYTES) {
+        return structuredFallbackPatch(STRUCTURED_RESULT_FALLBACK_REASONS.RESULT_TOO_LARGE, bytes);
+      }
+      let value;
+      try { value = JSON.parse(serialized); } catch {
+        return structuredFallbackPatch(STRUCTURED_RESULT_FALLBACK_REASONS.RESULT_UNAVAILABLE, bytes);
+      }
+      return { structured: { value, bytes, receivedAt: Date.now() }, outputSchemaRequested: true };
+    }
+
+    /**
+     * 启动成功后**立即**挂接 result，绝不 await（票据 30）。
+     *
+     * 工具 execute 只返回 admission；结果在后台按 Promise 回调写入 child_models。
+     * rejection 被显式消费，因此不会产生未处理 rejection，也不改写 child 的既有结算。
+     */
+    function armStructuredResultCapture(activation, request) {
+      if (!structuredRequestedOfRequest(request)) return;
+      const childId = activation?.childId;
+      if (typeof childId !== "string" || childId.length === 0) return;
+      const meta = structuredRequestMeta.get(request);
+      if (meta?.notRestored === true) {
+        writeStructuredPatch(childId, structuredFallbackPatch(STRUCTURED_RESULT_FALLBACK_REASONS.SCHEMA_NOT_RESTORED));
+        return;
+      }
+      const result = activation?.result;
+      if (result === null || typeof result !== "object" || typeof result.then !== "function") {
+        writeStructuredPatch(childId, structuredFallbackPatch(STRUCTURED_RESULT_FALLBACK_REASONS.RESULT_UNAVAILABLE));
+        return;
+      }
+      Promise.resolve(result).then(
+        (value) => { writeStructuredPatch(childId, structuredPatchFromActivationResult(value)); },
+        () => { writeStructuredPatch(childId, structuredFallbackPatch(STRUCTURED_RESULT_FALLBACK_REASONS.RESULT_UNAVAILABLE)); },
+      ).catch((error) => {
+        ctx.logger.warn("dsh-expert-group: structured result capture failed: " + (error instanceof Error ? error.message : String(error)));
+      });
+    }
+
+    /**
+     * 构造上下文继承的结构化错误（票据 29）。
+     *
+     * 错误同时带 `code` 与 `validation` 之外的显式标记；消息只含用户可读原因与
+     * “重新派发”指引，不包含 prompt、会话内容或宿主原始错误正文。
+     *
+     * @param {string} message - 用户可读原因。
+     * @param {string} code - CONTEXT_INHERITANCE_ERROR_CODES 之一。
+     * @returns {Error} 带稳定 code 的错误。
+     */
+    function contextInheritanceError(message, code) {
+      const error = new Error(message);
+      error.code = code;
+      error.validation = true;
+      return error;
+    }
+
+    /** 目标 subagent provider 名：只接受非空字符串（配置/注册面可能给出任意值）。 */
+    function validSubagentProviderName(value) {
+      return typeof value === "string" && value.trim().length > 0 && value.length <= 128
+        ? value.trim()
+        : void 0;
+    }
+
+    /**
+     * 宿主当前注册的 provider 名列表。
+     *
+     * rc.2 的 SubagentService 公开 `list()`（返回注册名、插入顺序）；旧替身可能没有
+     * 该 seam，此时返回 undefined，调用方只按默认名探测。绝不用私有 map 或猜测
+     * provider 名。
+     *
+     * @returns {string[]|undefined} 注册名数组；seam 缺失/抛错/形状非法时 undefined。
+     */
+    function registeredSubagentProviderNames() {
+      if (typeof subagents.list !== "function") return void 0;
+      try {
+        const names = subagents.list();
+        if (!Array.isArray(names)) return void 0;
+        return names.filter((name) => typeof name === "string" && name.trim().length > 0);
+      } catch {
+        return void 0;
+      }
+    }
+
+    /**
+     * provider 是否具备“继承父上下文”的全部能力位（票据 29 / 契约报告 §3.1）。
+     *
+     * 判定只看公开形状：
+     * - inheritsParentContext === true（描述性字段，但必须由 provider 自己声明）；
+     * - prepareContinuable 是函数（local/continuable 路径）；
+     * - capabilities.agentOptions / depthLimit 都为 true。
+     *
+     * 刻意不要求 agentPreset：官方 fork provider 的 agentPreset=false，且 DEG 从不为
+     * 继承型 child 传 preset。也不在这里调用 prepareContinuable（那属于宿主 manager
+     * 的启动路径，DEG 只做只读能力探测）。
+     *
+     * @param {object|undefined} provider - 已注册 provider。
+     * @returns {boolean} 是否可用于上下文继承。
+     */
+    function providerInheritsParentContext(provider) {
+      if (provider === void 0 || provider === null) return false;
+      const caps = provider.capabilities ?? {};
+      return provider.inheritsParentContext === true
+        && typeof provider.prepareContinuable === "function"
+        && caps.agentOptions === true
+        && caps.depthLimit === true;
+    }
+
+    /**
+     * 解析继承型 subagent provider 的注册名（票据 29）。
+     *
+     * 规则（绝不猜）：
+     * 1. 若名为 "fork" 的 provider 满足全部能力位 → 用它（官方默认名）；
+     * 2. 否则按能力位收集全部候选：
+     *    - 恰好一个 → 用它（宿主可能自定义了 providerName）；
+     *    - 多个 → 仅当恰好一个名字包含 "fork"（不区分大小写）时用它；
+     *    - 其余情况（无候选 / 多个 fork 命名 / 多个无 fork 命名）→ 显式不可用。
+     *
+     * @returns {string} 可用的继承型 provider 名。
+     * @throws {Error} code=CONTEXT_INHERITANCE_UNAVAILABLE。
+     */
+    function resolveInheritingSubagentProviderName() {
+      const preferred = "fork";
+      const providerOf = (name) => {
+        try { return subagents.getProvider(name); } catch { return void 0; }
+      };
+      if (providerInheritsParentContext(providerOf(preferred))) return preferred;
+      const registered = registeredSubagentProviderNames();
+      const names = registered === void 0 ? [preferred] : registered;
+      const candidates = [];
+      for (const name of names) {
+        if (name === preferred) continue;
+        if (providerInheritsParentContext(providerOf(name))) candidates.push(name);
+      }
+      if (candidates.length === 1) return candidates[0];
+      if (candidates.length > 1) {
+        const forkish = candidates.filter((name) => /fork/i.test(name));
+        if (forkish.length === 1) return forkish[0];
+      }
+      throw contextInheritanceError(
+        "当前宿主没有可用的上下文继承 provider（需要 inheritsParentContext=true、"
+          + "prepareContinuable 以及 agentOptions/depthLimit 能力位）；"
+          + "请改用普通专家或重新派发",
+        CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE,
+      );
+    }
+
+    /**
+     * 读取父会话的完整事件日志（与宿主 fork provider 的 `completedTurnPrefix` 同源）。
+     *
+     * 优先使用 Session.snapshotEvents()（rc.2 上 fork provider 读的就是它）；没有该
+     * 方法时回落到公开的 `session.events` 数组。只读，不复制事件、不构造 seed。
+     *
+     * @param {object|undefined} parent - 调用派发的父代理。
+     * @returns {Array|undefined} 事件数组；日志不可读时 undefined。
+     */
+    function parentSessionEvents(parent) {
+      const session = parent?.session;
+      if (session === null || typeof session !== "object") return void 0;
+      if (typeof session.snapshotEvents === "function") {
+        try {
+          const events = session.snapshotEvents();
+          return Array.isArray(events) ? events : void 0;
+        } catch {
+          return void 0;
+        }
+      }
+      return Array.isArray(session.events) ? session.events : void 0;
+    }
+
+    /**
+     * 派发前检查父会话是否已有“已完成的 turn”（票据 29）。
+     *
+     * 宿主 fork provider 找不到 turn/end 时会静默返回空 seed，子代理按 fresh 启动；
+     * 因此 DEG 必须在派发前用同一日志来源确认存在最后一个 turn/end。检查只读：
+     * 不切边界、不调用 buildForkSeed、不复制父历史——边界与 seed 完全交给 provider。
+     *
+     * 进行中的 turn 不影响本检查：最后一个 turn/end（含）之后的 tail 由 provider 排除；
+     * 只要存在任何一个 turn/end 就可以安全继承。
+     *
+     * @param {object|undefined} parent - 父代理。
+     * @throws {Error} code=CONTEXT_INHERITANCE_EMPTY（无已完成 turn）或
+     *   CONTEXT_INHERITANCE_UNAVAILABLE（日志不可读）。
+     */
+    function assertParentHasCompletedTurn(parent) {
+      const events = parentSessionEvents(parent);
+      if (events === void 0) {
+        throw contextInheritanceError(
+          "当前会话无法读取已完成 turn 日志，无法继承上下文；请改用普通专家或重新派发",
+          CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE,
+        );
+      }
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        if (events[index]?.type === "turn/end") return;
+      }
+      throw contextInheritanceError(
+        "当前会话还没有已完成的 turn，无法继承上下文；请先完成一轮对话后重新派发",
+        CONTEXT_INHERITANCE_ERROR_CODES.EMPTY,
+      );
+    }
+
+    /**
+     * 角色是否开启了上下文继承（票据 29）。
+     *
+     * 读取面已丢弃 Observer/未知/自定义角色键与非法值；这里再显式排除 Observer，
+     * 即便设置被外部写成 true 也强制关闭（Observer 的安全边界不依赖设置校验）。
+     *
+     * @param {string} role - 角色 id。
+     * @returns {boolean} 是否继承父上下文。
+     */
+    function roleInheritsContext(role) {
+      if (typeof role !== "string" || role.length === 0) return false;
+      if (role === "observer") return false;
+      if (!CONTEXT_INHERITANCE_ROLE_IDS.includes(role)) return false;
+      let snapshot;
+      try { snapshot = settingsSource(); } catch { return false; }
+      return snapshot?.inheritContext?.[role] === true;
+    }
+
+    /**
+     * 解析一次派发应使用的 subagent provider 与继承开关（票据 29）。
+     *
+     * - Observer 永远 spawn（即使设置被外部写成 true）；
+     * - 未开启继承的角色继续使用既有 spawn provider（保留 spawnProviderReady 语义）；
+     * - 开启继承的角色必须使用合格的继承型 provider，并在派发前确认父日志存在
+     *   已完成 turn；任何一项不成立都显式失败，绝不静默回退 spawn。
+     *
+     * @param {string} role - 角色 id。
+     * @param {object} parent - 实际父代理（seed 来源）。
+     * @returns {{provider: string, inheritContext: boolean}} 目标 provider 与继承标记。
+     */
+    function resolveSubagentProviderForRole(role, parent) {
+      if (!roleInheritsContext(role)) return { provider: "spawn", inheritContext: false };
+      // 先确认 provider 可用再检查 seed：宿主没有继承能力时应报告“不可用”，
+      // 而不是先要求用户完成一轮对话（两件事的修复动作不同）。
+      const provider = resolveInheritingSubagentProviderName();
+      assertParentHasCompletedTurn(parent);
+      return { provider, inheritContext: true };
+    }
+
+    /**
+     * 按已持久化的 child_models 快照解析恢复/重建目标（票据 29）。
+     *
+     * 恢复路径**只读**快照，绝不按当前设置重新选择：
+     * - 普通 spawn child 继续用它记录的非继承 provider（旧记录缺失时按 "spawn"）；
+     * - 原继承型 child 必须重新拿到合格的继承 provider；记录里的 provider 已不可用时
+     *   显式失败并提示重新派发，绝不静默改成 spawn（那会丢失已继承的上下文）；
+     * - Observer 永远是非继承通道（即使记录被外部篡改为 true）。
+     *
+     * @param {string} role - 角色 id。
+     * @param {object} parent - 恢复时的父代理（seed 来源）。
+     * @param {object|undefined} persisted - child_models 记录（可含 subagentProvider/inheritContext）。
+     * @returns {{provider: string, inheritContext: boolean}} 目标 provider 与继承标记。
+     */
+    function resolvePersistedSubagentTarget(role, parent, persisted) {
+      const recordedProvider = validSubagentProviderName(persisted?.subagentProvider);
+      if (role === "observer") return { provider: "spawn", inheritContext: false };
+      if (persisted?.inheritContext !== true) {
+        return { provider: recordedProvider ?? "spawn", inheritContext: false };
+      }
+      if (!CONTEXT_INHERITANCE_ROLE_IDS.includes(role)) {
+        throw contextInheritanceError(
+          "无法恢复继承型专家：角色 " + String(role) + " 不允许继承上下文；请重新派发普通专家",
+          CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE,
+        );
+      }
+      let provider;
+      if (recordedProvider !== void 0) {
+        let recorded;
+        try { recorded = subagents.getProvider(recordedProvider); } catch { recorded = void 0; }
+        if (!providerInheritsParentContext(recorded)) {
+          throw contextInheritanceError(
+            "无法恢复继承型专家：原 provider \"" + recordedProvider + "\" 已不可用（宿主未注册或不支持继承）；"
+              + "请重新派发该任务以重新选择继承通道",
+            CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE,
+          );
+        }
+        provider = recordedProvider;
+      } else {
+        // 理论上的旧/手工记录：没有 provider 名但有继承标记时，只能按能力位重新解析。
+        provider = resolveInheritingSubagentProviderName();
+      }
+      assertParentHasCompletedTurn(parent);
+      return { provider, inheritContext: true };
+    }
+
+    /**
      * DEG-only 的双契约启动适配器。
      *
      * startActivation 存在时只组装 RC1 公共字段：request 仅剥离顶层 label 与 signal
@@ -7763,30 +10700,58 @@ export default {
      * 避免把 admission 错误伪装成兼容路径。
      */
     async function startExpertActivation({ request, label, signal }) {
+      // 目标 subagent provider（票据 29）：唯一来源是请求上的内部字段，所有调用点
+      // （角色工具、fan-out 分片、恢复重建）在组装请求时写入同一份值。它只用于选择
+      // 宿主 provider，必须在调用宿主前剥离，绝不作为 SubagentStartRequest 字段透传。
+      const targetProvider = validSubagentProviderName(request?.subagentProvider) ?? "spawn";
+      // 继承型 provider 由 provider 自己按父日志构造 seed；DEG 只选择 provider、
+      // 传入 shard/persona/toolFilter 等既有字段，绝不添加 agentPreset（官方 fork 的
+      // agentPreset 能力位为 false），也绝不自行调用 prepareContinuable/buildForkSeed。
       if (typeof subagents.startActivation === "function") {
         // RC1 manager 会在 admission 前直接调用 signal.throwIfAborted()；缺失或不完整的 signal
         // 必须在 DEG 边界 fail-closed，不能把 RC1 合同错误伪装成 legacy fallback。
         if (signal === void 0 || signal === null || typeof signal.throwIfAborted !== "function") {
           throw new TypeError("RC1 startActivation requires an AbortSignal");
         }
-        const { label: _requestLabel, signal: _requestSignal, ...activationRequest } = request ?? {};
-        return subagents.startActivation({
-          provider: "spawn",
+        const {
+          label: _requestLabel,
+          signal: _requestSignal,
+          subagentProvider: _requestProvider,
+          ...activationRequest
+        } = request ?? {};
+        const activation = await subagents.startActivation({
+          provider: targetProvider,
           label: typeof label === "string" ? label : request?.label,
           request: activationRequest,
           signal,
           delivery: "parent",
         });
+        // 结构化交付（票据 30）：启动成功即挂接 result，绝不在这里 await 完整结果。
+        // request 上的 outputSchema 原样透传给宿主；child_models 只写 structured/标记。
+        armStructuredResultCapture(activation, request);
+        return activation;
       }
       if (typeof subagents.startContinuable === "function") {
+        // legacy 路径只支持 spawn：它没有 provider 级 seed 语义，把它用于 fork
+        // 等于静默丢失上下文。请求了继承（或目标 provider 不是 spawn）时明确失败。
+        if (targetProvider !== "spawn" || request?.agentOptions?.[EXPERT_INHERIT_CONTEXT_MARKER] === true) {
+          throw contextInheritanceError(
+            "当前宿主只有 legacy startContinuable 启动路径，不支持上下文继承（provider=" + targetProvider
+              + "）；请改用普通专家或重新派发",
+            CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE,
+          );
+        }
+        // legacy 宿主同样不能看到 DEG 的内部 provider 选择字段；其余既有字段
+        // （label/signal/persona/toolFilter/maxDepth）保持原样，兼容旧契约。
+        const { subagentProvider: _legacyProvider, ...legacyRequest } = request ?? {};
         return subagents.startContinuable({
-          provider: "spawn",
+          provider: targetProvider,
           label: typeof label === "string" ? label : request?.label,
-          request,
+          request: legacyRequest,
           signal,
         });
       }
-      throw new Error("subagent provider \"spawn\" has no supported activation method");
+      throw new Error("subagent provider \"" + targetProvider + "\" has no supported activation method");
     }
 
     /**
@@ -7832,14 +10797,40 @@ export default {
     }
 
     /**
+     * 专家 admission 的完整 deny 边界（票据 27）。
+     *
+     * 与内置角色完全同源，只是把「角色自身 toolDeny + 运行期自定义角色工具名」并进候选：
+     * - 只读角色（含未知/已删除角色）：READONLY_DENY + toolDeny + 扩展，并并入全部动态
+     *   MCP 工具（includeDynamicMcp=true，fail-closed）；
+     * - 可写角色：EXPERT_DELEGATION_DENY + ROOT_ONLY_TOOL_DENY + toolDeny + 扩展。
+     * 合并成一份候选后只调用一次 effectiveDeny：可见性过滤按名称逐项执行，
+     * 因此与旧实现「两次过滤再拼接」等价，但不会漏掉新增的自定义 role 工具名。
+     *
+     * @param {object} parent - 调用工具的子代理父代理（Agent 对象）。
+     * @param {object|undefined} roleEntry - 运行期目录里的角色记录（未知按只读）。
+     * @returns {string[]} 可交给 tools.restrict() 的 deny 名单。
+     */
+    function expertDenyForAdmission(parent, roleEntry) {
+      const candidates = expertDenyCandidates(roleEntry, runtimeCustomRoleToolNames());
+      const readOnlyRole = roleEntry === void 0 || roleEntry.readOnly === true;
+      return effectiveDeny(parent, candidates, readOnlyRole);
+    }
+
+    /**
      * route 的稳定序列化 key：provider/model/reasoningEffort 三者任一变化
      * 都视为 route 改变（例如用户在侧边栏换了模型），既有 child 不可再复用。
      */
     function routeKeyOf(selection) {
+      // 上下文继承（票据 29）：目标 subagent provider 与继承开关也属于 route 的一部分。
+      // 旧 child_models 记录没有这两个字段时按 "spawn"/false 归一，保证升级前创建的
+      // spawn child 仍能被同 route 复用；继承开关一旦改变就必然产生新 key，旧 child
+      // 不会被静默续作（其 seed 语义与新派发不同）。
       return JSON.stringify({
         provider: selection.provider,
         model: selection.model,
         reasoningEffort: selection.reasoningEffort === void 0 ? null : selection.reasoningEffort,
+        subagentProvider: validSubagentProviderName(selection.subagentProvider) ?? "spawn",
+        inheritContext: selection.inheritContext === true,
       });
     }
 
@@ -7895,6 +10886,24 @@ export default {
       const name = typeof meta.name === "string" ? meta.name.trim().toLowerCase() : "";
       if (name === "placeholder" || name === "placeholder.png" || name.startsWith("placeholder.")) return true;
       return false;
+    }
+
+    /**
+     * 从 role tool 的 image 参数推导路由阶段的输入类型要求（票据 24）。
+     *
+     * 只有“真实图片”才要求 image 能力：
+     * - undefined/null/非对象/数组/空占位 attachment → 无要求（与 admission 的
+     *   “按无图片处理并给出 scopeWarning”完全一致，绝不把占位参数泄漏成 image 路由）；
+     * - 非空 pngPath → 无要求（后续 admission 仍按既有错误拒绝客户端指定的路径，
+     *   路由阶段不需要为一张会被拒绝的输入换模型）；
+     * - 其它 → { inputModalities: ["image"] }，由 executeModelRoutePlan 要求
+     *   image === "supported" 才选中该候选。
+     */
+    function imageRequirementsOf(image) {
+      if (image === void 0 || image === null || typeof image !== "object" || Array.isArray(image)) return undefined;
+      if (typeof image.pngPath === "string" && image.pngPath.length > 0) return undefined;
+      if (isEmptyImagePlaceholderMeta(image.attachment)) return undefined;
+      return { inputModalities: ["image"] };
     }
 
     /**
@@ -8044,6 +11053,150 @@ export default {
     }
 
     /**
+     * per-shard 排队等待账本（票据 26）：parentTaskId -> { agent, shardIds: Set<string> }。
+     *
+     * 为什么需要它：role/provider 名额不足时，分片只是「排队」——没有 running child，
+     * 因而没有 child 创建/状态事件能证明它还在等待。若不登记进 root wait 账本，
+     * root turn 会在排队工作真正开始前就被判定静止并收口（用户看到「任务完成」，
+     * 实际分片还没跑）。
+     *
+     * 记账边界：
+     * - 只在 shard.status === "queued" 时登记（running/终态不登记）；
+     * - 结算点固定为：shard 进入 running、shard 进入任一终态（成功/失败/取消/超时/
+     *   中断）、以及 task_settled / onParentSettled 的兜底结算；
+     * - agent 保存登记当时的 exact root Agent 对象。账本的 settle 需要对象身份，
+     *   按 id 现查可能拿到同 id 的 replacement 代际，从而错误结算到别的 root。
+     * - works 的真相始终是 rootTurnWaits 内部表；这里的 shardIds 只是本地镜像，
+     *   用于兜底结算与"是否还有排队项"的快速判断，两者由同一组调用点同步维护。
+     */
+    const fanoutShardWaitRecords = new Map();
+    /** 终态集合的快速判定（与 fanout.js 的 isTerminalShardStatus 同源词表）。 */
+    const FANOUT_SHARD_TERMINAL_SET = new Set(SHARD_TERMINAL_STATUSES);
+
+    /**
+     * 为任务中所有**排队中**的分片登记等待工作（幂等）。
+     *
+     * 调用点：submit / continuation / retry / 冷恢复补登记——它们都经由
+     * registerFanoutGoalHandoff 进入，因此这里能覆盖全部"任务重新变为 pending"的路径。
+     *
+     * @param {object} agent - exact root Agent。
+     * @param {string} parentTaskId - 父任务 id。
+     * @param {object} task - manager 的权威任务快照（含 shards[].status）。
+     * @returns {number} 本次新登记的分片数（幂等重复登记返回 0）。
+     */
+    function registerFanoutShardWaits(agent, parentTaskId, task) {
+      if (turnWaitStopping || !isLiveRootAgent(agent)) return 0;
+      if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return 0;
+      if (task === null || typeof task !== "object" || !Array.isArray(task.shards)) return 0;
+      const shards = task.shards.filter((shard) => shard?.status === "queued");
+      if (shards.length === 0) return 0;
+      let record = fanoutShardWaitRecords.get(parentTaskId);
+      if (record === void 0 || record.agent !== agent) {
+        record = { agent, shardIds: new Set() };
+        fanoutShardWaitRecords.set(parentTaskId, record);
+      }
+      let registered = 0;
+      for (const shard of shards) {
+        const shardId = typeof shard.shardId === "string" ? shard.shardId : "";
+        if (shardId.length === 0) continue;
+        // 先入本地镜像再 track：track 对同一键幂等，因此重复调用不会重复计数。
+        const wasKnown = record.shardIds.has(shardId);
+        const key = rootTurnWaits.track(agent, { kind: "fanout-shard", parentTaskId, shardId });
+        if (key === void 0) continue;
+        record.shardIds.add(shardId);
+        if (!wasKnown) registered += 1;
+      }
+      return registered;
+    }
+
+    /**
+     * 精确结算一个排队分片的工作（shard 进入 running 或任一终态时调用）。
+     *
+     * @param {string} parentTaskId - 父任务 id。
+     * @param {string} shardId - 分片 id。
+     * @returns {boolean} 是否确实结算了一项。
+     */
+    function settleFanoutShardWait(parentTaskId, shardId) {
+      if (turnWaitStopping) return false;
+      const record = fanoutShardWaitRecords.get(parentTaskId);
+      if (record === void 0 || !record.shardIds.has(shardId)) return false;
+      record.shardIds.delete(shardId);
+      const settled = rootTurnWaits.settle(record.agent, { kind: "fanout-shard", parentTaskId, shardId });
+      if (record.shardIds.size === 0) fanoutShardWaitRecords.delete(parentTaskId);
+      return settled;
+    }
+
+    /**
+     * 兜底结算该任务**全部**剩余排队分片工作。
+     *
+     * 用途：task_settled（正常情况下每一项已被 shard 事件精确结算，这里是事件丢失或
+     * 关闭路径的兜底）与 onParentSettled（任务真实终态边界）。幂等：没有剩余项时
+     * 什么都不做。
+     *
+     * @param {string} parentTaskId - 父任务 id。
+     * @returns {number} 本次结算掉的分片数。
+     */
+    function settleAllFanoutShardWaits(parentTaskId) {
+      const record = fanoutShardWaitRecords.get(parentTaskId);
+      if (record === undefined) return 0;
+      if (turnWaitStopping) {
+        // 插件正在卸载：账本会被整体 dispose，只需清掉本地镜像，不再调用 settle。
+        fanoutShardWaitRecords.delete(parentTaskId);
+        return 0;
+      }
+      const shardIds = [...record.shardIds];
+      fanoutShardWaitRecords.delete(parentTaskId);
+      let settled = 0;
+      for (const shardId of shardIds) {
+        if (rootTurnWaits.settle(record.agent, { kind: "fanout-shard", parentTaskId, shardId })) settled += 1;
+      }
+      return settled;
+    }
+
+    /** root 代际退休：丢弃它名下的 per-shard 镜像（账本本身由 rootTurnWaits.retire 收口）。 */
+    function dropFanoutShardWaitsForRoot(previous) {
+      for (const [parentTaskId, record] of [...fanoutShardWaitRecords]) {
+        if (record?.agent !== previous) continue;
+        fanoutShardWaitRecords.delete(parentTaskId);
+      }
+    }
+
+    /**
+     * manager 生命周期事件的只读消费（票据 26）：维护 per-shard 排队账本。
+     *
+     * 事件语义（与 fanout.js 的 emitShardStatus/aggregateTask 同源）：
+     * - shard_status_changed 且 status === "running" 或终态 → 精确结算该分片；
+     * - task_settled → 兜底结算该任务剩余分片工作（防事件丢失/关闭路径）；
+     * - 其它事件（task_registered / 诊断事件）不改账本。
+     *
+     * 只在"确实命中本地镜像"时才调用 settle，因此重复事件、迟到事件和与
+     * onParentSettled 的重复兜底都是安全 no-op。
+     *
+     * @param {unknown} event - manager 事件（来自 fanout-host 的 onEvent seam）。
+     */
+    function handleFanoutLifecycleEvent(event) {
+      if (event === null || typeof event !== "object") return;
+      if (event.type === "shard_status_changed") {
+        const status = event.status;
+        if (status !== "running" && !FANOUT_SHARD_TERMINAL_SET.has(status)) return;
+        settleFanoutShardWait(event.parentTaskId, event.shardId);
+        return;
+      }
+      if (event.type === "task_settled") {
+        // 结构化声明（票据 30）：正常完成/部分失败的任务仍可能被 in-process 手工 retry
+        // （同一 parentTaskId 重新进入 pending），此时必须复用同一 schema；只有已取消、
+        // 不存在 retry 路径的任务才在结算时清理。回收/关闭仍无条件清理。
+        let terminalTask;
+        try { terminalTask = fanoutHost?.getTask?.(event.parentTaskId); } catch { terminalTask = null; }
+        if (terminalTask?.parentCancelRequested === true) {
+          clearFanoutOutputSchemas(event.parentTaskId);
+          clearFanoutRoute(event.parentTaskId);
+        }
+        settleAllFanoutShardWaits(event.parentTaskId);
+      }
+    }
+
+    /**
      * 为一个 fan-out 父任务登记等待工作。
      *
      * @param {object} parent - exact live root Agent。
@@ -8058,6 +11211,10 @@ export default {
       // 已终态快照：未来不会再有 task_settled，登记等待工作会永远无法结算。
       if (fanoutTaskIsTerminal(result?.task)) return false;
       const existing = fanoutTurnWaitRecords.get(parentTaskId);
+      // per-shard 排队工作与任务级登记相互独立：即使任务级工作已登记（重复 submit /
+      // 恢复竞争），排队分片仍必须各自登记（track 幂等），否则当前这批排队分片
+      // 在任务级工作之外没有任何可结算依据。
+      registerFanoutShardWaits(parent, parentTaskId, result?.task);
       // 未释放的既有登记（pending/active）幂等短路：duplicate submit 或 restore 竞争都不得重复登记。
       if (existing !== void 0 && existing.state !== "released") return true;
       const attempt = nextFanoutHandoffSequence();
@@ -8097,6 +11254,140 @@ export default {
     }
 
     /**
+     * fan-out 结构化声明（票据 30）的 Host 侧有界映射：parentTaskId -> shardId -> schema。
+     *
+     * schema 原文只进入派发请求与该内存表，绝不写进 manager 的持久化 payload 或事件；
+     * 任务结算/回收/关闭时清理，冷恢复后表为空即视为无法恢复 schema。
+     */
+    const fanoutOutputSchemas = new Map();
+    const FANOUT_SCHEMA_TASK_LIMIT = 64;
+
+    function cacheFanoutOutputSchemas(parentTaskId, declarations) {
+      if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return;
+      if (!(declarations instanceof Map) || declarations.size === 0) return;
+      if (!fanoutOutputSchemas.has(parentTaskId) && fanoutOutputSchemas.size >= FANOUT_SCHEMA_TASK_LIMIT) {
+        const oldest = fanoutOutputSchemas.keys().next().value;
+        if (oldest !== undefined) fanoutOutputSchemas.delete(oldest);
+      }
+      fanoutOutputSchemas.set(parentTaskId, new Map(declarations));
+    }
+
+    function fanoutOutputSchemaFor(parentTaskId, shardId) {
+      const shards = fanoutOutputSchemas.get(parentTaskId);
+      return shards?.get(shardId);
+    }
+
+    function clearFanoutOutputSchemas(parentTaskId) {
+      if (typeof parentTaskId === "string" && parentTaskId.length > 0) fanoutOutputSchemas.delete(parentTaskId);
+    }
+
+    function clearAllFanoutOutputSchemas() {
+      fanoutOutputSchemas.clear();
+    }
+
+    /**
+     * fan-out 提交前路由的 Host 侧有界映射（票据 24 fallback × 票据 26 provider 名额）。
+     *
+     * 为什么需要第二张表：fanout 工具在提交前已经执行过一次真实预检（primary -> 候选），
+     * 得到**实际**选中的 provider/model；而 manager 的 buildRequest 是逐 attempt 独立
+     * 调用的，若让它在 admission 时重新解析，就可能：
+     * - 因为 primary 此刻恢复可用而换回另一个 provider，导致任务的 provider 归属
+     *   （提交时已固化、用于 provider 名额）与实际运行 provider 不一致；
+     * - 重复执行 fallback，放大模型解析成本与降级计数语义的分歧。
+     *
+     * 因此提交成功后（**同步**，早于 manager 的 microtask drain）把预检路由写到本表，
+     * buildRequest 优先使用它。表只含 provider/model/路由 marker，不含 prompt/凭据/schema。
+     *
+     * 生命周期与 fanoutOutputSchemas 完全一致：任务取消、回收、关闭时清理；完成/部分失败
+     * 的任务保留到同一进程内的手工 retry 结束（冷启动后表为空，只能重新解析）。
+     */
+    const fanoutRoutes = new Map();
+    const FANOUT_ROUTE_TASK_LIMIT = 64;
+
+    /**
+     * 归一预检路由为可缓存形状；非法（缺 selection/marker）返回 undefined。
+     *
+     * 接受两种形状：预检结果（selection + 扁平 marker 字段）与缓存条目
+     * （{selection, marker}），这样提交路径与已有缓存条目可以走同一入口。
+     */
+    function normalizedFanoutRoute(route) {
+      const selection = normalizeModelSelection(route?.selection);
+      const marker = normalizeModelRouteMarker(route?.marker ?? route);
+      if (selection === undefined || marker === undefined) return undefined;
+      return { selection, marker };
+    }
+
+    /** 有界写入：同一 parentTaskId 重复写入只刷新值，不新增键。 */
+    function cacheFanoutRoute(parentTaskId, route) {
+      if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return;
+      const normalized = normalizedFanoutRoute(route);
+      if (normalized === undefined) return;
+      if (!fanoutRoutes.has(parentTaskId) && fanoutRoutes.size >= FANOUT_ROUTE_TASK_LIMIT) {
+        const oldest = fanoutRoutes.keys().next().value;
+        if (oldest !== undefined) fanoutRoutes.delete(oldest);
+      }
+      fanoutRoutes.set(parentTaskId, normalized);
+    }
+
+    /** 读取该任务提交时固化的预检路由（缺失表示冷恢复/旧任务/已清理）。 */
+    function fanoutRouteFor(parentTaskId) {
+      if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return undefined;
+      return fanoutRoutes.get(parentTaskId);
+    }
+
+    function clearFanoutRoute(parentTaskId) {
+      if (typeof parentTaskId === "string" && parentTaskId.length > 0) fanoutRoutes.delete(parentTaskId);
+    }
+
+    function clearAllFanoutRoutes() {
+      fanoutRoutes.clear();
+    }
+
+    /**
+     * 派发前 provider 一致性校验（fail-closed）。
+     *
+     * 任务的 provider 归属只在提交时确定一次；admission 解析出的实际 provider 必须与之
+     * 相同。不一致时**绝不**继续启动 child——继续会把 running 名额记到错误 provider 名下，
+     * 比直接失败更糟。任务没有 provider 归属（旧快照/未配置模型）时不参与校验。
+     */
+    function assertFanoutProviderRouteUnchanged(parentTaskId, route) {
+      let task;
+      try { task = fanoutHost?.getTask?.(parentTaskId); } catch { task = null; }
+      const taskProvider = typeof task?.provider === "string" ? task.provider.trim() : "";
+      if (taskProvider.length === 0) return;
+      const actualProvider = typeof route?.selection?.provider === "string" ? route.selection.provider : "";
+      if (actualProvider === taskProvider) return;
+      const error = new Error("fan-out provider 路由在派发前发生变化：任务提交时固化的 provider 与实际解析不一致，已拒绝启动 child");
+      error.name = "ProviderRouteChangedError";
+      error.code = PROVIDER_ROUTE_CHANGED;
+      error.reason = "provider_route_changed";
+      throw error;
+    }
+
+    /**
+     * 该 fan-out attempt 的历史是否声明过 schema（用于冷恢复/结算后手工重试）。
+     *
+     * 只读 manager 快照与 child_models；当前 attempt 本身的 childId 也纳入（restore 会把
+     * 上一轮 childId 复制到新 attempt），但当前 attempt 之后的记录绝不会被误读。
+     */
+    function fanoutSchemaWasRequestedBefore(input) {
+      if (!Number.isSafeInteger(input?.attempt) || input.attempt < 1) return false;
+      const task = typeof fanoutHost?.getTask === "function" ? fanoutHost.getTask(input.parentTaskId) : null;
+      const shard = Array.isArray(task?.shards)
+        ? task.shards.find((entry) => entry?.shardId === input.shardId)
+        : undefined;
+      const attempts = Array.isArray(shard?.attempts) ? shard.attempts : [];
+      for (const attempt of attempts) {
+        if (!Number.isSafeInteger(attempt?.attempt) || attempt.attempt >= input.attempt) continue;
+        const childId = typeof attempt.childId === "string" ? attempt.childId : "";
+        if (childId.length === 0) continue;
+        const record = source().childModels?.[childId];
+        if (record?.outputSchemaRequested === true) return true;
+      }
+      return false;
+    }
+
+    /**
      * fan-out 提交入口：只调用 manager 并登记 root turn 等待工作。
      *
      * 改造后这里**不再暂停 durable goal**：任务在后台按自己的调度推进，root 的当前
@@ -8105,10 +11396,70 @@ export default {
      *
      * @param {object} parent - exact live root Agent。
      * @param {object} args - fanout 工具的已校验入参（含 role）。
+     * @param {object} [precheckRoute] - 提交前 resolveRoleModelRoute 的实际选择与 marker。
      * @returns {object} manager 的提交结果。
      */
-    function submitFanoutTask(parent, args) {
-      const result = fanoutHost.submit(parent, args);
+    function submitFanoutTask(parent, args, precheckRoute) {
+      /**
+       * provider 归属（票据 26 背压）与提交前路由固化（票据 24 fallback）。
+       *
+       * 为什么在组合根解析而不是在 manager 里：provider 是「模型路由」的概念，
+       * 权威来源是 resolveRole（会话覆盖优先、其次全局默认），但**真正的 provider**
+       * 是提交前预检（primary -> 有序候选）实际选中的那个。manager 只该拿到一个稳定
+       * 的归属字符串用于并发记账，不应自己会去读 settings/会话覆盖，也不应重新跑
+       * fallback。
+       *
+       * precheckRoute 由 fanout 工具在提交前用同一套 executeModelRoutePlan 得到：
+       * - 优先使用 route.selection.provider（fallback 后的实际 provider）；
+       * - 仅在未传预检结果（兼容调用/测试）时回落到 resolveRole 的主选择。
+       *
+       * 解析不到选择（角色尚未配置模型）时**不传** provider：provider 限流对该任务
+       * 不生效，但角色/任务级限流仍照常生效——绝不因为无法归属就拒绝提交。
+       *
+       * 提交返回后同步把预检路由写进有界映射：manager 的 drain 在 microtask 中执行，
+       * 因此 buildRequest 一定能在任何 admission 之前看到它，不会二次 fallback。
+       */
+      const role = typeof args?.role === "string" ? args.role : "";
+      // 结构化声明（票据 30）：逐分片在提交前校验；任一分片非法/超限或 provider 不支持
+      // 都整体拒绝（不登记任务、不创建任何 child）。schema 原文只留在内存映射里。
+      const declarations = new Map();
+      for (const [index, shard] of (Array.isArray(args?.shards) ? args.shards : []).entries()) {
+        const shardId = typeof shard?.shardId === "string" ? shard.shardId : String(index);
+        const declaration = normalizeOutputSchemaDeclaration(shard?.outputSchema, "fanout 分片 " + shardId);
+        if (declaration !== undefined) declarations.set(shardId, declaration.schema);
+      }
+      if (declarations.size > 0) {
+        const target = resolveSubagentProviderForRole(role, parent);
+        assertOutputSchemaProviderSupport(target.provider, "fanout " + role);
+      }
+      const route = normalizedFanoutRoute(precheckRoute);
+      const selection = role.length > 0 && typeof parent?.id === "string" ? resolveRole(parent.id, role) : null;
+      // 预检路由优先：fallback 后实际选中的 provider 才是名额归属，而不是 primary。
+      const provider = route?.selection.provider
+        ?? (typeof selection?.provider === "string" && selection.provider.trim().length > 0
+          ? selection.provider.trim()
+          : undefined);
+      const result = fanoutHost.submit(parent, provider === undefined ? args : { ...args, provider });
+      if (declarations.size > 0 && typeof result?.parentTaskId === "string"
+        && (result.duplicate !== true || !fanoutOutputSchemas.has(result.parentTaskId))) {
+        // 幂等命中的既有任务保留最初声明的 schema；只有进程内映射确实缺失（例如
+        // 结算后重放同一 requestId）时才用本次声明补齐，避免重复提交改写既有契约。
+        cacheFanoutOutputSchemas(result.parentTaskId, declarations);
+      }
+      /**
+       * 路由映射写入必须**先于任何 await**：manager 在 submit 内只登记任务并把 drain
+       * 排进 microtask，因此这里同步写入后，buildRequest 必然能看到同一份预检路由。
+       *
+       * 幂等命中的既有任务保留最初路由；只有映射确实缺失、且任务的实际 provider 与
+       * 本次预检一致时才补齐，避免重复提交把旧任务改写到另一条 provider 路由上。
+       */
+      const parentTaskId = typeof result?.parentTaskId === "string" ? result.parentTaskId : "";
+      if (route !== undefined && result?.accepted !== false && parentTaskId.length > 0) {
+        const taskProvider = typeof result?.task?.provider === "string" ? result.task.provider : "";
+        const existingRoute = fanoutRouteFor(parentTaskId);
+        const providerMatches = taskProvider.length === 0 || taskProvider === route.selection.provider;
+        if (existingRoute === undefined && providerMatches) cacheFanoutRoute(parentTaskId, route);
+      }
       registerFanoutGoalHandoff(parent, result);
       return result;
     }
@@ -8324,7 +11675,14 @@ export default {
     fanoutHost = createFanoutRuntimeModule({
       createRuntime: (options) => createFanoutRuntime(options),
       runtimeOptions: {
-        writeRoles: ["designer", "fixer"],
+        // affectedPaths 冲突只对可写角色生效（内置 designer/fixer + 运行期目录里的可写
+        // 自定义角色）。组合根这里按**装配时刻**的运行期目录计算：之后新增的自定义
+        // 可写角色要到下一次进程启动才会进入该集合（fanout.js 不在本票据改动范围内，
+        // 其 writeRoles 在运行时构造期固定）。这是已知边界，已在票据 27 实施记录中标注。
+        writeRoles: activeRoles().filter((role) => {
+          const entry = roleCatalog().get(role);
+          return entry !== void 0 && entry.readOnly !== true;
+        }),
       },
       /**
        * 角色级并发上限的角色级共享池：唯一权威来源是插件 settings.roleConcurrencyLimit。
@@ -8342,6 +11700,24 @@ export default {
        */
       concurrencyLimit: () => normalizeRoleConcurrencyLimit(settingsSource()?.roleConcurrencyLimit),
       /**
+       * 逐角色并发映射（票据 26）：与上面的 roleConcurrencyLimit 是**两层**关系。
+       *
+       * roleConcurrencyLimit 是「没有逐角色覆盖时」的默认值；roleLimits 是逐角色覆盖
+       * （候选设置自己的角色集，含自定义角色）。两者都由 manager 在派发时实时解析：
+       * 设置页保存后，之后进入 running 的分片立即按新映射受限，无需重新装配。
+       *
+       * 这里传的是**已归一**快照里的字段（旧配置缺字段 = 空映射），因此 manager 拿到的
+       * 要么是合法 1..64 的映射，要么是空对象；manager 侧还有一道非法条目兜底诊断。
+       */
+      roleLimits: () => settingsSource()?.roleLimits,
+      /**
+       * provider 级并发上限映射（票据 26）：{provider: 0..64}，0/未设置 = 不限制。
+       *
+       * 只约束真正进入 running 的分片数（信号量语义），排队不占名额、也不预留；
+       * 判定顺序固定为先 provider 后 role（见 fanout.js 的 dispatchAvailable）。
+       */
+      providerLimits: () => settingsSource()?.providerLimits,
+      /**
        * 角色级默认超时（票据 06）：同样传解析函数，而不是快照值。
        *
        * 管理器每创建一个新 attempt 解析一次：设置保存后新 attempt 立即使用新值，
@@ -8349,15 +11725,43 @@ export default {
        * 优先级：分片级 timeoutMs > 父任务 timeoutMs > 本项 > 未启用。
        */
       roleTimeoutMs: () => normalizeRoleTimeoutMs(settingsSource()?.roleTimeoutMs),
+      /**
+       * manager 事件的只读观察钩子（票据 26）：维护 per-shard 排队等待账本。
+       * 与任务级 fanout 工作相互独立：排队分片进入 running/终态时精确结算，
+       * task_settled 时兜底结算剩余项（事件丢失也不会永久悬挂）。
+       */
+      onFanoutEvent: (event) => handleFanoutLifecycleEvent(event),
       buildRequest: async (input, signal) => {
         const parent = host.lineage.parentAgentOf(input.parentTaskId);
         if (parent === void 0) throw new Error("fan-out parent root is unavailable: " + input.parentTaskId);
-        const selection = resolveRole(parent.id, input.role);
-        if (selection === null) throw new Error(input.role + " 专家尚未配置模型");
-        const validatedSelection = await validateSelectionWithSignal(selection, signal);
-        const deny = readOnly(input.role)
-          ? effectiveDeny(parent, READONLY_DENY, true)
-          : [...effectiveDeny(parent, EXPERT_DELEGATION_DENY), ...effectiveDeny(parent, ROOT_ONLY_TOOL_DENY)];
+        // 启动前路由（票据 24）：恢复产生的 interrupted attempt 只读 child_models 里的
+        // 实际路由，不重新选择；普通新派发才执行 primary -> candidates 的 fallback 计划。
+        //
+        // 优先级（票据 24 × 26 修复）：
+        // 1. restoredRoute：中断 attempt 的持久化实际路由（恢复不重选）；
+        // 2. 提交时的预检路由：同一 parentTaskId 的新 attempt/retry 复用提交时已确定的
+        //    实际 provider，避免第二次 fallback 选到另一个 provider、把名额记错；
+        // 3. 冷恢复/旧任务：只能重新解析（随后必须通过 provider 一致性校验）。
+        const restoredRoute = restoredFanoutModelRoute(input);
+        const cachedRoute = restoredRoute === null ? fanoutRouteFor(input.parentTaskId) : undefined;
+        const precomputedRoute = cachedRoute === undefined
+          ? undefined
+          : { selection: { ...cachedRoute.selection }, ...cachedRoute.marker };
+        const route = restoredRoute ?? precomputedRoute ?? await resolveRoleModelRoute(input.role, parent.id, signal);
+        if (route === null) throw new Error(input.role + " 专家尚未配置模型");
+        // fail-closed：实际 provider 必须等于任务提交时固化的 provider 归属；否则继续
+        // 启动 child 会把 running 名额记到错误的 provider 名下（比直接失败更糟）。
+        assertFanoutProviderRouteUnchanged(input.parentTaskId, route);
+        const validatedSelection = route.selection;
+        // 目标 subagent provider（票据 29）：新 attempt 按当前角色设置选择；恢复出来的
+        // interrupted attempt 只读上一 child 的快照，绝不按当前设置重选。Observer 无论
+        // 设置如何都强制非继承通道；继承型失败绝不静默回退 spawn。
+        const subagentTarget = restoredRoute === null
+          ? resolveSubagentProviderForRole(input.role, parent)
+          : resolvePersistedSubagentTarget(input.role, parent, restoredRoute);
+        // deny 边界来自运行期目录（内置 + 自定义同源）：只读自定义角色沿用 READONLY_DENY
+        // 并叠加自身 toolDeny；可写自定义角色同样叠加委派与 root-only 拒绝。
+        const deny = expertDenyForAdmission(parent, roleCatalog().require(input.role));
         // 分片任务名称是展示层短标签：有名称时子代理的 dispatch label 与任务正文都
         // 显示"分片代号 + 任务名称"，让专家自己知道这一片在整体目标里叫什么；没有名称
         // 时保持旧文案（只有分片代号与 attempt 序号）。
@@ -8376,14 +11780,27 @@ export default {
         // 同一份值写入内部 marker，由 onAgentCreated 随 child_models 持久化，
         // 供冷恢复的 composition 兜底使用（不会进入任务 prompt）。
         const childPersona = resolvePersonaForAdmission(input.role);
+        // 结构化声明（票据 30）：本次 attempt 的 schema 只来自 Host 侧有界映射；
+        // 映射缺失（冷恢复/任务已结算后重试）时不重新声明，但历史确实声明过时把本轮
+        // 标记为 schema_not_restored（child_models 只写 fallback 标记）。
+        const outputSchema = fanoutOutputSchemaFor(input.parentTaskId, input.shardId);
+        const schemaNotRestored = outputSchema === undefined && fanoutSchemaWasRequestedBefore(input);
         const request = {
           label: "fan-out " + input.role + "/" + input.shardId + (shardName === undefined ? "" : " · " + shardName) + " #" + input.attempt,
           prompt: [{ type: "text", text: buildExpertTaskPrompt(input.role, taskText) }],
           parent,
+          // 内部字段：只供 startExpertActivation 选择宿主 provider，调用宿主前剥离。
+          subagentProvider: subagentTarget.provider,
           agentOptions: {
             provider: validatedSelection.provider,
             model: validatedSelection.model,
             [EFFORT_MARKER]: validatedSelection.reasoningEffort,
+            // 目标 subagent provider / 继承开关 marker（票据 29）：随 child_models 落盘。
+            [EXPERT_SUBAGENT_PROVIDER_MARKER]: subagentTarget.provider,
+            [EXPERT_INHERIT_CONTEXT_MARKER]: subagentTarget.inheritContext,
+            // 实际路由（票据 24）：分片 child 的 candidateIndex/fallbackCount/
+            // lastRouteErrorCode 随 child_models 落盘，投影与恢复只读该快照。
+            [EXPERT_ROUTE_MARKER]: routeMarkerOf(route),
             [ROLE_MARKER]: input.role,
             [PARENT_MARKER]: parent.id,
             [CONTINUABLE_MARKER]: true,
@@ -8396,12 +11813,22 @@ export default {
             [FANOUT_PARENT_AGENT_MARKER]: parent.id,
             [FANOUT_SHARD_MARKER]: input.shardId,
             [FANOUT_ATTEMPT_MARKER]: input.attempt,
+            ...(outputSchema === undefined && schemaNotRestored !== true
+              ? {}
+              : { [OUTPUT_SCHEMA_REQUESTED_MARKER]: true }),
           },
           persona: childPersona,
           toolFilter: { deny: ensureExpertSendMessageDenied(deny) },
           maxDepth: 1,
+          // schema 原文只进入宿主请求；恢复轮没有 schema，只有“曾声明过”的标记。
+          ...(outputSchema === undefined ? {} : { outputSchema }),
         };
-        return { request, parentAgent: parent, parentId: parent.id, role: input.role };
+        if (outputSchema !== undefined) {
+          markStructuredRequest(request, { requested: true, notRestored: false });
+        } else if (schemaNotRestored === true) {
+          markStructuredRequest(request, { requested: true, notRestored: true });
+        }
+        return { request, parentAgent: parent, parentId: parent.id, role: input.role, route: routeMarkerOf(route) };
       },
       startContinuable: ({ request, signal }) => startExpertActivation({
         request,
@@ -8469,11 +11896,32 @@ export default {
           // admission 快照，冷恢复的 composition 兜底据此重建角色人格；malformed 值
           // 不写入 durable schema（真实 storage-domain 会在写入边界整条拒绝）。
           const personaSnapshot = validPersonaMarker(agent.options?.[PERSONA_MARKER]);
+          // 实际路由 marker（票据 24）：由 buildRequest 在启动前 fallback 后写入。
+          const routeSnapshot = normalizeModelRouteMarker(agent.options?.[EXPERT_ROUTE_MARKER]);
+          // 目标 subagent provider / 继承开关（票据 29）：marker 优先；cold-resume 的
+          // agent options 不还原 marker，回落到 DEG 自有 child_models 记录。
+          const persistedFanoutChild = typeof childId === "string" ? source().childModels?.[childId] : void 0;
+          const subagentProviderSnapshot = validSubagentProviderName(agent.options?.[EXPERT_SUBAGENT_PROVIDER_MARKER])
+            ?? validSubagentProviderName(persistedFanoutChild?.subagentProvider);
+          const inheritContextSnapshot = typeof agent.options?.[EXPERT_INHERIT_CONTEXT_MARKER] === "boolean"
+            ? agent.options[EXPERT_INHERIT_CONTEXT_MARKER]
+            : (typeof persistedFanoutChild?.inheritContext === "boolean" ? persistedFanoutChild.inheritContext : void 0);
           void writeChildModel(childId, {
             provider,
             model,
             ...(typeof agent.options?.[EFFORT_MARKER] === "string" ? { reasoningEffort: agent.options[EFFORT_MARKER] } : {}),
+            ...(routeSnapshot === undefined ? {} : routeSnapshot),
+            ...(subagentProviderSnapshot === void 0 ? {} : { subagentProvider: subagentProviderSnapshot }),
+            ...(inheritContextSnapshot === void 0 ? {} : { inheritContext: inheritContextSnapshot }),
+            // 结构化交付（票据 30）：只保留布尔与已捕获结果；schema 原文绝不落盘。
+            ...(agent.options?.[OUTPUT_SCHEMA_REQUESTED_MARKER] === true
+              || persistedFanoutChild?.outputSchemaRequested === true
+              ? { outputSchemaRequested: true }
+              : {}),
+            ...(persistedFanoutChild?.structured === undefined ? {} : { structured: persistedFanoutChild.structured }),
             ...(typeof role === "string" ? { role } : {}),
+            // 角色显示名快照（票据 27）：自定义角色删除后历史分片仍能显示标签。
+            ...(typeof role === "string" && typeof roleLabelOfRole(role) === "string" ? { roleLabel: roleLabelOfRole(role) } : {}),
             ...(typeof parentId === "string" ? { parentId } : {}),
             continuable: true,
             // fan-out 走独立 onAgentCreated 回调；这里同步保存 RC1 admission deny 快照。
@@ -8491,7 +11939,7 @@ export default {
               fanoutShardId: shardId,
               fanoutAttempt: attempt,
             } : {}),
-          });
+          }).then(() => flushPendingStructuredPatch(childId));
         }
       },
       lineage: host.lineage,
@@ -8509,6 +11957,18 @@ export default {
        * 不可用时才退回 id，交由对象身份校验 fail-closed。
        */
       onParentSettled: (parentTaskId, parentAgent, parentAgentId) => {
+        // 结构化声明（票据 30）：只有已取消任务（不存在 retry 路径）在真实终态清理；
+        // 完成/部分失败的任务保留有界 schema 映射，供同一进程内的手工 retry 复用。
+        let terminalTask;
+        try { terminalTask = fanoutHost?.getTask?.(parentTaskId); } catch { terminalTask = null; }
+        if (terminalTask?.parentCancelRequested === true) {
+          clearFanoutOutputSchemas(parentTaskId);
+          clearFanoutRoute(parentTaskId);
+        }
+        // per-shard 排队工作兜底结算（票据 26）：task_settled 事件路径通常已经结算过，
+        // 这里是「任务真实终态」的权威边界，负责清掉任何残留镜像（例如关闭路径或
+        // 事件丢失），确保 root 不会因为一个永远等不到的 shard 事件而悬挂。
+        settleAllFanoutShardWaits(parentTaskId);
         if (turnWaitStopping) return;
         const agent = parentAgent ?? (typeof parentAgentId === "string" ? agents.get(parentAgentId) : void 0);
         if (agent === void 0) return;
@@ -8545,7 +12005,12 @@ export default {
       logger: ctx.logger,
     });
     consumeFanoutRestore("runtime-wired", fanoutHost.restore());
-    ctx.effect(() => () => fanoutHost?.close(), "dsh-expert-group: fan-out runtime");
+    ctx.effect(() => () => {
+      // 关闭/回收边界清理 Host 侧 schema 映射：关闭后不再有可复用的派发契约。
+      clearAllFanoutOutputSchemas();
+      clearAllFanoutRoutes();
+      fanoutHost?.close();
+    }, "dsh-expert-group: fan-out runtime");
 
     // Expert Group 只投影现有状态；它不订阅或改变任务生命周期，RPC 调用时按需生成快照。
     // 快照分两级：首屏返回轻量快照（跳过全部冷读），完整快照在后台构建后写回缓存
@@ -8566,8 +12031,17 @@ export default {
       recoveryRecords,
       source,
       sessionQuery: () => expertGroupSessionQuery,
+      // 角色显示名（票据 27）：每次构建现读运行期目录，因此新增/删除自定义角色后
+      // 侧栏标签立即跟随；历史节点仍优先使用 child_models 里的持久化 roleLabel。
+      roleLabels: () => roleLabelsProjection(),
+      // 用量（票据 25）：live 账本优先于持久化记录，去抖窗口内的最新值也能进入快照；
+      // runtime 只读该投影，不参与计量与刷盘。
+      usageFor: (childId) => usageLedger.usageFor(childId),
       logger: ctx.logger,
     });
+    // 角色目录变化后的快照失效入口：装配完成后再挂上，避免 apply 早期重建目录时误用。
+    invalidateAllRoleSnapshots = () => expertGroupRuntime.invalidateSnapshots({ all: true });
+    ctx.effect(() => () => { invalidateAllRoleSnapshots = null; }, "dsh-expert-group: role catalog snapshot invalidation");
     /**
      * 快照缓存失效接线（幂等、O(1)）。
      *
@@ -8606,9 +12080,9 @@ export default {
       // 对齐 dsh-tool-subagent：provider 缺失或能力不足时不注册工具，等 provider-added 再挂载。
       if (toolDisposers.has(role)) return;
       if (!spawnProviderReady()) return;
-      // 未注册角色不挂载工具（注册表是唯一角色来源）；persona 在 admission 边界解析，
-      // 因此这里不再缓存角色人格快照。
-      if (ROLE_META[role] === void 0) return;
+      // 未注册角色不挂载工具（运行期目录是唯一角色来源，含自定义角色）；
+      // persona 在 admission 边界解析，因此这里不再缓存角色人格快照。
+      if (!roleCatalog().has(role)) return;
 
       /**
        * 校验显式续作句柄（role tool 的 childId）：必须存在、属于当前 root，
@@ -8823,6 +12297,40 @@ export default {
           // 重建出的 child 只会拿到「本轮 follow-up 文本」而丢掉原任务上下文；此时明确
           // 失败并请 root 改派新任务，绝不静默把旧任务替换成一个内容不完整的 child。
           throw new Error(role + " 续作失败：child " + childId + " 已不可恢复且缺少 durable Session，请作为新任务重新派发");
+        }
+        // 显式续作触发的重建同样只读原 child_models 的通道快照（票据 29）：原继承型
+        // child 必须继续用继承 provider，绝不因为当前设置变化而静默换成 spawn。
+        const persistedChild = readStorageSnapshot()?.childModels?.[childId];
+        // 持久化记录缺失（写入失败/极旧 child）时回落到本次请求已解析的目标通道，
+        // 而不是无条件 spawn：后者会把“当前仍要求继承”的重建静默降级成 fresh。
+        const targetSnapshot = persistedChild ?? {
+          subagentProvider: request.subagentProvider,
+          inheritContext: request.agentOptions?.[EXPERT_INHERIT_CONTEXT_MARKER],
+        };
+        let rebuildTarget;
+        try {
+          rebuildTarget = resolvePersistedSubagentTarget(role, parent, targetSnapshot);
+        } catch (error) {
+          throw contextInheritanceError(
+            role + " 续作失败：" + (error instanceof Error ? error.message : String(error))
+              + "；请作为新任务重新派发",
+            error?.code === CONTEXT_INHERITANCE_ERROR_CODES.EMPTY
+              ? CONTEXT_INHERITANCE_ERROR_CODES.EMPTY
+              : CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE,
+          );
+        }
+        request.subagentProvider = rebuildTarget.provider;
+        if (request.agentOptions !== void 0 && typeof request.agentOptions === "object") {
+          request.agentOptions[EXPERT_SUBAGENT_PROVIDER_MARKER] = rebuildTarget.provider;
+          request.agentOptions[EXPERT_INHERIT_CONTEXT_MARKER] = rebuildTarget.inheritContext;
+        }
+        // 结构化交付（票据 30）：续作触发的重建同样是新 activation；只有本轮显式
+        // 重新给出 schema 时才能声明，否则历史声明只能标记 schema_not_restored。
+        if (request.outputSchema === undefined && persistedChild?.outputSchemaRequested === true) {
+          if (request.agentOptions !== void 0 && typeof request.agentOptions === "object") {
+            request.agentOptions[OUTPUT_SCHEMA_REQUESTED_MARKER] = true;
+          }
+          markStructuredRequest(request, { requested: true, notRestored: true });
         }
         let rebuiltChildId;
         let messageId;
@@ -9308,10 +12816,15 @@ export default {
           // 自动图片入口也走同一 admission 语义：persona 只解析一次，既交给宿主
           // composition，也写入内部 marker 供冷恢复兜底（绝不进入视觉任务 prompt）。
           const childPersona = resolvePersonaForAdmission("observer");
+          // Observer 自动图片路由**永远**使用非继承 provider（票据 29）：Observer 的
+          // 安全边界是“只接收视觉任务，不接收用户上下文”，即使设置被外部写成
+          // inheritContext.observer=true，这里也强制 spawn，绝不继承父日志。
+          const observerSubagentProvider = resolveSubagentProviderForRole(role, parent);
           const request = {
             label: "用户图片",
             prompt: promptContent,
             parent,
+            subagentProvider: observerSubagentProvider.provider,
             agentOptions: {
               provider: selection.provider,
               model: selection.model,
@@ -9321,6 +12834,8 @@ export default {
               [CONTINUABLE_MARKER]: true,
               [DENY_MARKER]: observerDeny,
               [PERSONA_MARKER]: childPersona,
+              [EXPERT_SUBAGENT_PROVIDER_MARKER]: observerSubagentProvider.provider,
+              [EXPERT_INHERIT_CONTEXT_MARKER]: observerSubagentProvider.inheritContext,
             },
             persona: childPersona,
             toolFilter: { deny: observerDeny },
@@ -9329,7 +12844,11 @@ export default {
           const scope = delegationScopeKey(parent.id, role);
           // 去重必须使用与真实 child prompt 相同的规范化 Observer 任务，兼容旧/新包装复用。
           const taskKey = delegationTaskKey(observerTaskPrompt + "\n[images:" + imageAttachments.map((attachment) => attachment.attachmentId).join(",") + "]");
-          const routeKey = routeKeyOf(selection);
+          const routeKey = routeKeyOf({
+            ...selection,
+            subagentProvider: observerSubagentProvider.provider,
+            inheritContext: observerSubagentProvider.inheritContext,
+          });
           throwIfAborted(signal);
           const outcome = await delegationTracker.serialize(scope, () => delegateWithScopeAdmission({
             scope,
@@ -9361,7 +12880,7 @@ export default {
 
       const disposeTool = ctx.effect(() => tools.register(defineTool({
         name: role,
-        description: buildRoleToolDescription(role),
+        description: buildRoleToolDescription(role, roleCatalog()),
         parameters: {
           description: {
             type: "string",
@@ -9372,6 +12891,11 @@ export default {
             type: "string",
             required: true,
             description: "A complete self-contained task for the expert child.",
+          },
+          outputSchema: {
+            type: "object",
+            additionalProperties: true,
+            description: "Optional structured-output JSON Schema (object root, dsh-tools enforced subset). When set, the child must return a structured result matching it; DEG validates the declaration before dispatch (invalid, >64KiB UTF-8, or an unsupported provider is rejected and no child is created). The schema is passed through to the host request and is never written to event history or snapshots; the structured result is read-only and does not change the expert's final text summary contract.",
           },
           affectedPaths: {
             type: "array",
@@ -9596,6 +13120,18 @@ export default {
               ? { kind: "cancelled", started: false, accepted: true, cancelled: true, childId: cancelled.childId }
               : rejectedHandleResult("child-not-found", "CHILD_NOT_FOUND", cancelled.warning);
           }
+          // 结构化声明（票据 30）：先在 admission 之前做完整的形状/子集/64KiB 校验。
+          // 被拒绝的声明没有登记任何 admission、没有创建 child，因此回执不带凭据。
+          let outputSchemaDeclaration;
+          try {
+            outputSchemaDeclaration = normalizeOutputSchemaDeclaration(args?.outputSchema, role);
+          } catch (error) {
+            return rejectedHandleResult(
+              "schema",
+              error?.code ?? OUTPUT_SCHEMA_ERROR_CODES.INVALID,
+              error instanceof Error ? error.message : String(error),
+            );
+          }
           const admissionTicket = beginRootAdmission(parent);
           let failurePhase = "provider";
           try {
@@ -9603,20 +13139,23 @@ export default {
             throw new Error(`subagent provider "spawn" is not available (missing a supported activation seam/provider capabilities/prepareContinuable); the ${role} expert tool cannot start a child`);
           }
           failurePhase = "selection";
-          const resolvedRole = resolveRole(parent.id, role);
-          if (resolvedRole == null) {
+          // 启动前路由（票据 24）：primary -> 有序候选，只对预检类失败降级；
+          // 全部失败抛 MODEL_CANDIDATES_EXHAUSTED，绝不在此处发起任何模型请求。
+          // 真实 image 任务把“需要 image 输入”带进路由：主模型不支持时跳过候选，
+          // 而不是等 admission 才拒绝。占位/空 image 不要求能力（与下面的忽略逻辑一致）。
+          const route = await resolveRoleModelRoute(role, parent.id, signal, imageRequirementsOf(args.image));
+          if (route === null) {
             throw new Error(`${role} 专家尚未配置模型：请在“dsh-expert-group”设置页为该角色选择模型（候选来自设置中已添加的模型）；右侧「专家模型」侧边栏仅用于当前会话点击“应用”`);
           }
-          const selection = await validateSelectionWithSignal(resolvedRole, signal);
+          const selection = route.selection;
           if (!host.lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
           // 所有专家（含 designer/fixer）都禁止再委派（防孙代理）；只读角色再叠加
           // 写/命令限制。deny 列表必须按“当前组合里实际可见的工具”动态计算：
           // 平台门控的 bash/pwsh 与 preset 域内的 workflow 可能不存在，
           // 静态全量列入会在子代理创建窗口触发 tools.restrict 的未知工具错误。
-          const deny = readOnly(role)
-            ? effectiveDeny(parent, READONLY_DENY, true)
-            // 保留历史再委派 deny 的调用边界，再叠加只属于 root 的通知工具。
-            : [...effectiveDeny(parent, EXPERT_DELEGATION_DENY), ...effectiveDeny(parent, ROOT_ONLY_TOOL_DENY)];
+          // 保留历史再委派 deny 的调用边界（只读再叠加写/命令限制），并叠加角色自身
+          // toolDeny 与运行期自定义角色工具名：自定义角色与内置角色同一组合规则。
+          const deny = expertDenyForAdmission(parent, roleCatalog().require(role));
           // send_message 是 scope-local 工具，不能依赖 effectiveDeny 的全局可见性判断；
           // 显式加入 child filter 后，DSH 不会再向专家追加英文通信指令。
           const childDeny = ensureExpertSendMessageDenied(deny);
@@ -9643,31 +13182,35 @@ export default {
             } else {
               // 直接图片 admission 必须建立在目标 role 的模型明确声明 image 能力上；unknown 也拒绝，
               // 避免把图片交给可能只支持文本的 child。
-            let targetInfo;
-            try {
-              targetInfo = await llm.resolveModelInfo(selection.provider, selection.model, signal);
-            } catch (error) {
-              throw new Error(`${imageRole} 模型 image 能力查询失败，无法安全投递图片；原始输入已保留`, { cause: error });
-            }
-            const imageRoute = decideImageRoute({
-              // 直接 role tool 使用同一三态路由函数作为严格能力断言；返回的 target
-              // 只用于判断是否可安全投递，不会把图片改路由到 Observer。
-              mainImage: "unsupported",
-              observerImage: imageCapability(targetInfo),
-              observerPreferred: true,
-            });
-            if (imageRoute.target === "error") {
-              const message = role === "observer"
-                ? imageRoute.message
-                : `${imageRole} 模型未明确声明 image 输入能力，无法安全投递图片；`;
-              throw new Error(`${message} 原始输入已保留`);
-            }
-            imageAttachment = await prepareRoleImage(args.image, signal, imageRole);
-            promptContent = buildImageContent({
-              attachment: imageAttachment,
-              text: taskPrompt,
-               role: imageRole,
-            });
+              // 路由阶段已经为真实 image 派发探测过能力：优先复用 route.capabilities，
+              // 避免二次 resolveModelInfo；只有 route 没有能力信息时才回退到原查询。
+              let targetInfo = route.capabilities;
+              if (targetInfo === undefined || targetInfo === null) {
+                try {
+                  targetInfo = await llm.resolveModelInfo(selection.provider, selection.model, signal);
+                } catch (error) {
+                  throw new Error(`${imageRole} 模型 image 能力查询失败，无法安全投递图片；原始输入已保留`, { cause: error });
+                }
+              }
+              const imageRoute = decideImageRoute({
+                // 直接 role tool 使用同一三态路由函数作为严格能力断言；返回的 target
+                // 只用于判断是否可安全投递，不会把图片改路由到 Observer。
+                mainImage: "unsupported",
+                observerImage: imageCapability(targetInfo),
+                observerPreferred: true,
+              });
+              if (imageRoute.target === "error") {
+                const message = role === "observer"
+                  ? imageRoute.message
+                  : `${imageRole} 模型未明确声明 image 输入能力，无法安全投递图片；`;
+                throw new Error(`${message} 原始输入已保留`);
+              }
+              imageAttachment = await prepareRoleImage(args.image, signal, imageRole);
+              promptContent = buildImageContent({
+                attachment: imageAttachment,
+                text: taskPrompt,
+                 role: imageRole,
+              });
             }
           }
           // persona 在 admission 边界**只解析一次**：同一个值既交给宿主 composition
@@ -9675,14 +13218,32 @@ export default {
           // 设置页保存的自定义提示词只影响之后新建的 child，既有 running/idle/ready
           // child 保持创建时的 persona；marker 绝不进入任务 prompt。
           const childPersona = resolvePersonaForAdmission(role);
+          // 目标 subagent provider（票据 29）在 admission 边界解析一次：Observer 永远
+          // spawn；开启继承的角色必须拿到合格的 fork provider 且父日志已有已完成 turn，
+          // 否则显式失败（resolveSubagentProviderForRole 抛出稳定 code），绝不静默降级。
+          const subagentTarget = resolveSubagentProviderForRole(role, parent);
+          // 目标 provider 必须显式声明 outputSchema 能力；不支持时拒绝派发，
+          // 绝不静默把结构化请求退化成纯文本（错误在 admission 失败通道返回稳定 code）。
+          if (outputSchemaDeclaration !== undefined) {
+            assertOutputSchemaProviderSupport(subagentTarget.provider, role);
+          }
           const request = {
             label: args.description,
             prompt: promptContent,
             parent,
+            // 内部字段：只供 startExpertActivation 选择宿主 provider，调用宿主前剥离。
+            subagentProvider: subagentTarget.provider,
             agentOptions: {
               provider: selection.provider,
               model: selection.model,
               [EFFORT_MARKER]: selection.reasoningEffort,
+              // 目标 subagent provider / 继承开关 marker（票据 29）：随 child_models 落盘，
+              // 恢复/重建只读它，不按当前设置重新选择。
+              [EXPERT_SUBAGENT_PROVIDER_MARKER]: subagentTarget.provider,
+              [EXPERT_INHERIT_CONTEXT_MARKER]: subagentTarget.inheritContext,
+              // 实际路由（票据 24）：candidateIndex=0 表示 primary；fallbackCount 与
+              // lastRouteErrorCode 随 child_models 落盘，侧栏/恢复只读该快照。
+              [EXPERT_ROUTE_MARKER]: routeMarkerOf(route),
               // 角色/父代理 marker：agent/created 时与模型快照一同持久化，
               // 供重启后按 parentId+role+route 恢复可复用 child。
               [ROLE_MARKER]: role,
@@ -9702,7 +13263,14 @@ export default {
             // 第二道硬防线：专家是叶子工作者，maxDepth 1 禁止其再创建孙代理
             // （子代理 depth 为 1，再委派 depth 2 会触发 SubagentDepthError）。
             maxDepth: 1,
+            // schema 原文只进入宿主派发请求；内部 marker 只记录“声明过”，供
+            // agent/created / persistChildDispatch 写入 outputSchemaRequested。
+            ...(outputSchemaDeclaration === undefined ? {} : { outputSchema: outputSchemaDeclaration.schema }),
           };
+          if (outputSchemaDeclaration !== undefined) {
+            request.agentOptions[OUTPUT_SCHEMA_REQUESTED_MARKER] = true;
+            markStructuredRequest(request, { requested: true, notRestored: false });
+          }
           // 所有专家委派统一走可续接（continuable）子代理：
           // 无条件写入 continuable 标记，agent/created 据此持久化，重启恢复
           // 只接受带标记的 child（无 one-shot 路径）。
@@ -9713,7 +13281,13 @@ export default {
             ? `${taskPrompt}\n[image:${imageAttachment.attachmentId}]`
             : taskPrompt;
           const taskKey = delegationTaskKey(taskInput);
-          const routeKey = routeKeyOf(selection);
+          // routeKey 纳入目标 provider 与继承开关（票据 29）：继承开关变化必然改变
+          // route，既有 spawn child 不会被当作同一 route 静默续作/复用。
+          const routeKey = routeKeyOf({
+            ...selection,
+            subagentProvider: subagentTarget.provider,
+            inheritContext: subagentTarget.inheritContext,
+          });
           // run_in_background 只保留为兼容输入；省略、true、false 都统一走
           // 非阻塞 admission。是否结束当前 root turn 只由 continue_parent_turn 决定。
           const handoffExpected = args.continue_parent_turn !== true;
@@ -9813,6 +13387,8 @@ export default {
 
 
       toolDisposers.set(role, disposeTool);
+      // 记录挂载时的有效定义：目录同步据此判断是否需要重挂载（描述/静态元数据刷新）。
+      mountedRoleSignatures.set(role, roleDefinitionSignature(roleCatalog().get(role)));
     }
 
     /** 卸载某角色工具及其 effect；幂等。 */
@@ -9821,6 +13397,7 @@ export default {
       const dispose = toolDisposers.get(role);
       if (dispose === void 0) return;
       toolDisposers.delete(role);
+      mountedRoleSignatures.delete(role);
       try { dispose(); } catch (error) {
         ctx.logger.warn(`dsh-expert-group: dispose tool ${role} failed: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -9844,6 +13421,8 @@ export default {
           + "回收不保留任务墓碑，针对已回收 parentTaskId 的查询返回 task_not_found；"
           + "回收后同一 requestId 再提交视为新任务（旧幂等记录随任务删除），不会命中旧任务句柄。",
         parameters: {
+          // 枚举与运行时校验同源（运行期目录）：角色集变化时本工具会重挂载，
+          // 因此新增/删除自定义角色不需要重启，也不会出现"枚举里有但校验拒绝"。
           role: { type: "string", enum: activeRoles(), required: true, description: "One enabled expert role shared by all shards. 复用时必须与原任务的 role 一致。" },
           basePrompt: { type: "string", required: true, description: "Shared public goal delivered to every shard child. 复用时它是**本轮**的共享目标。" },
           shards: {
@@ -9860,6 +13439,11 @@ export default {
                   description: "Optional human-readable shard task name, e.g. 实现添加任务名称. Trimmed, non-blank and at most 256 UTF-8 bytes; omitted names fall back to shardId in the sidebar.",
                 },
                 prompt: { type: "string", required: true },
+                outputSchema: {
+                  type: "object",
+                  additionalProperties: true,
+                  description: "Optional structured-output JSON Schema for this shard (object root, dsh-tools enforced subset). Validated before dispatch: an invalid schema, >64KiB UTF-8, or a provider without outputSchema capability rejects the whole fan-out and creates no child. In-process retries reuse the same schema; after cold restore the schema is not restored and that round is marked schema_not_restored. The schema is never written to task snapshots or event history.",
+                },
                 affectedPaths: { type: "array", items: { type: "string" } },
                 // 分片级超时覆盖（票据 06）：0 = 显式禁用；启用值 1000–86400000 毫秒且为
                 // 1000 的整数倍。优先于父任务级默认值与角色级设置默认值。
@@ -9934,7 +13518,7 @@ export default {
           if (!host.lineage.isLiveGeneration(parent, host.lineage.tokenFor(parent))) throw new Error("root generation is no longer live");
           if (!spawnProviderReady()) throw new Error("subagent provider spawn is not ready");
           const role = typeof args?.role === "string" ? args.role.trim() : "";
-          if (!activeRoles().includes(role)) throw new Error("未启用的 fan-out role: " + role);
+          if (!isActiveRole(role)) throw new Error("未启用的 fan-out role: " + role);
 
           // 多轮复用：复用判定由主代理发起，插件负责校验 + 执行 + 回执。复用时不再解析模型
           // （不新建 child），但仍要求 role 属于当前启用的 role 集合，避免对被禁用的 role 续作。
@@ -9945,6 +13529,15 @@ export default {
             }
             const parentTaskId = typeof continuation.parentTaskId === "string" ? continuation.parentTaskId.trim() : "";
             if (parentTaskId.length === 0) throw new Error("continuation.parentTaskId 必须是非空字符串");
+            // 结构化声明只能存在于一次新的 activation 上；多轮续作把 prompt 投递给既有
+            // child（不新建 activation），宿主不会重新建立结构化契约。显式拒绝比静默
+            // 忽略 schema 更安全，也保持“绝不静默退文本”的边界。
+            if (Array.isArray(args?.shards) && args.shards.some((shard) => shard?.outputSchema !== undefined)) {
+              throw outputSchemaError(
+                OUTPUT_SCHEMA_ERROR_CODES.UNSUPPORTED,
+                "fan-out continuation 不能重新声明 outputSchema：续作复用既有 child，宿主不会为新消息建立结构化契约",
+              );
+            }
             if (exec?.signal?.aborted === true) throw createAbortError();
             const result = continueFanoutTask(parent, {
               parentTaskId,
@@ -9974,11 +13567,12 @@ export default {
             };
           }
 
-          const selection = resolveRole(parent.id, role);
-          if (selection === null) throw new Error(role + " 专家尚未配置模型");
-          await validateSelectionWithSignal(selection, exec?.signal);
+          // 提交前的快速预检（票据 24）：与分片 buildRequest 共用同一套路由计划，
+          // 因此 primary 失效但候选可用时，任务仍能提交并由各分片走同一 fallback。
+          const precheckRoute = await resolveRoleModelRoute(role, parent.id, exec?.signal);
+          if (precheckRoute === null) throw new Error(role + " 专家尚未配置模型");
           if (exec?.signal?.aborted === true) throw createAbortError();
-          const result = submitFanoutTask(parent, { ...args, role });
+          const result = submitFanoutTask(parent, { ...args, role }, precheckRoute);
           const continuationHandle = buildFanoutContinuationHandle(result.task);
           return {
             kind: "fanout",
@@ -10058,6 +13652,8 @@ export default {
     for (const role of activeRoles()) mountRole(role);
     mountFanoutTool();
     refreshRoutingPrompt();
+    // 工具面装配完成：此后任何目录重建（设置保存/外部编辑）都要同步挂载/卸载工具。
+    roleToolsReady = true;
 
     ctx.on("subagent/provider-added", (provider) => {
       if (provider?.name !== "spawn") return;
@@ -10721,6 +14317,574 @@ export default {
       });
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // 手动派发与任务模板（票据 28，服务端部分）
+    //
+    // 设计边界（与规格书 §6 一致）：
+    // - 只新增 **RPC 入口**，不复制任何派发逻辑：单专家/ fan-out / 模板派发最终都走
+    //   与 fanout 工具完全相同的 submitFanoutTask → manager.submit 路径，因此
+    //   admission、affectedPaths 冲突、角色/provider 并发、wait ledger 与目标交接
+    //   天然同源，不存在“第二个 admission 路径”；
+    // - 模型预检复用 resolveRoleModelRoute（fallback × provider 名额），并在提交前
+    //   把实际选中的路由传给 submitFanoutTask，与工具派发一致；
+    // - 模板只保存派发参数，不保存模型凭据/密钥/临时绝对路径；模板内容是**不可信
+    //   输入**，每次派发都重新做结构与权限校验（角色可能已经被删除/禁用）；
+    // - 模板 id 由 Host 生成（tpl-<uuid>），绝不把用户输入当 storage key 或路径。
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /** 单专家派发在 manager 内的固定分片 id（内部实现细节，不是用户输入）。 */
+    const MANUAL_DISPATCH_SINGLE_SHARD_ID = "single";
+    /**
+     * 单专家派发的分片执行说明。
+     *
+     * manager 要求每个分片都有非空 prompt；单专家模式下用户目标放在 basePrompt，
+     * 分片本身只需要一条固定的执行说明。这样回执/侧栏仍显示“一个分片”，且不会
+     * 把同一段目标重复两遍（重复只会浪费 task_input 预算）。
+     */
+    const MANUAL_DISPATCH_SINGLE_SHARD_PROMPT = "按公共目标完成本次任务，并返回完整最终结果。";
+    /** 模板库整份文档的序列化上限（UTF-8 字节）：32 个模板的合理上界。 */
+    const FANOUT_TEMPLATE_MAX_BYTES = 1024 * 1024;
+    /** 模板名称上限：120 个码点且 ≤512 UTF-8 字节（与分片名称同一个“短标签”口径）。 */
+    const FANOUT_TEMPLATE_NAME_MAX_CHARS = 120;
+    const FANOUT_TEMPLATE_NAME_MAX_BYTES = 512;
+    /** 列表摘要里 prompt 预览的码点上限：摘要有界，不返回模板正文全文。 */
+    const FANOUT_TEMPLATE_PREVIEW_CHARS = 160;
+    /**
+     * 模板内容里的“明显凭据”模式。
+     *
+     * 这是**保守拒绝**而不是完备的密钥扫描：模板是会被反复重放的持久化输入，宁可
+     * 误拒一个正常文本，也不要把 sk-/Bearer/私钥/显式 password= 之类写进 domain。
+     * 错误回执只给字段名与固定类别，绝不回显命中的原文。
+     */
+    const FANOUT_TEMPLATE_CREDENTIAL_PATTERNS = Object.freeze([
+      { kind: "private_key", pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i },
+      { kind: "bearer_token", pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/i },
+      { kind: "sk_token", pattern: /\bsk-[A-Za-z0-9_-]{8,}/ },
+      { kind: "aws_access_key", pattern: /\bAKIA[0-9A-Z]{16}\b/ },
+      { kind: "github_token", pattern: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/ },
+      {
+        kind: "credential_assignment",
+        pattern: /\b(?:api[_-]?key|access[_-]?key|secret(?:[_-]?key)?|password|passwd|auth[_-]?token|access[_-]?token)\s*[:=]\s*["']?[A-Za-z0-9._~+/=-]{8,}/i,
+      },
+    ]);
+
+    /**
+     * 构造一个手动派发/模板 RPC 的结构化失败结果。
+     *
+     * 与 fanout 工具的抛错路径分开是刻意的：RPC 的失败必须带稳定 code/status，
+     * 客户端据此区分“参数错 / 角色不可用 / 模板不存在 / 存储失败”，而不是解析文案。
+     */
+    function manualDispatchFailure(status, code, message, details) {
+      return {
+        ok: false,
+        status,
+        code,
+        message,
+        ...(details === undefined ? {} : { details }),
+      };
+    }
+
+    /** 把 manager / validateSubmitInput 的判定结果翻译成 RPC 失败（复用同一 code 词表）。 */
+    function manualDispatchVerdictFailure(verdict) {
+      return manualDispatchFailure(
+        400,
+        typeof verdict?.code === "string" && verdict.code.length > 0 ? verdict.code : "INVALID_FANOUT",
+        typeof verdict?.message === "string" && verdict.message.length > 0 ? verdict.message : "fan-out 参数不合法",
+        {
+          ...(typeof verdict?.field === "string" ? { field: verdict.field } : {}),
+          ...(verdict?.violation !== undefined ? { violation: verdict.violation } : {}),
+          ...(verdict?.conflict !== undefined ? { conflict: verdict.conflict } : {}),
+        },
+      );
+    }
+
+    /** 结构化声明的失败（schema 非法/超限/provider 不支持）：只回传稳定 code 与有界元数据。 */
+    function manualDispatchSchemaFailure(error) {
+      return manualDispatchFailure(
+        400,
+        typeof error?.code === "string" && error.code.length > 0 ? error.code : OUTPUT_SCHEMA_ERROR_CODES.INVALID,
+        typeof error?.message === "string" ? error.message : "outputSchema 不合法",
+        error?.details !== null && typeof error?.details === "object" && !Array.isArray(error.details)
+          ? { ...error.details }
+          : undefined,
+      );
+    }
+
+    /**
+     * 校验并归一一次手动派发的入参（不产生任何副作用）。
+     *
+     * 结构/预算/超时/并发全部委托给 manager 的 validateSubmitInput：这是与工具派发
+     * 同一份校验实现，绝不在 RPC 层复制一套阈值。outputSchema 不归 manager 管，
+     * 因此这里用与 submitFanoutTask 同一个 normalizeOutputSchemaDeclaration 预校验，
+     * 避免“模型预检跑完才发现 schema 非法”。
+     *
+     * @param {object} input - RPC body 或模板重建出的派发入参。
+     * @returns {object} 成功时 {ok:true, mode, role, args}；失败时 manualDispatchFailure 形状。
+     */
+    function buildManualDispatchPlan(input) {
+      const raw = input !== null && typeof input === "object" && !Array.isArray(input) ? input : {};
+      const mode = raw.mode === "single" || raw.mode === "fanout" ? raw.mode : "";
+      if (mode.length === 0) {
+        return manualDispatchFailure(400, "invalid-mode", "mode 必须是 single 或 fanout", { field: "mode" });
+      }
+      const role = typeof raw.role === "string" ? raw.role.trim() : "";
+      if (role.length === 0) return manualDispatchFailure(400, "invalid-role", "缺少 role", { field: "role" });
+      // 角色必须当前启用（内置 + 显式启用的可选角色 + 自定义角色）：手动派发不得
+      // 绕过运行期角色目录，也不能给已删除/未启用的角色创建 child。
+      if (!isActiveRole(role)) {
+        return manualDispatchFailure(400, "invalid-role", "未启用的角色: " + role, { field: "role" });
+      }
+
+      let basePrompt;
+      let rawShards;
+      if (mode === "single") {
+        // single 的对外语义就是“恰好一个分片”：shards 属于 fanout 形态的参数，
+        // 混用会让“用户以为传了两片、实际只跑一片”成为静默丢输入，因此显式拒绝。
+        if (Array.isArray(raw.shards) && raw.shards.length > 0) {
+          return manualDispatchFailure(
+            400,
+            "INVALID_SHARDS",
+            "single 模式必须恰好一个分片：请用 prompt 提供任务，不要传 shards",
+            { field: "shards" },
+          );
+        }
+        const prompt = typeof raw.prompt === "string" ? raw.prompt : "";
+        if (prompt.trim().length === 0) {
+          return manualDispatchFailure(400, "INVALID_PROMPT", "single 模式需要非空 prompt", { field: "prompt" });
+        }
+        basePrompt = prompt;
+        rawShards = [{ shardId: MANUAL_DISPATCH_SINGLE_SHARD_ID, prompt: MANUAL_DISPATCH_SINGLE_SHARD_PROMPT }];
+      } else {
+        basePrompt = typeof raw.basePrompt === "string" ? raw.basePrompt : "";
+        if (basePrompt.trim().length === 0) {
+          return manualDispatchFailure(400, "INVALID_BASE_PROMPT", "fanout 模式需要非空 basePrompt", { field: "basePrompt" });
+        }
+        if (!Array.isArray(raw.shards) || raw.shards.length === 0) {
+          return manualDispatchFailure(400, "INVALID_SHARDS", "fanout 模式需要非空 shards", { field: "shards" });
+        }
+        rawShards = raw.shards;
+      }
+
+      const verdict = validateSubmitInput({
+        role,
+        basePrompt,
+        shards: rawShards,
+        allowOverlap: raw.allowOverlap,
+        timeoutMs: raw.timeoutMs,
+        concurrencyLimit: raw.concurrencyLimit,
+        requestId: raw.requestId,
+      });
+      if (!verdict.ok) return manualDispatchVerdictFailure(verdict);
+
+      const schemas = new Map();
+      try {
+        for (let index = 0; index < verdict.shards.length; index += 1) {
+          const declaration = normalizeOutputSchemaDeclaration(
+            rawShards[index]?.outputSchema,
+            "分片 " + verdict.shards[index].shardId,
+          );
+          if (declaration !== undefined) schemas.set(verdict.shards[index].shardId, declaration.schema);
+        }
+      } catch (error) {
+        if (error?.name === "OutputSchemaError") return manualDispatchSchemaFailure(error);
+        throw error;
+      }
+
+      // manager 的 validateSubmitInput 会丢弃未知字段（含 outputSchema）；这里把已校验
+      // 的 schema 合并回归一后的分片，submitFanoutTask 才能在提交时看到完整声明。
+      const shards = verdict.shards.map((shard) => (
+        schemas.has(shard.shardId) ? { ...shard, outputSchema: schemas.get(shard.shardId) } : shard
+      ));
+      const args = { role, basePrompt, shards, allowOverlap: verdict.allowOverlap === true };
+      if (verdict.timeoutMs !== undefined) args.timeoutMs = verdict.timeoutMs;
+      if (verdict.concurrencyLimit !== undefined) args.concurrencyLimit = verdict.concurrencyLimit;
+      if (verdict.requestId !== undefined) args.requestId = verdict.requestId;
+      return { ok: true, mode, role, basePrompt, args };
+    }
+
+    /**
+     * 扫描模板文本里的明显凭据。
+     *
+     * @param {string} text - 待检查文本。
+     * @param {string} field - 出错时的字段路径（不含原文）。
+     * @param {object[]} findings - 收集结果（按扫描顺序，取第一条回执）。
+     */
+    function scanTemplateCredentialText(text, field, findings) {
+      if (typeof text !== "string" || text.length === 0) return;
+      for (const entry of FANOUT_TEMPLATE_CREDENTIAL_PATTERNS) {
+        if (entry.pattern.test(text)) {
+          findings.push({ field, kind: entry.kind });
+          return;
+        }
+      }
+    }
+
+    /** 判断一个 affectedPath 是否是明显的临时绝对路径（模板不得固化这类路径）。 */
+    function isEphemeralTemplatePath(value) {
+      if (typeof value !== "string" || value.length === 0) return false;
+      if (/%(?:TEMP|TMP)%/i.test(value)) return true;
+      const absolute = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(value);
+      if (!absolute) return false;
+      return /(?:^|[\\/])(?:Temp|tmp|var[\\/]folders)(?:[\\/]|$)/i.test(value);
+    }
+
+    /**
+     * 校验一段“模板保存/模板派发”输入并归一成可持久化模板。
+     *
+     * 两种模板形态与规格书 §6 的字段一致：
+     * - 单专家模板：只保存 prompt（prompt 或 basePrompt 二选一），派发时转成单分片；
+     * - fan-out 模板：保存 basePrompt + shards（每个分片可有名称/影响范围/超时/schema）。
+     *
+     * 保存与派发共用本函数：模板内容不可信，派发时必须按**当前**角色目录与预算重算。
+     *
+     * @param {object} input - name/role/prompt|basePrompt/shards/...。
+     * @returns {object} {ok:true, template, plan} 或 manualDispatchFailure。
+     */
+    function buildFanoutTemplatePlan(input) {
+      const raw = input !== null && typeof input === "object" && !Array.isArray(input) ? input : {};
+      const name = typeof raw.name === "string" ? raw.name.trim() : "";
+      if (name.length === 0) {
+        return manualDispatchFailure(400, "invalid-template", "模板 name 必须是非空字符串", { field: "name" });
+      }
+      if ([...name].length > FANOUT_TEMPLATE_NAME_MAX_CHARS || utf8ByteLength(name) > FANOUT_TEMPLATE_NAME_MAX_BYTES) {
+        return manualDispatchFailure(
+          400,
+          "invalid-template",
+          "模板 name 超出上限（最多 " + FANOUT_TEMPLATE_NAME_MAX_CHARS + " 个字符 / " + FANOUT_TEMPLATE_NAME_MAX_BYTES + " 字节）",
+          { field: "name" },
+        );
+      }
+      // 控制字符会破坏侧栏/日志的单行展示，保存前直接拒绝而不是静默清洗。
+      if (/[\u0000-\u001f\u007f]/u.test(name)) {
+        return manualDispatchFailure(400, "invalid-template", "模板 name 不能包含控制字符", { field: "name" });
+      }
+      const role = typeof raw.role === "string" ? raw.role.trim() : "";
+      if (role.length === 0) {
+        return manualDispatchFailure(400, "invalid-role", "模板缺少 role", { field: "role" });
+      }
+      if (!isActiveRole(role)) {
+        return manualDispatchFailure(400, "invalid-role", "未启用的角色: " + role, { field: "role" });
+      }
+
+      const hasShards = Array.isArray(raw.shards) && raw.shards.length > 0;
+      if (Array.isArray(raw.shards) && raw.shards.length === 0) {
+        return manualDispatchFailure(400, "invalid-template", "模板 shards 不能是空数组", { field: "shards" });
+      }
+      const hasPrompt = typeof raw.prompt === "string" && raw.prompt.trim().length > 0;
+      const hasBasePrompt = typeof raw.basePrompt === "string" && raw.basePrompt.trim().length > 0;
+
+      // 规格书的字段写作「basePrompt 或 prompt」：两者都是公共目标的同义输入。
+      // - fan-out 模板：公共目标 + shards，统一存为 basePrompt；
+      // - 单专家模板：只有公共目标，统一存为 prompt。
+      // 同时给出两个名字视为歧义（无法判断用户想保留哪个），显式拒绝而不是猜。
+      if (hasPrompt && hasBasePrompt) {
+        return manualDispatchFailure(
+          400,
+          "invalid-template",
+          "模板的 prompt 与 basePrompt 只能提供一个",
+          { field: "prompt" },
+        );
+      }
+      let mode;
+      let singlePrompt;
+      let basePrompt;
+      let dispatchShards;
+      if (hasShards) {
+        mode = "fanout";
+        basePrompt = hasBasePrompt ? raw.basePrompt : raw.prompt;
+        if (typeof basePrompt !== "string" || basePrompt.trim().length === 0) {
+          return manualDispatchFailure(400, "invalid-template", "fan-out 模板需要非空 basePrompt 或 prompt", { field: "basePrompt" });
+        }
+        dispatchShards = raw.shards;
+      } else {
+        singlePrompt = hasPrompt ? raw.prompt : (hasBasePrompt ? raw.basePrompt : "");
+        if (typeof singlePrompt !== "string" || singlePrompt.trim().length === 0) {
+          return manualDispatchFailure(400, "invalid-template", "单专家模板需要非空 prompt", { field: "prompt" });
+        }
+        mode = "single";
+      }
+
+      // 结构/预算/超时/并发/ schema 全部复用与真实派发同一个 plan builder。
+      const plan = buildManualDispatchPlan({
+        mode,
+        role,
+        ...(mode === "single" ? { prompt: singlePrompt } : { basePrompt, shards: dispatchShards }),
+        allowOverlap: raw.allowOverlap,
+        timeoutMs: raw.timeoutMs,
+        concurrencyLimit: raw.concurrencyLimit,
+      });
+      if (plan.ok !== true) return plan;
+
+      // 凭据/临时路径扫描：只回传字段名与固定类别，绝不回显命中的原文。
+      const findings = [];
+      scanTemplateCredentialText(name, "name", findings);
+      if (mode === "single") {
+        scanTemplateCredentialText(singlePrompt, "prompt", findings);
+      } else {
+        scanTemplateCredentialText(basePrompt, "basePrompt", findings);
+        for (let index = 0; index < plan.args.shards.length; index += 1) {
+          const shard = plan.args.shards[index];
+          scanTemplateCredentialText(shard.prompt, "shards[" + index + "].prompt", findings);
+          scanTemplateCredentialText(shard.name, "shards[" + index + "].name", findings);
+          for (let pathIndex = 0; pathIndex < (shard.affectedPaths?.length ?? 0); pathIndex += 1) {
+            const path = shard.affectedPaths[pathIndex];
+            scanTemplateCredentialText(path, "shards[" + index + "].affectedPaths[" + pathIndex + "]", findings);
+            if (findings.length === 0 && isEphemeralTemplatePath(path)) {
+              return manualDispatchFailure(
+                400,
+                "ephemeral-path-rejected",
+                "模板不能保存临时绝对路径：shards[" + index + "].affectedPaths[" + pathIndex + "]",
+                { field: "shards[" + index + "].affectedPaths[" + pathIndex + "]" },
+              );
+            }
+          }
+        }
+      }
+      if (findings.length > 0) {
+        return manualDispatchFailure(
+          400,
+          "credential-rejected",
+          "模板包含疑似凭据或密钥（" + findings[0].field + "），已拒绝保存",
+          { field: findings[0].field, kind: findings[0].kind },
+        );
+      }
+
+      const template = {
+        name,
+        role,
+        ...(mode === "single"
+          ? { prompt: singlePrompt }
+          : { basePrompt, shards: plan.args.shards }),
+        allowOverlap: plan.args.allowOverlap === true,
+        ...(plan.args.concurrencyLimit === undefined ? {} : { concurrencyLimit: plan.args.concurrencyLimit }),
+        ...(plan.args.timeoutMs === undefined ? {} : { timeoutMs: plan.args.timeoutMs }),
+      };
+      return { ok: true, mode, template, plan };
+    }
+
+    /**
+     * 模板文档的「读-改-写」串行链。
+     *
+     * enqueueWrite 只串行化写；模板保存是 read-modify-write：两个并发保存若都在写前读到
+     * 同一份旧文档，后写者会静默覆盖先写者（丢更新）。这里用独立 Promise 链把整段
+     * 读改写串起来；链上一步失败不阻塞下一步（每次都从实际 storage 重读最新文档）。
+     */
+    let fanoutTemplateMutationChain = Promise.resolve();
+    function runFanoutTemplateMutation(task) {
+      const run = fanoutTemplateMutationChain.then(task, () => task());
+      fanoutTemplateMutationChain = run.then(() => undefined, () => undefined);
+      return run;
+    }
+
+    /** 读取模板文档（只读、不缓存）：storage 未 ready 时明确不可用，绝不返回空库冒充成功。 */
+    function readFanoutTemplateDocument() {
+      const binding = host.storage.active();
+      if (binding?.fanoutTemplateAuthoritative !== true || binding.fanoutTemplateTable === void 0) {
+        return { ok: false };
+      }
+      const entries = tableEntries(binding.fanoutTemplateTable);
+      if (entries === void 0) return { ok: false };
+      return { ok: true, document: normalizeTemplateDocumentEntries(entries) };
+    }
+
+    /**
+     * 持久化模板文档。
+     *
+     * 写入必须走组合根同一条 enqueueWrite 串行链：模板保存与 fan-out 快照/child 写入
+     * 共享 storage generation 门控，卸载时同样会被 drain，绝不旁路。
+     */
+    function persistFanoutTemplateDocument(document) {
+      return enqueueWrite(async () => {
+        const binding = host.storage.active();
+        if (binding?.fanoutTemplateAuthoritative !== true || binding.fanoutTemplateTable === void 0) {
+          throw new Error("storage domain is not ready for fan-out template write");
+        }
+        const result = await persistDomainEntry({
+          table: binding.fanoutTemplateTable,
+          key: FANOUT_TEMPLATE_STORE_KEY,
+          value: document,
+          isCurrent: () => storageBinding.isCurrent(binding),
+        });
+        if (result.detached === true) {
+          const error = new Error("storage domain binding was replaced during fan-out template write");
+          error.code = "PERSISTENCE_GENERATION_STALE";
+          error.category = "generation-stale";
+          throw error;
+        }
+        // 同步只读投影缓存：source()/readDomainSnapshot 的下一次读取仍以表为准，
+        // 这里只让同一进程内已建立的快照缓存立即看到新文档（与 fanout 快照同策略）。
+        const current = storageBinding.domainSnapshot();
+        if (current !== null && typeof current === "object") {
+          storageBinding.setDomainSnapshot({ ...current, fanoutTemplates: document });
+        }
+        return true;
+      });
+    }
+
+    /**
+     * 模板列表摘要：有界、无 schema 原文、无凭据/绝对路径全文。
+     *
+     * prompt 只给有界预览与字节数；分片给 shardId/名称/影响范围/超时与“是否声明 schema”
+     * 布尔。客户端需要完整内容时必须显式发起模板派发，而不是靠列表把整库读进内存。
+     */
+    function summarizeFanoutTemplate(template) {
+      const record = template !== null && typeof template === "object" && !Array.isArray(template) ? template : {};
+      const shards = Array.isArray(record.shards) ? record.shards.slice(0, FANOUT_BUDGET.maxShardsPerTask) : [];
+      const mode = shards.length > 0 ? "fanout" : "single";
+      const promptText = mode === "single"
+        ? (typeof record.prompt === "string" ? record.prompt : "")
+        : (typeof record.basePrompt === "string" ? record.basePrompt : "");
+      return {
+        id: typeof record.id === "string" ? record.id : null,
+        name: typeof record.name === "string" ? record.name : "",
+        role: typeof record.role === "string" ? record.role : "",
+        mode,
+        promptBytes: utf8ByteLength(promptText),
+        // 预览按码点切分：不会把多字节字符切成半个，也不会让列表随模板正文增长。
+        preview: [...promptText].slice(0, FANOUT_TEMPLATE_PREVIEW_CHARS).join(""),
+        shards: shards.map((shard) => {
+          const entry = shard !== null && typeof shard === "object" && !Array.isArray(shard) ? shard : {};
+          return {
+            shardId: typeof entry.shardId === "string" ? entry.shardId : "",
+            ...(typeof entry.name === "string" && entry.name.length > 0 ? { name: entry.name } : {}),
+            promptBytes: utf8ByteLength(typeof entry.prompt === "string" ? entry.prompt : ""),
+            affectedPaths: Array.isArray(entry.affectedPaths)
+              ? entry.affectedPaths.slice(0, 64).map((path) => String(path).slice(0, 512))
+              : [],
+            ...(Number.isSafeInteger(entry.timeoutMs) ? { timeoutMs: entry.timeoutMs } : {}),
+            hasOutputSchema: entry.outputSchema !== undefined,
+          };
+        }),
+        allowOverlap: record.allowOverlap === true,
+        ...(Number.isSafeInteger(record.concurrencyLimit) ? { concurrencyLimit: record.concurrencyLimit } : {}),
+        ...(Number.isSafeInteger(record.timeoutMs) ? { timeoutMs: record.timeoutMs } : {}),
+        createdAt: Number.isSafeInteger(record.createdAt) ? record.createdAt : null,
+        updatedAt: Number.isSafeInteger(record.updatedAt) ? record.updatedAt : null,
+      };
+    }
+
+    /**
+     * 手动派发/模板共用的提交路径。
+     *
+     * 与 fanout 工具 execute 的关键步骤逐项同源：
+     * 1) spawn provider 就绪；
+     * 2) resolveRoleModelRoute 做真实预检（primary → 有序候选 fallback）；
+     * 3) submitFanoutTask(parent, args, precheckRoute) 提交并登记 root wait。
+     *
+     * 因此手动派发不会绕过 admission、冲突检查、并发限制、wait ledger 或目标交接；
+     * 只读角色的 deny 由 manager 构造 child 请求时按同一注册表施加。
+     *
+     * @param {object} parent - exact live root Agent。
+     * @param {object} plan - buildManualDispatchPlan 的成功结果。
+     * @param {AbortSignal|undefined} signal - RPC 请求取消信号。
+     * @returns {Promise<object>} {ok:true, receipt} 或 manualDispatchFailure。
+     */
+    async function runManualFanoutDispatch(parent, plan, signal) {
+      if (!spawnProviderReady()) {
+        return manualDispatchFailure(503, "subagent-unavailable", "subagent provider 不可用，无法派发专家任务");
+      }
+      let route;
+      try {
+        route = await resolveRoleModelRoute(plan.role, parent.id, signal);
+      } catch (error) {
+        // 取消必须原样上抛（由 RPC 映射 499），其它预检失败回结构化 code，不回传原始错误正文。
+        if (signal?.aborted === true || error?.name === "AbortError" || error?.code === "ABORT_ERR") throw error;
+        const routeCode = modelRouteErrorCodeOf(error);
+        return manualDispatchFailure(
+          400,
+          "model-route-unavailable",
+          "角色 " + plan.role + " 的模型预检失败："
+            + modelRouteErrorMessage(routeCode),
+          { code: routeCode },
+        );
+      }
+      if (route === null) {
+        return manualDispatchFailure(400, "role-model-not-configured", plan.role + " 专家尚未配置模型");
+      }
+      if (signal?.aborted === true) throw createAbortError();
+
+      let result;
+      try {
+        result = submitFanoutTask(parent, plan.args, route);
+      } catch (error) {
+        // schema 在提交阶段可能因 provider 能力不足被拒绝（输出契约不降级）。
+        if (error?.name === "OutputSchemaError") return manualDispatchSchemaFailure(error);
+        // manager 的校验/冲突/容量拒绝保持其稳定 code（客户端可按同一词表处理）。
+        if (error?.name === "FanoutValidationError") {
+          return manualDispatchVerdictFailure({
+            code: error.code,
+            message: error.message,
+            field: error.field,
+            violation: error.violation,
+            conflict: error.conflict,
+          });
+        }
+        throw error;
+      }
+      if (result?.accepted === false) {
+        // manager 关闭/回收屏障等“当前不可提交”的拒绝：与 500 内部错误区分，可重试。
+        const reclaimInProgress = result.code === "RECLAIM_IN_PROGRESS";
+        return manualDispatchFailure(
+          reclaimInProgress ? 409 : 503,
+          reclaimInProgress ? "dispatch-reclaim-in-progress" : "dispatch-unavailable",
+          reclaimInProgress ? "已有回收正在进行中，请稍后重试" : "fan-out 当前不可提交",
+          typeof result.code === "string" ? { code: result.code } : undefined,
+        );
+      }
+
+      const continuation = buildFanoutContinuationHandle(result.task);
+      return {
+        ok: true,
+        receipt: {
+          kind: "fanout",
+          accepted: true,
+          mode: plan.mode,
+          parentTaskId: result.parentTaskId,
+          role: result.role,
+          status: result.status,
+          // 幂等命中必须显式标注 duplicate，让客户端知道这一击没有新建任务。
+          ...(result.duplicate === true ? { duplicate: true } : {}),
+          ...(Number.isSafeInteger(result.task?.round) ? { round: result.task.round } : {}),
+          shardIds: result.shardIds,
+          ...(continuation === void 0 ? {} : { continuation }),
+          task: result.task,
+        },
+      };
+    }
+
+    /**
+     * 手动派发/模板动作的 root 解析（root-only + exact live root）。
+     *
+     * 复用 fanoutRpcRootSession 的同一套判定（非子会话、非 DEG child、registry 有 live
+     * Agent），并额外要求当前代际 token 仍 live：同 id replacement / 已销毁 root 不能
+     * 借旧 sessionId 派发新 child。失败统一 404，不泄露跨 root 的存在性。
+     *
+     * @param {object} body - RPC body。
+     * @returns {{ok:true, parent:object, sessionId:string} | {ok:false, failure:object}}
+     */
+    function requireManualFanoutRoot(body) {
+      const sessionId = fanoutRpcSessionId(body);
+      if (sessionId.length === 0) {
+        return { ok: false, failure: manualDispatchFailure(400, "bad-request", "缺少 sessionId") };
+      }
+      if (fanoutRpcIsChildSession(sessionId)) {
+        return { ok: false, failure: manualDispatchFailure(404, "session-not-found", "根会话不存在或尚未恢复") };
+      }
+      const parent = fanoutRpcRootSession(sessionId);
+      let live = false;
+      if (parent !== void 0) {
+        try {
+          live = isLiveRootAgent(parent) && host.lineage.isLiveGeneration(parent, host.lineage.tokenFor(parent));
+        } catch {
+          live = false;
+        }
+      }
+      if (live !== true) {
+        return { ok: false, failure: manualDispatchFailure(404, "session-not-found", "根会话不存在或尚未恢复") };
+      }
+      return { ok: true, parent, sessionId };
+    }
+
     function fanoutRpcRootSession(sessionId) {
       if (typeof sessionId !== "string" || sessionId.length === 0) return void 0;
       const agent = agents.get(sessionId);
@@ -10796,24 +14960,79 @@ export default {
      * 能力缺失（旧 Host）时原样返回任务，绝不伪造授权；shard 能力按 shardId 对齐，
      * 缺失条目的 shard 保持原样（客户端回退旧行为）。
      */
+
+    /**
+     * fan-out RPC 任务快照的结构化结果补齐（票据 30，只读副本）。
+     *
+     * manager 的权威任务不含 schema/结构化结果（schema 从不进入快照）；这里按
+     * attempt.childId 从 child_models 补齐 structured/outputSchemaRequested。
+     * task 级只汇总 outputSchemaRequested 与逐 attempt 的结构化结果列表，绝不合并 value。
+     */
+    function enrichFanoutTaskStructured(task, sessionId) {
+      if (task === null || typeof task !== "object" || !Array.isArray(task.shards)) return task;
+      let children = {};
+      try { children = source()?.childModels ?? {}; } catch { children = {}; }
+      /** 只从本 root 的 fan-out child 记录补齐：跨 root 的记录绝不进入任务快照。 */
+      const ownedRecord = (childId) => {
+        const record = typeof childId === "string" ? children[childId] : undefined;
+        return record !== null && typeof record === "object" && record.parentId === sessionId ? record : undefined;
+      };
+      let taskRequested = false;
+      const structuredResults = [];
+      const shards = task.shards.map((shard) => {
+        if (shard === null || typeof shard !== "object") return shard;
+        const attempts = Array.isArray(shard.attempts)
+          ? shard.attempts.map((attempt) => {
+            if (attempt === null || typeof attempt !== "object") return attempt;
+            const childId = typeof attempt.childId === "string" ? attempt.childId : "";
+            const fields = structuredProjectionFields(ownedRecord(childId));
+            if (fields.outputSchemaRequested === true) taskRequested = true;
+            if (fields.structured !== undefined) {
+              structuredResults.push({
+                shardId: typeof shard.shardId === "string" ? shard.shardId : null,
+                attempt: Number.isSafeInteger(attempt.attempt) ? attempt.attempt : null,
+                childId: childId.length === 0 ? null : childId,
+                structured: fields.structured,
+              });
+            }
+            return Object.keys(fields).length === 0 ? attempt : { ...attempt, ...fields };
+          })
+          : shard.attempts;
+        const latest = Array.isArray(attempts) && attempts.length > 0 ? attempts[attempts.length - 1] : undefined;
+        return {
+          ...shard,
+          ...(Array.isArray(attempts) ? { attempts } : {}),
+          ...(latest?.structured === undefined ? {} : { structured: latest.structured }),
+          ...(latest?.outputSchemaRequested === true ? { outputSchemaRequested: true } : {}),
+        };
+      });
+      return {
+        ...task,
+        shards,
+        ...(structuredResults.length === 0 ? {} : { structured: structuredResults }),
+        ...(taskRequested ? { outputSchemaRequested: true } : {}),
+      };
+    }
+
     function fanoutRpcTaskWithCapabilities(sessionId, task) {
       if (task === null || task === void 0 || typeof task !== "object") return task;
+      const enriched = enrichFanoutTaskStructured(task, sessionId);
       const capabilities = fanoutRpcCapabilitiesOf(sessionId, task.parentTaskId);
-      if (capabilities === null) return task;
+      if (capabilities === null) return enriched;
       const shardCapabilities = capabilities.shards !== null && typeof capabilities.shards === "object"
         && !Array.isArray(capabilities.shards)
         ? capabilities.shards
         : {};
-      const shards = Array.isArray(task.shards)
-        ? task.shards.map((shard) => {
+      const shards = Array.isArray(enriched.shards)
+        ? enriched.shards.map((shard) => {
           const shardId = typeof shard?.shardId === "string" ? shard.shardId : "";
           const shardCapability = shardCapabilities[shardId];
           return shardCapability !== null && typeof shardCapability === "object"
             ? { ...shard, capabilities: shardCapability }
             : shard;
         })
-        : task.shards;
-      return { ...task, capabilities, ...(Array.isArray(task.shards) ? { shards } : {}) };
+        : enriched.shards;
+      return { ...enriched, capabilities, ...(Array.isArray(enriched.shards) ? { shards } : {}) };
     }
 
     /**
@@ -11275,9 +15494,45 @@ export default {
             ok: true,
             roles,
             activeRoles: roles,
+            // 角色只读投影（票据 27）：含自定义角色。客户端据此渲染设置页角色表与侧栏标签；
+            // roleLabels 是显示名（中文），roleDescriptions 是职责摘要（设置页提示）。
+            roleLabels: roleLabelsProjection(),
+            roleDescriptions: roleDescriptionsOf(roleCatalog().records()),
+            // 设置页「自定义角色」编辑器的数据源：与保存/运行期目录同源的定义映射。
+            customRoles: snap.customRoles ?? {},
+            customRoleDiagnostics: projectCustomRoleDiagnostics(snap.customRoleDiagnostics),
             enableObserver: config.enableObserver === true,
             observerPreferred: snap.observerPreferred === true,
             roleConcurrencyLimit: snap.roleConcurrencyLimit,
+            /**
+             * 并发映射（票据 26）：meta 必须携带这两个字段，否则设置页无法渲染
+             * 逐角色/provider 编辑面（客户端波次），诊断也无法解释任务为什么排队。
+             * 只回传归一后的生效值 + 有界的丢弃诊断，不回传 settings 原始文档。
+             */
+            roleLimits: snap.roleLimits ?? {},
+            providerLimits: snap.providerLimits ?? {},
+            limitDiagnostics: projectLimitDiagnostics(snap.limitDiagnostics),
+            /**
+             * 角色级上下文继承（票据 29）：只含内置非 Observer 角色的显式 true。
+             * 设置页继承开关与 token 成本提示属客户端波次；服务端只提供读取面与
+             * 保存面。是否真正可用仍取决于宿主是否有合格的 fork provider（派发时
+             * fail-closed 校验，错误码 CONTEXT_INHERITANCE_UNAVAILABLE）。
+             */
+            inheritContext: snap.inheritContext ?? {},
+            inheritContextDiagnostics: projectInheritContextDiagnostics(snap.inheritContextDiagnostics),
+            /**
+             * 单价（票据 25）：meta 只回传**原始单价**（每百万 token）与读取期诊断，
+             * 不在后端计算/展示成本——缺单价时客户端显示 token 与请求数即可，
+             * 绝不显示假成本。cost 估算由客户端按需调用同一套纯函数规则。
+             */
+            modelPrices: Array.isArray(snap.modelPrices) ? snap.modelPrices : [],
+            modelPriceDiagnostics: projectModelPriceDiagnostics(snap.modelPriceDiagnostics),
+            /**
+             * 用量聚合（票据 25，全局只读）：totals / byRole / byProvider / byModel /
+             * recentTasks（≤16）。只由 child_models.usage 与 live 账本投影，不含
+             * prompt/response/凭据/完整路径；没有样本时 totals 为 null，不补 0。
+             */
+            usage: usageSummaryFor(null),
             // 角色默认超时（毫秒，0=不启用）：meta 只回传归一后的生效值。
             roleTimeoutMs: snap.roleTimeoutMs,
             // 任务管理默认开启：meta 只回传归一后的生效值，供设置页与诊断读取。
@@ -11301,6 +15556,206 @@ export default {
           const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
           if (sessionId.length === 0) { fail(400, "bad-request", "缺少 sessionId"); return; }
           send(200, { ok: true, snapshot: await expertGroupRuntime.snapshotForSession(sessionId) });
+          return;
+        }
+
+        /**
+         * 手动派发与任务模板（票据 28，服务端部分）。
+         *
+         * 五个动作共用同一条授权边界（root-only、exact live root，子会话/未知/旧代际一律
+         * 404），并且都不是新的 admission 路径：
+         * - fanout-dispatch → buildManualDispatchPlan（manager 同一校验）→ runManualFanoutDispatch
+         *   → submitFanoutTask（与 fanout 工具完全同源）；
+         * - fanout-template-* → 只读写独立 domain 表；模板派发时重新走上面的 plan builder
+         *   与 submit 路径，模板内容不被信任。
+         */
+        if (body.action === "fanout-dispatch"
+          || body.action === "fanout-template-list"
+          || body.action === "fanout-template-save"
+          || body.action === "fanout-template-delete"
+          || body.action === "fanout-template-dispatch") {
+          const rootState = requireManualFanoutRoot(body);
+          if (rootState.ok !== true) {
+            const failure = rootState.failure;
+            fail(failure.status, failure.code, failure.message, failure.details);
+            return;
+          }
+          const parent = rootState.parent;
+
+          if (body.action === "fanout-dispatch") {
+            const plan = buildManualDispatchPlan(body);
+            if (plan.ok !== true) { fail(plan.status, plan.code, plan.message, plan.details); return; }
+            const outcome = await runManualFanoutDispatch(parent, plan, signal);
+            if (outcome.ok !== true) { fail(outcome.status, outcome.code, outcome.message, outcome.details); return; }
+            send(200, { ok: true, ...outcome.receipt });
+            return;
+          }
+
+          // 以下模板动作都要求模板存储 ready：缺少 binding 时明确 503，绝不用空库冒充保存成功。
+          if (body.action === "fanout-template-list") {
+            const templateState = readFanoutTemplateDocument();
+            if (templateState.ok !== true) {
+              fail(503, "template-storage-unavailable", "模板存储尚未就绪");
+              return;
+            }
+            const templateDocument = templateState.document;
+            send(200, {
+              ok: true,
+              templates: templateDocument.templates.map((template) => summarizeFanoutTemplate(template)),
+              count: templateDocument.templates.length,
+              limit: FANOUT_TEMPLATE_LIMIT,
+            });
+            return;
+          }
+
+          if (body.action === "fanout-template-save" || body.action === "fanout-template-delete") {
+            // 保存的纯结构校验可以放在锁外；真正读文档、判重、判上限与落盘都在同一条
+            // 串行链里完成，避免两个并发保存基于同一份旧文档互相覆盖（丢更新）。
+            const plan = body.action === "fanout-template-save" ? buildFanoutTemplatePlan(body) : undefined;
+            if (plan !== undefined && plan.ok !== true) {
+              fail(plan.status, plan.code, plan.message, plan.details);
+              return;
+            }
+            const outcome = await runFanoutTemplateMutation(async () => {
+              const templateState = readFanoutTemplateDocument();
+              if (templateState.ok !== true) {
+                return manualDispatchFailure(503, "template-storage-unavailable", "模板存储尚未就绪");
+              }
+              const templateDocument = templateState.document;
+
+              if (body.action === "fanout-template-delete") {
+                const templateId = typeof body.templateId === "string" ? body.templateId.trim() : "";
+                if (templateId.length === 0) {
+                  return manualDispatchFailure(400, "bad-request", "缺少 templateId");
+                }
+                const index = templateDocument.templates.findIndex((template) => template?.id === templateId);
+                if (index < 0) return manualDispatchFailure(404, "template-not-found", "模板不存在");
+                const templates = templateDocument.templates.filter((_, entryIndex) => entryIndex !== index);
+                const document = { version: FANOUT_TEMPLATE_VERSION, templates };
+                try {
+                  await persistFanoutTemplateDocument(document);
+                } catch (error) {
+                  ctx.logger.warn("dsh-expert-group: fan-out template persistence failed: "
+                    + (error instanceof Error ? error.message : String(error)));
+                  return manualDispatchFailure(500, "template-persist-failed", "模板删除未能落盘，模板库保持不变，可稍后重试");
+                }
+                return { ok: true, value: { deleted: true, templateId, count: templates.length } };
+              }
+
+              // 锁外只做了纯结构校验；真正落盘前再确认角色仍启用，避免校验与写入之间
+              // 角色被删除/禁用后仍保存出一个不可派发的模板。
+              if (!isActiveRole(plan.template.role)) {
+                return manualDispatchFailure(400, "invalid-role", "未启用的角色: " + plan.template.role, { field: "role" });
+              }
+              const rawTemplateId = typeof body.templateId === "string" ? body.templateId.trim() : "";
+              const existingIndex = rawTemplateId.length === 0
+                ? -1
+                : templateDocument.templates.findIndex((template) => template?.id === rawTemplateId);
+              if (rawTemplateId.length > 0 && existingIndex < 0) {
+                return manualDispatchFailure(404, "template-not-found", "模板不存在");
+              }
+              if (rawTemplateId.length === 0 && templateDocument.templates.length >= FANOUT_TEMPLATE_LIMIT) {
+                return manualDispatchFailure(
+                  400,
+                  "template-limit",
+                  "模板数量已达上限 " + FANOUT_TEMPLATE_LIMIT + " 个，请先删除不再使用的模板",
+                  { limit: FANOUT_TEMPLATE_LIMIT, count: templateDocument.templates.length },
+                );
+              }
+              const now = Date.now();
+              const existing = existingIndex >= 0 ? templateDocument.templates[existingIndex] : undefined;
+              // 模板 id 由 Host 生成，绝不使用用户输入作为 key/路径；更新只按已有 id 匹配。
+              const templateId = rawTemplateId.length > 0 ? rawTemplateId : "tpl-" + randomUUID();
+              const template = {
+                id: templateId,
+                ...plan.template,
+                createdAt: Number.isSafeInteger(existing?.createdAt) ? existing.createdAt : now,
+                updatedAt: now,
+              };
+              const templates = existingIndex >= 0
+                ? templateDocument.templates.map((entry, index) => (index === existingIndex ? template : entry))
+                : [...templateDocument.templates, template];
+              const document = { version: FANOUT_TEMPLATE_VERSION, templates };
+              const bytes = utf8ByteLength(JSON.stringify(document));
+              if (!Number.isSafeInteger(bytes) || bytes > FANOUT_TEMPLATE_MAX_BYTES) {
+                return manualDispatchFailure(
+                  400,
+                  "template-limit",
+                  "模板库总量超过上限 " + FANOUT_TEMPLATE_MAX_BYTES + " 字节，请删除不再使用的模板",
+                  {
+                    maxBytes: FANOUT_TEMPLATE_MAX_BYTES,
+                    bytes: Number.isSafeInteger(bytes) ? bytes : null,
+                    count: templates.length,
+                  },
+                );
+              }
+              try {
+                await persistFanoutTemplateDocument(document);
+              } catch (error) {
+                ctx.logger.warn("dsh-expert-group: fan-out template persistence failed: "
+                  + (error instanceof Error ? error.message : String(error)));
+                // 先落盘再返回：失败时磁盘与读取投影都保持旧文档，绝不宣告半成功。
+                return manualDispatchFailure(500, "template-persist-failed", "模板保存未能落盘，模板库保持不变，可稍后重试");
+              }
+              return {
+                ok: true,
+                value: {
+                  created: existingIndex < 0,
+                  template: summarizeFanoutTemplate(template),
+                  count: templates.length,
+                },
+              };
+            });
+            if (outcome.ok !== true) { fail(outcome.status, outcome.code, outcome.message, outcome.details); return; }
+            send(200, { ok: true, ...outcome.value });
+            return;
+          }
+
+          const templateState = readFanoutTemplateDocument();
+          if (templateState.ok !== true) {
+            fail(503, "template-storage-unavailable", "模板存储尚未就绪");
+            return;
+          }
+          const templateDocument = templateState.document;
+
+          // fanout-template-dispatch：模板内容是不可信输入，重新按当前角色/预算/schema 校验。
+          const templateId = typeof body.templateId === "string" ? body.templateId.trim() : "";
+          if (templateId.length === 0) {
+            fail(400, "bad-request", "缺少 templateId");
+            return;
+          }
+          const template = templateDocument.templates.find((entry) => entry?.id === templateId);
+          if (template === undefined) {
+            fail(404, "template-not-found", "模板不存在");
+            return;
+          }
+          let requestId;
+          if (body.requestId !== undefined && body.requestId !== null) {
+            if (typeof body.requestId !== "string" || body.requestId.trim().length === 0) {
+              fail(400, "INVALID_REQUEST_ID", "requestId 必须是非空字符串");
+              return;
+            }
+            requestId = body.requestId;
+          }
+          const templatePlan = buildFanoutTemplatePlan({
+            name: template.name,
+            role: template.role,
+            ...(template.prompt === undefined ? {} : { prompt: template.prompt }),
+            ...(template.basePrompt === undefined ? {} : { basePrompt: template.basePrompt }),
+            ...(template.shards === undefined ? {} : { shards: template.shards }),
+            allowOverlap: template.allowOverlap,
+            concurrencyLimit: template.concurrencyLimit,
+            timeoutMs: template.timeoutMs,
+          });
+          if (templatePlan.ok !== true) {
+            // 模板保存后角色被删除/禁用、schema 被篡改、超时越界等都收敛为同一来源的稳定 code。
+            fail(templatePlan.status, templatePlan.code, templatePlan.message, templatePlan.details);
+            return;
+          }
+          if (requestId !== undefined) templatePlan.plan.args.requestId = requestId;
+          const outcome = await runManualFanoutDispatch(parent, templatePlan.plan, signal);
+          if (outcome.ok !== true) { fail(outcome.status, outcome.code, outcome.message, outcome.details); return; }
+          send(200, { ok: true, templateId, ...outcome.receipt });
           return;
         }
 
@@ -11481,6 +15936,8 @@ export default {
           const reclaimed = Array.isArray(outcome.reclaimed) ? outcome.reclaimed : [];
           // 已回收任务的等待记录若已 released，顺手清掉：它们已不可寻址，留着只会占满有界表。
           for (const parentTaskId of reclaimed) {
+            clearFanoutOutputSchemas(parentTaskId);
+            clearFanoutRoute(parentTaskId);
             const waitRecord = fanoutTurnWaitRecords.get(parentTaskId);
             if (waitRecord !== undefined && waitRecord.state === "released") {
               fanoutTurnWaitRecords.delete(parentTaskId);
@@ -11559,6 +16016,9 @@ export default {
             let result;
             if (body.action === "fanout-cancel-parent") {
               result = fanoutHost.cancelParent(parentTaskId);
+              // 取消后的任务没有 retry 路径：与 outputSchema 映射同生命周期清理，
+              // 避免已取消任务的预检路由占满有界表（重新提交会得到新 parentTaskId）。
+              if (result?.accepted === true) clearFanoutRoute(parentTaskId);
             } else {
               const shardId = typeof body.shardId === "string" ? body.shardId.trim() : "";
               if (shardId.length === 0) { fail(400, "bad-request", "缺少 shardId"); return; }
@@ -11670,8 +16130,49 @@ export default {
             return;
           }
           // 兼容旧 Host 的调用形状：commitSettingsCandidate(body.settings, expectedRevision);
-          const committed = await commitSettingsCandidate(body.settings, expectedRevision, signal);
+          // 票据 20：`changed` 是可选的变更集（新客户端携带 `string[]`，旧客户端不携带，
+          // Host 会按「已保存值 vs 候选」的差异自行推导）。候选本身仍是完整值，
+          // replace 语义与 revision 栅栏完全不变。
+          const committed = await commitSettingsCandidate(body.settings, expectedRevision, signal, body.changed);
           send(200, { ok: true, ...committed });
+          return;
+        }
+        /**
+         * 「发送测试通知」动作（票据 14）。
+         *
+         * 唯一通道是 config.createSystemToast 创建的真实适配器：这里直接调用它的
+         * show()，绝不伪造任务状态、不创建假任务、不写终止快照，也不绕过平台适配器
+         * 自己拼 XML/子进程。回执只给出平台固定枚举、是否真的显示与适配器声明的
+         * reason token；桌面上的真实显示/发声仍属人工验收（见票据）。
+         *
+         * 开关语义：通知总开关关闭时**不发送**（与后台投递同一约束），回执 reason=disabled；
+         * 事件类型过滤不适用于测试动作——用户显式点击就是要求验证通道。
+         */
+        if (body.action === "notification-test") {
+          const platform = systemToastPlatformToken();
+          if (systemToastEnabled() !== true) {
+            send(200, { ok: true, test: { shown: false, reason: "disabled", platform } });
+            return;
+          }
+          if (typeof systemToast?.show !== "function") {
+            fail(503, "notification-unavailable", "系统通知通道不可用");
+            return;
+          }
+          let result;
+          try {
+            result = await systemToast.show({
+              ...testNotificationToast(),
+              // 与后台投递共用同一份音量设置；测试动作不改变任何设置。
+              volume: systemToastVolume(),
+            });
+          } catch (error) {
+            logSystemToastFailure(error);
+            fail(502, "notification-failed", "系统通知投递失败");
+            return;
+          }
+          // 注入实现可能返回自由文本：reason 只接受模块声明过的固定 token。
+          const reason = systemToastDiagnosticToken(result?.reason) ?? "unknown";
+          send(200, { ok: true, test: { shown: result?.shown === true, reason, platform } });
           return;
         }
         const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
@@ -11725,6 +16226,23 @@ export default {
                 // 子代理角色：优先在线 agent 的 options marker，其次持久化记录；
                 // 缺失时留空（客户端隐藏角色前缀，显示与旧版一致）。
                 role: agent?.options?.[ROLE_MARKER] ?? recorded?.role,
+                // 实际路由（票据 24）：只回传确实记录过的字段；缺失时省略而不是伪造 0。
+                ...(() => {
+                  const marked = routeFieldsOfMarker(agent?.options?.[EXPERT_ROUTE_MARKER]);
+                  return Object.keys(marked).length > 0 ? marked : modelRouteFieldsFromRecord(recorded);
+                })(),
+                // 用量（票据 25）：live 账本优先（去抖窗口内也最新），其次 child_models.usage；
+                // 缺失为 null，客户端据此显示“用量不可用”，绝不显示 0 成本。
+                usage: (() => {
+                  const live = usageLedger.usageFor(sessionId);
+                  if (live !== null) return live;
+                  const stored = projectUsage(recorded?.usage);
+                  return stored !== null && hasUsageMetrics(stored) ? stored : null;
+                })(),
+                // 结构化交付（票据 30）：只读结果；缺失为 null，不伪造回退标记。
+                // schema 原文永不回传，只有是否声明过与最终结果本身。
+                structured: projectStructuredResult(recorded?.structured),
+                ...(recorded?.outputSchemaRequested === true ? { outputSchemaRequested: true } : {}),
               },
             });
             return;
@@ -11735,14 +16253,18 @@ export default {
           const roles = activeRoles();
           const defaults = {};
           const overrides = {};
+          const candidates = {};
           for (const role of roles) {
             defaults[role] = snap.defaults?.[role] ?? null;
             overrides[role] = snap.sessionOverrides?.[sessionId]?.[role] ?? null;
+            // 候选是全局配置：会话覆盖只替换 primary，不改变这里的列表。
+            candidates[role] = snap.candidates?.[role] ?? [];
           }
           // 全局提示词覆盖与角色模型配置同源：都来自 settings，与会话无关，
           // 因此这里只返回已保存的有效覆盖（缺失键表示该角色跟随默认 persona）。
           const promptOverrides = {};
-          for (const entry of listRoles()) {
+          // 运行期目录（内置 + 自定义）：自定义角色的提示词覆盖与内置角色同源投影。
+          for (const entry of roleCatalog().records()) {
             const value = promptOverrideFor(snap[PROMPT_OVERRIDES_SETTINGS_KEY], entry.id);
             if (value !== void 0) promptOverrides[entry.id] = value;
           }
@@ -11756,8 +16278,30 @@ export default {
             ok: true,
             kind: "root",
             roles, defaults, overrides,
+            // 会话级覆盖代次（票据 21）：设置页打开/保存时以它做 CAS 栅栏；旧客户端
+            // 忽略该未知字段，旧 Host 更不会出现它，客户端缺字段时按"不支持"降级。
+            overrideRevision: sessionOverrideProjectionOf(snap, sessionId).revision,
+            // 自定义角色定义（票据 27）：设置页据此渲染编辑器；非法读取值已在
+            // normalizeSnapshot 内丢弃并诊断，不会以坏值形式出现在这里。
+            customRoles: snap.customRoles ?? {},
+            roleLabels: roleLabelsProjection(),
+            // 模型候选读取面（票据 24）：有序数组 + 自动降级上限；非法读取值已在
+            // normalizeSnapshot 里回退为空/默认 2，客户端无需再容错。
+            candidates,
+            fallbackLimit: snap.fallbackLimit,
+            // 并发映射（票据 26）：与 meta 同源的归一值；设置页读取面据此渲染
+            // 逐角色/provider 编辑面（UI 属客户端波次），旧客户端忽略未知字段。
+            roleLimits: snap.roleLimits ?? {},
+            providerLimits: snap.providerLimits ?? {},
+            // 上下文继承（票据 29）：与 meta 同源的归一映射；设置页读取面据此渲染开关
+            // （UI 属客户端波次），旧客户端忽略未知字段。
+            inheritContext: snap.inheritContext ?? {},
+            // 单价（票据 25）：与 meta 同源的归一原始单价；设置页据此编辑每百万 token 价格。
+            modelPrices: Array.isArray(snap.modelPrices) ? snap.modelPrices : [],
             rolePrompts: describeRolePrompts(snap),
             promptOverrides,
+            // 当前 root 的用量摘要（票据 25）：按 child_models.parentId 限定，最多 16 个最近任务。
+            usageSummary: usageSummaryFor(sessionId),
             provider: snap.provider ?? "",
             enableObserver: config.enableObserver === true,
             observerPreferred: snap.observerPreferred === true,
@@ -11770,6 +16314,190 @@ export default {
           return;
         }
 
+        /**
+         * 会话级模型覆盖（票据 21）：读取 + 带代次的写入/清除。
+         *
+         * 边界与既有 get/commit 同源：
+         * - 读：root-only（子会话没有自己的覆盖），离线仍可读（live=false），不要求 agent 在线；
+         * - 写：live root + 启用角色 + 与全局同一套精确目录校验（validateSelectionWithSignal），
+         *   且只在 storage domain ready 后写入；绝不改全局 settings、绝不改候选列表。
+         * - 代次：每个会话独立 revision，set/clear 成功后 +1；expectedRevision 不匹配返回
+         *   409 + 权威 revision/覆盖，客户端保留草稿并提示，不自动覆盖。
+         */
+        if (body.action === "session-override-get") {
+          if (isChild) { fail(404, "session-not-found", "根会话不存在或尚未恢复"); return; }
+          const snap = source();
+          const view = sessionOverrideProjectionOf(snap, sessionId);
+          // live 用现有 exact root/live 判定（与 fan-out 读根解析同一入口）：agent 在线、
+          // 且不是任何父会话的子代理。离线时仍返回持久化覆盖，供设置页只读展示。
+          const live = fanoutRpcRootSession(sessionId) !== void 0;
+          send(200, { ok: true, sessionId, overrides: view.overrides, revision: view.revision, live });
+          return;
+        }
+        if (body.action === "session-override-set" || body.action === "session-override-clear") {
+          const clearOnly = body.action === "session-override-clear";
+          if (isChild) { fail(400, "read-only", "子代理会话只读，不能修改会话级模型覆盖"); return; }
+          // 写入必须由 live root 发起：离线会话的覆盖无法证明归属于当前调用方，
+          // 且客户端本就应按只读处理；这里再 fail-closed 一次。
+          if (fanoutRpcRootSession(sessionId) === void 0) {
+            fail(404, "session-not-found", "会话不存在或尚未恢复");
+            return;
+          }
+          const expectedRevision = body.expectedRevision;
+          if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+            fail(400, "bad-request", "expectedRevision 无效");
+            return;
+          }
+          const role = typeof body.role === "string" ? body.role.trim() : "";
+          if (!isActiveRole(role)) { fail(400, "invalid-role", "未启用的角色: " + role); return; }
+          /**
+           * 选择校验在写临界区之外完成（与既有 session commit 一致）：目录解析可能是
+           * 异步的，放进临界区只会拉长串行链；非法模型因此不会产生任何 domain 写入。
+           * reasoningEffort 的显式性由 validateSelectionWithSignal 保持：未传就仍是未指定。
+           */
+          let selection;
+          if (!clearOnly) {
+            selection = await validateSelectionWithSignal(body.selection, signal);
+          }
+          await enqueueWrite(async () => {
+            const binding = host.storage.active();
+            if (binding?.sessionAuthoritative !== true
+              || binding?.sessionOverrideMetaAuthoritative !== true
+              || binding.sessionOverrideMetaTable === void 0) {
+              throw new Error("storage domain is not ready for session override write");
+            }
+            if (!storageBinding.isCurrent(binding)) throw new Error("storage domain binding was replaced");
+            // CAS 读与写必须落在同一个串行临界区：前一批写完成后这里才是权威代次。
+            const current = source();
+            const view = sessionOverrideProjectionOf(current, sessionId);
+            if (view.revision !== expectedRevision) {
+              throw sessionOverrideConflictError(view.revision, view.overrides);
+            }
+            const next = { ...(current.sessionOverrides?.[sessionId] ?? {}) };
+            if (clearOnly) delete next[role];
+            else next[role] = selection;
+            const nextRevision = view.revision + 1;
+            const isCurrent = () => storageBinding.isCurrent(binding);
+            /**
+             * 先写代次、再写内容：反过来的话，内容成功而代次失败会留下"覆盖已变但
+             * revision 未前进"的状态，下一个持旧代次的写入会静默覆盖这次结果。
+             * 内容写失败时尽力把代次回滚到旧值（回滚失败也只会多一次冲突提示，
+             * 不会造成丢失更新）。
+             */
+            const metaWrite = await persistDomainEntry({
+              table: binding.sessionOverrideMetaTable,
+              key: sessionId,
+              value: { revision: nextRevision },
+              isCurrent,
+            });
+            if (metaWrite.detached) {
+              // binding 在代次写入后被替换：不再写内容，让调用方显式重试。
+              const detached = new Error("storage domain binding was replaced");
+              detached.code = "PERSISTENCE_GENERATION_STALE";
+              detached.category = "generation-stale";
+              throw detached;
+            }
+            try {
+              if (Object.keys(next).length > 0) {
+                const result = await persistDomainEntry({
+                  table: binding.sessionTable,
+                  key: sessionId,
+                  value: next,
+                  isCurrent,
+                });
+                if (result.detached) {
+                  const detached = new Error("storage domain binding was replaced");
+                  detached.code = "PERSISTENCE_GENERATION_STALE";
+                  detached.category = "generation-stale";
+                  throw detached;
+                }
+              } else {
+                // 清掉最后一个角色后删除整行：读取面继续把"没有覆盖"表达为缺行，
+                // 旧读者看到的形状与从未写过完全一致（不留下空对象）。
+                const removed = await removeDomainEntry({ table: binding.sessionTable, key: sessionId, isCurrent });
+                if (removed.detached) {
+                  const detached = new Error("storage domain binding was replaced");
+                  detached.code = "PERSISTENCE_GENERATION_STALE";
+                  detached.category = "generation-stale";
+                  throw detached;
+                }
+              }
+            } catch (error) {
+              // 内容写失败：尽力回滚代次，避免"内容没变、代次却前进"的无谓冲突。
+              try {
+                await persistDomainEntry({
+                  table: binding.sessionOverrideMetaTable,
+                  key: sessionId,
+                  value: { revision: view.revision },
+                  isCurrent,
+                });
+              } catch { /* 回滚是尽力而为：失败也只是多一次可重试的冲突提示。 */ }
+              throw error;
+            }
+          }).then(() => {
+            observeStorageWrite(true, void 0, "session_overrides");
+          }, (error) => {
+            // 冲突不是存储故障：只在真正的写入失败上记录健康状态。
+            if (error?.code !== "SESSION_OVERRIDE_CONFLICT") observeStorageWrite(false, error, "session_overrides");
+            throw error;
+          });
+          const view = sessionOverrideProjectionOf(source(), sessionId);
+          send(200, {
+            ok: true,
+            sessionId,
+            overrides: view.overrides,
+            revision: view.revision,
+            live: true,
+          });
+          return;
+        }
+
+        if (body.action === "model-preflight") {
+          // root-only 只读预检（票据 24）：返回 primary 与每个候选的真实可用性。
+          // 不创建 child、不写 settings、不发起模型请求；只调用 validateSelectionWithSignal
+          // （目录/凭据/能力解析）并复用同一错误分类。
+          if (isChild) { fail(400, "read-only", "model-preflight 只能查询根会话"); return; }
+          const role = typeof body.role === "string" ? body.role.trim() : "";
+          if (!isActiveRole(role)) { fail(400, "invalid-role", "未启用的角色: " + role); return; }
+          const snap = source();
+          const primarySelection = snap.defaults?.[role];
+          const primary = primarySelection === undefined || primarySelection === null
+            ? {
+              provider: "",
+              model: "",
+              reasoningEffort: null,
+              ok: false,
+              code: MODEL_ROUTE_NOT_CONFIGURED,
+              message: modelRouteErrorMessage(MODEL_ROUTE_NOT_CONFIGURED),
+              // 没有主选择就没有可探测的目标：保持与 preflightSelectionEntry 同形状。
+              inputModalities: [],
+              image: "unknown",
+            }
+            : await preflightSelectionEntry(primarySelection, signal);
+          let candidateSelections;
+          if (body.candidates !== void 0) {
+            if (!Array.isArray(body.candidates)) { fail(400, "bad-request", "candidates 必须是数组"); return; }
+            if (body.candidates.length > MAX_MODEL_CANDIDATES_PER_ROLE) {
+              fail(400, "bad-request", "候选最多 " + MAX_MODEL_CANDIDATES_PER_ROLE + " 个");
+              return;
+            }
+            candidateSelections = body.candidates;
+          } else {
+            candidateSelections = candidateSelectionsOfRole(role);
+          }
+          const candidates = [];
+          for (const selection of candidateSelections) {
+            candidates.push(await preflightSelectionEntry(selection, signal));
+          }
+          send(200, {
+            ok: true,
+            role,
+            primary,
+            candidates,
+            fallbackLimit: snap.fallbackLimit,
+          });
+          return;
+        }
         if (body.action === "commit") {
           // 写操作从严：客户端提示或在线会话头表明是子代理，一律拒绝；
           // 子代理已结束且提示缺失（历史会话）时仍会被持久化记录识别为子代理。
@@ -11804,7 +16532,7 @@ export default {
           const changeInputs = [];
           for (const change of changes) {
             const role = typeof change?.role === "string" ? change.role : "";
-            if (!activeRoles().includes(role)) { fail(400, "invalid-role", `未启用的角色: ${role}`); return; }
+            if (!isActiveRole(role)) { fail(400, "invalid-role", `未启用的角色: ${role}`); return; }
             const selection = typeof change?.selection === "object" && change.selection !== null ? change.selection : null;
             if (!selection || typeof selection.provider !== "string" || typeof selection.model !== "string") {
               fail(400, "bad-request", "selection 需要 provider 与 model");
@@ -11836,19 +16564,53 @@ export default {
             }
             await enqueueWrite(async () => {
               const binding = host.storage.active();
-              if (binding?.sessionAuthoritative !== true) {
+              if (binding?.sessionAuthoritative !== true
+                || binding?.sessionOverrideMetaAuthoritative !== true
+                || binding.sessionOverrideMetaTable === void 0) {
                 throw new Error("storage domain is not ready for session override write");
               }
               const current = source();
               const next = { ...(current.sessionOverrides?.[sessionId] ?? {}) };
               for (const change of normalizedChanges) next[change.role] = change.selection;
               if (!storageBinding.isCurrent(binding)) throw new Error("storage domain binding was replaced");
-              const result = await persistDomainEntry({
-                table: binding.sessionTable,
+              const isCurrent = () => storageBinding.isCurrent(binding);
+              /**
+               * 旧 RPC 的 session 提交同样推进代次（票据 21）：它没有 expectedRevision，
+               * 但覆盖内容确实变了；若不推进，设置页手里的旧代次会静默覆盖这次写入。
+               * 写入顺序与新动作同源：先代次、后内容，内容失败时尽力回滚代次。
+               */
+              const priorRevision = sessionOverrideProjectionOf(current, sessionId).revision;
+              const metaWrite = await persistDomainEntry({
+                table: binding.sessionOverrideMetaTable,
                 key: sessionId,
-                value: next,
-                isCurrent: () => storageBinding.isCurrent(binding),
+                value: { revision: priorRevision + 1 },
+                isCurrent,
               });
+              if (metaWrite.detached) {
+                const detached = new Error("storage domain binding was replaced");
+                detached.code = "PERSISTENCE_GENERATION_STALE";
+                detached.category = "generation-stale";
+                throw detached;
+              }
+              let result;
+              try {
+                result = await persistDomainEntry({
+                  table: binding.sessionTable,
+                  key: sessionId,
+                  value: next,
+                  isCurrent,
+                });
+              } catch (error) {
+                try {
+                  await persistDomainEntry({
+                    table: binding.sessionOverrideMetaTable,
+                    key: sessionId,
+                    value: { revision: priorRevision },
+                    isCurrent,
+                  });
+                } catch { /* 回滚尽力而为。 */ }
+                throw error;
+              }
               if (result.detached) {
                 const detached = new Error("storage domain binding was replaced");
                 detached.code = "PERSISTENCE_GENERATION_STALE";
@@ -11937,6 +16699,24 @@ export default {
         // 结构化客户端输入错误（如图片声明的 mediaType 与真实字节不符）：
         // 必须返回 400，而不是把客户端问题伪装成 500 internal。
         return { status: 400, code: "invalid-selection", message: error.message };
+      }
+      if (error?.code === "SESSION_OVERRIDE_CONFLICT") {
+        // 会话覆盖的 CAS 冲突（票据 21）：与 settings 冲突同一语义（409 + 权威代次），
+        // 客户端据此保留草稿、推进本地代次并提示重试。details 只含固定形状的
+        // currentRevision 与归一后的覆盖映射，不含会话正文或任何请求体。
+        const currentRevision = Number.isSafeInteger(error.currentRevision) && error.currentRevision >= 0
+          ? error.currentRevision
+          : 0;
+        const overrides = error.overrides !== null && typeof error.overrides === "object"
+          && !Array.isArray(error.overrides)
+          ? error.overrides
+          : {};
+        return {
+          status: 409,
+          code: "session-override-conflict",
+          message: error.message,
+          details: { currentRevision, overrides },
+        };
       }
       if (error?.code === "SETTINGS_CONFLICT") {
         // 冲突必须携带 Host 的权威 revision：客户端据此只推进本地 revision 并保留 dirty
@@ -12238,6 +17018,22 @@ export default {
             : connectionProbeStatus === "absent" ? "legacy" : "pending";
       return {
         version: CAPABILITY_REPORT_VERSION,
+        // 模型候选与启动前 fallback（票据 24）：本版本始终提供保存期预检与
+        // primary -> candidates 的启动前降级；客户端据此显示候选编辑器。
+        modelFallback: true,
+        // 自定义角色（票据 27）：本版本提供设置声明、运行期目录、工具面/ fan-out 枚举、
+        // RPC meta 投影与删除守卫；客户端据此显示自定义角色编辑器与侧栏标签。
+        customRoles: true,
+        // 上下文继承（票据 29）：本版本提供服务端角色级开关、fork provider 选择、seed
+        // 边界检查、Observer 隔离、持久化与恢复；设置页继承开关与 token 成本提示属
+        // 后续客户端波次。
+        contextInheritance: true,
+        // 结构化交付（票据 30）：本版本提供服务端 outputSchema 声明/校验/透传、
+        // 结果后台捕获、回退标记、持久化与只读投影；侧栏结构化结果展示属客户端波次。
+        structuredOutput: true,
+        // 会话级模型覆盖（票据 21）：本版本提供 root-only 的读取 / 带代次写入 / 清除、
+        // 独立代次表与设置页读取面；客户端据此显示"仅本会话"编辑区。
+        sessionOverride: true,
         host: {
           // 声明于 inject 的硬依赖：缺任何一个插件都不加载（最低宿主契约）。
           tools: hardDependencyCapability(tools),
@@ -12444,6 +17240,18 @@ export default {
         }
       }
       /**
+       * provider 级上限投影（票据 26）：provider 名是用户在设置里写的公开配置，
+       * 不是会话数据；仍然做条数/长度上限，保证诊断大小不随配置无界增长。
+       */
+      const providerOverrides = {};
+      const providerLimitsState = concurrency?.providers;
+      if (providerLimitsState !== null && typeof providerLimitsState === "object") {
+        for (const provider of Object.keys(providerLimitsState).slice(0, 32)) {
+          const limit = providerLimitsState[provider];
+          if (Number.isSafeInteger(limit)) providerOverrides[provider.slice(0, 64)] = limit;
+        }
+      }
+      /**
        * 持久化/恢复诊断投影（票据 04）。
        *
        * 分类权威是 host/persistence-health（failureCategory/consecutiveFailures/时间戳），
@@ -12588,6 +17396,19 @@ export default {
           concurrency: {
             default: diagnosticCount(concurrency?.default),
             roles: roleOverrides,
+            /**
+             * provider 级上限（票据 26）：0 = 显式不限制，未出现 = 未配置（同样不限制）。
+             * 与 roles 一样只投影归一后的生效值。
+             */
+            providers: providerOverrides,
+            /**
+             * 限流/排队诊断（票据 26）：按 role 与 provider 的 limit/running/queued/
+             * lastThrottledAt/etaMs。数据源是 manager 的同一套 running 计数与 shard
+             * 状态（没有第二套计数器）；etaMs 在样本不足时显式为 null + "unknown"。
+             */
+            throttle: fanoutState.throttle === null || fanoutState.throttle === undefined
+              ? null
+              : projectThrottleDiagnostics(fanoutState.throttle),
             // 解析来源（live / snapshot / fallback）与最近一次非法上限只保留固定
             // 枚举/类型；message 是插件内部固定文案（不含设置原文或原始返回值），
             // 经长度与控制字符归一再透出，让用户能解释"设置页=3、实际并发=10"。

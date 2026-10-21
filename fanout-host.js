@@ -1259,6 +1259,9 @@ export function createFanoutRuntime(options = {}) {
     allowOverlap: options.allowOverlap,
     concurrencyLimit: options.concurrencyLimit,
     roleLimits: options.roleLimits,
+    // provider 级并发上限（票据 26）：与 roleLimits 同形的解析函数/静态映射，
+    // 直接透传给 manager；本模块不缓存、不做第二套判定。
+    providerLimits: options.providerLimits,
     // 角色级默认超时（票据 06）：同 concurrencyLimit 一样支持解析函数，
     // 由 manager 在每次新建 attempt 时读一次当前 settings。
     roleTimeoutMs: options.roleTimeoutMs,
@@ -1839,6 +1842,14 @@ export function createFanoutRuntime(options = {}) {
         },
       };
     },
+    /**
+     * 限流/排队诊断（票据 26，只读转发）：manager 是计数与限流状态的唯一来源，
+     * Host 只负责透出，不额外维护第二套 running/queued 计数。旧 manager 缺能力时
+     * 返回 null（消费方必须按"不可用"处理，绝不伪造 0）。
+     */
+    throttleDiagnostics: () => (typeof manager.throttleDiagnostics === "function"
+      ? manager.throttleDiagnostics()
+      : null),
     close,
     /**
      * 只读预算视图：当前用量、冻结上限与最近一次违规。恢复事件（外部输入）的违规

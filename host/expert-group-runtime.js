@@ -17,6 +17,14 @@
  * @module dsh-expert-group/host/expert-group-runtime
  */
 import { buildExpertGroupSnapshot } from "./expert-group-snapshot.js";
+import {
+  EXPERT_ROUTE_MARKER,
+  EXPERT_SUBAGENT_PROVIDER_MARKER,
+  EXPERT_INHERIT_CONTEXT_MARKER,
+  projectModelRouteFields,
+} from "../shared.js";
+import { hasUsageMetrics, projectUsage, sumUsageByChildId } from "./usage-ledger.js";
+import { projectStructuredResult } from "../shared.js";
 
 function nonEmpty(value) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -332,9 +340,41 @@ function runSummary(session, status, mode, events = sessionEvents(session)) {
   };
 }
 
+/**
+ * 目标 subagent provider / 继承开关的只读投影（票据 29）。
+ *
+ * 持久化 child_models 是权威；live child 在持久化落地前可从 agentOptions marker
+ * 或本次投影的恢复上下文读到同一份值。缺失时整体省略字段，绝不伪造 false。
+ *
+ * @param {object|undefined} persisted - child_models 记录。
+ * @param {object|undefined} agent - live Agent。
+ * @param {object|undefined} context - recovery 上下文。
+ * @returns {object} 可展开的投影字段。
+ */
+function subagentContextFields(persisted, agent, context) {
+  const provider = firstText(
+    persisted?.subagentProvider,
+    agent?.options?.[EXPERT_SUBAGENT_PROVIDER_MARKER],
+    context?.subagentProvider,
+  );
+  const inheritCandidates = [
+    persisted?.inheritContext,
+    agent?.options?.[EXPERT_INHERIT_CONTEXT_MARKER],
+    context?.inheritContext,
+  ];
+  const inherit = inheritCandidates.find((value) => typeof value === "boolean");
+  return {
+    ...(provider === null ? {} : { subagentProvider: provider }),
+    ...(inherit === void 0 ? {} : { inheritContext: inherit }),
+  };
+}
+
 function modelMetadata(agent, persisted, context) {
   const header = safeCall(() => agent?.session?.requestHeader?.(), null);
   const config = header?.config ?? {};
+  // 实际路由（票据 24）：持久化 child_models 是权威；live child 在持久化落地前
+  // 可从 agentOptions marker 读到同一份值。缺失字段整体省略，绝不补 0。
+  const marker = safeCall(() => agent?.options?.[EXPERT_ROUTE_MARKER], undefined);
   return {
     provider: firstText(config.provider, agent?.options?.provider, context?.provider, persisted?.provider),
     model: firstText(config.model, agent?.options?.model, context?.model, persisted?.model),
@@ -346,6 +386,10 @@ function modelMetadata(agent, persisted, context) {
       context?.reasoningEffort,
       persisted?.reasoningEffort,
     ),
+    ...projectModelRouteFields(persisted),
+    ...projectModelRouteFields(marker),
+    // 目标 subagent provider / 继承开关（票据 29）：缺失省略，不伪造 false。
+    ...subagentContextFields(persisted, agent, context),
   };
 }
 
@@ -525,6 +569,9 @@ const SNAPSHOT_INFLIGHT_LIMIT = 2 * SNAPSHOT_CACHE_LIMIT;
  *   位于既有降级链的同一槽位（见 collectExperts 的 taskName）。
  * @param {object} [dependencies.logger] - 可选：`{warn}`。后台完整构建失败不再向请求方抛出，
  *   因此需要一条宿主日志出口；缺失时静默（只保留 lastError，供 awaitFullBuild 观察）。
+ * @param {Function} [dependencies.roleLabels] - 可选：`() => Record<string,string>`，运行期
+ *   角色目录的「id → 显示名」投影（含自定义角色，票据 27）。专家/分片/attempt 的 roleLabel
+ *   优先使用记录里持久化的值（角色被删除后仍可读），缺失时才回落到这份映射。
  * @returns {{snapshotForSession(sessionId:string): Promise<object>,
  *   invalidateSnapshots(sessionId?:string): number,
  *   awaitFullBuild(sessionId:string): Promise<object|null>}}
@@ -539,6 +586,10 @@ export function createExpertGroupRuntime({
   source,
   sessionQuery,
   projectionTitleFor,
+  roleLabels,
+  // 用量账本的 live 读面（票据 25，可选）：返回某 child 当前累积 usage 的投影。
+  // 缺失/旧调用方时投影只读 child_models.usage（持久化值），行为仍向后兼容。
+  usageFor,
   logger,
   now = Date.now,
 } = {}) {
@@ -551,6 +602,66 @@ export function createExpertGroupRuntime({
   function persistedChildren() {
     const snapshot = safeCall(() => source?.(), null);
     return snapshot?.childModels && typeof snapshot.childModels === "object" ? snapshot.childModels : {};
+  }
+
+  /**
+   * 单个 child 的用量投影（票据 25）。
+   *
+   * 优先读 live 账本（去抖窗口内的最新值），其次读 child_models.usage（重启/恢复后仍可读）。
+   * 两条来源都只接受白名单投影；没有可用 token/请求数时返回 null，调用方据此**省略**字段，
+   * 绝不补一个 0 成本的 usage 对象。
+   *
+   * @param {string} childId - 会话/child id。
+   * @param {object} persisted - 本次投影的 child_models 映射。
+   * @returns {object|null} 有界 usage 投影或 null。
+   */
+  function usageOfChild(childId, persisted) {
+    const live = typeof usageFor === "function" && typeof childId === "string" && childId.length > 0
+      ? projectUsage(safeCall(() => usageFor(childId), null))
+      : null;
+    if (live !== null && hasUsageMetrics(live)) return live;
+    const persistedRecord = persisted?.[childId];
+    const stored = persistedRecord !== null && typeof persistedRecord === "object"
+      ? projectUsage(persistedRecord.usage)
+      : null;
+    return stored !== null && hasUsageMetrics(stored) ? stored : null;
+  }
+
+
+  /**
+   * 单个 child 的结构化投影（票据 30）。
+   *
+   * child_models.structured 是唯一持久化来源（值 <= 64KiB）；缺失返回 null，调用方
+   * 据此整字段省略。绝不把“没有结果”伪造成空对象或回退标记。
+   */
+  function structuredOfChild(childId, persisted) {
+    const record = typeof childId === "string" ? persisted?.[childId] : undefined;
+    return projectStructuredResult(record?.structured);
+  }
+
+  /** 该 child 是否声明过 outputSchema：只有持久化 true 才输出，缺失不伪造 false。 */
+  function outputSchemaRequestedOfChild(childId, persisted) {
+    const record = typeof childId === "string" ? persisted?.[childId] : undefined;
+    return record?.outputSchemaRequested === true;
+  }
+
+  /** 运行期角色显示名映射（含自定义角色）；不可用时返回空对象，绝不猜显示名。 */
+  function currentRoleLabels() {
+    if (typeof roleLabels !== "function") return {};
+    const value = safeCall(() => roleLabels(), null);
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+  }
+
+  /**
+   * 角色的显示名投影：持久化快照优先（历史任务在角色删除后仍可显示标签），
+   * 其次运行期目录。两者都没有时返回 null。
+   */
+  function roleLabelOf(role, persistedLabel) {
+    const explicit = firstText(persistedLabel);
+    if (explicit !== null) return explicit;
+    const roleId = firstText(role);
+    if (roleId === null) return null;
+    return firstText(currentRoleLabels()[roleId]);
   }
 
   /**
@@ -880,6 +991,11 @@ export function createExpertGroupRuntime({
       const evidenceFree = fast === true && (session === undefined || session === null)
         && (agent === undefined || agent === null);
       const projectedStatus = evidenceFree && (status === "ready" || status === "idle") ? "unknown" : status;
+      // 用量（票据 25）：live 账本优先，其次 child_models.usage；无有效样本时省略整个字段。
+      const usage = usageOfChild(childId, persisted);
+      // 结构化交付（票据 30）：只读投影；缺失省略，绝不伪造回退/空值。
+      const structured = structuredOfChild(childId, persisted);
+      const outputSchemaRequested = outputSchemaRequestedOfChild(childId, persisted);
       experts.push({
         id: childId,
         kind: "expert",
@@ -897,11 +1013,19 @@ export function createExpertGroupRuntime({
         content: firstText(context?.promptText, childSnapshot?.lastDispatch?.prompt, sessionPrompt),
         contentSource: context?.promptText ? "dispatch-prompt" : sessionPrompt ? "session-log" : "unavailable",
         role: firstText(record?.role, childSnapshot?.role, agent?.options?.__degExpertRole),
+        // 角色显示名（票据 27）：持久化快照优先，角色被删除后历史任务仍可显示标签。
+        roleLabel: roleLabelOf(
+          firstText(record?.role, childSnapshot?.role, agent?.options?.__degExpertRole),
+          firstText(childSnapshot?.roleLabel),
+        ),
         ...metadata,
         status: projectedStatus,
         ...(evidenceFree ? {} : { running: firstText(agent?.status, session?.status) === "running" }),
         runSummary: runSummary(session, projectedStatus, mode, events),
         continuable: mode === "continuable",
+        ...(usage === null ? {} : { usage }),
+        ...(structured === null ? {} : { structured }),
+        ...(outputSchemaRequested ? { outputSchemaRequested: true } : {}),
         createdAt: createdAtOf(session?.createdAt, session?.header?.createdAt, childSnapshot?.createdAt),
       });
     }
@@ -962,19 +1086,68 @@ export function createExpertGroupRuntime({
     const projectedAttempts = attempts.map((attempt) => {
       const childId = firstText(attempt?.childId);
       const proof = proofs.get(childId);
-      if (proof === undefined || proof.owned === true) {
-        return contradicts(childId, attempt?.attempt) ? { ...attempt, childId: null } : attempt;
-      }
-      return { ...attempt, childId: null };
+      const owned = (proof === undefined || proof.owned === true)
+        && contradicts(childId, attempt?.attempt) !== true;
+      if (!owned) return { ...attempt, childId: null };
+      // 实际路由（票据 24）：尝试本身的持久化字段（未来管理器的快照扩展）优先，
+      // 缺失时从同一 child 的 child_models 记录补齐 candidateIndex/fallbackCount/
+      // lastRouteErrorCode；没有记录就省略字段，绝不伪造 0。
+      const route = {
+        ...projectModelRouteFields(attempt),
+        ...projectModelRouteFields(persisted[childId]),
+      };
+      // 角色显示名（票据 27）：attempt 自身记录优先，其次同一 child 的 child_models 快照；
+      // 两者都没有时省略字段（不猜显示名）。角色删除后历史 attempt 仍保留标签。
+      const attemptRoleLabel = roleLabelOf(firstText(attempt?.role, task?.role), firstText(attempt?.roleLabel, persisted[childId]?.roleLabel));
+      const labeled = attemptRoleLabel === null ? attempt : { ...attempt, roleLabel: attemptRoleLabel };
+      // 目标 subagent provider / 继承开关（票据 29）：attempt 自身字段优先，其次同一
+      // child 的 child_models 快照；都没有时省略字段，不伪造 false。
+      const attemptSubagent = subagentContextFields(attempt, null, persisted[childId]);
+      const settledAttempt = Object.keys(attemptSubagent).length === 0
+        ? labeled
+        : { ...labeled, ...attemptSubagent };
+      // 用量（票据 25）：归属已证明的 attempt 才允许带 usage；缺失时省略整个字段，
+      // 绝不把“没拿到 usage”渲染成 0 token。
+      const attemptUsage = usageOfChild(childId, persisted);
+      // 结构化交付（票据 30）：只读结果/声明标记来自同一 child 的 child_models；
+      // 归属已证明的 attempt 才补齐，缺失整体省略。
+      const attemptStructured = structuredOfChild(childId, persisted);
+      const attemptRequested = outputSchemaRequestedOfChild(childId, persisted);
+      const settled = Object.keys(route).length === 0 ? labeled : { ...labeled, ...route };
+      const withSubagent = Object.keys(attemptSubagent).length === 0 ? settled : { ...settled, ...attemptSubagent };
+      return {
+        ...withSubagent,
+        ...(attemptUsage === null ? {} : { usage: attemptUsage }),
+        ...(attemptStructured === null ? {} : { structured: attemptStructured }),
+        ...(attemptRequested ? { outputSchemaRequested: true } : {}),
+      };
     });
+    // 分片用量 = 全部 attempt 的用量按 childId 去重汇总：续作复用同一 child 时，
+    // child_models.usage 是累计值，不能被多轮 attempt 重复相加。
+    const shardUsage = sumUsageByChildId(projectedAttempts.map((attempt) => ({
+      childId: attempt?.childId,
+      usage: attempt?.usage,
+    })));
     const shardStatus = firstText(shard?.status, ownedChild?.agent?.status, ownedChild?.session?.status) ?? "unknown";
+    // 分片级结构化结果取最新 attempt 的 child_models（与 usage 同一“最新 attempt”口径）；
+    // 不跨 attempt 合并 value，每个 attempt 自己的 structured 保留在 attempts 里。
+    const shardStructured = structuredOfChild(navigationChildId, persisted);
+    const shardRequested = outputSchemaRequestedOfChild(navigationChildId, persisted);
     return {
       ...shard,
       childId: ownedChild === undefined ? null : navigationChildId,
       role: firstText(shard?.role, task?.role),
+      // 分片角色显示名（票据 27）：manager/分片记录优先，其次同一 child 快照，最后运行期目录。
+      roleLabel: roleLabelOf(
+        firstText(shard?.role, task?.role),
+        firstText(shard?.roleLabel, persisted[navigationChildId]?.roleLabel),
+      ),
       ...modelMetadata(ownedChild?.agent, ownedChild?.childSnapshot ?? null, null),
       runSummary: runSummary(ownedChild?.session, shardStatus, "continuable", sessionEvents(ownedChild?.session)),
       continuable: true,
+      ...(shardUsage === null || !hasUsageMetrics(shardUsage) ? {} : { usage: shardUsage }),
+      ...(shardStructured === null ? {} : { structured: shardStructured }),
+      ...(shardRequested ? { outputSchemaRequested: true } : {}),
       attempts: projectedAttempts,
     };
   }
@@ -1013,10 +1186,19 @@ export function createExpertGroupRuntime({
         }
       }
     }
+    // 父任务用量 = 全部分片 attempt 的用量按 childId 去重汇总（防止跨分片重复或
+    // 续作多轮重复）。没有有效样本时省略字段，父任务不显示假成本。
+    const taskUsage = sumUsageByChildId(projectedShards.flatMap((shard) => (
+      Array.isArray(shard?.attempts) ? shard.attempts.map((attempt) => ({
+        childId: attempt?.childId,
+        usage: attempt?.usage,
+      })) : []
+    )));
     return {
       ...task,
       shards: projectedShards,
       ...(capabilities === undefined ? {} : { capabilities }),
+      ...(taskUsage === null || !hasUsageMetrics(taskUsage) ? {} : { usage: taskUsage }),
     };
   }
 
@@ -1203,6 +1385,8 @@ export function createExpertGroupRuntime({
       },
       experts,
       fanoutTasks,
+      // 角色显示名（票据 27）：含自定义角色；只有至少一个条目时才出现在快照顶层。
+      roleLabels: currentRoleLabels(),
       // partial 是本次新增的快照级标记：true = 轻量快照（跳过了全部冷读，状态可能不完整），
       // false = 完整权威快照。客户端据此在轻量快照期间保持状态圆点/活动文案中性。
       partial: fast === true,

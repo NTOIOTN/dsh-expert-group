@@ -20,6 +20,29 @@
    * 插件不自造第二套动画，动画只由官方组件提供。
    */
   const RUNTIME_STATE_DOT = Object.freeze({ running: "ongoing", ready: "done", unknown: "idle" });
+  /**
+   * attempt 状态的展示文案（票据 12 时间线）。
+   *
+   * 协议词表 → 用户可读词；不在表里的值原样展示（未知值不猜、也不隐藏）。
+   * 这些文案只属于时间线，不参与任务行圆点（圆点仍只有 running/ready/unknown）。
+   */
+  /** 「查看全部」展开选择的记账上限（见 renderAttemptTimeline 的有界淘汰）。 */
+  const TIMELINE_EXPANDED_KEY_LIMIT = 256;
+  const ATTEMPT_STATUS_LABELS = Object.freeze({
+    queued: "排队", waiting: "等待", running: "运行中", succeeded: "成功", failed: "失败",
+    cancelled: "已取消", timed_out: "超时", interrupted: "已中断", idle: "空闲", ready: "就绪", unknown: "未知",
+  });
+  /**
+   * 状态筛选下拉的选项。value 必须与 model.STATUS_FILTER_GROUPS 的键一致；
+   * 渲染层不解析协议状态，只把分组键交给模型过滤器。
+   */
+  const STATUS_FILTER_OPTIONS = Object.freeze([
+    Object.freeze({ value: "running", label: "运行中" }),
+    Object.freeze({ value: "failed", label: "失败" }),
+    Object.freeze({ value: "succeeded", label: "已完成" }),
+    Object.freeze({ value: "cancelled", label: "已取消" }),
+    Object.freeze({ value: "idle", label: "空闲" }),
+  ]);
   // ACTIVE_STATUSES / RETRY_STATUSES 只服务于 fan-out 管理语义（取消/重试判定），不是展示状态词表。
   const ACTIVE_STATUSES = new Set(["queued", "waiting", "running"]);
   const RETRY_STATUSES = new Set(["failed", "timed_out", "interrupted"]);
@@ -35,6 +58,66 @@
    */
   const RIGHTBAR_WIDTH_RATIO = 0.2;
   const OTHER_RIGHTBAR_WIDTH_RATIO = 0.5;
+  /**
+   * 用户可调宽度的边界与持久化键（票据 18）。
+   *
+   * 20% 只是**默认值**：用户拖拽手柄或按方向键调整之后，比例写进 localStorage，之后每次
+   * 挂载、视口变化与「宿主夺回宽度」的恢复写入都按这份偏好重算（见 resolveExpertRightbarWidthRatio）。
+   * 边界取舍：
+   * - 下限 15%：再窄时间线条（开始/耗时/重试）与批量控件会挤成不可读的一列；
+   * - 上限 50%：与宿主「其它右侧分页」的可调上限一致，Expert Group 页绝不比宿主自己的分栏模式更宽；
+   * - 比例是**视口比例**，写进宿主 layout store 的仍是取整后的像素值。
+   */
+  const RIGHTBAR_WIDTH_RATIO_MIN = 0.15;
+  const RIGHTBAR_WIDTH_RATIO_MAX = 0.5;
+  const RIGHTBAR_WIDTH_PREFERENCE_KEY = "dsh-expert-group/rightbar-width-ratio:v1";
+
+  /**
+   * 比例归一：只接受可转成有限数字的值，并 clamp 到 [0.15, 0.5]；非法值返回 null。
+   *
+   * 返回 null 而不是默认值：调用方必须能区分「明确是 0（或坏值）→ 拒绝这次输入」与
+   * 「用户想要 20%」。持久化读面才负责把非法/缺失归一到默认 20%。
+   */
+  function clampRightbarWidthRatio(value) {
+    const numeric = typeof value === "number" ? value : Number(value);
+    if (Number.isFinite(numeric) !== true) return null;
+    if (numeric < RIGHTBAR_WIDTH_RATIO_MIN) return RIGHTBAR_WIDTH_RATIO_MIN;
+    if (numeric > RIGHTBAR_WIDTH_RATIO_MAX) return RIGHTBAR_WIDTH_RATIO_MAX;
+    return numeric;
+  }
+
+  /**
+   * 读取持久化的宽度偏好：缺失、坏值或被越界写成极端值的旧数据一律归一到默认 20%。
+   *
+   * localStorage 不可用（隐私模式、被宿主策略禁用、SSR）时返回默认值，绝不抛错；宽度功能
+   * 因此退化成「每次都用默认比例」，但页面与轮询不受影响。
+   */
+  function readStoredRightbarWidthRatio() {
+    const storage = sidebarLocalStorage();
+    if (storage === null) return RIGHTBAR_WIDTH_RATIO;
+    let raw = null;
+    try { raw = storage.getItem(RIGHTBAR_WIDTH_PREFERENCE_KEY); } catch { raw = null; }
+    if (typeof raw !== "string" || raw.trim() === "") return RIGHTBAR_WIDTH_RATIO;
+    const clamped = clampRightbarWidthRatio(Number(raw.trim()));
+    return clamped === null ? RIGHTBAR_WIDTH_RATIO : clamped;
+  }
+
+  /**
+   * 写入宽度偏好：先 clamp 再落盘；存储不可用/抛错时静默失败。
+   *
+   * 写入失败**不**回滚本次宽度：用户已经看到的宽度必须立即生效，偏好丢失只影响下次挂载。
+   */
+  function storeRightbarWidthRatio(value) {
+    const clamped = clampRightbarWidthRatio(value);
+    if (clamped === null) return null;
+    const storage = sidebarLocalStorage();
+    if (storage === null) return clamped;
+    try { storage.setItem(RIGHTBAR_WIDTH_PREFERENCE_KEY, String(clamped)); } catch { /* 见上：本次仍生效。 */ }
+    return clamped;
+  }
+
+  /** Expert Group 页当前生效的宽度比例：持久化偏好（已 clamp）或默认 20%。 */
+  const resolveExpertRightbarWidthRatio = () => readStoredRightbarWidthRatio();
   /**
    * 「宿主里那份右栏宽度是否仍是插件写的」的匹配容差（px）。
    *
@@ -243,7 +326,9 @@
    * close 请求 resolve 之后的验证窗口：resolve 只代表请求完成，绝不代表 tab 已经关闭。
    *
    * 验证只认 readSidebarOpenTabs() 的**精确 tabId** 结果，并沿用既有的
-   * SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS = 2 次连续缺失确认（2.5 秒轮询 ⇒ 正常验证窗口约 5 秒）。
+   * SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS = 2 次连续缺失确认（运行态 2.5 秒轮询 ⇒ 正常验证窗口约 5 秒；
+   * 票据 16 之后空闲态按阶梯退避、隐藏/非活跃暂停，验证窗口相应变宽，但 inventory 通知与 observer
+   * 仍会立刻推进，因此这只是「最坏情况下再确认一次」的上界，而不是常见路径的延迟）。
    * 10 秒是这条验证链的上限：超时后释放租约、保留 record / origin / attempt，由下一次同步决定重试。
    */
   const SIDEBAR_TAB_CLOSE_VERIFY_TIMEOUT_MS = 10000;
@@ -294,6 +379,112 @@
   function text(value, fallback) {
     if (typeof value !== "string" || value.trim() === "") return fallback;
     return value.trim();
+  }
+
+  // ── 票据 25 / 26 / 27 / 28：侧栏消费的宿主 meta 与派发入参归一 ─────────────────
+  //
+  // 这些是纯函数：不做 RPC、不读写宿主状态，只在渲染/事件路径把注入值收敛成
+  // 「有界、缺字段保持缺失」的形状。所有 RPC 仍走 callRpc 这唯一入口。
+
+  /** meta.activeRoles/roles 的条目上限：Host 侧最多 16 个自定义 + 6 个内置角色。 */
+  const HOST_META_ROLE_LIMIT = 32;
+  /** 手动派发单个分片的 affectedPaths 上限（与 fan-out 工具面同量级，Host 仍是最终裁决）。 */
+  const DISPATCH_AFFECTED_PATH_LIMIT = 64;
+
+  /**
+   * 宿主 meta 的只读归一（票据 25/26/27）。
+   *
+   * 只保留侧栏真正消费的字段，且**缺什么就是什么**：
+   * - roles：activeRoles（优先）或 roles，去重、限条数；不按静态内置角色表过滤，
+   *   自定义角色因此与内置角色完全同源；
+   * - roleLabels：角色 id → 显示名；
+   * - modelPrices：原样数组（每一项的合法性由 findModelPrice/estimateUsageCost 再校验）；
+   * - throttle：diagnostics.fanout.concurrency.throttle（role/provider 的 limit/running/queued/etaMs）；
+   * - usage：全局用量聚合（totals/byRole/...），只用于诊断区展示。
+   */
+  function normalizeHostMeta(value) {
+    const source = object(value);
+    const roles = [];
+    const rawRoles = Array.isArray(source.activeRoles) ? source.activeRoles : (Array.isArray(source.roles) ? source.roles : []);
+    for (const entry of rawRoles) {
+      if (roles.length >= HOST_META_ROLE_LIMIT) break;
+      const role = text(entry, null);
+      if (role !== null && roles.indexOf(role) === -1) roles.push(role);
+    }
+    const diagnostics = object(source.diagnostics);
+    const fanout = object(diagnostics.fanout);
+    const concurrency = object(fanout.concurrency);
+    return {
+      roles,
+      roleLabels: object(source.roleLabels),
+      modelPrices: Array.isArray(source.modelPrices) ? source.modelPrices : [],
+      usage: object(source.usage),
+      throttle: Object.keys(concurrency.throttle === undefined ? {} : object(concurrency.throttle)).length === 0
+        ? null
+        : object(concurrency.throttle),
+      capabilities: object(source.capabilities),
+    };
+  }
+
+  /** 手册派发/模板 RPC 的幂等 requestId：宿主只把它当作去重键，不参与存储路径。 */
+  function newDispatchRequestId() {
+    try {
+      if (typeof globalThis.crypto?.randomUUID === "function") return "ui-" + globalThis.crypto.randomUUID();
+    } catch { /* 老宿主没有 randomUUID：退回时间戳 + 随机后缀。 */ }
+    return "ui-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  }
+
+  /**
+   * 逗号/换行/分号分隔的路径列表归一：去空白、去空项、去重、限条数。
+   * 只做客户端整理；合法性与写冲突检查仍由 Host 的 same validateSubmitInput 裁决。
+   */
+  function parsePathList(value, limit) {
+    if (typeof value !== "string" || value.trim() === "") return [];
+    const max = Number.isSafeInteger(limit) && limit > 0 ? limit : DISPATCH_AFFECTED_PATH_LIMIT;
+    const paths = [];
+    for (const part of value.split(/[\n,;]/)) {
+      const path = part.trim();
+      if (path === "" || paths.indexOf(path) !== -1) continue;
+      paths.push(path);
+      if (paths.length >= max) break;
+    }
+    return paths;
+  }
+
+  /** 正安全整数输入（表单里的字符串或数字）：空串/非法/非正返回 null（不猜默认值）。 */
+  function parsePositiveInteger(value) {
+    if (value === undefined || value === null) return null;
+    const raw = typeof value === "number" ? value : String(value).trim();
+    if (raw === "") return null;
+    const parsed = Number(raw);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+  }
+
+  /**
+   * 快照里是否存在任何用量事实（票据 25 的懒加载触发条件）。
+   *
+   * 只在渲染后的 effect 里读（纯读 normalized 快照），不发请求；命中一次就够：
+   * 面板据此按需读取 meta.modelPrices 计算估算成本，不改变任何既有轮询节奏。
+   */
+  function snapshotHasUsageFact(value, depth = 0) {
+    if (depth > 8 || value === null || typeof value !== "object") return false;
+    const source = object(value);
+    const usage = object(source.usage);
+    for (const field of ["inputTokens", "outputTokens", "totalTokens", "billedInputTokens", "requests"]) {
+      if (typeof usage[field] === "number" && Number.isFinite(usage[field])) return true;
+    }
+    // 快照根是 root 字段（不是 children）：先看根节点自身，再看它的子节点/分片/attempt。
+    if (snapshotHasUsageFact(source.root, depth + 1)) return true;
+    for (const child of Array.isArray(source.children) ? source.children : []) {
+      if (snapshotHasUsageFact(child, depth + 1)) return true;
+    }
+    for (const shard of Array.isArray(source.shards) ? source.shards : []) {
+      if (snapshotHasUsageFact(shard, depth + 1)) return true;
+      for (const attempt of Array.isArray(object(shard).attempts) ? object(shard).attempts : []) {
+        if (snapshotHasUsageFact(attempt, depth + 1)) return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -831,9 +1022,11 @@
     return text(title, "");
   }
 
-  function metadataOf(node) {
+  function metadataOf(node, roleLabels) {
     const model = modelApi();
-    if (typeof model.formatExpertMetadata === "function") return model.formatExpertMetadata(node);
+    // 票据 27：把合并后的 roleLabels（snapshot 优先、meta 兜底）交给模型；
+    // 节点自带的 roleLabel 在模型内优先，没有任何显示名时回退既有的角色 id 文案。
+    if (typeof model.formatExpertMetadata === "function") return model.formatExpertMetadata(node, { roleLabels });
     const source = object(node);
     return [text(source.role, source.kind === "root" ? "Orchestrator" : "Expert"), text(source.provider, "未知供应商"), text(source.model, "未知模型"), text(source.effort, "默认")].join(" · ");
   }
@@ -941,6 +1134,145 @@
     }, stateDotOf(react, primitives, status));
   }
 
+
+  /**
+   * 任务状态播报的类别边界（票据 18）。
+   *
+   * 只播报四个用户语义事件：开始、完成、失败、取消。类别刻意用**集合**而不是字符串比较，
+   * 因为 Host 的规范状态词表之外还可能有历史别名（canceled/done/completed 等）：
+   * - 活跃集合用于「从非活跃变成活跃」= 开始；queued → running 不再重复播报；
+   * - 完成集合只认 succeeded/ready 等终态，绝不把 cancelled 混进完成；
+   * - 失败集合包含 timed_out/interrupted：用户需要感知的「没成功」都在这里；
+   * - unknown 一律不播报：没有证据的状态变化不算事件（避免轻量快照升级成完整快照时刷屏）。
+   */
+  const ANNOUNCEMENT_ACTIVE_STATUSES = new Set(["queued", "waiting", "running"]);
+  const ANNOUNCEMENT_FINISHED_STATUSES = new Set(["succeeded", "success", "completed", "complete", "done", "ready"]);
+  const ANNOUNCEMENT_FAILED_STATUSES = new Set(["failed", "error", "timed_out", "timeout", "interrupted"]);
+  const ANNOUNCEMENT_CANCELLED_STATUSES = new Set(["cancelled", "canceled"]);
+  /** 一次播报里最多列出多少个任务：多分片同时结束时只给前 5 个 + 总数，避免长句无法听完。 */
+  const ANNOUNCEMENT_MAX_ITEMS = 5;
+
+  /**
+   * 从 normalized 快照里收集「播报身份 → { name, status }」。
+   *
+   * 键必须稳定：普通节点用 id/sessionId，fanout 的分片用 parentTaskId:shardId（shardId 只在
+   * 父任务内唯一）。名称只用于播报文案：root 固定「主代理」（与第一行同源），专家用 taskName，
+   * 分片优先 taskName、其次 shardId。任何字段缺失都不猜名称，回退到稳定 id。
+   */
+  function collectAnnouncementTasks(snapshot) {
+    const result = new Map();
+    const root = object(object(snapshot).root);
+    if (Object.keys(root).length === 0) return result;
+    const visit = (node, fallbackName) => {
+      const source = object(node);
+      const id = text(source.id, text(source.sessionId, text(source.parentTaskId, null)));
+      if (id === null) return;
+      const isRoot = source.kind === "root";
+      const name = isRoot
+        ? "主代理"
+        : text(source.taskName, text(source.sessionId, fallbackName));
+      result.set(id, { name: text(name, id), status: statusOf(source) });
+      for (const child of Array.isArray(source.children) ? source.children : []) visit(child, id);
+      for (const shard of Array.isArray(source.shards) ? source.shards : []) {
+        const shardId = text(shard.shardId, null);
+        if (shardId === null) continue;
+        const shardName = text(shard.taskName, shardId);
+        result.set(id + ":" + shardId, { name: shardName, status: statusOf(shard) });
+      }
+    };
+    visit(root, "主代理");
+    return result;
+  }
+
+  /**
+   * 单条状态迁移 → 播报类别；不需要播报时返回 null。
+   *
+   * 只有**可证明的前态**才产生事件：
+   * - 前态是 unknown（轻量快照/证据不足）时不播报，避免「数据补齐」被误读成任务完成；
+   * - 同一状态不播报（相同快照的每一轮轮询因此天然去重）；
+   * - 取消/失败优先于完成：终态重叠时按用户更关心的坏消息归类；
+   * - 完成只认「前态活跃/空闲 → 终态成功」：已经完成的任务再次完成没有新信息。
+   */
+  function announcementKindOf(previousStatus, nextStatus) {
+    if (previousStatus === nextStatus) return null;
+    if (previousStatus === "unknown" || nextStatus === "unknown") return null;
+    if (ANNOUNCEMENT_CANCELLED_STATUSES.has(nextStatus)) return "cancel";
+    if (ANNOUNCEMENT_FAILED_STATUSES.has(nextStatus)) return "fail";
+    if (ANNOUNCEMENT_FINISHED_STATUSES.has(nextStatus)) {
+      return ANNOUNCEMENT_ACTIVE_STATUSES.has(previousStatus) || previousStatus === "idle" ? "finish" : null;
+    }
+    if (ANNOUNCEMENT_ACTIVE_STATUSES.has(nextStatus) && ANNOUNCEMENT_ACTIVE_STATUSES.has(previousStatus) !== true) return "start";
+    return null;
+  }
+
+  /**
+   * 比较前后两份播报身份表，返回本轮的状态迁移事件（无变化返回空数组）。
+   *
+   * 频率控制完全来自「差异」而不是定时器：轮询重复返回同一棵树时事件集合为空，
+   * 因此不会重复播报；渲染层把同一轮的多个事件合并成一句（最多 5 项 + 总数），
+   * 绝不会为每个节点各播一次。新出现的节点只有**正在运行**才算「开始」——
+   * 首次加载历史里的已完成任务绝不补播。文案与分隔符由渲染层按宿主语言拼接（票据 19）。
+   */
+  function announcementEventsOf(previousTasks, nextTasks) {
+    const events = [];
+    for (const [id, next] of nextTasks) {
+      const previous = previousTasks.get(id);
+      const kind = previous === undefined
+        ? (ANNOUNCEMENT_ACTIVE_STATUSES.has(next.status) ? "start" : null)
+        : announcementKindOf(previous.status, next.status);
+      if (kind === null) continue;
+      // 只产出结构化事件；文案与分隔符由渲染层按宿主语言拼接（票据 19）。
+      events.push({ kind, name: next.name });
+    }
+    return events;
+  }
+
+  /**
+   * 把序列化结果交给浏览器下载（票据 12 的导出交付面）。
+   *
+   * 纯客户端：Blob + object URL + 一个临时 <a download>，不接触宿主状态、不发 RPC。
+   * 任何一步不可用（Node 测试、无 document/Blob/URL 的宿主、隐私模式拒绝）都返回 false，
+   * 绝不抛错——调用方据此保留「序列化本身已完成」的事实，界面不会因为下载失败而崩。
+   *
+   * object URL 在 click 之后立即 revoke：临时锚点不再需要这份句柄，早释放避免长会话泄漏。
+   */
+  function downloadExportFile(result) {
+    if (!result || typeof result.content !== "string") return false;
+    try {
+      const BlobCtor = globalThis.Blob;
+      const urlApi = globalThis.URL;
+      const doc = globalThis.document;
+      if (typeof BlobCtor !== "function"
+        || urlApi === null || urlApi === undefined || typeof urlApi.createObjectURL !== "function"
+        || doc === null || doc === undefined || typeof doc.createElement !== "function") return false;
+      const blob = new BlobCtor([result.content], { type: typeof result.mimeType === "string" ? result.mimeType : "text/plain" });
+      const objectUrl = urlApi.createObjectURL(blob);
+      try {
+        const anchor = doc.createElement("a");
+        anchor.href = objectUrl;
+        anchor.download = typeof result.filename === "string" ? result.filename : "expert-group-export";
+        anchor.rel = "noopener";
+        anchor.style.display = "none";
+        try { doc.body?.appendChild?.(anchor); } catch { /* 没有 body 的宿主也允许 click 兜底。 */ }
+        try { anchor.click?.(); } catch { /* 下载被宿主拒绝：序列化已完成，静默降级。 */ }
+        try { anchor.remove?.(); } catch { try { doc.body?.removeChild?.(anchor); } catch { /* 清理失败不影响导出。 */ } }
+      } finally {
+        // 延迟一帧再释放：部分浏览器在 click 后的当前宏任务里还需要这个 object URL 才能开始下载。
+        const release = () => {
+          try { urlApi.revokeObjectURL(objectUrl); } catch { /* 释放失败不改变导出结果。 */ }
+        };
+        if (typeof urlApi.revokeObjectURL === "function") {
+          if (typeof globalThis.setTimeout === "function") {
+            try { globalThis.setTimeout(release, 0); } catch { release(); }
+          } else {
+            release();
+          }
+        }
+      }
+      return true;
+    } catch { return false; }
+  }
+
   function safeNormalize(raw) {
     const model = modelApi();
     if (typeof model.normalizeExpertGroupSnapshot !== "function") return null;
@@ -985,6 +1317,11 @@
    * 「每次轮询都是新内容」，内容比较就彻底失效，也就回到了每次全树重渲染。
    *
    * 比较方向是单向的：内容相等 ⇒ 不更新状态；内容不等 ⇒ 一定更新，绝不吞掉真实变化。
+   *
+   * 顶层 revision（票据 12）**不参与**这里：它是 Host 对「除 generatedAt 与 revision 自身之外全部
+   * 内容」的摘要，语义上等价于下面的逐字段比较，但把它加进来会改变既有短路语义（旧 Host 缺失
+   * revision 时两侧恒不相等，轮询会退化成每轮全树重渲染）。客户端因此只归一/导出 revision，
+   * 内容相等判定继续完全由本函数负责。
    */
   function samePanelSnapshot(left, right) {
     if (left === right) return true;
@@ -999,6 +1336,319 @@
       // 立刻出现或消失——漏掉它会让「重试成功」停在旧横幅上（反之亦然）。
       && snapshotContentEquals(left.recovery ?? null, right.recovery ?? null)
       && snapshotContentEquals(left.root, right.root);
+  }
+
+  /**
+   * 侧栏轮询时间表（票据 16）：整个面板的刷新节奏只有这一份常量来源。
+   *
+   * 语义分层（互不干扰，失败优先）：
+   * - 运行态 activeMs：有任务在跑时必须保持接近实时的刷新（沿用既有的 2.5 秒）；
+   * - 空闲 idleStepsMs：没有任何运行中的任务时逐档退避（2.5 → 5 → 10 → 20 → 30 秒），
+   *   长期空转不再每 2.5 秒发一次请求；
+   * - 连续失败 failureBaseMs 起按 1/2/4/8/16… 指数递进，封顶 failureMaxMs（30 秒）。
+   *
+   * 所有时间都以毫秒计，且只影响「下一轮什么时候排」，不参与任何内容比较；
+   * 测试通过注入 setInterval/clearInterval 观察与推进，绝不真实等待。
+   */
+  const PANEL_POLL_TIMINGS = Object.freeze({
+    activeMs: 2500,
+    idleStepsMs: Object.freeze([2500, 5000, 10000, 20000, 30000]),
+    failureBaseMs: 1000,
+    failureMaxMs: 30000,
+  });
+
+  /**
+   * 连续失败第 n 次应等待多久（n 从 1 开始）：1s → 2s → 4s → 8s → 16s → 30s（封顶）。
+   *
+   * 指数上限先按 2^(n-1) 计算，再与 failureMaxMs 取小；n 过大时直接钳到封顶，
+   * 避免 Math.pow 溢出成 Infinity（那会让 setInterval 收到非法延时）。
+   */
+  function panelFailureDelayMs(failureCount) {
+    const count = Number.isSafeInteger(failureCount) && failureCount > 0 ? failureCount : 0;
+    if (count === 0) return 0;
+    const exponential = PANEL_POLL_TIMINGS.failureBaseMs * Math.pow(2, Math.min(count - 1, 16));
+    return Math.min(exponential, PANEL_POLL_TIMINGS.failureMaxMs);
+  }
+
+  /**
+   * 空闲第 n 档的刷新间隔：2.5s → 5s → 10s → 20s → 30s；超过最后一档后停在 30s。
+   *
+   * idleLevel 由调用方按「连续多少个成功且空闲的轮询周期」推进，绝不因为一次失败而前进或后退
+   * （失败有自己的退避轴，两者正交）。
+   */
+  function panelIdleDelayMs(idleLevel) {
+    const steps = PANEL_POLL_TIMINGS.idleStepsMs;
+    const level = Number.isSafeInteger(idleLevel) && idleLevel > 0 ? idleLevel : 0;
+    return steps[Math.min(level, steps.length - 1)];
+  }
+
+  /**
+   * 下一轮轮询间隔（失败优先）：失败退避 > 运行态 2.5s > 空闲阶梯退避。
+   *
+   * @param {{failureCount?: number, running?: boolean, idleLevel?: number}} state
+   * @returns {number} 毫秒
+   */
+  function panelNextPollDelayMs(state) {
+    const source = object(state);
+    const failureDelay = panelFailureDelayMs(source.failureCount);
+    if (failureDelay > 0) return failureDelay;
+    if (source.running !== false) return PANEL_POLL_TIMINGS.activeMs;
+    return panelIdleDelayMs(source.idleLevel);
+  }
+
+  /**
+   * 归一化 fanout-events 响应（票据 15；Host 契约见 index.js 的 fanout-events 分支）。
+   *
+   * 关键判据是 conclusive：只有 events 是数组时，这份响应才真的回答了「游标之后有没有新事件」。
+   * 旧 Host 或测试替身可能对任何 action 都回同一份载荷（例如只给 snapshot），此时**绝不**把
+   * 「读不到」当成「没有变化」——调用方必须退回全量快照，宁可多拉一次，也不让界面停在旧数据上。
+   *
+   * cursor 缺失/非法时保持 null（不伪造）：下一轮仍用当前游标重读，绝不假装已经同步过。
+   */
+  function readFanoutEventBatch(raw) {
+    const source = object(raw);
+    const events = Array.isArray(source.events) ? source.events : null;
+    const cursor = Number.isSafeInteger(source.cursor) && source.cursor >= 0 ? source.cursor : null;
+    const earliestSequence = Number.isSafeInteger(source.earliestSequence) && source.earliestSequence > 0
+      ? source.earliestSequence
+      : null;
+    return {
+      events,
+      cursor,
+      earliestSequence,
+      gap: source.gap === true,
+      dropped: Number.isSafeInteger(source.dropped) && source.dropped > 0 ? source.dropped : 0,
+      conclusive: events !== null,
+    };
+  }
+
+  /**
+   * 游标是否过旧（读不到的事件已经永久缺失）。
+   *
+   * Host 的 gap 字段是权威答案；缺失该字段时按 Host 的同一公式自行判定：
+   * 序号从 1 开始，所以只有「确实裁剪过队首」（earliest > 1）且 cursor 落在裁剪区间里才算缺口——
+   * cursor=0 与 earliest=1 时前面本来就没有事件，绝不能误判成 gap 而每轮都全量重拉。
+   */
+  function fanoutBatchIsStale(batch, cursor) {
+    if (batch === null || batch === undefined) return false;
+    if (batch.gap === true) return true;
+    if (batch.earliestSequence === null || batch.earliestSequence === undefined) return false;
+    const after = Number.isSafeInteger(cursor) && cursor >= 0 ? cursor : 0;
+    return batch.earliestSequence > 1 && after < batch.earliestSequence;
+  }
+
+  /**
+   * 快照里是否还有运行中的任务（决定运行态 2.5s 还是空闲阶梯退避）。
+   *
+   * 复用模型的运行状态证据链（runtimeStatusOf：目录/Host running 布尔/协议 status），
+   * 因此刷新节奏与界面上的圆点永不互相矛盾，插件也不自建第二套状态词表。
+   *
+   * 两个刻意保守的边界：
+   * - partial（轻量快照）下证据不足时模型给出中性值 unknown，这里按「可能有活」处理，
+   *   保持 2.5s——轻量快照只会持续一个刷新周期（见 pollOnce 对 partial 的强制全量），
+   *   宁可多刷一轮，也不在状态未知时退到 30 秒；
+   * - 遍历有界（最多 4096 个节点），坏数据或手工构造的超大树绝不可能把调度器卡死。
+   */
+  function snapshotHasRunningWork(snapshot) {
+    if (snapshot === null || typeof snapshot !== "object") return false;
+    if (snapshot.partial === true) return true;
+    const model = modelApi();
+    const runtimeStatusOf = typeof model.runtimeStatusOf === "function" ? model.runtimeStatusOf : null;
+    if (runtimeStatusOf === null) return false;
+    const pending = [snapshot.root];
+    let visited = 0;
+    while (pending.length > 0 && visited < 4096) {
+      const node = pending.pop();
+      visited += 1;
+      if (node === null || typeof node !== "object") continue;
+      let status;
+      try { status = runtimeStatusOf(node, undefined, {}); } catch { status = "unknown"; }
+      if (status === "running") return true;
+      if (Array.isArray(node.children)) for (const child of node.children) pending.push(child);
+      if (Array.isArray(node.shards)) for (const shard of node.shards) pending.push(shard);
+    }
+    return false;
+  }
+
+  /**
+   * 当前面板所在 tab 的活跃度证据（票据 16）：true / false / null（未知）。
+   *
+   * 读面优先级固定：
+   * 1. 注入的 deps.isTabActive()：install 侧或宿主可以给出的明确注入点，测试同样经此驱动；
+   * 2. 宿主 tab 信息（props.useTabInfo()）里显式给出的 active / isActive 布尔；
+   * 3. 都没有 ⇒ null（未知）：生产环境退回 document 可见性这一既有判据。
+   *
+   * 刻意**不**从 sidebarRight.active() 之类的旁证推断：那描述的是「某个 pane 的活跃 tab」，
+   * 与「本面板所在 tab 是否活跃」不是同一件事，凭它暂停轮询会把正常的后台观察误停。
+   */
+  function readPanelTabActivity(deps, props, tabInfo) {
+    const injected = deps?.isTabActive;
+    if (typeof injected === "function") {
+      try {
+        const value = injected();
+        if (value === true || value === false) return value;
+      } catch { /* 注入读面抛错：按未知处理，退回文档可见性。 */ }
+    }
+    for (const candidate of [tabInfo, tabInfo?.tab]) {
+      const source = object(candidate);
+      if (source.active === true || source.active === false) return source.active;
+      if (source.isActive === true || source.isActive === false) return source.isActive;
+    }
+    return null;
+  }
+
+  /**
+   * 把一轮轮询结果记进调度器状态（票据 16）。
+   *
+   * 记账规则：
+   * - 同一轮（id 相同）只记一次：多个 tick 观察到同一个在途轮次时绝不能把失败/空闲档加两次；
+   * - 取消/旧代次（cancelled）不记失败，也不推进空闲档（那不是一次真实的刷新结论）；
+   * - 成功 ⇒ 失败计数清零，并按「还有没有运行中的任务」推进或清零空闲档；
+   * - 失败 ⇒ 失败计数 +1（封顶 16 档，足够超过 30 秒封顶），空闲档保持不变（正交）。
+   */
+  function applyPanelPollCycle(scheduler, cycle, latestSnapshot) {
+    if (scheduler === null || scheduler === undefined) return;
+    if (cycle === null || cycle === undefined || typeof cycle !== "object") return;
+    const id = Number.isSafeInteger(cycle.id) ? cycle.id : null;
+    if (id !== null) {
+      if (id <= scheduler.lastCycleId) return;
+      scheduler.lastCycleId = id;
+    }
+    if (cycle.cancelled === true) return;
+    if (cycle.ok === true) {
+      scheduler.failureCount = 0;
+      const effective = cycle.snapshot === null || cycle.snapshot === undefined ? latestSnapshot : cycle.snapshot;
+      if (snapshotHasRunningWork(effective)) {
+        scheduler.running = true;
+        scheduler.idleLevel = 0;
+      } else {
+        scheduler.running = false;
+        scheduler.idleLevel = Math.min(
+          scheduler.idleLevel + 1,
+          PANEL_POLL_TIMINGS.idleStepsMs.length - 1,
+        );
+      }
+    } else {
+      scheduler.failureCount = Math.min(scheduler.failureCount + 1, 16);
+    }
+    scheduler.delay = panelNextPollDelayMs(scheduler);
+  }
+
+  /**
+   * 面板标题栏错误槽的来源分类（票据 13：状态可读性）。
+   *
+   * 症状：快照轮询失败与用户动作（取消/重试分片、取消父任务）失败共用同一个标题栏错误面，
+   * 该错误面固定渲染「快照读取失败」——于是一次动作失败会被读成「任务树坏了」，用户去点重试
+   * 只会重新拉一次快照，动作失败的真实原因与后续动作都得不到提示。
+   *
+   * 三类来源的边界（渲染层只按来源选择固定文案，完整 message 始终只放在 title 属性里）：
+   * - snapshot：快照请求失败（首屏、2.5 秒轮询、手动刷新都没拿到任务树）；
+   * - action：用户动作失败（动作被 Host 结构化拒绝，或动作链路上非 RPC 层的失败）；
+   * - rpc：动作内部的 RPC 传输/协议失败（adapter 抛错、响应体读不出来、协议标识非法）。
+   *
+   * 快照请求本身即使失败在传输层也归 snapshot：用户看到的事实是「任务树没读到」，
+   * 传输细节属于 title。这条边界保证动作失败再也不会显示「快照读取失败」。
+   */
+  const PANEL_ERROR_SOURCES = Object.freeze({
+    snapshot: "snapshot",
+    action: "action",
+    rpc: "rpc",
+  });
+
+  // 三类来源的固定短文案已迁到消息表（sidebar.error.*，见渲染层 errorLabelOf）；
+  // 这里只保留来源枚举，title 属性仍然是受限的 message。
+
+  /**
+   * callRpc 传输/协议失败的分类标记。
+   *
+   * 用 Symbol 而不是可枚举字段：adapter 抛出的错误对象可能被宿主或别的插件共享，插件绝不
+   * 在它上面留下可见字段。标记不改变 message/name/原型链，因此快照路径里
+   * `error?.name === "AbortError"` 的取消判定与既有断言逐字不变。`Symbol.for` 保证同一进程内
+   * 重新执行本模块（HMR / 双份加载）仍认得同一个标记。
+   */
+  const RPC_FAILURE_KIND = Symbol.for("dsh-expert-group/rpc-failure-kind");
+  const RPC_FAILURE_TRANSPORT = "rpc";
+
+  /**
+   * 给传输/协议失败打标记并原样返回（不吞、不改写、不重新包装对象形态的错误）。
+   *
+   * - 任何对象形态的抛出值（Error / DOMException / 自定义错误对象）原样返回：message/name/stack
+   *   逐字保留，AbortError 的取消判定与既有断言不变；
+   * - adapter 抛出原始值（字符串 / 数字）时包一层 Error，message 与既有
+   *   `error instanceof Error ? error.message : String(error)` 的结果逐字一致；
+   * - 冻结或不可扩展的错误对象打不了标记：静默返回原错误，分类退回 action 语义
+   *   （宁可少一个 rpc 文案，也绝不因为打标记失败而丢掉错误本身）。
+   */
+  function markRpcTransportFailure(error) {
+    // 任何对象形态的抛出值（Error、DOMException、自定义错误对象）都原样返回：只包住字符串/数字等
+    // 原始值。这样 `error.name`（取消判定）、`error.message`（title 文案）与既有断言都不变。
+    const failure = error !== null && typeof error === "object"
+      ? error
+      : new Error(error === undefined || error === null ? "RPC 请求失败" : String(error));
+    try {
+      Object.defineProperty(failure, RPC_FAILURE_KIND, {
+        value: RPC_FAILURE_TRANSPORT,
+        configurable: true,
+        enumerable: false,
+        writable: false,
+      });
+    } catch { /* 冻结对象：保留原错误，分类按 action 处理。 */ }
+    return failure;
+  }
+
+  /**
+   * 读回 RPC 传输/协议失败标记；没有标记（= 不是 RPC 层失败）返回 null。
+   *
+   * 只认本模块写下的那个值：宿主或 adapter 自己碰巧挂了一个同名字段也不会被误判成传输失败。
+   */
+  function rpcFailureKindOf(error) {
+    if (error === null || typeof error !== "object") return null;
+    try {
+      return error[RPC_FAILURE_KIND] === RPC_FAILURE_TRANSPORT ? RPC_FAILURE_TRANSPORT : null;
+    } catch { return null; }
+  }
+
+  /**
+   * Host 结构化拒绝（ok:false）对应的 Error。
+   *
+   * message 与既有行为逐字一致（测试与用户可见文案都依赖它）；额外把稳定 code/details
+   * 挂成**不可枚举**属性：既有 deepEqual / 文案断言不受影响，而手动派发等需要按来源
+   * 展示 code 的入口可以读取它。details 只由消费方按白名单读取，绝不整段渲染。
+   */
+  function rpcBusinessError(errorBlock) {
+    const block = object(errorBlock);
+    const error = new Error(text(block.message, "RPC 请求失败"));
+    try {
+      Object.defineProperty(error, "code", {
+        value: text(block.code, null),
+        configurable: true,
+        enumerable: false,
+        writable: false,
+      });
+      Object.defineProperty(error, "details", {
+        value: block.details,
+        configurable: true,
+        enumerable: false,
+        writable: false,
+      });
+    } catch { /* 冻结/不可扩展错误对象：保留 message 即可。 */ }
+    return error;
+  }
+
+  /**
+   * 「更新于」时间的**唯一**格式化入口（票据 13）：本地时区、24 小时制、固定 HH:MM:SS。
+   *
+   * 集中在这里的理由：标题栏可见文案、title 提示与测试断言必须同源，任何一处单独手写
+   * 时间拼接都会让同一份数据在界面上出现两种格式。读不到有效时间戳（null / NaN / 非正数）
+   * 返回 null，调用方据此不渲染时间片段，绝不显示「更新于 Invalid Date」。
+   */
+  function formatPanelUpdatedTime(value) {
+    const at = Number(value);
+    if (Number.isFinite(at) !== true || at <= 0) return null;
+    const date = new Date(at);
+    if (Number.isNaN(date.getTime()) === true) return null;
+    const pad = (part) => (part < 10 ? "0" + part : String(part));
+    return pad(date.getHours()) + ":" + pad(date.getMinutes()) + ":" + pad(date.getSeconds());
   }
 
   /**
@@ -1063,20 +1713,57 @@
     return [connection, request, init];
   }
 
-  async function callRpc(deps, ctx, request, init = {}) {
+  /**
+   * 唯一的 RPC 调用入口。
+   *
+   * 失败分类（票据 13）：**传输/协议**层失败（没有 adapter、协议标识非法、adapter 抛错或
+   * Promise reject、响应体读不出来）会打上传输失败标记，动作路径据此把错误槽呈现为「请求失败」；
+   * 而 Host 的结构化拒绝（`ok:false`）说明这次往返已经完成、只是 Host 对请求本身说不，
+   * 因此不打标记，动作路径按「操作失败」呈现。快照路径不区分这两类——它一律呈现自身的
+   * 「快照读取失败」，传输细节只留在 title 里。
+   *
+   * 所有既有语义逐字保留：错误 message 仍是 adapter / Host 给出的原文，AbortError 仍是同名错误
+   * （快照路径的可取消判定不依赖 instanceof），成功 envelope 的三种形状照旧解包。
+   *
+   * 可选的 select 参数（票据 15）：默认解包仍返回「快照本体」。快照增量同步需要读到与快照**同级**
+   * 的 cursor（若 Host 将来在响应顶层提供），而默认解包会把同级字段丢掉，因此这条路径传入 select
+   * 拿到未收窄的 envelope。不传 select 时三种 envelope 形状的返回值逐字不变（既有调用方零影响）。
+   */
+  async function callRpc(deps, ctx, request, init = {}, select) {
     const fn = deps.requestPluginRpc;
-    if (typeof fn !== "function") throw new Error("当前 DSH 未提供插件 RPC");
-    const protocol = rpcAdapterProtocolOf(deps);
-    const response = await fn(...rpcAdapterArguments(protocol, ctx, request, init));
-    if (response?.ok === false) throw new Error(text(response.error?.message, "RPC 请求失败"));
-    if (typeof response?.json === "function") {
-      const payload = await response.json();
-      if (payload?.ok === false) throw new Error(text(payload.error?.message, "RPC 请求失败"));
-      const body = payload?.value ?? payload;
-      return body?.snapshot ?? body;
+    if (typeof fn !== "function") throw markRpcTransportFailure(new Error("当前 DSH 未提供插件 RPC"));
+    let protocol;
+    try {
+      protocol = rpcAdapterProtocolOf(deps);
+    } catch (error) {
+      // 协议标识非法 = 请求根本没进入传输层，属于协议层失败。
+      throw markRpcTransportFailure(error);
     }
-    if (response?.value !== undefined) return response.value?.snapshot ?? response.value;
-    return response?.snapshot ?? response;
+    let response;
+    try {
+      response = await fn(...rpcAdapterArguments(protocol, ctx, request, init));
+    } catch (error) {
+      // adapter 同步抛错 / Promise reject / 取消：全都是传输层失败（标记不改 name，取消判定照旧）。
+      throw markRpcTransportFailure(error);
+    }
+    if (response?.ok === false) throw rpcBusinessError(response.error);
+    if (typeof response?.json === "function") {
+      let payload;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        // 响应回来了但读不出协议体：同样属于协议层失败。
+        throw markRpcTransportFailure(error);
+      }
+      if (payload?.ok === false) throw rpcBusinessError(payload.error);
+      const body = payload?.value ?? payload;
+      return typeof select === "function" ? select(body) : (body?.snapshot ?? body);
+    }
+    if (response?.value !== undefined) {
+      if (typeof select === "function") return select(response.value);
+      return response.value?.snapshot ?? response.value;
+    }
+    return typeof select === "function" ? select(response) : (response?.snapshot ?? response);
   }
 
   function styleTag() {
@@ -1086,9 +1773,17 @@
     tag.dataset.plugin = "dsh-expert-group";
     tag.dataset.pluginCss = STYLE_ID;
     tag.textContent = [
-      ".deg_expert_group{display:flex;flex-direction:column;min-width:0;height:100%;overflow:auto;padding:8px 10px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1,transparent);font-size:12px;line-height:16px}",
-      ".deg_expert_group_header{display:flex;align-items:center;min-height:28px;gap:6px;border-bottom:1px solid var(--dsw-alias-border-l2);font-weight:600}",
+      // position:relative 只为宽度拖拽手柄（.deg_expert_group_resizer）提供定位上下文，不影响既有布局。
+      ".deg_expert_group{position:relative;display:flex;flex-direction:column;min-width:0;height:100%;overflow:auto;padding:8px 10px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1,transparent);font-size:12px;line-height:16px}",
+      // 标题栏允许换行（票据 13）：新增 partial 徽标 / 更新时间 / 分类错误文案之后，窄右栏
+      // 一行放不下时按行折行，绝不把标题或状态挤成不可读的一列。min-height 28px 保持既有高度。
+      ".deg_expert_group_header{display:flex;flex-wrap:wrap;align-items:center;min-height:28px;gap:6px;border-bottom:1px solid var(--dsw-alias-border-l2);font-weight:600}",
       ".deg_expert_group_header_title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      // 轻量（partial）快照的可见徽标：数据不完整是一个需要用户看见的状态，不能只靠圆点颜色暗示。
+      // 与「多次重试」徽标同款描边样式，颜色沿用主题 warning，不新增视觉词汇。
+      ".deg_expert_group_partial{flex:0 0 auto;box-sizing:border-box;padding:0 4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);border-radius:4px;color:var(--dsw-alias-state-warning-primary,#f59e0b);font-size:11px;font-weight:600;line-height:14px;white-space:nowrap}",
+      // 「更新于 HH:MM:SS」：次级色、等宽数字（时间跳动时不抖），窄栏允许省略但保留 title。
+      ".deg_expert_group_updated{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px;font-weight:400;font-variant-numeric:tabular-nums}",
       ".deg_expert_group_header_action,.deg_expert_group_chevron,.deg_expert_group_action,.deg_expert_group_sidebar_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}",
       ".deg_expert_group_header_action{width:24px;height:24px;margin-left:auto}",
       // 标题栏 Auto 开关：紧凑到与标题同一行，右对齐且不换行，绝不遮挡标题或右侧操作按钮。
@@ -1111,9 +1806,24 @@
       ".deg_expert_group_header_action:hover,.deg_expert_group_chevron:hover,.deg_expert_group_action:hover:not(:disabled),.deg_expert_group_sidebar_action:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
       ".deg_expert_group_header_action:focus-visible,.deg_expert_group_chevron:focus-visible,.deg_expert_group_action:focus-visible,.deg_expert_group_sidebar_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
       ".deg_expert_group_tree{min-width:0;padding-top:5px}",
+      ".deg_expert_group_tree_items{min-width:0}",
+      // 视觉隐藏的 aria-live 状态区（票据 18）：只服务辅助技术，不占布局、不参与指针命中。
+      // 用 1px 裁剪而不是 display:none —— display:none 的内容不会被播报。
+      ".deg_expert_group_announcer{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}",
+      // 可导航行的明确焦点轮廓（票据 18）：不再依赖浏览器默认（宿主 reset 有时会把它抹掉）。
+      // 任务名与第三行摘要都是 role=button 的 div，键盘焦点必须一眼可见。
+      ".deg_expert_group_task:focus-visible,.deg_expert_group_content:focus-visible,.deg_expert_group_fanout_title>.deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
+      // 右栏宽度拖拽手柄（票据 18）：贴在面板左缘的 6px 竖条，拖拽改变视口比例。
+      // touch-action:none 让触控板/触摸屏的拖拽不会被浏览器滚动吃掉；透明背景只在 hover/拖拽时显形。
+      ".deg_expert_group_resizer{position:absolute;top:0;left:0;bottom:0;width:6px;cursor:col-resize;touch-action:none;background:transparent;z-index:2}",
+      ".deg_expert_group_resizer:hover,.deg_expert_group_resizer[data-dragging=true]{background:var(--dsw-alias-interactive-bg-hover)}",
+      ".deg_expert_group_resizer:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:-2px}",
       ".deg_expert_group_node{position:relative;min-width:0;padding-left:16px}",
       ".deg_expert_group_node_root{padding-left:0}",
-      ".deg_expert_group_row{box-sizing:border-box;display:grid;grid-template-columns:20px 20px minmax(0,1fr);min-width:0;height:60px;min-height:60px;padding:4px 0}",
+      // 票据 12：任务行从固定 60px 改为最小高度——开始时间/耗时/重试/失败摘要作为三行主体的
+      // 相邻块（.deg_expert_group_metrics），行高按内容增长而不是把内容挤出固定行盒。
+      // 树线锚点仍以 60px 的主行高度为参照（--deg-parent-row-height），新增块只向下延伸。
+      ".deg_expert_group_row{box-sizing:border-box;display:grid;grid-template-columns:20px 20px minmax(0,1fr);min-width:0;min-height:60px;padding:4px 0}",
       // 第一行必须是 auto：默认单行 16px 时与旧布局逐像素相同；分片第一行换行时按内容撑高，
       // 绝不把多行文本压进 16px 行盒而与第二行重叠——它没有省略号语义（见 .deg_expert_group_shard_task）。
       // 第二、三行保持 16px 是因为省略号只在单行行盒上生效：行盒被内容撑开时 WebKit/Blink 会退化成
@@ -1204,9 +1914,100 @@
       ".deg_expert_group_action{width:24px;height:24px;padding:0}",
       ".deg_expert_group_action:disabled{opacity:.45;cursor:wait}",
       ".deg_expert_group_empty{padding:16px 2px;color:var(--dsw-alias-label-secondary)}",
+      // 独立错误空态（票据 13）：没有缓存快照且请求失败时，正文只渲染这一块，绝不与
+      // 「暂无 Expert Group 任务」同时出现。标题行用错误色，细节行允许换行并可悬停读全文。
+      ".deg_expert_group_error_empty{display:flex;flex-direction:column;gap:2px;padding:16px 2px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}",
+      ".deg_expert_group_error_empty_title{font-weight:600}",
+      ".deg_expert_group_error_empty_detail{min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-size:11px}",
       ".deg_expert_group_skeleton{height:52px;margin:4px 0;border-radius:5px;background:var(--dsw-alias-bg-layer-2,var(--dsw-alias-interactive-bg-hover));opacity:.65}",
       ".deg_expert_group_error{display:flex;align-items:center;gap:4px;padding:6px 0;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));font-size:11px}",
       ".deg_expert_group_count{margin-left:auto;color:var(--dsw-alias-label-secondary);font-size:11px;font-weight:400}",
+      // ── 票据 12：任务时间线 / 搜索过滤 / 导出 ──────────────────────────────
+      // 三行主体的相邻块容器：时间线条与 attempt 时间线都放在第三列里纵向排列，
+      // 不占额外的 grid 列（不会挤压状态圆点/折叠箭头/操作按钮）。
+      ".deg_expert_group_cell{display:flex;flex-direction:column;min-width:0}",
+      // 任务行时间线条：开始时间 / 耗时 / 重试次数 / 最近活动 / 多次重试徽标 / 失败摘要。
+      // 窄右栏时按 flex-wrap 换行；每一段自身单行省略，完整文本仍在 tooltip 里。
+      ".deg_expert_group_metrics{display:flex;flex-wrap:wrap;align-items:center;gap:2px 6px;min-width:0;padding:2px 0 0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
+      ".deg_expert_group_metrics_part{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
+      ".deg_expert_group_metrics_separator{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
+      // 「多次重试」徽标：只在 retryCount 达到阈值时出现，文案不暗示存在已知的 maxAttempts。
+      ".deg_expert_group_retry_warning{flex:0 0 auto;box-sizing:border-box;padding:0 4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);border-radius:4px;color:var(--dsw-alias-state-warning-primary,#f59e0b);font-weight:600;line-height:14px}",
+      // 受限失败摘要：稳定 code + 一行 message（模型已脱敏/截断），固定单行省略。
+      ".deg_expert_group_failure{flex:1 1 100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
+      // attempt 时间线：只读列表，左侧一条细线把它与任务主体区分开。
+      ".deg_expert_group_attempts{display:flex;flex-direction:column;gap:0;min-width:0;margin:2px 0;padding:0 0 0 6px;border-inline-start:1px solid var(--dsw-alias-border-l2)}",
+      // 票据 25/30：attempt 条目改为纵向（首行单元格 + 用量/成本 + 结构化结果），
+      // 首行仍是原来的 flex 行，文本顺序与旧结构逐字一致。
+      ".deg_expert_group_attempt{display:flex;flex-direction:column;align-items:stretch;gap:0;min-width:0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
+      ".deg_expert_group_attempt_row{display:flex;align-items:center;gap:6px;min-width:0}",
+      ".deg_expert_group_attempt_usage{display:flex;flex-wrap:wrap;gap:0 6px;min-width:0;padding-left:2px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px}",
+      ".deg_expert_group_attempt_usage_tokens{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
+      ".deg_expert_group_attempt_cost{min-width:0;overflow-wrap:anywhere}",
+      ".deg_expert_group_attempt_cost[data-cost-configured=false]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
+      // 行内用量徽标（任务/专家/分片）：等宽数字，窄栏可省略但 title 保留完整值。
+      ".deg_expert_group_usage{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
+      ".deg_expert_group_usage[data-usage=missing]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
+      // 结构化结果区：有界 JSON 预览按可读前缀展示，超长换行而不是横向滚动/溢出右栏。
+      ".deg_expert_group_structured{min-width:0;margin:2px 0 0;padding:2px 4px;border-inline-start:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:15px;overflow-wrap:anywhere;max-height:84px;overflow:auto}",
+      ".deg_expert_group_structured[data-fallback=true]{border-inline-start-color:var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
+      ".deg_expert_group_shard_extra{display:flex;flex-direction:column;min-width:0}",
+      // ── 票据 26/28：诊断区、新建任务表单、模板库与回执 ──────────────────────
+      ".deg_expert_group_diagnostics{margin:4px 0 0;padding:5px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);font-size:11px}",
+      ".deg_expert_group_diagnostics_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
+      ".deg_expert_group_diagnostics_rows{display:flex;flex-direction:column;gap:2px;margin-top:3px}",
+      ".deg_expert_group_diag_row{display:flex;flex-wrap:wrap;gap:0 6px;min-width:0}",
+      ".deg_expert_group_diag_name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}",
+      ".deg_expert_group_diag_values{flex:1 1 160px;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary)}",
+      ".deg_expert_group_diagnostics_empty,.deg_expert_group_diagnostics_usage{margin-top:3px;color:var(--dsw-alias-label-secondary)}",
+      ".deg_expert_group_dispatch{margin:4px 0 0;padding:6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);font-size:11px}",
+      ".deg_expert_group_dispatch_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
+      ".deg_expert_group_dispatch_row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:4px 8px;margin-top:4px}",
+      ".deg_expert_group_dispatch_field{display:flex;flex:1 1 120px;flex-direction:column;gap:2px;min-width:0;margin-top:4px}",
+      ".deg_expert_group_dispatch_label{color:var(--dsw-alias-label-secondary);font-size:11px}",
+      ".deg_expert_group_dispatch_input{box-sizing:border-box;width:100%;min-width:0;padding:2px 4px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:11px;line-height:16px}",
+      ".deg_expert_group_dispatch_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+      ".deg_expert_group_dispatch_textarea{resize:vertical;min-height:40px}",
+      ".deg_expert_group_dispatch_check{display:inline-flex;align-items:center;gap:4px;margin-top:4px;color:var(--dsw-alias-label-secondary)}",
+      ".deg_expert_group_dispatch_shards{display:flex;flex-direction:column;gap:4px;margin-top:4px}",
+      ".deg_expert_group_dispatch_shard{display:flex;flex-direction:column;padding:4px;border:1px dashed var(--dsw-alias-border-l2);border-radius:5px}",
+      ".deg_expert_group_dispatch_shard_head{display:flex;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
+      ".deg_expert_group_dispatch_actions{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}",
+      ".deg_expert_group_dispatch_error{margin-top:4px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));overflow-wrap:anywhere}",
+      ".deg_expert_group_dispatch_notice{margin-top:4px;color:var(--dsw-alias-label-secondary)}",
+      ".deg_expert_group_templates{margin-top:6px;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2)}",
+      ".deg_expert_group_templates_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
+      ".deg_expert_group_template{display:flex;flex-direction:column;gap:2px;margin-top:4px;padding:4px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px}",
+      ".deg_expert_group_template_name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}",
+      ".deg_expert_group_template_meta{color:var(--dsw-alias-label-secondary)}",
+      ".deg_expert_group_template_preview{min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));max-height:48px;overflow:auto}",
+      ".deg_expert_group_template_actions{display:flex;flex-wrap:wrap;gap:4px;margin-top:2px}",
+      ".deg_expert_group_templates_empty{color:var(--dsw-alias-label-secondary);margin-top:4px}",
+      ".deg_expert_group_dispatch_receipt{margin:4px 0 0;padding:5px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;color:var(--dsw-alias-label-secondary);font-size:11px;overflow-wrap:anywhere}",
+      ".deg_expert_group_dispatch_receipt>div:first-child{color:var(--dsw-alias-label-primary);font-weight:600}",
+      ".deg_expert_group_attempt_index{flex:0 0 auto;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums}",
+      ".deg_expert_group_attempt_status{flex:0 0 auto;font-weight:600}",
+      ".deg_expert_group_attempt[data-status=failed] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=timed_out] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=interrupted] .deg_expert_group_attempt_status{color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
+      ".deg_expert_group_attempt_duration{flex:0 0 auto;font-variant-numeric:tabular-nums}",
+      ".deg_expert_group_attempt_time{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
+      // fan-out 聚合时间线里的分片归属：只在聚合视图出现，分片自己的时间线不带这段。
+      ".deg_expert_group_attempt_shard{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      // 「查看全部 / 收起」：时间线唯一的交互控件（只切换展示条数，不改数据）。
+      ".deg_expert_group_attempts_toggle{flex:0 0 auto;align-self:flex-start;box-sizing:border-box;height:20px;margin:1px 0 0;padding:0 4px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
+      ".deg_expert_group_attempts_toggle:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+      ".deg_expert_group_attempts_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+      // fan-out 标题列：标题 + 时间线/计数/失败摘要纵向排列，标题行仍可点击导航。
+      ".deg_expert_group_fanout_title{display:flex;flex-direction:column;min-width:0}",
+      ".deg_expert_group_fanout_title>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
+      // 搜索/过滤/导出工具条：位于任务树顶部，只在快照已上屏时出现。
+      ".deg_expert_group_toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:5px 0 2px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
+      ".deg_expert_group_search{flex:1 1 120px;min-width:0;box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px}",
+      ".deg_expert_group_filter{flex:0 1 auto;min-width:0;box-sizing:border-box;height:24px;padding:0 2px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px}",
+      ".deg_expert_group_search:focus-visible,.deg_expert_group_filter:focus-visible,.deg_expert_group_export_button:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+      ".deg_expert_group_export{display:flex;flex:0 0 auto;gap:4px;margin-left:auto}",
+      ".deg_expert_group_export_button{box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
+      ".deg_expert_group_export_button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+      ".deg_expert_group_filter_empty{padding:8px 2px;color:var(--dsw-alias-label-secondary);font-size:11px}",
     ].join("");
     document.head?.appendChild(tag);
   }
@@ -2744,7 +3545,13 @@
      * 成功刷新（含内容不变的轮询响应）保持新鲜，只被渲染过却始终没拉取成功的 root 不会顶掉别人。
      */
     const SNAPSHOT_CACHE_LIMIT = 32;
-    /** rootSessionId → 最近成功的 normalized 快照；Map 的迭代顺序即 LRU 顺序（末尾最新）。 */
+    /**
+     * rootSessionId → { snapshot, updatedAt }；Map 的迭代顺序即 LRU 顺序（末尾最新）。
+     *
+     * 条目带 updatedAt（票据 13）的理由：重挂载时首帧直接拿缓存快照上屏，标题栏的「更新于」
+     * 必须同源——只有快照而没有时间，新实例要么显示一个假的当前时间，要么干脆不显示时间。
+     * updatedAt 记录的是「这份内容最近一次被成功确认」的时间戳（毫秒），由写入方提供。
+     */
     const snapshotCache = new Map();
     /**
      * 日常打开/关闭子代理 tab 不改写右栏宽度；只有首次从 Expert Group-only 单 pane 创建
@@ -2755,7 +3562,7 @@
      * 换算，同时保留 tab 的开/关与外部关闭同步语义：它们只维护 sidebarTabRecordsRef 中的
      * 精确 tabId 记录。
      */
-    /** 纯读缓存：命中返回快照，未命中返回 null；绝不重排 LRU、绝不写入（渲染路径只允许用它）。 */
+    /** 纯读缓存：命中返回 { snapshot, updatedAt }，未命中返回 null；绝不重排 LRU、绝不写入。 */
     const peekCachedSnapshot = (rootSessionId) => {
       if (rootSessionId === "" || snapshotCache.has(rootSessionId) !== true) return null;
       return snapshotCache.get(rootSessionId) ?? null;
@@ -2763,11 +3570,14 @@
     /**
      * 写缓存并做有限 LRU 淘汰：同一 root 覆盖旧值并移到最新；超过上限时从最久未使用的 root 开始
      * 删除，保证长时间反复切换会话也不会无界增长（上限内每个 root 至多一份快照）。
+     *
+     * updatedAt 由调用方给出（成功响应的到达时间）。每次成功响应都会写缓存，因此 LRU 新鲜度
+     * 语义与票据 13 之前逐字一致：正在被观察的 root 由它自己的成功拉取保持新鲜。
      */
-    const writeCachedSnapshot = (rootSessionId, next) => {
+    const writeCachedSnapshot = (rootSessionId, next, updatedAt) => {
       if (rootSessionId === "" || next === null || next === undefined) return;
       snapshotCache.delete(rootSessionId);
-      snapshotCache.set(rootSessionId, next);
+      snapshotCache.set(rootSessionId, { snapshot: next, updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now() });
       while (snapshotCache.size > SNAPSHOT_CACHE_LIMIT) {
         const oldest = snapshotCache.keys().next();
         if (oldest.done === true) break;
@@ -2775,14 +3585,20 @@
       }
     };
     /**
-     * 某个 root 的初始展示状态：命中缓存就是「已有快照、已加载」，未命中仍是 skeleton 语义。
+     * 某个 root 的初始展示状态：命中缓存就是「已有快照、已加载、有更新时间」，未命中仍是 skeleton。
      * 错误信息不缓存——上一次失败不该污染新实例的首屏（真正的失败会在本次刷新里重新得到）。
      * 只做纯读 peek：命中不改变 LRU 顺序，因此调用它（挂载帧 / 视图回退分支，含 StrictMode
      * 双渲染）不会产生任何缓存副作用。
      */
     const initialStateFor = (rootSessionId) => {
       const cached = peekCachedSnapshot(rootSessionId);
-      return { rootSessionId, snapshot: cached, loading: cached === null, error: null };
+      return {
+        rootSessionId,
+        snapshot: cached === null ? null : cached.snapshot,
+        updatedAt: cached === null ? null : cached.updatedAt,
+        loading: cached === null,
+        error: null,
+      };
     };
 
     /**
@@ -2955,6 +3771,16 @@
       const rootSessionId = resolvedRoot || "";
       // 右栏 tab 域按当前 Session 隔离；缺失时回退 root，保持旧宿主的确定性作用域。
       const sidebarSessionId = sessionId || rootSessionId;
+      /**
+       * 当前面板所在 tab 的活跃度（票据 16）：true / false / null（未知）。
+       *
+       * 读面只在这里解析一次（渲染期纯读），两个消费者共用同一份结论：
+       * - 挂载 effect 用它决定是否一开始就暂停轮询；
+       * - 独立的活跃度 effect 用它处理「非活跃 → 暂停 / 重新活跃 → 立即刷新」。
+       * 宿主没有明确 active 字段时是 null：生产退回 document 可见性，绝不凭旁证暂停。
+       */
+      const tabActivity = readPanelTabActivity(config, props, tabInfo);
+      const tabActivityKey = tabActivity === true ? "active" : (tabActivity === false ? "inactive" : "unknown");
       // 同一个 root 的最近成功快照由闭包缓存提供：重新挂载（新 Panel 实例）时首帧直接渲染任务树，
       // 不再先闪两条 skeleton；没有缓存的真正首次访问仍然是 snapshot=null + loading=true。
       // 这里用懒初始化：只有挂载那一帧才读一次缓存（StrictMode 会重复调用初始化函数，但缓存读
@@ -2984,7 +3810,274 @@
       const autoOpenDraftPair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
       const autoOpenDraft = autoOpenDraftPair[0];
       const setAutoOpenDraft = autoOpenDraftPair[1];
+      /**
+       * 客户端本地搜索/过滤状态（票据 12）：{ rootSessionId, query, role, status }。
+       *
+       * 三条硬约束：
+       * - **不持久化**：只有内存状态，刷新页面即回到「无过滤」，绝不写 sessionStorage
+       *   （展开状态是唯一的持久化 UI 状态，过滤不属于它）；
+       * - **不新增 RPC**：过滤只作用于已归一的内存快照，轮询节奏与请求体完全不变；
+       * - **按 root 绑定**：rootSessionId 与当前 root 不一致时按空过滤处理。切换会话后
+       *   旧会话的搜索词/角色筛选不会把新会话的树整棵隐藏（也不需要渲染期 setState）。
+       */
+      const emptyFilter = Object.freeze({ rootSessionId: null, query: "", role: "", status: "" });
+      const filterPair = typeof react.useState === "function"
+        ? react.useState(emptyFilter)
+        : [emptyFilter, () => {}];
+      const filterState = filterPair[0] !== null && typeof filterPair[0] === "object" ? filterPair[0] : emptyFilter;
+      const setFilterState = filterPair[1];
+      /**
+       * 「查看全部」时间线的本地展开集合：键是稳定节点键（fanout:<id> / shard:<parent>:<shard>）。
+       *
+       * 用 ref + bump 而不是 useState：展开集合不参与快照内容比较，也不需要跨渲染树传递；
+       * 这样与 pendingSet / recoveryRetryRef 同一模式，点击只触发一次重渲染。
+       * 同样不持久化：刷新后回到「最近 5 条」的默认视图。
+       */
+      const timelineExpandedRef = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };
+
+      /**
+       * 票据 25/26/27/28 的客户端读面状态。
+       *
+       * - meta：宿主 meta（角色清单/显示名/单价/限流诊断/全局用量）。**懒加载**：只有用户
+       *   打开「诊断」或「新建任务」，或快照第一次出现用量事实时才读一次；挂载与轮询路径
+       *   不新增任何请求，既有请求计数契约不变。
+       * - dispatch：新建任务内联表单（null = 关闭）；回执与本地校验错误分开存放——
+       *   Host 结构化拒绝仍走标题栏错误槽（唯一错误面），本地解析错误只落在表单内。
+       * - templates：模板库只读摘要（Host 已限定 ≤32，客户端再截断一次）。
+       */
+      const metaPair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
+      const meta = metaPair[0];
+      const setMeta = metaPair[1];
+      // 事件路径（runAction 的尾随刷新）读取的是**当前渲染**的 meta，用 ref 同步写入。
+      const metaStateRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      metaStateRef.current = meta;
+      const dispatchDraftPair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
+      const dispatchDraft = dispatchDraftPair[0];
+      const setDispatchDraft = dispatchDraftPair[1];
+      const dispatchReceiptPair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
+      const dispatchReceipt = dispatchReceiptPair[0];
+      const setDispatchReceipt = dispatchReceiptPair[1];
+      const dispatchErrorPair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
+      const dispatchError = dispatchErrorPair[0];
+      const setDispatchError = dispatchErrorPair[1];
+      const templateNoticePair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
+      const templateNotice = templateNoticePair[0];
+      const setTemplateNotice = templateNoticePair[1];
+      const templatesPair = typeof react.useState === "function"
+        ? react.useState({ status: "idle", templates: [], count: 0, limit: 32, message: null })
+        : [{ status: "idle", templates: [], count: 0, limit: 32, message: null }, () => {}];
+      const templatesState = templatesPair[0];
+      const setTemplatesState = templatesPair[1];
+      const diagnosticsOpenPair = typeof react.useState === "function" ? react.useState(false) : [false, () => {}];
+      const diagnosticsOpen = diagnosticsOpenPair[0];
+      const setDiagnosticsOpen = diagnosticsOpenPair[1];
+
+      /**
+       * 任务状态播报（票据 18）：{ rootSessionId, tasks }。
+       *
+       * 基线放在 ref 里而不是 state：它只服务「上一份快照是什么」这一比较，不参与渲染。
+       * 语义边界：
+       * - 首次挂载 / 切换 root 时只建立基线，**绝不播报历史任务**（包括缓存首屏与重挂载）；
+       * - 每次快照变化按 collectAnnouncementTasks + announcementTextOf 求差异，同内容轮询没有差异；
+       * - 播报文本只在确实有事件时写入 state（同一帧最多一次 setState），因此 aria-live 区域
+       *   不会因为轮询而反复重读同一句话。
+       */
+      const announcerRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      const announcementPair = typeof react.useState === "function" ? react.useState("") : ["", () => {}];
+      const announcement = announcementPair[0];
+      const setAnnouncement = announcementPair[1];
+      if (typeof react.useEffect === "function") {
+        react.useEffect(() => {
+          if (state.snapshot === null) return;
+          const tasks = collectAnnouncementTasks(state.snapshot);
+          const previous = announcerRef.current;
+          announcerRef.current = { rootSessionId, tasks };
+          // 首次挂载或切换 root：只建立基线，绝不把已有任务补播成「开始/完成」。
+          if (previous === null || previous.rootSessionId !== rootSessionId) return;
+          const events = announcementEventsOf(previous.tasks, tasks);
+          if (events.length === 0) return;
+          const visible = events.slice(0, ANNOUNCEMENT_MAX_ITEMS)
+            .map((event) => t("announce." + event.kind, { name: event.name }));
+          if (events.length > ANNOUNCEMENT_MAX_ITEMS) visible.push(t("announce.more", { count: events.length }));
+          setAnnouncement(visible.join(panelLocale === "en" ? "; " : "；"));
+        }, [state.snapshot, rootSessionId]);
+      }
+      /**
+       * 右栏宽度拖拽（票据 18）：只在本面板拿到了 install 侧的两个注入点时才渲染手柄。
+       *
+       * 分工：
+       * - Panel 只负责「这次拖拽/按键想把比例改成多少」与本地 aria-valuenow；
+       * - install 侧负责 clamp 后的真实写入（setRightbar）与 localStorage 持久化。
+       * 直接 createExpertGroupPanel（旧宿主/单测）没有注入点时完全不渲染手柄，
+       * 绝不留下一个拖了没反应的控件。
+       */
+      const readWidthRatio = typeof config.readRightbarWidthRatio === "function" ? config.readRightbarWidthRatio : null;
+      const applyWidthRatio = typeof config.applyRightbarWidthRatio === "function" ? config.applyRightbarWidthRatio : null;
+      const widthRatioPair = typeof react.useState === "function"
+        ? react.useState(() => {
+          const stored = readWidthRatio === null ? null : clampRightbarWidthRatio(readWidthRatio());
+          return stored === null ? RIGHTBAR_WIDTH_RATIO : stored;
+        })
+        : [RIGHTBAR_WIDTH_RATIO, () => {}];
+      const widthRatio = widthRatioPair[0];
+      const setWidthRatio = widthRatioPair[1];
+      /** 拖拽会话：{ startX, startRatio, lastRatio, listeners }；null 表示没有在拖。 */
+      const widthDragRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      /**
+       * 一次比例变更的唯一收口：先更新本地值（aria-valuenow 立刻反映），再交给 install 侧。
+       * persist=false 用于拖动过程中的连续预览，避免每次 pointermove 都写一次 localStorage；
+       * 松手/按键结束时用 persist=true 落盘。应用失败不抛给事件处理器：拖拽只是体验增强。
+       */
+      const commitWidthRatio = (value, options = {}) => {
+        const clamped = clampRightbarWidthRatio(value);
+        if (clamped === null) return null;
+        setWidthRatio(clamped);
+        if (applyWidthRatio !== null) {
+          try { applyWidthRatio(clamped, { persist: options.persist === true }); } catch { /* 见上。 */ }
+        }
+        return clamped;
+      };
+      /** 拖拽事件宿主：优先 window（真实浏览器的 pointer 事件目标），缺失时退回 globalThis。 */
+      const widthDragHost = () => {
+        try { return globalThis.window ?? globalThis; } catch { return null; }
+      };
+      const detachWidthDrag = (drag) => {
+        const host = widthDragHost();
+        if (host === null || drag === null) return;
+        try {
+          host.removeEventListener?.("pointermove", drag.onMove);
+          host.removeEventListener?.("pointerup", drag.onEnd);
+          host.removeEventListener?.("pointercancel", drag.onEnd);
+          host.removeEventListener?.("mousemove", drag.onMove);
+          host.removeEventListener?.("mouseup", drag.onEnd);
+        } catch { /* 移除失败不阻断松手收口。 */ }
+      };
+      const endWidthDrag = () => {
+        const drag = widthDragRef.current;
+        if (drag === null) return;
+        widthDragRef.current = null;
+        detachWidthDrag(drag);
+        commitWidthRatio(drag.lastRatio, { persist: true });
+      };
+      const onWidthDragMove = (event) => {
+        const drag = widthDragRef.current;
+        if (drag === null) return;
+        const viewport = viewportWidthOf();
+        const clientX = Number(event?.clientX);
+        if (viewport === null || Number.isFinite(clientX) !== true) return;
+        event?.preventDefault?.();
+        // 手柄在右栏左缘：指针向左拖 → 右栏更宽 → 比例增大。
+        const next = clampRightbarWidthRatio(drag.startRatio + (drag.startX - clientX) / viewport);
+        if (next === null) return;
+        drag.lastRatio = next;
+        commitWidthRatio(next, { persist: false });
+      };
+      const onWidthDragStart = (event) => {
+        // 写面是手柄存在的唯一条件；读面缺失时从本地 widthRatio（默认 20%）起手。
+        if (applyWidthRatio === null) return;
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        const clientX = Number(event?.clientX);
+        if (Number.isFinite(clientX) !== true) return;
+        endWidthDrag();
+        // 起手比例以**当前上屏值**为准（aria-valuenow 与拖拽必须同源）；
+        // 注入的读面只在挂载那一帧参与初始化，避免拖拽过程中被外部旧值拉回。
+        const startRatio = clampRightbarWidthRatio(widthRatio) ?? RIGHTBAR_WIDTH_RATIO;
+        const drag = {
+          startX: clientX,
+          startRatio,
+          lastRatio: startRatio,
+          onMove: null,
+          onEnd: null,
+        };
+        drag.onMove = (moveEvent) => onWidthDragMove(moveEvent);
+        drag.onEnd = () => endWidthDrag();
+        const host = widthDragHost();
+        try {
+          host?.addEventListener?.("pointermove", drag.onMove);
+          host?.addEventListener?.("pointerup", drag.onEnd);
+          host?.addEventListener?.("pointercancel", drag.onEnd);
+          host?.addEventListener?.("mousemove", drag.onMove);
+          host?.addEventListener?.("mouseup", drag.onEnd);
+        } catch { /* 监听装不上时手柄仍可用键盘调整。 */ }
+        widthDragRef.current = drag;
+      };
+      /**
+       * 键盘调整：Left 缩窄 / Right 加宽（每次 2%），Home/End 直达边界。
+       * 与拖拽共用同一条 commit 路径，方向键同样持久化。
+       */
+      const onWidthResizerKeyDown = (event) => {
+        const key = event?.key;
+        if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "Home" && key !== "End") return;
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        const step = 0.02;
+        const current = clampRightbarWidthRatio(widthRatio) ?? RIGHTBAR_WIDTH_RATIO;
+        const next = key === "Home" ? RIGHTBAR_WIDTH_RATIO_MIN
+          : key === "End" ? RIGHTBAR_WIDTH_RATIO_MAX
+            : key === "ArrowLeft" ? current - step : current + step;
+        commitWidthRatio(next, { persist: true });
+      };
+      /**
+       * 宽度手柄节点：role=separator + 比例 aria 值，指针与键盘两条调整路径共用本地 widthRatio。
+       * 手柄只在有写入能力（apply）时出现；read 缺失时按默认比例初始化（仍可拖拽）。
+       */
+      const widthResizer = applyWidthRatio === null
+        ? null
+        : react.createElement("div", {
+          className: "deg_expert_group_resizer",
+          role: "separator",
+          "aria-orientation": "vertical",
+          "aria-label": "调整右栏宽度",
+          "aria-valuemin": Math.round(RIGHTBAR_WIDTH_RATIO_MIN * 100),
+          "aria-valuemax": Math.round(RIGHTBAR_WIDTH_RATIO_MAX * 100),
+          "aria-valuenow": Math.round(widthRatio * 100),
+          "data-dragging": widthDragRef.current !== null ? "true" : undefined,
+          tabIndex: 0,
+          onPointerDown: onWidthDragStart,
+          onMouseDown: onWidthDragStart,
+          onKeyDown: onWidthResizerKeyDown,
+        });
+
       const model = modelApi();
+      /**
+       * 宿主语言解析（票据 19）：ctx.locale → ctx.i18n.locale → useTabInfo().locale →
+       * document.documentElement.lang → navigator.language → 默认 zh。
+       *
+       * 解析集中在挂载/渲染期做一次纯读；候选值只从注入面与环境读取，绝不写回。
+       * 模型缺失（契约外直载、未装 model 模块）时退回 zh，保证既有中文断言不变。
+       */
+      const panelLocale = (() => {
+        const sources = {
+          ctxLocale: (() => { try { return ctx?.locale; } catch { return undefined; } })(),
+          i18nLocale: (() => { try { return ctx?.i18n?.locale; } catch { return undefined; } })(),
+          tabInfo,
+          documentLang: (() => {
+            try { return globalThis.document?.documentElement?.lang; } catch { return undefined; }
+          })(),
+          navigatorLanguage: (() => {
+            try { return globalThis.navigator?.language; } catch { return undefined; }
+          })(),
+        };
+        if (typeof model.resolveClientLocale === "function") return model.resolveClientLocale(sources);
+        // 模型缺失的降级：只识别 en 前缀，其余一律 zh（与默认语言一致）。
+        const candidates = [sources.ctxLocale, sources.i18nLocale, sources.tabInfo?.locale, sources.documentLang, sources.navigatorLanguage];
+        return candidates.some((value) => typeof value === "string" && value.trim().toLowerCase().startsWith("en")) ? "en" : "zh";
+      })();
+      /**
+       * 文案查询入口：所有用户可见的核心文案都经它取消息表。
+       * 缺失键由模型回退默认语言；模型缺失时最后退回空串以外的中性占位（不暴露键名）。
+       */
+      const t = (key, vars) => {
+        if (typeof model.translateMessage === "function") return model.translateMessage(panelLocale, key, vars);
+        return "—";
+      };
+      /**
+       * 错误槽短文案（票据 13 的来源分类 × 票据 19 的消息表）：
+       * 只接受 snapshot / action / rpc 三个稳定来源；未知来源一律按 action 呈现，
+       * 完整 message 仍只放在 title 属性里。
+       */
+      const errorLabelOf = (source) => t("sidebar.error." + (source === "snapshot" || source === "rpc" ? source : "action"));
       // 展开状态只依赖 storage 与 root；缓存 store 可避免每次 RPC/通知重渲染都重复读取
       // sessionStorage 和解析同一份展开键。
       const createStore = () => typeof model.createExpansionStore === "function"
@@ -3009,6 +4102,103 @@
       currentRootRef.current = rootSessionId;
       const currentSidebarSessionRef = typeof react.useRef === "function" ? react.useRef(sidebarSessionId) : { current: sidebarSessionId };
       currentSidebarSessionRef.current = sidebarSessionId;
+      /**
+       * 票据 25/26/27/28：meta 读取的单飞标记与懒加载记账。
+       *
+       * meta 是旁路读面（角色显示名/单价/限流诊断/全局用量），不是任务树的第二事实源：
+       * 读失败一律静默保持 null（UI 回退角色 id / 「未配置单价，不估算」），绝不写标题栏
+       * 错误槽——否则一次诊断读取失败会让用户以为任务树坏了。
+       */
+      const metaRequestRef = typeof react.useRef === "function" ? react.useRef({ inFlight: false }) : { current: { inFlight: false } };
+      /** 已经为哪个 root 触发过「快照有用量 ⇒ 自动读 meta」，每个 root 最多一次。 */
+      const metaAutoAttemptRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      /** runAction 尾随刷新使用的 meta 刷新入口（每次渲染同步写入，避免闭包陈旧）。 */
+      const metaRefreshRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      /** 模板库请求的单飞标记：打开表单/保存/删除后不会并发堆请求。 */
+      const templatesRequestRef = typeof react.useRef === "function" ? react.useRef({ inFlight: false }) : { current: { inFlight: false } };
+
+      /**
+       * 可读错误文案（票据 28）：折叠控制字符、脱敏绝对路径并截断；有稳定 code 时置于最前。
+       * 只用于客户端自造提示（模板列表/本地校验），Host 结构化拒绝仍走 runAction 的错误槽。
+       */
+      const displayErrorMessage = (error) => {
+        const api = modelApi();
+        const raw = error instanceof Error ? error.message : String(error);
+        const code = text(object(error).code, null);
+        const combined = code === null ? raw : code + " · " + raw;
+        return typeof api?.redactDisplayText === "function"
+          ? (api.redactDisplayText(combined, 200) || combined)
+          : combined.slice(0, 200);
+      };
+
+      /**
+       * 读取宿主 meta（唯一入口，单飞）。
+       *
+       * 只在明确的用户读面或快照出现用量事实时调用；返回值只给调用方做「读到了/没读到」
+       * 判定，失败静默（UI 保持「角色 id / 未配置单价」的保守显示）。
+       */
+      const loadMeta = async () => {
+        if (mountedRef.current !== true) return null;
+        const request = metaRequestRef.current;
+        if (request.inFlight === true) return null;
+        request.inFlight = true;
+        try {
+          const body = await callRpc(config, contextRef.current, { action: "meta" }, {}, (value) => object(value));
+          if (mountedRef.current !== true) return null;
+          const normalized = normalizeHostMeta(body);
+          setMeta(normalized);
+          return normalized;
+        } catch {
+          // 旁路读面失败不写错误槽：角色 id 与「未配置单价，不估算」仍是诚实显示。
+          return null;
+        } finally {
+          request.inFlight = false;
+        }
+      };
+      metaRefreshRef.current = loadMeta;
+
+      /**
+       * 读取模板库摘要（票据 28，单飞）。
+       *
+       * Host 只回有界摘要（不含 outputSchema 原文/凭据/路径全文），客户端再截断到 32 条。
+       * 失败写进模板区的小字 + 标题栏错误槽（与动作失败共用同一个错误面）。
+       */
+      const loadTemplates = async () => {
+        if (mountedRef.current !== true) return null;
+        const targetSessionId = typeof currentRootRef.current === "string" ? currentRootRef.current : "";
+        if (targetSessionId === "") return null;
+        const request = templatesRequestRef.current;
+        if (request.inFlight === true) return null;
+        request.inFlight = true;
+        setTemplatesState((previous) => ({ ...previous, status: "loading", message: null }));
+        try {
+          const body = await callRpc(
+            config,
+            contextRef.current,
+            { action: "fanout-template-list", sessionId: targetSessionId },
+            {},
+            (value) => object(value),
+          );
+          if (mountedRef.current !== true || currentRootRef.current !== targetSessionId) return null;
+          const templates = Array.isArray(body.templates) ? body.templates.slice(0, 32) : [];
+          const count = Number.isSafeInteger(body.count) && body.count >= 0 ? body.count : templates.length;
+          const limit = Number.isSafeInteger(body.limit) && body.limit > 0 ? body.limit : 32;
+          setTemplatesState({ status: "ready", templates, count, limit, message: null });
+          return body;
+        } catch (error) {
+          if (mountedRef.current !== true) return null;
+          const message = displayErrorMessage(error);
+          setTemplatesState((previous) => ({ ...previous, status: "error", message }));
+          const source = rpcFailureKindOf(error) === RPC_FAILURE_TRANSPORT
+            ? PANEL_ERROR_SOURCES.rpc
+            : PANEL_ERROR_SOURCES.action;
+          const at = Date.now();
+          setState((previous) => ({ ...previous, error: { source, message, at } }));
+          return null;
+        } finally {
+          request.inFlight = false;
+        }
+      };
       /**
        * surface 身份令牌：给每一条「跨 await 的异步动作」用的**不可复用**身份。
        *
@@ -3054,7 +4244,87 @@
       const refreshStateRef = typeof react.useRef === "function"
         ? react.useRef({ rootSessionId: null, inFlight: null, pending: false })
         : { current: { rootSessionId: null, inFlight: null, pending: false } };
-      const refresh = () => {
+      /**
+       * fanout 事件游标（票据 15）：{ rootSessionId, cursor }，只描述「本实例当前 root 已经读到哪」。
+       *
+       * 语义边界：
+       * - 起始值 0 = 「从头读保留窗口」（Host 的 getEvents 以 0 为起点），不是伪造的对齐位置；
+       * - 切换 root 时重置（旧 root 的游标对新 root 没有意义）；A→B→A 同样从头读，
+       *   多读一轮事件最多触发一次全量快照，绝不会漏事件；
+       * - 只在**真正读到** Host 返回的 cursor 时推进：请求失败、响应缺字段、被取消、旧代次
+       *   一律原地不动 —— 下一轮用同一个游标重读，宁可重复也绝不把未确认的区间当成已同步。
+       */
+      const fanoutCursorRef = typeof react.useRef === "function"
+        ? react.useRef({ rootSessionId, cursor: 0 })
+        : { current: { rootSessionId, cursor: 0 } };
+      if (fanoutCursorRef.current.rootSessionId !== rootSessionId) {
+        fanoutCursorRef.current = { rootSessionId, cursor: 0 };
+      }
+      /**
+       * 最近一次渲染提交的快照（票据 16）。
+       *
+       * 调度器在 effect 闭包里运行，它看到的 state 永远停留在挂载那一帧；
+       * 而「还有没有运行中的任务」「当前是不是轻量快照」必须按**最新上屏**的数据回答。
+       * 渲染期同步写入这个引用（与 refreshRef / sidebarTabSyncRef 同一写法），读取者只做纯读。
+       */
+      const latestSnapshotRef = typeof react.useRef === "function"
+        ? react.useRef(state.snapshot)
+        : { current: state.snapshot };
+      latestSnapshotRef.current = state.snapshot;
+      /**
+       * 最近一次渲染提交的错误槽（票据 15 的失败恢复）。
+       *
+       * 用途只有一个：上一轮**快照**读取失败时，下一轮轮询必须直接重试整棵快照。
+       * 少了这条规则，事件读面一旦健康（无事件）就会让快照错误与旧数据永久挂在界面上——
+       * 失败的自动恢复因此不能只依赖「有事件」。
+       */
+      const latestPanelErrorRef = typeof react.useRef === "function"
+        ? react.useRef(state.error)
+        : { current: state.error };
+      latestPanelErrorRef.current = state.error;
+      /**
+       * 增量轮询的单飞状态（票据 15）：{ rootSessionId, inFlight, pending }。
+       *
+       * 与 refreshStateRef 分工不同：那条链路保护**快照请求**（通知/手动/动作尾随共用），
+       * 这条保护**一轮增量同步**（先 fanout-events、必要时再快照）。两者都有「单飞 + 一次尾随」：
+       * 在途期间到来的轮询只记一次 pending，结算后立刻补跑一轮，绝不并发堆请求。
+       */
+      const pollSyncStateRef = typeof react.useRef === "function"
+        ? react.useRef({ rootSessionId: null, inFlight: null, pending: false })
+        : { current: { rootSessionId: null, inFlight: null, pending: false } };
+      /** 轮次序号：同一轮结果被多个 tick 观察到时，调度器据此只记账一次（见 applyPanelPollCycle）。 */
+      const pollCycleSequenceRef = typeof react.useRef === "function" ? react.useRef(0) : { current: 0 };
+      /**
+       * 采纳一次快照响应里出现的游标（票据 15 的强制全量路径）。
+       *
+       * Host 当前的 expert-group-snapshot 响应**不带** cursor（契约只有 snapshot + revision），
+       * 因此这里按「有就采纳、没有就保持」处理：
+       * - 返回 false 时调用方什么都不做，下一轮 fanout-events 继续用当前游标（绝不伪造一个进度）；
+       * - 只接受本 root 的响应：旧 root 的迟到响应不得改写新 root 的游标。
+       */
+      const adoptFanoutCursorFromSnapshot = (requestRoot, envelope) => {
+        const cursor = Number.isSafeInteger(envelope?.cursor) && envelope.cursor >= 0 ? envelope.cursor : null;
+        if (cursor === null) return false;
+        if (fanoutCursorRef.current.rootSessionId !== requestRoot) return false;
+        fanoutCursorRef.current = { rootSessionId: requestRoot, cursor: Math.max(fanoutCursorRef.current.cursor, cursor) };
+        return true;
+      };
+      /**
+       * 把事件游标推进到 max(当前, 给定值)（票据 15）：null/非法值表示 Host 没给游标 ⇒ 原地不动，
+       * 绝不伪造一个进度；只接受本 root 的推进（旧 root 的迟到结果不得改写新 root 的游标）。
+       */
+      const advanceFanoutCursor = (nextCursor) => {
+        if (!Number.isSafeInteger(nextCursor) || nextCursor < 0) return false;
+        if (fanoutCursorRef.current.rootSessionId !== rootSessionId) return false;
+        if (nextCursor <= fanoutCursorRef.current.cursor) return false;
+        fanoutCursorRef.current = { rootSessionId, cursor: nextCursor };
+        return true;
+      };
+      const refresh = (refreshOptions) => {
+        // 手动刷新（标题栏的刷新/重试按钮）即使内容完全一致也要提交一次新的更新时间：用户点了
+        // 刷新，界面必须给出「已经刷新过」的可见反馈。自动轮询/通知/尾随刷新绝不走这条分支，
+        // 「内容相等不重渲染」的契约因此逐字不变。
+        const commitManualTimestamp = refreshOptions?.manual === true;
         const refreshState = refreshStateRef.current;
         // 同一组件实例切换 root 时，立即放弃旧请求；旧 Promise 的 finally 通过对象身份检查，
         // 不会清理或触发新 root 的请求。
@@ -3067,12 +4337,18 @@
         if (refreshState.inFlight !== null) {
           // 通知、轮询和手工重试在同一请求期间只合并成一次尾随刷新。
           refreshState.pending = true;
-          return refreshState.inFlight.promise;
+          // merged 标记（票据 15）：这次「刷新」复用的是**别人**在更早时刻发出的快照请求。
+          // 增量轮询据此拒绝推进游标——那份响应可能早于它刚读到的事件，
+          // 推进游标就等于把这段事件当成了已上屏，界面会停在旧数据上直到下一次事件。
+          return refreshState.inFlight.promise.then((outcome) => (typeof outcome === "object" && outcome !== null
+            ? { ...outcome, merged: true }
+            : { ok: false, snapshot: null, merged: true }));
         }
         const requestSequence = ++requestSequenceRef.current;
         if (rootSessionId === "") {
-          setState({ rootSessionId, snapshot: null, loading: false, error: null });
-          return Promise.resolve();
+          setState({ rootSessionId, snapshot: null, updatedAt: null, loading: false, error: null });
+          // 空 root 不是失败：返回成功结果，调度器按「没有任务」进入空闲退避。
+          return Promise.resolve({ ok: true, snapshot: null, skipped: true });
         }
         const controller = typeof globalThis.AbortController === "function" ? new globalThis.AbortController() : null;
         const request = { rootSessionId, requestSequence, controller, promise: null };
@@ -3086,78 +4362,158 @@
             // 同一 root：保留当前快照（尾随刷新绝不清屏）。状态本身没有变化（没有待展示的错误、
             // loading 语义与当前快照一致）时返回原对象 —— React 直接 bail out，2.5s 轮询与
             // 会话通知的空转不再产生任何重渲染。
+            //
+            // 错误清理语义（票据 13）：开始一轮刷新只清 snapshot/rpc 错误（它们会被本次请求的结果
+            // 重新裁决）；**action 错误必须留下**，否则「动作刚失败 → 2.5 秒轮询开始 → 错误被
+            // 无声清掉」会让用户看不到动作失败。它只由下一次动作或手动刷新/重试清除。
             const nextLoading = previous.snapshot === null;
-            if (previous.error === null && previous.loading === nextLoading) return previous;
-            return { rootSessionId, snapshot: previous.snapshot, loading: nextLoading, error: null };
+            const keptError = previous.error !== null && previous.error.source === PANEL_ERROR_SOURCES.action
+              ? previous.error
+              : null;
+            if (previous.error === keptError && previous.loading === nextLoading) return previous;
+            return {
+              rootSessionId,
+              snapshot: previous.snapshot,
+              updatedAt: previous.updatedAt,
+              loading: nextLoading,
+              error: keptError,
+            };
           }
           // 切换 root：用目标 root 的缓存快照顶首屏，缓存未命中仍然是「snapshot=null + loading」
-          // 的 skeleton 语义。缓存按 root 隔离，因此这里绝不会把旧 root 的内容显示到新 root 上。
-          return { rootSessionId, snapshot: cachedBaseline, loading: cachedBaseline === null, error: null };
+          // 的 skeleton 语义。缓存按 root 隔离，因此这里绝不会把旧 root 的内容显示到新 root 上；
+          // 错误与更新时间同样按 root 重建（上一次失败绝不带到新会话的首屏）。
+          return {
+            rootSessionId,
+            snapshot: cachedBaseline === null ? null : cachedBaseline.snapshot,
+            updatedAt: cachedBaseline === null ? null : cachedBaseline.updatedAt,
+            loading: cachedBaseline === null,
+            error: null,
+          };
         });
         const promise = (async () => {
+          // 本次刷新的结果（票据 15/16）：{ ok, snapshot, aborted, stale, reason }。
+          // 刷新本身仍然只负责状态写入与错误语义；结果对象只服务增量轮询的调度器
+          // （失败退避 / 空闲退避 / 运行态判定），不改变任何既有调用方看到的行为。
+          let outcome = { ok: false, snapshot: null, reason: text(refreshOptions?.reason, "refresh") };
           try {
-            const raw = await callRpc(
+            // 用带 select 的调用拿完整 envelope：快照本体之外，Host 若在顶层给出 cursor，
+            // 这里必须能读到它（票据 15 的强制全量路径）。不传 select 的调用方行为逐字不变。
+            const envelope = await callRpc(
               config,
               contextRef.current,
               { action: "expert-group-snapshot", sessionId: rootSessionId },
               controller === null ? {} : { signal: controller.signal },
+              (body) => object(body),
             );
+            // 兼容两种响应形状：Host 的 { ok, snapshot } 信封，或旧替身/旧 Host 直接给快照本体。
+            const raw = envelope.snapshot === undefined || envelope.snapshot === null ? envelope : envelope.snapshot;
             const next = safeNormalize(raw);
             if (next === null) throw new Error("快照格式无效");
-            // 只有当前请求、当前 root 且页面仍挂载时才允许提交，防止旧 surface 的慢响应
-            // 覆盖新会话，同时保证一次尾随刷新不会被旧请求的收尾逻辑吞掉。
-            if (mountedRef.current === true
+            // 提交门禁：只有当前请求、当前 root 且页面仍挂载时才允许写状态/缓存，防止旧 surface
+            // 的慢响应覆盖新会话，同时保证一次尾随刷新不会被旧请求的收尾逻辑吞掉。
+            // 先算出门禁结论再写 outcome：过期响应的 ok 必须是「未提交」（stale），
+            // 否则增量轮询会误以为这次快照成功并推进游标（票据 15 的游标只随成功提交前进）。
+            const current = mountedRef.current === true
               && refreshState.inFlight === request
               && requestSequence === requestSequenceRef.current
-              && rootSessionId === request.rootSessionId) {
+              && rootSessionId === request.rootSessionId;
+            outcome = { ok: true, snapshot: next, stale: current !== true, reason: outcome.reason };
+            if (current) {
               // 只有真正上屏的这份成功快照进缓存：被取消、过期或失败的响应都不写。
               // 写入同时完成 LRU 提权：正在被观察的 root 由它自己的成功拉取保持新鲜
               // （渲染期不再有任何重排，因此提权只能发生在这里）。
-              writeCachedSnapshot(rootSessionId, next);
+              //
+              // 时间戳只在这里取一次（事件路径），并同时写进缓存与状态：标题栏的「更新于」与
+              // 重挂载首屏的缓存时间因此同源，不可能出现两份互相矛盾的时间。
+              const updatedAt = Date.now();
+              writeCachedSnapshot(rootSessionId, next, updatedAt);
+              // 强制全量路径（票据 15）：响应带 cursor 就采纳并重建游标；Host 当前不带，
+              // 则保持当前游标（下一轮 fanout-events 从它继续），绝不伪造一个「已对齐」。
+              adoptFanoutCursorFromSnapshot(rootSessionId, envelope);
               setState((previous) => {
                 // 内容级比较：Host 每次响应都是全新对象（generatedAt 还是新的 Date.now()），
                 // 引用不同但上屏内容深度相等时不产生新状态 —— React 直接 bail out，
                 // 大任务树空闲时每 2.5s 的全树重渲染就此消失。真实变化一定更新，绝不吞掉。
+                //
+                // 错误清理语义（票据 13）：成功快照只清 snapshot/rpc 错误；action 错误保留到
+                // 下一次动作或手动刷新/重试（见 PANEL_ERROR_SOURCES 的说明）。
+                const keptError = previous.error !== null && previous.error.source === PANEL_ERROR_SOURCES.action
+                  ? previous.error
+                  : null;
+                // revision 短路（票据 15）：Host 的顶层 revision 是「除 generatedAt 与 revision 自身之外
+                // 全部内容」的摘要，两份快照 revision 相同就意味着**上屏内容完全相同**。此时直接返回
+                // 原状态对象（保留旧 snapshot 引用、零重渲染），连深比较都不做。
+                //
+                // 与票据 13 的时间语义冲突时的取舍（以不重渲染优先）：revision 相同 ⇒ 不更新 updatedAt，
+                // 「更新于」继续表示「内容最后一次上屏的时刻」——这正是 13 已经写明的既有语义；
+                // 用户想要一次可见的新时间戳，走的是 manual 刷新（下面那一条显式排除它）。
+                // samePanelSnapshot 仍然保留：旧 Host 没有 revision 时由它承担同一职责（逐字段深比较）。
+                const sameRevision = typeof previous.snapshot?.revision === "string"
+                  && typeof next.revision === "string"
+                  && previous.snapshot.revision.length > 0
+                  && previous.snapshot.revision === next.revision;
                 if (previous.rootSessionId === rootSessionId
                   && previous.loading === false
-                  && previous.error === null
-                  && samePanelSnapshot(previous.snapshot, next)) return previous;
-                return { rootSessionId, snapshot: next, loading: false, error: null };
+                  && previous.error === keptError
+                  && (sameRevision || samePanelSnapshot(previous.snapshot, next))
+                  // 手动刷新：内容一致也提交一次新时间戳（等于同一毫秒时仍然 bail out）。
+                  && (commitManualTimestamp !== true || previous.updatedAt === updatedAt)) return previous;
+                return { rootSessionId, snapshot: next, updatedAt, loading: false, error: keptError };
               });
             }
           } catch (error) {
             const aborted = controller?.signal?.aborted === true || error?.name === "AbortError";
-            if (!aborted
-              && mountedRef.current === true
+            const current = mountedRef.current === true
               && refreshState.inFlight === request
               && requestSequence === requestSequenceRef.current
-              && rootSessionId === request.rootSessionId) {
+              && rootSessionId === request.rootSessionId;
+            // 结果对象：取消与旧代次都不算「刷新失败」（调度器据此不退避，见 applyPanelPollCycle）。
+            outcome = { ok: false, snapshot: null, aborted, stale: current !== true, reason: outcome.reason };
+            if (!aborted && current) {
+              // 时间戳在事件路径取一次：setState 的 updater 必须是纯函数（StrictMode 可能调用两次）。
+              const failedAt = Date.now();
               setState((previous) => {
                 // 失败时保留当前 root 的最后有效快照（同实例的当前态，或该 root 的缓存快照），
-                // 只在标题栏给出错误提示与重试入口；缓存未命中时仍是原来的空态语义。
+                // 只在标题栏给出错误提示与重试入口；缓存未命中时仍是原来的空态语义（由渲染层的
+                // 独立错误空态承担，绝不与「暂无任务」同时出现）。
                 // 缓存读取同样在事件路径预先完成（cachedBaseline），updater 保持纯函数。
-                const baseline = previous.rootSessionId === rootSessionId
+                const sameRoot = previous.rootSessionId === rootSessionId;
+                const baseline = sameRoot
                   ? previous.snapshot
-                  : cachedBaseline;
+                  : (cachedBaseline === null ? null : cachedBaseline.snapshot);
+                // 快照请求的失败**永远**归 snapshot 槽：即使底层是传输失败，用户看到的事实仍是
+                // 「任务树没读到」；传输细节只进 title。动作失败因此绝不会被误标成这一类。
                 const message = error instanceof Error ? error.message : String(error);
                 // 同一条错误、同一份快照的重复失败同样不产生新状态：失败横幅已经在上屏，
-                // 每 2.5s 重排一次标题栏没有意义（错误文案变化时才更新）。
-                if (previous.rootSessionId === rootSessionId
-                  && previous.error === message
+                // 每 2.5s 重排一次标题栏没有意义（错误文案变化时才更新；at 因此表示首次出现时间）。
+                if (sameRoot
+                  && previous.error !== null
+                  && previous.error.source === PANEL_ERROR_SOURCES.snapshot
+                  && previous.error.message === message
                   && previous.loading === false
                   && previous.snapshot === baseline) return previous;
-                return { rootSessionId, snapshot: baseline, loading: false, error: message };
+                return {
+                  rootSessionId,
+                  snapshot: baseline,
+                  updatedAt: sameRoot ? previous.updatedAt : (cachedBaseline === null ? null : cachedBaseline.updatedAt),
+                  loading: false,
+                  error: { source: PANEL_ERROR_SOURCES.snapshot, message, at: failedAt },
+                };
               });
             }
           }
-          if (refreshState.inFlight !== request) return;
-          refreshState.inFlight = null;
-          if (refreshState.pending && mountedRef.current === true && refreshState.rootSessionId === rootSessionId) {
-            refreshState.pending = false;
-            void refresh();
-          } else {
-            refreshState.pending = false;
+          // 收尾只由「仍然是当前在途请求」的那一个负责：被取消/被取代的请求绝不清理或触发
+          // 新请求的尾随刷新（与旧实现的早退语义逐字等价，只是这里还要把结果交给调用方）。
+          if (refreshState.inFlight === request) {
+            refreshState.inFlight = null;
+            if (refreshState.pending && mountedRef.current === true && refreshState.rootSessionId === rootSessionId) {
+              refreshState.pending = false;
+              void refresh();
+            } else {
+              refreshState.pending = false;
+            }
           }
+          return outcome;
         })();
         request.promise = promise;
         return promise;
@@ -3172,6 +4528,165 @@
        */
       const refreshRef = typeof react.useRef === "function" ? react.useRef(refresh) : { current: refresh };
       refreshRef.current = refresh;
+      /**
+       * 当前挂载对应的轮询调度器（票据 16）：{ timer, delay, paused, detached, failureCount,
+       * idleLevel, running, lastCycleId, activityKey }。effect 每次重建（root/session 变化）都换新对象，
+       * 旧对象在 cleanup 里 detached，任何迟到回调据此拒绝再排定时器或写状态。
+       *
+       * 读源码时注意：文中其它位置出现的「2.5 秒轮询」指**运行态的节奏**（有任务在跑）；
+       * 空闲阶梯退避、失败退避与隐藏/非活跃暂停都由 PANEL_POLL_TIMINGS 与本调度器统一决定。
+       */
+      const panelSchedulerRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      /** 一轮增量同步的结果是否仍属于当前 surface（挂载中 + 同一 root/session + 同一 surface 令牌）。 */
+      const pollSurfaceStillCurrent = () => sidebarSurfaceStillCurrent();
+
+      /**
+       * 一轮增量同步（票据 15）：先读 fanout-events，只有确实有事件/缺口时才拉整棵快照。
+       *
+       * 分支与语义：
+       * - 无事件且无缺口 ⇒ outcome "none"：**不请求** expert-group-snapshot、不写任何状态、
+       *   不产生重渲染（这是本轮修复的核心：空闲时不再每 2.5 秒重传整棵树）；
+       * - 有事件 ⇒ 拉一次全量快照（事件只是「有变化」的证据，内容仍以快照为准）；
+       * - gap / 游标过旧（事件已被裁剪）⇒ 拉一次全量快照，并以响应的 cursor 重建游标；
+       * - 响应不可判定（旧 Host 没有 fanout-events、或替身对任何 action 都回同一份载荷）⇒
+       *   降级为既有全量语义：宁可多拉一次，也绝不把「读不到」当成「没有变化」；
+       * - 读面失败/取消/旧代次 ⇒ 不推进游标、不写状态、不计失败（失败由随后的快照请求裁决）。
+       *
+       * 返回 { id, outcome, ok, cancelled, snapshot }：id 用于让调度器对同一轮只记账一次。
+       */
+      const pollOnce = async (request) => {
+        const nextId = () => {
+          pollCycleSequenceRef.current += 1;
+          return pollCycleSequenceRef.current;
+        };
+        const cancelledCycle = (outcome) => ({ id: nextId(), outcome, ok: false, cancelled: true, snapshot: null });
+        // 两条「必须强制全量」的既有语义，都优先于事件探测：
+        // 1. 轻量快照（partial）：Host 的 partial 只在冷读时出现，若因为「没有新事件」跳过快照，
+        //    partial 可能永远停在界面上（票据 13 的升级语义会回归）；
+        // 2. 上一轮快照读取失败：事件读面健康（无事件）不能让快照失败永久挂起，失败必须被重试到成功。
+        const partialBaseline = latestSnapshotRef.current !== null && latestSnapshotRef.current?.partial === true;
+        const lastSnapshotError = latestPanelErrorRef.current;
+        const retryAfterFailure = lastSnapshotError !== null
+          && lastSnapshotError !== undefined
+          && lastSnapshotError.source === PANEL_ERROR_SOURCES.snapshot;
+        if (partialBaseline || retryAfterFailure) {
+          const full = (await refresh({ reason: partialBaseline ? "partial" : "retry" })) ?? {};
+          return {
+            id: nextId(),
+            outcome: partialBaseline ? "partial" : "retry",
+            ok: full.ok === true,
+            cancelled: full.aborted === true || full.stale === true,
+            snapshot: full.snapshot ?? null,
+          };
+        }
+        const cursorBefore = fanoutCursorRef.current.rootSessionId === rootSessionId ? fanoutCursorRef.current.cursor : 0;
+        let batch = null;
+        try {
+          const response = await callRpc(
+            config,
+            contextRef.current,
+            { action: "fanout-events", sessionId: rootSessionId, after: cursorBefore },
+            request.controller === null ? {} : { signal: request.controller.signal },
+          );
+          batch = readFanoutEventBatch(response);
+        } catch (error) {
+          const aborted = request.controller?.signal?.aborted === true || error?.name === "AbortError";
+          // 取消/旧代次：这一轮作废，绝不推进游标、也绝不当成「没有变化」。
+          if (aborted) return cancelledCycle("cancelled");
+          // 读面不可用：降级为全量快照（旧 Host 语义），不写错误横幅。
+          batch = null;
+        }
+        if (!pollSurfaceStillCurrent()) return cancelledCycle("stale");
+        if (batch !== null && batch.conclusive) {
+          if (fanoutBatchIsStale(batch, cursorBefore)) {
+            // gap / 游标过旧：事件已经永久缺失，只能整棵重拉。
+            const full = (await refresh({ reason: "gap" })) ?? {};
+            // 只有全量**成功**后才以响应 cursor 重建游标：失败/取消时保留旧游标，下一轮重读同一段。
+            // 否则一次失败的 gap 恢复会把这段事件当成「已处理」，界面就永久停在旧数据上。
+            if (full.ok === true && full.stale !== true && full.merged !== true) advanceFanoutCursor(batch.cursor);
+            return {
+              id: nextId(),
+              outcome: "gap",
+              ok: full.ok === true,
+              cancelled: full.aborted === true || full.stale === true,
+              snapshot: full.snapshot ?? null,
+            };
+          }
+          if (batch.events.length > 0) {
+            const full = (await refresh({ reason: "events" })) ?? {};
+            // 同上：快照没成功就不推进游标，这些事件下一轮还会被重读。
+            if (full.ok === true && full.stale !== true && full.merged !== true) advanceFanoutCursor(batch.cursor);
+            return {
+              id: nextId(),
+              outcome: "events",
+              ok: full.ok === true,
+              cancelled: full.aborted === true || full.stale === true,
+              snapshot: full.snapshot ?? null,
+            };
+          }
+          // 无事件且无缺口：整棵树一定没有变化 —— 不拉快照、不写状态、不重渲染。
+          // 这里推进游标是安全的：Host 明确回答「游标之后什么都没有」，不存在待处理的区间。
+          advanceFanoutCursor(batch.cursor);
+          return { id: nextId(), outcome: "none", ok: true, cancelled: false, snapshot: null };
+        }
+        // 不可判定（缺 events 数组 / 读面失败）：全量降级。
+        const fallback = (await refresh({ reason: "events-unavailable" })) ?? {};
+        return {
+          id: nextId(),
+          outcome: "fallback",
+          ok: fallback.ok === true,
+          cancelled: fallback.aborted === true || fallback.stale === true,
+          snapshot: fallback.snapshot ?? null,
+        };
+      };
+
+      /**
+       * 跑一轮（含尾随）增量同步：单飞 + 一次尾随，与 refresh 的 pending 语义同构。
+       *
+       * 在途期间到来的轮询只记一次 pending；结算后立刻补跑**一轮**，绝不并发堆请求。
+       * 结果对象带回给调度器记账（失败退避 / 空闲退避 / 运行态判定）。
+       */
+      const runPollCycle = () => {
+        const state = pollSyncStateRef.current;
+        if (state.rootSessionId !== rootSessionId) {
+          // 切换 root：旧 root 的在途轮询立刻取消，尾随标记清零（旧结果绝不写回新 surface）。
+          state.inFlight?.controller?.abort?.();
+          state.inFlight = null;
+          state.pending = false;
+          state.rootSessionId = rootSessionId;
+        }
+        if (state.inFlight !== null) {
+          state.pending = true;
+          return state.inFlight.promise;
+        }
+        const request = {
+          rootSessionId,
+          controller: typeof globalThis.AbortController === "function" ? new globalThis.AbortController() : null,
+          promise: null,
+        };
+        state.inFlight = request;
+        const promise = (async () => {
+          let cycle = null;
+          try {
+            cycle = await pollOnce(request);
+            while (state.pending && state.inFlight === request && pollSurfaceStillCurrent()) {
+              state.pending = false;
+              cycle = await pollOnce(request);
+            }
+          } catch {
+            // pollOnce 内部已把 RPC 失败降级为全量；万一仍抛错，按一次失败收口，
+            // 绝不让调度器停在「以为还有一轮在途」的状态。
+            pollCycleSequenceRef.current += 1;
+            cycle = { id: pollCycleSequenceRef.current, outcome: "error", ok: false, cancelled: false, snapshot: null };
+          } finally {
+            if (state.inFlight === request) state.inFlight = null;
+            state.pending = false;
+          }
+          return cycle;
+        })();
+        request.promise = promise;
+        return promise;
+      };
       /**
        * 子代理侧栏打开状态：复合键（sessionId + rootSessionId + 资源地址）→
        * { sessionId, rootSessionId, tabId, title, misses, origin }。
@@ -3340,26 +4855,113 @@
             bump((value) => value + 1);
             void refresh();
           });
-          const poll = () => {
+          const documentRef = globalThis.document;
+          /**
+           * 可暂停 / 可退避的轮询调度器（票据 16）。
+           *
+           * 字段语义：
+           * - timer：当前 setInterval 句柄；每一轮结算后按新延迟**重排**（单一在途定时器）；
+           * - delay：下一轮的间隔，由 panelNextPollDelayMs 统一计算（失败优先，其次运行态/空闲档）；
+           * - paused：隐藏 / 非活跃导致的暂停；暂停期间没有任何定时器；
+           * - detached：effect 已卸载；任何迟到回调据此拒绝再排定时器或写状态；
+           * - failureCount / idleLevel：失败退避与空闲退避两条正交的记分轴；
+           * - lastCycleId：已经记账过的轮次序号（同一轮被多个 tick 观察到时只记一次）；
+           * - activityKey：最近一次渲染观察到的 tab 活跃度（active / inactive / unknown）。
+           */
+          const scheduler = {
+            timer: null,
+            delay: PANEL_POLL_TIMINGS.activeMs,
+            paused: false,
+            detached: false,
+            failureCount: 0,
+            idleLevel: 0,
+            running: true,
+            lastCycleId: 0,
+            activityKey: tabActivityKey,
+          };
+          /** 文档可见性：读面抛错按可见处理（旧实现的降级语义逐字保留）。 */
+          const readDocumentHidden = () => {
+            try { return documentRef?.hidden === true; } catch { return false; }
+          };
+          const clearSchedulerTimer = () => {
+            if (scheduler.timer === null) return;
+            // 句柄由所在环境的 setInterval 生成，必须用同一环境的 clearInterval 释放。
+            if (typeof globalThis.clearInterval === "function") {
+              try { globalThis.clearInterval(scheduler.timer); } catch { /* 清理失败不影响渲染。 */ }
+            }
+            scheduler.timer = null;
+          };
+          const armScheduler = () => {
+            clearSchedulerTimer();
+            if (scheduler.detached === true || scheduler.paused === true) return;
+            if (typeof globalThis.setInterval !== "function") return;
+            try { scheduler.timer = globalThis.setInterval(runScheduledPoll, scheduler.delay); } catch { scheduler.timer = null; }
+          };
+          const pauseScheduler = () => {
+            if (scheduler.paused === true) { clearSchedulerTimer(); return; }
+            scheduler.paused = true;
+            // 暂停即停表：隐藏/非活跃期间不再产生任何轮询请求（旧实现只是在下一次 tick 里跳过）。
+            clearSchedulerTimer();
+          };
+          const resumeScheduler = (refreshImmediately) => {
+            if (scheduler.detached === true) return;
+            scheduler.paused = false;
+            // 暂停期间不积累失败/空闲档：恢复后回到运行态节奏（并由调用方立刻刷新一次）。
+            scheduler.failureCount = 0;
+            scheduler.idleLevel = 0;
+            scheduler.delay = panelNextPollDelayMs(scheduler);
+            // 文档仍然隐藏时不排表也不刷新：可见性真正恢复时 onVisibilityChange 会再调一次本函数。
+            if (readDocumentHidden()) { clearSchedulerTimer(); return; }
+            armScheduler();
+            if (refreshImmediately === true) void refresh();
+          };
+          scheduler.pause = pauseScheduler;
+          scheduler.resume = resumeScheduler;
+          /**
+           * 本轮轮询是否应该暂停：文档隐藏或所在 tab 非活跃。
+           *
+           * 活跃度未知（宿主没有明确 active 字段）时**不**暂停：生产退回文档可见性这一既有判据，
+           * 绝不凭「读不到活跃度」把正常观察停掉。
+           */
+          const pollSurfaceBlocked = () => {
+            if (readDocumentHidden()) return "hidden";
+            if (scheduler.activityKey === "inactive") return "inactive";
+            return null;
+          };
+          const runScheduledPoll = () => {
             // 右栏 tab 的外部关闭同步先跑：它不依赖页面可见性（隐藏标签页里用户也可能在别处关掉
             // 这个 tab），且没有任何打开记录时立刻返回，不触碰 DOM。
             sidebarTabSyncRef.current?.();
-            try {
-              if (globalThis.document?.hidden === true) return;
-            } catch { /* 某些宿主 document 代理读取 hidden 会抛错，按可见处理。 */ }
-            void refresh();
+            if (pollSurfaceBlocked() !== null) {
+              // 隐藏 / 非活跃：立刻停表（回到前台或重新活跃时由 visibilitychange / 活跃度 effect 唤醒）。
+              pauseScheduler();
+              return;
+            }
+            // 刻意**不** await 整轮同步（与旧 poll 的「发起即返回」语义一致）：结算在后台链路里完成，
+            // 记账后按新的延迟重排下一轮。tick 只负责发起（测试用 await intervals.tick() 观察同样成立）。
+            void runPollCycle().then((cycle) => {
+              if (scheduler.detached === true || panelSchedulerRef.current !== scheduler) return;
+              applyPanelPollCycle(scheduler, cycle, latestSnapshotRef.current);
+              armScheduler();
+            });
           };
-          const timer = typeof globalThis.setInterval === "function" ? globalThis.setInterval(poll, 2500) : null;
-          const documentRef = globalThis.document;
           const onVisibilityChange = () => {
             try {
               if (documentRef?.hidden !== true) {
-                void refresh();
+                // 回到前台：立即刷新一次并恢复调度（票据 16）。
+                resumeScheduler(true);
                 // 回到前台时补一次同步：后台期间 MutationObserver 可能被浏览器节流。
                 sidebarTabSyncRef.current?.();
+              } else {
+                // 隐藏：立刻暂停，不再排任何轮询。
+                pauseScheduler();
               }
             } catch { /* 可见性通知只是加速恢复，读取失败不影响轮询。 */ }
           };
+          panelSchedulerRef.current = scheduler;
+          // 挂载时按当前可见性/活跃度决定是否排表：不可见/非活跃就保持暂停（恢复时立即刷新一次）。
+          if (pollSurfaceBlocked() !== null) pauseScheduler();
+          else armScheduler();
           try { documentRef?.addEventListener?.("visibilitychange", onVisibilityChange); } catch { /* 可选 API。 */ }
           // 挂载（或切换 root 后重挂载）时立刻对齐一次：记录可能来自同一个 root 的上一个实例。
           sidebarTabSyncRef.current?.();
@@ -3369,8 +4971,9 @@
            * 观察面固定为 document.body 子树而不是面板节点：右栏面板会迟到挂载（展开后才出现）、
            * 也会被宿主按 surface 整体重挂载，盯住具体节点会在重挂载后失联；而回调本身在没有任何
            * 打开记录时立即返回，空闲时（绝大多数时间）连一次 DOM 查询都不会发生。
-           * 没有 MutationObserver / 没有 document.body / observe 抛错时静默降级为「只靠既有
-           * 2.5 秒轮询与 visibilitychange 兜底」，绝不因为观察器缺失影响面板渲染。
+           * 没有 MutationObserver / 没有 document.body / observe 抛错时静默降级为「只靠既有的
+           * 自适应轮询（运行态 2.5s / 空闲退避 / 隐藏与非活跃暂停）与 visibilitychange 兜底」，
+           * 绝不因为观察器缺失影响面板渲染。
            */
                      let unsubscribeOpenTabs = null;
            try {
@@ -3405,19 +5008,47 @@
               try { cancelSidebarSplit.call(config, splitIntent.token, { reason: "unmount" }); } catch { /* 事务收口失败不能阻断卸载。 */ }
             }
             requestSequenceRef.current += 1;
+            // 轮询调度器与增量同步一起停：先标记 detached，任何迟到回调都不会再排定时器或写状态。
+            scheduler.detached = true;
+            clearSchedulerTimer();
+            if (panelSchedulerRef.current === scheduler) panelSchedulerRef.current = null;
+            const pollState = pollSyncStateRef.current;
+            pollState.pending = false;
+            pollState.inFlight?.controller?.abort?.();
+            pollState.inFlight = null;
             refreshState.pending = false;
             refreshState.inFlight?.controller?.abort?.();
             refreshState.inFlight = null;
             if (typeof unsubscribe === "function") unsubscribe();
              if (typeof unsubscribeOpenTabs === "function") unsubscribeOpenTabs();
-            if (timer !== null && typeof globalThis.clearInterval === "function") globalThis.clearInterval(timer);
             try { documentRef?.removeEventListener?.("visibilitychange", onVisibilityChange); } catch { /* 可选 API。 */ }
             // 观察器必须与本次挂载同生共死：留一个仍在观察 body 的 observer 就是长期泄漏。
             try { tabObserver?.disconnect?.(); } catch { /* 可选 API。 */ }
           };
         }, [rootSessionId, sidebarSessionId]);
       }
-      const navigation = getOpenSession(config, contextRef.current);
+      /**
+       * tab 活跃度变化（票据 16）：非活跃暂停轮询，重新活跃立即刷新。
+       *
+       * 为什么是独立 effect 而不是挂载 effect 的依赖项：活跃度变化只应改变**调度状态**，
+       * 绝不该像切换 root 那样重建整条挂载链路（那会释放手柄锁、取消分栏事务、重建观察器）。
+       * 这里只在值真的变化时动手：首次挂载时调度器已经按当前结论排过表
+       * （scheduler.activityKey 与当前值相等 ⇒ no-op），所以挂载不会重复刷新。
+       */
+      if (typeof react.useEffect === "function") {
+        react.useEffect(() => {
+          const scheduler = panelSchedulerRef.current;
+          if (scheduler === null || scheduler.detached === true) return;
+          if (scheduler.activityKey === tabActivityKey) return;
+          scheduler.activityKey = tabActivityKey;
+          if (tabActivityKey === "inactive") {
+            scheduler.pause?.();
+            return;
+          }
+          // active：立即刷新一次并恢复调度；unknown：退回文档可见性判定，只恢复排表。
+          scheduler.resume?.(tabActivityKey === "active");
+        }, [tabActivityKey]);
+      }      const navigation = getOpenSession(config, contextRef.current);
       /**
        * 导航与侧栏动作依赖的可选服务（每个渲染帧解析一次，成本是可忽略的属性读取）。
        *
@@ -3547,6 +5178,23 @@
        */
       const partialSnapshot = snapshot?.partial === true;
       /**
+       * 票据 25：快照里第一次出现用量事实时，懒加载一次 meta（单价/全局用量）。
+       *
+       * 为什么按需而不是挂载即读：既有契约把「挂载只发一次首屏快照」写进了请求计数测试，
+       * 诊断是旁路读面，绝不能改变轮询节奏；而没有用量时也不需要单价。
+       * 每个 root 最多触发一次（metaAutoAttemptRef），失败不重试、不写错误槽。
+       */
+      const usageFactPresent = snapshot === null ? false : snapshotHasUsageFact(snapshot);
+      if (typeof react.useEffect === "function") {
+        react.useEffect(() => {
+          if (usageFactPresent !== true) return;
+          if (metaStateRef.current !== null) return;
+          if (metaAutoAttemptRef.current === rootSessionId) return;
+          metaAutoAttemptRef.current = rootSessionId;
+          void loadMeta();
+        }, [usageFactPresent, rootSessionId]);
+      }
+      /**
        * 容器（空闲分组）在轻量快照下使用的中性运行状态：取值与模型导出的
        * UNKNOWN_RUNTIME_STATUS 同源，模型缺失时按同名字面量兜底，避免两处各存一份词表。
        */
@@ -3565,7 +5213,20 @@
              && previous.snapshot !== snapshot) sidebarTabSyncRef.current?.();
          }, [rootSessionId, sidebarSessionId, snapshot]);
        }
-      const retry = () => { void refresh(); };
+      /**
+       * 标题栏的**手动刷新 / 重试**入口（票据 13：常驻刷新按钮）。
+       *
+       * 与自动轮询的区别只有一处：手动刷新是用户的显式推进，因此它先清掉当前 surface 的
+       * **所有**错误（含只允许由动作或手动操作清除的 action 错误），再发起刷新——用户点了刷新
+       * 却还看到上一条错误，会以为这次点击没有生效；同时它带 manual 标记，让内容完全一致时
+       * 也提交一次新的「更新于」时间（自动轮询绝不会这样）。
+       */
+      const retry = () => {
+        setState((previous) => (previous.rootSessionId === rootSessionId && previous.error !== null
+          ? { ...previous, error: null }
+          : previous));
+        void refresh({ manual: true });
+      };
       const expand = (node) => store ? store.isExpanded(node) : (node?.kind === "root" || (typeof model.defaultExpanded === "function" && model.defaultExpanded(node)));
       const toggle = (node) => {
         if (store) store.toggle(node);
@@ -6952,10 +8613,433 @@
         makeIcon(primitives, arrowIcon, { size: 20, className: "deg_expert_group_double_arrow_icon", "aria-hidden": true })));
       };
 
-      const renderChevron = (node, open) => react.createElement("button", {
-        type: "button", className: "deg_expert_group_chevron", title: open ? "折叠" : "展开",
-        "aria-label": open ? "折叠" : "展开", "aria-expanded": open, onClick: (event) => { event?.stopPropagation?.(); toggle(node); },
-      }, makeIcon(primitives, open ? "IconChevronDownOutlineRegular" : "IconChevronRightOutlineRegular", { size: 14 }));
+      const renderChevron = (node, open) => {
+        // 折叠/展开文案走消息表（票据 19）：title 与 aria-label 同源，en 宿主下不再中文硬编码。
+        const label = open ? t("sidebar.collapse") : t("sidebar.expand");
+        return react.createElement("button", {
+          type: "button", className: "deg_expert_group_chevron", title: label,
+          "aria-label": label, "aria-expanded": open, onClick: (event) => { event?.stopPropagation?.(); toggle(node); },
+        }, makeIcon(primitives, open ? "IconChevronDownOutlineRegular" : "IconChevronRightOutlineRegular", { size: 14 }));
+      };
+
+      /**
+       * 票据 12 的时间线渲染助手（任务时间线条 / attempt 时间线 / 失败摘要）。
+       *
+       * 所有格式化、脱敏、截断与排序都走模型层纯函数（可单测、Host/客户端同一契约）。
+       * 模型版本较旧（缺函数）时这些块整体降级为不渲染——绝不在这里复制一份算法，
+       * 否则 Host 契约一变就会出现两份互相漂移的上限/阈值。
+       *
+       * 两个边界：
+       * - 时间线只读：唯一的交互是「查看全部/收起」切换展示条数，绝不发动作 RPC；
+       * - 失败摘要只在失败语义状态展示：重试后已成功的分片不把历史错误继续挂在行上
+       *   （历史错误仍可在展开的时间线里看到）。
+       */
+      const modelFunction = (name) => {
+        const api = modelApi();
+        return api !== null && api !== undefined && typeof api[name] === "function" ? api[name] : null;
+      };
+      const finiteNumber = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
+      const formatDurationText = (value) => {
+        const fn = modelFunction("formatDuration");
+        return fn === null ? null : fn(value);
+      };
+      const formatClockText = (value) => {
+        const fn = modelFunction("formatClockTime");
+        return fn === null ? null : fn(value);
+      };
+      const formatIsoText = (value) => {
+        const fn = modelFunction("formatIsoTime");
+        return fn === null ? null : fn(value);
+      };
+      const failureSummaryText = (value) => {
+        const fn = modelFunction("formatFailureSummary");
+        return fn === null ? null : fn(value);
+      };
+      const isFailureStatusOf = (status) => {
+        const fn = modelFunction("isFailureStatus");
+        return fn === null ? ["failed", "timed_out", "interrupted"].includes(status) : fn(status) === true;
+      };
+      const retryWarningThreshold = () => {
+        const value = modelApi()?.RETRY_WARNING_THRESHOLD;
+        return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 3;
+      };
+      /**
+       * 角色显示名（票据 27）：节点 roleLabel → snapshot.roleLabels → meta.roleLabels → 角色 id。
+       *
+       * snapshot 与 meta 的合并只在这里发生一次（snapshot 优先），因此筛选下拉、元数据行与
+       * 派发表单看到的是同一份显示名，且**绝不按静态内置角色表过滤**（自定义角色同源）。
+       */
+      const mergedRoleLabels = (() => {
+        const sources = [
+          snapshot === null || snapshot === undefined ? null : object(snapshot.roleLabels),
+          meta === null ? null : object(meta.roleLabels),
+        ];
+        const merged = {};
+        let any = false;
+        for (const source of sources) {
+          if (source === null) continue;
+          for (const key of Object.keys(source)) {
+            if (merged[key] !== undefined) continue;
+            const label = text(source[key], null);
+            if (label === null) continue;
+            merged[key] = label;
+            any = true;
+          }
+        }
+        return any ? merged : null;
+      })();
+      const roleLabelFromMap = (role, labels) => {
+        const api = modelApi();
+        return typeof api?.roleLabelFrom === "function" ? api.roleLabelFrom(role, labels) : null;
+      };
+      const roleLabelFor = (role, nodeLabel) => text(nodeLabel, null)
+        ?? roleLabelFromMap(role, mergedRoleLabels)
+        ?? text(role, null);
+
+      // ── 票据 25 / 30：用量与结构化结果的渲染助手 ─────────────────────────────
+      const finiteToken = (value) => finiteNumber(value);
+      const tokenText = (value) => {
+        const api = modelApi();
+        return typeof api?.formatTokenCount === "function" ? api.formatTokenCount(value) : null;
+      };
+      const usageOf = (node) => {
+        const api = modelApi();
+        if (typeof api?.normalizeUsage !== "function") return null;
+        return api.normalizeUsage(object(node).usage);
+      };
+      const findPriceOf = (provider, modelId) => {
+        const api = modelApi();
+        if (meta === null || typeof api?.findModelPrice !== "function") return null;
+        return api.findModelPrice(meta.modelPrices, provider, modelId);
+      };
+      const estimateCostOf = (usage, provider, modelId) => {
+        const api = modelApi();
+        if (typeof api?.estimateUsageCost !== "function") return null;
+        return api.estimateUsageCost(usage, findPriceOf(provider, modelId));
+      };
+      const formatCost = (value) => {
+        const amount = finiteNumber(value);
+        if (amount === null) return null;
+        if (amount === 0) return "0";
+        if (amount < 0.000001) return amount.toExponential(2);
+        return amount >= 0.01 ? amount.toFixed(4) : amount.toFixed(6);
+      };
+      /** 完整用量 tooltip（有界）：只列已知项，缺失不补 0。 */
+      const usageTitleOf = (usage) => {
+        const source = usage;
+        if (source === null) return "用量：—";
+        const parts = [];
+        const tokens = [["inputTokens", "输入"], ["outputTokens", "输出"], ["cacheReadTokens", "缓存读"], ["cacheWriteTokens", "缓存写"], ["reasoningTokens", "推理"]];
+        for (const [field, label] of tokens) {
+          const value = finiteToken(source[field]);
+          if (value !== null) parts.push(label + " " + value);
+        }
+        for (const [field, label] of [["requests", "请求"], ["retries", "重试"], ["fallbacks", "降级"]]) {
+          const value = finiteToken(source[field]);
+          if (value !== null) parts.push(label + " " + value);
+        }
+        const duration = formatDurationText(source.runMs);
+        if (duration !== null) parts.push("运行时长 " + duration);
+        return parts.length === 0 ? "用量：—" : "用量：" + parts.join(" · ");
+      };
+      /**
+       * 任务/专家/分片行的紧凑用量（票据 25）：有界 token 数 + 请求数。
+       * 没有任何用量事实时只显示「用量 —」，绝不把缺失显示成 0。
+       */
+      const renderUsageBadge = (value, options) => {
+        const usage = usageOf({ usage: value });
+        const kind = text(object(options).kind, "expert");
+        if (usage === null) {
+          return react.createElement("span", {
+            key: "usage",
+            className: "deg_expert_group_usage",
+            "data-usage": "missing",
+            "data-kind": kind,
+            title: "用量：—",
+          }, "用量 —");
+        }
+        const tokens = finiteToken(usage.totalTokens) ?? finiteToken(usage.inputTokens);
+        const requests = finiteToken(usage.requests);
+        return react.createElement("span", {
+          key: "usage",
+          className: "deg_expert_group_usage",
+          "data-usage": "present",
+          "data-kind": kind,
+          title: usageTitleOf(usage),
+        }, "tok " + (tokenText(tokens) ?? "—") + " · 请求 " + (requests === null ? "—" : String(requests)));
+      };
+      /**
+       * attempt 详情（票据 25）：input/output/cache/reasoning tokens 与 requests/retries/fallbacks/runMs，
+       * 以及按 meta.modelPrices 计算的估算成本；缺失字段显示「—」，无单价显示「未配置单价，不估算」。
+       */
+      const renderAttemptUsage = (entry, options) => {
+        const source = object(entry);
+        const usage = usageOf(source);
+        const fallbackProvider = text(object(options).provider, null);
+        const fallbackModel = text(object(options).model, null);
+        const value = (field) => (usage === null ? null : finiteToken(usage[field]));
+        const pairs = [
+          ["输入", value("inputTokens")],
+          ["输出", value("outputTokens")],
+          ["缓存读", value("cacheReadTokens")],
+          ["缓存写", value("cacheWriteTokens")],
+          ["推理", value("reasoningTokens")],
+        ].map(([label, raw]) => label + " " + (raw === null ? "—" : String(raw)));
+        pairs.push("请求 " + (value("requests") === null ? "—" : String(value("requests"))));
+        pairs.push("重试 " + (value("retries") === null ? "—" : String(value("retries"))));
+        pairs.push("降级 " + (value("fallbacks") === null ? "—" : String(value("fallbacks"))));
+        pairs.push("运行时长 " + (formatDurationText(value("runMs")) ?? "—"));
+        // 单价按 usage 自带的 provider/model 匹配；缺失时回退所属分片/任务（同一角色同一模型）。
+        const provider = (usage === null ? null : text(usage.provider, null)) ?? fallbackProvider;
+        const modelId = (usage === null ? null : text(usage.model, null)) ?? fallbackModel;
+        const price = findPriceOf(provider, modelId);
+        let costText = "估算成本：未配置单价，不估算";
+        let currency = null;
+        const cost = usage === null ? null : estimateCostOf(usage, provider, modelId);
+        if (price !== null && cost !== null) {
+          currency = cost.currency;
+          costText = "估算成本 ≈ " + (formatCost(cost.totalCost) ?? "—") + " " + cost.currency + "（按每百万 token 单价估算）";
+        } else if (price !== null) {
+          costText = "估算成本：—（缺少计费 token）";
+        }
+        return react.createElement("div", {
+          className: "deg_expert_group_attempt_usage",
+          "data-cost-currency": currency === undefined ? undefined : currency,
+          title: (usage === null ? "用量：—" : usageTitleOf(usage)) + " · " + costText,
+        },
+        react.createElement("span", { className: "deg_expert_group_attempt_usage_tokens" }, pairs.join(" · ")),
+        react.createElement("span", { className: "deg_expert_group_attempt_cost", "data-cost-configured": price === null ? "false" : "true" }, costText));
+      };
+      /**
+       * 结构化结果区（票据 30）：有 value 时有界 JSON 预览（超长截断并提示），回退时显示稳定原因；
+       * 绝不显示 schema 原文（Host 本来就不投影它），也不改变既有文本总结的展示。
+       */
+      const renderStructuredBlock = (value, requested, options) => {
+        const api = modelApi();
+        const preview = typeof api?.structuredPreviewOf === "function" ? api.structuredPreviewOf(value) : null;
+        const asked = requested === true;
+        if (preview === null && asked !== true) return null;
+        const kind = text(object(options).kind, "expert");
+        let textValue = "结构化结果：尚未返回（已请求输出契约）";
+        let fallback = false;
+        let truncated = false;
+        let reason = null;
+        if (preview !== null) {
+          if (preview.text !== null) {
+            textValue = "结构化结果：" + preview.text + (preview.truncated === true ? " …（预览已截断）" : "");
+            truncated = preview.truncated === true;
+          } else {
+            fallback = true;
+            reason = text(preview.reason, "result_unavailable");
+            const reasonText = typeof api?.structuredFallbackText === "function"
+              ? api.structuredFallbackText(reason)
+              : "结构化结果不可用";
+            textValue = "结构化结果回退：" + reasonText + "（" + reason + "）";
+          }
+        }
+        return react.createElement("div", {
+          className: "deg_expert_group_structured",
+          "data-kind": kind,
+          "data-fallback": fallback ? "true" : undefined,
+          "data-reason": reason === null ? undefined : reason,
+          "data-truncated": truncated ? "true" : undefined,
+          // role=status 让回退/截断对辅助技术可见；完整预览仍受 title 的 400 字符上限约束。
+          role: "status",
+          title: textValue.length > 400 ? textValue.slice(0, 400) + "…" : textValue,
+        }, textValue);
+      };
+      const renderFailureSummary = (failure) => {
+        const summary = failureSummaryText(failure);
+        if (summary === null) return null;
+        const content = summary.message === null ? summary.code : summary.code + " · " + summary.message;
+        return react.createElement("span", {
+          key: "failure",
+          className: "deg_expert_group_failure",
+          "data-failure-code": summary.code,
+          role: "status",
+          title: content,
+        }, content);
+      };
+      /**
+       * 任务行的紧凑时间信息：开始时间 / 耗时 / 重试次数 / 最近活动 / 多次重试徽标 / 失败摘要。
+       *
+       * 字段全部来自 Host 投影（会话节点只有 startedAt/lastActivityAt；fanout/shard 另有
+       * attemptCount/retryCount/failure）。缺失的片段直接省略，不用「—」把每一行都填满占位；
+       * 只有时间线项在耗时与时间都缺失时才退化为「—」，避免出现空白的列表项。
+       */
+      const renderMetrics = (node, options = {}) => {
+        const source = object(node);
+        const status = statusOf(source);
+        const kind = text(options.kind, text(source.kind, "expert"));
+        const segments = [];
+        const pushSegment = (key, textValue, titleValue) => {
+          if (segments.length > 0) {
+            segments.push(react.createElement("span", {
+              key: key + "-separator",
+              className: "deg_expert_group_metrics_separator",
+              "aria-hidden": "true",
+            }, "·"));
+          }
+          segments.push(react.createElement("span", {
+            key,
+            className: "deg_expert_group_metrics_part",
+            title: typeof titleValue === "string" ? titleValue : textValue,
+          }, textValue));
+        };
+        const startedAt = finiteNumber(source.startedAt);
+        const startedClock = formatClockText(startedAt);
+        if (startedClock !== null) pushSegment("started", "开始 " + startedClock, formatIsoText(startedAt) ?? ("开始 " + startedClock));
+        const durationText = formatDurationText(source.durationMs);
+        if (durationText !== null) pushSegment("duration", "耗时 " + durationText);
+        const retryCount = finiteNumber(source.retryCount);
+        if (retryCount !== null) pushSegment("retry", "重试 " + retryCount + " 次", "已重试 " + retryCount + " 次");
+        const lastActivityAt = finiteNumber(source.lastActivityAt);
+        const lastActivityClock = formatClockText(lastActivityAt);
+        if (lastActivityClock !== null) pushSegment("activity", "最近活动 " + lastActivityClock, formatIsoText(lastActivityAt) ?? ("最近活动 " + lastActivityClock));
+        const retryWarning = retryCount !== null && retryCount >= retryWarningThreshold()
+          ? react.createElement("span", {
+            key: "retry-warning",
+            className: "deg_expert_group_retry_warning",
+            "data-retry-warning": "true",
+            role: "status",
+            // 不写「接近尝试上限」：Host 不发布 maxAttempts，我们没有可证明的上限。
+            title: "已重试 " + retryCount + " 次",
+          }, "多次重试")
+          : null;
+        const failure = isFailureStatusOf(status) ? renderFailureSummary(source.failure) : null;
+        // 票据 25：任务/专家/分片行必须有界的 token 数与请求数；缺失显示「—」而不是省略
+        // （用户需要区分「没有用量」与「还没读到」）。用量段独立于时间片段：时间信息缺失
+        // 时它仍然渲染，因此这里不再有「整块返回 null」的分支。
+        const usageBadge = renderUsageBadge(source.usage, { kind });
+        return react.createElement("div", {
+          className: "deg_expert_group_metrics",
+          "data-metrics-kind": kind,
+          role: "group",
+          "aria-label": "任务时间信息",
+        }, ...segments, usageBadge, retryWarning, failure);
+      };
+      /**
+       * attempt 时间线（只读）：默认最近 N 条，可切换「查看全部 / 收起」。
+       *
+       * key 由调用方给出稳定节点键（fanout:<id> / shard:<parent>:<shard>）：
+       * 同一个分片在轮询刷新后仍复用同一份展开状态，切换 root 后不会污染别的会话。
+       * 时间线本体没有任何按钮/链接，只有条数切换按钮。
+       */
+      const renderAttemptTimeline = (node, options = {}) => {
+        const timelineOf = modelFunction("attemptTimelineOf");
+        if (timelineOf === null) return null;
+        const key = text(options.key, null);
+        if (key === null) return null;
+        const expanded = timelineExpandedRef.current.has(key) === true;
+        let timeline = null;
+        try { timeline = timelineOf(node, { expanded }); } catch { return null; }
+        if (timeline === null || !Array.isArray(timeline.entries)) return null;
+        // 单价匹配的回退归属：分片/任务自身投影的 provider/model（attempt 上没有这两个字段）。
+        const timelineProvider = text(object(node).provider, null);
+        const timelineModel = text(object(node).model, null);
+        const rows = timeline.entries.map((entry, index) => {
+          const attemptStatus = text(entry.status, "unknown");
+          const attemptNumber = finiteNumber(entry.attempt) ?? finiteNumber(entry.position) ?? index + 1;
+          const duration = formatDurationText(entry.durationMs);
+          const timestamp = finiteNumber(entry.finishedAt) ?? finiteNumber(entry.startedAt);
+          const clock = formatClockText(timestamp);
+          const durationLabel = duration === null ? (clock ?? "—") : duration;
+          const cells = [
+            react.createElement("span", { key: "index", className: "deg_expert_group_attempt_index" }, "#" + attemptNumber),
+            react.createElement("span", {
+              key: "status",
+              className: "deg_expert_group_attempt_status",
+              "data-status": attemptStatus,
+            }, ATTEMPT_STATUS_LABELS[attemptStatus] ?? attemptStatus),
+            react.createElement("span", {
+              key: "duration",
+              className: "deg_expert_group_attempt_duration",
+              title: durationLabel,
+            }, durationLabel),
+          ];
+          if (duration !== null && clock !== null) {
+            cells.push(react.createElement("span", {
+              key: "time",
+              className: "deg_expert_group_attempt_time",
+              title: formatIsoText(timestamp) ?? clock,
+            }, clock));
+          }
+          const shardId = text(entry.shardId, null);
+          if (shardId !== null) {
+            cells.push(react.createElement("span", {
+              key: "shard",
+              className: "deg_expert_group_attempt_shard",
+              title: text(entry.shardTaskName, shardId),
+            }, shardId));
+          }
+          return react.createElement("div", {
+            key: key + ":" + (shardId ?? "single") + ":" + attemptNumber + ":" + index,
+            className: "deg_expert_group_attempt",
+            role: "listitem",
+            "data-status": attemptStatus,
+            "data-attempt": String(attemptNumber),
+            ...(shardId === null ? {} : { "data-shard-id": shardId }),
+          },
+          // 第一行保持既有的序号/状态/耗时/时间/分片单元格（文本顺序与旧结构逐字一致）。
+          react.createElement("div", { className: "deg_expert_group_attempt_row" }, ...cells),
+          // 票据 25/30：attempt 详情（用量/成本 + 结构化结果）。只读、无按钮，
+          // 时间线唯一的交互仍是「查看全部/收起」。
+          renderAttemptUsage(entry, {
+            provider: text(entry.provider, null) ?? timelineProvider,
+            model: text(entry.model, null) ?? timelineModel,
+          }),
+          renderStructuredBlock(entry.structured, entry.outputSchemaRequested, { kind: "attempt" }));
+        });
+        const toggle = timeline.total > timeline.limit
+          ? react.createElement("button", {
+            key: "toggle",
+            type: "button",
+            className: "deg_expert_group_attempts_toggle",
+            "aria-expanded": expanded,
+            "aria-label": expanded ? "收起尝试时间线" : "查看全部尝试时间线",
+            title: expanded ? "只显示最近 " + timeline.limit + " 条" : "查看全部 " + timeline.total + " 条",
+            onClick: (event) => {
+              // 时间线在可导航行内部：按钮点击绝不触发行导航或折叠。
+              event?.preventDefault?.();
+              event?.stopPropagation?.();
+              const expandedKeys = timelineExpandedRef.current;
+              if (expandedKeys.has(key)) expandedKeys.delete(key);
+              else {
+                expandedKeys.add(key);
+                // 有界记账：长会话里节点会不断消失/新增，只保留最近的 256 份展开选择，
+                // 避免一份永不清理的 Set 随会话寿命无界增长。
+                while (expandedKeys.size > TIMELINE_EXPANDED_KEY_LIMIT) {
+                  const oldest = expandedKeys.values().next();
+                  if (oldest.done === true) break;
+                  expandedKeys.delete(oldest.value);
+                }
+              }
+              bump((value) => value + 1);
+            },
+          }, expanded ? "收起" : "查看全部")
+          : null;
+        return react.createElement("div", {
+          className: "deg_expert_group_attempts",
+          role: "list",
+          "aria-label": "尝试时间线",
+          "data-total": String(timeline.total),
+          "data-expanded": expanded,
+        }, ...rows, toggle);
+      };
+      /**
+       * 导出当前快照（客户端本地序列化 + Blob 下载）。
+       *
+       * 只读 normalized 快照：不写宿主状态、不发 RPC；下载能力缺失时返回 false（序列化本身
+       * 由模型层的 serializeSnapshot 覆盖测试）。两个格式共用同一条纯函数路径。
+       */
+      const exportSnapshotAs = (format) => {
+        if (snapshot === null) return false;
+        const serialize = modelFunction("serializeSnapshot");
+        if (serialize === null) return false;
+        let result = null;
+        try { result = serialize(snapshot, { format }); } catch { return false; }
+        return downloadExportFile(result);
+      };
 
       /**
        * 每个代理节点固定三行；行内容与折叠状态无关，永不因展开状态隐藏任何一行。
@@ -7012,7 +9096,7 @@
           "aria-label": "打开任务会话：" + (summary === "" ? fullName : summary),
           onKeyDown,
         };
-        const metadata = metadataOf(source);
+        const metadata = metadataOf(source, mergedRoleLabels);
         const taskClassName = "deg_expert_group_line deg_expert_group_task"
           + (oneLine ? "" : " deg_expert_group_shard_task");
         const trailing = options.trailing === undefined ? null : options.trailing;
@@ -7026,10 +9110,17 @@
         }, ...taskChildren);
         // 主代理批量控件作为标题行的相邻 flex 项，标题收缩省略时控件仍固定在标题末尾。
         // 其它专家 / 分片 / 空闲成员不传 trailing，单会话箭头结构保持不变。
-        return react.createElement("div", { className: "deg_expert_group_row_main", "data-kind": source.kind || "expert", "data-expanded": true },
+        // 三行主体必须保持恰好 3 个子节点（既有 DOM 契约）：时间线条/attempt 时间线放在
+        // 相邻块（.deg_expert_group_cell）里纵向排列，绝不改变三行网格的行数与顺序。
+        const rowMain = react.createElement("div", { className: "deg_expert_group_row_main", "data-kind": source.kind || "expert", "data-expanded": true },
           taskLine,
           react.createElement("div", { className: "deg_expert_group_meta", title: metadata }, metadata),
           react.createElement("div", { className: "deg_expert_group_line deg_expert_group_content", title: summary, onClick: onNavigate, ...summaryProps }, summary));
+        const extras = [];
+        if (options.metrics !== undefined && options.metrics !== null) extras.push(options.metrics);
+        if (options.footer !== undefined && options.footer !== null) extras.push(options.footer);
+        if (extras.length === 0) return rowMain;
+        return react.createElement("div", { className: "deg_expert_group_cell" }, rowMain, ...extras);
       };
 
       /**
@@ -7045,16 +9136,52 @@
         options,
       );
 
-      const renderExpert = (node, index, parentId) => {
+      const renderExpert = (node, index, parentId, treeMeta) => {
+        // 本地过滤：自身或其子节点都不命中时整棵子树隐藏（祖先由父级 isVisible 保留）。
+        if (passesFilter(node) !== true) return null;
         // 轻量快照里没有活动证据的专家行渲染中性圆点（不声明已结束），完整快照不受影响。
         const runtimeStatus = runtimeStatusOfNode(node, parentId, undefined, { partial: partialSnapshot });
-        return react.createElement("div", { key: node.id || node.sessionId || "expert-" + index, className: "deg_expert_group_node" },
-          react.createElement("div", { className: "deg_expert_group_row", "data-status": runtimeStatus, "data-expanded": true },
+        const children = Array.isArray(node.children) ? node.children : [];
+        const hasChildren = children.length > 0;
+        // 只有真的有子节点时才渲染可折叠箭头：叶子专家行保留固定占位，
+        // 绝不留下点了没有任何变化的按钮。有子节点时展开状态复用既有 chevron 机制与默认规则。
+        const expertOpen = hasChildren ? expand(node) : true;
+        const chevron = hasChildren
+          ? renderChevron(node, expertOpen)
+          : react.createElement("span", { className: "deg_expert_group_chevron_placeholder", "aria-hidden": "true" });
+        // 树语义（票据 18）：行本身是 treeitem，层级位置来自父级传入的 treeMeta。
+        // 位置/总数必须按**过滤后的可见集合**计算，否则辅助技术会读到不存在的兄弟项。
+        const meta = treeMeta !== undefined && treeMeta !== null
+          ? treeMeta
+          : { level: 2, posinset: index + 1, setsize: index + 1 };
+        const visibleChildNodes = children.filter((child) => passesFilter(child) === true);
+        return react.createElement("div", { key: node.id || node.sessionId || "expert-" + index, className: "deg_expert_group_node", role: "none" },
+          react.createElement("div", {
+            className: "deg_expert_group_row",
+            role: "treeitem",
+            "aria-level": meta.level,
+            "aria-posinset": meta.posinset,
+            "aria-setsize": meta.setsize,
+            ...(hasChildren ? { "aria-expanded": expertOpen } : {}),
+            "data-status": runtimeStatus,
+            "data-expanded": expertOpen,
+          },
             statusIcon(react, primitives, runtimeStatus),
-            react.createElement("span", { className: "deg_expert_group_chevron_placeholder", "aria-hidden": "true" }),
-            react.createElement("div", null, renderThreeLines(node, { sessionId: node.sessionId, parentId }))),
-          Array.isArray(node.children) && node.children.length > 0
-            ? react.createElement("div", { className: "deg_expert_group_children" }, node.children.map((child, childIndex) => renderExpert(child, childIndex, parentId)))
+            chevron,
+            react.createElement("div", null, renderThreeLines(node, {
+              sessionId: node.sessionId,
+              parentId,
+              // 会话节点只有 startedAt/lastActivityAt（Host 不发布完成时间），缺失片段自动省略。
+              metrics: renderMetrics(node, { kind: node.kind || "expert" }),
+              // 票据 30：专家自己的结构化结果区（有 value / 回退 / 已请求但未返回三种形态）。
+              footer: renderStructuredBlock(node.structured, node.outputSchemaRequested, { kind: node.kind || "expert" }),
+            }))),
+          hasChildren && expertOpen
+            ? react.createElement("div", { className: "deg_expert_group_children", role: "group" }, visibleChildNodes.map((child, childIndex) => renderExpert(child, childIndex, parentId, {
+              level: meta.level + 1,
+              posinset: childIndex + 1,
+              setsize: visibleChildNodes.length,
+            })))
             : null);
       };
 
@@ -7062,14 +9189,14 @@
        * 空闲分组是容器而非代理：它的圆点直接用规范值 ready（绿色静态圆点），
        * 分组内成员各自按官方目录证据决定 running/ready。
        */
-      const renderIdleGroup = (nodes, trailing) => {
+      const renderIdleGroup = (nodes, trailing, treeMeta) => {
         // 空列表同样要渲染：snapshot 已经加载（调用方只在有快照时调用）时「空闲子代理（0）」与零圆点
         // 是用户看得到的零状态；加载中 / 没有快照时调用方根本不会走到这里，绝不伪造零。
         const members = Array.isArray(nodes) ? nodes : [];
-        const group = { kind: "idle-group", id: rootSessionId + "__idle__", taskName: "空闲子代理", status: "idle", children: members };
+        const group = { kind: "idle-group", id: rootSessionId + "__idle__", taskName: t("sidebar.idleGroup.name"), status: "idle", children: members };
         const open = expand(group);
         const idleTitleChildren = [
-          react.createElement("div", { className: "deg_expert_group_line deg_expert_group_task" }, "空闲子代理（" + members.length + "）"),
+          react.createElement("div", { className: "deg_expert_group_line deg_expert_group_task" }, t("sidebar.idleGroup", { count: members.length })),
         ];
         // 空闲分组的批量候选只来自当前 idleChildren；运行中的专家或分片会被排除。
         // slot 与计数标题同属第三列的 inline flex，标题按可用宽度省略，slot 不会被推到行尾。
@@ -7077,12 +9204,26 @@
         // 轻量快照下分组容器同样不声明「已结束」：它收纳的成员状态可能还没被完整读取，
         // 因此容器圆点跟随成员的中性态；完整快照仍按既有 ready 圆点渲染。
         const idleGroupStatus = partialSnapshot === true ? neutralRuntimeStatus : "ready";
-        return react.createElement("div", { className: "deg_expert_group_idle_group", "data-expanded": open },
-          react.createElement("div", { className: "deg_expert_group_row deg_expert_group_idle_header", "data-status": idleGroupStatus, "data-expanded": open },
+        // 树语义：空闲分组是根的第 N 个可见子节点（treeitem），成员是它的下一级（role=group）。
+        // 分组本身的展开/折叠由 aria-expanded 暴露，成员位置按当前 idleChildren 计算。
+        const meta = treeMeta !== undefined && treeMeta !== null
+          ? treeMeta
+          : { level: 2, posinset: 1, setsize: 1 };
+        return react.createElement("div", { className: "deg_expert_group_idle_group", "data-expanded": open, role: "none" },
+          react.createElement("div", {
+            className: "deg_expert_group_row deg_expert_group_idle_header",
+            role: "treeitem",
+            "aria-level": meta.level,
+            "aria-posinset": meta.posinset,
+            "aria-setsize": meta.setsize,
+            "aria-expanded": open,
+            "data-status": idleGroupStatus,
+            "data-expanded": open,
+          },
             statusIcon(react, primitives, idleGroupStatus),
             renderChevron(group, open),
             react.createElement("div", { className: "deg_expert_group_idle_title_line" }, ...idleTitleChildren)),
-          open ? react.createElement("div", { className: "deg_expert_group_children deg_expert_group_idle_children" }, members.map((node, index) => node.kind === "fanout" ? renderFanout(node, index) : renderExpert(node, index, rootSessionId))) : null);
+          open ? react.createElement("div", { className: "deg_expert_group_children deg_expert_group_idle_children", role: "group" }, members.map((node, index) => node.kind === "fanout" ? renderFanout(node, index, { level: meta.level + 1, posinset: index + 1, setsize: members.length }) : renderExpert(node, index, rootSessionId, { level: meta.level + 1, posinset: index + 1, setsize: members.length }))) : null);
       };
 
       const pendingSet = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };
@@ -7117,41 +9258,79 @@
        * 这是刻意取舍——锁只需要在「同一实例的同一个动作」上成立，加入 root 会让锁出现第二事实源，
        * 反而可能在切换瞬间漏锁；跨实例的重复提交由 Host 侧的任务状态判定兜底。
        */
-      const runAction = async (request, key, requiresConfirm, message) => {
+      const runAction = async (request, key, requiresConfirm, message, options) => {
+        // options（票据 25/28）：{ includeErrorCode, safeMessage, refreshMeta }；
+        // 默认全部关闭，取消/重试等既有动作的文案与副作用逐字不变。
+        const actionOptions = object(options);
         // 已卸载的实例不再接受新动作（按钮即使还残留在旧 DOM 上也不会发出请求）。
-        if (mountedRef.current !== true) return;
+        if (mountedRef.current !== true) return null;
         // 同键动作进行中：静默忽略，不排队也不提示。
-        if (pendingSet.current.has(key)) return;
+        if (pendingSet.current.has(key)) return null;
         // 先占锁再确认：锁必须在第一个 await 之前生效，否则重复点击会穿过上面的空闲检查。
         pendingSet.current.add(key);
         // 立刻让同键动作进入 pending 态（按钮 disabled + aria-busy），单击到确认弹窗之间的
         // 空隙里再次点击同样会被 has(key) 拦下。
         bump((value) => value + 1);
+        // 新动作开始即让上一条**动作类**错误退场（票据 13）：action/rpc 错误只属于发起它的那次
+        // 动作，用户再次操作时它已经过期。snapshot 错误属于快照槽，不在这里清（它由刷新自己裁决）。
+        setState((previous) => {
+          const current = previous.error;
+          if (current === null || (current.source !== PANEL_ERROR_SOURCES.action && current.source !== PANEL_ERROR_SOURCES.rpc)) {
+            return previous;
+          }
+          return { ...previous, error: null };
+        });
         try {
           if (requiresConfirm) {
             // 没有确认能力时什么都不做：破坏性操作绝不降级为静默执行。
-            if (typeof config.confirm !== "function") return;
+            if (typeof config.confirm !== "function") return null;
             let accepted = false;
             try { accepted = await config.confirm(message); } catch { accepted = false; }
-            if (accepted !== true) return;
+            if (accepted !== true) return null;
             // 确认弹窗打开期间 surface 可能已被卸载：卸载即静默放弃，不再发请求。
-            if (mountedRef.current !== true) return;
+            if (mountedRef.current !== true) return null;
           }
           // 重读当前选中 root：ref 在每次渲染同步写入，因此这里拿到的是「确认完成这一刻」
           // 用户实际选中的会话。空会话无法定位任务，直接放弃而不是发一条无目标的请求。
           const targetSessionId = typeof currentRootRef.current === "string" ? currentRootRef.current : "";
-          if (targetSessionId === "") return;
-          await callRpc(config, contextRef.current, { ...request, sessionId: targetSessionId });
+          if (targetSessionId === "") return null;
+          const result = await callRpc(config, contextRef.current, { ...request, sessionId: targetSessionId });
           // RPC 在途期间卸载：不刷新、不写状态（动作本身已由 Host 侧收下，无需再补）。
-          if (mountedRef.current !== true) return;
+          if (mountedRef.current !== true) return null;
           // 走最新渲染的 refresh：确认期间切换过 root 时，用旧闭包刷新会把旧 root 的快照
           // 写回新 surface，也会为旧 root 多发一次请求。
           await refreshRef.current();
+          // 票据 26：meta 已经加载（用户打开过诊断读面）时随动作补一次只读诊断刷新，
+          // 让「取消排队分片」后 running/queued 立即回到最新；未加载时绝不新增请求。
+          if (metaStateRef.current !== null && actionOptions.refreshMeta !== false) {
+            const refreshMeta = metaRefreshRef.current;
+            if (typeof refreshMeta === "function") void refreshMeta();
+          }
+          // 票据 28：把回执原样交给调用方（手动派发需要 parentTaskId/continuation）。
+          return result;
         } catch (error) {
           // 卸载后的失败没有可展示的错误面，静默丢弃，绝不 setState。
-          if (mountedRef.current !== true) return;
-          // 操作失败与快照失败共用标题错误面：旧快照继续可见，用户可直接重试。
-          setState((previous) => ({ ...previous, error: error instanceof Error ? error.message : String(error) }));
+          if (mountedRef.current !== true) return null;
+          // 动作失败按来源分档（票据 13）：callRpc 标记过的传输/协议失败呈现「请求失败」，
+          // 其余（Host 结构化拒绝、动作链路上的其它失败）呈现「操作失败」。
+          // 两种来源都**不再**显示「快照读取失败」：任务树本身没坏，旧快照继续可见。
+          let message = error instanceof Error ? error.message : String(error);
+          if (actionOptions.safeMessage === true) {
+            const redact = modelFunction("redactDisplayText");
+            const clean = redact === null ? message : redact(message, 200);
+            message = clean === "" ? message : clean;
+          }
+          // 票据 28：派发类动作把 Host 的稳定 code 放在最前面，用户可按来源核对
+          // （客户端仍然只展示文案，不解析 code 做业务判断）。其它动作保持既有原文。
+          const code = actionOptions.includeErrorCode === true ? text(object(error).code, null) : null;
+          if (code !== null) message = code + " · " + message;
+          const source = rpcFailureKindOf(error) === RPC_FAILURE_TRANSPORT
+            ? PANEL_ERROR_SOURCES.rpc
+            : PANEL_ERROR_SOURCES.action;
+          // 时间戳在事件路径取一次：updater 保持纯函数（StrictMode 可能调用两次）。
+          const at = Date.now();
+          setState((previous) => ({ ...previous, error: { source, message, at } }));
+          return null;
         } finally {
           // 释放锁无条件执行（含提前 return 的分支）；只有仍挂载时才触发重渲染。
           pendingSet.current.delete(key);
@@ -7212,12 +9391,292 @@
         await refreshRef.current();
       };
 
+      // ── 票据 28：手动派发与任务模板（全部复用 runAction / callRpc / refresh / 错误槽） ──
+      //
+      // 关键边界：
+      // 1) 唯一写路径是 runAction：它已经负责 pending 去重、root 切换后的目标重读、卸载后放弃、
+      //    尾随快照刷新与错误来源分档；这里**不新建第二套请求/刷新逻辑**。
+      // 2) 派发请求体与 fan-out 工具面同字段（role/prompt|basePrompt/shards/allowOverlap/
+      //    timeoutMs/concurrencyLimit/requestId），outputSchema 只作为表单输入透传，Host 再校验。
+      // 3) 只读角色能否派发完全由 Host 裁决：客户端只展示 Host 的拒绝（按来源进入错误槽），
+      //    绝不自行放行或改写角色权限。
+      /** 上一次成功派发的请求体（仅内存；用于「重放上次」，不含 requestId/凭据）。 */
+      const lastDispatchRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+
+      const emptyDispatchShard = () => ({ name: "", prompt: "", affectedPaths: "", outputSchema: "", timeoutMs: "" });
+      const dispatchValidationError = (message) => ({ error: message });
+
+      /** 角色候选：meta.activeRoles 优先，meta 未就绪时用当前快照里实际出现的角色（含自定义角色）。 */
+      const dispatchRoleChoices = () => {
+        const roles = [];
+        const add = (role) => {
+          const id = text(role, null);
+          if (id !== null && roles.indexOf(id) === -1) roles.push(id);
+        };
+        if (meta !== null) for (const role of meta.roles) add(role);
+        if (roles.length === 0) {
+          const collect = (nodes, depth) => {
+            if (depth > 8) return;
+            for (const node of Array.isArray(nodes) ? nodes : []) {
+              const source = object(node);
+              add(source.role);
+              collect(source.children, depth + 1);
+              for (const shard of Array.isArray(source.shards) ? source.shards : []) add(object(shard).role);
+            }
+          };
+          collect(snapshot === null ? [] : object(snapshot.root).children, 0);
+        }
+        return roles;
+      };
+
+      const openDispatch = () => {
+        setDispatchError(null);
+        setDispatchReceipt(null);
+        setTemplateNotice(null);
+        setDispatchDraft((previous) => previous !== null ? previous : {
+          mode: "single",
+          role: dispatchRoleChoices()[0] ?? "",
+          prompt: "",
+          basePrompt: "",
+          shards: [emptyDispatchShard()],
+          allowOverlap: false,
+          concurrencyLimit: "",
+          timeoutMs: "",
+          name: "",
+        });
+        // 用户明确打开派发表单 ⇒ 按需读一次角色清单/单价（已有 meta 则复用）与模板库；
+        // 失败静默降级，绝不阻塞表单本身。
+        if (metaStateRef.current === null) void loadMeta();
+        void loadTemplates();
+      };
+      const closeDispatch = () => {
+        setDispatchDraft(null);
+        setDispatchError(null);
+      };
+      const updateDispatch = (patch) => setDispatchDraft((previous) => (
+        previous === null ? previous : { ...previous, ...object(patch) }
+      ));
+      const updateDispatchShard = (index, patch) => setDispatchDraft((previous) => {
+        if (previous === null) return previous;
+        const shards = previous.shards.map((shard, position) => (position === index ? { ...shard, ...object(patch) } : shard));
+        return { ...previous, shards };
+      });
+      const addDispatchShard = () => setDispatchDraft((previous) => (
+        previous === null ? previous : { ...previous, shards: previous.shards.concat([emptyDispatchShard()]) }
+      ));
+      const removeDispatchShard = (index) => setDispatchDraft((previous) => {
+        // 至少保留一个分片：空列表对 Host 是 INVALID_SHARDS，客户端不制造这种提交。
+        if (previous === null || previous.shards.length <= 1) return previous;
+        return { ...previous, shards: previous.shards.filter((_shard, position) => position !== index) };
+      });
+
+      /** 分片表单 → Host 分片结构；任一字段非法时只返回可读错误，不发请求。 */
+      const buildDispatchShards = (draft) => {
+        const rows = Array.isArray(draft.shards) ? draft.shards : [];
+        if (rows.length === 0) return dispatchValidationError("至少需要一个分片");
+        const shards = [];
+        for (let index = 0; index < rows.length; index += 1) {
+          const row = object(rows[index]);
+          const prompt = typeof row.prompt === "string" ? row.prompt : "";
+          if (prompt.trim() === "") return dispatchValidationError("分片 " + (index + 1) + " 需要非空任务提示");
+          const entry = { prompt };
+          const name = text(row.name, null);
+          if (name !== null) entry.name = name;
+          const affectedPaths = parsePathList(row.affectedPaths);
+          if (affectedPaths.length > 0) entry.affectedPaths = affectedPaths;
+          // outputSchema 是可选 JSON 对象；原文只存在于输入框，绝不写进回执/模板列表展示。
+          const schemaText = typeof row.outputSchema === "string" ? row.outputSchema.trim() : "";
+          if (schemaText !== "") {
+            let schema;
+            try { schema = JSON.parse(schemaText); } catch { return dispatchValidationError("分片 " + (index + 1) + " 的 outputSchema 不是合法 JSON"); }
+            if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
+              return dispatchValidationError("分片 " + (index + 1) + " 的 outputSchema 必须是 JSON 对象");
+            }
+            entry.outputSchema = schema;
+          }
+          const shardTimeout = parsePositiveInteger(row.timeoutMs);
+          if (shardTimeout !== null) entry.timeoutMs = shardTimeout;
+          shards.push(entry);
+        }
+        return { shards };
+      };
+
+      /** 派发/模板共用的可选字段：allowOverlap + 任务级 timeoutMs/concurrencyLimit。 */
+      const dispatchExtras = (draft) => {
+        const extras = { allowOverlap: draft.allowOverlap === true };
+        const timeoutMs = parsePositiveInteger(draft.timeoutMs);
+        if (timeoutMs !== null) extras.timeoutMs = timeoutMs;
+        const concurrencyLimit = parsePositiveInteger(draft.concurrencyLimit);
+        if (concurrencyLimit !== null) extras.concurrencyLimit = concurrencyLimit;
+        return extras;
+      };
+
+      const buildDispatchRequest = (draft) => {
+        const source = object(draft);
+        const mode = source.mode === "fanout" ? "fanout" : "single";
+        const role = text(source.role, null);
+        if (role === null) return dispatchValidationError("请选择专家角色");
+        const request = {
+          action: "fanout-dispatch",
+          mode,
+          role,
+          ...dispatchExtras(source),
+          // 每次提交生成新 requestId：Host 用它做幂等去重（重复提交返回同一 parentTaskId）。
+          requestId: newDispatchRequestId(),
+        };
+        if (mode === "single") {
+          const prompt = typeof source.prompt === "string" ? source.prompt : "";
+          if (prompt.trim() === "") return dispatchValidationError("请输入任务提示");
+          request.prompt = prompt;
+          return { request };
+        }
+        const basePrompt = typeof source.basePrompt === "string" ? source.basePrompt : "";
+        if (basePrompt.trim() === "") return dispatchValidationError("请输入公共目标");
+        const built = buildDispatchShards(source);
+        if (built.error !== undefined) return built;
+        request.basePrompt = basePrompt;
+        request.shards = built.shards;
+        return { request };
+      };
+
+      const buildTemplateRequest = (draft) => {
+        const source = object(draft);
+        const name = text(source.name, null);
+        if (name === null) return dispatchValidationError("请填写模板名称");
+        const mode = source.mode === "fanout" ? "fanout" : "single";
+        const request = { action: "fanout-template-save", name, ...dispatchExtras(source) };
+        const role = text(source.role, null);
+        if (role === null) return dispatchValidationError("请选择专家角色");
+        request.role = role;
+        if (mode === "single") {
+          const prompt = typeof source.prompt === "string" ? source.prompt : "";
+          if (prompt.trim() === "") return dispatchValidationError("请输入任务提示");
+          request.prompt = prompt;
+          return { request };
+        }
+        const basePrompt = typeof source.basePrompt === "string" ? source.basePrompt : "";
+        if (basePrompt.trim() === "") return dispatchValidationError("请输入公共目标");
+        const built = buildDispatchShards(source);
+        if (built.error !== undefined) return built;
+        request.basePrompt = basePrompt;
+        request.shards = built.shards;
+        return { request };
+      };
+
+      /** 派发回执的有界投影：只保留 parentTaskId/轮次/续作句柄的标量字段。 */
+      const dispatchReceiptOf = (value) => {
+        const source = object(value);
+        const continuation = object(source.continuation);
+        return {
+          parentTaskId: text(source.parentTaskId, null),
+          mode: text(source.mode, null),
+          role: text(source.role, null),
+          duplicate: source.duplicate === true,
+          round: finiteNumber(source.round),
+          continuation: Object.keys(continuation).length === 0 ? null : {
+            parentTaskId: text(continuation.parentTaskId, null),
+            round: finiteNumber(continuation.round),
+            running: continuation.running === true,
+            reusable: continuation.reusable === true,
+          },
+        };
+      };
+
+      const submitDispatch = async () => {
+        if (dispatchDraft === null || pendingSet.current.has("dispatch")) return;
+        const built = buildDispatchRequest(dispatchDraft);
+        if (built.error !== undefined) { setDispatchError(built.error); return; }
+        setDispatchError(null);
+        setTemplateNotice(null);
+        const result = await runAction(built.request, "dispatch", false, "", {
+          includeErrorCode: true,
+          safeMessage: true,
+          refreshMeta: true,
+        });
+        if (result === null) return;
+        // 去掉 requestId 后留作「重放上次」的基线（重放会生成新的 requestId，不是幂等命中）。
+        const replayable = { ...built.request };
+        delete replayable.requestId;
+        lastDispatchRef.current = replayable;
+        setDispatchReceipt(dispatchReceiptOf(result));
+        setDispatchDraft(null);
+      };
+
+      const replayLastDispatch = async () => {
+        const last = object(lastDispatchRef.current);
+        if (text(last.action, null) !== "fanout-dispatch") return;
+        if (pendingSet.current.has("dispatch-replay")) return;
+        setDispatchError(null);
+        setTemplateNotice(null);
+        const result = await runAction({ ...last, requestId: newDispatchRequestId() }, "dispatch-replay", false, "", {
+          includeErrorCode: true,
+          safeMessage: true,
+          refreshMeta: true,
+        });
+        if (result === null) return;
+        setDispatchReceipt(dispatchReceiptOf(result));
+      };
+
+      const saveDispatchTemplate = async () => {
+        if (dispatchDraft === null || pendingSet.current.has("template-save")) return;
+        const built = buildTemplateRequest(dispatchDraft);
+        if (built.error !== undefined) { setDispatchError(built.error); return; }
+        setDispatchError(null);
+        setTemplateNotice(null);
+        const result = await runAction(built.request, "template-save", false, "", {
+          includeErrorCode: true,
+          safeMessage: true,
+        });
+        if (result === null) return;
+        const count = Number.isSafeInteger(result.count) ? result.count : null;
+        setTemplateNotice(count === null ? "模板已保存" : "模板已保存（共 " + count + " 个）");
+        await loadTemplates();
+      };
+
+      const dispatchTemplateById = async (template) => {
+        const id = text(object(template).id, null);
+        if (id === null) return;
+        const key = "template-dispatch:" + id;
+        if (pendingSet.current.has(key)) return;
+        setDispatchError(null);
+        setTemplateNotice(null);
+        const result = await runAction(
+          { action: "fanout-template-dispatch", templateId: id, requestId: newDispatchRequestId() },
+          key,
+          false,
+          "",
+          { includeErrorCode: true, safeMessage: true, refreshMeta: true },
+        );
+        if (result === null) return;
+        setDispatchReceipt(dispatchReceiptOf(result));
+        setDispatchDraft(null);
+      };
+
+      const deleteTemplateById = async (template) => {
+        const id = text(object(template).id, null);
+        if (id === null) return;
+        const key = "template-delete:" + id;
+        if (pendingSet.current.has(key)) return;
+        const title = text(object(template).name, id);
+        setTemplateNotice(null);
+        const result = await runAction(
+          { action: "fanout-template-delete", templateId: id },
+          key,
+          true,
+          "确认删除模板 " + title + "？",
+          { includeErrorCode: true, safeMessage: true },
+        );
+        if (result === null) return;
+        setTemplateNotice("模板已删除");
+        await loadTemplates();
+      };
+
       const renderAction = (label, Icon, onClick, pending) => react.createElement("button", {
         type: "button", className: "deg_expert_group_action", title: pending ? label + "（处理中）" : label,
         "aria-label": pending ? label + "（处理中）" : label, "aria-busy": pending || undefined, disabled: pending, onClick,
       }, makeIcon(primitives, Icon, { size: 14 }));
 
-      const renderShard = (task, shard, index) => {
+      const renderShard = (task, shard, index, treeMeta) => {
         const shardKey = text(shard.shardId, "shard-" + index);
         const latestChildId = text(shard.childId, null);
         const status = statusOf(shard);
@@ -7251,15 +9710,54 @@
         // 展示状态用规范运行状态，证据与第三行同源（最新 attempt 的 childId 查目录项）；
         // status 仍保留给取消/重试判定（管理语义不变）。
         const runtimeStatus = runtimeStatusOfNode(shardNode, rootSessionId, latestChildId);
-        return react.createElement("div", { key: shardKey, className: "deg_expert_group_shard", "data-shard-id": shardKey, "data-status": runtimeStatus, "data-expanded": true },
+        // 分片的展开状态复用既有 chevron 机制：默认规则沿用 defaultExpanded（运行/等待/失败展开，
+        // 空闲/完成/取消收起），用户的手动选择由 createExpansionStore 持久化并优先。
+        // shardNode.id 是 parentTaskId:shardId 复合键，因此不同 fan-out 的同名分片互不覆盖。
+        const shardOpen = expand(shardNode);
+        // 键含 rootSessionId：同一实例切换 root 后，不同会话的同名分片绝不共享展开状态。
+        const timelineKey = "shard:" + rootSessionId + ":" + task.parentTaskId + ":" + shardKey;
+        // 票据 30：分片详情先展示结构化结果（最新 attempt 的投影），再展示 attempt 时间线；
+        // 两者都缺时 footer 保持 null，分片 DOM 与改动前逐字一致。
+        const shardStructured = renderStructuredBlock(shard.structured, shard.outputSchemaRequested, { kind: "shard" });
+        const shardTimeline = shardOpen ? renderAttemptTimeline(shard, { key: timelineKey }) : null;
+        const shardFooter = shardStructured === null && shardTimeline === null
+          ? null
+          : react.createElement("div", { className: "deg_expert_group_shard_extra" }, shardStructured, shardTimeline);
+        // 分片是 fan-out 父任务下的下一级树项（顶层 fan-out 时为第 3 层）。
+        // 位置/总数只按**当前可见分片**计算（过滤后集合）。
+        const meta = treeMeta !== undefined && treeMeta !== null
+          ? treeMeta
+          : { level: 3, posinset: index + 1, setsize: index + 1 };
+        return react.createElement("div", {
+          key: shardKey,
+          className: "deg_expert_group_shard",
+          role: "treeitem",
+          "aria-level": meta.level,
+          "aria-posinset": meta.posinset,
+          "aria-setsize": meta.setsize,
+          "data-shard-id": shardKey,
+          "data-status": runtimeStatus,
+          "data-expanded": shardOpen,
+        },
           statusIcon(react, primitives, runtimeStatus),
-          react.createElement("span", { className: "deg_expert_group_chevron_placeholder", "aria-hidden": "true" }),
-          renderThreeLines(shardNode, { sessionId: latestChildId, parentId: rootSessionId, oneLine: false }),
+          renderChevron(shardNode, shardOpen),
+          renderThreeLines(shardNode, {
+            sessionId: latestChildId,
+            parentId: rootSessionId,
+            oneLine: false,
+            // 时间线条常驻（开始/耗时/重试/最近活动/失败摘要），attempt 时间线只在展开时渲染。
+            metrics: renderMetrics(shard, { kind: "shard" }),
+            footer: shardFooter,
+          }),
           react.createElement("div", { className: "deg_expert_group_actions" }, actions));
       };
 
-      const renderFanout = (task, index) => {
+      const renderFanout = (task, index, treeMeta) => {
+        // 本地过滤：父任务自身命中时保留全部分片，否则只保留命中的分片；
+        // 整条分支（含父任务）都不命中时由父级 passesFilter 直接跳过。
+        if (passesFilter(task) !== true) return null;
         const shards = Array.isArray(task.shards) ? task.shards : [];
+        const visibleShards = filterActive === true && taskFilter !== null ? taskFilter.shardsFor(task) : shards;
         const open = expand(task);
         const incomplete = shards.filter((shard) => ACTIVE_STATUSES.has(statusOf(shard))).length;
         const parentKey = "cancel-parent:" + task.parentTaskId;
@@ -7274,33 +9772,537 @@
         // data-status 是对外的规范运行状态；管理状态改由 data-task-status 暴露，
         // 供了解 fan-out 内部结算的消费方读取，展示层不再出现 succeeded/failed 等词。
         const runtimeStatus = runtimeStatusOf(task, null);
-        return react.createElement("div", { key: task.parentTaskId || "fanout-" + index, className: "deg_expert_group_fanout", "data-status": runtimeStatus, "data-task-status": statusOf(task) },
-          react.createElement("div", { className: "deg_expert_group_fanout_header" },
+        // 父任务的时间线条（开始/耗时/尝试与重试次数/最近活动/失败摘要）与标题同列纵向排列：
+        // 标题仍可点击导航，时间线条不参与导航、不拦截点击。
+        // 展开后的 attempt 聚合时间线放在分片之后：它是「最近发生的尝试」的日志视图，
+        // 不插入标题与首个分片之间，树线锚点与既有布局保持一致。
+        // 过滤期间聚合时间线只统计可见分片：与分片列表保持同一份过滤视图，避免「过滤后仍显示被隐藏分片的尝试」。
+        const timelineSource = filterActive === true && taskFilter !== null ? { ...task, shards: visibleShards } : task;
+        const fanoutTimeline = open ? renderAttemptTimeline(timelineSource, { key: "fanout:" + rootSessionId + ":" + task.parentTaskId }) : null;
+        // 树语义：fan-out 头部是第 2 层 treeitem，分片容器是它的 group（位置只算可见分片）。
+        const meta = treeMeta !== undefined && treeMeta !== null
+          ? treeMeta
+          : { level: 2, posinset: index + 1, setsize: index + 1 };
+        // fan-out 标题（票据 18）：可聚焦 + Enter/Space 跳转会话，与任务名/第三行同一套键盘契约。
+        // 只有真的能导航（宿主提供 uiWorkspace.openSession 且任务有 sessionId）时才挂 role/tabIndex，
+        // 绝不留下一个「可聚焦但按了没反应」的标题；它是 div，不是嵌套 button。
+        // 票据 27：fan-out 标题的角色段优先使用显示名（含自定义角色），没有显示名时
+        // 保持既有的「角色 id 首字母大写」文案逐字不变。
+        const fanoutRole = roleLabelFor(task.role, task.roleLabel) ?? "Expert";
+        const fanoutTitle = fanoutRole.charAt(0).toUpperCase() + fanoutRole.slice(1)
+          + " · " + shards.length + " shards · " + RUNTIME_STATUS_LABELS[runtimeStatusOf(task, null)];
+        /**
+         * fan-out 标题的导航目标（票据 18）。
+         *
+         * Host 快照里的 fan-out 父任务是**任务**而不是会话：投影不带 sessionId，旧实现的
+         * onClick 因此永远拿不到可导航目标（标题看起来可点、实际没反应）。这里给出一条可证明的
+         * 落点：优先用显式 sessionId（老形状/未来 Host 提供时逐字沿用），否则用最新分片 attempt
+         * 的 childId——优先仍在运行的可见分片，其次 manager 顺序里第一个有 childId 的分片。
+         * 目标只从当前**可见**分片里选：过滤隐藏的分片绝不成为导航目标。
+         */
+        const fanoutNavigationId = (() => {
+          const explicit = text(task.sessionId, null);
+          if (explicit !== null) return explicit;
+          let fallback = null;
+          for (const shard of visibleShards) {
+            const childId = text(object(shard).childId, null);
+            if (childId === null) continue;
+            if (ACTIVE_STATUSES.has(statusOf(shard))) return childId;
+            if (fallback === null) fallback = childId;
+          }
+          return fallback;
+        })();
+        const fanoutNavigable = navigation.available === true && fanoutNavigationId !== null;
+        const onFanoutKeyDown = fanoutNavigable
+          ? (event) => {
+            if (event?.key !== "Enter" && event?.key !== " ") return;
+            event.preventDefault?.();
+            event.stopPropagation?.();
+            handleOpen(fanoutNavigationId);
+          }
+          : undefined;
+        return react.createElement("div", { key: task.parentTaskId || "fanout-" + index, className: "deg_expert_group_fanout", role: "none", "data-status": runtimeStatus, "data-task-status": statusOf(task) },
+          react.createElement("div", {
+            className: "deg_expert_group_fanout_header",
+            role: "treeitem",
+            "aria-level": meta.level,
+            "aria-posinset": meta.posinset,
+            "aria-setsize": meta.setsize,
+            "aria-expanded": open,
+          },
             statusIcon(react, primitives, runtimeStatus),
             renderChevron(task, open),
-            react.createElement("div", { className: "deg_expert_group_line deg_expert_group_task", title: titleOf(task), onClick: navigation.available === true && task.sessionId ? () => handleOpen(task.sessionId) : undefined }, titleOf(task)),
+            react.createElement("div", { className: "deg_expert_group_fanout_title" },
+              react.createElement("div", {
+                className: "deg_expert_group_line deg_expert_group_task",
+                title: fanoutTitle,
+                ...(fanoutNavigable ? { role: "button", tabIndex: 0, "aria-label": "打开任务会话：" + fanoutTitle, onKeyDown: onFanoutKeyDown } : {}),
+                onClick: fanoutNavigable ? () => handleOpen(fanoutNavigationId) : undefined,
+              }, fanoutTitle),
+              renderMetrics(task, { kind: "fanout" })),
             react.createElement("div", { className: "deg_expert_group_actions" }, actions)),
           // 箭头函数按 (shard, index, array) 收到与旧 `renderShard.bind(null, task)` 完全相同的实参
           // （renderShard 只用前两个），但不再每次渲染都新建一个绑定函数。
-          open ? react.createElement("div", { className: "deg_expert_group_fanout_shards deg_expert_group_tree_children" }, shards.map((shard, shardIndex) => renderShard(task, shard, shardIndex))) : null);
+          open ? react.createElement("div", { className: "deg_expert_group_fanout_shards deg_expert_group_tree_children", role: "group" }, visibleShards.map((shard, shardIndex) => renderShard(task, shard, shardIndex, {
+            level: meta.level + 1,
+            posinset: shardIndex + 1,
+            setsize: visibleShards.length,
+          }))) : null,
+          fanoutTimeline);
       };
 
       const children = Array.isArray(snapshot?.root?.children) ? snapshot.root.children : [];
+      /**
+       * 客户端本地过滤（票据 12）：只读内存快照，不新增 RPC、不写任何持久化。
+       *
+       * 三条语义：
+       * - 过滤状态绑定 root：切换会话后旧搜索词/角色/状态不会把新会话的树整棵隐藏；
+       * - 祖先路径保留：父级用 isVisible（自身命中，或任一子节点/分片命中）决定整棵子树是否展示；
+       * - 批量 slot 在过滤期间隐藏：批量关闭作用于整棵树，不能让用户在「看不见候选」时误关。
+       */
+      const filterSource = filterState.rootSessionId === rootSessionId ? filterState : emptyFilter;
+      const filterFactory = modelFunction("createTaskFilter");
+      let taskFilter = null;
+      if (filterFactory !== null) {
+        try { taskFilter = filterFactory(filterSource); } catch { taskFilter = null; }
+      }
+      const filterActive = taskFilter !== null && taskFilter.active === true;
+      const passesFilter = (node) => (filterActive !== true || taskFilter.isVisible(node) === true);
+      const updateFilter = (patch) => {
+        setFilterState({ ...filterSource, ...patch, rootSessionId });
+      };
       // 普通专家按实际运行状态分组，fan-out 父任务则按 manager 的聚合终态进入空闲组。
       // 轻量快照（partial）下没有活动证据的专家是 unknown：**仍进空闲组显示**（位置与完整快照
       // 一致，不再因证据缺失而换组），但圆点/文案保持中性，且不参与任何批量关闭或抑制清理
       // （见 sidebarNodeIsIdleMembership 与 idleSidebarResourceAddresses 的分工）。
       // fan-out 展示与取消/重试仍使用各自的 manager 状态，不受分组位置影响。
       const idleChildren = sidebarIdleChildren();
-      const visibleChildren = children.filter((node) => !idleChildren.includes(node));
+      const visibleChildren = children.filter((node) => !idleChildren.includes(node)).filter((node) => passesFilter(node));
+      const visibleIdleChildren = filterActive === true ? idleChildren.filter((node) => passesFilter(node)) : idleChildren;
       // 两行标题后的批量 slot 内容：主代理行只覆盖运行中的普通专家/最新分片，空闲标题行只覆盖
       // idleChildren（因此天然继承同一套证据规则：unknown 成员不在其中，绝不成为关闭候选）。
       // 两者都只在渲染期纯读 openTabs inventory 与 close 能力（inventory 读不出来、
       // 或候选存在但 close 缺失时返回 null，不渲染任何东西）；打开能力不参与这里的判定。
-      const rootBatchSlot = renderSidebarBatchSlot(runningSidebarResourceAddresses(), "运行中的子代理");
-      const idleBatchSlot = renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren), "空闲子代理");
+      // 过滤期间整体隐藏（见上面 updateFilter 的说明）。
+      const rootBatchSlot = filterActive === true ? null : renderSidebarBatchSlot(runningSidebarResourceAddresses(), "运行中的子代理");
+      const idleBatchSlot = filterActive === true ? null : renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren), t("sidebar.idleGroup.name"));
       const root = snapshot?.root;
+      /**
+       * 顶部工具条（票据 12）：搜索输入 + 角色筛选 + 状态筛选 + Markdown/JSON 导出。
+       *
+       * 只在快照已上屏时渲染（skeleton/空态没有可过滤/可导出的内容）；所有交互都在本地完成：
+       * 输入/下拉只改内存过滤状态，导出只读 normalized 快照并交给浏览器下载。
+       * 角色候选从当前快照里现算（普通专家、fan-out 父任务与分片），而不是写死词表。
+       */
+      /**
+       * 票据 26：排队/限流诊断区（只读）。
+       *
+       * 数据只来自 meta.diagnostics.fanout.concurrency.throttle（Host 的同一套 running/queued
+       * 计数）。etaMs 缺失时显示「未知」，**绝不**用任务耗时或猜测值算一个 ETA；
+       * limit=0 在 provider 维度表示「不限制」。meta 未加载时只显示读取中，不伪造零值。
+       */
+      const renderDiagnostics = () => {
+        if (diagnosticsOpen !== true) return null;
+        const metaThrottle = meta === null ? null : meta.throttle;
+        const rows = [];
+        const pushRows = (kind, list) => {
+          for (const value of Array.isArray(list) ? list : []) {
+            const row = object(value);
+            const key = text(kind === "role" ? row.role : row.provider, null);
+            if (key === null) continue;
+            const limit = finiteNumber(row.limit);
+            const running = finiteNumber(row.running);
+            const queued = finiteNumber(row.queued);
+            const etaMs = finiteNumber(row.etaMs);
+            const etaText = etaMs === null ? "未知" : (formatDurationText(etaMs) ?? "未知");
+            const limitText = limit === null ? "—" : (limit === 0 ? "不限" : String(limit));
+            const nameText = kind === "role" ? (roleLabelFor(key, null) ?? key) : key;
+            rows.push(react.createElement("div", {
+              key: kind + ":" + key,
+              className: "deg_expert_group_diag_row",
+              "data-kind": kind,
+              "data-key": key,
+              "data-eta-source": text(row.etaSource, "unknown"),
+            },
+            react.createElement("span", { className: "deg_expert_group_diag_name", title: key }, nameText + (kind === "role" ? "（角色）" : "（provider）")),
+            react.createElement("span", { className: "deg_expert_group_diag_values" },
+              "运行 " + (running === null ? "—" : String(running))
+              + " · 排队 " + (queued === null ? "—" : String(queued))
+              + " · 上限 " + limitText
+              + " · 预计等待 " + etaText)));
+          }
+        };
+        if (metaThrottle !== null) {
+          pushRows("role", metaThrottle.roles);
+          pushRows("provider", metaThrottle.providers);
+        }
+        const totals = meta === null ? null : object(object(meta.usage).totals);
+        return react.createElement("section", {
+          className: "deg_expert_group_diagnostics",
+          role: "region",
+          "aria-label": "排队与限流诊断",
+        },
+        react.createElement("div", { className: "deg_expert_group_diagnostics_head" },
+          react.createElement("span", null, "排队与限流诊断"),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_expert_group_export_button",
+            "aria-label": "收起排队与限流诊断",
+            onClick: () => setDiagnosticsOpen(false),
+          }, "收起")),
+        meta === null
+          ? react.createElement("div", { className: "deg_expert_group_diagnostics_empty" }, "诊断读取中…")
+          : (rows.length === 0
+            ? react.createElement("div", { className: "deg_expert_group_diagnostics_empty" }, "暂无排队/限流诊断（宿主未提供）")
+            : react.createElement("div", { className: "deg_expert_group_diagnostics_rows", role: "list" }, ...rows)),
+        totals === null
+          ? null
+          : react.createElement("div", { className: "deg_expert_group_diagnostics_usage" }, renderUsageBadge(totals, { kind: "totals" })));
+      };
+
+      /** 表单字段容器（label + 控件）；控件自身负责 aria-label 与受控值。 */
+      const renderDispatchField = (label, control) => react.createElement("label", { className: "deg_expert_group_dispatch_field" },
+        react.createElement("span", { className: "deg_expert_group_dispatch_label" }, label),
+        control);
+
+      /**
+       * 票据 28：新建任务内联表单。
+       *
+       * 字段与 fan-out 工具面一致：mode/role/prompt|basePrompt/分片（name/prompt/affectedPaths/
+       * outputSchema/timeout）/allowOverlap/concurrencyLimit/timeoutMs/模板名称。
+       * 「至少一个分片」「非法 JSON」等本地错误只显示在表单内；Host 的结构化拒绝走错误槽。
+       */
+      const renderDispatchForm = () => {
+        if (dispatchDraft === null) return null;
+        const draft = dispatchDraft;
+        const roles = dispatchRoleChoices();
+        const pending = pendingSet.current.has("dispatch");
+        const saving = pendingSet.current.has("template-save");
+        const mode = draft.mode === "fanout" ? "fanout" : "single";
+        const shards = Array.isArray(draft.shards) ? draft.shards : [];
+        const textInput = (label, ariaLabel, value, onChange) => renderDispatchField(label, react.createElement("input", {
+          type: "text",
+          className: "deg_expert_group_dispatch_input",
+          "aria-label": ariaLabel,
+          value: value,
+          onChange: (event) => onChange(event?.target?.value ?? ""),
+        }));
+        const option = (value, label) => react.createElement("option", { key: value, value }, label);
+        const promptValue = mode === "single" ? draft.prompt : draft.basePrompt;
+        const promptControl = react.createElement("textarea", {
+          className: "deg_expert_group_dispatch_input deg_expert_group_dispatch_textarea",
+          "aria-label": mode === "single" ? "任务提示" : "公共目标",
+          rows: 3,
+          value: promptValue,
+          onChange: (event) => {
+            const value = event?.target?.value ?? "";
+            updateDispatch(mode === "single" ? { prompt: value } : { basePrompt: value });
+          },
+        });
+        const shardSection = mode === "fanout"
+          ? react.createElement("div", { className: "deg_expert_group_dispatch_shards", role: "group", "aria-label": "分片列表" },
+            ...shards.map((value, index) => {
+              const shard = object(value);
+              return react.createElement("div", {
+                key: "dispatch-shard-" + index,
+                className: "deg_expert_group_dispatch_shard",
+                role: "group",
+                "aria-label": "分片 " + (index + 1),
+              },
+              react.createElement("div", { className: "deg_expert_group_dispatch_shard_head" },
+                react.createElement("span", null, "分片 " + (index + 1)),
+                react.createElement("button", {
+                  type: "button",
+                  className: "deg_expert_group_export_button",
+                  "aria-label": "删除分片 " + (index + 1),
+                  disabled: shards.length <= 1,
+                  onClick: () => removeDispatchShard(index),
+                }, "删除")),
+              textInput("名称", "分片 " + (index + 1) + " 名称", text(shard.name, ""),
+                (next) => updateDispatchShard(index, { name: next })),
+              renderDispatchField("任务提示", react.createElement("textarea", {
+                className: "deg_expert_group_dispatch_input deg_expert_group_dispatch_textarea",
+                "aria-label": "分片 " + (index + 1) + " 任务提示",
+                rows: 2,
+                value: typeof shard.prompt === "string" ? shard.prompt : "",
+                onChange: (event) => updateDispatchShard(index, { prompt: event?.target?.value ?? "" }),
+              })),
+              textInput("影响范围（逗号/换行分隔）", "分片 " + (index + 1) + " 影响范围", typeof shard.affectedPaths === "string" ? shard.affectedPaths : "",
+                (next) => updateDispatchShard(index, { affectedPaths: next })),
+              renderDispatchField("outputSchema（可选 JSON 对象）", react.createElement("textarea", {
+                className: "deg_expert_group_dispatch_input deg_expert_group_dispatch_textarea",
+                "aria-label": "分片 " + (index + 1) + " 输出 schema",
+                rows: 2,
+                value: typeof shard.outputSchema === "string" ? shard.outputSchema : "",
+                onChange: (event) => updateDispatchShard(index, { outputSchema: event?.target?.value ?? "" }),
+              })),
+              textInput("超时（毫秒，可选）", "分片 " + (index + 1) + " 超时", typeof shard.timeoutMs === "string" ? shard.timeoutMs : String(shard.timeoutMs ?? ""),
+                (next) => updateDispatchShard(index, { timeoutMs: next })));
+            }),
+            react.createElement("button", {
+              type: "button",
+              className: "deg_expert_group_export_button",
+              "aria-label": "添加分片",
+              onClick: addDispatchShard,
+            }, "添加分片"))
+          : null;
+        return react.createElement("section", {
+          className: "deg_expert_group_dispatch",
+          role: "form",
+          "aria-label": "新建任务",
+          "data-mode": mode,
+        },
+        react.createElement("div", { className: "deg_expert_group_dispatch_head" },
+          react.createElement("span", null, "新建任务"),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_expert_group_export_button",
+            "aria-label": "关闭新建任务",
+            onClick: closeDispatch,
+          }, "关闭")),
+        react.createElement("div", { className: "deg_expert_group_dispatch_row" },
+          renderDispatchField("模式", react.createElement("select", {
+            className: "deg_expert_group_filter",
+            "aria-label": "派发模式",
+            value: mode,
+            onChange: (event) => updateDispatch({ mode: event?.target?.value === "fanout" ? "fanout" : "single" }),
+          }, option("single", "单专家"), option("fanout", "fan-out"))),
+          renderDispatchField("角色", react.createElement("select", {
+            className: "deg_expert_group_filter",
+            "aria-label": "派发角色",
+            value: text(draft.role, ""),
+            onChange: (event) => updateDispatch({ role: event?.target?.value ?? "" }),
+          },
+          roles.length === 0 ? option("", "（暂无可用角色）") : null,
+          ...roles.map((role) => option(role, roleLabelFor(role, null) ?? role))))),
+        renderDispatchField(mode === "single" ? "任务提示" : "公共目标", promptControl),
+        shardSection,
+        react.createElement("div", { className: "deg_expert_group_dispatch_row" },
+          react.createElement("label", { className: "deg_expert_group_dispatch_check" },
+            react.createElement("input", {
+              type: "checkbox",
+              "aria-label": "允许影响范围重叠",
+              checked: draft.allowOverlap === true,
+              onChange: (event) => updateDispatch({ allowOverlap: event?.target?.checked === true }),
+            }),
+            react.createElement("span", null, "允许影响范围重叠")),
+          textInput("并发上限", "并发上限", String(draft.concurrencyLimit ?? ""),
+            (next) => updateDispatch({ concurrencyLimit: next })),
+          textInput("任务超时（毫秒）", "任务超时", String(draft.timeoutMs ?? ""),
+            (next) => updateDispatch({ timeoutMs: next }))),
+        textInput("模板名称（保存模板时必填）", "模板名称", String(draft.name ?? ""),
+          (next) => updateDispatch({ name: next })),
+        dispatchError === null
+          ? null
+          : react.createElement("div", { className: "deg_expert_group_dispatch_error", role: "alert" }, dispatchError),
+        react.createElement("div", { className: "deg_expert_group_dispatch_actions" },
+          react.createElement("button", {
+            type: "button",
+            className: "deg_expert_group_export_button",
+            "aria-label": "派发任务",
+            "aria-busy": pending || undefined,
+            disabled: pending,
+            onClick: () => { void submitDispatch(); },
+          }, pending ? "派发中…" : "派发"),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_expert_group_export_button",
+            "aria-label": "保存为模板",
+            "aria-busy": saving || undefined,
+            disabled: saving,
+            onClick: () => { void saveDispatchTemplate(); },
+          }, saving ? "保存中…" : "保存为模板")),
+        templateNotice === null ? null : react.createElement("div", { className: "deg_expert_group_dispatch_notice", role: "status" }, templateNotice),
+        renderTemplates());
+      };
+
+      /** 票据 28：模板库列表（有界摘要；不显示 outputSchema 原文）。 */
+      const renderTemplates = () => {
+        if (dispatchDraft === null) return null;
+        const status = templatesState.status;
+        const templates = templatesState.templates.slice(0, 32);
+        const rows = templates.map((value) => {
+          const template = object(value);
+          const id = text(template.id, null);
+          const title = text(template.name, "（未命名模板）");
+          const role = text(template.role, null);
+          const roleText = roleLabelFor(role, null) ?? "—";
+          const mode = template.mode === "fanout" ? "fan-out" : "单专家";
+          const shardCount = Array.isArray(template.shards) ? template.shards.length : 0;
+          const hasSchema = Array.isArray(template.shards) && template.shards.some((shard) => object(shard).hasOutputSchema === true);
+          const preview = text(template.preview, null);
+          const dispatching = id === null || pendingSet.current.has("template-dispatch:" + id);
+          const deleting = id === null || pendingSet.current.has("template-delete:" + id);
+          return react.createElement("div", {
+            key: id ?? title + "-" + String(template.createdAt),
+            className: "deg_expert_group_template",
+            role: "listitem",
+            "data-template-id": id ?? undefined,
+          },
+          react.createElement("div", { className: "deg_expert_group_template_name", title }, title),
+          react.createElement("div", { className: "deg_expert_group_template_meta" },
+            mode + " · " + roleText + (mode === "fan-out" ? " · " + shardCount + " 分片" : "") + (hasSchema ? " · 含输出契约" : "")),
+          preview === null ? null : react.createElement("div", { className: "deg_expert_group_template_preview", title: preview }, preview),
+          react.createElement("div", { className: "deg_expert_group_template_actions" },
+            react.createElement("button", {
+              type: "button",
+              className: "deg_expert_group_export_button",
+              "aria-label": "从模板派发 " + title,
+              disabled: dispatching,
+              onClick: () => { void dispatchTemplateById(template); },
+            }, "从模板派发"),
+            react.createElement("button", {
+              type: "button",
+              className: "deg_expert_group_export_button",
+              "aria-label": "删除模板 " + title,
+              disabled: deleting,
+              onClick: () => { void deleteTemplateById(template); },
+            }, "删除")));
+        });
+        return react.createElement("div", { className: "deg_expert_group_templates", role: "group", "aria-label": "任务模板" },
+          react.createElement("div", { className: "deg_expert_group_templates_head" },
+            react.createElement("span", null, "模板 " + templatesState.count + "/" + templatesState.limit),
+            status === "loading" ? react.createElement("span", { role: "status" }, "读取中…") : null),
+          status === "error" && templatesState.message !== null
+            ? react.createElement("div", { className: "deg_expert_group_dispatch_error", role: "status" }, templatesState.message)
+            : null,
+          status === "ready" && rows.length === 0
+            ? react.createElement("div", { className: "deg_expert_group_templates_empty" }, "还没有保存的模板")
+            : null,
+          ...rows);
+      };
+
+      /** 票据 28：派发回执（parentTaskId + continuation 摘要；不展开完整句柄）。 */
+      const renderDispatchReceipt = () => {
+        if (dispatchReceipt === null) return null;
+        const receipt = dispatchReceipt;
+        const continuation = object(receipt.continuation);
+        const roleText = roleLabelFor(receipt.role, null) ?? receipt.role ?? "—";
+        const lines = [
+          "已派发父任务：" + (receipt.parentTaskId ?? "—") + " · 角色 " + roleText + (receipt.mode === "fanout" ? " · fan-out" : " · 单专家"),
+        ];
+        if (receipt.duplicate === true) lines.push("Host 判定为重复提交（幂等命中，未新建任务）");
+        if (Object.keys(continuation).length > 0) {
+          lines.push("续作句柄：parentTaskId " + (text(continuation.parentTaskId, null) ?? "—")
+            + (finiteNumber(continuation.round) === null ? "" : " · 第 " + finiteNumber(continuation.round) + " 轮")
+            + " · " + (continuation.running === true ? "运行中" : (continuation.reusable === true ? "可续作" : "已结束")));
+        }
+        return react.createElement("div", {
+          className: "deg_expert_group_dispatch_receipt",
+          role: "status",
+          "data-parent-task-id": receipt.parentTaskId ?? undefined,
+          title: lines.join(" "),
+        }, ...lines.map((line, index) => react.createElement("div", { key: "receipt-line-" + index }, line)));
+      };
+
+      const renderToolbar = () => {
+        if (snapshot === null) return null;
+        const roles = [];
+        const addRole = (value) => {
+          const role = text(value, null);
+          if (role !== null && roles.indexOf(role) === -1) roles.push(role);
+        };
+        const collectRoles = (nodes) => {
+          for (const node of Array.isArray(nodes) ? nodes : []) {
+            addRole(node.role);
+            collectRoles(node.children);
+            for (const shard of Array.isArray(node.shards) ? node.shards : []) addRole(shard.role);
+          }
+        };
+        // 刻意不把根会话角色放进候选：根行永远可见，选中它只会得到「根行 + 空结果」，
+        // 对用户没有意义。候选只来自真正会被过滤的子节点。
+        collectRoles(root?.children);
+        roles.sort();
+        const exportButton = (format, label, visibleText) => react.createElement("button", {
+          type: "button",
+          className: "deg_expert_group_export_button",
+          "aria-label": label,
+          title: label,
+          onClick: (event) => {
+            event?.preventDefault?.();
+            event?.stopPropagation?.();
+            exportSnapshotAs(format);
+          },
+        }, visibleText);
+        return react.createElement("div", { className: "deg_expert_group_toolbar", role: "search", "aria-label": t("sidebar.search.label") },
+          react.createElement("input", {
+            type: "search",
+            className: "deg_expert_group_search",
+            "aria-label": t("sidebar.search.aria"),
+            placeholder: t("sidebar.search.placeholder"),
+            value: filterSource.query,
+            onChange: (event) => { updateFilter({ query: event?.target?.value ?? "" }); },
+          }),
+          react.createElement("select", {
+            className: "deg_expert_group_filter",
+            "aria-label": t("sidebar.filter.role"),
+            value: filterSource.role,
+            onChange: (event) => { updateFilter({ role: event?.target?.value ?? "" }); },
+          }, [
+            react.createElement("option", { key: "__all_roles", value: "" }, t("sidebar.filter.allRoles")),
+            // 票据 27：value 仍是角色 id（过滤按 id 匹配），显示名优先用 roleLabel，
+            // 自定义角色因此不会被静态内置角色表过滤掉。
+            ...roles.map((role) => react.createElement("option", { key: role, value: role }, roleLabelFor(role, null) ?? role)),
+          ]),
+          react.createElement("select", {
+            className: "deg_expert_group_filter",
+            "aria-label": t("sidebar.filter.status"),
+            value: filterSource.status,
+            onChange: (event) => { updateFilter({ status: event?.target?.value ?? "" }); },
+          }, [
+            react.createElement("option", { key: "__all_statuses", value: "" }, t("sidebar.filter.allStatuses")),
+            ...STATUS_FILTER_OPTIONS.map((option) => react.createElement("option", { key: option.value, value: option.value }, option.label)),
+          ]),
+          // 票据 28：手动派发入口（新建任务 / 重放上次）与票据 26 的诊断入口都在工具条上；
+          // 三者都只读本地状态或调用已有 RPC，导出按钮的既有行为不变。
+          react.createElement("button", {
+            type: "button",
+            className: "deg_expert_group_export_button",
+            "aria-label": "新建任务",
+            title: "手动派发单专家或 fan-out 任务",
+            onClick: (event) => {
+              event?.preventDefault?.();
+              event?.stopPropagation?.();
+              openDispatch();
+            },
+          }, "新建任务"),
+          lastDispatchRef.current === null
+            ? null
+            : react.createElement("button", {
+              type: "button",
+              className: "deg_expert_group_export_button",
+              "aria-label": "重放上次派发",
+              title: "用上一次成功派发的参数再派发一次（新任务）",
+              disabled: pendingSet.current.has("dispatch-replay"),
+              onClick: (event) => {
+                event?.preventDefault?.();
+                event?.stopPropagation?.();
+                void replayLastDispatch();
+              },
+            }, "重放上次"),
+          react.createElement("button", {
+            type: "button",
+            className: "deg_expert_group_export_button",
+            "aria-label": "排队与限流诊断",
+            "aria-expanded": diagnosticsOpen,
+            onClick: (event) => {
+              event?.preventDefault?.();
+              event?.stopPropagation?.();
+              const next = diagnosticsOpen !== true;
+              setDiagnosticsOpen(next);
+              // 打开诊断时才读取 meta（挂载/轮询路径不新增请求）；已加载则直接复用。
+              if (next && metaStateRef.current === null) void loadMeta();
+            },
+          }, "诊断"),
+          react.createElement("div", { className: "deg_expert_group_export" },
+            exportButton("markdown", t("sidebar.export.markdown"), "MD"),
+            exportButton("json", t("sidebar.export.json"), "JSON")));
+      };
       const rootOpen = root === null ? true : expand(root);
+      // 根层的可见兄弟集合（票据 18）：普通/空闲成员之外，空闲分组本身也是根的一个可见子项。
+      // 过滤把空闲组整体隐藏时它**不计入** setsize/posinset，位置信息必须与用户看到的集合一致。
+      const idleGroupVisible = !(filterActive === true && visibleIdleChildren.length === 0);
+      const rootSiblingCount = visibleChildren.length + (idleGroupVisible ? 1 : 0);
       // 根行的圆点走与专家行同一条 partial 规则：轻量快照里没有活动证据的根会话渲染中性圆点，
       // 而不是「已结束」的绿色圆点；完整快照与旧宿主下与既有渲染逐字一致。
       const rootStatus = runtimeStatusOf(root, null, { partial: partialSnapshot });
@@ -7358,23 +10360,78 @@
           title: recovery.retryable === false
             ? "该原因通常需要修复持久化快照后才能恢复；点击会重新读取当前持久化快照"
             : "重新读取当前持久化快照并重跑恢复",
-          "aria-label": "重试恢复",
+          "aria-label": t("sidebar.recovery.retry"),
           "aria-busy": recoveryRetryPending || undefined,
           disabled: recoveryRetryPending,
           onClick: retryRecovery,
           // 文字按钮：进度态把文案换成「重试中…」，可见且可被辅助技术读到。
-        }, recoveryRetryPending ? "重试中…" : "重试恢复"));
+        }, recoveryRetryPending ? t("sidebar.recovery.retrying") : t("sidebar.recovery.retry")));
+      /**
+       * 错误空态（票据 13）：失败且没有任何可展示快照时，标题栏错误槽之外还要有一块**独立**的
+       * 正文占位——只留一行「暂无 Expert Group 任务」会让用户以为任务真的不存在。
+       *
+       * 三个来源共用同一块空态，但文案与 data-error-source 各自可辨：可见文案是来源短文案
+       * （与标题栏一致），细节 message 放在下面一行并以 title 提供完整内容（受 Host 限长约束）。
+       * 有缓存快照时这条空态根本不渲染：上一次的数据继续显示，错误只在标题栏提示。
+       */
+      const errorEmptyState = (panelError) => react.createElement("div", {
+        className: "deg_expert_group_empty deg_expert_group_error_empty",
+        role: "alert",
+        "data-error-source": panelError.source,
+        title: panelError.message,
+      },
+      react.createElement("div", { className: "deg_expert_group_error_empty_title" },
+        errorLabelOf(panelError.source)),
+      react.createElement("div", { className: "deg_expert_group_error_empty_detail" }, panelError.message));
       const body = viewState.loading && snapshot === null
         ? react.createElement("div", { className: "deg_expert_group_tree", "aria-busy": "true" }, react.createElement("div", { className: "deg_expert_group_skeleton" }), react.createElement("div", { className: "deg_expert_group_skeleton" }))
-        : snapshot === null
-          ? react.createElement("div", { className: "deg_expert_group_empty" }, "暂无 Expert Group 任务")
+        : snapshot === null && viewState.error !== null
+          ? errorEmptyState(viewState.error)
+          : snapshot === null
+          ? react.createElement("div", { className: "deg_expert_group_empty" }, t("sidebar.empty"))
           : react.createElement("div", { className: "deg_expert_group_tree" },
-            react.createElement("div", { className: "deg_expert_group_node deg_expert_group_node_root", "data-root": "true" },
-              react.createElement("div", { className: "deg_expert_group_row", "data-status": rootStatus, "data-expanded": true }, statusIcon(react, primitives, rootStatus), renderChevron(root, rootOpen), react.createElement("div", null, renderThreeLines(root, { sessionId: root.sessionId, parentId: null, expanded: true, trailing: rootBatchSlot }))),
-              rootOpen ? react.createElement("div", { className: "deg_expert_group_children" }, [
-                ...visibleChildren.map((node, index) => node.kind === "fanout" ? renderFanout(node, index) : renderExpert(node, index, rootSessionId)),
-                renderIdleGroup(idleChildren, idleBatchSlot),
-              ]) : null));
+            renderToolbar(),
+            // 票据 26/28：诊断区、新建任务表单与派发回执都在工具条之下、任务树之上；
+            // 三者只在对应显式状态打开时渲染，默认（没有交互）DOM 与既有面板一致。
+            renderDiagnostics(),
+            renderDispatchForm(),
+            renderDispatchReceipt(),
+            // 树语义（票据 18）：role=tree 只包住真正的树项，工具条（role=search）留在树外，
+            // 避免辅助技术把搜索框当成树的子项。aria-label 给整棵树一个稳定名称。
+            react.createElement("div", { className: "deg_expert_group_tree_items", role: "tree", "aria-label": "专家任务树" },
+            react.createElement("div", { className: "deg_expert_group_node deg_expert_group_node_root", role: "none", "data-root": "true" },
+              react.createElement("div", {
+                className: "deg_expert_group_row",
+                role: "treeitem",
+                "aria-level": 1,
+                "aria-posinset": 1,
+                "aria-setsize": 1,
+                "aria-expanded": rootOpen,
+                "data-status": rootStatus,
+                "data-expanded": rootOpen,
+              }, statusIcon(react, primitives, rootStatus), renderChevron(root, rootOpen), react.createElement("div", null, renderThreeLines(root, {
+                sessionId: root.sessionId,
+                parentId: null,
+                expanded: true,
+                trailing: rootBatchSlot,
+                // 会话节点只有 startedAt/lastActivityAt（Host 不发布会话完成时间，durationMs 为 null）。
+                metrics: renderMetrics(root, { kind: "root" }),
+              }))),
+              rootOpen ? react.createElement("div", { className: "deg_expert_group_children", role: "group" }, [
+                ...visibleChildren.map((node, index) => node.kind === "fanout"
+                  ? renderFanout(node, index, { level: 2, posinset: index + 1, setsize: rootSiblingCount })
+                  : renderExpert(node, index, rootSessionId, { level: 2, posinset: index + 1, setsize: rootSiblingCount })),
+                // 过滤期间：空闲组成员的命中才算命中；整组没有命中时不渲染空分组（由下方空态统一提示）。
+                idleGroupVisible
+                  ? renderIdleGroup(filterActive === true ? visibleIdleChildren : idleChildren, idleBatchSlot, { level: 2, posinset: visibleChildren.length + 1, setsize: rootSiblingCount })
+                  : null,
+                // 过滤无命中时的空态：只提示「没有匹配」，绝不把「零结果」伪装成「没有任务」。
+                // 根行自身命中也算有结果（它始终可见，不再叠加一条「没有匹配」的误导提示）。
+                filterActive === true && visibleChildren.length === 0 && visibleIdleChildren.length === 0
+                  && taskFilter !== null && taskFilter.matches(root) !== true
+                  ? react.createElement("div", { className: "deg_expert_group_filter_empty", role: "status" }, t("sidebar.filter.empty"))
+                  : null,
+              ].filter((node) => node !== null && node !== undefined)) : null)));
       /**
        * 标题栏「Auto」开关（紧凑、与标题同一行，不遮挡标题与行内批量控件）：
        *
@@ -7397,12 +10454,66 @@
         onChange: (event) => toggleAutoOpen(event?.target?.checked === true),
       }),
       react.createElement("span", { className: "deg_expert_group_header_auto_label" }, "Auto"));
+      /**
+       * 标题栏的状态区（票据 13）：
+       *
+       * - partial 徽标：只在 snapshot.partial === true 时出现，明确告诉用户「这份数据不完整」；
+       *   中性圆点、空闲分组等既有 partial 契约逐字不变，徽标只是把它们已经在表达的事实显式化。
+       * - 「更新于 HH:MM:SS」：只在该 root 有成功快照时出现；时间来自提交成功快照时记录的时间戳，
+       *   格式由 formatPanelUpdatedTime 集中定义（本地时区 24 小时制）。
+       * - 错误槽：按来源选择固定文案（快照读取失败 / 操作失败 / 请求失败），完整 message 只在 title。
+       * - 刷新按钮：**常驻**（不再只在错误时出现）。无错误时 aria-label="刷新"，有错误时保留
+       *   既有「重试」语义与 aria-label，两者都走同一个 retry（先清错误再刷新）。
+       */
+      const panelError = viewState.error;
+      const panelErrorLabel = panelError === null
+        ? null
+        : errorLabelOf(panelError.source);
+      const updatedTime = snapshot === null ? null : formatPanelUpdatedTime(viewState.updatedAt);
+      const partialBadge = partialSnapshot === true
+        ? react.createElement("span", {
+          className: "deg_expert_group_partial",
+          role: "status",
+          "data-partial": "true",
+          title: t("sidebar.partial.title"),
+        }, t("sidebar.partial"))
+        : null;
+      const updatedBadge = updatedTime === null
+        ? null
+        : react.createElement("span", { className: "deg_expert_group_updated", title: t("sidebar.updated.title") }, t("sidebar.updated", { time: updatedTime }));
+      const refreshLabel = panelError === null ? t("sidebar.refresh") : t("sidebar.retry");
+      const refreshButton = react.createElement("button", {
+        type: "button",
+        className: "deg_expert_group_header_action",
+        title: refreshLabel,
+        "aria-label": refreshLabel,
+        onClick: retry,
+      }, makeIcon(primitives, "IconRefreshOutlineRegular", { size: 14 }));
       return react.createElement("section", { className: "deg_expert_group", "data-version": version, "aria-label": "Expert Group" },
+        // 宽度拖拽手柄（票据 18）：只在 install 注入了写入能力时渲染，贴在面板左缘。
+        widthResizer,
+        // 任务状态播报区（票据 18）：视觉隐藏但始终存在（role=status 隐含 aria-live=polite）。
+        // 空字符串时同样保持节点存在，辅助技术才能在后续文本变化时稳定播报。
+        react.createElement("div", {
+          className: "deg_expert_group_announcer",
+          role: "status",
+          "aria-live": "polite",
+          "aria-atomic": "true",
+          "data-announcement": announcement === "" ? undefined : announcement,
+        }, announcement),
         react.createElement("header", { className: "deg_expert_group_header" },
-          react.createElement("span", { className: "deg_expert_group_header_title" }, "Expert Group"),
+          react.createElement("span", { className: "deg_expert_group_header_title" }, t("sidebar.title")),
+          partialBadge,
+          updatedBadge,
           autoOpenToggle,
-          viewState.error !== null ? react.createElement("span", { className: "deg_expert_group_error", title: viewState.error }, "快照读取失败") : null,
-          viewState.error !== null ? react.createElement("button", { type: "button", className: "deg_expert_group_header_action", title: "重试", "aria-label": "重试", onClick: retry }, makeIcon(primitives, "IconRefreshOutlineRegular", { size: 14 })) : null), recoveryBanner, body);
+          panelError === null
+            ? null
+            : react.createElement("span", {
+              className: "deg_expert_group_error",
+              "data-error-source": panelError.source,
+              title: panelError.message,
+            }, panelErrorLabel),
+          refreshButton), recoveryBanner, body);
     }
     Panel.displayName = "ExpertGroupPanel";
     return Panel;
@@ -8415,13 +11526,15 @@
       try { globalThis.clearTimeout?.(timer); } catch { /* 收口路径必须继续执行。 */ }
     };
     /**
-     * 为某个 surface 会话写入固定 20% 的右栏宽度；返回是否真的写了。
+     * 为某个 surface 会话写入右栏宽度（默认比例 = 持久化偏好，缺省 20%）；返回是否真的写了。
      *
      * 写入时机：只有该会话的 Expert Group surface 被激活（openTargets 里的当前可见会话）时才写，
      * 并且**同一会话不重复改写**——宿主里的这个值可能已经是用户拖拽或宿主自己算出的结果；
      * 视口宽度变化导致同一会话的目标 px 变化时会重写一次。
      *
-     * 20% 是精确比例：插件不做任何最小值 clamp（宿主 setRightbar 自己有 clamp，它才是权威边界）。
+     * 比例边界（票据 18）：Expert Group 页的默认比例是 20%，用户拖拽/键盘调整后以 localStorage
+     * 里的偏好为准（readStoredRightbarWidthRatio 已 clamp 到 15%–50%）；other 模式仍固定 50%。
+     * 这里不再对传入比例做二次 clamp（调用方已归一），宿主 setRightbar 自己的 clamp 仍是最终边界。
      *
      * 写入前会 best-effort 同步宿主自己那份视口缓存：宿主 clamp 用的是 AppFrame 根元素宽度，
      * 冷启动时它可能还停在旧值，会把目标宽度夹小（2560 视口写 1280，宿主按 1280 缓存夹成 896），
@@ -8433,7 +11546,7 @@
      * 且**不记账**——写入失败不算应用，后续通知仍可重试，宿主自己的默认宽度继续生效。
      * 可选的视口同步 action 缺失、读属性抛错或调用抛错都不阻断既有 setRightbar 路径。
      */
-    const applyRightbarWidth = (sessionId, ratio = RIGHTBAR_WIDTH_RATIO, force = false) => {
+    const applyRightbarWidth = (sessionId, ratio = resolveExpertRightbarWidthRatio(), force = false) => {
       if (sessionId === null || sessionId === undefined) return false;
       // 视口宽度读不到（无 DOM 环境）就没有可换算的比例：放弃写入，保留宿主当前值。
       const viewportWidth = viewportWidthOf();
@@ -8668,8 +11781,8 @@
       // 万一出现也一律不猜。
       let ratio = null;
       if (mode === "expert") {
-        // 20% 是插件独占的固定比例：视口变化与「宿主夺回宽度」两条边沿都必须重算。
-        ratio = RIGHTBAR_WIDTH_RATIO;
+        // expert 模式的比例来自持久化偏好（缺省 20%）：视口变化与「宿主夺回宽度」两条边沿都重算。
+        ratio = resolveExpertRightbarWidthRatio();
       } else if (mode === "other") {
         // other 是可调模式，**只认视口变化这一条边沿**：
         // - 宿主夺回宽度（面板宽度 != 插件 target）在 other 模式里恰恰是「用户拖过一次」的
@@ -8680,9 +11793,9 @@
         if (ownership === null || ownership.matches !== true) return false;
         ratio = OTHER_RIGHTBAR_WIDTH_RATIO;
       } else if (mode === null && (isWidthPrepared(sessionId) || isWidthActive(sessionId))) {
-        // prepared / active 只由**成功的 20% 写入**置位（openTargets 预置，或 confirmed 分支 /
-        // 事务收口时按 20% 恢复成功），因此它们证明的模式就是 expert；这里绝不据此推断 50%。
-        ratio = RIGHTBAR_WIDTH_RATIO;
+        // prepared / active 只由**成功的 expert 比例写入**置位（openTargets 预置，或 confirmed 分支 /
+        // 事务收口时按偏好恢复成功），因此它们证明的模式就是 expert；这里绝不据此推断 50%。
+        ratio = resolveExpertRightbarWidthRatio();
       }
       if (ratio === null) return false;
       // 写入判据与 confirmed 分支**共用**同一份有界预算（见 recoverRightbarWidth）：视口变化本身不再
@@ -9466,7 +12579,7 @@
       const shouldPrepareWidth = expertPageCanOwnWidth && (widthSurfaceChanged
         || isWidthActive(current)
         || !rightbarWidths.has(current));
-      if (shouldPrepareWidth && applyRightbarWidth(current, RIGHTBAR_WIDTH_RATIO, widthSurfaceChanged)) {
+      if (shouldPrepareWidth && applyRightbarWidth(current, resolveExpertRightbarWidthRatio(), widthSurfaceChanged)) {
         // 归属已由写入路径接管（applyRightbarWidth → claimRightbarWidthOwnership）。
         // 只有本次确实写入才标记 prepared；把 Map 里的旧目标当作“刚写过”会漏掉
         // 「其它分页改宽 → 返回 Expert Group」这条必须强制恢复 20% 的进入边沿。
@@ -9537,7 +12650,8 @@
      * 右栏拖拽手柄锁的重估实现（在 install 末尾接线，早于 subscribeSessions 的首次通知）。
      *
      * 判定只用宿主公开读面：**当前可见会话**的活跃 tab 必须是 Expert Group。
-     * - "confirmed"：锁住 [data-side=rightbar]，用户在这一页上拖不动右栏；
+     * - "confirmed"：不锁 [data-side=rightbar]（票据 18：用户必须能拖拽并记住宽度）；
+     *   只有首次分栏事务在途时才锁，事务提交/取消后立刻解锁；
      * - "other" / "missing"：用户在别的右侧分页或没有活跃 tab → 立刻解锁并还原样式；
      * - "unknown"（旧宿主没有 active() 读面等）：无法证明当前页就是 Expert Group，
      *   按兼容处理**不解锁也不加锁**——保持上一次已确认的状态，绝不误伤其它页面。
@@ -9572,9 +12686,12 @@
         try { cancelSidebarSplit(transaction.token, { reason: "session-switched" }); } catch { /* 后续同步仍会重估。 */ }
       }
       if (rightbarSplitTransactions.has(current)) {
-        // split → openTabs/DOM 提交期间保持 50% 且不锁手柄；guide-only 不足以结算。
+        // 首次分栏事务期间**锁住宿主手柄**（票据 18）：这段窗口里宽度由事务独占（临时 50%），
+        // 用户拖拽只会和事务的“split → openResource → 提交证据 → 收口”竞争同一个全局宽度。
+        // 事务提交/取消后立刻解锁（见 commitSidebarSplit / cancelSidebarSplit），因此锁只覆盖
+        // 这一次过渡；guide-only 不足以结算，deadline 会兜底收口。
         // 只对本会话成立：别的会话的在途事务不阻塞本会话的宽度/手柄判定。
-        rightbarDragLock.setLocked(false);
+        rightbarDragLock.setLocked(true);
         return;
       }
       const activeEvidence = activeTabEvidenceOf(current);
@@ -9593,16 +12710,16 @@
         return;
       }
       if (evidence === "confirmed") {
-        // openTargets 已在同一同步栈为这个 surface 成功预置过 20% 时，只消费 prepared 标记；
-        // 否则这是从其它可调分页重新进入 Expert Group，必须强制恢复 20%。只有宽度已经成功
-        // 落到宿主（本轮 prepared 或此前 active）才允许提交 expert 模式并锁手柄。
+        // openTargets 已在同一同步栈为这个 surface 成功预置过偏好比例时，只消费 prepared 标记；
+        // 否则这是从其它可调分页重新进入 Expert Group，必须强制恢复偏好比例。只有宽度已经成功
+        // 落到宿主（本轮 prepared 或此前 active）才允许提交 expert 模式。
         // prepared / active 只按当前 sessionId 读取：别的会话的记账绝不参与判定。
         const prepared = isWidthPrepared(current);
         const alreadyActive = isWidthActive(current);
         let widthReady = prepared || alreadyActive;
         if (!widthReady) {
           // 归属由写入路径接管（applyRightbarWidth → claimRightbarWidthOwnership）。
-          widthReady = applyRightbarWidth(current, RIGHTBAR_WIDTH_RATIO, true);
+          widthReady = applyRightbarWidth(current, resolveExpertRightbarWidthRatio(), true);
         } else {
           const viewportChanged = rightbarWidthViewportChanged(current) === true;
           // 一次面板读数同时给出 matches / differs 两份结论（见 rightbarOwnershipOf）。
@@ -9615,9 +12732,9 @@
             // 1. 窗口最大化 / 全屏 / 拖拽改变了视口：20% 是**视口比例**，必须按新视口重新换算并写入，
             //    否则右栏会一直停在最大化之前那份旧像素宽度上（1600 写 320，3200 仍是 320）；
             // 2. **宿主夺回了那份 px**：DSH 重启后宿主从持久化布局恢复它自己那份旧值，而这份恢复
-            //    晚于插件的首次写入（视口一直没变）。Expert Group 页的手柄被插件锁住、20% 又是插件
-            //    独占比例，因此「面板宽度不再等于插件 target」就是宿主夺回所有权的可验证证据，必须
-            //    把 20% 重新写回去，否则用户看到的是「重启后右栏从 640 缩到 320」。
+            //    晚于插件的首次写入（视口一直没变）。Expert Group 页的宽度是插件的持久化偏好，
+            //    因此「面板宽度不再等于插件 target」就是宿主夺回所有权的可验证证据，必须把偏好
+            //    重新写回去，否则用户看到的是「重启后右栏从 640 缩到 320」。
             // 两条判据都为假时一个字节都不写：同一视口的重复通知仍然保持原有去重语义。
             //
             // 写入许可与 recomputeOwnedWidth（unknown 分支）**共用**同一份有界预算：视口变化不再是
@@ -9628,13 +12745,16 @@
             // 这条边沿同样要过证据关：面板宽度读不出来（ownership 为 null）时 recoverRightbarWidth
             // 直接 fail-closed——即使视口真的变了，这里也一个字节都不写（读面不可用期间没有任何证据
             // 说明面板宽度偏离了 target，写下去就是无据改写宿主那份**全局**宽度偏好）。
-            recoverRightbarWidth(current, RIGHTBAR_WIDTH_RATIO, ownership);
+            recoverRightbarWidth(current, resolveExpertRightbarWidthRatio(), ownership);
           }
         }
         setWidthPrepared(current, false);
         setWidthActive(current, widthReady);
         setWidthMode(current, widthReady ? "expert" : null);
-        rightbarDragLock.setLocked(widthReady);
+        // Expert Group 页默认**不锁**宿主手柄（票据 18）：右栏宽度必须允许用户拖拽，
+        // 偏好由面板自己的拖拽手柄写入 localStorage（见 applyRightbarWidthRatio）。
+        // 只有首次分栏事务那一小段窗口才锁（见上面的 rightbarSplitTransactions 分支）。
+        rightbarDragLock.setLocked(false);
         return;
       }
       if (evidence === "missing") {
@@ -9784,7 +12904,9 @@
       // 归属已由写入路径接管（applyRightbarWidth → claimRightbarWidthOwnership）。
       clearRightbarWidthMarks(sessionId);
       setWidthMode(sessionId, "split-pending");
-      try { rightbarDragLock.setLocked(false); } catch { /* 临时解锁失败不阻断公开 split；同步会继续收口。 */ }
+      // 事务一开始就锁住宿主手柄（票据 18）：这一次过渡里宽度由插件独占（临时 50%），
+      // 用户拖拽会和 split/openResource 的提交证据竞争同一个全局宽度。提交/取消后立刻解锁。
+      try { rightbarDragLock.setLocked(true); } catch { /* 锁定失败不阻断公开 split；同步会继续重估。 */ }
       try {
         transaction.deadlineTimer = globalThis.setTimeout(() => {
           // 迟到的 deadline 只收口**仍然在途的自己那一条**：已被 commit/cancel 收口的 token 查不到
@@ -9854,12 +12976,13 @@
         if (current === null) {
           // 终止边沿（没有任何可见 surface 接手）：宿主那份全局宽度只能由这里收口，
           // 否则会长期停留在事务期间的临时 50%。恢复的是旧事务会话自己的 20%。
-          const restored = applyRightbarWidth(transaction.sessionId, RIGHTBAR_WIDTH_RATIO, true);
+          const restored = applyRightbarWidth(transaction.sessionId, resolveExpertRightbarWidthRatio(), true);
           claimRightbarWidthOwnership(transaction.sessionId);
           setWidthPrepared(transaction.sessionId, restored === true);
           setWidthActive(transaction.sessionId, restored === true);
           setWidthMode(transaction.sessionId, restored === true ? "expert" : null);
-          try { rightbarDragLock.setLocked(restored === true); } catch { /* 后续同步重估。 */ }
+          // 事务收口（终止边沿）：锁必须立刻交还宿主；恢复宽度成功与否都由后续同步重估。
+          try { rightbarDragLock.setLocked(false); } catch { /* 后续同步重估。 */ }
           return true;
         }
         // 可见 surface 已切到**另一会话**：只清理这个被切走的事务和它自己的 transient 记账，
@@ -9884,11 +13007,12 @@
       const shouldRestoreExpert = transaction.previousMode === "expert" || composition === "confirmed";
       if (shouldRestoreExpert) {
         // 归属已由写入路径接管（applyRightbarWidth → claimRightbarWidthOwnership）。
-        const restored = applyRightbarWidth(transaction.sessionId, RIGHTBAR_WIDTH_RATIO, true);
+        const restored = applyRightbarWidth(transaction.sessionId, resolveExpertRightbarWidthRatio(), true);
         setWidthPrepared(transaction.sessionId, restored === true);
         setWidthActive(transaction.sessionId, restored === true);
         setWidthMode(transaction.sessionId, restored === true ? "expert" : null);
-        try { rightbarDragLock.setLocked(restored === true); } catch { /* 后续同步重估。 */ }
+        // 事务已收口：解锁，用户重新获得拖拽能力（偏好写入由面板手柄负责）。
+        try { rightbarDragLock.setLocked(false); } catch { /* 后续同步重估。 */ }
       } else {
         // 还原的只是本会话自己的前态（别的会话的记账与它无关）。
         setWidthPrepared(transaction.sessionId, false);
@@ -9910,6 +13034,28 @@
       markSidebarSplitOpen,
       commitSidebarSplit,
       cancelSidebarSplit,
+      /**
+       * 宽度偏好的两个注入点（票据 18）：面板只提出「想改成多少」，真实写入与持久化都在这里。
+       *
+       * - 写入前先 clamp 并（按需）落盘；存储不可用不影响本次生效；
+       * - 分栏事务进行中时宽度由事务独占（临时 50%）：只记偏好，不写宿主，避免拖拽与事务
+       *   互相覆盖；事务收口后的下一次同步会按新偏好重算；
+       * - 写入成功后把本会话标记为 expert 模式并接管所有权，后续视口变化仍按同一偏好重算。
+       */
+      readRightbarWidthRatio: resolveExpertRightbarWidthRatio,
+      applyRightbarWidthRatio: (ratio, options = {}) => {
+        const clamped = clampRightbarWidthRatio(ratio);
+        if (clamped === null) return null;
+        if (options.persist === true) storeRightbarWidthRatio(clamped);
+        const sessionId = currentSurfaceSessionId();
+        if (sessionId === null) return clamped;
+        if (rightbarSplitTransactions.has(sessionId)) return clamped;
+        if (applyRightbarWidth(sessionId, clamped, true) !== true) return clamped;
+        setWidthPrepared(sessionId, false);
+        setWidthActive(sessionId, true);
+        setWidthMode(sessionId, "expert");
+        return clamped;
+      },
     });
 
     const unsubscribe = subscribeSessions({ ...config, sessions }, ctx, openTargets);

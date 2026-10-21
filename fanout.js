@@ -28,6 +28,11 @@
  *    派发一个 shard 必须同时满足「任务自身 running < 任务级上限」与「role 共享 running <
  *    role 池上限」。若只按单层覆盖，低任务级上限的父任务会被其它父任务占用的 role 槽位
  *    饿死，而高任务级上限的父任务又能单任务越过 role 共享池。
+ *    - provider 级 providerLimits（票据 26，{provider: 0..64}，0/未设置 = 不限制）：
+ *      统计该 provider 下**所有**父任务的 running 分片数，名额只在分片真正进入 running
+ *      时占用，排队不占名额也不预留；判定顺序固定为「先 provider、后 role」，释放顺序
+ *      相反（分片终态时同时归还两个池），因此不存在交叉等待导致死锁的可能。任务没有
+ *      provider 归属（角色未配置主模型）时不进入任何 provider 池。
  *    角色级/default 两层描述"该角色的共享并发池"，可以注入解析函数并按当前设置动态
  *    取值（设置页保存后立即约束后续派发）；任务级显式限制会随任务快照固化，恢复后不变。
  *    并发来源优先级：当前设置解析值（live）> 快照中的显式角色级映射 > 安全默认值。
@@ -94,7 +99,11 @@ import {
   measureJsonBytes,
   measureUtf8Bytes,
 } from "./resource-budget.js";
-import { describeSubagentCapacityFailure } from "./shared.js";
+import {
+  MODEL_ROUTE_ERROR_CODES,
+  classifyModelRouteError,
+  describeSubagentCapacityFailure,
+} from "./shared.js";
 
 /** per-role 并发上限的默认值。 */
 export const DEFAULT_CONCURRENCY_LIMIT = 10;
@@ -102,6 +111,25 @@ export const DEFAULT_CONCURRENCY_LIMIT = 10;
 export const MIN_CONCURRENCY_LIMIT = 1;
 /** per-role 并发上限的上界。 */
 export const MAX_CONCURRENCY_LIMIT = 64;
+/**
+ * provider 级并发上限的下界（0 = 不限制）。
+ *
+ * 与 role 级上限不同，provider 上限允许多一个「0」取值：规格书把 0 定义为
+ * 「显式不限制」，用于表达「这里没有名额约束」，而不是「配置缺失」。
+ */
+export const MIN_PROVIDER_LIMIT = 0;
+/** provider 并发上限的上界：与 role 级共享同一个数量级上界。 */
+export const MAX_PROVIDER_LIMIT = MAX_CONCURRENCY_LIMIT;
+/**
+ * 限流预计等待（etaMs）所需的最小历史样本数。
+ *
+ * 样本来自「一次限流窗口 → 真正派发成功」的时长。单一样本噪声太大，不足以支撑
+ * 一个用户可以据此安排工作的数字，因此少于该数量时诊断必须显式返回 null +
+ * etaSource:"unknown"，绝不伪造精确等待时间。
+ */
+export const THROTTLE_ETA_MIN_SAMPLES = 2;
+/** 限流统计的键上界：角色/provider 键来自设置，仍必须有界，避免诊断面无限增长。 */
+export const THROTTLE_STATS_LIMIT = 128;
 
 /**
  * 回收进行中的统一拒绝码（Host/RPC/客户端与测试共用，避免字符串漂移）。
@@ -113,6 +141,19 @@ export const RECLAIM_IN_PROGRESS_CODE = "RECLAIM_IN_PROGRESS";
 
 /** 已回收任务的迟到回调统一拒绝码（结构化 no-op，不复活任务）。 */
 export const TASK_RECLAIMED_CODE = "TASK_RECLAIMED";
+
+/**
+ * 派发前 provider 路由改变的统一拒绝码（票据 26 与票据 24 的交叉边界）。
+ *
+ * 为什么需要它：任务的 provider 归属在**提交时**固化（用于 provider 级并发名额），
+ * 而候选 fallback 可能在 admission 时解析出另一个 provider。若二者不一致，继续启动
+ * child 就会把运行名额记到错误的 provider 名下（provider A 未被占用、provider B 却超发），
+ * 因此必须 fail-closed 拒绝本次 admission，让任务以稳定原因失败，而不是悄悄错记名额。
+ *
+ * Host 的 buildRequest 抛出本码；fanout.js 的启动错误归一保留该码与固定文案，
+ * 不把 provider/模型配置或原始错误正文写进事件历史。
+ */
+export const PROVIDER_ROUTE_CHANGED = "PROVIDER_ROUTE_CHANGED";
 
 /** 单次显式回收的父任务数上限：与 maxTasks 同源（不允许一次回收超过容量本身）。 */
 export const MAX_RECLAIM_BATCH = FANOUT_BUDGET.maxTasks;
@@ -516,6 +557,20 @@ function toShardError(error, fallbackMessage) {
   return { name: "Error", message: String(error) };
 }
 
+/**
+ * 该错误是否是 provider 限流（429 / rate limit / 配额）。
+ *
+ * 复用 shared.js 的唯一分类器，不在这里写第二套正则：路由层与 fanout 层的
+ * 「什么算限流」必须同源，否则会出现「路由不肯降级、fanout 却把它当普通失败」的裂缝。
+ *
+ * @param {unknown} error - 启动/admission/completion 的原始错误。
+ * @returns {boolean}
+ */
+function isProviderRateLimitedError(error) {
+  if (error === null || typeof error !== "object") return false;
+  return classifyModelRouteError(error) === MODEL_ROUTE_ERROR_CODES.PROVIDER_RATE_LIMITED;
+}
+
 /** 把任意启动结果规范化为结构化错误。 */
 function normalizeLaunchError(error) {
   // 容量耗尽：用户看到可读提示（等待子代理完成 / 继续使用现有子代理），
@@ -523,6 +578,46 @@ function normalizeLaunchError(error) {
   const capacity = describeSubagentCapacityFailure(error);
   if (capacity !== undefined) {
     return { name: "SubagentCapacityError", code: capacity.code, message: capacity.message };
+  }
+  /**
+   * provider 限流（票据 26）：给出稳定原因码，且**不**伪装成可 fallback 的预检错误。
+   *
+   * 两阶段策略都要求不换候选：
+   * - 派发前名额已满 → 由调度器的 provider 名额排队承担（根本不进入本函数）；
+   * - 运行中/启动时的 429 → 由宿主请求级退避重试处理，重试耗尽后 attempt 失败；
+   *   这里只负责把失败归一成可检索的原因码，供 RPC/侧栏/诊断区分「限流」与「未知失败」。
+   *
+   * 不携带 provider/model 或原始错误正文：错误会进事件历史与快照，限流正文常含
+   * 请求 id 与配额细节，属于不应落盘的外部负载。
+   */
+  if (isProviderRateLimitedError(error)) {
+    return {
+      name: "ProviderRateLimitedError",
+      code: MODEL_ROUTE_ERROR_CODES.PROVIDER_RATE_LIMITED,
+      reason: "provider_rate_limited",
+      // retryable 只表达「这是一次可退避重试的失败」，不表示插件会自动重试。
+      retryable: true,
+      message: "provider 返回 429/限流：由宿主退避重试处理，本 attempt 不切换模型",
+    };
+  }
+  /**
+   * provider 路由在派发前改变（票据 24 fallback × 票据 26 provider 名额）。
+   *
+   * Host 的 buildRequest 已按提交时固化的 provider 做过一致性校验；这里只负责把
+   * 结构化错误投影进 attempt 快照，**保留稳定 code**（普通 Error 的 name/message
+   * 投影会丢掉自定义 code，诊断就只能看到一个普通启动失败）。
+   *
+   * 不携带任务/provider/model 配置与原始错误正文：错误会进入事件历史与快照。
+   */
+  if (error?.code === PROVIDER_ROUTE_CHANGED) {
+    return {
+      name: "ProviderRouteChangedError",
+      code: PROVIDER_ROUTE_CHANGED,
+      reason: "provider_route_changed",
+      // 不可重试：重新解析同一个任务仍可能得到不同 provider，必须由调用方重新提交。
+      retryable: false,
+      message: "fan-out provider 路由在派发前发生变化：任务提交时固化的 provider 与实际解析不一致，已拒绝启动 child",
+    };
   }
   if (error instanceof Error) {
     return toShardError({ name: error.name, message: error.message, stack: error.stack }, "shard 启动失败");
@@ -586,6 +681,55 @@ export function validateConcurrencyLimit(value) {
  * @param {Record<string, number>} [roleLimits]
  * @returns {Record<string, number>}
  */
+/**
+ * 校验 provider 级并发上限：0（不限制）或 1~64 的整数。
+ *
+ * 与 validateConcurrencyLimit 的差别只有一个：0 是合法值。用独立函数而不是给
+ * 旧函数加参数，是为了让「任务/角色上限不允许 0」这条既有契约保持逐字不变。
+ *
+ * @param {unknown} value - 待校验值。
+ * @returns {{ok:boolean, value?:number, code?:string, message?:string}}
+ */
+export function validateProviderLimit(value) {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    return { ok: false, code: "INVALID_PROVIDER_LIMIT", message: "providerLimits 必须是 " + MIN_PROVIDER_LIMIT + "~" + MAX_PROVIDER_LIMIT + " 的整数" };
+  }
+  if (value < MIN_PROVIDER_LIMIT || value > MAX_PROVIDER_LIMIT) {
+    return { ok: false, code: "INVALID_PROVIDER_LIMIT", message: "providerLimits 必须在 " + MIN_PROVIDER_LIMIT + "~" + MAX_PROVIDER_LIMIT + " 之间" };
+  }
+  return { ok: true, value };
+}
+
+/**
+ * 把 providerLimits 配置规范化为干净的 provider -> limit 映射（票据 26）。
+ *
+ * 语义与 normalizeRoleLimits 一致：函数形式原样透传（每次派发读一次当前设置），
+ * 静态映射逐条校验，非法条目抛错而不是静默降级成「不限制」——把写错的凭据式
+ * 配置悄悄放开是比启动失败更糟的故障。
+ *
+ * @param {Record<string, number>|Function} [providerLimits] - provider 级上限映射。
+ * @returns {Record<string, number>|Function}
+ */
+export function normalizeProviderLimits(providerLimits) {
+  if (providerLimits === undefined || providerLimits === null) return {};
+  if (typeof providerLimits === "function") return providerLimits;
+  if (typeof providerLimits !== "object" || Array.isArray(providerLimits)) {
+    throw new FanoutValidationError("INVALID_PROVIDER_LIMITS", "providerLimits 必须是 provider -> limit 的映射", { field: "providerLimits" });
+  }
+  const normalized = {};
+  for (const [provider, limit] of Object.entries(providerLimits)) {
+    if (provider.trim().length === 0) {
+      throw new FanoutValidationError("INVALID_PROVIDER_LIMITS", "providerLimits 的 provider 键必须是非空字符串", { field: "providerLimits" });
+    }
+    const check = validateProviderLimit(limit);
+    if (!check.ok) {
+      throw new FanoutValidationError("INVALID_PROVIDER_LIMITS", "providerLimits." + provider + " 非法: " + check.message, { field: "providerLimits." + provider });
+    }
+    normalized[provider] = limit;
+  }
+  return normalized;
+}
+
 export function normalizeRoleLimits(roleLimits) {
   if (roleLimits === undefined || roleLimits === null) return {};
   // 函数形式是"每次新建父任务时读取当前 settings"的解析回调（见 createFanoutManager）。
@@ -806,6 +950,27 @@ export function validateSubmitInput(input) {
   if (!taskTimeoutVerdict.ok) return taskTimeoutVerdict;
   const timeoutMs = taskTimeoutVerdict.value;
 
+  /**
+   * 任务级 provider 归属（票据 26 背压）。
+   *
+   * 由组合根在提交前按「会话覆盖优先、其次全局默认」解析出主选择的 provider 传入，
+   * 用来建立 provider 级并发计数（同一任务的所有 running 分片都记到该 provider 名下）。
+   *
+   * 缺失是**合法**的：角色尚未配置主模型时无法确定 provider，此时 provider 限流不
+   * 生效，但角色级/任务级限流照常生效（绝不因为无法归属就把任务拒绝）。
+   *
+   * 已知边界（规格书记录）：候选 fallback 可能在启动时换成别的 provider，本期仍按
+   * 任务提交时的主 provider 记账，不按每次 admission 的实际 provider 重新分摊——
+   * 那会需要「运行中迁移名额」的额外语义，属于后续票据范围。
+   */
+  let provider;
+  if (raw.provider !== undefined && raw.provider !== null) {
+    if (typeof raw.provider !== "string" || raw.provider.trim().length === 0) {
+      return { ok: false, code: "INVALID_PROVIDER", message: "provider 必须是非空字符串", field: "provider" };
+    }
+    provider = raw.provider.trim();
+  }
+
   let requestId;
   if (raw.requestId !== undefined && raw.requestId !== null) {
     if (typeof raw.requestId !== "string" || raw.requestId.trim().length === 0) {
@@ -822,6 +987,7 @@ export function validateSubmitInput(input) {
     ...(requestId === undefined ? {} : { requestId }),
     ...(concurrencyLimit === undefined ? {} : { concurrencyLimit }),
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(provider === undefined ? {} : { provider }),
     allowOverlap: raw.allowOverlap === true,
   };
 }
@@ -902,6 +1068,10 @@ function budgetVerdict(resource, limit, receivedBytes, field, hint, extra) {
  * @param {Record<string, number>|Function} [options.roleLimits] - role 级并发上限覆盖；函数形式
  *   返回 {role: limit}，缺失 role 落到默认值。函数返回值里的非法条目一律回退默认值，
  *   绝不让 scheduler 拿到 NaN/负数/越界值。
+ * @param {Record<string, number>|Function} [options.providerLimits] - provider 级并发上限
+ *   （票据 26）：{provider: 1..64}；0 或缺失表示不限制。函数形式按「每次派发读一次当前
+ *   设置」解析，用途与 concurrencyLimit/roleLimits 相同（设置保存后立即约束后续派发）。
+ *   名额只在分片真正进入 running 时占用，排队不占名额、也不做预留。
  * @param {number|Function} [options.roleTimeoutMs] - 角色级默认超时（毫秒，票据 06）。
  *   传函数时按「每次新建 attempt 读一次当前 settings」动态解析（Host 用它接入
  *   settings.roleTimeoutMs）；0 表示角色级显式禁用。优先级：shard 显式 > 父任务默认
@@ -922,6 +1092,7 @@ export function createFanoutManager(options = {}) {
     conflictChecker: injectedConflictChecker,
     conflictObserver,
     roleLimits: rawRoleLimits,
+    providerLimits: rawProviderLimits,
     concurrencyLimit: rawConcurrencyLimit,
     roleTimeoutMs: rawRoleTimeoutMs,
     stopGraceMs: rawStopGraceMs,
@@ -1017,11 +1188,21 @@ export function createFanoutManager(options = {}) {
   let lastResolvedDefaultConcurrencyLimit = defaultConcurrencyLimit;
   let roleLimits = normalizeRoleLimits(rawRoleLimits);
   /**
+   * provider 级映射（票据 26）：与 roleLimits 完全同构的来源模型。
+   * 函数形式 = live（每次派发读当前 settings）；静态映射 = snapshot（恢复时被快照替换）。
+   */
+  let providerLimits = normalizeProviderLimits(rawProviderLimits);
+  /**
    * 恢复出来的显式角色级映射，仅当构造时 roleLimits 是 live 解析函数时作为第二层
    * 回退：当前 settings 解析值 > 快照显式映射 > 安全默认值。静态 roleLimits 不走这里
    * （restore 直接替换静态映射，保持既有语义）。
    */
   let restoredRoleLimitOverrides = Object.freeze({});
+  /**
+   * 恢复出来的显式 provider 级映射：与 restoredRoleLimitOverrides 同构，
+   * 只在 live provider 解析函数没有给出该 provider 的合法值时补位。
+   */
+  let restoredProviderLimitOverrides = Object.freeze({});
   /**
    * 解析函数返回非法值时的诊断：按 kind 分别保存，**解析成功后清除对应条目**。
    *
@@ -1138,6 +1319,18 @@ export function createFanoutManager(options = {}) {
    */
   const runningCountsByTask = new Map();
   /**
+   * provider 共享池的 running 计数（票据 26）：provider -> 该 provider 下**所有**父任务
+   * 的 running 分片数。
+   *
+   * 与 runningCountsByRole 同源同点更新（唯一调用点 addRunningCount）：provider 是跨
+   * 角色的共享资源，多个角色可能同时打爆同一 provider，因此不能按 role 聚合，也不能
+   * 复用任务级计数。只统计**任务级 provider 归属**（task.provider）下的 running 分片；
+   * 没有归属的任务不进入任何 provider 池（provider 限流对它们不生效）。
+   *
+   * 该索引是派生状态：restore 时由 rebuildIndexes() 从 tasks 重建，不写入快照。
+   */
+  const runningCountsByProvider = new Map();
+  /**
    * 影响范围索引（票据 07）：key 使用 **attempt 对象身份**，而不是 shard。
    *
    * 为什么必须按 attempt：超时/取消的旧 attempt 可能仍未停止，此时 shard 已经允许重试；
@@ -1177,6 +1370,17 @@ export function createFanoutManager(options = {}) {
   const subscribers = new Set();
   /** 每个 role 的派发轮转游标，用于父任务间公平轮转。 */
   const rotationCursors = new Map();
+  /**
+   * 限流统计（票据 26）：kind(role|provider) -> 键 -> 时间戳与历史等待样本。
+   *
+   * 只服务诊断：名额是否可用始终由 running 计数与 limits 决定，这里的历史平均**不**
+   * 参与任何调度决策。样本定义是「一次限流窗口开始（第一次被挡住）→ 该键下真正派发
+   * 成功」的墙钟时长；少于 THROTTLE_ETA_MIN_SAMPLES 时不提供 etaMs。
+   */
+  const throttleStats = {
+    role: new Map(),
+    provider: new Map(),
+  };
 
   let sequence = 0;
   let nextTaskNumber = 0;
@@ -1709,7 +1913,7 @@ export function createFanoutManager(options = {}) {
    * 事件负载只含 kind / 来源 / 回退值：不含设置原文、原始返回值或任何会话数据，避免
    * 把 journald/事件历史变成敏感信息泄露面。
    *
-   * @param {"concurrencyLimit"|"roleLimits"} kind - 非法值的解析路径。
+   * @param {"concurrencyLimit"|"roleLimits"|"providerLimits"} kind - 非法值的解析路径。
    * @param {unknown} value - 原始返回值（只取类型，不落盘）。
    * @param {string} [message] - 覆盖默认诊断文案（按 kind 或"含非法条目"区分）。
    */
@@ -1720,7 +1924,9 @@ export function createFanoutManager(options = {}) {
       valueType: value === null ? "null" : typeof value,
       message: message ?? (kind === "concurrencyLimit"
         ? "settings 解析出的并发上限不是 1~" + MAX_CONCURRENCY_LIMIT + " 的整数，已回退默认值 " + DEFAULT_CONCURRENCY_LIMIT
-        : "settings 解析出的 roleLimits 不是 role -> limit 映射，已忽略全部角色级覆盖"),
+        : kind === "providerLimits"
+          ? "settings 解析出的 providerLimits 不是 provider -> limit 映射，已忽略全部 provider 级覆盖"
+          : "settings 解析出的 roleLimits 不是 role -> limit 映射，已忽略全部角色级覆盖"),
     });
     lastInvalidLimitKind = kind;
     if (!firstObservation) return;
@@ -1728,7 +1934,11 @@ export function createFanoutManager(options = {}) {
       type: "concurrency_limit_fallback",
       kind,
       source: "fallback",
-      fallback: kind === "concurrencyLimit" ? DEFAULT_CONCURRENCY_LIMIT : "role-default",
+      // 回退目标必须与真实调度行为一致：默认上限回退数值，role 映射回退默认值，
+      // provider 映射回退"不限制"（0 语义），否则诊断会撒谎。
+      fallback: kind === "concurrencyLimit"
+        ? DEFAULT_CONCURRENCY_LIMIT
+        : (kind === "providerLimits" ? "provider-unlimited" : "role-default"),
     });
   }
 
@@ -1847,6 +2057,86 @@ export function createFanoutManager(options = {}) {
   }
 
   /**
+   * 解析 provider 级覆盖（票据 26）：与 resolveRoleLimits 同一套来源模型。
+   *
+   * - live 解析函数每次调用都重新读取当前设置（设置保存后立即约束后续派发）；
+   * - 结构非法时整体忽略 live 覆盖并记录一次性诊断；
+   * - 单个 provider 的非法值只让该 provider 回退到快照映射/不限制；
+   * - 合法的 0 必须原样保留：它表示「显式不限制」，不能与「未配置」混淆——
+   *   虽然两者调度上等价，但诊断必须如实投影用户写了什么。
+   *
+   * @returns {Readonly<Record<string, number>>} provider -> 0..64 的冻结映射。
+   */
+  function resolveProviderLimits() {
+    if (typeof providerLimits !== "function") return providerLimits;
+    let raw;
+    let liveUnavailable = false;
+    try {
+      raw = providerLimits();
+    } catch {
+      // 解析函数读的是外部 settings：异常只允许降级，不能让调度抛错。
+      noteInvalidDynamicLimit("providerLimits", undefined);
+      liveUnavailable = true;
+      raw = undefined;
+    }
+    const normalized = {};
+    if (!liveUnavailable) {
+      if (raw === undefined || raw === null) {
+        // 没有 live 覆盖不是"非法值"：清除诊断，由快照映射/不限制兜底。
+        clearInvalidDynamicLimit("providerLimits");
+      } else if (typeof raw !== "object" || Array.isArray(raw)) {
+        noteInvalidDynamicLimit("providerLimits", raw);
+      } else {
+        let invalidEntry = false;
+        for (const [provider, limit] of Object.entries(raw)) {
+          const check = validateProviderLimit(limit);
+          if (check.ok && provider.trim().length > 0) normalized[provider] = check.value;
+          else invalidEntry = true;
+        }
+        if (invalidEntry) {
+          noteInvalidDynamicLimit(
+            "providerLimits",
+            raw,
+            "settings 解析出的 providerLimits 含非法条目，已忽略这些 provider 级覆盖",
+          );
+        } else {
+          clearInvalidDynamicLimit("providerLimits");
+        }
+      }
+    }
+    // 第二层：恢复出来的显式 provider 级映射，只在 live 没有给出合法值时补位。
+    for (const [provider, limit] of Object.entries(restoredProviderLimitOverrides)) {
+      if (typeof normalized[provider] === "number") continue;
+      const check = validateProviderLimit(limit);
+      if (check.ok) normalized[provider] = check.value;
+    }
+    return Object.freeze(normalized);
+  }
+
+  /**
+   * 某个任务生效的 provider 名额上限；undefined 表示不受 provider 限流约束。
+   *
+   * 语义（票据 26）：
+   * - 任务没有 provider 归属（角色未配置主模型）→ undefined（不限制）；
+   * - provider 未配置、显式 0 → undefined（不限制）；
+   * - 1..64 → 该 provider 的并发名额。
+   *
+   * 接收**已解析**的 provider 映射而不是自己再读一次设置：调度热路径一轮只解析一次，
+   * 避免每个候选分片都重复遍历设置对象。
+   *
+   * @param {object} task - 父任务。
+   * @param {Readonly<Record<string, number>>} resolved - 本轮解析出的 provider -> limit。
+   * @returns {number|undefined}
+   */
+  function providerLimitOf(task, resolved) {
+    const provider = typeof task?.provider === "string" ? task.provider : "";
+    if (provider.length === 0) return undefined;
+    const configured = resolved[provider];
+    if (typeof configured !== "number" || configured <= 0) return undefined;
+    return configured;
+  }
+
+  /**
    * 快照里对外暴露的单个任务"有效并发上限"，仅供展示与契约稳定使用。
    *
    * 三级优先级：任务级显式 concurrencyLimit（submit 入参，或快照恢复出来的任务级值）
@@ -1902,20 +2192,28 @@ export function createFanoutManager(options = {}) {
   function concurrencyLimits() {
     const state = resolveDefaultConcurrencyLimitState();
     const roles = resolveRoleLimits();
+    // provider 级映射（票据 26）与 role 级同源同点解析：诊断必须与调度读到同一份值。
+    const providers = resolveProviderLimits();
+    // invalid 必须在两次解析之后取：任一解析路径都可能刷新最近一次非法诊断。
     const invalid = invalidLimitSnapshot();
     return Object.freeze({
       default: state.value,
       roles: Object.freeze({ ...roles }),
+      providers: Object.freeze({ ...providers }),
       source: state.source,
       ...(invalid === null ? {} : { invalid }),
     });
   }
 
   /**
-   * 同步一个 shard 的 running 归属：role 共享池计数与父任务自身计数一起增减。
+   * 同步一个 shard 的 running 归属：role 共享池、父任务自身与 provider 三个计数一起增减。
    *
-   * 两个计数必须同源同点更新（唯一调用点是 setShardStatus）：只要有一处漏改，派发判定
+   * 三个计数必须同源同点更新（唯一调用点是 setShardStatus）：只要有一处漏改，派发判定
    * 就会读到漂移值，出现超发或永久饿死。计数归零时删除条目，避免空条目长期驻留。
+   *
+   * 释放语义：进入终态时三个维度在同一个同步调用里一起归还（provider 与 role 的释放
+   * 顺序因此天然反向前提中"先 provider 后 role"的获取顺序），不存在交叉等待，也就不
+   * 可能因为"持有 role 等 provider"而死锁。
    */
   function addRunningCount(task, delta) {
     const role = task.role;
@@ -1925,6 +2223,13 @@ export function createFanoutManager(options = {}) {
     const nextTaskCount = (runningCountsByTask.get(task) ?? 0) + delta;
     if (nextTaskCount <= 0) runningCountsByTask.delete(task);
     else runningCountsByTask.set(task, nextTaskCount);
+    // provider 计数（票据 26）与前两个维度同源同点更新：没有归属的任务不进入任何
+    // provider 池（provider 限流对它们不生效），因此也不会在这里凭空创建条目。
+    const provider = typeof task.provider === "string" ? task.provider : "";
+    if (provider.length === 0) return;
+    const nextProviderCount = (runningCountsByProvider.get(provider) ?? 0) + delta;
+    if (nextProviderCount <= 0) runningCountsByProvider.delete(provider);
+    else runningCountsByProvider.set(provider, nextProviderCount);
   }
 
   function addTaskToRoleIndex(task, roleIndex) {
@@ -2046,6 +2351,7 @@ export function createFanoutManager(options = {}) {
     parentsByRole.clear();
     runningCountsByRole.clear();
     runningCountsByTask.clear();
+    runningCountsByProvider.clear();
     activeShardEntries.clear();
     activeShardsByPath.clear();
     nextActiveOrder = 0;
@@ -2241,6 +2547,9 @@ export function createFanoutManager(options = {}) {
       // 父任务级默认超时（票据 06）：只含**显式**值。它是「分片没有自己的
       // timeoutMs 时用什么」的唯一依据，因此必须在任务视图里如实暴露。
       ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
+      // provider 归属（票据 26）：任务视图如实投影，诊断与客户端只读展示据此把
+      // 排队/运行分片归到某个 provider 名下（它不改变 prompt 或任何调度输入）。
+      ...(task.provider === undefined ? {} : { provider: task.provider }),
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
       settledAt: task.settledAt ?? null,
@@ -2298,6 +2607,9 @@ export function createFanoutManager(options = {}) {
       defaultConcurrencyLimit: lastResolvedDefaultConcurrencyLimit,
       concurrencySource: resolverSource,
       roleLimits,
+      // provider 级映射（票据 26）：与 roleLimits 同层持久化。函数形式（live）在
+      // JSON 序列化时自然消失，因此快照里有值就说明这是一个可冻结的静态映射。
+      providerLimits,
       writeRoles,
       defaultAllowOverlap,
       parentRotation: Object.fromEntries(rotationCursors),
@@ -2319,6 +2631,9 @@ export function createFanoutManager(options = {}) {
         // 父任务级默认超时必须随快照持久化，否则重启后未显式给出超时的分片
         // 会静默回到角色默认值（票据 06）。
         ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
+        // provider 归属随任务快照持久化（票据 26）：重启后 provider 级计数必须还能
+        // 按同一归属重建；旧快照没有该字段时保持 undefined（限流不生效，不是错误）。
+        ...(task.provider === undefined ? {} : { provider: task.provider }),
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
         settledAt: task.settledAt ?? null,
@@ -2769,6 +3084,124 @@ export function createFanoutManager(options = {}) {
     return new Map(runningCountsByTask);
   }
 
+  function activeCountsByProvider() {
+    // provider 份额同样是派生索引：dispatch 在副本上累计本轮派发，避免边派发边改写
+    // 权威计数（权威计数仍只在 setShardStatus 处更新）。
+    return new Map(runningCountsByProvider);
+  }
+
+  /** 取（或创建）某个限流键的统计条目；键数量有硬上界，避免诊断面无限增长。 */
+  function throttleStatsFor(kind, key) {
+    const map = throttleStats[kind];
+    let entry = map.get(key);
+    if (entry !== undefined) return entry;
+    entry = { lastThrottledAt: undefined, episodeStartedAt: undefined, samples: 0, totalWaitMs: 0 };
+    map.set(key, entry);
+    while (map.size > THROTTLE_STATS_LIMIT) {
+      const oldest = map.keys().next().value;
+      if (oldest === key) break;
+      map.delete(oldest);
+    }
+    return entry;
+  }
+
+  /**
+   * 记录一次「因名额不足而跳过该候选」的事实。
+   *
+   * 只写诊断时间戳：episodeStartedAt 只在**一个连续限流窗口的第一帧**设置，后续被
+   * 挡住的派发只刷新 lastThrottledAt，不会篡改窗口起点（否则 etaMs 会被无限拉短）。
+   */
+  function noteThrottled(kind, key) {
+    const at = now();
+    const entry = throttleStatsFor(kind, key);
+    entry.lastThrottledAt = at;
+    if (entry.episodeStartedAt === undefined) entry.episodeStartedAt = at;
+  }
+
+  /**
+   * 某个键下真正派发成功后采样一次「限流窗口时长」。
+   *
+   * 没有进行中的窗口（从未被挡住，或上一个窗口已经采样）时是 no-op：只在真实发生过
+   * 排队的情况下累计样本，绝不把正常直接派发的 0 等待混进平均。
+   */
+  function noteDispatchReleased(kind, key) {
+    const entry = throttleStats[kind]?.get(key);
+    if (entry === undefined || entry.episodeStartedAt === undefined) return;
+    entry.samples += 1;
+    entry.totalWaitMs += Math.max(0, now() - entry.episodeStartedAt);
+    entry.episodeStartedAt = undefined;
+  }
+
+  /**
+   * 限流与排队诊断（票据 26，只读）：按 role 与 provider 投影 limit/running/queued/
+   * lastThrottledAt/etaMs。
+   *
+   * 数据来源只有三处，且都不是新计数器：
+   * - running：runningCountsByRole / runningCountsByProvider（与调度同一来源）；
+   * - queued：直接数 shard.status === "queued"（排队就是状态，不存在第二套队列）；
+   * - limit：resolveRoleLimits/resolveProviderLimits + 默认值。
+   *
+   * etaMs 只在历史样本 ≥ THROTTLE_ETA_MIN_SAMPLES 时给出简单均值，否则显式
+   * null + etaSource:"unknown"——不伪造精确值。
+   */
+  function throttleDiagnostics() {
+    const roles = resolveRoleLimits();
+    const providers = resolveProviderLimits();
+    const defaultLimit = resolveDefaultConcurrencyLimit();
+    const queuedByRole = new Map();
+    const queuedByProvider = new Map();
+    const roleKeys = new Set([...parentsByRole.keys(), ...Object.keys(roles)]);
+    const providerKeys = new Set(Object.keys(providers));
+    // 任务数与分片数都有预算上界（resource-budget），因此这里是常数级聚合。
+    for (const task of tasks.values()) {
+      const provider = typeof task.provider === "string" && task.provider.length > 0 ? task.provider : undefined;
+      if (provider !== undefined) providerKeys.add(provider);
+      for (const shard of task.shards) {
+        if (shard.status !== "queued") continue;
+        queuedByRole.set(task.role, (queuedByRole.get(task.role) ?? 0) + 1);
+        if (provider !== undefined) queuedByProvider.set(provider, (queuedByProvider.get(provider) ?? 0) + 1);
+      }
+    }
+    const roleRows = {};
+    for (const role of roleKeys) {
+      roleRows[role] = throttleRow("role", role, {
+        limit: typeof roles[role] === "number" ? roles[role] : defaultLimit,
+        running: runningCountsByRole.get(role) ?? 0,
+        queued: queuedByRole.get(role) ?? 0,
+      });
+    }
+    const providerRows = {};
+    for (const provider of providerKeys) {
+      providerRows[provider] = throttleRow("provider", provider, {
+        // provider 限流用 0 表示「不限制」：诊断如实投影 0，而不是省略或改写成默认值。
+        limit: typeof providers[provider] === "number" ? providers[provider] : 0,
+        running: runningCountsByProvider.get(provider) ?? 0,
+        queued: queuedByProvider.get(provider) ?? 0,
+      });
+    }
+    return Object.freeze({
+      roles: Object.freeze(roleRows),
+      providers: Object.freeze(providerRows),
+      etaMinSamples: THROTTLE_ETA_MIN_SAMPLES,
+    });
+  }
+
+  /** 单行限流诊断（只含标量/固定枚举，可直接进入 RPC/meta 投影）。 */
+  function throttleRow(kind, key, { limit, running, queued }) {
+    const entry = throttleStats[kind].get(key);
+    const samples = entry?.samples ?? 0;
+    const hasEta = samples >= THROTTLE_ETA_MIN_SAMPLES;
+    return Object.freeze({
+      limit,
+      running,
+      queued,
+      lastThrottledAt: entry?.lastThrottledAt === undefined ? null : entry.lastThrottledAt,
+      etaMs: hasEta ? Math.round(entry.totalWaitMs / samples) : null,
+      etaSource: hasEta ? "historical-average" : "unknown",
+      samples,
+    });
+  }
+
   /**
    * 派发一轮：每个 role 在「父任务轮转顺序」上取下一个可派发 shard。
    * 轮转游标按 role 维护，保证后来的父任务不会因为前面有大量排队 shard 而饿死。
@@ -2783,6 +3216,8 @@ export function createFanoutManager(options = {}) {
     if (reclaimState !== null) return false;
     const roleActiveCounts = activeCountsByRole();
     const taskActiveCounts = activeCountsByTask();
+    // provider 份额同样用本轮副本：权威计数只在 setShardStatus 处更新。
+    const providerActiveCounts = activeCountsByProvider();
     // parentsByRole 保持首次注册 role 的顺序，避免每轮遍历整个 tasks 表。
     const roles = [...parentsByRole.keys()];
 
@@ -2795,25 +3230,66 @@ export function createFanoutManager(options = {}) {
       if (!Number.isInteger(cursor) || cursor < 0 || cursor >= parents.length) cursor = 0;
       // 本 role 共享池当前已占用的槽位；每派发一个 shard 就 +1，直到达到池上限。
       let used = roleActiveCounts.get(role) ?? 0;
-      // role 共享池上限只看 role 级设置/默认值，不读任何任务的 concurrencyLimit，因此
-      // 同一 role 下所有父任务解析出的池上限必然相同：在循环外算一次，避免热路径重复求值。
-      // 池子已满时不能再进入内层循环——否则第一个候选会把 blockedInARow 记成"无法产出"，
-      // 看起来像所有父任务都被自身上限卡住，从而提前跳出本 role（语义等价但仍然多做一次
-      // 无效遍历）。直接 break 保持与旧实现完全一致的可观测行为。
-      if (used >= rolePoolLimitFor(parents[0])) continue;
+      // provider 级上限同样在一轮开始时解析一次：它是设置级配置，对同 role 下所有
+      // 任务都相同；设置保存后下一轮 drain 立即读到新值（不做任何缓存）。
+      const resolvedProviderLimits = resolveProviderLimits();
+      /**
+       * role 池已满的快速短路：本 role 本轮没有任何可派发的候选，直接进入下一个 role。
+       *
+       * 与「先 provider 后 role」不矛盾：role 名额是候选派发的最后一道闸门，池子已满时
+       * 任何候选都不可能通过，因此跳过 provider 判定不改变任何派发决策，也不会占用或
+       * 预留任何名额；它只是避免空转，并保留父任务轮转游标不被无意义推进。
+       *
+       * 必须放在轮转循环之前而不是只放在循环内：否则每次 drain 都会先把游标推进一格
+       * 才因为池满 break，多轮 drain 累积下来就破坏了父任务轮转公平性（大型任务会
+       * 抢占后来者的槽位）。这里只记录一次 role 限流事实，不推进游标。
+       */
+      if (used >= rolePoolLimitFor(parents[0])) {
+        noteThrottled("role", role);
+        continue;
+      }
       // 轮转预算：一圈内每个父任务最多贡献一个 shard，保证公平性；
       // 若一圈后仍有空槽位（例如某个父任务已无排队 shard），允许再走一圈补齐，
       // 这样并发上限才真正被填满，而不是每轮只启动一个。
       let budget = parents.length;
       // 连续遇到「本轮无法产出」的父任务计数。只有轮转一整圈都没有任何产出才停止：
-      // 某个父任务被**自身任务级上限**卡住时仍有其它父任务可以派发，因此它只能算
-      // "本轮无产出"，不能直接终止整个 role 的派发（否则高上限的任务会被低上限的
-      // 邻居饿死）。无排队 shard / 冲突判定失败同样属于"本轮无产出"。
+      // 某个父任务被**自身任务级上限**或 **provider 名额**卡住时仍有其它父任务可以派发，
+      // 因此它只能算"本轮无产出"，不能直接终止整个 role 的派发（否则高上限的任务会被
+      // 低上限的邻居饿死）。无排队 shard / 冲突判定失败同样属于"本轮无产出"。
       let blockedInARow = 0;
       while (budget > 0) {
         const task = parents[cursor % parents.length];
         cursor = (cursor + 1) % parents.length;
         budget -= 1;
+        /**
+         * 名额判定顺序（票据 26 / 规格书 §3）：**先 provider，后 role**。
+         *
+         * 为什么顺序重要：两者都是非阻塞判定、失败都不占任何名额，但诊断需要如实反映
+         * "真正卡住这一帧的是哪个维度"。provider 是跨角色的共享资源，先判定它可以让
+         * provider 满时直接跳过该任务（不消耗、也不虚假占用 role 名额），并且不会因为
+         * role 池刚好满而把限流原因记到 role 名下。
+         *
+         * 判定通过后名额仍只在 startShard 真正把分片推进到 running 时才占用——
+         * 排队不占名额、不做预留，因此这里读到的 used/usedProvider 可以安全地只用于比较。
+         */
+        const providerLimit = providerLimitOf(task, resolvedProviderLimits);
+        if (providerLimit !== undefined) {
+          const usedProvider = providerActiveCounts.get(task.provider) ?? 0;
+          if (usedProvider >= providerLimit) {
+            // provider 满：跳过该任务并记为"本轮无产出"，绝不启动 child、绝不占 role 名额。
+            noteThrottled("provider", task.provider);
+            blockedInARow += 1;
+            if (blockedInARow >= parents.length) break;
+            continue;
+          }
+        }
+        // role 共享池上限只看 role 级设置/默认值，不读任何任务的 concurrencyLimit，
+        // 因此同一 role 下所有父任务解析出的池上限必然相同（循环内重复求值成本极低）。
+        // 池子满时整个 role 都不可能再派发：直接结束本 role，避免空转一圈。
+        if (used >= rolePoolLimitFor(task)) {
+          noteThrottled("role", role);
+          break;
+        }
         // 任务级上限只与**该父任务自身**的 running 数比较：其它父任务占用 role 槽位
         // 不再影响它（旧实现拿 role 全局计数比较，导致低上限任务被别的任务饿死）。
         const taskLimit = taskLimitFor(task);
@@ -2849,11 +3325,24 @@ export function createFanoutManager(options = {}) {
           // 次 drain 的内层循环（budget 重置允许连续派发同一任务）会读到过期值，
           // 使任务越过自身任务级上限——快照要等下一次 dispatchAvailable 才刷新。
           taskActiveCounts.set(task, (taskActiveCounts.get(task) ?? 0) + 1);
+          // provider 份额同理必须在本轮内同步累计：否则同一 drain 里连续派发多个
+          // 同 provider 分片时会读到过期份额，直接超发。
+          if (providerLimit !== undefined) {
+            providerActiveCounts.set(task.provider, (providerActiveCounts.get(task.provider) ?? 0) + 1);
+            // 真正派发成功 = 该 provider 的限流窗口结束，采样一次等待时长（诊断用）。
+            noteDispatchReleased("provider", task.provider);
+          }
+          noteDispatchReleased("role", role);
           blockedInARow = 0;
           if (closed) break;
           // role 共享池在派发过程中可能刚好被填满（例如另一路径同步派发），逐次复核；
           // 一旦填满就停止本 role 的派发，保证 role 全局 running 不越过池上限。
           if (used >= rolePoolLimitFor(task)) break;
+          // provider 名额同样逐次复核：填满后本 role 内同 provider 的任务不再尝试。
+          if (providerLimit !== undefined && (providerActiveCounts.get(task.provider) ?? 0) >= providerLimit) {
+            budget = parents.length;
+            continue;
+          }
           // 有新 shard 进入 running 后，重新评估其它父任务的排队情况。
           budget = parents.length;
         }
@@ -3917,6 +4406,9 @@ export function createFanoutManager(options = {}) {
       // 父任务级默认超时（票据 06）：只写**显式**值，随任务快照固化。
       // 未设置时不出现该字段，交给角色级默认值动态解析；0 是合法的「显式禁用」。
       ...(verdict.timeoutMs === undefined ? {} : { timeoutMs: verdict.timeoutMs }),
+      // provider 归属（票据 26）：提交时得到的稳定归属，随任务快照固化，供 provider
+      // 级并发计数使用；缺失表示该角色没有主模型，provider 限流不生效。
+      ...(verdict.provider === undefined ? {} : { provider: verdict.provider }),
       createdAt: timestamp,
       updatedAt: timestamp,
       settledAt: undefined,
@@ -5188,6 +5680,15 @@ export function createFanoutManager(options = {}) {
       if (typeof task.role !== "string" || !Array.isArray(task.shards)) {
         throw new FanoutValidationError("INVALID_SNAPSHOT", "快照任务缺少 role/shards: " + task.parentTaskId, { field: "tasks" });
       }
+      // provider 归属（票据 26）：存在时必须是可用的非空字符串；缺失是合法的（旧快照
+      // 或角色未配置主模型），恢复后保持 undefined，provider 限流对它不生效。
+      if (task.provider !== undefined && (typeof task.provider !== "string" || task.provider.trim().length === 0)) {
+        throw new FanoutValidationError(
+          "INVALID_SNAPSHOT",
+          "快照任务 provider 必须是非空字符串: " + task.parentTaskId,
+          { field: "tasks.provider" },
+        );
+      }
       if (task.status !== undefined && !FANOUT_TASK_STATUSES.includes(task.status)) {
         throw new FanoutValidationError(
           "INVALID_SNAPSHOT_STATUS",
@@ -5321,6 +5822,11 @@ export function createFanoutManager(options = {}) {
     const restoredRoleLimits = snapshot.roleLimits === undefined
       ? roleLimits
       : normalizeRoleLimits(snapshot.roleLimits);
+    // provider 级映射与 roleLimits 同一来源模型（票据 26）：结构非法时整体拒绝
+    // 快照，绝不静默降级成「不限制」——那会把用户明确配置的名额悄悄放开。
+    const restoredProviderLimits = snapshot.providerLimits === undefined
+      ? providerLimits
+      : normalizeProviderLimits(snapshot.providerLimits);
     if (snapshot.writeRoles !== undefined
       && snapshot.writeRoles !== null
       && !Array.isArray(snapshot.writeRoles)
@@ -5362,6 +5868,17 @@ export function createFanoutManager(options = {}) {
     } else if (typeof roleLimits === "function") {
       // 快照没有角色级映射：清空上一轮的第二层回退，避免跨快照残留旧覆盖。
       restoredRoleLimitOverrides = Object.freeze({});
+    }
+    // provider 级映射复用同一套两层语义（票据 26）：live 解析函数优先，快照映射只作
+    // 第二层回退；静态映射沿用「快照替换构造配置」的既有语义。
+    if (snapshot.providerLimits !== undefined) {
+      if (typeof providerLimits === "function") {
+        restoredProviderLimitOverrides = Object.freeze({ ...restoredProviderLimits });
+      } else {
+        providerLimits = restoredProviderLimits;
+      }
+    } else if (typeof providerLimits === "function") {
+      restoredProviderLimitOverrides = Object.freeze({});
     }
     writeRoles = restoredWriteRoles;
     defaultAllowOverlap = restoredDefaultAllowOverlap;
@@ -5480,6 +5997,9 @@ export function createFanoutManager(options = {}) {
         // 父任务级默认超时随快照恢复；缺字段（旧快照）等于「未设置」，
         // 之后创建的 attempt 依然能取到当前角色默认值。
         ...(typeof rawTask.timeoutMs === "number" ? { timeoutMs: rawTask.timeoutMs } : {}),
+        // provider 归属随快照恢复（票据 26）；旧快照缺字段时保持 undefined，
+        // provider 计数因此不会凭空给该任务建份额。
+        ...(typeof rawTask.provider === "string" ? { provider: rawTask.provider.trim() } : {}),
         createdAt: typeof rawTask.createdAt === "number" ? rawTask.createdAt : now(),
         updatedAt: typeof rawTask.updatedAt === "number" ? rawTask.updatedAt : now(),
         settledAt: typeof rawTask.settledAt === "number" ? rawTask.settledAt : undefined,
@@ -5856,8 +6376,13 @@ export function createFanoutManager(options = {}) {
     }),
     /** 事件历史只读状态：条数/字节/累计丢弃/最早可用序号（gap 判定用）。 */
     eventHistoryStatus,
-    /** 只读并发视图：有效默认值 + 各 role 覆盖 + 解析来源（诊断，不泄露任务负载）。 */
+    /** 只读并发视图：有效默认值 + 各 role/provider 覆盖 + 解析来源（不泄露任务负载）。 */
     concurrencyLimits,
+    /**
+     * 只读限流/排队诊断（票据 26）：按 role 与 provider 给出 limit/running/queued/
+     * lastThrottledAt 与 etaMs。只读、无副作用，可在 RPC meta 中直接投影。
+     */
+    throttleDiagnostics,
     /**
      * 只读预算视图：当前用量、冻结上限与最近一次违规。
      * 不暴露任何调度内部状态，宿主/客户端据此判断是否接近预算。

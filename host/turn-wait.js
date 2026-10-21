@@ -65,6 +65,24 @@ export function turnWaitWorkKey(work) {
       ? "fanout:" + work.parentTaskId + ":" + attempt
       : "fanout:" + work.parentTaskId;
   }
+  /**
+   * 单个排队分片的工作键（票据 26 背压）。
+   *
+   * 语义：一个 shard 处于 queued（= 正在排队等待 role/provider 名额）时登记一项工作，
+   * shard 进入 running 或任一终态时精确结算。键只含 parentTaskId + shardId：
+   * - **幂等**：提交/续作/重试/恢复都可能对同一排队分片重复登记，键相同即同一项，
+   *   不会把一次排队算成多份未结算工作；
+   * - **不含 attempt**：排队是 shard 的当前状态，重试产生的新 attempt 仍然只是
+   *   "这个分片在排队"，用 attempt 会把同一段排队拆成两个键、结算后残留悬挂项；
+   * - 与任务级 "fanout:<id>:<attempt>" 键不同源：任务级工作表达「整个父任务还没结算」，
+   *   per-shard 工作表达「这个分片还没开始/没结束」，两者必须能独立结算，否则排队
+   *   分片结束而任务仍在跑时无法精确释放。
+   */
+  if (work.kind === "fanout-shard") {
+    if (typeof work.parentTaskId !== "string" || work.parentTaskId.length === 0) return void 0;
+    if (typeof work.shardId !== "string" || work.shardId.length === 0) return void 0;
+    return "fanout-shard:" + work.parentTaskId + ":" + work.shardId;
+  }
   return void 0;
 }
 
@@ -544,7 +562,7 @@ export function createRootTurnWaitRegistry(options = {}) {
    * 登记一项未结算工作。重复登记同一键幂等。
    *
    * @param {object} agent - exact root Agent。
-   * @param {{kind:"admission",token:string}|{kind:"fanout",parentTaskId:string,attempt?:number}} work - 工作描述。
+   * @param {{kind:"admission",token:string}|{kind:"fanout",parentTaskId:string,attempt?:number}|{kind:"fanout-shard",parentTaskId:string,shardId:string}} work - 工作描述。
    * @returns {string|undefined} 工作键；非法输入或已卸载时 undefined。
    */
   function track(agent, work) {

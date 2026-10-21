@@ -13,8 +13,11 @@
  *
  * 角色显示名与职责摘要来自统一角色注册表；未知角色在这里直接拒绝，避免为
  * 未声明的角色生成一个默认（可能更宽）的工具描述或 persona。
+ *
+ * 自定义角色（票据 27）与内置角色共用同一份函数：调用方传入运行期目录
+ * （内置 + 自定义）即可，不需要第二套 persona 注入或工具描述实现。
  */
-import { listRoles, requireRole } from "./role-registry.js";
+import { listRoles, ROLE_REGISTRY } from "./role-registry.js";
 
 /**
  * role tool 的固定派发契约（英文，随每个 role tool description 下发）。
@@ -30,11 +33,12 @@ export const ROLE_TOOL_ADMISSION_CONTRACT = " Every expert dispatch prompt must 
 /**
  * 生产注册与测试共用同一个 builder，避免源码正则复制或重建实际 tool description。
  * @param {string} role - 当前注册的专家角色名。
+ * @param {object} [registry] - 运行期角色目录（内置 + 自定义）；缺省走内置注册表。
  * @returns {string} 当前角色的完整短描述。
  * @throws {RoleRegistryError} 未知角色（code 为 UNKNOWN_ROLE）。
  */
-export function buildRoleToolDescription(role) {
-  const entry = requireRole(role);
+export function buildRoleToolDescription(role, registry = ROLE_REGISTRY) {
+  const entry = registry.require(role);
   return `向一个专用专家 child 派发 ${entry.id} 角色（${entry.label}）的完整、独立任务：${entry.description}必须包含任务正文、相关路径和预期验证。` + ROLE_TOOL_ADMISSION_CONTRACT;
 }
 
@@ -138,6 +142,32 @@ export const DEFAULT_EXPERT_PERSONA = Object.freeze(Object.fromEntries(listRoles
 })));
 
 /**
+ * 解析一个角色记录的**可编辑默认 persona**（不含固定执行纪律）。
+ *
+ * 内置角色来自本文件的 persona 表；自定义角色（票据 27）来自设置的 persona 字段，
+ * 缺失时用 description 兜底——职责描述本身就是用户对「这个专家该做什么」的完整声明，
+ * 因此不会出现空人格。两者都缺失时显式失败，绝不用空字符串启动专家。
+ *
+ * @param {object} entry - 角色注册表记录（内置或自定义）。
+ * @returns {string} 可编辑默认 persona。
+ */
+export function defaultExpertPersonaOf(entry) {
+  if (entry === null || typeof entry !== "object") throw new Error("缺少角色记录，无法解析默认 persona");
+  if (entry.custom === true) {
+    const persona = typeof entry.persona === "string" && entry.persona.trim().length > 0 ? entry.persona : entry.description;
+    if (typeof persona !== "string" || persona.trim().length === 0) {
+      throw new Error("自定义角色缺少 persona 与 description: " + String(entry.id));
+    }
+    return persona;
+  }
+  const persona = ROLE_PERSONAS[entry.id]?.persona;
+  if (typeof persona !== "string" || persona.length === 0) {
+    throw new Error("缺少注册角色的 persona: " + String(entry.id));
+  }
+  return persona;
+}
+
+/**
  * 组装一个专家 child 的完整系统提示词 persona。
  *
  * 无论有没有自定义覆盖，固定执行纪律都恰好追加一次，因此覆盖只能替换专家专属
@@ -148,12 +178,13 @@ export const DEFAULT_EXPERT_PERSONA = Object.freeze(Object.fromEntries(listRoles
  *
  * @param {string} role - 专家角色 id（未注册角色抛 UNKNOWN_ROLE）。
  * @param {string|undefined} override - 该角色的自定义覆盖（空白视为没有覆盖）。
+ * @param {object} [registry] - 运行期角色目录（内置 + 自定义）；缺省走内置注册表。
  * @returns {string} 最终 persona。
  */
-export function resolveExpertPersona(role, override) {
-  const entry = requireRole(role);
+export function resolveExpertPersona(role, override, registry = ROLE_REGISTRY) {
+  const entry = registry.require(role);
   const base = typeof override === "string" && override.trim().length > 0
     ? override
-    : DEFAULT_EXPERT_PERSONA[entry.id];
+    : defaultExpertPersonaOf(entry);
   return base + FIXED_EXPERT_DISCIPLINE;
 }

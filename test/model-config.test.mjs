@@ -786,7 +786,7 @@ test("模型配置：被角色默认使用的档位不得被删除，提示列�
   assert.deepEqual(modelConfig.rolesAffectedByChange(defaults, { provider: "acme", removeProvider: true }).map((entry) => entry.role), ["fixer", "explorer"]);
 });
 
-test("模型配置：从两份目录算出被取消的档位，新增与删除的行不误报", () => {
+test("模型配置：从两份目录算出被删除的档位，取消档位与删除整行都计入，新增行不误报", () => {
   const before = [
     { id: "a", reasoningEfforts: { off: "", high: "high" } },
     { id: "b", reasoningEfforts: { low: "low" } },
@@ -796,9 +796,15 @@ test("模型配置：从两份目录算出被取消的档位，新增与删除�
     { id: "b", reasoningEfforts: { low: "low", max: "max" } },
     { id: "c", reasoningEfforts: { medium: "medium" } },
   ];
-  assert.deepEqual(modelConfig.removedLevelsOf(before, after), ["high"]);
-  assert.deepEqual(modelConfig.removedLevelsOf(before, [{ id: "a", reasoningEfforts: { off: "", high: "high" } }]), [],
-    "被整行删除的模型不参与档位守卫（其档位随该行一起消失）");
+  assert.deepEqual(modelConfig.removedLevelsOf(before, after), ["high"], "取消勾选的档位必须计入删除");
+  // 票据 20：整行删除的档位随该行一起消失，因此同样计入删除集合（不再只在「恢复默认」时生效）。
+  assert.deepEqual(modelConfig.removedLevelsOf(before, [{ id: "a", reasoningEfforts: { off: "", high: "high" } }]), ["low"],
+    "被整行删除的模型，其档位必须计入删除集合");
+  assert.deepEqual(modelConfig.removedLevelsOf(before, before), [], "没有任何变化时不得误报");
+  assert.deepEqual(modelConfig.removedLevelsOf([...before, { id: "no-efforts" }], after), ["high"],
+    "没有声明任何档位的行被删除不产生档位删除");
+  assert.deepEqual(modelConfig.removedLevelsOf(before, [{ id: "c", reasoningEfforts: { medium: "medium" } }]).sort(), ["high", "low", "off"],
+    "整份目录被替换（恢复默认/清空）时所有原有档位都算删除");
 });
 
 // ── 卡片渲染面与编辑会话：折叠、七档复选框、独立应用/取消、冲突与守卫 ────────
@@ -992,7 +998,7 @@ test("模型配置：恢复默认删除目录时仍阻止删除角色正在使�
   assert.deepEqual(plan.removedLevels, ["off", "high"]);
   assert.deepEqual(plan.affectedRoles, [{ role: "fixer", reasoningEffort: "high" }]);
 });
-test("模型配置：普通删除整行不启用恢复默认的整行档位守卫", () => {
+test("模型配置：卡片上的单行删除触发与删除 provider 相同的角色联动守卫", () => {
   const fixtures = cardFixtures();
   const session = modelConfig.createCardSession({
     provider: fixtures.row.provider,
@@ -1003,10 +1009,35 @@ test("模型配置：普通删除整行不启用恢复默认的整行档位守�
     revision: fixtures.namespace.revision,
     roleDefaults: { fixer: { provider: "acme", model: "m1", reasoningEffort: "high" } },
   });
-  session.edit((draft) => ({ ...draft, models: [] }));
+  // 与 UI 的「删除」按钮同一条路径（client.js 调用 config.removeModelRow）。
+  session.edit((draft) => ({ ...draft, models: modelConfig.removeModelRow(session.modelRows, 0) }));
+  assert.deepEqual(modelConfig.modelDraftsOf(session.draft.models), [], "夹具必须真的删掉了那一行");
   const plan = session.plan();
-  assert.equal(plan.ok, true);
-  assert.deepEqual(plan.removedLevels, undefined);
+  assert.equal(plan.ok, false, "票据 20：删除被角色默认使用的模型行不得绕过角色联动守卫");
+  assert.equal(plan.guard, true);
+  assert.deepEqual(plan.removedLevels, ["off", "high"], "被删行的全部档位都算删除");
+  assert.deepEqual(plan.affectedRoles, [{ role: "fixer", reasoningEffort: "high" }]);
+  assert.match(plan.error, /无法保存/);
+  assert.match(plan.error, /fixer/);
+  assert.match(plan.error, /不会自动改写角色配置/);
+  assert.equal(plan.ops, undefined, "被守卫拦下时不得产生任何待提交操作");
+
+  // 反向边界：角色没有使用被删行的任何档位时，单行删除照常可以保存。
+  const allowed = modelConfig.createCardSession({
+    provider: fixtures.row.provider,
+    profilePath: fixtures.row.settingsPath,
+    storedUser: fixtures.namespace.user,
+    value: fixtures.namespace.value,
+    base: fixtures.namespace.base,
+    revision: fixtures.namespace.revision,
+    roleDefaults: { fixer: { provider: "acme", model: "m1", reasoningEffort: "max" } },
+  });
+  allowed.edit((draft) => ({ ...draft, models: modelConfig.removeModelRow(allowed.modelRows, 0) }));
+  const allowedPlan = allowed.plan();
+  assert.equal(allowedPlan.ok, true, "不受影响的角色不得拦住这次删除");
+  assert.equal(allowedPlan.guard, undefined);
+  assert.deepEqual(allowedPlan.ops, [{ op: "unset", path: ["providers", "acme", "models"] }],
+    "清空目录仍表达为删除用户层覆盖");
 });
 test("模型配置：卡片会话在已有覆盖上只提交最小 diff，外部提交的字段不被误删", () => {
   const fixtures = cardFixtures();

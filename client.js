@@ -39,6 +39,279 @@ window.__ModuleLoader__.load({
     const expertGroupModel = globalThis[Symbol.for("dsh-expert-group/client-expert-group-model")];
     const expertGroupSidebar = globalThis[Symbol.for("dsh-expert-group/client-expert-group-sidebar")];
 
+    // ── 文案层（票据 19）──────────────────────────────────────────────────
+    //
+    // 消息表的权威实现语义在 shared.js；浏览器侧由 client-expert-group-model.js 投影。
+    // 设置页只使用模型暴露的 resolveClientLocale / translateMessage（缺失时保持安全占位）。
+    const localeModelApi = () => globalThis[Symbol.for("dsh-expert-group/client-expert-group-model")] ?? expertGroupModel;
+    /**
+     * 设置页 locale 解析顺序：ctx.locale → ctx.i18n.locale → document.documentElement.lang
+     * → navigator.language → zh。纯读，不写回任何宿主状态。
+     */
+    function resolveSettingsLocale(ctx) {
+      const model = localeModelApi();
+      const sources = {
+        ctxLocale: (() => { try { return ctx?.locale; } catch { return undefined; } })(),
+        i18nLocale: (() => { try { return ctx?.i18n?.locale; } catch { return undefined; } })(),
+        documentLang: (() => { try { return globalThis.document?.documentElement?.lang; } catch { return undefined; } })(),
+        navigatorLanguage: (() => { try { return globalThis.navigator?.language; } catch { return undefined; } })(),
+      };
+      if (typeof model?.resolveClientLocale === "function") return model.resolveClientLocale(sources);
+      const candidates = [sources.ctxLocale, sources.i18nLocale, sources.documentLang, sources.navigatorLanguage];
+      return candidates.some((value) => typeof value === "string" && value.trim().toLowerCase().startsWith("en")) ? "en" : "zh";
+    }
+    /**
+     * 设置页 zh 文案的**降级回退表**（票据 19）。
+     *
+     * 生产 bundle 恒先执行 client-expert-group-model.js（消息表投影），设置页因此总是走
+     * model.translateMessage。只有「契约外直接加载 client.js」的旧宿主/测试拿不到模型，
+     * 这里用一份只含 settings.* 的中文回退保证：绝不渲染空串或内部键名，也绝不改变
+     * 默认 zh 下的既有文案。回退表与权威表的 zh 值由 settings 契约测试逐键对比。
+     */
+    const SETTINGS_ZH_FALLBACK = Object.freeze({
+      "settings.title": "dsh-expert-group",
+      "settings.hint": "专家模型使用 DSH 当前已配置的 provider 和模型目录。",
+      "settings.taskManagement": "任务管理",
+      "settings.auto": "Auto",
+      "settings.autoTitle": "自动打开运行中的子代理侧栏会话",
+      "settings.notifications": "通知弹窗",
+      "settings.notificationVolume": "通知音量",
+      "settings.notificationEvents": "通知事件",
+      "settings.notificationVolume.range": "通知音量滑块",
+      "settings.notificationVolume.number": "通知音量数值",
+      "settings.notificationEvent.completed": "任务完成",
+      "settings.roleTimeout.aria": "角色默认超时",
+      "settings.notificationEvent.completed.aria": "通知任务完成",
+      "settings.notificationEvent.waiting.aria": "通知等待用户",
+      "settings.notificationEvent.failed.aria": "通知任务失败",
+      "settings.notificationEvent.waiting": "等待用户",
+      "settings.notificationEvent.failed": "任务失败",
+      "settings.unifiedProvider": "统一供应商",
+      "settings.noProvider": "无",
+      "settings.observerPreferred": "Observer优先",
+      "settings.concurrencyLimit": "单个角色并发上限",
+      "settings.roleTimeout": "角色默认超时 (s)",
+      "settings.roleTimeout.title": "默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
+      "settings.save": "保存",
+      "settings.saving": "保存中…",
+      "settings.discard": "放弃修改",
+      "settings.saved": "已保存",
+      "settings.unsaved": "有未保存的修改",
+      "settings.diagnostics.title": "诊断与通知状态",
+      "settings.diagnostics.capabilities": "能力矩阵",
+      "settings.diagnostics.runtime": "运行时诊断",
+      "settings.diagnostics.budget": "预算用量与最近违规",
+      "settings.diagnostics.persistence": "持久化与恢复",
+      "settings.diagnostics.notifications": "通知投递",
+      "settings.diagnostics.loading": "正在读取宿主诊断…",
+      "settings.diagnostics.unavailable": "宿主诊断不可用；以下只显示客户端能力。",
+      "settings.diagnostics.absent": "宿主未提供诊断数据；以下只显示客户端能力。",
+      "settings.testNotification": "发送测试通知",
+      "settings.testNotification.sending": "发送中…",
+      "settings.testNotification.sent": "已发送测试通知",
+      "settings.testNotification.disabled": "通知已关闭，未发送测试通知",
+      "settings.sessionOverride.title": "仅本会话模型覆盖",
+      "settings.sessionOverride.hint": "只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
+      "settings.sessionOverride.noSession": "未打开会话：打开一个会话后可在此临时覆盖角色模型。",
+      "settings.sessionOverride.child": "当前是子代理会话，会话级模型覆盖只读。",
+      "settings.sessionOverride.loading": "正在读取本会话覆盖…",
+      "settings.sessionOverride.unavailable": "本会话覆盖读取失败，请稍后重试。",
+      "settings.sessionOverride.unsupported": "当前宿主版本不支持会话级模型覆盖。",
+      "settings.sessionOverride.offline": "会话未运行：会话级覆盖只读。",
+      "settings.sessionOverride.followGlobal": "跟随全局默认",
+      "settings.sessionOverride.override": "本会话覆盖",
+      "settings.sessionOverride.revision": "代次 {revision}",
+      "settings.sessionOverride.provider": "供应商",
+      "settings.sessionOverride.model": "模型",
+      "settings.sessionOverride.effort": "思考深度",
+      "settings.sessionOverride.effortDefault": "模型默认",
+      "settings.sessionOverride.save": "保存覆盖",
+      "settings.sessionOverride.clear": "清除",
+      "settings.sessionOverride.saving": "保存中…",
+      "settings.sessionOverride.saved": "已保存本会话覆盖",
+      "settings.sessionOverride.cleared": "已清除，恢复全局默认",
+      "settings.sessionOverride.conflict": "其他页面已修改本会话覆盖（当前代次 {revision}）；你的输入已保留，请确认后重试。",
+      "settings.sessionOverride.failed": "保存失败：{message}",
+      "settings.sessionOverride.retry": "重新读取",
+      "settings.sessionOverride.globalSummary": "全局：{provider} / {model}",
+      "settings.sessionOverride.emptyGlobal": "未配置全局默认",
+    });
+    /** 取一条设置页文案：模型可用时走权威投影；缺失时用 zh 回退表插值（绝不显示键名）。 */
+    function settingsText(locale, key, vars) {
+      const model = localeModelApi();
+      if (typeof model?.translateMessage === "function") return model.translateMessage(locale, key, vars);
+      const template = SETTINGS_ZH_FALLBACK[key];
+      if (template === undefined) return "—";
+      const values = vars !== null && typeof vars === "object" ? vars : {};
+      return template.replace(/\{([a-z][a-z0-9_]*)\}/gi, (match, name) => {
+        const value = values[name];
+        return value === void 0 || value === null ? match : String(value);
+      });
+    }
+    /**
+     * 票据 24/27 新增设置区块的**本地**文案表（zh/en 成对）。
+     *
+     * 为什么不在 shared.js：本票据的文件边界禁止修改权威消息表；但直接复用
+     * settingsText 会让新键在真实 bundle 里渲染成中性占位（MISSING_MESSAGE_TEXT）。
+     * 因此这里只承载本控件组自己的键：取值顺序是 locale → zh，任何缺失都回退中文，
+     * 绝不渲染键名或空串；默认 zh 与既有文案逐字不变。
+     */
+    const SETTINGS_EXTRA_MESSAGES = Object.freeze({
+      "settings.modelCandidates.title": { zh: "模型候选与自动降级" },
+      "settings.modelCandidates.hint": { zh: "每个角色先使用角色默认模型；启动前失败时按顺序降级到候选，最多 fallbackLimit 次。候选是全局配置。" },
+      "settings.modelCandidates.fallbackLimit": { zh: "自动降级上限" },
+      "settings.modelCandidates.fallbackLimit.title": { zh: "0 = 不降级；默认 2；最多 4。只影响保存之后创建的尝试。" },
+      "settings.modelCandidates.preflight": { zh: "预检" },
+      "settings.modelCandidates.preflight.running": { zh: "预检中…" },
+      "settings.modelCandidates.preflight.ok": { zh: "预检通过" },
+      "settings.modelCandidates.preflight.failed": { zh: "预检失败：{message}" },
+      "settings.modelCandidates.preflight.stale": { zh: "预检结果已过期，请重新预检" },
+      "settings.modelCandidates.preflight.unavailable": { zh: "当前宿主不支持模型预检" },
+      "settings.modelCandidates.preflight.error": { zh: "预检请求失败：{message}" },
+      "settings.modelCandidates.primary": { zh: "主选择" },
+      "settings.modelCandidates.primary.none": { zh: "尚未配置主选择" },
+      "settings.modelCandidates.empty": { zh: "还没有候选" },
+      "settings.modelCandidates.add": { zh: "添加候选" },
+      "settings.modelCandidates.limit": { zh: "每个角色最多 8 个候选" },
+      "settings.modelCandidates.provider": { zh: "供应商" },
+      "settings.modelCandidates.model": { zh: "模型" },
+      "settings.modelCandidates.effort": { zh: "思考深度" },
+      "settings.modelCandidates.up": { zh: "上移" },
+      "settings.modelCandidates.down": { zh: "下移" },
+      "settings.modelCandidates.remove": { zh: "删除" },
+      "settings.modelCandidates.row": { zh: "候选 {index}" },
+      // 票据 24 候选级 image/输入类型能力（Host model-preflight 返回）。
+      "settings.modelCandidates.image.supported": { zh: "image 输入：支持" },
+      "settings.modelCandidates.image.unsupported": { zh: "image 输入：不支持" },
+      "settings.modelCandidates.image.unknown": { zh: "image 输入：未知" },
+      "settings.modelCandidates.error.incomplete": { zh: "候选第 {index} 行需要同时填写供应商和模型" },
+      "settings.modelCandidates.error.duplicate": { zh: "候选第 {index} 行与前面的候选重复" },
+      "settings.customRoles.title": { zh: "自定义角色" },
+      "settings.customRoles.hint": { zh: "自定义角色与内置角色共用注册、人格、权限、模型与恢复路径；保存时严格校验，缺失只读性或工具拒绝会被拒绝。" },
+      "settings.customRoles.builtin": { zh: "内置角色（只读）" },
+      "settings.customRoles.custom": { zh: "自定义角色" },
+      "settings.customRoles.empty": { zh: "还没有自定义角色" },
+      "settings.customRoles.add": { zh: "新增自定义角色" },
+      "settings.customRoles.remove": { zh: "删除角色" },
+      "settings.customRoles.id": { zh: "角色标识" },
+      "settings.customRoles.id.hint": { zh: "小写字母开头，仅小写字母、数字与连字符，长度 2–32；仅新增时可填写。" },
+      "settings.customRoles.label": { zh: "显示名" },
+      "settings.customRoles.statusLabel": { zh: "状态标签" },
+      "settings.customRoles.description": { zh: "职责描述" },
+      "settings.customRoles.readOnly": { zh: "权限" },
+      "settings.customRoles.readOnly.empty": { zh: "请选择只读或可写" },
+      "settings.customRoles.readOnly.readOnly": { zh: "只读" },
+      "settings.customRoles.readOnly.writable": { zh: "可写" },
+      "settings.customRoles.toolDeny": { zh: "工具拒绝（每行一个工具名）" },
+      "settings.customRoles.toolDeny.hint": { zh: "允许为空，但字段必须存在；空白行会被忽略。" },
+      "settings.customRoles.persona": { zh: "人格（可选）" },
+      "settings.customRoles.error.readOnly": { zh: "自定义角色“{role}”必须显式选择只读或可写" },
+      "settings.customRoles.error.toolDeny": { zh: "自定义角色“{role}”必须显式提交工具拒绝列表（允许为空）" },
+      "settings.customRoles.error.id": { zh: "自定义角色标识“{id}”不合法：必须小写字母开头、仅小写字母/数字/连字符，长度 2–32" },
+      "settings.customRoles.error.idBuiltin": { zh: "自定义角色标识不得覆盖内置角色：{id}" },
+      "settings.customRoles.error.idDuplicate": { zh: "自定义角色标识重复：{id}" },
+      "settings.customRoles.error.label": { zh: "自定义角色“{role}”的显示名不能为空且不超过 64 字符" },
+      "settings.customRoles.error.description": { zh: "自定义角色“{role}”的职责描述不能为空且不超过 500 字符" },
+      "settings.customRoles.error.statusLabel": { zh: "自定义角色“{role}”的状态标签不超过 32 字符" },
+      "settings.customRoles.error.persona": { zh: "自定义角色“{role}”的人格不超过 8000 字符" },
+      "settings.customRoles.error.toolDenyEntry": { zh: "自定义角色“{role}”的工具拒绝最多 64 条，单条不超过 128 字符" },
+      "settings.customRoles.error.limit": { zh: "自定义角色最多 16 个" },
+      "settings.customRoles.error.host": { zh: "宿主拒绝保存：{message}" },
+      "settings.customRoles.inUse": { zh: "仍有活动任务引用该角色，宿主已拒绝删除：{message}" },
+      // ── 票据 26/29/25：并发与背压、上下文继承、用量与单价 ──────────────────
+      "settings.limits.title": { zh: "并发与背压" },
+      "settings.limits.hint": { zh: "「单个角色并发上限」是默认值；下面的逐角色与逐 provider 上限会覆盖它。排队不占名额，名额只在分片进入运行态时占用。" },
+      "settings.limits.roleTitle": { zh: "逐角色并发上限" },
+      "settings.limits.roleHint": { zh: "留空 = 使用默认值（当前 {fallback}）；启用值为 1–64 的整数。" },
+      "settings.limits.roleLimit": { zh: "并发上限" },
+      "settings.limits.providerTitle": { zh: "逐 provider 并发上限" },
+      "settings.limits.providerHint": { zh: "单位是同时运行的分片数；0 或留空 = 不限制；启用值为 1–64 的整数。保存时不校验模型目录。" },
+      "settings.limits.providerName": { zh: "provider 名称" },
+      "settings.limits.providerLimit": { zh: "上限" },
+      "settings.limits.add": { zh: "添加 provider 上限" },
+      "settings.limits.remove": { zh: "删除该行" },
+      "settings.limits.empty": { zh: "还没有 provider 上限行" },
+      "settings.limits.rowLimit": { zh: "provider 上限最多 32 行" },
+      "settings.limits.unlimited": { zh: "不限制" },
+      "settings.limits.unknown": { zh: "未知" },
+      "settings.limits.never": { zh: "从未" },
+      "settings.limits.liveTitle": { zh: "运行时排队与放行（只读）" },
+      "settings.limits.liveProvidersTitle": { zh: "生效的 provider 上限" },
+      "settings.limits.liveProvidersEmpty": { zh: "宿主未提供 provider 上限投影（或未配置）。" },
+      "settings.limits.liveUnknown": { zh: "宿主未提供运行时限流诊断，排队与预计等待为未知。" },
+      "settings.limits.liveEmpty": { zh: "当前没有被限流或排队的角色/provider。" },
+      "settings.limits.throttleLine": { zh: "运行 {running} · 排队 {queued} · 上限 {limit} · 预计等待 {eta}（{etaSource}） · 最近限流 {last}" },
+      "settings.limits.etaSource.average": { zh: "历史均值" },
+      "settings.limits.etaSource.unknown": { zh: "样本不足" },
+      "settings.limits.etaHint": { zh: "预计等待来自历史均值（至少需要 {samples} 个样本）；样本不足时显示“未知”，它不是承诺值。" },
+      "settings.limits.invalidTitle": { zh: "已忽略的限流配置（读取期）" },
+      "settings.limits.invalidRow": { zh: "{field}：{target} → {reason}" },
+      "settings.limits.reason.invalid_limit": { zh: "值不在合法范围内" },
+      "settings.limits.reason.unknown_role": { zh: "未知角色" },
+      "settings.limits.reason.invalid_key": { zh: "provider 键为空" },
+      "settings.limits.reason.invalid_shape": { zh: "结构不合法" },
+      "settings.limits.error.roleLimit": { zh: "{role}：并发上限必须是 1–64 的整数（留空 = 使用默认值）" },
+      "settings.limits.error.providerEmpty": { zh: "provider 上限第 {index} 行缺少 provider 名称" },
+      "settings.limits.error.providerTooLong": { zh: "provider 上限第 {index} 行的名称超过 128 字符" },
+      "settings.limits.error.providerDuplicate": { zh: "provider 上限第 {index} 行与前面的 provider 重复" },
+      "settings.limits.error.providerLimit": { zh: "provider 上限第 {index} 行必须是 0–64 的整数（留空 = 不限制）" },
+      "settings.inherit.title": { zh: "上下文继承" },
+      "settings.inherit.hint": { zh: "开启后专家会继承父会话已完成 turn 的前缀，减少重复说明；继承会增加输入 token 成本（按继承到的前缀大小计），因此默认关闭。" },
+      "settings.inherit.cost": { zh: "只继承已完成 turn 的前缀，不包含进行中 turn、未完成工具输出与隐藏消息；Observer 始终隔离。" },
+      "settings.inherit.toggle": { zh: "继承父会话上下文" },
+      "settings.inherit.on": { zh: "已开启" },
+      "settings.inherit.off": { zh: "关闭（默认）" },
+      "settings.inherit.unavailableTitle": { zh: "不提供继承的角色" },
+      "settings.inherit.observer": { zh: "Observer：只接收视觉任务，强制隔离，不接收用户上下文。" },
+      "settings.inherit.custom": { zh: "{role}：自定义角色不提供上下文继承。" },
+      "settings.inherit.requirement": { zh: "实际能否继承还取决于宿主是否提供合格的 fork provider；不满足时派发会显式失败并提示重新派发。" },
+      "settings.usage.title": { zh: "用量与单价" },
+      "settings.usage.hint": { zh: "用量来自宿主已有的 usage 事件（只读，不含提示词、响应、凭据与路径）；单价只用于可选的成本估算。" },
+      "settings.usage.totals": { zh: "合计" },
+      "settings.usage.byRole": { zh: "按角色" },
+      "settings.usage.byProvider": { zh: "按提供方" },
+      "settings.usage.byModel": { zh: "按模型" },
+      "settings.usage.byProviderModel": { zh: "按提供方+模型" },
+      "settings.usage.groupOverflow": { zh: "其他组合（不估算）" },
+      "settings.usage.recent": { zh: "最近任务（最多 16 条）" },
+      "settings.usage.empty": { zh: "宿主还没有可用的用量样本。" },
+      "settings.usage.line": { zh: "输入 {input} · 输出 {output} token｜请求 {requests} · 重试 {retries}{run}" },
+      "settings.usage.runSuffix": { zh: "｜耗时 {run}" },
+      "settings.usage.priceTitle": { zh: "每模型单价（每百万 token）" },
+      "settings.usage.priceHint": { zh: "金额为每百万 token 的单价，币种默认 USD；provider+model 不能重复。空行或非法金额会阻止保存。" },
+      "settings.usage.priceProvider": { zh: "provider" },
+      "settings.usage.priceModel": { zh: "model" },
+      "settings.usage.priceInput": { zh: "输入单价/百万 token" },
+      "settings.usage.priceOutput": { zh: "输出单价/百万 token" },
+      "settings.usage.priceCurrency": { zh: "币种" },
+      "settings.usage.priceAdd": { zh: "添加单价" },
+      "settings.usage.priceRemove": { zh: "删除该单价" },
+      "settings.usage.priceEmpty": { zh: "还没有配置单价：只显示 token 与请求数，不估算成本。" },
+      "settings.usage.noPrice": { zh: "没有匹配的单价：不估算成本（绝不显示假成本）。" },
+      "settings.usage.estimateTitle": { zh: "按单价估算（示例）" },
+      "settings.usage.estimateHint": { zh: "计算方式：计费输入 token ÷ 1,000,000 × 输入单价 + 输出 token ÷ 1,000,000 × 输出单价，保留 4 位小数。这是估算，不是账单。" },
+      "settings.usage.estimateRow": { zh: "{model}：约 {cost} {currency}" },
+      "settings.usage.estimateNoSample": { zh: "单价已配置，但还没有匹配到该 provider+model 的用量样本。" },
+      "settings.usage.estimateMissingProviderModel": { zh: "宿主未提供 provider 级聚合（旧版本），暂不估算成本；用量展示不受影响。" },
+      "settings.usage.error.limit": { zh: "单价最多 64 条" },
+      "settings.usage.error.incomplete": { zh: "单价第 {index} 行必须同时填写 provider 与 model" },
+      "settings.usage.error.tooLong": { zh: "单价第 {index} 行的 provider/model 超过 128 字符" },
+      "settings.usage.error.rate": { zh: "单价第 {index} 行的输入/输出单价必须是 ≥0 的数字（每百万 token）" },
+      "settings.usage.error.currency": { zh: "单价第 {index} 行的币种最多 8 字符（留空 = USD）" },
+      "settings.usage.error.duplicate": { zh: "单价第 {index} 行与前面的 provider+model 重复" },
+    });
+    /** 取本票据新增控件的文案：locale 缺失或该语言无译文时回退 zh，绝不渲染键名。 */
+    function settingsExtraText(locale, key, vars) {
+      const entry = SETTINGS_EXTRA_MESSAGES[key];
+      if (entry === void 0) return settingsText(locale, key, vars);
+      const template = typeof entry[locale] === "string" && entry[locale].length > 0 ? entry[locale] : entry.zh;
+      const values = vars !== null && typeof vars === "object" ? vars : {};
+      return template.replace(/\{([a-z][a-z0-9_]*)\}/gi, (match, name) => {
+        const value = values[name];
+        return value === void 0 || value === null ? match : String(value);
+      });
+    }
+
     // ── 设置页样式：仅保留 dsh-expert-group settings section 使用的规则。
     const css = "" +
       ".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:760px;color:var(--dsw-alias-label-primary)}" +
@@ -114,17 +387,46 @@ window.__ModuleLoader__.load({
       ".deg_prompt_dialog h3{margin:0 0 8px;font-size:16px;line-height:24px;color:var(--dsw-alias-label-primary)}" +
       ".deg_prompt_dialog p{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}" +
       ".deg_prompt_dialog_actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-top:18px}" +
-      // 通知设置是紧凑工具条：标签不换行，停留时间选择器固定宽度，音量组吸收剩余空间。
+      // 通知设置是紧凑工具条：标签不换行，音量组吸收剩余空间（停留时长字段已按票据 14 移除）。
       ".deg_settings_notification_row{display:flex;align-items:center;gap:16px;min-width:0;white-space:nowrap}" +
       ".deg_settings_notification_row>.deg_settings_checkbox{flex:0 0 auto}" +
-      ".deg_settings_notification_row>.deg_settings_control:nth-child(2){flex:0 0 auto}" +
-      ".deg_settings_notification_row>.deg_settings_control:nth-child(2) .deg_settings_label{white-space:nowrap}" +
-      ".deg_settings_notification_row>.deg_settings_control:nth-child(2) select{flex:0 0 74px;width:74px}" +
-      ".deg_settings_notification_row>.deg_settings_control:nth-child(3){flex:1 1 auto;min-width:0}" +
-      ".deg_settings_notification_row>.deg_settings_control:nth-child(3) .deg_settings_label{flex:0 0 auto;white-space:nowrap}" +
-      ".deg_settings_notification_row>.deg_settings_control:nth-child(3) input[type=range]{flex:1 1 auto;min-width:48px}" +
-      ".deg_settings_notification_row>.deg_settings_control:nth-child(3) input[type=number]{flex:0 0 72px;width:72px}" +
-      "@media (max-width:520px){.deg_settings_notification_row{flex-wrap:wrap;row-gap:12px}.deg_settings_notification_row>.deg_settings_control:nth-child(3){flex-basis:100%}}" +
+      ".deg_settings_notification_row>.deg_settings_control{flex:1 1 auto;min-width:0}" +
+      ".deg_settings_notification_row>.deg_settings_control .deg_settings_label{flex:0 0 auto;white-space:nowrap}" +
+      ".deg_settings_notification_row>.deg_settings_control input[type=range]{flex:1 1 auto;min-width:48px}" +
+      ".deg_settings_notification_row>.deg_settings_control input[type=number]{flex:0 0 72px;width:72px}" +
+      "@media (max-width:520px){.deg_settings_notification_row{flex-wrap:wrap;row-gap:12px}.deg_settings_notification_row>.deg_settings_control{flex-basis:100%}}" +
+      // 通知事件类型（票据 14）：一组三个复选框，窄屏允许换行。
+      ".deg_settings_notification_events_row{display:flex;align-items:center;gap:16px;flex-wrap:wrap;min-width:0}" +
+      ".deg_settings_notification_events{display:flex;align-items:center;flex-wrap:wrap;gap:16px 20px;min-width:0}" +
+      // 会话级模型覆盖（票据 21）：每个启用角色一行，保持紧凑的文本编辑面。
+      ".deg_so_section{display:flex;flex-direction:column;gap:10px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_so_title{font-size:14px;line-height:22px;font-weight:600;margin:0;color:var(--dsw-alias-label-primary)}" +
+      ".deg_so_hint{font-size:12px;line-height:18px;margin:0;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_so_rows{display:flex;flex-direction:column;gap:10px;min-width:0}" +
+      ".deg_so_row{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);min-width:0}" +
+      ".deg_so_row_head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;min-width:0}" +
+      ".deg_so_role{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary)}" +
+      ".deg_so_state{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere;text-align:right}" +
+      ".deg_so_fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr) minmax(0,.9fr);gap:10px;min-width:0}" +
+      ".deg_so_field{display:flex;flex-direction:column;gap:4px;min-width:0}" +
+      ".deg_so_field_label{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_so_input{width:100%;min-width:0;box-sizing:border-box;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}" +
+      ".deg_so_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}" +
+      ".deg_so_input:disabled{opacity:.5;cursor:not-allowed}" +
+      ".deg_so_actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}" +
+      ".deg_so_actions .deg_btn{flex:0 0 auto;min-width:88px}" +
+      ".deg_so_actions .deg_so_state{margin-right:auto}" +
+      "@media (max-width:520px){.deg_so_fields{grid-template-columns:minmax(0,1fr)}.deg_so_state{text-align:left}}" +
+      // 独立诊断区块（票据 14）：只读计数/状态行，使用紧凑两列布局。
+      ".deg_settings_diagnostics{display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_settings_diagnostics_title{font-size:14px;line-height:22px;font-weight:600;margin:0;color:var(--dsw-alias-label-primary)}" +
+      ".deg_settings_diagnostic_group{display:flex;flex-direction:column;gap:6px;min-width:0}" +
+      ".deg_settings_diagnostic_group_title{font-size:12px;line-height:18px;font-weight:600;margin:0;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_settings_diagnostic_row{display:flex;align-items:center;justify-content:space-between;gap:16px;min-width:0;font-size:12px;line-height:18px}" +
+      ".deg_settings_diagnostic_label{color:var(--dsw-alias-label-secondary);min-width:0;overflow-wrap:anywhere}" +
+      ".deg_settings_diagnostic_value{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;overflow-wrap:anywhere;text-align:right}" +
+      ".deg_settings_notification_test{justify-content:flex-start;flex-wrap:wrap}" +
+      ".deg_settings_notification_test .deg_btn{flex:0 0 auto;min-width:112px}" +
       ".deg_subagent_metadata{display:block;box-sizing:border-box;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary,var(--dsw-alias-label-primary));font-size:11px;line-height:16px}" +
       ".deg_full_system_prompt_root[data-open]{padding-bottom:4px}" +
       ".deg_full_system_prompt_chevron{color:var(--dsw-alias-label-secondary)}" +
@@ -255,7 +557,59 @@ window.__ModuleLoader__.load({
        ".deg_pd_actions .deg_pd_open:disabled{opacity:1;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));background:transparent;border-color:var(--dsw-alias-border-l2)}" +
        ".deg_pd_note{min-width:0;flex:1 1 220px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}" +
        // 窄屏将状态移到 Provider/模型下一行，避免六角色被三列硬挤成不可读的省略号。
-       "@media (max-width:480px){.deg_pd_roles_header,.deg_pd_role{grid-template-columns:minmax(72px,auto) minmax(0,1fr);column-gap:8px}.deg_pd_roles_header{padding-top:5px}.deg_pd_roles_header span:last-child{grid-column:2;text-align:left}.deg_pd_role{align-items:start;row-gap:2px;padding:7px 0}.deg_pd_role_name{grid-row:1 / span 2;align-self:start}.deg_pd_role_value{white-space:normal;overflow-wrap:anywhere;text-overflow:clip}.deg_pd_role_state{grid-column:2;justify-self:start;text-align:left}}";
+       "@media (max-width:480px){.deg_pd_roles_header,.deg_pd_role{grid-template-columns:minmax(72px,auto) minmax(0,1fr);column-gap:8px}.deg_pd_roles_header{padding-top:5px}.deg_pd_roles_header span:last-child{grid-column:2;text-align:left}.deg_pd_role{align-items:start;row-gap:2px;padding:7px 0}.deg_pd_role_name{grid-row:1 / span 2;align-self:start}.deg_pd_role_value{white-space:normal;overflow-wrap:anywhere;text-overflow:clip}.deg_pd_role_state{grid-column:2;justify-self:start;text-align:left}}" +
+      // ── 模型候选与自动降级（票据 24）────────────────────────────────────────
+      ".deg_mcand_section,.deg_cr_section{display:flex;flex-direction:column;gap:10px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_mcand_title,.deg_cr_title{font-size:14px;line-height:22px;font-weight:600;margin:0}" +
+      ".deg_mcand_hint,.deg_cr_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}" +
+      ".deg_mcand_limit{display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0}" +
+      ".deg_mcand_role{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px}" +
+      ".deg_mcand_role_head{display:flex;align-items:center;gap:8px;min-width:0}" +
+      ".deg_mcand_role_name{font-size:13px;line-height:20px;font-weight:600}" +
+      ".deg_mcand_primary{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0;overflow-wrap:anywhere}" +
+      ".deg_mcand_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) minmax(0,.7fr) auto;align-items:center;gap:6px;min-width:0}" +
+      ".deg_mcand_row input{width:100%;min-width:0;box-sizing:border-box;padding:5px 7px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);font:inherit;font-size:12px;line-height:18px}" +
+      ".deg_mcand_actions{display:flex;align-items:center;gap:4px}" +
+      ".deg_mcand_actions .deg_btn{flex:0 0 auto;min-width:auto;width:26px;height:26px;padding:0;line-height:1}" +
+      ".deg_mcand_status{grid-column:1/-1;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}" +
+      ".deg_mcand_status[data-deg-candidate-ok=true]{color:var(--dsw-alias-state-success-primary,#22c55e)}" +
+      ".deg_mcand_status[data-deg-candidate-ok=false]{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}" +
+      ".deg_mcand_empty{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_cr_list{display:flex;flex-direction:column;gap:6px;margin:0;padding:0;list-style:none}" +
+      ".deg_cr_builtin{display:flex;gap:8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);min-width:0}" +
+      ".deg_cr_builtin_name{flex:0 0 auto;color:var(--dsw-alias-label-primary)}" +
+      ".deg_cr_row{display:grid;grid-template-columns:minmax(120px,.8fr) minmax(0,1fr);gap:8px 10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;min-width:0}" +
+      ".deg_cr_field{display:flex;flex-direction:column;gap:4px;min-width:0}" +
+      ".deg_cr_field_label{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_cr_row input,.deg_cr_row select,.deg_cr_row textarea{width:100%;min-width:0;box-sizing:border-box;padding:5px 7px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);font:inherit;font-size:12px;line-height:18px}" +
+      ".deg_cr_row textarea{min-height:52px;resize:vertical}" +
+      ".deg_cr_row input:disabled,.deg_cr_row select:disabled,.deg_cr_row textarea:disabled,.deg_mcand_row input:disabled{opacity:.5;cursor:not-allowed}" +
+      ".deg_cr_row_wide{grid-column:1/-1}" +
+      ".deg_cr_row_head{display:flex;align-items:center;gap:8px;grid-column:1/-1;min-width:0}" +
+      ".deg_cr_row_head .deg_btn{margin-left:auto;min-width:auto}" +
+      ".deg_cr_row_id{font-size:12px;line-height:18px;font-family:var(--ds-font-family-code,inherit)}" +
+      ".deg_cr_actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}" +
+      // 票据 26/29/25 新增区块（并发与背压 / 上下文继承 / 用量与单价）共用一套紧凑样式：
+      // 只读行与编辑行都用 grid，两列（标签 + 值）；provider 上限行与单价行再多一列删除按钮。
+      ".deg_extra_section{display:flex;flex-direction:column;gap:10px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_extra_title{font-size:14px;line-height:22px;font-weight:600;margin:0}" +
+      ".deg_extra_subtitle{font-size:12px;line-height:18px;font-weight:600;margin:0;color:var(--dsw-alias-label-primary)}" +
+      ".deg_extra_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}" +
+      ".deg_extra_block{display:flex;flex-direction:column;gap:8px;min-width:0}" +
+      ".deg_extra_rows{display:flex;flex-direction:column;gap:6px;min-width:0}" +
+      ".deg_extra_row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;min-width:0}" +
+      ".deg_extra_row_provider{grid-template-columns:minmax(0,1fr) 84px auto}" +
+      ".deg_extra_row_price{grid-template-columns:minmax(0,1.1fr) minmax(0,1.1fr) minmax(0,.8fr) minmax(0,.8fr) 66px auto}" +
+      ".deg_extra_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);min-width:0;overflow-wrap:anywhere}" +
+      ".deg_extra_value{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere;text-align:right}" +
+      ".deg_extra_empty{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}" +
+      ".deg_extra_row input{width:100%;min-width:0;box-sizing:border-box;padding:5px 7px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}" +
+      ".deg_extra_row input:disabled{opacity:.5;cursor:not-allowed}" +
+      ".deg_extra_row .deg_btn{flex:0 0 auto;min-width:auto;width:26px;height:26px;padding:0;line-height:1}" +
+      ".deg_extra_actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}" +
+      ".deg_extra_actions .deg_btn{flex:0 0 auto}" +
+      ".deg_extra_diag{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);margin:0;overflow-wrap:anywhere}" +
+      "@media (max-width:640px){.deg_mcand_row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.deg_cr_row{grid-template-columns:minmax(0,1fr)}.deg_extra_row_price{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.deg_extra_value{text-align:left}}";
 
 
     const cssTagId = "dsh-expert-group/settings.module.css";
@@ -1157,22 +1511,33 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 原生运行状态文案里唯一可替换的精确子串。
+     * 原生运行状态文案的可替换前缀候选（票据 19：中英文 locale 都生效）。
      *
-     * DSH 0.2.0-rc1 在输入区上方渲染宿主自己的运行状态行，中文 locale 的可见文案形如
-     * 「深度求索中，用时8分12秒...」（前面还可能挂着鲸鱼尾巴节点与独立的 aria-hidden 计时器）。
-     * 插件只拥有这一段前缀：替换它就能把当前会话的角色投影到宿主原生行上，而逗号、用时、
-     * 末尾省略号以及前后兄弟节点/动画全部保持宿主原样——既不重建整行，也不创建覆盖层。
+     * DSH 0.2.0-rc1 在输入区上方渲染宿主自己的运行状态行：中文 locale 形如
+     * 「深度求索中，用时8分12秒...」，英文 locale 可能是 "Deep diving..." / "Deep thinking..." /
+     * "Thinking..."。插件只拥有这一段前缀：替换它就能把当前会话的角色投影到宿主原生行上，
+     * 而逗号、用时、末尾省略号以及前后兄弟节点/动画全部保持宿主原样。
+     *
+     * 投影同步：权威列表在 shared.js 的 NATIVE_RUNNING_STATUS_PREFIXES，classic bundle 无法
+     * import ESM，因此这里是手写投影；两处必须逐项同值（测试同时覆盖两侧）。
      */
-    const NATIVE_RUNNING_STATUS_PREFIX = "深度求索中";
+    const NATIVE_RUNNING_STATUS_PREFIXES = Object.freeze([
+      "深度求索中",
+      "Deep diving",
+      "Deep thinking",
+      "Thinking",
+    ]);
+    /** 向后兼容：旧导出名继续指中文主前缀；新代码只用候选列表。 */
+    const NATIVE_RUNNING_STATUS_PREFIX = NATIVE_RUNNING_STATUS_PREFIXES[0];
 
     /**
      * 只替换原生运行前缀的纯函数（fail-closed）。本实现与 shared.js 的同名导出语义同步
      * （classic bundle 无法 import ESM 权威实现，两处只允许逐字保持同一份语义）。
      *
      * 边界语义：
-     * - 原文里没有该精确子串时返回 null：调用方必须保持宿主原文案，绝不猜测或整行重建；
-     * - 只替换**第一处**出现，其余内容逐字节保留（分隔逗号、用时、末尾省略号、空白与大小写）；
+     * - 原文里没有任何候选前缀时返回 null：调用方必须保持宿主原文案，绝不猜测或整行重建；
+     * - 只替换**第一处**出现（中英文候选混排时取原文最靠前的那个；同位置优先更长候选），
+     *   其余内容逐字节保留（分隔逗号、用时、末尾省略号、空白与大小写）；
      * - 原文或替换文案不是非空字符串时返回 null。
      * @param {unknown} currentText - 宿主当前渲染的原生文案。
      * @param {unknown} replacementText - 角色文案（例如 "Explorer running"，不带省略号）。
@@ -1181,9 +1546,16 @@ window.__ModuleLoader__.load({
     function replaceNativeStatusPrefix(currentText, replacementText) {
       if (typeof currentText !== "string" || currentText.length === 0) return null;
       if (typeof replacementText !== "string" || replacementText.length === 0) return null;
-      const at = currentText.indexOf(NATIVE_RUNNING_STATUS_PREFIX);
-      if (at === -1) return null;
-      return currentText.slice(0, at) + replacementText + currentText.slice(at + NATIVE_RUNNING_STATUS_PREFIX.length);
+      let match = null;
+      for (const prefix of NATIVE_RUNNING_STATUS_PREFIXES) {
+        const at = currentText.indexOf(prefix);
+        if (at === -1) continue;
+        if (match === null || at < match.at || (at === match.at && prefix.length > match.prefix.length)) {
+          match = { at, prefix };
+        }
+      }
+      if (match === null) return null;
+      return currentText.slice(0, match.at) + replacementText + currentText.slice(match.at + match.prefix.length);
     }
 
     /**
@@ -2218,7 +2590,7 @@ window.__ModuleLoader__.load({
     const SETTINGS_ROLE_LABELS = STATUS_ROLE_LABELS;
     // meta 尚未返回时的初始行：只含默认角色，可选角色（observer）由 meta 决定是否展示。
     const SETTINGS_REQUIRED_ROLE_IDS = SETTINGS_ROLE_IDS.filter((role) => role !== "observer");
-    const SETTINGS_NO_PROVIDER_LABEL = "无";
+
 
     // 提示词入口始终使用完整角色表，与模型配置的 activeRoles 读取路径刻意分离；
     // 因此 Observer 未启用时仍可配置提示词，但不会参与统一 provider 选择。
@@ -2297,11 +2669,17 @@ window.__ModuleLoader__.load({
       return { ok: true, code: null, message: null, count, maxGraphemes: max };
     }
 
-    /** 只从 settings 快照保留已知角色的字符串覆盖，避免脏 wire 数据进入编辑器。 */
-    function normalizePromptOverrides(value, maxGraphemes = DEFAULT_PROMPT_MAX_GRAPHEMES) {
+    /**
+     * 只从 settings 快照保留已知角色的字符串覆盖，避免脏 wire 数据进入编辑器。
+     *
+     * 票据 27：角色集合可由调用方显式传入（Host rolePrompts.roles，含自定义角色）；
+     * 缺省仍是内置六角色，纯函数调用与旧 Host 语义不变。
+     */
+    function normalizePromptOverrides(value, maxGraphemes = DEFAULT_PROMPT_MAX_GRAPHEMES, roleIds = PROMPT_ROLE_IDS) {
       if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
       const normalized = {};
-      for (const role of PROMPT_ROLE_IDS) {
+      const roles = Array.isArray(roleIds) && roleIds.length > 0 ? roleIds : PROMPT_ROLE_IDS;
+      for (const role of roles) {
         const text = value[role];
         if (typeof text !== "string") continue;
         if (!validatePromptText(text, maxGraphemes).ok) continue;
@@ -2321,10 +2699,13 @@ window.__ModuleLoader__.load({
      * 将 Host rolePrompts 投影归一为固定六角色顺序。投影未完整到达时返回 null，
      * 编辑页据此显示加载而不是先用空文本冒充一个可保存的提示词。
      */
-    function normalizeRolePromptProjection(projection, settingsValue, snapshotOverridesAuthoritative = false) {
+    function normalizeRolePromptProjection(projection, settingsValue, snapshotOverridesAuthoritative = false, roleIds = PROMPT_ROLE_IDS) {
       if (projection === null || typeof projection !== "object" || Array.isArray(projection)
         || !Array.isArray(projection.entries)) return null;
-      const fallbackOverrides = normalizePromptOverrides(settingsValue?.promptOverrides, projection.maxGraphemes);
+      // 票据 27：角色集合以 Host 投影自己声明的 roles 为准（含自定义角色）；缺省仍是
+      // 内置六角色，因此旧 Host 与纯函数调用的行为完全不变。
+      const roles = Array.isArray(roleIds) && roleIds.length > 0 ? roleIds : PROMPT_ROLE_IDS;
+      const fallbackOverrides = normalizePromptOverrides(settingsValue?.promptOverrides, projection.maxGraphemes, roles);
       const settingsHasOverrides = settingsValue !== null && typeof settingsValue === "object"
         && Object.prototype.hasOwnProperty.call(settingsValue, "promptOverrides");
       // 纯函数两参数调用保留旧 Host 投影语义；只有设置组件在接收到完整 snapshot
@@ -2333,7 +2714,7 @@ window.__ModuleLoader__.load({
         .filter((entry) => entry && typeof entry.role === "string")
         .map((entry) => [entry.role, entry]));
       const entries = [];
-      for (const role of PROMPT_ROLE_IDS) {
+      for (const role of roles) {
         const source = byRole.get(role);
         if (typeof source?.defaultPersona !== "string") return null;
         // settings snapshot 到达后比一次 meta 更权威：meta 可能仍是组件首次读取的旧投影，
@@ -2358,7 +2739,7 @@ window.__ModuleLoader__.load({
         ? projection.maxGraphemes
         : DEFAULT_PROMPT_MAX_GRAPHEMES;
       return {
-        roles: PROMPT_ROLE_IDS,
+        roles,
         maxGraphemes,
         customizable: projection.customizable === true,
         entries,
@@ -2388,10 +2769,13 @@ window.__ModuleLoader__.load({
     /**
      * 统一供应商只观察设置页实际展示的角色；Observer 未启用时，其旧配置不能污染选择器。
      * 未传角色列表时沿用旧版五个必选专家，供纯函数调用和旧 Host 兼容。
+     *
+     * 票据 27：不再按本地静态角色表过滤——meta.activeRoles 是运行期目录的唯一读取面，
+     * 自定义角色必须与内置角色一样参与统一供应商与行级迁移（否则会从角色表消失）。
      */
     function settingsRolesForProvider(roles) {
       const candidates = Array.isArray(roles) ? roles : SETTINGS_REQUIRED_ROLE_IDS;
-      return [...new Set(candidates.filter((role) => SETTINGS_ROLE_IDS.includes(role)))];
+      return [...new Set(candidates.filter((role) => typeof role === "string" && role.length > 0))];
     }
 
     /**
@@ -2412,21 +2796,24 @@ window.__ModuleLoader__.load({
       return configured.every((provider) => provider === first) ? first : "";
     }
 
-    const NOTIFICATION_HOLD_OPTIONS = Object.freeze([
-      { value: 5000, label: "5s" },
-      { value: 10000, label: "10s" },
-      { value: 30000, label: "30s" },
-      { value: 60000, label: "60s" },
-      { value: 300000, label: "5min" },
-      { value: 600000, label: "10min" },
-      { value: 0, label: "永久" },
-    ]);
-    const DEFAULT_NOTIFICATION_HOLD_MS = 5000;
+    /**
+     * 通知事件类型（票据 14）：设置页与 Host 使用同一组稳定 id。
+     * 标签只用于展示，不属于持久化字段。
+     */
+    const NOTIFICATION_EVENT_TYPES = Object.freeze(["completed", "waiting", "failed"]);
+    // 事件标签已迁到消息表（settings.notificationEvent.*，见渲染层 t(...)）。
 
-    /** 设置页只允许固定时长；旧配置或非法值回退到 5 秒。 */
-    function notificationHoldMsOf(value) {
-      const number = typeof value === "number" ? value : NaN;
-      return NOTIFICATION_HOLD_OPTIONS.some((option) => option.value === number) ? number : DEFAULT_NOTIFICATION_HOLD_MS;
+    /**
+     * 通知事件开关归一：缺失/非法一律按开启，只有显式 false 才关闭。
+     *
+     * 与 Host 读取面同一语义：旧配置没有该字段时保持历史行为（全部投递），
+     * 读到一个坏值也不会静默关掉通知；写入面的严格校验在 Host 提交端点。
+     */
+    function normalizeNotificationEvents(value) {
+      const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const normalized = {};
+      for (const type of NOTIFICATION_EVENT_TYPES) normalized[type] = source[type] !== false;
+      return normalized;
     }
 
     function clampNotificationVolume(value) {
@@ -2457,6 +2844,775 @@ window.__ModuleLoader__.load({
       return Number.isSafeInteger(value) && value >= 1000 && value <= 86400000 && value % 1000 === 0
         ? value
         : DEFAULT_ROLE_TIMEOUT_MS;
+    }
+
+    // ── 票据 24/27：候选模型与自定义角色的归一、校验（设置页草稿与提交共用）──
+    //
+    // 上限与 Host 完全一致：候选 8、降级上限 4（默认 2）、自定义角色 16、toolDeny 64 条。
+    // 这些常量只用于客户端预校验与 UI 限制，权威拒绝仍在 Host 的 settings-commit。
+    const MAX_MODEL_CANDIDATES_PER_ROLE = 8;
+    const MAX_MODEL_FALLBACK_LIMIT = 4;
+    const DEFAULT_MODEL_FALLBACK_LIMIT = 2;
+    const MAX_CUSTOM_ROLES = 16;
+    const CUSTOM_ROLE_FIELD_LIMITS = Object.freeze({ label: 64, statusLabel: 32, description: 500, persona: 8000, toolDenyEntries: 64, toolName: 128 });
+    /** 与 role-registry.js 的 CUSTOM_ROLE_ID_PATTERN 同规则（小写字母开头，2..32）。 */
+    const CUSTOM_ROLE_ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
+
+    /** 降级上限只接受 0..4 的安全整数；缺失/非法按默认 2 归一（与 Host 读取面一致）。 */
+    function normalizeModelFallbackLimitDraft(value) {
+      return Number.isSafeInteger(value) && value >= 0 && value <= MAX_MODEL_FALLBACK_LIMIT ? value : DEFAULT_MODEL_FALLBACK_LIMIT;
+    }
+    /**
+     * 单条候选归一：只保留 provider/model 字符串与可选非空 effort。
+     *
+     * 与 defaults 的读取归一不同，这里**不丢弃空串**：设置页新增的候选行在用户填写前
+     * 就是 {provider:"", model:""}，读取归一若丢掉它，草稿与源看起来相同（保存按钮会
+     * 错误地保持禁用）。空串行由保存前的 validateModelCandidateRows 明确拒绝。
+     */
+    function normalizeModelCandidateSelection(entry) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return null;
+      if (typeof entry.provider !== "string" || typeof entry.model !== "string") return null;
+      const reasoningEffort = typeof entry.reasoningEffort === "string" ? entry.reasoningEffort : "";
+      return { provider: entry.provider, model: entry.model, ...(reasoningEffort.length > 0 ? { reasoningEffort } : {}) };
+    }
+    /** 角色 -> 有序候选映射归一；保留全部角色（含未展示的旧角色），每角色最多 8 条。 */
+    function normalizeModelCandidatesDraft(value) {
+      const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const candidates = {};
+      for (const [role, list] of Object.entries(source)) {
+        if (typeof role !== "string" || role.length === 0 || !Array.isArray(list)) continue;
+        const normalized = [];
+        for (const entry of list.slice(0, MAX_MODEL_CANDIDATES_PER_ROLE)) {
+          const selection = normalizeModelCandidateSelection(entry);
+          if (selection !== null) normalized.push(selection);
+        }
+        if (normalized.length > 0) candidates[role] = normalized;
+      }
+      return candidates;
+    }
+    /** 候选去重键：provider + model + 规范化 effort（空 effort 与缺省等价）。 */
+    function modelCandidateKeyOf(selection) {
+      return (selection?.provider ?? "") + "\u0000" + (selection?.model ?? "") + "\u0000" + (typeof selection?.reasoningEffort === "string" ? selection.reasoningEffort : "");
+    }
+    /**
+     * 候选草稿的保存前校验（fail-closed，绝不静默丢弃用户输入）：行必须同时有
+     * provider/model，同一角色候选去重，角色级最多 8 条。
+     */
+    function validateModelCandidateRows(candidates) {
+      const source = candidates !== null && typeof candidates === "object" ? candidates : {};
+      for (const [role, list] of Object.entries(source)) {
+        if (!Array.isArray(list)) continue;
+        if (list.length > MAX_MODEL_CANDIDATES_PER_ROLE) return { ok: false, code: "limit", role, index: 0 };
+        const seen = new Set();
+        for (let index = 0; index < list.length; index += 1) {
+          const selection = normalizeModelCandidateSelection(list[index]);
+          if (selection === null || selection.provider.length === 0 || selection.model.length === 0) return { ok: false, code: "incomplete", role, index: index + 1 };
+          const key = modelCandidateKeyOf(selection);
+          if (seen.has(key)) return { ok: false, code: "duplicate", role, index: index + 1 };
+          seen.add(key);
+        }
+      }
+      return { ok: true, code: null, role: null, index: 0 };
+    }
+    /** toolDeny 文本域 -> 工具名数组：按行拆分、去空白、去空行（允许空数组，但字段存在）。 */
+    function customRoleToolDenyLinesOf(text) {
+      if (typeof text !== "string") return [];
+      return text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+    }
+    /**
+     * 单条自定义角色定义归一（读取面）：保留用户可声明字段的原始文本，供编辑器继续修改。
+     * label/description 缺失或为空的条目在 Host 读取面本就会被丢弃并诊断，这里保持一致。
+     */
+    function normalizeCustomRoleDefinitionDraft(id, definition) {
+      // 与 Host 读取面一致：非法 id（含大写/下划线/超长）整条丢弃，避免编辑器渲染不可保存的行。
+      if (typeof id !== "string" || !CUSTOM_ROLE_ID_PATTERN.test(id)) return null;
+      if (definition === null || typeof definition !== "object" || Array.isArray(definition)) return null;
+      if (typeof definition.label !== "string" || definition.label.trim().length === 0) return null;
+      if (typeof definition.description !== "string" || definition.description.length === 0) return null;
+      return {
+        label: definition.label,
+        ...(typeof definition.statusLabel === "string" && definition.statusLabel.length > 0 ? { statusLabel: definition.statusLabel } : {}),
+        description: definition.description,
+        ...(typeof definition.readOnly === "boolean" ? { readOnly: definition.readOnly } : {}),
+        // 只接受纯字符串数组；缺失/坏值保持"未声明"，保存时按 fail-closed 拒绝。
+        ...(Array.isArray(definition.toolDeny) && definition.toolDeny.every((entry) => typeof entry === "string") ? { toolDeny: definition.toolDeny.slice() } : {}),
+        ...(typeof definition.persona === "string" && definition.persona.length > 0 ? { persona: definition.persona } : {}),
+      };
+    }
+    /** 自定义角色映射归一：id 字典序（与 Host 文档顺序一致），坏条目整条丢弃。 */
+    function normalizeCustomRolesDraft(value) {
+      const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const roles = {};
+      for (const id of Object.keys(source).sort()) {
+        const definition = normalizeCustomRoleDefinitionDraft(id, source[id]);
+        if (definition !== null) roles[id] = definition;
+      }
+      return roles;
+    }
+    /** 编辑器行序号：只用于 React key 与测试定位，不进入任何提交字段。 */
+    let customRoleRowSequence = 0;
+    /** 由归一后的定义创建一行编辑器状态；id 为空表示"新增"（id 可编辑）。 */
+    function createCustomRoleRow(definition, id = "") {
+      customRoleRowSequence += 1;
+      return {
+        key: "role-row-" + customRoleRowSequence, id, isNew: id.length === 0,
+        label: typeof definition?.label === "string" ? definition.label : "",
+        statusLabel: typeof definition?.statusLabel === "string" ? definition.statusLabel : "",
+        description: typeof definition?.description === "string" ? definition.description : "",
+        readOnly: typeof definition?.readOnly === "boolean" ? String(definition.readOnly) : "",
+        // null 表示源文档里没有该字段：保存前必须显式补上，绝不静默补空数组放行。
+        toolDenyText: Array.isArray(definition?.toolDeny) ? definition.toolDeny.join("\n") : null,
+        persona: typeof definition?.persona === "string" ? definition.persona : "",
+      };
+    }
+    /** settings.customRoles 文档 -> 编辑器行（按 id 字典序，与 Host 文档顺序一致）。 */
+    function customRoleRowsFromDocument(value) {
+      return Object.entries(normalizeCustomRolesDraft(value)).map(([id, definition]) => createCustomRoleRow(definition, id));
+    }
+    /**
+     * 编辑器行 -> 可提交定义。顺序固定且缺省字段一律省略，保证与 normalizeCustomRolesDraft
+     * 对同一份文档产出逐字节相同的形状，dirty 判定不会因为键序或补默认值而误报。
+     */
+    function customRoleRowDefinition(row) {
+      const id = typeof row?.id === "string" ? row.id.trim() : "";
+      if (id.length === 0) return null;
+      const label = typeof row.label === "string" ? row.label.trim() : "";
+      const statusLabel = typeof row.statusLabel === "string" ? row.statusLabel.trim() : "";
+      const description = typeof row.description === "string" ? row.description : "";
+      const readOnly = row.readOnly === "true" ? true : (row.readOnly === "false" ? false : void 0);
+      const toolDeny = typeof row.toolDenyText !== "string" ? void 0 : customRoleToolDenyLinesOf(row.toolDenyText);
+      const persona = typeof row.persona === "string" ? row.persona : "";
+      return {
+        id,
+        definition: {
+          label, ...(statusLabel.length > 0 ? { statusLabel } : {}), description,
+          ...(readOnly === void 0 ? {} : { readOnly }), ...(toolDeny === void 0 ? {} : { toolDeny }),
+          ...(persona.length > 0 ? { persona } : {}),
+        },
+      };
+    }
+    /** 编辑器行 -> settings.customRoles 文档：按 id 字典序，重复 id 由校验提前拒绝。 */
+    function customRolesDocumentOfRows(rows) {
+      const byId = {};
+      for (const row of Array.isArray(rows) ? rows : []) {
+        const built = customRoleRowDefinition(row);
+        if (built !== null) byId[built.id] = built.definition;
+      }
+      const document = {};
+      for (const id of Object.keys(byId).sort()) document[id] = byId[id];
+      return document;
+    }
+    /**
+     * 自定义角色行的保存前校验（fail-closed）。只在 readOnly/toolDeny 缺失或非法时阻断
+     * 保存；其余字段按 Host 同一组长度上限提前给出可读原因。保留名/未知字段由 Host 裁决。
+     */
+    function validateCustomRoleRows(rows, options = {}) {
+      const list = Array.isArray(rows) ? rows : [];
+      const builtinIds = Array.isArray(options.builtinIds) ? options.builtinIds : SETTINGS_ROLE_IDS;
+      if (list.length > MAX_CUSTOM_ROLES) return { ok: false, code: "limit", role: "", id: "" };
+      const seen = new Set();
+      for (const row of list) {
+        const id = typeof row?.id === "string" ? row.id.trim() : "";
+        if (!CUSTOM_ROLE_ID_PATTERN.test(id)) return { ok: false, code: "id", role: id, id };
+        if (builtinIds.includes(id)) return { ok: false, code: "idBuiltin", role: id, id };
+        if (seen.has(id)) return { ok: false, code: "idDuplicate", role: id, id };
+        seen.add(id);
+        const checks = [
+          ["label", typeof row.label === "string" ? row.label.trim().length : 0, CUSTOM_ROLE_FIELD_LIMITS.label, true],
+          ["description", typeof row.description === "string" ? row.description.length : 0, CUSTOM_ROLE_FIELD_LIMITS.description, true],
+          ["statusLabel", typeof row.statusLabel === "string" ? row.statusLabel.trim().length : 0, CUSTOM_ROLE_FIELD_LIMITS.statusLabel, false],
+          ["persona", typeof row.persona === "string" ? row.persona.length : 0, CUSTOM_ROLE_FIELD_LIMITS.persona, false],
+        ];
+        for (const [code, length, max, required] of checks) {
+          if ((required && length === 0) || length > max) return { ok: false, code, role: id, id };
+        }
+        // 只读性必须显式选择：空串/布尔字符串以外的值一律拒绝，绝不默认放开权限。
+        if (row.readOnly !== "true" && row.readOnly !== "false") return { ok: false, code: "readOnly", role: id, id };
+        // toolDeny 必须显式存在（允许空文本域 = 空数组），缺失时拒绝而不是补空数组。
+        if (typeof row.toolDenyText !== "string") return { ok: false, code: "toolDeny", role: id, id };
+        const denyLines = customRoleToolDenyLinesOf(row.toolDenyText);
+        if (denyLines.length > CUSTOM_ROLE_FIELD_LIMITS.toolDenyEntries || denyLines.some((line) => line.length > CUSTOM_ROLE_FIELD_LIMITS.toolName)) return { ok: false, code: "toolDenyEntry", role: id, id };
+      }
+      return { ok: true, code: null, role: null, id: "" };
+    }
+    /** 候选校验结果 -> 可读中文原因（角色显示名优先，索引从 1 开始）。 */
+    function modelCandidatesErrorMessage(t, roleLabelOf, validation) {
+      if (validation.code === "limit") return t("settings.modelCandidates.limit");
+      return (typeof roleLabelOf === "function" ? roleLabelOf(validation.role) : validation.role) + "：" + t("settings.modelCandidates.error." + (validation.code ?? "incomplete"), { index: validation.index });
+    }
+    /** 自定义角色校验结果 -> 可读中文原因（缺 readOnly/toolDeny 为 fail-closed 的主要路径）。 */
+    function customRoleValidationMessage(t, validation) {
+      return t("settings.customRoles.error." + (validation.code ?? "host"), {
+        role: validation.role !== undefined && validation.role !== "" ? validation.role : "?",
+        id: validation.id !== undefined && validation.id !== "" ? validation.id : (validation.role || "?"),
+      });
+    }
+    /** Host 拒绝自定义角色保存 -> 保留 Host 原文；删除守卫错误使用独立的"仍在使用"文案。 */
+    function customRoleHostErrorMessage(t, cause, message) {
+      const code = typeof cause?.code === "string" ? cause.code : "";
+      return code === "CUSTOM_ROLE_IN_USE" || /拒绝删除|仍在使用|in use/i.test(message)
+        ? t("settings.customRoles.inUse", { message })
+        : t("settings.customRoles.error.host", { message });
+    }
+    // ── 票据 26/29/25：并发映射、上下文继承、用量与单价的草稿归一与校验 ────────────
+    //
+    // 边界常量与服务端同源：roleLimits 1..64（逐角色覆盖）、providerLimits 0..64
+    // （0 = 不限制）、modelPrices 最多 64 条（provider/model ≤128 字符、币种 1..8）。
+    // 客户端只做保存前预校验与输入限制，**权威拒绝仍在 Host 的 settings-commit**：
+    // 这里绝不把自己的归一结果当作"已经保存成功"。
+    const MIN_ROLE_LIMIT = 1;
+    const MAX_ROLE_LIMIT = 64;
+    const MIN_PROVIDER_CONCURRENCY_LIMIT = 0;
+    const MAX_PROVIDER_CONCURRENCY_LIMIT = 64;
+    const MAX_MODEL_PRICES = 64;
+    // provider 上限行的编辑上限：Host 不对该映射设条数上限（只校验键与值），但设置页必须有界，
+    // 与诊断投影的 32 条一致；达到上限后"添加"按钮禁用并给出原因。
+    const MAX_PROVIDER_LIMIT_ROWS = 32;
+    const MAX_MODEL_PRICE_TEXT_CHARS = 128;
+    const MAX_MODEL_PRICE_CURRENCY_CHARS = 8;
+    const DEFAULT_MODEL_PRICE_CURRENCY = "USD";
+    /**
+     * 可开启上下文继承的角色：内置非 Observer（explorer/librarian/oracle/designer/fixer）。
+     *
+     * client.js 是 classic bundle，运行期不能 import shared.js，因此这里保留与
+     * shared.js 的 CONTEXT_INHERITANCE_ROLE_IDS（= ROLES）同一份手写投影；Observer 的
+     * 隔离是安全边界，不因设置文档而改变。
+     */
+    const CONTEXT_INHERITANCE_ROLE_IDS = Object.freeze(STATUS_ROLE_IDS.filter((role) => role !== "observer"));
+
+    /** roleLimits 允许的角色键：内置角色（含未启用的 Observer 存量上限）+ 本次声明的角色。 */
+    function roleLimitAllowedRoles(roles) {
+      const allowed = new Set(SETTINGS_ROLE_IDS);
+      for (const role of Array.isArray(roles) ? roles : []) {
+        if (typeof role === "string" && role.length > 0) allowed.add(role);
+      }
+      return allowed;
+    }
+
+    /**
+     * 逐角色并发上限草稿归一（票据 26）。
+     *
+     * 只做**形状**归一：合法角色键 + 有限数字，键按字典序输出（草稿与快照必须逐字节
+     * 可比，否则对象键序差异会被误判成 dirty）。范围（1..64）留给保存前的
+     * validateRoleLimitsDocument 判定，这样用户输入 0/80 时能看到可读错误，
+     * 而不是在归一阶段被静默丢弃后"保存按钮点了没反应"。
+     * 未知角色键（读取面本就会丢弃并诊断）不进入草稿。
+     */
+    function normalizeRoleLimitsDraft(value, roles) {
+      const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const allowed = roleLimitAllowedRoles(roles);
+      const limits = {};
+      for (const role of Object.keys(source).sort()) {
+        if (!allowed.has(role)) continue;
+        const limit = source[role];
+        if (typeof limit !== "number" || !Number.isFinite(limit)) continue;
+        limits[role] = limit;
+      }
+      return limits;
+    }
+
+    /** 逐角色并发上限的保存前校验（fail-closed）：每项必须是 1..64 的安全整数。 */
+    function validateRoleLimitsDocument(limits) {
+      const source = limits !== null && typeof limits === "object" && !Array.isArray(limits) ? limits : {};
+      for (const role of Object.keys(source)) {
+        const limit = source[role];
+        if (!Number.isSafeInteger(limit) || limit < MIN_ROLE_LIMIT || limit > MAX_ROLE_LIMIT) {
+          return { ok: false, code: "roleLimit", role, index: 0 };
+        }
+      }
+      return { ok: true, code: null, role: null, index: 0 };
+    }
+
+    /**
+     * 逐 provider 并发上限草稿归一（票据 26）。
+     *
+     * provider 键只要求非空字符串（**不查模型目录**：目录不可用不应阻塞限流配置保存），
+     * 值只保留有限数字；0 是合法的"显式不限制"。键按字典序输出，理由同 roleLimits。
+     */
+    function normalizeProviderLimitsDraft(value) {
+      const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const limits = {};
+      for (const provider of Object.keys(source).sort()) {
+        if (typeof provider !== "string" || provider.trim().length === 0) continue;
+        const limit = source[provider];
+        if (typeof limit !== "number" || !Number.isFinite(limit)) continue;
+        limits[provider] = limit;
+      }
+      return limits;
+    }
+
+    /** provider 上限编辑器行序号：只用于 React key 与测试定位，不进入任何提交字段。 */
+    let providerLimitRowSequence = 0;
+
+    /** 由归一后的 provider 映射创建一行编辑器状态（provider/limit 可为空，表示新增行）。 */
+    function createProviderLimitRow(provider, limit) {
+      providerLimitRowSequence += 1;
+      return {
+        key: "provider-limit-row-" + providerLimitRowSequence,
+        provider: typeof provider === "string" ? provider : "",
+        limit: typeof limit === "number" ? limit : "",
+      };
+    }
+
+    /** settings.providerLimits 文档 -> 编辑器行（按 provider 字典序，与归一顺序一致）。 */
+    function providerLimitRowsOfDocument(value) {
+      return Object.entries(normalizeProviderLimitsDraft(value)).map(([provider, limit]) => createProviderLimitRow(provider, limit));
+    }
+
+    /**
+     * 编辑器行 -> settings.providerLimits 文档（replace 语义的完整映射）。
+     *
+     * 完全空白的行（名称与上限都为空）视为"点了添加还没填"的行而被忽略；只填了名称时
+     * 上限留空 = 0（显式不限制）。provider 名与上限都在保存前校验里 fail-closed。
+     */
+    function providerLimitsDocumentOfRows(rows) {
+      const document = {};
+      for (const row of Array.isArray(rows) ? rows : []) {
+        const provider = typeof row?.provider === "string" ? row.provider.trim() : "";
+        const blankLimit = row?.limit === "" || row?.limit === null || row?.limit === void 0;
+        if (provider.length === 0 && blankLimit) continue;
+        document[provider] = blankLimit ? 0 : row.limit;
+      }
+      const sorted = {};
+      for (const provider of Object.keys(document).sort()) sorted[provider] = document[provider];
+      return sorted;
+    }
+
+    /**
+     * provider 上限行的保存前校验（fail-closed）。
+     *
+     * 名称空/超长、与前面的行重复、上限不是 0..64 的安全整数都会阻止保存并给出可读原因：
+     * 静默丢弃会让用户以为限流已经生效。
+     */
+    function validateProviderLimitRows(rows) {
+      const document = providerLimitsDocumentOfRows(rows);
+      const seen = new Set();
+      let index = 0;
+      for (const row of Array.isArray(rows) ? rows : []) {
+        const provider = typeof row?.provider === "string" ? row.provider.trim() : "";
+        const blankLimit = row?.limit === "" || row?.limit === null || row?.limit === void 0;
+        if (provider.length === 0 && blankLimit) continue;
+        index += 1;
+        if (provider.length === 0) return { ok: false, code: "providerEmpty", index };
+        if (provider.length > MAX_MODEL_PRICE_TEXT_CHARS) return { ok: false, code: "providerTooLong", index };
+        if (seen.has(provider)) return { ok: false, code: "providerDuplicate", index };
+        seen.add(provider);
+        const limit = document[provider];
+        if (!Number.isSafeInteger(limit) || limit < MIN_PROVIDER_CONCURRENCY_LIMIT || limit > MAX_PROVIDER_CONCURRENCY_LIMIT) {
+          return { ok: false, code: "providerLimit", index };
+        }
+      }
+      return { ok: true, code: null, index: 0 };
+    }
+
+    /**
+     * 上下文继承草稿归一（票据 29）：只保留内置非 Observer 角色的显式 true。
+     *
+     * 与 Host 读取面同一语义：显式 false 与缺失同义（关闭），非法键（Observer、未知角色、
+     * 自定义角色）与非布尔值不进入草稿。因此"关掉一个本来没开的角色"不会让页面变 dirty，
+     * 自定义角色的存量坏键也不会被重新提交。
+     */
+    function normalizeInheritContextDraft(value) {
+      const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const enabled = {};
+      for (const role of CONTEXT_INHERITANCE_ROLE_IDS) {
+        if (source[role] === true) enabled[role] = true;
+      }
+      return enabled;
+    }
+
+    /** 单价金额草稿：只有有限非负数才是"已填写"，其余（含空串）保持未填写状态。 */
+    function normalizePriceAmountDraft(value) {
+      return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : "";
+    }
+
+    /** 单条单价草稿归一：只保留固定字段；provider/model 不是字符串的坏行整条丢弃。 */
+    function normalizeModelPriceDraftEntry(entry) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return null;
+      if (typeof entry.provider !== "string" || typeof entry.model !== "string") return null;
+      return {
+        provider: entry.provider,
+        model: entry.model,
+        inputPerMillion: normalizePriceAmountDraft(entry.inputPerMillion),
+        outputPerMillion: normalizePriceAmountDraft(entry.outputPerMillion),
+        currency: typeof entry.currency === "string" ? entry.currency : "",
+      };
+    }
+
+    /**
+     * 单价草稿归一（票据 25）：保留行顺序与"未填写"状态。
+     *
+     * 与候选模型同样的理由：设置页新增的单价行在用户填写前就是空串金额，归一若丢掉它，
+     * 草稿与源看起来相同（保存按钮会错误地保持禁用）。空行由保存前的
+     * validateModelPricesDraft 明确拒绝。
+     */
+    function normalizeModelPricesDraft(value) {
+      if (!Array.isArray(value)) return [];
+      const prices = [];
+      for (const entry of value.slice(0, MAX_MODEL_PRICES)) {
+        const normalized = normalizeModelPriceDraftEntry(entry);
+        if (normalized !== null) prices.push(normalized);
+      }
+      return prices;
+    }
+
+    /** 单价草稿 -> settings.modelPrices 文档：去空白、币种缺省 USD、金额必须是数字。 */
+    function modelPricesDocumentOfDraft(rows) {
+      return (Array.isArray(rows) ? rows : []).map((row) => ({
+        provider: typeof row?.provider === "string" ? row.provider.trim() : "",
+        model: typeof row?.model === "string" ? row.model.trim() : "",
+        inputPerMillion: typeof row?.inputPerMillion === "number" ? row.inputPerMillion : Number.NaN,
+        outputPerMillion: typeof row?.outputPerMillion === "number" ? row.outputPerMillion : Number.NaN,
+        currency: typeof row?.currency === "string" && row.currency.trim().length > 0
+          ? row.currency.trim()
+          : DEFAULT_MODEL_PRICE_CURRENCY,
+      }));
+    }
+
+    /**
+     * 单价草稿的保存前校验（fail-closed，票据 25）。
+     *
+     * 空行/缺字段/负数/非有限数/重复 provider+model/超量都在这里拒绝：单价是成本展示的
+     * 输入，静默丢掉未填完的行会让用户以为已经配置成功。币种留空按 USD 处理（与 Host
+     * 读取面的缺省一致），仅做长度限制。
+     */
+    function validateModelPricesDraft(rows) {
+      const list = Array.isArray(rows) ? rows : [];
+      if (list.length > MAX_MODEL_PRICES) return { ok: false, code: "limit", index: 0 };
+      const seen = new Set();
+      for (let position = 0; position < list.length; position += 1) {
+        const row = list[position];
+        const index = position + 1;
+        const provider = typeof row?.provider === "string" ? row.provider.trim() : "";
+        const model = typeof row?.model === "string" ? row.model.trim() : "";
+        if (provider.length === 0 || model.length === 0) return { ok: false, code: "incomplete", index };
+        if (provider.length > MAX_MODEL_PRICE_TEXT_CHARS || model.length > MAX_MODEL_PRICE_TEXT_CHARS) return { ok: false, code: "tooLong", index };
+        for (const field of ["inputPerMillion", "outputPerMillion"]) {
+          const amount = row?.[field];
+          if (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0) return { ok: false, code: "rate", index };
+        }
+        const currency = typeof row?.currency === "string" ? row.currency.trim() : "";
+        if (currency.length > MAX_MODEL_PRICE_CURRENCY_CHARS) return { ok: false, code: "currency", index };
+        const key = provider + "\u0000" + model;
+        if (seen.has(key)) return { ok: false, code: "duplicate", index };
+        seen.add(key);
+      }
+      return { ok: true, code: null, index: 0 };
+    }
+
+    /**
+     * 用量指标白名单（票据 25）：只读取 token/计数/耗时与归属文本。
+     *
+     * Host 投影已经过滤过一遍，这里再按同一白名单收敛：即使有人把 prompt、响应、
+     * 凭据或路径塞进 usage，也不会进入渲染树。
+     */
+    /**
+     * provider+model 组合分组的客户端条数上限。
+     *
+     * 与 Host 的 MAX_USAGE_GROUPS 同值（浏览器侧不能 import Host 模块，故持有同值副本）：
+     * Host 已把结果收敛到 ≤64 条，这里再兜一层，防止自定义/异常注入把渲染成本放大。
+     */
+    const MAX_USAGE_PROVIDER_MODEL_GROUPS = 64;
+
+    const USAGE_METRIC_FIELDS = Object.freeze([
+      { id: "inputTokens", kind: "token" },
+      { id: "outputTokens", kind: "token" },
+      { id: "cacheReadTokens", kind: "token" },
+      { id: "cacheWriteTokens", kind: "token" },
+      { id: "reasoningTokens", kind: "token" },
+      { id: "billedInputTokens", kind: "token" },
+      { id: "totalTokens", kind: "token" },
+      { id: "requests", kind: "count" },
+      { id: "retries", kind: "count" },
+      { id: "fallbacks", kind: "count" },
+      { id: "runMs", kind: "duration" },
+    ]);
+
+    /** usage 投影归一：只保留白名单字段，缺字段省略（不补 0 冒充"已计量"）。 */
+    function normalizeUsageMetricsOf(value) {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+      const metrics = {};
+      for (const field of USAGE_METRIC_FIELDS) {
+        const raw = value[field.id];
+        if (field.kind === "duration") {
+          if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) metrics[field.id] = raw;
+          continue;
+        }
+        if (typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0) metrics[field.id] = raw;
+      }
+      for (const field of ["provider", "model", "role", "roleLabel"]) {
+        if (typeof value[field] === "string" && value[field].length > 0) metrics[field] = value[field].slice(0, MAX_MODEL_PRICE_TEXT_CHARS);
+      }
+      return metrics;
+    }
+
+    /** 单个用量聚合视图：没有任何可用指标时返回 null（界面显示"无样本"而不是 0）。 */
+    function normalizeUsageSummaryOf(value) {
+      const metrics = normalizeUsageMetricsOf(value);
+      return Object.keys(metrics).length === 0 ? null : metrics;
+    }
+
+    /**
+     * 归属文本归一：非字符串/空白返回 null（调用方回退 unknown），超长截断。
+     *
+     * NUL 一律替换为 U+FFFD（与 Host 同口径）：provider/model 里允许 NUL 时，简单
+     * `provider + NUL + model` 拼接会让两个不同组合得到同一个键；归一后组合键不再有歧义，
+     * 公开字段也不会把控制字符带进渲染树。
+     */
+    function usageGroupTextOf(value) {
+      if (typeof value !== "string") return null;
+      const textValue = value.trim();
+      if (textValue.length === 0) return null;
+      const normalized = textValue.includes("\u0000")
+        ? textValue.replace(/\u0000/g, "\uFFFD")
+        : textValue;
+      return normalized.slice(0, MAX_MODEL_PRICE_TEXT_CHARS);
+    }
+
+    /**
+     * provider+model 分组的稳定唯一键（长度前缀 + overflow 标志）。
+     *
+     * 不能用 "provider/model" 或 NUL 直接拼接做唯一键：provider/model 本身可能含 "/"，
+     * 且真实 other/other 与溢出桶的公开字段完全相同。长度前缀让"键 ↔ 内容"一一对应，
+     * overflow 位让真实 other/other（...:0）与溢出桶（...:1）永不相等。
+     */
+    function usageProviderModelKey(provider, model, overflow) {
+      return "pm:" + provider.length + ":" + provider + ":" + model.length + ":" + model
+        + ":" + (overflow === true ? "1" : "0");
+    }
+
+    /**
+     * provider+model 组合分组归一（票据 25 成本归属修复）。
+     *
+     * 成本估算必须以 (provider, model) 为单位精确匹配：byModel 合并了不同 provider 的
+     * 同名模型，拿它套 provider 单价会错误归属，两个 provider 都配置单价时还会重复计费。
+     * Host 的 meta.usage.byProviderModel 是数组（≤64 条）；这里同时兼容对象形态
+     * （旧/自定义注入：{ "provider\u0000model" | "provider/model": usage }），统一归一为
+     * [{ key, provider, model, overflow, usage }]。
+     *
+     * - overflow 只认 Host 的布尔 true；真实 other/other 的 overflow 为 false，两者不互相去重。
+     * - 含多个 NUL 的对象键无法区分分隔符与归属内容，直接跳过（fail-closed）。
+     * - 缺失/非法/没有可用指标时返回空数组，绝不补 0。
+     */
+    function normalizeUsageProviderModelGroups(input) {
+      const rows = [];
+      const seen = new Set();
+      const pushRow = (rawProvider, rawModel, rawUsage, rawOverflow) => {
+        if (rows.length >= MAX_USAGE_PROVIDER_MODEL_GROUPS) return;
+        const usage = normalizeUsageSummaryOf(rawUsage);
+        if (usage === null) return;
+        // usage 内部也保留 provider/model；它们同属公开视图，一并做 NUL 归一，
+        // 避免渲染树/序列化结果里残留控制字符。
+        const usageProvider = usageGroupTextOf(usage.provider);
+        if (usageProvider !== null) usage.provider = usageProvider;
+        const usageModel = usageGroupTextOf(usage.model);
+        if (usageModel !== null) usage.model = usageModel;
+        const provider = usageGroupTextOf(rawProvider) ?? "unknown";
+        const model = usageGroupTextOf(rawModel) ?? "unknown";
+        const overflow = rawOverflow === true;
+        const key = usageProviderModelKey(provider, model, overflow);
+        if (seen.has(key)) return;
+        seen.add(key);
+        rows.push({ key, provider, model, overflow, usage });
+      };
+      if (Array.isArray(input)) {
+        for (const entry of input.slice(0, MAX_USAGE_PROVIDER_MODEL_GROUPS)) {
+          if (entry === null || typeof entry !== "object") continue;
+          pushRow(entry.provider, entry.model, entry.usage, entry.overflow === true);
+        }
+        return rows;
+      }
+      if (input === null || typeof input !== "object") return rows;
+      for (const rawKey of Object.keys(input).slice(0, MAX_USAGE_PROVIDER_MODEL_GROUPS)) {
+        // 旧/自定义对象形态：键是 "provider\u0000model" 或 "provider/model"。
+        // 多个 NUL 的键有歧义（无法判断哪个 NUL 是分隔符），跳过而不是猜。
+        const nulCount = (rawKey.match(/\u0000/g) ?? []).length;
+        if (nulCount > 1) continue;
+        const separator = nulCount === 1 ? "\u0000" : (rawKey.includes("/") ? "/" : null);
+        const index = separator === null ? -1 : rawKey.indexOf(separator);
+        pushRow(
+          index < 0 ? "" : rawKey.slice(0, index),
+          index < 0 ? rawKey : rawKey.slice(index + separator.length),
+          input[rawKey],
+          false,
+        );
+      }
+      return rows;
+    }
+
+    /**
+     * meta.usage 归一（票据 25）：totals + byRole/byProvider/byModel/byProviderModel
+     * + recentTasks（≤16）。
+     *
+     * 分组最多 32 行、provider+model 组合最多 64 行、最近任务最多 16 条：投影本身在 Host
+     * 侧已有界，这里再加一层上限，保证设置页渲染成本不随历史增长。
+     * hasProviderModelGroups 区分「Host 提供了 provider 级聚合但为空」与「旧 Host 根本没提供」：
+     * 后者不允许回退到 byModel 套单价，界面显示明确的"暂不估算"。
+     */
+    function normalizeUsageView(value) {
+      const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const groupsOf = (input) => {
+        const map = input !== null && typeof input === "object" && !Array.isArray(input) ? input : {};
+        const rows = [];
+        for (const key of Object.keys(map)) {
+          if (rows.length >= 32) break;
+          const usage = normalizeUsageSummaryOf(map[key]);
+          if (usage === null) continue;
+          rows.push({ key: String(key).slice(0, MAX_MODEL_PRICE_TEXT_CHARS), usage });
+        }
+        return rows;
+      };
+      const recentTasks = [];
+      for (const entry of (Array.isArray(source.recentTasks) ? source.recentTasks : []).slice(0, 16)) {
+        const usage = normalizeUsageSummaryOf(entry?.usage);
+        if (usage === null) continue;
+        recentTasks.push({
+          role: typeof entry?.role === "string" ? entry.role.slice(0, MAX_MODEL_PRICE_TEXT_CHARS) : "",
+          roleLabel: typeof entry?.roleLabel === "string" ? entry.roleLabel.slice(0, MAX_MODEL_PRICE_TEXT_CHARS) : "",
+          provider: typeof entry?.provider === "string" ? entry.provider.slice(0, MAX_MODEL_PRICE_TEXT_CHARS) : "",
+          model: typeof entry?.model === "string" ? entry.model.slice(0, MAX_MODEL_PRICE_TEXT_CHARS) : "",
+          usage,
+        });
+      }
+      // 只有 Host 显式提供了 byProviderModel（数组或对象）才算"支持 provider 级聚合"；
+      // 缺失、字符串、数字等非法形态一律视为旧 Host，渲染层据此拒绝回退到 byModel 套价。
+      const providerModelSource = source.byProviderModel;
+      const hasProviderModelGroups = Array.isArray(providerModelSource)
+        || (providerModelSource !== null && typeof providerModelSource === "object");
+      return {
+        totals: normalizeUsageSummaryOf(source.totals),
+        byRole: groupsOf(source.byRole),
+        byProvider: groupsOf(source.byProvider),
+        byModel: groupsOf(source.byModel),
+        byProviderModel: normalizeUsageProviderModelGroups(providerModelSource),
+        hasProviderModelGroups,
+        recentTasks,
+      };
+    }
+
+    /** 非负安全整数或 null（区分"从未发生"与 0）。 */
+    function nonNegativeIntegerOrNull(value) {
+      return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+    }
+
+    /**
+     * 限流/排队诊断视图归一（票据 26）：meta.diagnostics.fanout.concurrency.throttle。
+     *
+     * 缺失（旧 Host）返回 null，界面显示"未知"而不是伪造 0 行；etaSource 只接受固定枚举。
+     */
+    function normalizeThrottleDiagnosticsView(value) {
+      if (value === null || value === void 0 || typeof value !== "object" || Array.isArray(value)) return null;
+      const rowsOf = (list, keyField) => {
+        const rows = [];
+        for (const entry of (Array.isArray(list) ? list : []).slice(0, 16)) {
+          if (entry === null || typeof entry !== "object") continue;
+          const key = typeof entry[keyField] === "string" ? entry[keyField] : "";
+          if (key.length === 0) continue;
+          rows.push({
+            key: key.slice(0, 64),
+            limit: nonNegativeIntegerOrNull(entry.limit),
+            running: nonNegativeIntegerOrNull(entry.running),
+            queued: nonNegativeIntegerOrNull(entry.queued),
+            samples: nonNegativeIntegerOrNull(entry.samples),
+            lastThrottledAt: nonNegativeIntegerOrNull(entry.lastThrottledAt),
+            etaMs: nonNegativeIntegerOrNull(entry.etaMs),
+            etaSource: entry.etaSource === "historical-average" ? "historical-average" : "unknown",
+          });
+        }
+        return rows;
+      };
+      return {
+        roles: rowsOf(value.roles, "role"),
+        providers: rowsOf(value.providers, "provider"),
+        etaMinSamples: nonNegativeIntegerOrNull(value.etaMinSamples) ?? 0,
+      };
+    }
+
+    /** 生效 provider 上限视图归一：meta.diagnostics.fanout.concurrency.providers（0 = 不限制）。 */
+    function normalizeConcurrencyProvidersView(value) {
+      const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const rows = [];
+      for (const provider of Object.keys(source).sort()) {
+        if (rows.length >= 32) break;
+        if (provider.length === 0) continue;
+        const limit = nonNegativeIntegerOrNull(source[provider]);
+        if (limit === null) continue;
+        rows.push({ provider: provider.slice(0, 64), limit });
+      }
+      return rows;
+    }
+
+    /**
+     * 读取期被丢弃的限流条目诊断归一（票据 26）：只保留字段/角色/provider/固定原因码。
+     */
+    function normalizeLimitDiagnosticsView(value) {
+      const source = value !== null && typeof value === "object" ? value : {};
+      const project = (list, keyField) => {
+        const rows = [];
+        for (const entry of (Array.isArray(list) ? list : []).slice(0, 16)) {
+          if (entry === null || typeof entry !== "object") continue;
+          rows.push({
+            field: diagnosticTextOf(entry.field, "unknown"),
+            target: typeof entry[keyField] === "string" ? entry[keyField].slice(0, 64) : "",
+            reason: diagnosticTextOf(entry.reason, "unknown"),
+          });
+        }
+        return rows;
+      };
+      return { roleLimits: project(source.roleLimits, "role"), providerLimits: project(source.providerLimits, "provider") };
+    }
+
+    /**
+     * 成本估算（纯函数，票据 25）：与 host/usage-ledger.js 的 estimateUsageCost 同一公式
+     * （计费输入 token 优先，其次输入 token；每百万 token 单价）。
+     *
+     * 缺单价或缺少可用 token 时返回 null：界面据此显示"不估算成本"，绝不返回 0 冒充免费。
+     */
+    function estimateUsageCostOf(usage, price) {
+      const metrics = normalizeUsageMetricsOf(usage);
+      const input = typeof metrics.billedInputTokens === "number" ? metrics.billedInputTokens : metrics.inputTokens;
+      const output = metrics.outputTokens;
+      if (typeof input !== "number" || typeof output !== "number") return null;
+      if (price === null || typeof price !== "object") return null;
+      const inputRate = price.inputPerMillion;
+      const outputRate = price.outputPerMillion;
+      if (typeof inputRate !== "number" || !Number.isFinite(inputRate) || inputRate < 0) return null;
+      if (typeof outputRate !== "number" || !Number.isFinite(outputRate) || outputRate < 0) return null;
+      const currency = typeof price.currency === "string" && price.currency.trim().length > 0
+        ? price.currency.trim()
+        : DEFAULT_MODEL_PRICE_CURRENCY;
+      const inputCost = (input / 1000000) * inputRate;
+      const outputCost = (output / 1000000) * outputRate;
+      return { currency, inputCost, outputCost, totalCost: inputCost + outputCost };
+    }
+
+    /** 只读计数的展示文本：缺失显示 "—"（未知），绝不用 0 冒充已计量。 */
+    function formatUsageCount(value) {
+      return typeof value === "number" && Number.isFinite(value) ? String(value) : "—";
+    }
+
+    /** 耗时展示：毫秒 → 人类可读（1s 以下保留毫秒）。 */
+    function formatUsageDuration(ms) {
+      if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return "—";
+      if (ms < 1000) return Math.round(ms) + "ms";
+      if (ms < 60000) return (Math.round(ms / 100) / 10) + "s";
+      if (ms < 3600000) return (Math.round(ms / 600) / 100) + "min";
+      return (Math.round(ms / 36000) / 100) + "h";
+    }
+
+    /** 金额展示：保留 4 位小数（规格要求的"估算精度"由界面标注）；非法值显示未知。 */
+    function formatCostAmount(value) {
+      return typeof value === "number" && Number.isFinite(value) ? value.toFixed(4) : "—";
+    }
+
+    /** 诊断时间戳展示：固定 UTC 秒级文本，避免把本地时区假设写进只读诊断。 */
+    function formatDiagnosticTimestamp(ms) {
+      if (!Number.isSafeInteger(ms) || ms < 0) return null;
+      try {
+        return new Date(ms).toISOString().replace("T", " ").slice(0, 19) + " UTC";
+      } catch {
+        return null;
+      }
     }
 
     function normalizeSettingsDraft(value, roles, allowLegacyProviderFallback = true) {
@@ -2500,7 +3656,7 @@ window.__ModuleLoader__.load({
         defaults,
         notificationEnabled: source.notificationEnabled !== false,
         notificationVolume: clampNotificationVolume(source.notificationVolume),
-        notificationHoldMs: notificationHoldMsOf(source.notificationHoldMs),
+        notificationEvents: normalizeNotificationEvents(source.notificationEvents),
         roleConcurrencyLimit: normalizeRoleConcurrencyLimit(source.roleConcurrencyLimit),
         // 角色默认超时缺失或非法时使用默认 10 小时；显式 0 保留为不启用。
         roleTimeoutMs: normalizeRoleTimeoutMs(source.roleTimeoutMs),
@@ -2510,6 +3666,32 @@ window.__ModuleLoader__.load({
         taskManagementEnabled: source.taskManagementEnabled !== false,
         // 自动打开缺字段/非法值时一律按关闭归一：默认不做任何自动 open/close。
         autoOpenSubagentSidebar: source.autoOpenSubagentSidebar === true,
+        // 票据 24：候选与降级上限**只在源文档显式存在时**进入草稿/提交形状。
+        // 缺字段 = 旧客户端/旧文档：不凭空写回默认值，Host 因此可以保持已有配置。
+        ...(Object.prototype.hasOwnProperty.call(source, "candidates")
+          ? { candidates: normalizeModelCandidatesDraft(source.candidates) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(source, "fallbackLimit")
+          ? { fallbackLimit: normalizeModelFallbackLimitDraft(source.fallbackLimit) }
+          : {}),
+        // 票据 27：自定义角色同理，缺字段时绝不提交空映射（那会删除已有角色）。
+        ...(Object.prototype.hasOwnProperty.call(source, "customRoles")
+          ? { customRoles: normalizeCustomRolesDraft(source.customRoles) }
+          : {}),
+        // 票据 26/29/25：并发映射、上下文继承与单价同属"缺字段 = Host 保持已有值"的字段，
+        // 只在源文档显式存在时进入草稿；否则一次无关保存会凭空写回空映射（等于清空配置）。
+        ...(Object.prototype.hasOwnProperty.call(source, "roleLimits")
+          ? { roleLimits: normalizeRoleLimitsDraft(source.roleLimits, roles) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(source, "providerLimits")
+          ? { providerLimits: normalizeProviderLimitsDraft(source.providerLimits) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(source, "inheritContext")
+          ? { inheritContext: normalizeInheritContextDraft(source.inheritContext) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(source, "modelPrices")
+          ? { modelPrices: normalizeModelPricesDraft(source.modelPrices) }
+          : {}),
       };
     }
 
@@ -2764,15 +3946,33 @@ window.__ModuleLoader__.load({
      * 唯一实现位于 client-freshness.js（本文件只注入 RPC 路由常量与草稿归一函数）；
      * 响应解析（含 code/status/currentRevision 结构化错误）同样由共享实现负责，
      * 这里不再保留第二份提交/解析逻辑。
+     *
+     * 票据 20：新客户端还要随请求上报变更集 `changed`（哪些字段真的变了）。共享实现的
+     * 请求体是固定的历史形状（action/settings/expectedRevision），因此只在**提供了变更集**
+     * 时用同一份共享原语（requestPluginRpc + readSettingsCommitOutcome，错误归一与
+     * currentRevision 解析完全一致）组一条带 `changed` 的请求；未提供变更集的调用
+     * （旧调用形状、其它使用方）逐字节保持原样。候选仍是完整值，replace 语义不变。
      */
-    async function commitSettingsCandidate(settings, revision, request = globalThis.fetch, connection, roles) {
-      return requireFreshnessSurface().commitSettingsCandidate(settings, revision, {
-        request,
-        connection,
-        normalizeSettingsDraft: normalizeSettingsCommitDraft,
-        roles,
-        rpcTarget: RPC_TARGET,
-      });
+    async function commitSettingsCandidate(settings, revision, request = globalThis.fetch, connection, roles, changed) {
+      const surface = requireFreshnessSurface();
+      if (changed === void 0) {
+        return surface.commitSettingsCandidate(settings, revision, {
+          request,
+          connection,
+          normalizeSettingsDraft: normalizeSettingsCommitDraft,
+          roles,
+          rpcTarget: RPC_TARGET,
+        });
+      }
+      const body = {
+        action: "settings-commit",
+        settings,
+        expectedRevision: revision,
+        // 变更集只描述「哪些字段变了」，不是 patch 协议：settings 仍提交完整候选。
+        changed,
+      };
+      const response = await requestPluginRpc(connection, body, {}, request);
+      return surface.readSettingsCommitOutcome(response, normalizeSettingsCommitDraft, roles);
     }
 
     /**
@@ -2810,12 +4010,21 @@ window.__ModuleLoader__.load({
       return [meta, () => setVersion((value) => value + 1), error];
     }
 
-    /** 从 meta 投影出启用角色；meta 缺失/不可用时沿用历史默认角色表。 */
+    /**
+     * 从 meta 投影出启用角色；meta 缺失/不可用时沿用历史默认角色表。
+     *
+     * 票据 27：角色集合以 Host 的 meta.activeRoles/roles 为准（已含自定义角色），
+     * 客户端只做去重与 Observer 补齐，绝不因本地静态角色表把自定义角色过滤掉。
+     */
     function useEnabledSettingsRoles(hostMeta) {
       return react.useMemo(() => {
         const configuredRoles = Array.isArray(hostMeta?.activeRoles) ? hostMeta.activeRoles : hostMeta?.roles;
         if (!Array.isArray(configuredRoles)) return SETTINGS_REQUIRED_ROLE_IDS;
-        const enabled = configuredRoles.filter((role) => SETTINGS_ROLE_IDS.includes(role));
+        const customIds = hostMeta?.customRoles !== null && typeof hostMeta?.customRoles === "object"
+          ? Object.keys(hostMeta.customRoles)
+          : [];
+        const enabled = configuredRoles.filter((role) => typeof role === "string" && role.length > 0
+          && (SETTINGS_ROLE_IDS.includes(role) || customIds.includes(role)));
         if (hostMeta?.enableObserver === true && !enabled.includes("observer")) enabled.push("observer");
         return enabled.filter((role, index) => enabled.indexOf(role) === index);
       }, [hostMeta]);
@@ -2971,6 +4180,59 @@ window.__ModuleLoader__.load({
       { id: "storageStatus", label: "storage 状态", path: ["storage", "status"], kind: "token" },
     ]);
 
+    /**
+     * 资源预算白名单（票据 14）：用量来自 meta 顶层 `budget`，最近一次违规来自
+     * diagnostics.persistence.lastBudgetViolation（与票据 04 的持久化诊断同源）。
+     *
+     * 两类来源共用一个白名单表：`source` 只决定从哪个只读对象按路径取字段，
+     * 取值归一与敏感性边界完全一致。这里绝不读取任务负载、prompt 或快照正文。
+     */
+    const HOST_BUDGET_FIELDS = Object.freeze([
+      { id: "budgetTasks", label: "预算用量：父任务", path: ["tasks"], kind: "count", source: "budget" },
+      { id: "budgetEvents", label: "预算用量：事件条数", path: ["events"], kind: "count", source: "budget" },
+      { id: "budgetEventBytes", label: "预算用量：事件字节", path: ["eventBytes"], kind: "count", source: "budget" },
+      { id: "budgetMaxTasks", label: "预算上限：父任务", path: ["limits", "maxTasks"], kind: "count", source: "budget" },
+      { id: "budgetMaxSnapshotBytes", label: "预算上限：快照字节", path: ["limits", "maxSnapshotBytes"], kind: "count", source: "budget" },
+      { id: "budgetMaxEventHistory", label: "预算上限：事件条数", path: ["limits", "maxEventHistory"], kind: "count", source: "budget" },
+      { id: "budgetMaxEventHistoryBytes", label: "预算上限：事件字节", path: ["limits", "maxEventHistoryBytes"], kind: "count", source: "budget" },
+      { id: "fanoutEventsRetained", label: "已保留 fan-out 事件", path: ["fanout", "events", "retained"], kind: "count" },
+      { id: "fanoutEventsDropped", label: "已裁剪 fan-out 事件", path: ["fanout", "events", "dropped"], kind: "count" },
+      { id: "lastBudgetCode", label: "最近预算违规码", path: ["persistence", "lastBudgetViolation", "code"], kind: "token" },
+      { id: "lastBudgetResource", label: "最近预算违规资源", path: ["persistence", "lastBudgetViolation", "resource"], kind: "token" },
+      { id: "lastBudgetPhase", label: "最近预算违规阶段", path: ["persistence", "lastBudgetViolation", "phase"], kind: "token" },
+      { id: "lastBudgetLimit", label: "最近违规上限", path: ["persistence", "lastBudgetViolation", "limit"], kind: "count" },
+      { id: "lastBudgetReceived", label: "最近违规实测值", path: ["persistence", "lastBudgetViolation", "receivedBytes"], kind: "count" },
+      { id: "lastBudgetRecoverable", label: "最近违规可恢复", path: ["persistence", "lastBudgetViolation", "recoverable"], kind: "flag" },
+    ]);
+
+    /** 持久化/恢复白名单（票据 04 投影，票据 14 接入设置页）。 */
+    const HOST_PERSISTENCE_FIELDS = Object.freeze([
+      { id: "persistenceLastResult", label: "持久化结果", path: ["persistence", "lastResult"], kind: "token" },
+      { id: "persistenceReason", label: "持久化原因", path: ["persistence", "reason"], kind: "token" },
+      { id: "persistenceCategory", label: "持久化失败分类", path: ["persistence", "category"], kind: "token" },
+      { id: "persistenceConsecutiveFailures", label: "连续持久化失败", path: ["persistence", "consecutiveFailures"], kind: "count" },
+      { id: "persistenceBlocked", label: "持久化阻塞", path: ["persistence", "blocked"], kind: "token" },
+      { id: "persistenceRestoreCode", label: "最近恢复错误码", path: ["persistence", "restore", "code"], kind: "token" },
+    ]);
+
+    /**
+     * 系统通知投递状态白名单（票据 14）。
+     *
+     * 数据来自 diagnostics.notifications.systemToast：Host 已在投影边界逐字段重建，
+     * 这里再按同一白名单读取，确保注入实现返回的正文/AUMID/路径即使混进 wire 也不会
+     * 进入设置页。只展示 sent/failed/dropped/lastReason 与 platform/version 等状态。
+     */
+    const HOST_NOTIFICATION_FIELDS = Object.freeze([
+      { id: "toastStatus", label: "通知通道状态", path: ["notifications", "systemToast", "status"], kind: "token" },
+      { id: "toastPlatform", label: "通知平台", path: ["notifications", "systemToast", "platform"], kind: "token" },
+      { id: "toastVersion", label: "通知适配器版本", path: ["notifications", "systemToast", "version"], kind: "count" },
+      { id: "toastSent", label: "已发送通知", path: ["notifications", "systemToast", "sent"], kind: "count" },
+      { id: "toastFailed", label: "失败投递", path: ["notifications", "systemToast", "failed"], kind: "count" },
+      { id: "toastDropped", label: "丢弃投递", path: ["notifications", "systemToast", "dropped"], kind: "count" },
+      { id: "toastLastReason", label: "最近投递结果", path: ["notifications", "systemToast", "lastReason"], kind: "token" },
+      { id: "toastAumidResolved", label: "通知身份已解析", path: ["notifications", "systemToast", "aumidResolved"], kind: "flag" },
+    ]);
+
     /** 宿主能力矩阵到客户端展示面的映射（状态语义统一为 available/degraded/absent/unknown）。 */
     const HOST_CAPABILITY_FIELDS = Object.freeze([
       { key: "rootTurnWait", id: "host.rootTurnWait", label: "Root turn 等待（session-activity）" },
@@ -3015,6 +4277,9 @@ window.__ModuleLoader__.load({
       const host = hostMeta !== null && typeof hostMeta === "object" ? hostMeta : {};
       const hostCapabilities = host.capabilities !== null && typeof host.capabilities === "object" ? host.capabilities : null;
       const hostDiagnostics = host.diagnostics !== null && typeof host.diagnostics === "object" ? host.diagnostics : null;
+      // 预算用量来自 meta 顶层 budget（fanoutHost.budget() 的只读投影）；它和 diagnostics
+      // 是同一份 meta 响应里的两个只读块，客户端仍只发一次请求，不新增任何轮询。
+      const hostBudget = host.budget !== null && typeof host.budget === "object" ? host.budget : null;
       const capabilityEntries = [];
       const clientList = Array.isArray(clientCapabilities) ? clientCapabilities : [];
       for (const entry of clientList) {
@@ -3044,13 +4309,22 @@ window.__ModuleLoader__.load({
           });
         }
       }
-      const runtime = [];
-      for (const field of HOST_DIAGNOSTIC_FIELDS) {
-        const value = readDiagnosticPath(hostDiagnostics, field.path);
-        if (field.kind === "flag") runtime.push({ id: field.id, label: field.label, value: diagnosticFlagOf(value), kind: "flag" });
-        else if (field.kind === "token") runtime.push({ id: field.id, label: field.label, value: diagnosticTextOf(value, "none"), kind: "token" });
-        else runtime.push({ id: field.id, label: field.label, value: diagnosticCountOf(value), kind: "count" });
+      /** 单条白名单行：kind 只决定取值归一方式，字段名与路径全部来自白名单表。 */
+      function diagnosticRowOf(field, value) {
+        if (field.kind === "flag") return { id: field.id, label: field.label, value: diagnosticFlagOf(value), kind: "flag" };
+        if (field.kind === "token") return { id: field.id, label: field.label, value: diagnosticTextOf(value, "none"), kind: "token" };
+        return { id: field.id, label: field.label, value: diagnosticCountOf(value), kind: "count" };
       }
+      /** 按白名单逐字段读取一组诊断行；`source: "budget"` 的行从 meta.budget 取值。 */
+      function readDiagnosticGroup(fields) {
+        const rows = [];
+        for (const field of fields) {
+          const source = field.source === "budget" ? hostBudget : hostDiagnostics;
+          rows.push(diagnosticRowOf(field, readDiagnosticPath(source, field.path)));
+        }
+        return rows;
+      }
+      const runtime = readDiagnosticGroup(HOST_DIAGNOSTIC_FIELDS);
       // 角色级并发上限：角色名是公开契约；其它键与非法值一律丢弃。
       const roleLimits = readDiagnosticPath(hostDiagnostics, ["fanout", "concurrency", "roles"]);
       const roleEntries = [];
@@ -3071,11 +4345,19 @@ window.__ModuleLoader__.load({
           rpcErrors.push({ code, count: diagnosticCountOf(entry?.count) });
         }
       }
+      // 宿主诊断不可用时，预算/持久化/通知三组都给空数组（不伪造 0 值冒充"健康"）；
+      // 客户端能力矩阵仍然可用，报告通过 hostAvailable 明确标注宿主面缺失。
+      const budget = hostBudget === null && hostDiagnostics === null ? [] : readDiagnosticGroup(HOST_BUDGET_FIELDS);
+      const persistence = hostDiagnostics === null ? [] : readDiagnosticGroup(HOST_PERSISTENCE_FIELDS);
+      const notifications = hostDiagnostics === null ? [] : readDiagnosticGroup(HOST_NOTIFICATION_FIELDS);
       return Object.freeze({
-        version: 1,
+        version: 2,
         hostAvailable: hostDiagnostics !== null,
         capabilities: Object.freeze(capabilityEntries.map((entry) => Object.freeze(entry))),
         runtime: Object.freeze([...runtime, ...roleEntries].map((entry) => Object.freeze(entry))),
+        budget: Object.freeze(budget.map((entry) => Object.freeze(entry))),
+        persistence: Object.freeze(persistence.map((entry) => Object.freeze(entry))),
+        notifications: Object.freeze(notifications.map((entry) => Object.freeze(entry))),
         rpcErrors: Object.freeze(rpcErrors.map((entry) => Object.freeze(entry)))
       });
     }
@@ -3106,6 +4388,32 @@ window.__ModuleLoader__.load({
       },
         react.createElement("span", { className: "deg_settings_diagnostic_label" }, entry.label),
         react.createElement("span", { className: "deg_settings_diagnostic_value" }, value));
+    }
+
+    /**
+     * 单组诊断行（能力矩阵 / 运行时 / 预算 / 持久化 / 通知）。
+     *
+     * 分组只是语义与可读性：每一行的字段面仍由上面的白名单决定，组标题不含任何宿主
+     * 返回值。空组返回 null（宿主没有该投影时不会渲染空壳）。
+     */
+    function renderDiagnosticGroup(title, id, entries, renderEntry) {
+      if (!Array.isArray(entries) || entries.length === 0) return null;
+      return react.createElement("div", {
+        key: id,
+        className: "deg_settings_diagnostic_group",
+        "data-deg-diagnostic-group": id,
+      },
+        react.createElement("h4", { className: "deg_settings_diagnostic_group_title" }, title),
+        entries.map(renderEntry));
+    }
+
+    /** 「发送测试通知」状态文案：只把固定 token 翻成中文，不回显宿主自由文本。 */
+    function notificationTestStatusText(state) {
+      if (state === null) return "";
+      if (state.pending === true) return "发送中…";
+      if (state.shown === true) return "已发送测试通知";
+      if (state.reason === "disabled") return "通知已关闭，未发送测试通知";
+      return "发送失败（" + (state.reason ?? "unknown") + "）";
     }
 
     // ── 「模型配置」区域：默认折叠，provider 卡片按需展开且独立应用/取消 ───────────
@@ -5606,6 +6914,1234 @@ window.__ModuleLoader__.load({
         open ? removeConfirmDialog : null);
     }
 
+    // ── 会话级模型覆盖（票据 21）──────────────────────────────────────────
+    /**
+     * 没有会话列表服务时使用的不变空 store。
+     *
+     * 设置页在真实宿主里总能通过注入的 `sessions` 服务读到会话列表；但契约测试、
+     * 旧宿主与「服务代理拒答」都可能没有它。这里返回一个**引用稳定**的空 store，
+     * 让 useSyncExternalStore 的订阅/快照身份不变，既不会漏 hook，也不会每次渲染
+     * 重新订阅；读取面因此安全降级为「未打开会话」。
+     */
+    const EMPTY_SESSION_LIST_STORE = Object.freeze({
+      subscribe: () => () => {},
+      getSnapshot: () => null,
+    });
+
+    /** 解析 `ctx.sessions.list` 的读取面；缺失/拒答时回退到空 store（绝不抛错）。 */
+    function sessionListStoreOf(ctx) {
+      try {
+        const list = ctx?.sessions?.list;
+        if (list !== null && typeof list === "object"
+          && typeof list.subscribe === "function" && typeof list.getSnapshot === "function") {
+          return {
+            subscribe: (callback) => list.subscribe(callback),
+            getSnapshot: () => list.getSnapshot(),
+          };
+        }
+      } catch { /* Cordis 未声明服务读取即抛错：按没有会话列表降级。 */ }
+      return EMPTY_SESSION_LIST_STORE;
+    }
+
+    /**
+     * 归一一个会话级 selection：只接受非空 provider/model 与可选字符串 effort。
+     * 返回对象始终是新的普通对象，绝不把响应里的未知字段带进 UI 状态。
+     */
+    function normalizeSessionOverrideSelection(selection) {
+      if (selection === null || typeof selection !== "object" || Array.isArray(selection)) return null;
+      if (typeof selection.provider !== "string" || selection.provider.length === 0) return null;
+      if (typeof selection.model !== "string" || selection.model.length === 0) return null;
+      const effort = typeof selection.reasoningEffort === "string" ? selection.reasoningEffort : "";
+      return {
+        provider: selection.provider,
+        model: selection.model,
+        ...(effort.length > 0 ? { reasoningEffort: effort } : {}),
+      };
+    }
+
+    /** 归一「角色 -> selection」映射：只保留已知角色与合法 selection，坏值整条丢弃。 */
+    function normalizeSessionOverrideMap(raw) {
+      const overrides = {};
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return overrides;
+      for (const role of PROMPT_ROLE_IDS) {
+        const selection = normalizeSessionOverrideSelection(raw[role]);
+        if (selection !== null) overrides[role] = selection;
+      }
+      return overrides;
+    }
+
+    /**
+     * 归一 session-override-get/set/clear 的成功响应。
+     *
+     * @param {object|null} payload - 已解析的 JSON 响应体。
+     * @returns {{overrides: object, revision: number, live: boolean}|null} 形状非法时返回 null。
+     */
+    function normalizeSessionOverrideView(payload) {
+      if (payload === null || typeof payload !== "object" || payload.ok !== true) return null;
+      if (!Number.isSafeInteger(payload.revision) || payload.revision < 0) return null;
+      return {
+        overrides: normalizeSessionOverrideMap(payload.overrides),
+        revision: payload.revision,
+        live: payload.live === true,
+      };
+    }
+
+    /**
+     * 读取一次会话覆盖 RPC 的结果：成功给出权威视图，失败给出稳定 code 与冲突 details。
+     * 冲突时 details.currentRevision/details.overrides 只用于推进本地基线，绝不覆盖草稿。
+     */
+    async function readSessionOverrideOutcome(response) {
+      let payload = null;
+      try { payload = await response?.json?.(); } catch { payload = null; }
+      if (response?.ok === true && payload?.ok === true) {
+        const view = normalizeSessionOverrideView(payload);
+        if (view === null) return { ok: false, code: "invalid-response", message: null };
+        return { ok: true, ...view };
+      }
+      const issue = payload?.error !== null && typeof payload?.error === "object" ? payload.error : {};
+      const details = issue?.details !== null && typeof issue?.details === "object" ? issue.details : {};
+      return {
+        ok: false,
+        code: typeof issue?.code === "string" ? issue.code : "unknown",
+        message: typeof issue?.message === "string" ? issue.message : null,
+        currentRevision: Number.isSafeInteger(details.currentRevision) && details.currentRevision >= 0
+          ? details.currentRevision
+          : null,
+        overrides: details.overrides === undefined ? null : normalizeSessionOverrideMap(details.overrides),
+      };
+    }
+
+    /** 草稿 -> 可提交 selection：effort 为空表示「模型默认」，请求里不携带该字段。 */
+    function sessionOverrideSelectionOfDraft(draft) {
+      const provider = typeof draft?.provider === "string" ? draft.provider : "";
+      const model = typeof draft?.model === "string" ? draft.model : "";
+      const effort = typeof draft?.reasoningEffort === "string" ? draft.reasoningEffort : "";
+      return { provider, model, ...(effort.length > 0 ? { reasoningEffort: effort } : {}) };
+    }
+
+    /** 逐字段比较两个草稿/选择（effort 缺失与空串等价）。 */
+    function sessionOverrideSelectionEquals(left, right) {
+      return (left?.provider ?? "") === (right?.provider ?? "")
+        && (left?.model ?? "") === (right?.model ?? "")
+        && (left?.reasoningEffort ?? "") === (right?.reasoningEffort ?? "");
+    }
+
+    /**
+     * 「仅本会话模型覆盖」区块（票据 21）。
+     *
+     * 数据边界：
+     * - 只读 session-override-get（打开/切换会话与手动重试）；保存/清除只调用
+     *   session-override-set/clear，绝不复用 settings-commit —— 会话覆盖不是全局设置。
+     * - 代次来自 Host 的持久化 revision；冲突时保留当前草稿，只把权威 revision/覆盖
+     *   推进到本地基线并提示，绝不自动覆盖用户输入。
+     * - live=false（会话未运行）与子代理会话一律只读；宿主未声明 capability 时整个
+     *   区块降级为不可用提示，不发任何 RPC。
+     *
+     * 渲染粒度：每个启用角色一行，provider/model 用文本输入 + 目录 datalist（紧凑、
+     * 不复制角色表那套三下拉逻辑），effort 用该模型声明的档位下拉。
+     */
+    function useSessionOverrideSection({ ctx, sessionList, roles, providerGroups, globalDefaults, t, hostMeta, hostMetaError }) {
+      const sessionEntries = react.useMemo(() => readEntries(sessionList?.byId), [sessionList]);
+      const currentSessionId = currentSessionIdOf(sessionList ?? {});
+      const rootId = react.useMemo(
+        () => rootSessionIdOf(sessionEntries, currentSessionId),
+        [sessionEntries, currentSessionId],
+      );
+      const childSession = rootId !== void 0 && currentSessionId !== rootId;
+      const capabilityChecked = hostMeta !== null && hostMeta !== undefined;
+      const capabilitySupported = hostMeta?.capabilities?.sessionOverride === true;
+      /**
+       * meta 读取失败时能力未知：不再无限停留在"正在读取"，而是**实测**一次
+       * session-override-get。新宿主即使 meta 失败也能正常返回；旧宿主会对未知 action
+       * 回 bad-request，据此降级为"宿主版本不支持"（比一直转圈更诚实）。
+       */
+      const capabilityProbe = !capabilityChecked && hostMetaError !== null && hostMetaError !== undefined;
+      const [state, setState] = react.useState(() => ({
+        status: "idle", overrides: {}, revision: 0, live: false,
+      }));
+      const [drafts, setDrafts] = react.useState({});
+      const [busyRole, setBusyRole] = react.useState(null);
+      const [notice, setNotice] = react.useState(null);
+      const [reloadToken, setReloadToken] = react.useState(0);
+      const requestSerial = react.useRef(0);
+      const loadedSessionRef = react.useRef(void 0);
+
+      react.useEffect(() => {
+        // 会话切换/关闭：直接收敛为对应的只读态，并取消任何在途请求的写入资格。
+        if (rootId === void 0 || childSession) {
+          requestSerial.current += 1;
+          loadedSessionRef.current = void 0;
+          setDrafts({});
+          setNotice(null);
+          setState({ status: rootId === void 0 ? "no-session" : "child", overrides: {}, revision: 0, live: false });
+          return () => {};
+        }
+        if (capabilityChecked && !capabilitySupported) {
+          requestSerial.current += 1;
+          setState({ status: "unsupported", overrides: {}, revision: 0, live: false });
+          return () => {};
+        }
+        if (!capabilityChecked && !capabilityProbe) {
+          // meta 还在读取且没有失败：先保持加载态，不先发一个大概率 400 的 RPC。
+          setState((previous) => previous.status === "ready"
+            ? previous
+            : { status: "loading", overrides: {}, revision: 0, live: false });
+          return () => {};
+        }
+        let cancelled = false;
+        requestSerial.current += 1;
+        const serial = requestSerial.current;
+        setState((previous) => previous.status === "ready"
+          ? { ...previous, status: "loading" }
+          : { status: "loading", overrides: {}, revision: 0, live: false });
+        void requestPluginRpc(ctx?.connection, { action: "session-override-get", sessionId: rootId })
+          .then(readSessionOverrideOutcome)
+          .then((outcome) => {
+            if (cancelled || serial !== requestSerial.current) return;
+            if (outcome.ok !== true) {
+              // 能力未知（meta 失败）时的探测：旧宿主对未知 action 回 bad-request，
+              // 此时按"版本不支持"呈现；其余失败仍给出可重试的读取错误。
+              setState({
+                status: !capabilityChecked && outcome.code === "bad-request" ? "unsupported" : "error",
+                overrides: {},
+                revision: 0,
+                live: false,
+              });
+              return;
+            }
+            // 只有会话真的换了才清草稿：同一会话的手动重读必须保留用户未提交的输入。
+            if (loadedSessionRef.current !== rootId) setDrafts({});
+            loadedSessionRef.current = rootId;
+            setState({ status: "ready", overrides: outcome.overrides, revision: outcome.revision, live: outcome.live });
+          })
+          .catch(() => {
+            if (cancelled || serial !== requestSerial.current) return;
+            setState({ status: "error", overrides: {}, revision: 0, live: false });
+          });
+        return () => { cancelled = true; };
+      }, [rootId, childSession, capabilityChecked, capabilitySupported, capabilityProbe, reloadToken, ctx]);
+
+      /** 冲突/普通失败都只更新提示；草稿在任何失败路径上都不清空。 */
+      const applyFailure = (outcome, role) => {
+        if (outcome.code === "session-override-conflict") {
+          setState((previous) => ({
+            ...previous,
+            status: "ready",
+            revision: Number.isSafeInteger(outcome.currentRevision) ? outcome.currentRevision : previous.revision,
+            overrides: outcome.overrides ?? previous.overrides,
+          }));
+          setNotice({
+            kind: "conflict",
+            role,
+            text: t("settings.sessionOverride.conflict", {
+              revision: Number.isSafeInteger(outcome.currentRevision) ? outcome.currentRevision : "?",
+            }),
+          });
+          return;
+        }
+        setNotice({
+          kind: "error",
+          role,
+          text: outcome.message !== null
+            ? t("settings.sessionOverride.failed", { message: outcome.message })
+            : t("settings.sessionOverride.unavailable"),
+        });
+      };
+
+      const applySuccess = (outcome, role, kind) => {
+        setState({ status: "ready", overrides: outcome.overrides, revision: outcome.revision, live: outcome.live });
+        setDrafts((previous) => {
+          if (!Object.prototype.hasOwnProperty.call(previous, role)) return previous;
+          const next = { ...previous };
+          delete next[role];
+          return next;
+        });
+        setNotice({ kind, role, revision: outcome.revision });
+      };
+
+      const submitRole = async (role, action) => {
+        if (busyRole !== null || state.status !== "ready" || state.live !== true) return;
+        const draft = drafts[role] ?? null;
+        const selection = action === "set" ? sessionOverrideSelectionOfDraft(draft) : null;
+        if (action === "set" && (draft === null || selection.provider.length === 0 || selection.model.length === 0)) return;
+        setBusyRole(role);
+        setNotice(null);
+        try {
+          const body = {
+            action: action === "set" ? "session-override-set" : "session-override-clear",
+            sessionId: rootId,
+            role,
+            expectedRevision: state.revision,
+          };
+          if (action === "set") body.selection = selection;
+          const outcome = await readSessionOverrideOutcome(
+            await requestPluginRpc(ctx?.connection, body),
+          );
+          if (outcome.ok === true) applySuccess(outcome, role, action === "set" ? "saved" : "cleared");
+          else applyFailure(outcome, role);
+        } catch {
+          setNotice({ kind: "error", role, text: t("settings.sessionOverride.unavailable") });
+        } finally {
+          setBusyRole(null);
+        }
+      };
+
+      const editableOf = (role) => {
+        if (Object.prototype.hasOwnProperty.call(drafts, role)) return drafts[role];
+        const effective = state.overrides[role] ?? normalizeSessionOverrideSelection(globalDefaults?.[role]) ?? null;
+        return {
+          provider: effective?.provider ?? "",
+          model: effective?.model ?? "",
+          reasoningEffort: effective?.reasoningEffort ?? "",
+        };
+      };
+
+      const updateDraft = (role, field, value) => {
+        setDrafts((previous) => {
+          const base = Object.prototype.hasOwnProperty.call(previous, role) ? previous[role] : editableOf(role);
+          const next = { ...base, [field]: value };
+          // 改模型时如果旧档位不被新模型支持，回落到「模型默认」而不是提交非法 effort。
+          if (field === "model") {
+            const provider = next.provider;
+            const model = providerGroups.find((group) => group?.id === provider)
+              ?.models?.find((entry) => entry?.id === value);
+            const efforts = Array.isArray(model?.reasoning?.efforts) ? model.reasoning.efforts : [];
+            if (next.reasoningEffort !== "" && !efforts.some((effort) => effort?.id === next.reasoningEffort)) {
+              next.reasoningEffort = "";
+            }
+          }
+          return { ...previous, [role]: next };
+        });
+        setNotice(null);
+      };
+
+      const readOnlyReasons = {
+        "no-session": t("settings.sessionOverride.noSession"),
+        child: t("settings.sessionOverride.child"),
+        unsupported: t("settings.sessionOverride.unsupported"),
+        error: t("settings.sessionOverride.unavailable"),
+        loading: t("settings.sessionOverride.loading"),
+      };
+      const readOnlyHint = state.status === "ready" && state.live !== true
+        ? t("settings.sessionOverride.offline")
+        : (readOnlyReasons[state.status] ?? null);
+      const writable = state.status === "ready" && state.live === true && busyRole === null;
+
+      const rows = writable === false && state.status !== "ready"
+        ? []
+        : roles.map((role) => {
+          const current = state.overrides[role] ?? null;
+          const globalDefault = normalizeSessionOverrideSelection(globalDefaults?.[role]);
+          const editable = editableOf(role);
+          const effectiveSaved = current ?? globalDefault;
+          const dirty = Object.prototype.hasOwnProperty.call(drafts, role)
+            && !sessionOverrideSelectionEquals(drafts[role], effectiveSaved);
+          const valid = editable.provider.length > 0 && editable.model.length > 0;
+          const roleLabel = SETTINGS_ROLE_LABELS[role] ?? role;
+          const providerGroup = providerGroups.find((group) => group?.id === editable.provider);
+          const modelEntry = providerGroup?.models?.find((entry) => entry?.id === editable.model);
+          const efforts = Array.isArray(modelEntry?.reasoning?.efforts) ? modelEntry.reasoning.efforts : [];
+          const effortOptions = [];
+          if (efforts.length > 0) {
+            effortOptions.push(react.createElement("option", { key: "__default", value: "" }, t("settings.sessionOverride.effortDefault")));
+            for (const effort of efforts) {
+              effortOptions.push(react.createElement("option", { key: effort.id, value: effort.id }, effort.name ?? effort.id));
+            }
+            // 历史/手写 effort 不在当前目录里时仍原样显示，避免下拉静默改值。
+            if (editable.reasoningEffort !== "" && !efforts.some((effort) => effort?.id === editable.reasoningEffort)) {
+              effortOptions.push(react.createElement("option", { key: "__stale", value: editable.reasoningEffort }, editable.reasoningEffort + "（不可用）"));
+            }
+          } else {
+            effortOptions.push(react.createElement("option", { key: "__unsupported", value: "" },
+              editable.provider ? t("settings.sessionOverride.effortDefault") : t("settings.sessionOverride.effort")));
+          }
+          const statusText = current !== null
+            ? t("settings.sessionOverride.override") + "：" + current.provider + " / " + current.model
+              + (current.reasoningEffort ? " / " + current.reasoningEffort : "")
+            : t("settings.sessionOverride.followGlobal")
+              + (globalDefault ? "（" + t("settings.sessionOverride.globalSummary", {
+                provider: globalDefault.provider,
+                model: globalDefault.model,
+              }) + "）" : "（" + t("settings.sessionOverride.emptyGlobal") + "）");
+          return react.createElement("div", {
+            key: role,
+            className: "deg_so_row",
+            "data-deg-session-override-role": role,
+            "data-deg-session-override-state": current !== null ? "override" : "follow",
+          },
+            react.createElement("div", { className: "deg_so_row_head" },
+              react.createElement("span", { className: "deg_so_role" }, roleLabel),
+              react.createElement("span", { className: "deg_so_state", "data-deg-session-override-status": "summary" }, statusText)),
+            // 模型候选只做输入提示：datalist 复用同一份模型目录，不复制角色表的三下拉逻辑。
+            react.createElement("datalist", { id: "deg-so-model-options-" + role },
+              sessionOverrideModelOptions(role, editable.provider, providerGroups).map((entry) => react.createElement(
+                "option",
+                { key: entry.id, value: entry.id },
+                entry.name ?? entry.id,
+              ))),
+            react.createElement("div", { className: "deg_so_fields" },
+              react.createElement("label", { className: "deg_so_field" },
+                react.createElement("span", { className: "deg_so_field_label" }, t("settings.sessionOverride.provider")),
+                react.createElement("input", {
+                  type: "text",
+                  className: "deg_so_input",
+                  list: "deg-so-provider-options",
+                  autoComplete: "off",
+                  "aria-label": roleLabel + " " + t("settings.sessionOverride.provider"),
+                  value: editable.provider,
+                  disabled: !writable,
+                  onChange: (event) => updateDraft(role, "provider", event.target.value),
+                })),
+              react.createElement("label", { className: "deg_so_field" },
+                react.createElement("span", { className: "deg_so_field_label" }, t("settings.sessionOverride.model")),
+                react.createElement("input", {
+                  type: "text",
+                  className: "deg_so_input",
+                  list: "deg-so-model-options-" + role,
+                  autoComplete: "off",
+                  "aria-label": roleLabel + " " + t("settings.sessionOverride.model"),
+                  value: editable.model,
+                  disabled: !writable,
+                  onChange: (event) => updateDraft(role, "model", event.target.value),
+                })),
+              react.createElement("label", { className: "deg_so_field" },
+                react.createElement("span", { className: "deg_so_field_label" }, t("settings.sessionOverride.effort")),
+                react.createElement("select", {
+                  className: "deg_so_input",
+                  "aria-label": roleLabel + " " + t("settings.sessionOverride.effort"),
+                  value: editable.reasoningEffort,
+                  disabled: !writable || efforts.length === 0,
+                  onChange: (event) => updateDraft(role, "reasoningEffort", event.target.value),
+                }, effortOptions))),
+            react.createElement("div", { className: "deg_so_actions" },
+              react.createElement("span", { className: "deg_so_state", "data-deg-session-override-revision": state.revision },
+                t("settings.sessionOverride.revision", { revision: state.revision })),
+              react.createElement("button", {
+                type: "button",
+                className: "deg_btn",
+                "data-deg-session-override-clear": role,
+                "aria-label": roleLabel + " " + t("settings.sessionOverride.clear"),
+                disabled: !writable || current === null,
+                onClick: () => submitRole(role, "clear"),
+              }, busyRole === role ? t("settings.sessionOverride.saving") : t("settings.sessionOverride.clear")),
+              react.createElement("button", {
+                type: "button",
+                className: "deg_btn deg_btn_primary",
+                "data-deg-session-override-save": role,
+                "aria-label": roleLabel + " " + t("settings.sessionOverride.save"),
+                disabled: !writable || !dirty || !valid,
+                onClick: () => submitRole(role, "set"),
+              }, busyRole === role ? t("settings.sessionOverride.saving") : t("settings.sessionOverride.save"))));
+        });
+
+      const noticeText = notice === null
+        ? null
+        : notice.kind === "saved"
+          ? t("settings.sessionOverride.saved")
+          : notice.kind === "cleared"
+            ? t("settings.sessionOverride.cleared")
+            : notice.text;
+
+      return react.createElement("section", {
+        className: "deg_so_section",
+        "data-deg-session-override": "section",
+        "data-deg-session-override-section-state": state.status,
+        "aria-label": t("settings.sessionOverride.title"),
+      },
+        react.createElement("h3", { className: "deg_so_title" }, t("settings.sessionOverride.title")),
+        react.createElement("p", { className: "deg_so_hint" }, t("settings.sessionOverride.hint")),
+        readOnlyHint === null ? null : react.createElement("p", {
+          className: "deg_so_hint",
+          "data-deg-session-override-readonly": state.status,
+        }, readOnlyHint),
+        state.status === "error" ? react.createElement("button", {
+          type: "button",
+          className: "deg_btn",
+          "data-deg-session-override-retry": "true",
+          onClick: () => setReloadToken((value) => value + 1),
+        }, t("settings.sessionOverride.retry")) : null,
+        noticeText === null ? null : react.createElement("p", {
+          className: notice?.kind === "error" || notice?.kind === "conflict" ? "deg_settings_error" : "deg_settings_status",
+          role: "status",
+          "data-deg-session-override-notice": notice?.kind ?? "none",
+        }, noticeText),
+        rows.length === 0 ? null : react.createElement("div", { className: "deg_so_rows" },
+          react.createElement("datalist", { id: "deg-so-provider-options" },
+            providerGroups.map((group) => react.createElement("option", { key: group.id, value: group.id }, group.name ?? group.id))),
+          ...rows));
+    }
+
+    // ── 模型候选与自动降级（票据 24）─────────────────────────────────────────
+
+    /**
+     * 归一 model-preflight 的单条结果：只保留固定字段，坏条目返回 null（不渲染假状态）。
+     *
+     * 票据 24 候选 image/输入类型补全：image 只接受三态枚举，其它（缺失/未知字符串）一律
+     * unknown；inputModalities 只保留字符串并去重，非法形态为空数组。旧 Host 不返回这两个
+     * 字段时保持 unknown/[]，界面显示“未知”而不是伪造支持。
+     */
+    function normalizePreflightEntry(entry) {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return null;
+      const effort = typeof entry.reasoningEffort === "string" && entry.reasoningEffort.length > 0 ? entry.reasoningEffort : null;
+      const image = entry.image === "supported" || entry.image === "unsupported" || entry.image === "unknown"
+        ? entry.image
+        : "unknown";
+      const inputModalities = [];
+      if (Array.isArray(entry.inputModalities)) {
+        for (const modality of entry.inputModalities) {
+          if (typeof modality !== "string") continue;
+          if (!inputModalities.includes(modality)) inputModalities.push(modality);
+        }
+      }
+      return {
+        provider: typeof entry.provider === "string" ? entry.provider : "",
+        model: typeof entry.model === "string" ? entry.model : "",
+        reasoningEffort: effort, ok: entry.ok === true,
+        code: typeof entry.code === "string" ? entry.code : "",
+        message: typeof entry.message === "string" ? entry.message : "",
+        image,
+        inputModalities,
+      };
+    }
+    /** 归一 model-preflight 响应；形状非法返回 null，由调用方显示可读错误而不是假状态。 */
+    function normalizeModelPreflightView(payload) {
+      if (payload === null || typeof payload !== "object" || payload.ok !== true) return null;
+      if (typeof payload.role !== "string" || payload.role.length === 0 || !Array.isArray(payload.candidates)) return null;
+      const primary = normalizePreflightEntry(payload.primary);
+      if (primary === null) return null;
+      const candidates = [];
+      for (const entry of payload.candidates) {
+        const normalized = normalizePreflightEntry(entry);
+        if (normalized !== null) candidates.push(normalized);
+      }
+      return { role: payload.role, primary, candidates, ...(Number.isSafeInteger(payload.fallbackLimit) ? { fallbackLimit: payload.fallbackLimit } : {}) };
+    }
+    /** 一次预检调用的结果归一：成功给逐候选视图，失败给稳定 code/message（不抛错）。 */
+    async function readModelPreflightOutcome(response) {
+      let payload = null;
+      try { payload = await response?.json?.(); } catch { payload = null; }
+      if (response?.ok === true && payload?.ok === true) {
+        const view = normalizeModelPreflightView(payload);
+        return view === null ? { ok: false, code: "invalid-response", message: null } : { ok: true, view };
+      }
+      const issue = payload?.error !== null && typeof payload?.error === "object" ? payload.error : {};
+      return { ok: false, code: typeof issue?.code === "string" ? issue.code : "unknown", message: typeof issue?.message === "string" ? issue.message : null };
+    }
+    /** 当前草稿候选的预检签名：草稿变化后旧结果必须显示"已过期"，绝不沿用假通过。 */
+    function modelCandidatesSignatureOf(list) {
+      if (!Array.isArray(list)) return "[]";
+      return JSON.stringify(list.map((entry) => {
+        const selection = normalizeModelCandidateSelection(entry);
+        return selection === null ? null : [selection.provider, selection.model, selection.reasoningEffort ?? ""];
+      }));
+    }
+    /**
+     * 模型候选区块的预检状态（票据 24）。
+     *
+     * 边界：只读 RPC；进入区块自动预检一次，角色集合变化时再跑一次；点击"预检"用
+     * **当前草稿**作为 candidates 覆盖提交。预检失败只记录原因，不参与保存门控。
+     */
+    function useModelCandidatesPreflight({ ctx, enabled, roles, draftRef, rolesKey }) {
+      const [state, setState] = react.useState(() => ({ byRole: {} }));
+      const serialsRef = react.useRef({});
+      const runRole = async (role, list) => {
+        const serial = (serialsRef.current[role] ?? 0) + 1;
+        serialsRef.current[role] = serial;
+        const signature = modelCandidatesSignatureOf(list);
+        setState((previous) => ({ byRole: { ...previous.byRole, [role]: { status: "loading", signature, view: null, message: null } } }));
+        try {
+          const selections = (Array.isArray(list) ? list : []).map((entry) => normalizeModelCandidateSelection(entry)).filter((entry) => entry !== null);
+          const outcome = await readModelPreflightOutcome(await requestPluginRpc(ctx?.connection, { action: "model-preflight", role, candidates: selections }));
+          if (serialsRef.current[role] !== serial) return;
+          setState((previous) => ({ byRole: { ...previous.byRole, [role]: outcome.ok === true
+            ? { status: "ready", signature, view: outcome.view, message: null }
+            : { status: outcome.code === "bad-request" ? "unsupported" : "error", signature, view: null, message: outcome.message } } }));
+        } catch {
+          if (serialsRef.current[role] !== serial) return;
+          setState((previous) => ({ byRole: { ...previous.byRole, [role]: { status: "error", signature, view: null, message: null } } }));
+        }
+      };
+      const runAll = () => {
+        for (const role of Array.isArray(roles) ? roles : []) void runRole(role, draftRef.current?.candidates?.[role] ?? []);
+      };
+      react.useEffect(() => {
+        if (enabled !== true) return () => {};
+        const list = Array.isArray(roles) ? roles : [];
+        for (const role of list) void runRole(role, draftRef.current?.candidates?.[role] ?? []);
+        return () => { for (const role of list) serialsRef.current[role] = (serialsRef.current[role] ?? 0) + 1; };
+      }, [enabled, rolesKey]);
+      return { byRole: state.byRole, runRole, runAll };
+    }
+    /**
+     * 预检结果的 image 能力文案（票据 24 补全）。
+     *
+     * 只渲染 Host 明确给出的三态；缺失/非法一律“未知”，绝不把未探测当成支持。
+     */
+    function preflightImageText(t, image) {
+      if (image === "supported") return t("settings.modelCandidates.image.supported");
+      if (image === "unsupported") return t("settings.modelCandidates.image.unsupported");
+      return t("settings.modelCandidates.image.unknown");
+    }
+
+    /** 预检结果的展示文案：ok 用固定通过文案，失败给出 Host 的固定原因（+稳定 code）。 */
+    function preflightStatusText(t, entry, result) {
+      if (entry === undefined) return null;
+      if (entry.status === "loading") return t("settings.modelCandidates.preflight.running");
+      if (entry.status === "unsupported") return t("settings.modelCandidates.preflight.unavailable");
+      if (entry.status === "error") return entry.message === null
+        ? t("settings.modelCandidates.preflight.unavailable")
+        : t("settings.modelCandidates.preflight.error", { message: entry.message });
+      if (result === undefined || result === null) return null;
+      if (result.ok === true) return t("settings.modelCandidates.preflight.ok");
+      return t("settings.modelCandidates.preflight.failed", { message: result.message.length > 0 ? result.message : result.code });
+    }
+    /**
+     * 渲染「模型候选与自动降级」区块（票据 24）。
+     *
+     * 每个启用角色展示 defaults 里的主选择与有序候选；候选行是纯文本编辑面
+     * （provider/model/effort），目录只作为 datalist 提示，因此目录不可用时仍可编辑，
+     * 是否合法由 Host 的提交端点裁决。
+     */
+    function renderModelCandidatesSection({ t, roles, draft, providerGroups, preflight, saving, readOnly, error, editDraft, roleLabelOf }) {
+      const h = react.createElement;
+      const candidateMap = draft.candidates !== null && typeof draft.candidates === "object" ? draft.candidates : {};
+      const defaults = draft.defaults !== null && typeof draft.defaults === "object" ? draft.defaults : {};
+      const fallbackLimit = Number.isSafeInteger(draft.fallbackLimit) ? draft.fallbackLimit : DEFAULT_MODEL_FALLBACK_LIMIT;
+      const updateList = (role, update) => editDraft((previous) => {
+        const map = { ...(previous.candidates ?? {}) };
+        map[role] = update(Array.isArray(map[role]) ? map[role].slice() : []);
+        return { ...previous, candidates: map };
+      });
+      const editCandidate = (role, index, field, value) => updateList(role, (list) => list.map((entry, position) => {
+        if (position !== index) return entry;
+        const base = normalizeModelCandidateSelection(entry) ?? { provider: "", model: "" };
+        const next = { ...base, [field]: value };
+        if (typeof next.reasoningEffort !== "string" || next.reasoningEffort.length === 0) delete next.reasoningEffort;
+        return next;
+      }));
+      const addCandidate = (role) => updateList(role, (list) => (list.length >= MAX_MODEL_CANDIDATES_PER_ROLE ? list : [...list, { provider: "", model: "" }]));
+      const removeCandidate = (role, index) => updateList(role, (list) => list.filter((unused, position) => position !== index));
+      const moveCandidate = (role, index, delta) => updateList(role, (list) => {
+        const target = index + delta;
+        if (target < 0 || target >= list.length) return list;
+        const next = list.slice();
+        const [item] = next.splice(index, 1);
+        next.splice(target, 0, item);
+        return next;
+      });
+      const rows = [];
+      for (const role of Array.isArray(roles) ? roles : []) {
+        const roleLabel = roleLabelOf(role);
+        const list = Array.isArray(candidateMap[role]) ? candidateMap[role] : [];
+        const primary = defaults[role] !== null && typeof defaults[role] === "object" ? defaults[role] : null;
+        const entry = preflight?.byRole?.[role];
+        const stale = entry !== undefined && entry.status === "ready" && entry.signature !== modelCandidatesSignatureOf(list);
+        const settled = entry?.status === "ready" ? { status: "ready" } : entry;
+        const primaryText = preflightStatusText(t, settled, entry?.view?.primary);
+        // stale 时不展示任何旧能力结论：旧响应可能对应已编辑的候选/主选择。
+        const primaryResult = stale ? null : entry?.view?.primary;
+        const candidateRows = list.map((candidate, index) => {
+          const selection = normalizeModelCandidateSelection(candidate) ?? { provider: "", model: "" };
+          const result = stale ? null : entry?.view?.candidates?.[index];
+          const status = stale ? t("settings.modelCandidates.preflight.stale") : preflightStatusText(t, entry, result);
+          const name = roleLabel + " " + t("settings.modelCandidates.row", { index: index + 1 });
+          return h("div", { key: role + "-candidate-" + index, className: "deg_mcand_row", "data-deg-candidate-row": role + ":" + index },
+            h("input", { type: "text", autoComplete: "off", list: "deg-mcand-provider-options", "aria-label": name + " " + t("settings.modelCandidates.provider"), value: selection.provider, disabled: saving || readOnly, onChange: (event) => editCandidate(role, index, "provider", event.target.value) }),
+            h("input", { type: "text", autoComplete: "off", list: "deg-mcand-model-options-" + role, "aria-label": name + " " + t("settings.modelCandidates.model"), value: selection.model, disabled: saving || readOnly, onChange: (event) => editCandidate(role, index, "model", event.target.value) }),
+            h("input", { type: "text", autoComplete: "off", list: "deg-mcand-effort-options-" + role + "-" + index, "aria-label": name + " " + t("settings.modelCandidates.effort"), value: selection.reasoningEffort ?? "", disabled: saving || readOnly, onChange: (event) => editCandidate(role, index, "reasoningEffort", event.target.value) }),
+            h("div", { className: "deg_mcand_actions" },
+              h("button", { type: "button", className: "deg_btn", "data-deg-candidate-up": role + ":" + index, "aria-label": name + " " + t("settings.modelCandidates.up"), disabled: saving || readOnly || index === 0, onClick: () => moveCandidate(role, index, -1) }, "↑"),
+              h("button", { type: "button", className: "deg_btn", "data-deg-candidate-down": role + ":" + index, "aria-label": name + " " + t("settings.modelCandidates.down"), disabled: saving || readOnly || index === list.length - 1, onClick: () => moveCandidate(role, index, 1) }, "↓"),
+              h("button", { type: "button", className: "deg_btn", "data-deg-candidate-remove": role + ":" + index, "aria-label": name + " " + t("settings.modelCandidates.remove"), disabled: saving || readOnly, onClick: () => removeCandidate(role, index) }, "×")),
+            status === null ? null : h("span", {
+              className: "deg_mcand_status",
+              "data-deg-candidate-status": role + ":" + index,
+              "data-deg-candidate-ok": result === null || result === undefined ? "unknown" : String(result.ok === true),
+            }, status + (result !== null && result !== undefined && result.ok !== true && result.code.length > 0 ? "（" + result.code + "）" : "")),
+            // image 能力只在有真实预检结果（非 stale/null）时渲染；它是独立 span，
+            // 不改变上面 status span 的 children 文本。
+            result === null || result === undefined ? null : h("span", {
+              className: "deg_mcand_capability",
+              "data-deg-candidate-image": role + ":" + index,
+            }, preflightImageText(t, result.image)));
+        });
+        const primaryValue = primary !== null && typeof primary.provider === "string" && primary.provider.length > 0 && typeof primary.model === "string" && primary.model.length > 0
+          ? primary.provider + " / " + primary.model + (typeof primary.reasoningEffort === "string" && primary.reasoningEffort.length > 0 ? " / " + primary.reasoningEffort : "")
+          : t("settings.modelCandidates.primary.none");
+        rows.push(h("div", { key: role, className: "deg_mcand_role", "data-deg-candidates-role": role },
+          h("div", { className: "deg_mcand_role_head" }, h("span", { className: "deg_mcand_role_name" }, roleLabel)),
+          h("p", { className: "deg_mcand_primary", "data-deg-candidate-primary": role },
+            t("settings.modelCandidates.primary") + "：" + primaryValue + (primaryText === null ? "" : " · " + primaryText),
+            primaryResult === null || primaryResult === undefined ? null : " · ",
+            primaryResult === null || primaryResult === undefined ? null : h("span", {
+              className: "deg_mcand_capability",
+              "data-deg-candidate-image": role + ":primary",
+            }, preflightImageText(t, primaryResult.image))),
+          candidateRows.length > 0 ? candidateRows : h("p", { className: "deg_mcand_empty", "data-deg-candidate-empty": role }, t("settings.modelCandidates.empty")),
+          h("button", {
+            type: "button", className: "deg_btn", "data-deg-candidate-add": role,
+            "aria-label": roleLabel + " " + t("settings.modelCandidates.add"),
+            title: list.length >= MAX_MODEL_CANDIDATES_PER_ROLE ? t("settings.modelCandidates.limit") : null,
+            disabled: saving || readOnly || list.length >= MAX_MODEL_CANDIDATES_PER_ROLE,
+            onClick: () => addCandidate(role),
+          }, t("settings.modelCandidates.add"))));
+      }
+      return h("section", { className: "deg_mcand_section", "data-deg-model-candidates": "section", "aria-label": t("settings.modelCandidates.title") },
+        h("h3", { className: "deg_mcand_title" }, t("settings.modelCandidates.title")),
+        h("p", { className: "deg_mcand_hint" }, t("settings.modelCandidates.hint")),
+        h("div", { className: "deg_mcand_limit" },
+          h("label", { className: "deg_settings_control", htmlFor: "deg-settings-model-fallback-limit" },
+            h("span", { className: "deg_settings_label" }, t("settings.modelCandidates.fallbackLimit")),
+            h("input", {
+              id: "deg-settings-model-fallback-limit", type: "number", min: 0, max: MAX_MODEL_FALLBACK_LIMIT, step: 1, inputMode: "numeric",
+              "aria-label": t("settings.modelCandidates.fallbackLimit"), title: t("settings.modelCandidates.fallbackLimit.title"),
+              value: draft.fallbackLimit === void 0 ? fallbackLimit : draft.fallbackLimit, disabled: saving || readOnly,
+              onChange: (event) => {
+                const raw = event.target.value;
+                const number = raw === "" ? null : Number(raw);
+                editDraft((previous) => ({ ...previous, fallbackLimit: raw === "" ? "" : Number.isFinite(number) ? Math.round(number) : previous.fallbackLimit }));
+              },
+            })),
+          h("button", { type: "button", className: "deg_btn", "data-deg-model-preflight": "all", disabled: (Array.isArray(roles) ? roles : []).length === 0, onClick: () => preflight.runAll() }, t("settings.modelCandidates.preflight"))),
+        error === null || error === undefined ? null : h("p", { className: "deg_settings_error", role: "alert", "data-deg-model-candidates-error": "true" }, error),
+        h("datalist", { id: "deg-mcand-provider-options" }, providerGroups.map((group) => h("option", { key: group.id, value: group.id }, group.name ?? group.id))),
+        rows);
+    }
+    // ── 自定义角色（票据 27）─────────────────────────────────────────────────
+    /**
+     * 渲染「自定义角色」区块（票据 27）。
+     *
+     * 内置角色只读展示（与运行期同一份 meta.roleLabels/roleDescriptions）；自定义角色
+     * 可编辑/删除，新增行才允许填 id。readOnly 用显式下拉（空 = 未选择），toolDeny 用
+     * 每行一个工具名的文本域（允许空，但字段本身始终存在）。
+     */
+    function renderCustomRolesSection({ t, rows, error, hostMeta, roleLabelOf, saving, readOnly, onAdd, onEdit, onRemove }) {
+      const h = react.createElement;
+      const field = (key, label, wide, control) => h("label", { key, className: wide ? "deg_cr_field deg_cr_row_wide" : "deg_cr_field" },
+        h("span", { className: "deg_cr_field_label" }, label), control);
+      const customRows = rows.map((row) => {
+        const id = typeof row.id === "string" ? row.id.trim() : "";
+        const display = id.length > 0 ? id : t("settings.customRoles.id");
+        const fieldInput = (key, label) => h("input", {
+          type: "text", autoComplete: "off", "data-deg-custom-role-field": key, "aria-label": display + " " + label,
+          value: row[key], disabled: saving || readOnly, onChange: (event) => onEdit(row.key, key, event.target.value),
+        });
+        return h("div", { key: row.key, className: "deg_cr_row", "data-deg-custom-role-row": row.key, "data-deg-custom-role-id": id },
+          h("div", { className: "deg_cr_row_head" },
+            row.isNew
+              ? h("input", { type: "text", autoComplete: "off", "data-deg-custom-role-field": "id", "aria-label": t("settings.customRoles.id"), placeholder: t("settings.customRoles.id"), value: row.id, disabled: saving || readOnly, onChange: (event) => onEdit(row.key, "id", event.target.value) })
+              : h("code", { className: "deg_cr_row_id", "data-deg-custom-role-field": "id" }, id),
+            h("button", { type: "button", className: "deg_btn", "data-deg-custom-role-remove": row.key, "aria-label": display + " " + t("settings.customRoles.remove"), disabled: saving || readOnly, onClick: () => onRemove(row.key) }, t("settings.customRoles.remove"))),
+          field("label", t("settings.customRoles.label"), false, fieldInput("label", t("settings.customRoles.label"))),
+          field("readOnly", t("settings.customRoles.readOnly"), false,
+            h("select", { "data-deg-custom-role-field": "readOnly", "aria-label": display + " " + t("settings.customRoles.readOnly"), value: row.readOnly, disabled: saving || readOnly, onChange: (event) => onEdit(row.key, "readOnly", event.target.value) },
+              h("option", { value: "" }, t("settings.customRoles.readOnly.empty")),
+              h("option", { value: "true" }, t("settings.customRoles.readOnly.readOnly")),
+              h("option", { value: "false" }, t("settings.customRoles.readOnly.writable")))),
+          field("statusLabel", t("settings.customRoles.statusLabel"), false, fieldInput("statusLabel", t("settings.customRoles.statusLabel"))),
+          field("description", t("settings.customRoles.description"), false, fieldInput("description", t("settings.customRoles.description"))),
+          field("toolDeny", t("settings.customRoles.toolDeny"), true,
+            h("textarea", { "data-deg-custom-role-field": "toolDeny", "aria-label": display + " " + t("settings.customRoles.toolDeny"), "aria-describedby": "deg-cr-tool-deny-hint", value: row.toolDenyText ?? "", disabled: saving || readOnly, onChange: (event) => onEdit(row.key, "toolDenyText", event.target.value) })),
+          field("persona", t("settings.customRoles.persona"), true,
+            h("textarea", { "data-deg-custom-role-field": "persona", "aria-label": display + " " + t("settings.customRoles.persona"), value: row.persona, disabled: saving || readOnly, onChange: (event) => onEdit(row.key, "persona", event.target.value) })));
+      });
+      return h("section", { className: "deg_cr_section", "data-deg-custom-roles": "section", "aria-label": t("settings.customRoles.title") },
+        h("h3", { className: "deg_cr_title" }, t("settings.customRoles.title")),
+        h("p", { className: "deg_cr_hint" }, t("settings.customRoles.hint")),
+        h("p", { className: "deg_cr_hint", "data-deg-custom-roles-builtin-hint": "true" }, t("settings.customRoles.builtin")),
+        h("ul", { className: "deg_cr_list", "data-deg-custom-roles-builtin": "list" }, ...SETTINGS_ROLE_IDS.map((role) => h("li", {
+          key: role, className: "deg_cr_builtin", "data-deg-custom-role-builtin": role,
+        },
+          h("span", { className: "deg_cr_builtin_name" }, roleLabelOf(role)),
+          h("span", { className: "deg_cr_builtin_desc" }, typeof hostMeta?.roleDescriptions?.[role] === "string" ? hostMeta.roleDescriptions[role] : "")))),
+        h("p", { className: "deg_cr_hint" }, t("settings.customRoles.custom")),
+        rows.length === 0 ? h("p", { className: "deg_mcand_empty", "data-deg-custom-roles-empty": "true" }, t("settings.customRoles.empty")) : h("div", { className: "deg_cr_list" }, ...customRows),
+        h("p", { className: "deg_cr_hint", id: "deg-cr-tool-deny-hint" }, t("settings.customRoles.toolDeny.hint")),
+        h("div", { className: "deg_cr_actions" },
+          h("button", { type: "button", className: "deg_btn", "data-deg-custom-role-add": "true", disabled: saving || readOnly || rows.length >= MAX_CUSTOM_ROLES, onClick: onAdd }, t("settings.customRoles.add")),
+          h("span", { className: "deg_cr_hint" }, t("settings.customRoles.id.hint"))),
+        error === null || error === undefined ? null : h("p", { className: "deg_settings_error", role: "alert", "data-deg-custom-role-error": "true" }, error));
+    }
+
+    // ── 并发与背压（票据 26）───────────────────────────────────────────────
+    /** 读取期丢弃原因 -> 中文；未知 code 原样显示（它是 Host 的稳定短标识符，不是自由文本）。 */
+    const LIMIT_DIAGNOSTIC_REASONS = Object.freeze(["invalid_limit", "unknown_role", "invalid_key", "invalid_shape"]);
+
+    /**
+     * 渲染「并发与背压」区块（票据 26）。
+     *
+     * 三部分：
+     * 1. 逐角色并发上限：只渲染当前 active roles；留空 = 删除覆盖，回落"单个角色并发上限"默认值；
+     * 2. 逐 provider 上限：可添加/删除名称 + 数字行，0 或留空 = 不限制（保存时不查模型目录）；
+     * 3. 只读运行时视图：生效 provider 上限、按 role/provider 的运行/排队/上限/预计等待/
+     *    最近限流时间，以及读取期被丢弃的非法条目。
+     *
+     * 只读数据全部来自同一次 meta 读取；缺失时显示"未知/空"，绝不伪造 0 或假的等待时间。
+     */
+    function renderConcurrencyLimitsSection({
+      t, roles, draft, providerLimitRows, hostMeta, error, saving, readOnly, roleLabelOf,
+      onEditRoleLimit, onAddProviderLimit, onEditProviderLimit, onRemoveProviderLimit,
+    }) {
+      const h = react.createElement;
+      const roleLimits = draft?.roleLimits !== null && typeof draft?.roleLimits === "object" ? draft.roleLimits : {};
+      const defaultLimit = normalizeRoleConcurrencyLimit(draft?.roleConcurrencyLimit);
+      const concurrency = readDiagnosticPath(hostMeta?.diagnostics, ["fanout", "concurrency"]);
+      const liveProviders = normalizeConcurrencyProvidersView(concurrency?.providers);
+      const throttle = normalizeThrottleDiagnosticsView(concurrency?.throttle);
+      const limitDiagnostics = normalizeLimitDiagnosticsView(hostMeta?.limitDiagnostics);
+      const reasonTextOf = (reason) => (LIMIT_DIAGNOSTIC_REASONS.includes(reason) ? t("settings.limits.reason." + reason) : reason);
+      const diagnosticRows = [];
+      for (const entry of limitDiagnostics.roleLimits) {
+        diagnosticRows.push({ id: "roleLimits:" + diagnosticRows.length, field: "roleLimits", target: entry.target, reason: entry.reason });
+      }
+      for (const entry of limitDiagnostics.providerLimits) {
+        diagnosticRows.push({ id: "providerLimits:" + diagnosticRows.length, field: "providerLimits", target: entry.target, reason: entry.reason });
+      }
+      const throttleRowOf = (kind, row) => h("div", {
+        key: kind + ":" + row.key,
+        className: "deg_extra_row",
+        "data-deg-throttle": kind + ":" + row.key,
+        "data-deg-throttle-limit": row.limit === null ? "" : String(row.limit),
+        "data-deg-throttle-running": row.running === null ? "" : String(row.running),
+        "data-deg-throttle-queued": row.queued === null ? "" : String(row.queued),
+        "data-deg-throttle-eta": row.etaMs === null ? "unknown" : String(row.etaMs),
+        "data-deg-throttle-eta-source": row.etaSource,
+        "data-deg-throttle-last": row.lastThrottledAt === null ? "none" : String(row.lastThrottledAt),
+      },
+        h("span", { className: "deg_extra_label" }, kind === "role" ? roleLabelOf(row.key) : row.key),
+        h("span", { className: "deg_extra_value" }, t("settings.limits.throttleLine", {
+          running: formatUsageCount(row.running),
+          queued: formatUsageCount(row.queued),
+          limit: row.limit === 0 ? t("settings.limits.unlimited") : formatUsageCount(row.limit),
+          eta: row.etaMs === null ? t("settings.limits.unknown") : formatUsageDuration(row.etaMs),
+          // etaSource 与 etaMs 一起展示：历史均值不是承诺值，样本不足时必须说清楚来源。
+          etaSource: row.etaSource === "historical-average"
+            ? t("settings.limits.etaSource.average")
+            : t("settings.limits.etaSource.unknown"),
+          last: row.lastThrottledAt === null
+            ? t("settings.limits.never")
+            : (formatDiagnosticTimestamp(row.lastThrottledAt) ?? t("settings.limits.unknown")),
+        })));
+      const roleRows = settingsRolesForProvider(roles).map((role) => h("div", {
+        key: role, className: "deg_extra_row", "data-deg-role-limit-row": role,
+      },
+        h("span", { className: "deg_extra_label" }, roleLabelOf(role)),
+        h("input", {
+          type: "number",
+          min: MIN_ROLE_LIMIT,
+          max: MAX_ROLE_LIMIT,
+          step: 1,
+          inputMode: "numeric",
+          "aria-label": roleLabelOf(role) + " " + t("settings.limits.roleLimit"),
+          "data-deg-role-limit": role,
+          placeholder: String(defaultLimit),
+          value: typeof roleLimits[role] === "number" ? roleLimits[role] : "",
+          disabled: saving || readOnly,
+          onChange: (event) => onEditRoleLimit(role, event.target.value),
+        })));
+      const providerRows = (Array.isArray(providerLimitRows) ? providerLimitRows : []).map((row, index) => h("div", {
+        key: row.key, className: "deg_extra_row deg_extra_row_provider", "data-deg-provider-limit-row": row.key,
+      },
+        h("input", {
+          type: "text",
+          autoComplete: "off",
+          "data-deg-provider-limit-field": "provider",
+          "aria-label": t("settings.limits.providerName") + " " + (index + 1),
+          placeholder: t("settings.limits.providerName"),
+          value: row.provider,
+          disabled: saving || readOnly,
+          onChange: (event) => onEditProviderLimit(row.key, "provider", event.target.value),
+        }),
+        h("input", {
+          type: "number",
+          min: MIN_PROVIDER_CONCURRENCY_LIMIT,
+          max: MAX_PROVIDER_CONCURRENCY_LIMIT,
+          step: 1,
+          inputMode: "numeric",
+          "data-deg-provider-limit-field": "limit",
+          "aria-label": t("settings.limits.providerLimit") + " " + (index + 1),
+          title: t("settings.limits.providerHint"),
+          value: row.limit === "" ? "" : row.limit,
+          disabled: saving || readOnly,
+          onChange: (event) => onEditProviderLimit(row.key, "limit", event.target.value),
+        }),
+        h("button", {
+          type: "button",
+          className: "deg_btn",
+          "data-deg-provider-limit-remove": row.key,
+          "aria-label": t("settings.limits.remove"),
+          disabled: saving || readOnly,
+          onClick: () => onRemoveProviderLimit(row.key),
+        }, "×")));
+      return h("section", {
+        className: "deg_extra_section",
+        "data-deg-limits": "section",
+        "aria-label": t("settings.limits.title"),
+      },
+        h("h3", { className: "deg_extra_title" }, t("settings.limits.title")),
+        h("p", { className: "deg_extra_hint" }, t("settings.limits.hint")),
+        h("div", { className: "deg_extra_block" },
+          h("h4", { className: "deg_extra_subtitle" }, t("settings.limits.roleTitle")),
+          h("p", { className: "deg_extra_hint" }, t("settings.limits.roleHint", { fallback: defaultLimit })),
+          h("div", { className: "deg_extra_rows" }, ...roleRows)),
+        h("div", { className: "deg_extra_block" },
+          h("h4", { className: "deg_extra_subtitle" }, t("settings.limits.providerTitle")),
+          h("p", { className: "deg_extra_hint" }, t("settings.limits.providerHint")),
+          providerRows.length === 0
+            ? h("p", { className: "deg_extra_empty", "data-deg-provider-limit-empty": "true" }, t("settings.limits.empty"))
+            : h("div", { className: "deg_extra_rows" }, ...providerRows),
+          h("div", { className: "deg_extra_actions" },
+            h("button", {
+              type: "button",
+              className: "deg_btn",
+              "data-deg-provider-limit-add": "true",
+              disabled: saving || readOnly || providerRows.length >= MAX_PROVIDER_LIMIT_ROWS,
+              title: providerRows.length >= MAX_PROVIDER_LIMIT_ROWS ? t("settings.limits.rowLimit") : null,
+              onClick: onAddProviderLimit,
+            }, t("settings.limits.add")))),
+        error === null || error === undefined
+          ? null
+          : h("p", { className: "deg_settings_error", role: "alert", "data-deg-limits-error": "true" }, error),
+        // 只读运行时视图：与编辑面刻意分块，用户不会误以为这些数字可编辑。
+        h("div", { className: "deg_extra_block", "data-deg-limits-live": "true" },
+          h("h4", { className: "deg_extra_subtitle" }, t("settings.limits.liveTitle")),
+          h("h4", { className: "deg_extra_subtitle" }, t("settings.limits.liveProvidersTitle")),
+          liveProviders.length === 0
+            ? h("p", { className: "deg_extra_empty", "data-deg-concurrency-provider-empty": "true" }, t("settings.limits.liveProvidersEmpty"))
+            : h("div", { className: "deg_extra_rows" }, ...liveProviders.map((row) => h("div", {
+              key: row.provider, className: "deg_extra_row", "data-deg-concurrency-provider": row.provider,
+              "data-deg-concurrency-provider-limit": String(row.limit),
+            },
+              h("span", { className: "deg_extra_label" }, row.provider),
+              h("span", { className: "deg_extra_value" }, row.limit === 0 ? t("settings.limits.unlimited") : String(row.limit))))),
+          throttle === null
+            ? h("p", { className: "deg_extra_empty", "data-deg-throttle-unavailable": "true" }, t("settings.limits.liveUnknown"))
+            : (throttle.roles.length === 0 && throttle.providers.length === 0
+              ? h("p", { className: "deg_extra_empty", "data-deg-throttle-empty": "true" }, t("settings.limits.liveEmpty"))
+              : h("div", { className: "deg_extra_rows" },
+                ...throttle.roles.map((row) => throttleRowOf("role", row)),
+                ...throttle.providers.map((row) => throttleRowOf("provider", row)))),
+          throttle === null
+            ? null
+            : h("p", { className: "deg_extra_hint", "data-deg-throttle-eta-hint": "true" },
+              t("settings.limits.etaHint", { samples: throttle.etaMinSamples })),
+          diagnosticRows.length === 0
+            ? null
+            : h("div", { className: "deg_extra_block", "data-deg-limit-diagnostics": "true" },
+              h("h4", { className: "deg_extra_subtitle" }, t("settings.limits.invalidTitle")),
+              h("div", { className: "deg_extra_rows" }, ...diagnosticRows.map((entry) => h("p", {
+                key: entry.id, className: "deg_extra_diag", "data-deg-limit-diagnostic": entry.id,
+              }, t("settings.limits.invalidRow", {
+                field: entry.field,
+                target: entry.target.length > 0 ? entry.target : "—",
+                reason: reasonTextOf(entry.reason),
+              })))))));
+    }
+
+    // ── 上下文继承（票据 29）──────────────────────────────────────────────
+    /**
+     * 渲染「上下文继承」区块（票据 29）。
+     *
+     * 只有内置非 Observer 角色（explorer/librarian/oracle/designer/fixer）显示可操作开关；
+     * Observer、未知角色与自定义角色一律以"不提供继承"的只读行出现，绝不放宽隔离边界。
+     * 开关默认关闭（缺字段 = 关闭），并说明继承会增加输入 token 成本——**不显示精确金额**
+     * （没有用量样本时任何数字都不可信，规格只要求提示成本方向）。
+     */
+    function renderInheritContextSection({ t, roles, draft, saving, readOnly, roleLabelOf, onToggle }) {
+      const h = react.createElement;
+      const inherit = draft?.inheritContext !== null && typeof draft?.inheritContext === "object" ? draft.inheritContext : {};
+      const rows = CONTEXT_INHERITANCE_ROLE_IDS.map((role) => h("div", {
+        key: role, className: "deg_extra_row", "data-deg-inherit-row": role,
+      },
+        h("label", { className: "deg_settings_checkbox" },
+          h("input", {
+            type: "checkbox",
+            "aria-label": roleLabelOf(role) + " " + t("settings.inherit.toggle"),
+            "data-deg-inherit-context": role,
+            checked: inherit[role] === true,
+            disabled: saving || readOnly,
+            onChange: (event) => onToggle(role, event.target.checked === true),
+          }),
+          h("span", { className: "deg_settings_label" }, roleLabelOf(role))),
+        h("span", {
+          className: "deg_extra_value",
+          "data-deg-inherit-state": inherit[role] === true ? "on" : "off",
+        }, inherit[role] === true ? t("settings.inherit.on") : t("settings.inherit.off"))));
+      // 不可用角色恒定包含 Observer（隔离是安全边界），其余 active 角色按"自定义/未知"解释。
+      const unavailable = [{
+        key: "observer",
+        text: t("settings.inherit.observer"),
+      }];
+      for (const role of settingsRolesForProvider(roles)) {
+        if (CONTEXT_INHERITANCE_ROLE_IDS.includes(role) || role === "observer") continue;
+        unavailable.push({ key: role, text: t("settings.inherit.custom", { role: roleLabelOf(role) }) });
+      }
+      return h("section", {
+        className: "deg_extra_section",
+        "data-deg-context-inheritance": "section",
+        "aria-label": t("settings.inherit.title"),
+      },
+        h("h3", { className: "deg_extra_title" }, t("settings.inherit.title")),
+        h("p", { className: "deg_extra_hint" }, t("settings.inherit.hint")),
+        h("p", { className: "deg_extra_hint", "data-deg-inherit-cost": "true" }, t("settings.inherit.cost")),
+        h("div", { className: "deg_extra_rows" }, ...rows),
+        h("div", { className: "deg_extra_block", "data-deg-inherit-unavailable-list": "true" },
+          h("h4", { className: "deg_extra_subtitle" }, t("settings.inherit.unavailableTitle")),
+          h("div", { className: "deg_extra_rows" }, ...unavailable.map((entry) => h("p", {
+            key: entry.key, className: "deg_extra_diag", "data-deg-inherit-unavailable": entry.key,
+          }, entry.text)))),
+        h("p", { className: "deg_extra_hint" }, t("settings.inherit.requirement")));
+    }
+
+    // ── 用量与单价（票据 25）─────────────────────────────────────────────
+    /** 一行用量摘要文本（token/请求/重试/耗时）；缺失指标显示"未知"，绝不补 0。 */
+    function usageSummaryText(t, usage) {
+      const run = typeof usage.runMs === "number"
+        ? t("settings.usage.runSuffix", { run: formatUsageDuration(usage.runMs) })
+        : "";
+      return t("settings.usage.line", {
+        input: formatUsageCount(usage.inputTokens),
+        output: formatUsageCount(usage.outputTokens),
+        requests: formatUsageCount(usage.requests),
+        retries: formatUsageCount(usage.retries),
+        run,
+      });
+    }
+
+    /**
+     * provider+model 分组标签。
+     *
+     * 溢出桶固定显示"其他组合（不估算）"；真实组用 "provider · model"（不用 "/" 拼接：
+     * provider/model 允许含 "/"，那样两个不同组合会显示成同一行）。真实 other/other 仍显示
+     * 自己的归属，绝不与溢出桶合并。
+     */
+    function usageProviderModelLabelOf(t, group) {
+      if (group.overflow === true) return t("settings.usage.groupOverflow");
+      return group.provider + " · " + group.model;
+    }
+
+    /**
+     * 渲染「用量与单价」区块（票据 25）。
+     *
+     * 左半是单价编辑（provider/model/input/output/currency，可添加删除，非法行 fail-closed），
+     * 右半是只读用量：totals 与 byRole/byProvider/byModel/byProviderModel/recentTasks（≤16），
+     * 指标只有 token/请求/重试/耗时。没有单价时明确"不估算成本"；有单价时给出公式说明与按
+     * **byProviderModel（provider+model 精确分组）**匹配的示例估算（不是账单）。
+     *
+     * 为什么不能用 byModel：它把不同 provider 的同名模型合并成一行，按 provider 单价
+     * 去匹配会把 A 的单价套到「A+B」的总量上；两个 provider 各配一条同名模型单价时，
+     * 同一份用量会被计费两次。旧 Host 没有 byProviderModel 时明确"暂不估算"，绝不回退。
+     * overflow 溢出桶只展示、绝不参与成本估算（真实 other/other 组仍可精确匹配 other/other 单价）。
+     */
+    function renderUsageSection({ t, draft, hostMeta, error, saving, readOnly, roleLabelOf, onAddPrice, onEditPrice, onRemovePrice }) {
+      const h = react.createElement;
+      const priceRows = normalizeModelPricesDraft(draft?.modelPrices);
+      const usage = normalizeUsageView(hostMeta?.usage);
+      const validPrices = priceRows.filter((row) => row.provider.trim().length > 0
+        && row.model.trim().length > 0
+        && typeof row.inputPerMillion === "number"
+        && typeof row.outputPerMillion === "number");
+      const estimates = [];
+      for (const price of validPrices) {
+        const provider = price.provider.trim();
+        const model = price.model.trim();
+        // 精确匹配 provider+model：字段级比较（不经字符串拼接），绝不跨 provider 复用用量。
+        // 溢出桶显式排除：它的公开字段是 other/other，但代表多个真实组合，绝不能套用
+        // 用户配置的 other/other 单价；真实 other/other 组（overflow === false）仍可精确匹配。
+        const group = usage.byProviderModel.find((entry) => entry.overflow !== true
+          && entry.provider === provider
+          && entry.model === model);
+        if (group === undefined) continue;
+        const cost = estimateUsageCostOf(group.usage, {
+          inputPerMillion: price.inputPerMillion,
+          outputPerMillion: price.outputPerMillion,
+          currency: price.currency,
+        });
+        if (cost === null) continue;
+        // 标签带上 provider：两个 provider 的同名模型会各占一行，只显示 model 无法区分。
+        // React key 用长度前缀的唯一键（provider/model 可能含 "/"），id 保留可读值作 data 属性。
+        estimates.push({
+          key: usageProviderModelKey(provider, model, false),
+          id: provider + "/" + model,
+          label: provider + " · " + model,
+          provider,
+          model,
+          cost,
+        });
+      }
+      // 有单价但旧 Host 没有 provider 级聚合：不估算、不伪造 0，也不回退到 byModel。
+      const providerModelMissing = validPrices.length > 0 && usage.hasProviderModelGroups !== true;
+      const priceRowNodes = priceRows.map((row, index) => h("div", {
+        key: "model-price-" + index, className: "deg_extra_row deg_extra_row_price", "data-deg-model-price-row": String(index),
+      },
+        h("input", {
+          type: "text", autoComplete: "off", "data-deg-model-price-field": "provider",
+          "aria-label": t("settings.usage.priceProvider") + " " + (index + 1),
+          placeholder: t("settings.usage.priceProvider"), value: row.provider,
+          disabled: saving || readOnly,
+          onChange: (event) => onEditPrice(index, "provider", event.target.value),
+        }),
+        h("input", {
+          type: "text", autoComplete: "off", "data-deg-model-price-field": "model",
+          "aria-label": t("settings.usage.priceModel") + " " + (index + 1),
+          placeholder: t("settings.usage.priceModel"), value: row.model,
+          disabled: saving || readOnly,
+          onChange: (event) => onEditPrice(index, "model", event.target.value),
+        }),
+        h("input", {
+          type: "number", min: 0, step: "any", inputMode: "decimal", "data-deg-model-price-field": "inputPerMillion",
+          "aria-label": t("settings.usage.priceInput") + " " + (index + 1),
+          placeholder: t("settings.usage.priceInput"), value: row.inputPerMillion,
+          disabled: saving || readOnly,
+          onChange: (event) => onEditPrice(index, "inputPerMillion", event.target.value),
+        }),
+        h("input", {
+          type: "number", min: 0, step: "any", inputMode: "decimal", "data-deg-model-price-field": "outputPerMillion",
+          "aria-label": t("settings.usage.priceOutput") + " " + (index + 1),
+          placeholder: t("settings.usage.priceOutput"), value: row.outputPerMillion,
+          disabled: saving || readOnly,
+          onChange: (event) => onEditPrice(index, "outputPerMillion", event.target.value),
+        }),
+        h("input", {
+          type: "text", autoComplete: "off", "data-deg-model-price-field": "currency",
+          "aria-label": t("settings.usage.priceCurrency") + " " + (index + 1),
+          placeholder: DEFAULT_MODEL_PRICE_CURRENCY, value: row.currency,
+          disabled: saving || readOnly,
+          onChange: (event) => onEditPrice(index, "currency", event.target.value),
+        }),
+        h("button", {
+          type: "button", className: "deg_btn", "data-deg-model-price-remove": String(index),
+          "aria-label": t("settings.usage.priceRemove"), disabled: saving || readOnly,
+          onClick: () => onRemovePrice(index),
+        }, "×")));
+      const usageRows = (id, rows, labelOf) => (rows.length === 0 ? null : h("div", {
+        key: id, className: "deg_extra_block", "data-deg-usage-group-block": id,
+      },
+        h("h4", { className: "deg_extra_subtitle" }, t("settings.usage." + id)),
+        h("div", { className: "deg_extra_rows" }, ...rows.map((entry) => h("div", {
+          key: id + ":" + entry.key, className: "deg_extra_row", "data-deg-usage-group": id + ":" + entry.key,
+        },
+          h("span", { className: "deg_extra_label" }, labelOf(entry.key)),
+          h("span", { className: "deg_extra_value" }, usageSummaryText(t, entry.usage)))))));
+      // provider+model 只读分组：溢出桶单独成行（"其他组合（不估算）"），绝不与真实
+      // other/other 合并；React key 与 data-deg-usage-group-key 都用带 overflow 位的唯一键，
+      // provider/model 含 "/" 时也不会互相覆盖。
+      const providerModelRows = usage.byProviderModel.length === 0 ? null : h("div", {
+        key: "byProviderModel", className: "deg_extra_block", "data-deg-usage-group-block": "byProviderModel",
+      },
+        h("h4", { className: "deg_extra_subtitle" }, t("settings.usage.byProviderModel")),
+        h("div", { className: "deg_extra_rows" }, ...usage.byProviderModel.map((group) => h("div", {
+          key: "byProviderModel:" + group.key,
+          className: "deg_extra_row",
+          "data-deg-usage-group": group.overflow === true
+            ? "byProviderModel:__overflow__"
+            : "byProviderModel:" + group.provider + "/" + group.model,
+          "data-deg-usage-group-key": group.key,
+          "data-deg-usage-group-overflow": group.overflow === true ? "true" : undefined,
+        },
+          h("span", { className: "deg_extra_label" }, usageProviderModelLabelOf(t, group)),
+          h("span", { className: "deg_extra_value" }, usageSummaryText(t, group.usage))))));
+      const recentRows = usage.recentTasks.map((task, index) => h("div", {
+        key: "recent-" + index, className: "deg_extra_row", "data-deg-usage-recent": String(index),
+      },
+        h("span", { className: "deg_extra_label" },
+          (task.roleLabel.length > 0 ? task.roleLabel : (task.role.length > 0 ? roleLabelOf(task.role) : t("settings.limits.unknown")))
+            + (task.model.length > 0 ? " · " + task.model : "")),
+        h("span", { className: "deg_extra_value" }, usageSummaryText(t, task.usage))));
+      const hasUsage = usage.totals !== null || usage.byRole.length > 0 || usage.byProvider.length > 0
+        || usage.byModel.length > 0 || usage.recentTasks.length > 0;
+      return h("section", {
+        className: "deg_extra_section",
+        "data-deg-usage": "section",
+        "aria-label": t("settings.usage.title"),
+      },
+        h("h3", { className: "deg_extra_title" }, t("settings.usage.title")),
+        h("p", { className: "deg_extra_hint" }, t("settings.usage.hint")),
+        h("div", { className: "deg_extra_block", "data-deg-model-prices": "true" },
+          h("h4", { className: "deg_extra_subtitle" }, t("settings.usage.priceTitle")),
+          h("p", { className: "deg_extra_hint" }, t("settings.usage.priceHint")),
+          priceRowNodes.length === 0
+            ? h("p", { className: "deg_extra_empty", "data-deg-model-price-empty": "true" }, t("settings.usage.priceEmpty"))
+            : h("div", { className: "deg_extra_rows" }, ...priceRowNodes),
+          h("div", { className: "deg_extra_actions" },
+            h("button", {
+              type: "button", className: "deg_btn", "data-deg-model-price-add": "true",
+              disabled: saving || readOnly || priceRows.length >= MAX_MODEL_PRICES,
+              title: priceRows.length >= MAX_MODEL_PRICES ? t("settings.usage.error.limit") : null,
+              onClick: onAddPrice,
+            }, t("settings.usage.priceAdd")))),
+        error === null || error === undefined
+          ? null
+          : h("p", { className: "deg_settings_error", role: "alert", "data-deg-model-price-error": "true" }, error),
+        h("div", { className: "deg_extra_block", "data-deg-usage-readonly": "true" },
+          h("h4", { className: "deg_extra_subtitle" }, t("settings.usage.totals")),
+          hasUsage === false
+            ? h("p", { className: "deg_extra_empty", "data-deg-usage-empty": "true" }, t("settings.usage.empty"))
+            : h("div", { className: "deg_extra_block" },
+              usage.totals === null
+                ? null
+                : h("div", {
+                  className: "deg_extra_row", "data-deg-usage-total": "true",
+                  "data-deg-usage-input": String(usage.totals.inputTokens ?? ""),
+                  "data-deg-usage-output": String(usage.totals.outputTokens ?? ""),
+                  "data-deg-usage-requests": String(usage.totals.requests ?? ""),
+                  "data-deg-usage-retries": String(usage.totals.retries ?? ""),
+                },
+                h("span", { className: "deg_extra_label" }, t("settings.usage.totals")),
+                h("span", { className: "deg_extra_value" }, usageSummaryText(t, usage.totals))),
+              usageRows("byRole", usage.byRole, roleLabelOf),
+              usageRows("byProvider", usage.byProvider, (key) => key),
+              usageRows("byModel", usage.byModel, (key) => key),
+              providerModelRows,
+              usage.recentTasks.length === 0
+                ? null
+                : h("div", { className: "deg_extra_block", "data-deg-usage-recent-block": "true" },
+                  h("h4", { className: "deg_extra_subtitle" }, t("settings.usage.recent")),
+                  h("div", { className: "deg_extra_rows" }, ...recentRows)))),
+        validPrices.length === 0
+          ? h("p", { className: "deg_extra_hint", "data-deg-usage-no-price": "true" }, t("settings.usage.noPrice"))
+          : providerModelMissing === true
+            // 旧 Host（或投影失败回退）只有 byModel：合并值无法安全套用 provider 单价，
+            // 这里明确"暂不估算"，用量展示照旧，绝不显示假成本或 0。
+            ? h("div", { className: "deg_extra_block", "data-deg-usage-estimate-hint": "true" },
+              h("h4", { className: "deg_extra_subtitle" }, t("settings.usage.estimateTitle")),
+              h("p", { className: "deg_extra_hint" }, t("settings.usage.estimateHint")),
+              h("p", { className: "deg_extra_empty", "data-deg-usage-provider-model-missing": "true" },
+                t("settings.usage.estimateMissingProviderModel")))
+            : h("div", { className: "deg_extra_block", "data-deg-usage-estimate-hint": "true" },
+              h("h4", { className: "deg_extra_subtitle" }, t("settings.usage.estimateTitle")),
+              h("p", { className: "deg_extra_hint" }, t("settings.usage.estimateHint")),
+              estimates.length === 0
+                ? h("p", { className: "deg_extra_empty", "data-deg-usage-estimate-empty": "true" }, t("settings.usage.estimateNoSample"))
+                : h("div", { className: "deg_extra_rows" }, ...estimates.map((entry) => h("div", {
+                  // React key 用长度前缀唯一键：provider/model 含 "/" 时 entry.id 可能重复。
+                  key: entry.key,
+                  className: "deg_extra_row",
+                  "data-deg-usage-estimate": entry.id,
+                  "data-deg-usage-estimate-key": entry.key,
+                  "data-deg-usage-estimate-provider": entry.provider,
+                  "data-deg-usage-estimate-model": entry.model,
+                  "data-deg-usage-estimate-cost": formatCostAmount(entry.cost.totalCost),
+                },
+                  h("span", { className: "deg_extra_label" }, entry.label),
+                  h("span", { className: "deg_extra_value" },
+                    t("settings.usage.estimateRow", {
+                      // 标签用 "provider · model"：同名模型在两个 provider 下各占一行，必须可区分。
+                      model: entry.label,
+                      cost: formatCostAmount(entry.cost.totalCost),
+                      currency: entry.cost.currency,
+                    })))))));
+    }
+    /** 每个角色行的模型候选 datalist：跟随当前 provider 过滤，provider 为空时列出全部。 */
+    function sessionOverrideModelOptions(role, provider, providerGroups) {
+      void role;
+      const group = providerGroups.find((entry) => entry?.id === provider);
+      const models = group === undefined
+        ? providerGroups.flatMap((entry) => (Array.isArray(entry?.models) ? entry.models : []))
+        : (Array.isArray(group.models) ? group.models : []);
+      return models;
+    }
+
     /**
      * 专家设置页。
      *
@@ -5614,24 +8150,113 @@ window.__ModuleLoader__.load({
      * 角色配置的保存一律走 DEG 自有提交端点（settings-commit → Host commitSettingsCandidate），
      * 绝不调用表单的 set/unset/mutate：那会绕过 DEG 的语义校验与目录代次检测。
      */
-    function DshExpertGroupSettings({ settingsForm, modelCatalog, modelConfigHost, ctx, diagnostics }) {
+    function DshExpertGroupSettings({ settingsForm, modelCatalog, modelConfigHost, ctx }) {
       const subscribe = react.useMemo(() => settingsForm.subscribe.bind(settingsForm), [settingsForm]);
       const getSnapshot = react.useMemo(() => settingsForm.getSnapshot.bind(settingsForm), [settingsForm]);
       const settingsSnapshot = react.useSyncExternalStore(subscribe, getSnapshot);
       const catalogSubscribe = react.useMemo(() => modelCatalog.subscribe.bind(modelCatalog), [modelCatalog]);
       const catalogGetSnapshot = react.useMemo(() => modelCatalog.getSnapshot.bind(modelCatalog), [modelCatalog]);
       const directoryState = react.useSyncExternalStore(catalogSubscribe, catalogGetSnapshot);
-      // 宿主 meta 同时提供角色表、能力矩阵与运行时诊断；读取失败时不显示诊断块。
+      // 宿主 meta 同时提供角色表、能力矩阵、运行时诊断与预算视图；诊断区因此不新增
+      // 任何 RPC/轮询，也不会因为打开设置页而触碰通知权限或专家任务。
       const [hostMeta, refreshHostMeta, hostMetaError] = useHostMeta(ctx);
       const roles = useEnabledSettingsRoles(hostMeta);
+      /**
+       * 会话级覆盖区块的会话来源（票据 21）：与侧栏/原生状态桥订阅同一条
+       * `ctx.sessions.list`。服务缺失时 sessionListStoreOf 返回引用稳定的空 store，
+       * 区块因此显示"未打开会话"而不是抛错或凭空猜一个会话 id；这里不新增轮询。
+       */
+      const sessionListStore = react.useMemo(() => sessionListStoreOf(ctx), [ctx]);
+      const sessionList = react.useSyncExternalStore(sessionListStore.subscribe, sessionListStore.getSnapshot);
+      /**
+       * 诊断报告（票据 14）：从同一次 meta 读取派生。
+       *
+       * hostMeta 缺失时仍返回客户端能力矩阵（hostAvailable=false），报告里绝不会凭空
+       * 出现宿主字段；所有取值都经过白名单归一，恶意/自由文本字段会被丢弃。
+       */
+      // 文案层（票据 19）：语言按宿主注入面解析一次；同一渲染内所有核心控件共用。
+      const uiLocale = resolveSettingsLocale(ctx);
+      const t = (key, vars) => settingsText(uiLocale, key, vars);
+      // 票据 24/27 新增区块的文案：本地 zh/en 表（权威消息表不在本票据的文件边界内）。
+      const tExtra = (key, vars) => settingsExtraText(uiLocale, key, vars);
+      // 角色显示名以 Host meta.roleLabels 为准（含自定义角色）；缺失时回落内置静态表。
+      const roleLabelOf = (role) => {
+        const label = hostMeta?.roleLabels?.[role];
+        return typeof label === "string" && label.length > 0 ? label : (SETTINGS_ROLE_LABELS[role] ?? role);
+      };
+      const diagnosticsReport = react.useMemo(
+        () => describeExpertGroupDiagnostics({
+          clientCapabilities: describeExpertGroupClientCapabilities(ctx),
+          hostMeta,
+        }),
+        [ctx, hostMeta],
+      );
+      /**
+       * 「发送测试通知」动作状态：null 表示尚未点击。
+       *
+       * 状态只保留 pending / shown / 固定 reason token 三项；不缓存任何通知正文、
+       * 不声称验证了横幅展示时长或系统发声（那些属于桌面人工验收）。
+       */
+      const [notificationTest, setNotificationTest] = react.useState(null);
+      const sendTestNotification = async () => {
+        if (notificationTest?.pending === true) return;
+        setNotificationTest({ pending: true, shown: false, reason: null });
+        try {
+          const response = await requestPluginRpc(ctx?.connection, { action: "notification-test" });
+          const json = response.ok === true ? await response.json() : null;
+          const result = json?.ok === true && json.test !== null && typeof json.test === "object" ? json.test : null;
+          setNotificationTest({
+            pending: false,
+            shown: result?.shown === true,
+            // reason 只接受诊断短标识符；注入实现/旧 Host 的自由文本退化为 unknown。
+            reason: diagnosticTextOf(result?.reason, "unknown"),
+          });
+        } catch {
+          setNotificationTest({ pending: false, shown: false, reason: "unknown" });
+        }
+      };
+      /**
+       * 提示词编辑器的角色集合（票据 27）：Host 投影自己声明的 roles（含自定义角色）。
+       * 未拿到投影时沿用内置六角色；因此旧 Host/旧夹具的按钮集合与语义完全不变。
+       */
+      const promptRoleIds = react.useMemo(() => {
+        const declared = hostMeta?.rolePrompts?.roles;
+        if (!Array.isArray(declared)) return PROMPT_ROLE_IDS;
+        const roles = declared.filter((role) => typeof role === "string" && role.length > 0);
+        return roles.length > 0 ? roles : PROMPT_ROLE_IDS;
+      }, [hostMeta]);
       const hostPromptProjection = react.useMemo(
-        () => normalizeRolePromptProjection(hostMeta?.rolePrompts, settingsSnapshot.value, true),
-        [hostMeta, settingsSnapshot.value],
+        () => normalizeRolePromptProjection(hostMeta?.rolePrompts, settingsSnapshot.value, true, promptRoleIds),
+        [hostMeta, settingsSnapshot.value, promptRoleIds],
       );
       react.useEffect(() => {
         void modelCatalog.load();
       }, [modelCatalog]);
       const [draft, setDraft] = react.useState(() => normalizeSettingsDraft(settingsSnapshot.value, roles));
+      /**
+       * 票据 27：自定义角色用独立的"编辑器行"状态承载文本（id 仅新增可填）。
+       *
+       * 不直接塞进 draft.customRoles：新增行在填完之前没有合法 id，而草稿归一/保存
+       * 都要求 id 就是映射键。行状态到提交文档的转换只发生在保存与 dirty 判定处，
+       * 两者共用 customRolesDocumentOfRows，避免两套形状漂移。
+       */
+      const [customRoleRows, setCustomRoleRows] = react.useState(
+        () => customRoleRowsFromDocument(settingsSnapshot.value?.customRoles),
+      );
+      const [customRoleError, setCustomRoleError] = react.useState(null);
+      const [candidatesError, setCandidatesError] = react.useState(null);
+      /**
+       * 票据 26：provider 上限用独立的"编辑器行"状态承载 provider 文本（settings 形状是
+       * 名称 -> 上限的映射，无法表示还没填名称的新增行）。行状态到提交文档的转换只发生在
+       * 保存与 dirty 判定处，两者共用 providerLimitsDocumentOfRows，避免两套形状漂移。
+       */
+      const [providerLimitRows, setProviderLimitRows] = react.useState(
+        () => providerLimitRowsOfDocument(settingsSnapshot.value?.providerLimits),
+      );
+      const [limitsError, setLimitsError] = react.useState(null);
+      const [modelPricesError, setModelPricesError] = react.useState(null);
+      // 删除失败（例如仍被活动任务引用）时用于精确恢复被删行，避免用户丢失已有定义。
+      const removedCustomRoleRowsRef = react.useRef([]);
       const [dirty, setDirty] = react.useState(false);
       const [saving, setSaving] = react.useState(false);
       const [error, setError] = react.useState(null);
@@ -5649,6 +8274,16 @@ window.__ModuleLoader__.load({
       const [leaveIntent, setLeaveIntent] = react.useState(null);
       const leaveTriggerRef = react.useRef(null);
       const leaveCancelRef = react.useRef(null);
+      // 预检回调只读当前草稿（不把 draft 放进 effect 依赖，避免每次键入触发一次 RPC）。
+      const draftRef = react.useRef(draft);
+      draftRef.current = draft;
+      const candidatesPreflight = useModelCandidatesPreflight({
+        ctx,
+        enabled: settingsSnapshot.status === "ready",
+        roles,
+        draftRef,
+        rolesKey: roles.join("|"),
+      });
       const promptProjection = localPromptProjection !== null
         && Number.isSafeInteger(localPromptProjection.revision)
         && localPromptProjection.revision > settingsSnapshot.revision
@@ -5671,9 +8306,9 @@ window.__ModuleLoader__.load({
         if (Object.prototype.hasOwnProperty.call(promptDrafts, role)) return promptDrafts[role];
         return promptEntryOf(baselineProjection, role)?.effective ?? "";
       };
-      const sourcePromptOverrides = normalizePromptOverrides(settingsSnapshot.value?.promptOverrides, promptMaxGraphemes);
-      const promptTouchedRoles = Object.keys(promptTouched).filter((role) => PROMPT_ROLE_IDS.includes(role));
-      const promptDirty = baselineProjection !== null && PROMPT_ROLE_IDS.some((role) => {
+      const sourcePromptOverrides = normalizePromptOverrides(settingsSnapshot.value?.promptOverrides, promptMaxGraphemes, promptRoleIds);
+      const promptTouchedRoles = Object.keys(promptTouched).filter((role) => promptRoleIds.includes(role));
+      const promptDirty = baselineProjection !== null && promptRoleIds.some((role) => {
         if (!Object.prototype.hasOwnProperty.call(promptTouched, role)) return false;
         const entry = promptEntryOf(baselineProjection, role);
         return entry !== null && promptTextOf(role) !== entry.effective;
@@ -5684,10 +8319,55 @@ window.__ModuleLoader__.load({
         normalizeSettingsDraft(draft, roles, false),
         normalizeSettingsDraft(settingsSnapshot.value, roles, false),
       );
-      const hasUnsavedChanges = settingsDirty || promptDirty;
+      /**
+       * 票据 27：自定义角色行的 dirty 判定与保存共用同一份文档形状。
+       *
+       * 只在行状态与已保存文档不同的时候提交 customRoles；否则缺字段的旧文档/旧客户端
+       * 不会因为一次无关保存被写入空映射（那等于删除用户已有的自定义角色）。
+       */
+      const sourceCustomRoles = normalizeCustomRolesDraft(settingsSnapshot.value?.customRoles);
+      const candidateCustomRoles = customRolesDocumentOfRows(customRoleRows);
+      const customRolesDirty = !settingsDraftEqual(candidateCustomRoles, sourceCustomRoles);
+      /**
+       * 票据 26：provider 上限行的 dirty 判定与保存共用同一份文档形状（理由同 customRoles：
+       * 行状态与映射文档之间只有一处转换，否则"能编辑却判不出 dirty"）。
+       */
+      const sourceProviderLimits = normalizeProviderLimitsDraft(settingsSnapshot.value?.providerLimits);
+      const candidateProviderLimits = providerLimitsDocumentOfRows(providerLimitRows);
+      const providerLimitsDirty = !settingsDraftEqual(candidateProviderLimits, sourceProviderLimits);
+      // 新增行已填写但 id 还空着：也算编辑，让保存能给出"id 不合法"的可读错误，
+      // 而不是让保存按钮无声禁用（完全空白的行不算）。
+      const customRoleRowsPending = customRoleRows.some((row) => row.isNew
+        && (row.id.trim().length > 0 || row.label.trim().length > 0 || row.description.length > 0 || row.readOnly !== ""));
+      const hasUnsavedChanges = settingsDirty || promptDirty || customRolesDirty || customRoleRowsPending
+        || providerLimitsDirty;
       // 编辑器内没有模型/通知控件；外部 snapshot 造成的列表草稿差异不应被误判为
       // 当前提示词的本地修改，否则干净编辑器无法自动刷新。
       const editorHasUnsavedChanges = selectedPromptRole === null ? hasUnsavedChanges : promptDirty;
+      /**
+       * 本次草稿是否要改动「模型字段」（统一供应商 / 角色默认模型）——票据 20。
+       *
+       * 保存守卫、保存按钮与 settings-commit 的变更集共用**同一个**判定，避免出现
+       * 「按钮禁用但 save() 允许」这类分裂：
+       * - 只编辑提示词时模型字段一律以当前完整快照为基底提交（见 save() 的 promptOnly），
+       *   因此不算模型字段变更；
+       * - 顶层统一供应商或任一角色行级 defaults 与已保存快照不同即为变更；
+       * - 模型目录不可用时**只有它为真**才阻断保存：通知、任务开关、提示词、并发/超时
+       *   等与模型无关的字段必须照常保存。模型下拉本身已按目录可用性禁用，用户不可能
+       *   在没有目录的情况下做出新的模型草稿，因此这里判定草稿差异而不是操作来源。
+       */
+      const promptOnlyDraft = selectedPromptRole !== null && promptTouchedRoles.length > 0;
+      const modelFieldsChanged = react.useMemo(() => {
+        if (promptOnlyDraft) return false;
+        const sourceValue = normalizeSettingsDraft(settingsSnapshot.value, roles);
+        const normalizedValue = normalizeSettingsDraft(draft, roles, false);
+        if (!settingsDraftEqual(normalizedValue.defaults, sourceValue.defaults)) return true;
+        return unifiedProviderOf(
+          normalizedValue.defaults,
+          roles,
+          typeof draft.provider === "string" ? draft.provider : "",
+        ) !== unifiedProviderOf(sourceValue.defaults, roles, sourceValue.provider);
+      }, [draft, roles, settingsSnapshot.value, promptOnlyDraft]);
 
       react.useEffect(() => {
         if (!dirty) {
@@ -5697,6 +8377,15 @@ window.__ModuleLoader__.load({
           setPromptDrafts({});
           setPromptTouched({});
           setPromptError(null);
+          // 票据 27：未编辑时行状态跟随权威文档；编辑中（dirty）绝不覆盖用户输入。
+          setCustomRoleRows(customRoleRowsFromDocument(settingsSnapshot.value?.customRoles));
+          removedCustomRoleRowsRef.current = [];
+          setCustomRoleError(null);
+          setCandidatesError(null);
+          // 票据 26/25：provider 上限行与校验错误同一条同步语义（未编辑才跟随权威文档）。
+          setProviderLimitRows(providerLimitRowsOfDocument(settingsSnapshot.value?.providerLimits));
+          setLimitsError(null);
+          setModelPricesError(null);
         }
       }, [dirty, settingsSnapshot.value, roles, promptMaxGraphemes]);
 
@@ -5769,6 +8458,108 @@ window.__ModuleLoader__.load({
         setDraft((previous) => update(previous));
       };
 
+      /** 票据 27：自定义角色行编辑与草稿 dirty 同一来源（保存/放弃/冲突提示保持一致）。 */
+      const touchCustomRoles = () => { setDirty(true); setSaved(false); setError(null); setCustomRoleError(null); };
+      const editCustomRoleRow = (key, field, value) => {
+        touchCustomRoles();
+        setCustomRoleRows((previous) => previous.map((row) => (row.key === key ? { ...row, [field]: value } : row)));
+      };
+      // 新行显式带 toolDeny: []（空文本域 = 显式空数组）；readOnly 保持未选择，
+      // 由保存前校验强制用户做出权限选择，绝不默认放开。
+      const addCustomRoleRow = () => {
+        touchCustomRoles();
+        setCustomRoleRows((previous) => (previous.length >= MAX_CUSTOM_ROLES ? previous : [...previous, createCustomRoleRow({ toolDeny: [] }, "")]));
+      };
+      const removeCustomRoleRow = (key) => {
+        touchCustomRoles();
+        setCustomRoleRows((previous) => {
+          const removed = previous.find((row) => row.key === key);
+          if (removed !== undefined && !removedCustomRoleRowsRef.current.some((row) => row.key === removed.key)) {
+            removedCustomRoleRowsRef.current = [...removedCustomRoleRowsRef.current, removed];
+          }
+          return previous.filter((row) => row.key !== key);
+        });
+      };
+
+      // ── 票据 26/29/25：并发映射、继承开关与单价行的编辑入口 ──────────────
+      /** provider 上限行编辑与草稿 dirty 同一来源（保存/放弃/冲突提示保持一致）。 */
+      const touchProviderLimitRows = () => {
+        setDirty(true); setSaved(false); setError(null); setLimitsError(null);
+      };
+      const editProviderLimitRow = (key, field, value) => {
+        touchProviderLimitRows();
+        setProviderLimitRows((previous) => previous.map((row) => {
+          if (row.key !== key) return row;
+          if (field !== "limit") return { ...row, [field]: typeof value === "string" ? value : "" };
+          // 数字输入只给出字符串：草稿里统一存"数字或空串"，文档转换与校验才不必再猜类型。
+          const text = typeof value === "string" ? value.trim() : "";
+          if (text === "") return { ...row, limit: "" };
+          const number = Number(text);
+          return { ...row, limit: Number.isFinite(number) ? number : "" };
+        }));
+      };
+      const addProviderLimitRow = () => {
+        touchProviderLimitRows();
+        setProviderLimitRows((previous) => (previous.length >= MAX_PROVIDER_LIMIT_ROWS
+          ? previous
+          : [...previous, createProviderLimitRow("", "")]));
+      };
+      const removeProviderLimitRow = (key) => {
+        touchProviderLimitRows();
+        setProviderLimitRows((previous) => previous.filter((row) => row.key !== key));
+      };
+      /**
+       * 逐角色并发上限输入（票据 26）。留空 = 删除覆盖（回落"单个角色并发上限"默认）；
+       * 非有限值保持上一次输入（与既有并发上限输入同一语义），范围由保存前校验给出可读错误。
+       */
+      const editRoleLimit = (role, raw) => {
+        const text = typeof raw === "string" ? raw.trim() : "";
+        editDraft((previous) => {
+          const map = { ...(previous.roleLimits ?? {}) };
+          if (text === "") {
+            delete map[role];
+            return { ...previous, roleLimits: map };
+          }
+          const number = Number(text);
+          if (!Number.isFinite(number)) return previous;
+          map[role] = number;
+          return { ...previous, roleLimits: map };
+        });
+      };
+      /**
+       * 上下文继承开关（票据 29）。只有内置非 Observer 角色可开启；关闭用删除键表达
+       * （归一后的文档只含显式 true，显式 false 与缺失同义）。
+       */
+      const toggleInheritContext = (role, enabled) => {
+        if (!CONTEXT_INHERITANCE_ROLE_IDS.includes(role)) return;
+        editDraft((previous) => {
+          const map = { ...(previous.inheritContext ?? {}) };
+          if (enabled === true) map[role] = true;
+          else delete map[role];
+          return { ...previous, inheritContext: map };
+        });
+      };
+      /** 单价行编辑（票据 25）：金额允许暂时为空串，保存前由 validateModelPricesDraft 拒绝。 */
+      const updateModelPrices = (update) => editDraft((previous) => ({
+        ...previous,
+        modelPrices: update(normalizeModelPricesDraft(previous.modelPrices)),
+      }));
+      const editModelPrice = (index, field, raw) => updateModelPrices((list) => list.map((row, position) => {
+        if (position !== index) return row;
+        if (field === "inputPerMillion" || field === "outputPerMillion") {
+          const text = typeof raw === "string" ? raw.trim() : "";
+          if (text === "") return { ...row, [field]: "" };
+          const number = Number(text);
+          // 非有限金额保持未填写状态：绝不会因为一个中间态输入把 NaN 写进草稿。
+          return { ...row, [field]: Number.isFinite(number) ? number : "" };
+        }
+        return { ...row, [field]: typeof raw === "string" ? raw : "" };
+      }));
+      const addModelPrice = () => updateModelPrices((list) => (list.length >= MAX_MODEL_PRICES
+        ? list
+        : [...list, { provider: "", model: "", inputPerMillion: "", outputPerMillion: "", currency: DEFAULT_MODEL_PRICE_CURRENCY }]));
+      const removeModelPrice = (index) => updateModelPrices((list) => list.filter((unused, position) => position !== index));
+
       const captureEditorBaseline = (role) => {
         if (role === null) return null;
         // 即使 rolePrompts 仍在加载，也必须先锁定进入编辑器时的 revision；
@@ -5802,7 +8593,7 @@ window.__ModuleLoader__.load({
         applyPromptNavigation(role);
       };
       const openPrompt = (role, event) => {
-        if (!PROMPT_ROLE_IDS.includes(role)) return;
+        if (!promptRoleIds.includes(role)) return;
         if (selectedPromptRole !== null && selectedPromptRole !== role) {
           requestPromptNavigation(role, event);
           return;
@@ -5820,7 +8611,7 @@ window.__ModuleLoader__.load({
         try { trigger?.focus?.(); } catch { /* 焦点恢复失败不应阻断编辑器。 */ }
       };
       const editPromptText = (role, text) => {
-        const nextPromptDirty = baselineProjection !== null && PROMPT_ROLE_IDS.some((candidate) => {
+        const nextPromptDirty = baselineProjection !== null && promptRoleIds.some((candidate) => {
           const entry = promptEntryOf(baselineProjection, candidate);
           if (entry === null) return false;
           return (candidate === role ? text : promptTextOf(candidate)) !== entry.effective;
@@ -5836,6 +8627,35 @@ window.__ModuleLoader__.load({
 
       const groups = Array.isArray(directoryState.groups) ? directoryState.groups : [];
       const providerGroups = groups.filter((group) => group && typeof group.id === "string");
+      /**
+       * 角色模型表的行集合：内置六角色（含未启用的 Observer，提示词入口历史行为）
+       * + meta.activeRoles（票据 27：自定义角色必须能设置主模型）。
+       */
+      const modelRowRoles = react.useMemo(() => {
+        const next = [...PROMPT_ROLE_IDS];
+        for (const role of roles) if (!next.includes(role)) next.push(role);
+        return next;
+      }, [roles]);
+      /**
+       * 会话级覆盖（票据 21）：作为**自定义 hook** 在任何提前返回之前调用。
+       *
+       * 设置页有三种提前返回（loading / unavailable / 提示词编辑态）；hook 必须与它们
+       * 之前的状态无关地每次都执行，否则从 loading 过渡到 ready 时会出现 hook 数量
+       * 变化（React 硬性禁止）。因此这里先调用 hook 拿到分区节点，只在就绪分支渲染。
+       */
+      const sessionOverrideSection = useSessionOverrideSection({
+        ctx,
+        sessionList,
+        // 票据 21 的会话覆盖仍只覆盖内置角色：自定义角色属于票据 27 的全局模型面，
+        // 不在本轮扩大会话级覆盖语义（其读取归一也按内置角色表过滤）。
+        roles: roles.filter((role) => PROMPT_ROLE_IDS.includes(role)),
+        providerGroups,
+        globalDefaults: normalizeSettingsDraft(settingsSnapshot.value, roles).defaults,
+        t,
+        hostMeta,
+        hostMetaError,
+      });
+
       /**
        * 目录可用性：`status === "ready"`，或**已有成功目录缓存**（groups 非空）。
        *
@@ -5854,9 +8674,12 @@ window.__ModuleLoader__.load({
       const unifiedProvider = unifiedProviderOf(draft.defaults, roles, draft.provider);
 
       const save = async ({ retry = false } = {}) => {
-        const promptOnlySave = selectedPromptRole !== null && promptTouchedRoles.length > 0;
-        if (!hasUnsavedChanges || saving || settingsSnapshot.writable !== true
-          || (!promptOnlySave && !catalogAvailable)) return false;
+        const promptOnlySave = promptOnlyDraft;
+        if (!hasUnsavedChanges || saving || settingsSnapshot.writable !== true) return false;
+        // 票据 20：模型目录不可用只阻断「这次确实要改模型字段」的保存。与模型无关的
+        // 字段（通知、任务开关、提示词、并发/超时）不依赖目录，必须照常保存——否则一次
+        // 目录刷新失败就会让整页设置不可写。
+        if (!promptOnlySave && modelFieldsChanged && !catalogAvailable) return false;
         const source = normalizeSettingsDraft(settingsSnapshot.value, roles);
         // 编辑器只修改提示词时必须以当前完整 snapshot 为候选基底：首次 CAS 会因旧 revision
         // 冲突而失败；明确重试时才以最新 snapshot + 用户实际提示词字段提交，绝不重放旧模型/通知。
@@ -5864,13 +8687,14 @@ window.__ModuleLoader__.load({
         const sourceProvider = unifiedProviderOf(source.defaults, roles, source.provider);
         const draftProviderIntent = promptOnlySave ? sourceProvider : (typeof draft.provider === "string" ? draft.provider : "");
         const draftProvider = unifiedProviderOf(normalizedDraft.defaults, roles, draftProviderIntent);
-        const defaultsChanged = !settingsDraftEqual(normalizedDraft.defaults, source.defaults);
-        // provider 的模型变化由 defaults 差异或用户明确改变统一选择器决定；通知字段单独保存时
-        // draftProviderIntent 与 sourceProvider 相同，因此不会把旧顶层 provider 强行写回行级配置。
-        // 目录门控与下拉同源（catalogAvailable）：缓存在手时用户从缓存里选出的 provider+model
-        // 是合法候选，必须能随这次保存一起提交，否则就成了"能选不能存"；反之没有任何目录时
-        // 这里仍然不写，绝不凭空写入一个无法校验的 provider。
-        const modelChanged = !promptOnlySave && catalogAvailable && (defaultsChanged || draftProviderIntent !== sourceProvider);
+        // provider 的模型变化由行级 defaults 差异或用户明确改变统一选择器决定；通知字段单独
+        // 保存时 draftProviderIntent 与 sourceProvider 相同，因此不会把旧顶层 provider 强行
+        // 写回行级配置。目录门控与下拉同源（catalogAvailable）：缓存在手时用户从缓存里选出的
+        // provider+model 是合法候选，必须能随这次保存一起提交，否则就成了"能选不能存"；
+        // 反之没有任何目录时这里仍然不写，绝不凭空写入一个无法校验的 provider。
+        // 判定与保存守卫/保存按钮同源（见 modelFieldsChanged），因此不存在"按钮可用但
+        // save() 静默丢弃模型草稿"的分裂。
+        const modelChanged = promptOnlySave ? false : modelFieldsChanged && catalogAvailable;
 
         // 提示词是完整 settings 候选中的一个全局映射。只有被编辑过的角色才会从草稿
         // 覆盖 source；恢复默认通过删除对应键表达，避免把默认文本固化成冗余覆盖。
@@ -5889,7 +8713,7 @@ window.__ModuleLoader__.load({
             const text = promptTextOf(role);
             const validation = validatePromptText(text, promptMaxGraphemes);
             if (!validation.ok) {
-              setPromptError((SETTINGS_ROLE_LABELS[role] ?? role) + "：" + validation.message);
+              setPromptError(roleLabelOf(role) + "：" + validation.message);
               return false;
             }
             if (entry === null || typeof entry.defaultPersona !== "string") {
@@ -5905,12 +8729,100 @@ window.__ModuleLoader__.load({
           && Object.prototype.hasOwnProperty.call(settingsSnapshot.value, "promptOverrides");
         const promptChanged = !promptOverridesEqual(candidatePromptOverrides, sourcePromptOverrides);
         const includePromptOverrides = sourceHasPromptOverrides || promptTouchedRoles.length > 0;
+        /**
+         * 票据 24：候选与降级上限只在**真正变化**时进入候选；校验也只覆盖本次变更
+         * （未编辑角色的存量失效候选不得阻塞其它字段保存）。
+         */
+        const sourceCandidates = normalizeModelCandidatesDraft(settingsSnapshot.value?.candidates);
+        const candidateCandidates = normalizeModelCandidatesDraft(normalizedDraft.candidates);
+        const candidatesChanged = promptOnlySave !== true && !settingsDraftEqual(candidateCandidates, sourceCandidates);
+        if (candidatesChanged) {
+          const validation = validateModelCandidateRows(candidateCandidates);
+          if (validation.ok !== true) { setCandidatesError(modelCandidatesErrorMessage(tExtra, roleLabelOf, validation)); return false; }
+        }
+        const sourceFallbackLimit = normalizeSettingsDraft(settingsSnapshot.value, roles).fallbackLimit;
+        const candidateFallbackLimit = normalizedDraft.fallbackLimit;
+        const fallbackLimitChanged = promptOnlySave !== true && candidateFallbackLimit !== void 0 && candidateFallbackLimit !== sourceFallbackLimit;
+        /**
+         * 票据 27：自定义角色只在行状态真的变化时提交整份映射（replace 语义）。
+         * 缺失 readOnly/toolDeny 时前端先给出可读错误并阻止提交——绝不默认放开。
+         */
+        const rowsBeforeSave = customRoleRows;
+        const includeCustomRoles = promptOnlySave !== true && (customRolesDirty || customRoleRowsPending);
+        if (includeCustomRoles) {
+          const validation = validateCustomRoleRows(customRoleRows, { builtinIds: SETTINGS_ROLE_IDS });
+          if (validation.ok !== true) { setCustomRoleError(customRoleValidationMessage(tExtra, validation)); return false; }
+        }
+        /**
+         * 票据 26/29/25：并发映射、上下文继承与单价只在**真正变化**时提交，且提交前
+         * fail-closed 校验（非法条目整次拒绝，绝不静默丢弃用户输入）。未变化的字段
+         * 一律以缺字段提交 —— 缺字段 = Host 保持已有值（旧客户端/旧文档同一语义）。
+         */
+        const sourceRoleLimits = normalizeRoleLimitsDraft(source.roleLimits, roles);
+        const draftRoleLimits = normalizeRoleLimitsDraft(normalizedDraft.roleLimits, roles);
+        const roleLimitsChanged = promptOnlySave !== true
+          && Object.prototype.hasOwnProperty.call(normalizedDraft, "roleLimits")
+          && !settingsDraftEqual(draftRoleLimits, sourceRoleLimits);
+        if (roleLimitsChanged) {
+          const validation = validateRoleLimitsDocument(draftRoleLimits);
+          if (validation.ok !== true) {
+            setLimitsError(tExtra("settings.limits.error.roleLimit", { role: roleLabelOf(validation.role) }));
+            return false;
+          }
+        }
+        // provider 上限：行状态是唯一编辑面，dirty 判定与提交文档共用同一份转换。
+        const providerRowsBeforeSave = providerLimitRows;
+        const providerLimitsChanged = promptOnlySave !== true && providerLimitsDirty;
+        const candidateProviderLimitsDocument = providerLimitsDocumentOfRows(providerLimitRows);
+        if (providerLimitsChanged) {
+          const validation = validateProviderLimitRows(providerLimitRows);
+          if (validation.ok !== true) {
+            setLimitsError(tExtra("settings.limits.error." + validation.code, { index: validation.index }));
+            return false;
+          }
+        }
+        const sourceInheritContext = normalizeInheritContextDraft(source.inheritContext);
+        const draftInheritContext = normalizeInheritContextDraft(normalizedDraft.inheritContext);
+        const inheritContextChanged = promptOnlySave !== true
+          && Object.prototype.hasOwnProperty.call(normalizedDraft, "inheritContext")
+          && !settingsDraftEqual(draftInheritContext, sourceInheritContext);
+        const sourceModelPrices = normalizeModelPricesDraft(source.modelPrices);
+        const draftModelPrices = normalizeModelPricesDraft(normalizedDraft.modelPrices);
+        const modelPricesChanged = promptOnlySave !== true
+          && Object.prototype.hasOwnProperty.call(normalizedDraft, "modelPrices")
+          && !settingsDraftEqual(draftModelPrices, sourceModelPrices);
+        let candidateModelPricesDocument = [];
+        if (modelPricesChanged) {
+          const validation = validateModelPricesDraft(draftModelPrices);
+          if (validation.ok !== true) {
+            setModelPricesError(tExtra("settings.usage.error." + validation.code, { index: validation.index }));
+            return false;
+          }
+          candidateModelPricesDocument = modelPricesDocumentOfDraft(draftModelPrices);
+        }
         const candidate = {
           ...normalizedDraft,
           provider: modelChanged ? draftProvider : sourceProvider,
           ...(modelChanged ? {} : { defaults: source.defaults }),
           ...(includePromptOverrides ? { promptOverrides: candidatePromptOverrides } : {}),
+          // 未变化的字段一律不提交：缺字段 = Host 保持已有值（旧客户端兼容语义）。
+          ...(candidatesChanged ? { candidates: candidateCandidates } : {}),
+          ...(fallbackLimitChanged
+            ? { fallbackLimit: typeof candidateFallbackLimit === "number" ? candidateFallbackLimit : DEFAULT_MODEL_FALLBACK_LIMIT }
+            : {}),
+          ...(includeCustomRoles ? { customRoles: candidateCustomRoles } : {}),
+          ...(roleLimitsChanged ? { roleLimits: draftRoleLimits } : {}),
+          ...(providerLimitsChanged ? { providerLimits: candidateProviderLimitsDocument } : {}),
+          ...(inheritContextChanged ? { inheritContext: draftInheritContext } : {}),
+          ...(modelPricesChanged ? { modelPrices: candidateModelPricesDocument } : {}),
         };
+        if (!candidatesChanged) delete candidate.candidates;
+        if (!fallbackLimitChanged) delete candidate.fallbackLimit;
+        if (!includeCustomRoles) delete candidate.customRoles;
+        if (!roleLimitsChanged) delete candidate.roleLimits;
+        if (!providerLimitsChanged) delete candidate.providerLimits;
+        if (!inheritContextChanged) delete candidate.inheritContext;
+        if (!modelPricesChanged) delete candidate.modelPrices;
         const ops = [];
         if (modelChanged) {
           ops.push({ op: "set", path: ["provider"], value: candidate.provider });
@@ -5922,8 +8834,10 @@ window.__ModuleLoader__.load({
         if (candidate.notificationVolume !== source.notificationVolume) {
           ops.push({ op: "set", path: ["notificationVolume"], value: candidate.notificationVolume });
         }
-        if (candidate.notificationHoldMs !== source.notificationHoldMs) {
-          ops.push({ op: "set", path: ["notificationHoldMs"], value: candidate.notificationHoldMs });
+        // 通知事件过滤（票据 14）：三个类别是一组完整设置，只有真正变化才写 op；
+        // 旧 Host 不认识该字段时会被提交端点按"未知字段"忽略，不会影响其它字段。
+        if (!settingsDraftEqual(candidate.notificationEvents, source.notificationEvents)) {
+          ops.push({ op: "set", path: ["notificationEvents"], value: candidate.notificationEvents });
         }
         if (candidate.observerPreferred !== source.observerPreferred) {
           ops.push({ op: "set", path: ["observerPreferred"], value: candidate.observerPreferred });
@@ -5949,6 +8863,49 @@ window.__ModuleLoader__.load({
         if (promptChanged) {
           ops.push({ op: "set", path: ["promptOverrides"], value: candidatePromptOverrides });
         }
+        /**
+         * 变更集（票据 20，settings-commit 的可选协议字段 `changed`）。
+         *
+         * 顶层字段直接由 ops 推导（只有真的变化才会产生 op）；模型字段进一步细化到
+         * 角色级 `defaults.<role>`，让 Host 只对真正变化的角色做真实目录解析，而不是把
+         * 整份 defaults 重新解析一遍（存量失效模型因此不再阻塞无关字段的保存）。
+         * 候选本身仍是**完整值**：`changed` 只描述"哪些字段变了"，不改变 replace 语义。
+         */
+        const changed = [];
+        if (modelChanged) {
+          // 顶层统一供应商只在值真的变了时报出（模型解析本身不需要它，它只是模型字段）。
+          if (candidate.provider !== sourceProvider) changed.push("provider");
+          for (const role of Object.keys(candidate.defaults)) {
+            if (!settingsDraftEqual(candidate.defaults[role], source.defaults[role])) changed.push("defaults." + role);
+          }
+          // 被删除的角色默认行同样是一次模型变更（defaults 是整份映射替换）：列出来才能让
+          // Host 区分「没有模型变更」与「删掉了一行」。
+          for (const role of Object.keys(source.defaults)) {
+            if (!Object.prototype.hasOwnProperty.call(candidate.defaults, role)) changed.push("defaults." + role);
+          }
+        }
+        for (const op of ops) {
+          const field = op.path[0];
+          // provider/defaults 已按上面的模型字段粒度上报，避免同一变更重复出现。
+          if (field === "defaults" || field === "provider") continue;
+          changed.push(field);
+        }
+        // 票据 24：候选变更按角色上报（candidates + candidates.<role>），Host 因此只解析
+        // 真正变化的角色；fallbackLimit 只在值真的变了才上报。
+        if (candidatesChanged) {
+          changed.push("candidates");
+          for (const role of new Set([...Object.keys(candidateCandidates), ...Object.keys(sourceCandidates)])) {
+            if (!settingsDraftEqual(candidateCandidates[role] ?? null, sourceCandidates[role] ?? null)) changed.push("candidates." + role);
+          }
+        }
+        if (fallbackLimitChanged) changed.push("fallbackLimit");
+        // 票据 27：自定义角色是整份映射替换，按顶层字段上报一次即可。
+        if (includeCustomRoles) changed.push("customRoles");
+        // 票据 26/29/25：并发映射、继承开关与单价同理（整份映射/数组替换，按顶层字段上报）。
+        if (roleLimitsChanged) changed.push("roleLimits");
+        if (providerLimitsChanged) changed.push("providerLimits");
+        if (inheritContextChanged) changed.push("inheritContext");
+        if (modelPricesChanged) changed.push("modelPrices");
         // 提示词首次提交必须保留进入编辑页时看到的 revision；实时 snapshot 只用于
         // 观察外部变化，不能被拿来绕过整体 settings 的 CAS。
         const expectedRevision = retry === true
@@ -5964,28 +8921,80 @@ window.__ModuleLoader__.load({
         try {
           let accepted;
           let committed = null;
-          if (ops.length > 0) {
+          // 票据 24/27：候选/降级/自定义角色不在 ops 里（它们不是默认值 op），但同样需要
+          // 真实提交；任一特殊字段变化都必须走 settings-commit，而不是只把快照当成已保存。
+          if (ops.length > 0 || candidatesChanged || fallbackLimitChanged || includeCustomRoles
+            || roleLimitsChanged || providerLimitsChanged || inheritContextChanged || modelPricesChanged) {
             // 角色配置唯一写入路径：DEG 自有提交端点（Host commitSettingsCandidate 完成
             // schema、语义与 revision CAS 校验）。绝不调用配置表单的 set/unset/mutate：
             // 那会绕过 DEG 的提示词语义校验与模型目录代次检测。
             // 共享镜像会随 settings/document-updated 自行刷新，无需本地推进 revision。
-            committed = await commitSettingsCandidate(candidate, expectedRevision, globalThis.fetch, ctx?.connection, roles);
+            committed = await commitSettingsCandidate(candidate, expectedRevision, globalThis.fetch, ctx?.connection, roles, changed);
             accepted = committed.settings;
           } else {
             accepted = normalizeSettingsCommitDraft(settingsForm.getSnapshot().value, roles);
           }
           // Host 已在同一提交边界完成 schema、模型和 revision 校验；200 响应中的
           // committed settings 是权威归一结果，不再与客户端草稿做易误报的 JSON 全量比较。
+          // 响应里的 promptOverrides 可能被归一函数按**旧角色表**裁剪过（新增自定义角色
+          // 尚未进入 meta）：以本次候选为基底合并，保证刚保存的自定义角色覆盖不被丢弃。
           const acceptedPromptOverrides = normalizePromptOverrides(
             Object.prototype.hasOwnProperty.call(accepted ?? {}, "promptOverrides")
-              ? accepted.promptOverrides
+              ? { ...candidatePromptOverrides, ...accepted.promptOverrides }
               : candidatePromptOverrides,
             promptMaxGraphemes,
+            promptRoleIds,
           );
-          setDraft(accepted);
+          /**
+           * 票据 26/29/25：Host 只回显本次真正写入的字段（未变化的字段被删掉），
+           * 因此保存成功后要为新字段回落本次候选/源值，避免控件在下一次 settings
+           * 快照到达前短暂变空——那会让用户以为自己的配置被抹掉了。
+           */
+          const acceptedDraft = accepted !== null && typeof accepted === "object" ? { ...accepted } : accepted;
+          if (acceptedDraft !== null && typeof acceptedDraft === "object") {
+            const keepNewField = (field, hadField, value) => {
+              if (Object.prototype.hasOwnProperty.call(acceptedDraft, field)) return;
+              if (hadField !== true) return;
+              acceptedDraft[field] = value;
+            };
+            keepNewField("roleLimits",
+              roleLimitsChanged || Object.prototype.hasOwnProperty.call(source, "roleLimits"),
+              roleLimitsChanged ? draftRoleLimits : sourceRoleLimits);
+            keepNewField("providerLimits",
+              providerLimitsChanged || Object.prototype.hasOwnProperty.call(source, "providerLimits"),
+              providerLimitsChanged ? candidateProviderLimitsDocument : sourceProviderLimits);
+            keepNewField("inheritContext",
+              inheritContextChanged || Object.prototype.hasOwnProperty.call(source, "inheritContext"),
+              inheritContextChanged ? draftInheritContext : sourceInheritContext);
+            keepNewField("modelPrices",
+              modelPricesChanged || Object.prototype.hasOwnProperty.call(source, "modelPrices"),
+              modelPricesChanged ? candidateModelPricesDocument : sourceModelPrices);
+          }
+          setDraft(acceptedDraft);
           setPromptDrafts({});
           setPromptTouched({});
-          const responseProjection = normalizeRolePromptProjection(committed?.rolePrompts, accepted, true);
+          setCandidatesError(null);
+          // 票据 27：保存成功必须用 Host 权威文档重建行状态（新角色从此不再是"新增"）；
+          // 响应未携带 customRoles（老 Host）时才回落到本次提交的映射。
+          if (accepted !== null && typeof accepted === "object" && accepted.customRoles !== void 0) {
+            setCustomRoleRows(customRoleRowsFromDocument(accepted.customRoles));
+          } else if (includeCustomRoles) {
+            setCustomRoleRows(customRoleRowsFromDocument(candidateCustomRoles));
+          }
+          setCustomRoleError(null);
+          removedCustomRoleRowsRef.current = [];
+          // 票据 26：provider 上限行同样用 Host 权威映射重建（响应缺字段时回落到本次提交）。
+          setProviderLimitRows(providerLimitRowsOfDocument(
+            acceptedDraft !== null && typeof acceptedDraft === "object" ? acceptedDraft.providerLimits : void 0,
+          ));
+          setLimitsError(null);
+          setModelPricesError(null);
+          // 角色目录变化后刷新 meta：角色表、提示词入口、候选区块与侧栏标签跟随新角色。
+          if (includeCustomRoles) refreshHostMeta();
+          // 并发映射变化后刷新 meta：只读区块展示的"生效 provider 上限/排队与放行"来自
+          // meta.diagnostics，不刷新会与刚保存的配置不一致（每次保存只多一次 meta 读取）。
+          if (roleLimitsChanged || providerLimitsChanged) refreshHostMeta();
+          const responseProjection = normalizeRolePromptProjection(committed?.rolePrompts, accepted, true, promptRoleIds);
           let acceptedProjection = responseProjection ?? promptProjection;
           if (acceptedProjection !== null) {
             for (const role of promptTouchedRoles) {
@@ -6024,6 +9033,26 @@ window.__ModuleLoader__.load({
             setSettingsConflict({ revision: cause.currentRevision, message });
           }
           if (promptTouchedRoles.length > 0) setPromptError(message);
+          if (includeCustomRoles) {
+            // 删除仍被活动任务引用的角色时 Host 会拒绝整次保存：恢复删除前的行状态，
+            // 并在区块内显示 Host 返回的原因（例如"自定义角色仍在使用中，已拒绝删除"），
+            // 绝不静默丢弃用户已有的角色定义。
+            setCustomRoleRows(rowsBeforeSave);
+            // 精确恢复本次删除的行：Host 拒绝删除（仍在使用）时定义不能从草稿里消失。
+            if (removedCustomRoleRowsRef.current.length > 0) {
+              const removed = removedCustomRoleRowsRef.current;
+              removedCustomRoleRowsRef.current = [];
+              setCustomRoleRows((previous) => {
+                const restored = previous.slice();
+                for (const row of removed) if (!restored.some((entry) => entry.key === row.key)) restored.push(row);
+                return restored;
+              });
+            }
+            setCustomRoleError(customRoleHostErrorMessage(tExtra, cause, message));
+          }
+          // 票据 26：provider 上限行在失败时保持用户输入（保存过程只读行状态）；
+          // 这里显式还原同一份行数组，保证失败路径不会悄悄丢掉刚添加/删除的行。
+          setProviderLimitRows(providerRowsBeforeSave);
           return false;
         } finally {
           setSaving(false);
@@ -6032,8 +9061,16 @@ window.__ModuleLoader__.load({
 
       const discard = () => {
         const snapshot = settingsForm.getSnapshot();
-        const refreshedProjection = normalizeRolePromptProjection(hostMeta?.rolePrompts, snapshot.value, true) ?? promptProjection;
+        const refreshedProjection = normalizeRolePromptProjection(hostMeta?.rolePrompts, snapshot.value, true, promptRoleIds) ?? promptProjection;
         setDraft(normalizeSettingsDraft(snapshot.value, roles));
+        setCustomRoleRows(customRoleRowsFromDocument(snapshot.value?.customRoles));
+        removedCustomRoleRowsRef.current = [];
+        setCustomRoleError(null);
+        setCandidatesError(null);
+        // 票据 26/25：放弃修改时行状态与校验错误一并回到权威文档。
+        setProviderLimitRows(providerLimitRowsOfDocument(snapshot.value?.providerLimits));
+        setLimitsError(null);
+        setModelPricesError(null);
         // 重新加载时清空局部草稿，让 Host 当前 effective/default 成为编辑初值。
         setPromptDrafts({});
         setPromptTouched({});
@@ -6060,7 +9097,7 @@ window.__ModuleLoader__.load({
           setPromptError("最新配置尚未到达，请稍后再加载");
           return;
         }
-        const projection = normalizeRolePromptProjection(hostMeta?.rolePrompts, snapshot.value, true) ?? promptProjection;
+        const projection = normalizeRolePromptProjection(hostMeta?.rolePrompts, snapshot.value, true, promptRoleIds) ?? promptProjection;
         if (selectedPromptRole === null || projection === null) {
           setPromptError("最新提示词配置不可用，请稍后重试");
           return;
@@ -6143,7 +9180,7 @@ window.__ModuleLoader__.load({
       const promptErrorMessage = promptError ?? promptValidationMessage ?? error ?? promptMetaMessage;
       const promptLabel = selectedPromptRole === null
         ? "专家"
-        : (SETTINGS_ROLE_LABELS[selectedPromptRole] ?? selectedPromptRole);
+        : roleLabelOf(selectedPromptRole);
       const promptEditor = selectedPromptRole === null ? null : react.createElement("div", { className: "deg_settings deg_settings_prompt_editor" },
         react.createElement("div", { className: "deg_prompt_header" },
           react.createElement("h2", { className: "deg_settings_title" }, promptLabel)),
@@ -6310,7 +9347,8 @@ window.__ModuleLoader__.load({
       // 而首次挂载（还没有任何成功目录）与 connection/reset 清空目录之后 groups 为空，
       // catalogAvailable 为 false，三个下拉和保存按钮一并禁用。
       // 业务禁用条件（saving / roleEnabled / 没有 provider、model、reasoning）保持不变。
-      const rows = PROMPT_ROLE_IDS.map((role) => {
+      const rows = modelRowRoles.map((role) => {
+        const roleLabel = roleLabelOf(role);
         const roleEnabled = roles.includes(role);
         const selection = draft.defaults[role] ?? null;
         const rowProvider = typeof selection?.provider === "string" ? selection.provider : "";
@@ -6388,30 +9426,36 @@ window.__ModuleLoader__.load({
             return { ...previous, defaults };
           });
         };
+        // 提示词入口只对 Host 投影声明的角色开放（票据 27：含自定义角色）；投影缺失时
+        // 仍是内置六角色，历史行为不变。
+        const promptEntryAvailable = promptRoleIds.includes(role);
         return react.createElement(react.Fragment, { key: role },
           react.createElement("div", { className: "deg_settings_table_cell deg_settings_role_cell" },
-            react.createElement("button", {
-              type: "button",
-              className: "deg_settings_role_button",
-              "data-deg-prompt-role": role,
-              "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + "提示词"
-                + (promptEntryOf(promptProjection, role)?.customized === true ? "（已自定义提示词）" : ""),
-              "aria-pressed": selectedPromptRole === role,
-              // 读取失败仍可进入错误页并重试；只有正在提交时才锁住入口，避免永久死锁。
-              disabled: saving,
-              onClick: (event) => openPrompt(role, event),
-            },
-              react.createElement("span", null, SETTINGS_ROLE_LABELS[role] ?? role),
-              promptEntryOf(promptProjection, role)?.customized === true
-                ? react.createElement("span", {
-                  className: "deg_settings_prompt_customized_dot",
-                  "aria-hidden": "true",
-                })
-                : null)),
+            promptEntryAvailable
+              ? react.createElement("button", {
+                type: "button",
+                className: "deg_settings_role_button",
+                "data-deg-prompt-role": role,
+                "aria-label": roleLabel + "提示词"
+                  + (promptEntryOf(promptProjection, role)?.customized === true ? "（已自定义提示词）" : ""),
+                "aria-pressed": selectedPromptRole === role,
+                // 读取失败仍可进入错误页并重试；只有正在提交时才锁住入口，避免永久死锁。
+                disabled: saving,
+                onClick: (event) => openPrompt(role, event),
+              },
+                react.createElement("span", null, roleLabel),
+                promptEntryOf(promptProjection, role)?.customized === true
+                  ? react.createElement("span", {
+                    className: "deg_settings_prompt_customized_dot",
+                    "aria-hidden": "true",
+                  })
+                  : null)
+              : react.createElement("span", { className: "deg_settings_label", "data-deg-role-label": role }, roleLabel),
+          ),
           react.createElement("div", { className: "deg_settings_table_cell" },
             react.createElement("select", {
               className: "deg_settings_provider_select",
-              "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + " 供应商",
+              "aria-label": roleLabel + " 供应商",
               value: rowProvider,
               disabled: saving || !catalogAvailable || !roleEnabled,
               onChange: updateProvider,
@@ -6419,7 +9463,7 @@ window.__ModuleLoader__.load({
           react.createElement("div", { className: "deg_settings_table_cell" },
             react.createElement("select", {
               className: "deg_settings_model_select",
-              "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + " 模型选择",
+              "aria-label": roleLabel + " 模型选择",
               value: selection?.model ?? "",
               disabled: saving || !catalogAvailable || !roleEnabled || !rowProvider || rowProviderGroup === undefined,
               onChange: updateModel,
@@ -6427,7 +9471,7 @@ window.__ModuleLoader__.load({
           react.createElement("div", { className: "deg_settings_table_cell" },
             react.createElement("select", {
               className: "deg_settings_effort_select",
-              "aria-label": (SETTINGS_ROLE_LABELS[role] ?? role) + " 思考深度",
+              "aria-label": roleLabel + " 思考深度",
               value: selection?.reasoningEffort ?? "",
               disabled: saving || !catalogAvailable || !roleEnabled || reasoning === undefined || !selection?.model,
               onChange: updateReasoning,
@@ -6439,32 +9483,32 @@ window.__ModuleLoader__.load({
         : react.createElement(ModelConfigSection, {
           host: modelConfigHost,
           roleDefaults: normalizeSettingsDraft(settingsSnapshot.value, roles).defaults,
-          roleLabelOf: (role) => SETTINGS_ROLE_LABELS[role] ?? role,
+          roleLabelOf,
         });
       return react.createElement("div", { className: "deg_settings" },
-        react.createElement("h2", { className: "deg_settings_title" }, "dsh-expert-group"),
-        react.createElement("p", { className: "deg_settings_hint" }, "专家模型使用 DSH 当前已配置的 provider 和模型目录。"),
+        react.createElement("h2", { className: "deg_settings_title" }, t("settings.title")),
+        react.createElement("p", { className: "deg_settings_hint" }, t("settings.hint")),
         modelConfigSection,
         react.createElement("div", { className: "deg_settings_row deg_settings_task_row" },
           react.createElement("label", { className: "deg_settings_checkbox" },
             react.createElement("input", {
               type: "checkbox",
-              "aria-label": "任务管理",
+              "aria-label": t("settings.taskManagement"),
               checked: draft.taskManagementEnabled,
               disabled: saving,
               onChange: (event) => editDraft((previous) => ({ ...previous, taskManagementEnabled: event.target.checked })),
             }),
-            react.createElement("span", { className: "deg_settings_label" }, "任务管理")),
+            react.createElement("span", { className: "deg_settings_label" }, t("settings.taskManagement"))),
           // 「Auto」自动打开运行中的子代理右侧栏会话；维持原悬浮说明与保存绑定。
-          react.createElement("label", { className: "deg_settings_checkbox", title: "自动打开运行中的子代理侧栏会话" },
+          react.createElement("label", { className: "deg_settings_checkbox", title: t("settings.autoTitle") },
             react.createElement("input", {
               type: "checkbox",
-              "aria-label": "Auto",
+              "aria-label": t("settings.auto"),
               checked: draft.autoOpenSubagentSidebar,
               disabled: saving,
               onChange: (event) => editDraft((previous) => ({ ...previous, autoOpenSubagentSidebar: event.target.checked === true })),
             }),
-            react.createElement("span", { className: "deg_settings_label" }, "Auto"))),
+            react.createElement("span", { className: "deg_settings_label" }, t("settings.auto")))),
         react.createElement("div", { className: "deg_settings_row deg_settings_notification_row" },
           react.createElement("label", { className: "deg_settings_checkbox" },
             react.createElement("input", {
@@ -6473,23 +9517,16 @@ window.__ModuleLoader__.load({
               disabled: saving,
               onChange: (event) => editDraft((previous) => ({ ...previous, notificationEnabled: event.target.checked })),
             }),
-            react.createElement("span", { className: "deg_settings_label" }, "通知弹窗")),
-          react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-notification-hold" },
-            react.createElement("span", { className: "deg_settings_label" }, "弹窗停留时间"),
-            react.createElement("select", {
-              id: "deg-settings-notification-hold",
-              "aria-label": "弹窗停留时间",
-              value: draft.notificationHoldMs,
-              disabled: saving,
-              onChange: (event) => editDraft((previous) => ({ ...previous, notificationHoldMs: notificationHoldMsOf(Number(event.target.value)) })),
-            }, NOTIFICATION_HOLD_OPTIONS.map((option) => react.createElement("option", { key: option.value, value: option.value }, option.label)))),
+            react.createElement("span", { className: "deg_settings_label" }, t("settings.notifications"))),
+          // 停留时长字段已按票据 14 移除：Windows Toast 的展示时长由系统策略决定，
+          // 旧配置里的该字段在读取/提交边界被忽略，不迁移、不报错。
           // 两个输入控件分别提供可访问名称，避免一个 label 同时包裹多个可标记控件。
           react.createElement("div", { className: "deg_settings_control" },
-            react.createElement("span", { className: "deg_settings_label" }, "通知音量"),
+            react.createElement("span", { className: "deg_settings_label" }, t("settings.notificationVolume")),
             react.createElement("input", {
               id: "deg-settings-notification-volume-range",
               type: "range", min: 0, max: 100, step: 1,
-              "aria-label": "通知音量滑块",
+              "aria-label": t("settings.notificationVolume.range"),
               value: draft.notificationVolume,
               disabled: saving,
               onChange: (event) => editDraft((previous) => ({ ...previous, notificationVolume: clampNotificationVolume(event.target.value) })),
@@ -6497,13 +9534,30 @@ window.__ModuleLoader__.load({
             react.createElement("input", {
               id: "deg-settings-notification-volume-number",
               type: "number", min: 0, max: 100, step: 1,
-              "aria-label": "通知音量数值",
+              "aria-label": t("settings.notificationVolume.number"),
               value: draft.notificationVolume,
               disabled: saving,
               onChange: (event) => editDraft((previous) => ({ ...previous, notificationVolume: clampNotificationVolume(event.target.value) })),
             }))),
+        // 通知事件类型（票据 14）：三个类别默认全开；保存后 Host 在投递前过滤，
+        // 关闭某一类不会改变任务快照/等待语义，也不会补发历史结论。
+        react.createElement("div", { className: "deg_settings_row deg_settings_notification_events_row" },
+          react.createElement("span", { className: "deg_settings_label" }, t("settings.notificationEvents")),
+          react.createElement("div", { className: "deg_settings_notification_events" },
+            NOTIFICATION_EVENT_TYPES.map((type) => react.createElement("label", { key: type, className: "deg_settings_checkbox" },
+              react.createElement("input", {
+                type: "checkbox",
+                "aria-label": t("settings.notificationEvent." + type + ".aria"),
+                checked: draft.notificationEvents[type] === true,
+                disabled: saving,
+                onChange: (event) => editDraft((previous) => ({
+                  ...previous,
+                  notificationEvents: { ...previous.notificationEvents, [type]: event.target.checked === true },
+                })),
+              }),
+              react.createElement("span", { className: "deg_settings_label" }, t("settings.notificationEvent." + type)))))),
         react.createElement("div", { className: "deg_settings_row" },
-          react.createElement("label", { className: "deg_settings_label", htmlFor: "deg-settings-provider" }, "统一供应商"),
+          react.createElement("label", { className: "deg_settings_label", htmlFor: "deg-settings-provider" }, t("settings.unifiedProvider")),
           react.createElement("div", { className: "deg_settings_control" },
             react.createElement("select", {
               id: "deg-settings-provider",
@@ -6527,21 +9581,89 @@ window.__ModuleLoader__.load({
                 };
               }),
             },
-              react.createElement("option", { value: "" }, SETTINGS_NO_PROVIDER_LABEL),
+              react.createElement("option", { value: "" }, t("settings.noProvider")),
               providerGroups.map((group) => react.createElement("option", { key: group.id, value: group.id }, group.name ?? group.id))))),
         react.createElement("div", { className: "deg_settings_table_wrap" },
           react.createElement("div", { className: "deg_settings_table" }, header, rows)),
+        // 会话级覆盖紧跟在角色模型表之后：它只替换本会话该角色的主选择。
+        sessionOverrideSection,
+        // 模型候选与自动降级（票据 24）：主选择来自 defaults，候选是全局有序列表。
+        renderModelCandidatesSection({
+          t: tExtra,
+          roles,
+          draft,
+          providerGroups,
+          preflight: candidatesPreflight,
+          saving,
+          readOnly: settingsReadOnly,
+          error: candidatesError,
+          editDraft,
+          roleLabelOf,
+        }),
+        // 自定义角色（票据 27）：位于诊断区之前，内置角色只读、自定义角色可编辑。
+        renderCustomRolesSection({
+          t: tExtra,
+          rows: customRoleRows,
+          error: customRoleError,
+          hostMeta,
+          roleLabelOf,
+          saving,
+          readOnly: settingsReadOnly,
+          onAdd: addCustomRoleRow,
+          onEdit: editCustomRoleRow,
+          onRemove: removeCustomRoleRow,
+        }),
+        // 并发与背压（票据 26）：逐角色/逐 provider 上限编辑 + 运行时限流只读视图。
+        // 「单个角色并发上限」保留在底部管理行，作为没有逐角色覆盖时的默认值。
+        renderConcurrencyLimitsSection({
+          t: tExtra,
+          roles,
+          draft,
+          providerLimitRows,
+          hostMeta,
+          error: limitsError,
+          saving,
+          readOnly: settingsReadOnly,
+          roleLabelOf,
+          onEditRoleLimit: editRoleLimit,
+          onAddProviderLimit: addProviderLimitRow,
+          onEditProviderLimit: editProviderLimitRow,
+          onRemoveProviderLimit: removeProviderLimitRow,
+        }),
+        // 上下文继承（票据 29）：只有内置非 Observer 角色可开启；其余角色只读说明。
+        renderInheritContextSection({
+          t: tExtra,
+          roles,
+          draft,
+          saving,
+          readOnly: settingsReadOnly,
+          roleLabelOf,
+          onToggle: toggleInheritContext,
+        }),
+        // 用量与单价（票据 25）：单价是可选的成本估算输入，用量来自宿主 usage 事件（只读）。
+        renderUsageSection({
+          t: tExtra,
+          draft,
+          hostMeta,
+          error: modelPricesError,
+          saving,
+          readOnly: settingsReadOnly,
+          roleLabelOf,
+          onAddPrice: addModelPrice,
+          onEditPrice: editModelPrice,
+          onRemovePrice: removeModelPrice,
+        }),
         react.createElement("div", { className: "deg_settings_row deg_settings_management_row" },
           react.createElement("label", { className: "deg_settings_checkbox" },
-            react.createElement("input", { type: "checkbox", "aria-label": "Observer优先", checked: draft.observerPreferred, disabled: saving, onChange: (event) => editDraft((previous) => ({ ...previous, observerPreferred: event.target.checked })) }),
-            react.createElement("span", { className: "deg_settings_label" }, "Observer优先")),
+            react.createElement("input", { type: "checkbox", "aria-label": t("settings.observerPreferred"), checked: draft.observerPreferred, disabled: saving, onChange: (event) => editDraft((previous) => ({ ...previous, observerPreferred: event.target.checked })) }),
+            react.createElement("span", { className: "deg_settings_label" }, t("settings.observerPreferred"))),
           react.createElement("div", { className: "deg_settings_limits" },
           react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-concurrency-limit" },
-            react.createElement("span", { className: "deg_settings_label" }, "单个角色并发上限"),
+            react.createElement("span", { className: "deg_settings_label" }, t("settings.concurrencyLimit")),
             react.createElement("input", {
               id: "deg-settings-role-concurrency-limit",
               type: "number",
-              "aria-label": "单个角色并发上限",
+              "aria-label": t("settings.concurrencyLimit"),
               min: 1,
               max: 64,
               step: 1,
@@ -6563,12 +9685,12 @@ window.__ModuleLoader__.load({
           // Host 的毫秒字段 roleTimeoutMs；与并发上限同一行的紧凑布局。
           // 精度与边界由 Host 与管理器共同保证；这里只提供步进与可访问名称。
           react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-timeout-ms" },
-            react.createElement("span", { className: "deg_settings_label" }, "角色默认超时 (s)"),
+            react.createElement("span", { className: "deg_settings_label" }, t("settings.roleTimeout")),
             react.createElement("input", {
               id: "deg-settings-role-timeout-ms",
               type: "number",
-              "aria-label": "角色默认超时",
-              title: "默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
+              "aria-label": t("settings.roleTimeout.aria"),
+              title: t("settings.roleTimeout.title"),
               min: 0,
               max: 86400,
               step: 1,
@@ -6587,12 +9709,55 @@ window.__ModuleLoader__.load({
                 }));
               },
             })))),
+        // ── 诊断与通知状态（票据 14）─────────────────────────────────────────
+        // 数据来自同一次 meta 读取：能力矩阵、运行时诊断、预算用量/最近违规、持久化与
+        // 系统通知投递状态。所有行都由白名单表构造，绝不回显宿主自由文本或绝对路径。
+        // 「发送测试通知」只调用 Host 的 notification-test 动作（真实系统通知适配器），
+        // 不伪造任务状态；桌面上的真实显示与发声仍属人工验收。
+        react.createElement("section", {
+          className: "deg_settings_diagnostics",
+          "data-deg-diagnostics": "section",
+          "aria-label": t("settings.diagnostics.title"),
+        },
+          react.createElement("h3", { className: "deg_settings_diagnostics_title" }, t("settings.diagnostics.title")),
+          diagnosticsReport.hostAvailable !== true
+            ? react.createElement("p", { className: "deg_settings_hint" },
+              hostMeta === null
+                ? (hostMetaError === null ? t("settings.diagnostics.loading") : t("settings.diagnostics.unavailable"))
+                : t("settings.diagnostics.absent"))
+            : null,
+          renderDiagnosticGroup(t("settings.diagnostics.capabilities"), "capabilities", diagnosticsReport.capabilities, renderDiagnosticCapability),
+          renderDiagnosticGroup(t("settings.diagnostics.runtime"), "runtime", diagnosticsReport.runtime, renderDiagnosticRuntime),
+          renderDiagnosticGroup(t("settings.diagnostics.budget"), "budget", diagnosticsReport.budget, renderDiagnosticRuntime),
+          renderDiagnosticGroup(t("settings.diagnostics.persistence"), "persistence", diagnosticsReport.persistence, renderDiagnosticRuntime),
+          react.createElement("div", {
+            className: "deg_settings_diagnostic_group",
+            "data-deg-diagnostic-group": "notifications",
+          },
+            react.createElement("h4", { className: "deg_settings_diagnostic_group_title" }, t("settings.diagnostics.notifications")),
+            diagnosticsReport.notifications.map(renderDiagnosticRuntime),
+            react.createElement("div", { className: "deg_settings_diagnostic_row deg_settings_notification_test" },
+              react.createElement("button", {
+                type: "button",
+                className: "deg_btn",
+                "aria-label": t("settings.testNotification"),
+                "data-deg-notification-test": notificationTest?.pending === true ? "pending" : "idle",
+                disabled: notificationTest?.pending === true,
+                onClick: sendTestNotification,
+              }, notificationTest?.pending === true ? t("settings.testNotification.sending") : t("settings.testNotification")),
+              react.createElement("span", {
+                className: "deg_settings_diagnostic_value",
+                role: "status",
+                "data-deg-notification-test-status": notificationTestStatusText(notificationTest),
+              }, notificationTestStatusText(notificationTest))))),
         directoryState.error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, directoryState.error) : null,
         error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, error) : null,
         react.createElement("div", { className: "deg_settings_footer" },
-          react.createElement("span", { className: "deg_settings_status", role: "status" }, saved ? "已保存" : hasUnsavedChanges ? "有未保存的修改" : ""),
-          react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving, onClick: discard }, "放弃修改"),
-          react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving || !catalogAvailable || settingsSnapshot.writable !== true, onClick: save }, saving ? "保存中…" : "保存")));
+          react.createElement("span", { className: "deg_settings_status", role: "status" }, saved ? t("settings.saved") : hasUnsavedChanges ? t("settings.unsaved") : ""),
+          react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving, onClick: discard }, t("settings.discard")),
+          // 票据 20：目录不可用只在本次草稿含模型字段变更时禁用保存；通知、任务开关、
+          // 提示词、并发/超时等与模型无关的字段必须照常可保存。
+          react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving || (modelFieldsChanged && !catalogAvailable) || settingsSnapshot.writable !== true, onClick: save }, saving ? t("settings.saving") : t("settings.save"))));
     }
     /**
      * 浏览器 FileReader 的等价字节编码：File.arrayBuffer() 取得原始字节，btoa()
@@ -7899,6 +11064,35 @@ window.__ModuleLoader__.load({
 
     exports.normalizeSettingsModelGroups = normalizeSettingsModelGroups;
     exports.normalizeSettingsDraft = normalizeSettingsDraft;
+    // 票据 24/27：设置页候选/自定义角色的公开纯函数面（界面与测试共用同一实现）。
+    exports.normalizeModelCandidatesDraft = normalizeModelCandidatesDraft;
+    exports.normalizeModelFallbackLimitDraft = normalizeModelFallbackLimitDraft;
+    exports.validateModelCandidateRows = validateModelCandidateRows;
+    exports.normalizeModelPreflightView = normalizeModelPreflightView;
+    exports.normalizeCustomRolesDraft = normalizeCustomRolesDraft;
+    exports.customRoleRowsFromDocument = customRoleRowsFromDocument;
+    exports.customRolesDocumentOfRows = customRolesDocumentOfRows;
+    exports.validateCustomRoleRows = validateCustomRoleRows;
+    // 票据 26/29/25：并发映射、上下文继承、单价与用量的公开纯函数面（界面与测试共用同一实现）。
+    exports.normalizeRoleLimitsDraft = normalizeRoleLimitsDraft;
+    exports.validateRoleLimitsDocument = validateRoleLimitsDocument;
+    exports.normalizeProviderLimitsDraft = normalizeProviderLimitsDraft;
+    exports.providerLimitRowsOfDocument = providerLimitRowsOfDocument;
+    exports.providerLimitsDocumentOfRows = providerLimitsDocumentOfRows;
+    exports.validateProviderLimitRows = validateProviderLimitRows;
+    exports.normalizeInheritContextDraft = normalizeInheritContextDraft;
+    exports.CONTEXT_INHERITANCE_ROLE_IDS = CONTEXT_INHERITANCE_ROLE_IDS;
+    exports.normalizeModelPricesDraft = normalizeModelPricesDraft;
+    exports.modelPricesDocumentOfDraft = modelPricesDocumentOfDraft;
+    exports.validateModelPricesDraft = validateModelPricesDraft;
+    exports.normalizeUsageView = normalizeUsageView;
+    exports.estimateUsageCostOf = estimateUsageCostOf;
+    exports.normalizeThrottleDiagnosticsView = normalizeThrottleDiagnosticsView;
+    exports.normalizeConcurrencyProvidersView = normalizeConcurrencyProvidersView;
+    exports.normalizeLimitDiagnosticsView = normalizeLimitDiagnosticsView;
+    exports.formatUsageDuration = formatUsageDuration;
+    exports.SETTINGS_EXTRA_MESSAGES = SETTINGS_EXTRA_MESSAGES;
+    exports.settingsExtraText = settingsExtraText;
     exports.countUnicodeGraphemes = countUnicodeGraphemes;
     exports.validatePromptText = validatePromptText;
     exports.normalizePromptOverrides = normalizePromptOverrides;
@@ -7929,6 +11123,9 @@ window.__ModuleLoader__.load({
      * - installNativeStatusBridge：把上面这些接进 DSH 原生运行行的 observer 生命周期。
      * 测试跨这些公开 seam 验证行为，不读取生产源码文本。
      */
+    // 票据 19：设置页 zh 回退表（仅供契约测试对比权威消息表，不参与运行期业务判断）。
+    exports.SETTINGS_ZH_FALLBACK = SETTINGS_ZH_FALLBACK;
+    exports.NATIVE_RUNNING_STATUS_PREFIXES = NATIVE_RUNNING_STATUS_PREFIXES;
     exports.NATIVE_RUNNING_STATUS_PREFIX = NATIVE_RUNNING_STATUS_PREFIX;
     exports.replaceNativeStatusPrefix = replaceNativeStatusPrefix;
     exports.resolveRunningStatusText = resolveRunningStatusText;
@@ -7966,6 +11163,12 @@ window.__ModuleLoader__.load({
     ]);
     // 只读能力矩阵与诊断面：设置页、维护者与测试共用同一份纯函数实现。
     exports.describeExpertGroupClientCapabilities = describeExpertGroupClientCapabilities;
+    /**
+     * 会话级覆盖的读取面归一（票据 21）：与设置页共用同一实现，测试据此断言
+     * 非法/越界响应不会被渲染成可编辑状态。
+     */
+    exports.normalizeSessionOverrideView = normalizeSessionOverrideView;
+    exports.normalizeSessionOverrideSelection = normalizeSessionOverrideSelection;
     exports.describeExpertGroupDiagnostics = describeExpertGroupDiagnostics;
     /**
      * 设置页导航行品牌图标（DOM 适配）的公开面：

@@ -77,7 +77,14 @@ export function createStorageBindingModule({ bindingController = createBindingCo
         hasBinding: binding !== undefined,
         status: binding?.status,
         generation: binding?.generation,
-        tableNames: binding === undefined ? [] : ["session_overrides", "child_models", "fanout_tasks"].filter((name) => binding[tableKeyOf(name)] !== undefined),
+        // 表清单是诊断面：session_override_meta（票据 21 的覆盖代次表）同样是
+        // 运行期硬依赖，缺失时写路径会显式拒绝，诊断必须如实列出。
+        tableNames: binding === undefined
+          ? []
+          // 票据 28：模板表与运行数据同域、独立表。诊断只投影“有哪些表”，
+          // 不暴露表内容；旧 binding 缺该表时如实少一项（= 写路径会显式拒绝）。
+          : ["session_overrides", "session_override_meta", "child_models", "fanout_tasks", "fanout_templates"]
+            .filter((name) => binding[tableKeyOf(name)] !== undefined),
       };
     },
     dispose() {
@@ -89,6 +96,8 @@ export function createStorageBindingModule({ bindingController = createBindingCo
 
 function tableKeyOf(tableName) {
   if (tableName === "session_overrides") return "sessionTable";
+  if (tableName === "session_override_meta") return "sessionOverrideMetaTable";
   if (tableName === "child_models") return "childTable";
+  if (tableName === "fanout_templates") return "fanoutTemplateTable";
   return "fanoutTable";
 }

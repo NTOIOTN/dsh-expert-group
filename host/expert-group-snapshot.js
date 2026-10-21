@@ -12,9 +12,17 @@
  * 3. 不猜内容：读不到的字段统一归一为 null，状态词表外的值统一归一为 "unknown"；
  *    缺失 taskName/content/contentSource 时不会用 id、prompt 或时间戳去拼凑。
  * 4. 幂等：同一份输入重复投影得到深度相等的输出，便于 RPC 缓存与差异比较。
+ * 5. 可比较：顶层 revision 是「除 generatedAt 与 revision 自身之外全部内容」的摘要——
+ *    内容相同则相同、内容变化则变化，客户端不必自己比较整棵树（票据 12）。
+ * 6. 只搬运已证明的时间：节点的开始/结束/耗时全部来自 manager 或投影自身已有的字段；
+ *    DSH 没有发布的能力（例如会话的完成时间）一律为 null，绝不用「最后一次活动」
+ *    冒充完成时间，也不把未知耗时写成 0。
  *
  * @module dsh-expert-group/host/expert-group-snapshot
  */
+import { createHash } from "node:crypto";
+import { hasUsageMetrics, projectUsage, sumUsageByChildId } from "./usage-ledger.js";
+import { projectModelRouteFields, projectStructuredResult, structuredProjectionFields } from "../shared.js";
 
 /** 投影 schema 版本；客户端只接受该版本的负载。 */
 export const EXPERT_GROUP_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -95,6 +103,441 @@ function numberOrNull(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+// ── 任务时间线与受限失败摘要（票据 12） ──────────────────────────────────────
+
+/**
+ * 终态词表（与模块顶部的状态注释一致）：只有这些状态才可能有 finishedAt/durationMs。
+ *
+ * 非终态（queued/waiting/running）以及 unknown 一律没有完成时间：时钟在走不代表任务结束。
+ */
+const TERMINAL_STATUS_SET = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
+
+/**
+ * 「失败」语义的终态集合。
+ *
+ * cancelled 不算失败（用户主动取消不是错误）；只有 failed/timed_out/interrupted 才参与
+ * 父任务级 failure 的挑选，避免把一次主动取消渲染成任务失败。
+ */
+const FAILURE_STATUS_SET = new Set(["failed", "timed_out", "interrupted"]);
+
+/**
+ * 「明确仍在进行中」的状态集合（与 client-expert-group-model.js 的 ACTIVE_STATUS_SET 同义）。
+ *
+ * 这些节点没有终点：即使输入误带 finishedAt/durationMs 也一律不采用，否则侧栏会把
+ * 「正在运行」渲染成「已耗时 1.2s」。unknown / 缺失状态保持宽容——旧快照没有可靠状态时，
+ * 显式给出的时间戳仍是唯一可用事实。
+ */
+const ACTIVE_STATUS_SET = new Set(["queued", "waiting", "running"]);
+
+/**
+ * 失败摘要 code 的字符上限：只作防御性闸门（允许列表内最长的码仅 19 位），
+ * 客户端只展示不解析。
+ */
+export const FAILURE_CODE_MAX_LENGTH = 64;
+
+/** 失败摘要 message 的字符上限：只给一行人类可读文案，绝不搬运整段错误/堆栈。 */
+export const FAILURE_MESSAGE_MAX_LENGTH = 160;
+
+/**
+ * message 安全检查的总长度上限（多行文本；票据 12 第六轮）。
+ *
+ * 超限直接整条回退：既避免在超长输入（完整响应体/日志）上做昂贵检查，也保证
+ * 「先截断再检查」不会把尾部凭据截成短而安全的残段。
+ */
+export const FAILURE_MESSAGE_SCAN_MAX_LENGTH = 8192;
+
+/**
+ * Unicode 格式字符 / 不可见字符 / 代理码位（票据 12 第七轮）。
+ *
+ * `\p{Cf}` 覆盖 U+200B/U+200C/U+200D/U+2060/U+FEFF/U+00AD 等零宽与格式字符；变体选择符
+ * U+FE00–U+FE0F 与孤立代理码位 `\p{Cs}` 同样不可见。它们不属于 `\s`、也不是 Cc 控制字符，
+ * 可能被用来拆分 Base64/hex（`AAECAwQFBgcICQoL\u200BA0ODxAREhMUFRYX`）。
+ *
+ * 正常错误消息不应包含这些字符，因此一旦出现**整条回退**，绝不做「删除后继续」处理。
+ */
+const INVISIBLE_FORMAT_PATTERN = /[\p{Cf}\p{Cs}\uFE00-\uFE0F]/u;
+
+/**
+ * 稳定错误码的**有限精确允许列表**（票据 12 第十二轮）：failure.code 与 recovery.code 共用。
+ *
+ * 历史：第十/十一轮按「形态」放行——长度 < 16 的任意全大写词、全大写+下划线机器码、
+ * 长度 < 16 的 CamelCase。形态规则本质上是**开放集合**：任何满足形态的字符串都能进入
+ * 快照。oracle 已复现 `recovery.code = "AbcdefGhijklmno"`（15 位、有效无填充 Base64URL，
+ * 命中 CamelCase 形态）与 `failure.code = "YXBPPWFL_ZGFJZWFHAA"`（19 位、含下划线，
+ * 命中全大写+下划线形态）被原样保留。只要还留一条形态规则，编码载荷通道就关不上。
+ *
+ * 本轮改为**精确字符串匹配的显式集合**：只有 `FAILURE_STABLE_CODES` 里的字面值会进入
+ * 快照，其余一律回退（failure ⇒ "error"，recovery ⇒ "RESTORE_FAILED"）。判定过程没有
+ * 任何正则、前缀/后缀或「像机器码」的形态放行路径，因此 Base64（标准/URL-safe/无填充/
+ * 带下划线）、hex、随机串与凭据词都不可能通过——它们不是集合成员，与「形态是否安全」
+ * 无关。
+ *
+ * 大小写：**不做**大小写归一。集合同时含 "ERROR"（运行时码）、"Error"（错误类名）与
+ * 回退值 "error"（小写），折叠会把三者合并、让兜底值变成另一个码；精确匹配保证
+ * 「输入 = 输出」，便于逐字审计。`eacces` / `Eacces` 这类大小写变体因此同样回退。
+ *
+ * 维护约束（新增稳定码必须同步三处，残余风险见 docs/tickets/12-task-timeline.md）：
+ * 1. 本文件 `FAILURE_STABLE_CODES`；
+ * 2. test/expert-group-snapshot.test.mjs 的集合完整性断言；
+ * 3. 票据 12 文档的允许列表说明。
+ * 集合只在发版时随代码增删，运行时不可扩展（有意的 fail-closed 设计）。
+ *
+ * 集合分四组，全部是**字面值**：
+ * - POSIX/Node errno（17 项）；
+ * - 插件/运行时稳定码（16 项）；
+ * - CamelCase 错误类名（10 项）；
+ * - 现有测试与运行时实际使用、但不属于前三组的稳定码（5 项：BUDGET_EXCEEDED 由 fan-out
+ *   预算闸门产生并会进入 attempt.error.code；ERR_MODULE_NOT_FOUND / ERR_MODEL_NOT_FOUND
+ *   是 Node 与模型解析失败的稳定短码；DivisionByZero / FIRST_FAILURE 是既有回归用例使用的
+ *   稳定夹具码，保留它们只为继续验证「name 回退」与「attempt 级合法码保留」两条语义）。
+ */
+export const FAILURE_STABLE_CODES = Object.freeze([
+  // POSIX/Node errno
+  "EACCES",
+  "EAGAIN",
+  "EBADMSG",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EEXIST",
+  "EIO",
+  "EISDIR",
+  "EMFILE",
+  "ENOENT",
+  "ENOMEM",
+  "ENOSPC",
+  "ENOTDIR",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ABORT_ERR",
+  "EAI_AGAIN",
+  // 插件/运行时稳定码
+  "ERROR",
+  "UNKNOWN",
+  "CANCELLED",
+  "INTERRUPTED",
+  "TIMEOUT",
+  "ERROR_RATE_LIMIT",
+  "RATE_LIMIT",
+  "MODEL_NOT_FOUND",
+  "AUTH_FAILED",
+  "INVALID_SNAPSHOT",
+  "RESTORE_FAILED",
+  "PERSISTENCE_FAILED",
+  "PERMISSION_DENIED",
+  "QUOTA_EXCEEDED",
+  "OVERLOADED",
+  "INVALID_REQUEST",
+  // CamelCase 错误类名
+  "Error",
+  "TypeError",
+  "ValidationError",
+  "AbortError",
+  "TimeoutError",
+  "RateLimitError",
+  "AuthenticationError",
+  "PermissionError",
+  "ModelNotFoundError",
+  "OverloadedError",
+  // 现有测试/运行时实际使用的补充稳定码（集合外的机器码仍一律拒绝）
+  "BUDGET_EXCEEDED",
+  "ERR_MODULE_NOT_FOUND",
+  "ERR_MODEL_NOT_FOUND",
+  "DivisionByZero",
+  "FIRST_FAILURE",
+]);
+
+/** 允许列表的精确查找索引：Set 命中即放行，不做任何归一（避免把兜底值 "error" 折进别的码）。 */
+const FAILURE_STABLE_CODE_SET = new Set(FAILURE_STABLE_CODES);
+
+/**
+ * 无法安全判断时的通用失败文案：宁可少说，也不把可能含凭据的原文输出到客户端。
+ */
+export const FAILURE_REDACTED_MESSAGE = "操作失败（详情已省略）";
+
+/**
+ * 固定安全消息白名单（票据 12 第十一轮）：message 唯一允许保留的文本。
+ *
+ * 上一轮仍是「安全自由文本白名单」：只要文本通过字符集与可疑形态检查就原样保留，
+ * 于是带编码语义的空白分段载荷（「BASE64 YXBPPWFL ZGFJZWFH」「encoded YXBp PWFl ZGFj ZWFh」）
+ * 仍能整体通过并原样进入快照——它不是凭据、不是 URL、也不是长 token，但会把编码后的
+ * 内容暴露给客户端。本轮不再尝试判断「这段自由文本是否安全」，而是**只保留精确命中
+ * 固定白名单的文案**：其余任何文本（含上述载荷、长文本、自由文本）一律回退
+ * FAILURE_REDACTED_MESSAGE。
+ *
+ * 匹配规则（唯一放宽的三点，且都不扩大可泄露内容）：
+ * - 大小写不敏感；NFKC 归一（全角字符先变 ASCII）；
+ * - 内部空白折叠为单空格（多行文本先把换行折叠为空格再整体匹配）；
+ * - 结尾句号（可重复，ASCII "." 或中文 "。"）与首尾空白忽略。
+ *
+ * 命中后返回**白名单里的规范文案**而不是原始输入：客户端看到的永远是固定字符串，
+ * 不随错误来源的大小写/标点变化。匹配是整体匹配——多行文本只有规范化后整体等于
+ * 某条白名单文案才保留，因此「第一行安全、第二行是载荷」不再可能泄漏。
+ *
+ * 白名单只增不改：新增条目必须是「不含任何动态内容」的固定短语，绝不引入会话
+ * 名称、模型名、路径或 token（否则等于重新打开自由文本通道）。
+ */
+export const FAILURE_SAFE_MESSAGES = Object.freeze([
+  "rate limit exceeded",
+  "model not found",
+  "permission denied",
+  "request timed out",
+  "authentication failed",
+  "authentication failed for model gpt-4",
+  "restore failed",
+  "shard failed",
+  "shard failed (retry 2)",
+  "模型不存在",
+  "请求超时",
+  "恢复失败",
+  "快照 shard 结构非法",
+]);
+
+/** 白名单的规范化索引：key = 归一后的文案，value = 规范文案（输出用）。 */
+const SAFE_FAILURE_MESSAGE_MAP = new Map(
+  FAILURE_SAFE_MESSAGES.map((message) => [normalizeSafeMessageKey(message), message]),
+);
+
+/**
+ * 白名单 key 归一：NFKC → 空白折叠 → 去首尾空白 → 去结尾句号 → 小写。
+ *
+ * `[.。]+$` 允许 "rate limit exceeded..."（重复句号）也归一为同一 key；除此之外
+ * 不做任何改写（不删中间标点、不拆词），保持「精确匹配」的可证明性。
+ */
+function normalizeSafeMessageKey(value) {
+  return value
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[.\u3002]+$/u, "")
+    .trim()
+    .toLowerCase();
+}
+
+/** 命中固定安全消息白名单时返回规范文案，否则返回 null（调用方整条回退）。 */
+function canonicalSafeFailureMessage(text) {
+  if (typeof text !== "string" || text.length === 0) return null;
+  return SAFE_FAILURE_MESSAGE_MAP.get(normalizeSafeMessageKey(text)) ?? null;
+}
+
+/**
+ * 稳定错误码准入（failure.code / recovery.code 共用，票据 12 第十二轮）。
+ *
+ * 唯一判定是**精确成员检查**：`FAILURE_STABLE_CODES` 命中即放行，否则拒绝。返回 false 表示
+ * 调用方必须回退各自的兜底值（failure ⇒ "error"，recovery ⇒ "RESTORE_FAILED"）。
+ *
+ * 保留长度闸门只是防御性一致（允许列表内最长的码为 19 位，远小于 64）：超长输入不必进入
+ * 集合查找，且「上限」契约在集合将来扩充时仍然成立。
+ *
+ * 为什么不再做「不可见字符 / 编码凭据词 / 随机串 / hex / 纯字母串」检查：它们都是**形态**
+ * 判定，而形态判定已被证明是开放集合（`AbcdefGhijklmno` 就是 15 位 CamelCase 形态的
+ * Base64URL）。精确集合天然拒绝这些输入（它们不是集合成员）；保留形态检查反而会让读者
+ * 误以为「形态安全」仍是放行条件。
+ */
+function isStableFailureCode(raw) {
+  if (raw.length === 0 || raw.length > FAILURE_CODE_MAX_LENGTH) return false;
+  return FAILURE_STABLE_CODE_SET.has(raw);
+}
+
+/**
+ * 失败摘要的 code：error.code || error.name || "error"，但只接受**有限精确允许列表**。
+ *
+ * 任何不在 `FAILURE_STABLE_CODES` 里的输入（自由文本、堆栈首行、含空格/冒号/引号、
+ * 超长 token、编码载荷 `AbcdefGhijklmno` / `YXBPPWFL_ZGFJZWFHAA`、`BASE64`/`ENCODED`/
+ * `SECRET`、随机串、hex、未登记的新机器码）都退化为稳定值 "error"，绝不像旧实现那样
+ * 「清理控制字符后直接截断」——截断会把 "Authorization: Bearer xxx" 这类内容的前 64 个
+ * 字符原样带进快照。
+ */
+function restrictedFailureCode(source) {
+  const raw = firstText(source?.code, source?.name);
+  if (raw === null) return "error";
+  return isStableFailureCode(raw) ? raw : "error";
+}
+
+/**
+ * 把原始 message 规范化为「多行扫描文本」（只规范化，不做取舍）。
+ *
+ * - 换行统一：\r\n、\r、\n、U+2028、U+2029 → \n（failure 与 recovery 共用同一份文本）；
+ * - 其余控制字符折叠为空格；
+ * - 行内空白折叠为单空格、逐行去首尾空白，并去掉整体首尾空白。
+ *
+ * 关键：这里**不**取首行、也不截断——白名单匹配必须在完整文本上做（票据 12 第六/十一轮：
+ * 先取首行会让换行分隔的载荷首段绕过整体匹配）。
+ */
+function normalizeFailureMessage(value) {
+  // 不可见格式字符闸门（票据 12 第七轮）：原文或其 NFKC 形态出现 \p{Cf}/\p{Cs}/变体选择符
+  // ⇒ 返回 null，调用方整条回退。必须在折叠空白之前检查——例如 U+FEFF 属于 \s，先折叠就会
+  // 变成「静默删除后继续」，正是本轮要禁止的行为。
+  if (INVISIBLE_FORMAT_PATTERN.test(value) || INVISIBLE_FORMAT_PATTERN.test(value.normalize("NFKC"))) {
+    return null;
+  }
+  return value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u2028\u2029]/g, "\n")
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/[^\S\n]+/g, " ")
+    .split("\n")
+    .map((line) => line.trim())
+    .join("\n")
+    .trim();
+}
+
+/**
+ * 失败摘要的 message：**唯一出口是固定安全消息白名单**（默认整条回退）。
+ *
+ * 处理顺序（票据 12 第十一轮收紧）：
+ * 1. 不可见字符闸门：原文或 NFKC 形态出现 \p{Cf}/\p{Cs}/变体选择符 ⇒ 整条回退（不删除后继续）；
+ * 2. 规范化：\r\n/\r/\n/U+2028/U+2029 统一为换行，其余控制字符折叠为空格；
+ * 3. 长度闸门：规范化后的完整文本超过 FAILURE_MESSAGE_SCAN_MAX_LENGTH（8192）⇒ 整条回退；
+ * 4. 把换行折叠为空格，在**完整文本**上做固定白名单匹配（大小写/结尾句号/空白归一后
+ *    必须整体等于某条白名单文案）；
+ * 5. 命中 ⇒ 返回白名单规范文案（防御性截断到 FAILURE_MESSAGE_MAX_LENGTH）；
+ *    未命中 ⇒ 整条回退 FAILURE_REDACTED_MESSAGE（"操作失败（详情已省略）"）。
+ *
+ * 与上一轮的差异：不再对自由文本做字符集/模式判定，也**不再取首行**——多行文本只有
+ * 规范化后整体命中白名单才保留，因此「第一行安全、第二行是载荷」不会泄漏任何一行。
+ * 没有可用文案时返回 null（调用方保留 code）。
+ */
+function restrictedFailureMessage(value) {
+  const raw = textOrNull(value);
+  if (raw === null) return null;
+  const normalized = normalizeFailureMessage(raw);
+  // 不可见格式字符（零宽/BOM/变体选择符/孤立代理）⇒ 无法安全判断，整条回退。
+  if (normalized === null) return FAILURE_REDACTED_MESSAGE;
+  if (normalized.length === 0) return null;
+  // ① 超长文本直接回退（不在超长输入上做白名单匹配）。
+  if (normalized.length > FAILURE_MESSAGE_SCAN_MAX_LENGTH) return FAILURE_REDACTED_MESSAGE;
+  // ② 完整文本整体匹配白名单：换行折叠为空格后必须整体等于某条固定文案。
+  const canonical = canonicalSafeFailureMessage(normalized.replace(/\n/g, " "));
+  if (canonical === null) return FAILURE_REDACTED_MESSAGE;
+  return canonical.length > FAILURE_MESSAGE_MAX_LENGTH
+    ? canonical.slice(0, FAILURE_MESSAGE_MAX_LENGTH)
+    : canonical;
+}
+
+/**
+ * 受限失败摘要投影（白名单出口）。
+ *
+ * 输入可能是 manager 的结构化错误对象（可能带 stack/result）、Error 实例或字符串；
+ * 输出恒为 `{ code, message }` 或 null：
+ * - 只读 code/name/message 三个字段，**绝不**搬运 stack、prompt、完整 result；
+ * - 凭据边界：code 只接受有限精确允许列表（FAILURE_STABLE_CODES，否则 "error"）；message 默认整条回退
+ *   `FAILURE_REDACTED_MESSAGE`，只有命中固定安全消息白名单的文案才保留
+ *   （见 restrictedFailureCode / restrictedFailureMessage）；
+ * - message 缺失时为 null（键仍然存在，客户端不需要判断存在性）；
+ * - 输入为 null/undefined/其它原始值（数字、布尔）时返回 null：没有错误就没有摘要。
+ */
+function projectFailure(value) {
+  if (value === null || value === undefined) return null;
+  const source = typeof value === "string" ? { message: value } : asRecord(value);
+  if (source === undefined) return null;
+  return {
+    code: restrictedFailureCode(source),
+    message: restrictedFailureMessage(source.message),
+  };
+}
+
+/**
+ * 两个时间戳之间的耗时（毫秒）。
+ *
+ * 任一缺失 → null：「不知道多久」不能写成 0，否则客户端会把未知显示成瞬时完成。
+ * 时钟回拨导致负值时按 0 处理，绝不向客户端输出负耗时。
+ */
+function durationBetween(startedAt, finishedAt) {
+  if (startedAt === null || finishedAt === null) return null;
+  return Math.max(0, finishedAt - startedAt);
+}
+
+/** 最新一次带错误 attempt 的受限失败摘要（attempts 按时间顺序追加，因此从后往前找）。 */
+function latestAttemptFailure(attempts) {
+  for (let index = attempts.length - 1; index >= 0; index -= 1) {
+    if (attempts[index].failure !== null) return attempts[index].failure;
+  }
+  return null;
+}
+
+/**
+ * shard 节点的时间线字段。
+ *
+ * - startedAt：第一个真正开始的 attempt 的 startedAt；旧快照完全没有 attempt 级时间时
+ *   回退 createdAt（分片登记时刻即时间线起点），不凭空造一个时间；
+ * - finishedAt：最后一个 attempt 的 finishedAt；**仍在运行的分片恒为 null**——历史
+ *   attempt 的完成时间不是当前这一轮的终点；
+ * - lastActivityAt：manager 的 updatedAt（任何状态推进都会刷新它），缺失为 null；
+ * - attemptCount/retryCount：attempts.length 与 max(0, length-1)；
+ * - failure：最新一次带 error 的 attempt 的受限摘要。
+ */
+function projectShardTimeline(source, status, attempts, running) {
+  const createdAt = numberOrNull(source?.createdAt);
+  let startedAt = createdAt;
+  for (const attempt of attempts) {
+    if (attempt.startedAt === null) continue;
+    startedAt = attempt.startedAt;
+    break;
+  }
+  const lastAttempt = attempts.length === 0 ? null : attempts[attempts.length - 1];
+  // 明确仍在进行中的分片（queued/waiting/running，或 running 布尔为 true）没有终点：
+  // 即使输入误带时间也不采用，与 attempt 级、客户端归一保持同一口径。
+  const stillActive = running === true || ACTIVE_STATUS_SET.has(status);
+  const finishedAt = stillActive || lastAttempt === null ? null : lastAttempt.finishedAt;
+  const attemptCount = attempts.length;
+  return {
+    startedAt,
+    finishedAt,
+    durationMs: durationBetween(startedAt, finishedAt),
+    lastActivityAt: numberOrNull(source?.updatedAt),
+    attemptCount,
+    retryCount: Math.max(0, attemptCount - 1),
+    failure: latestAttemptFailure(attempts),
+  };
+}
+
+/**
+ * 首个失败 shard 的受限失败摘要（父任务级 failure）。
+ *
+ * 只在**失败语义**的 shard 中挑选（failed/timed_out/interrupted）：某个分片重试后成功时，
+ * 它的历史错误不应被当成任务级失败。命中失败状态但没有可用摘要（例如仅超时、从未写过
+ * error）时继续往后找；全部没有则 null。
+ */
+function firstShardFailure(shards) {
+  for (const shard of shards) {
+    if (!FAILURE_STATUS_SET.has(shard.status)) continue;
+    if (shard.failure !== null) return shard.failure;
+  }
+  return null;
+}
+
+/**
+ * fan-out 父任务节点的时间线字段。
+ *
+ * - startedAt = createdAt（任务登记时刻就是时间线起点）；
+ * - finishedAt 只给**终态**任务：优先 manager 的 settledAt；旧快照可能没有该字段，
+ *   此时回退 updatedAt（manager 在结算时保证 updatedAt === settledAt，见 fanout.js 的
+ *   aggregateTask）。非终态一律 null，绝不把「最后一次活动」伪装成完成时间；
+ * - attemptCount/retryCount：所有 shard 的 attempt 总数与重试总数（分片内重试之和）；
+ * - failure：首个失败 shard 的受限摘要。
+ */
+function projectFanoutTimeline(source, status, shards) {
+  const startedAt = numberOrNull(source?.createdAt);
+  const updatedAt = numberOrNull(source?.updatedAt);
+  const settledAt = numberOrNull(source?.settledAt) ?? updatedAt;
+  const finishedAt = TERMINAL_STATUS_SET.has(status) ? settledAt : null;
+  let attemptCount = 0;
+  let retryCount = 0;
+  for (const shard of shards) {
+    attemptCount += shard.attemptCount;
+    retryCount += shard.retryCount;
+  }
+  return {
+    startedAt,
+    finishedAt,
+    durationMs: durationBetween(startedAt, finishedAt),
+    lastActivityAt: updatedAt,
+    attemptCount,
+    retryCount,
+    failure: firstShardFailure(shards),
+  };
+}
+
 // ── 恢复状态（recovery）投影 ─────────────────────────────────────────────────
 
 /**
@@ -106,30 +549,43 @@ function numberOrNull(value) {
  */
 export const EXPERT_GROUP_RECOVERY_STATUSES = Object.freeze(["ok", "failed", "none"]);
 
-/**
- * 稳定原因码的合法形态：只允许大写机器 token（如 INVALID_SNAPSHOT、BUDGET_EXCEEDED）。
- *
- * 这是**白名单式**约束而不是格式化：任何不符合形态的输入（自由文本、堆栈首行、
- * 含路径/控制字符的字符串）都退化为 RESTORE_FAILED，绝不会被原样带进客户端。
+/*
+ * recovery.code 与 failure.code 共用同一份**有限精确允许列表**（isStableFailureCode，
+ * 集合见 FAILURE_STABLE_CODES；票据 12 第十二轮）。集合外的任何字符串——包括满足旧形态
+ * 规则的编码载荷（AbcdefGhijklmno、YXBPPWFL_ZGFJZWFHAA）、BASE64/ENCODED/SECRET、随机串
+ * 与 hex——统一回退 `RESTORE_FAILED`（宁可只说「恢复失败」，也不透传无法证明安全的原因码）。
+ * recovery 的状态/消息投影（status 三态、message 白名单、at/retryable/persistenceBlocked）
+ * 不因本轮改动而变化。
  */
-const RECOVERY_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 /** recovery.message 的字符上限：一行诊断文案，客户端横幅最多展示一行。 */
 export const RECOVERY_MESSAGE_MAX_LENGTH = 200;
 
 /**
- * 受限 message：剔除控制字符（含换行/制表，避免多行撑爆横幅与日志）、
- * 折叠连续空白并限制长度。绝不透传堆栈、路径或快照正文。
+ * 受限 message（票据 12 第四/六/十一轮）：与失败摘要**共用同一套固定安全消息白名单**。
+ *
+ * 恢复失败的 message 常来自异常 error.message（可能是 Bearer、签名 URL、长 token、
+ * 键值对甚至完整响应体），只清控制字符 + 截断会把凭据原样带进快照。因此：
+ * 1. 用与 failure message 相同的 `normalizeFailureMessage` 规范化多行文本
+ *    （\r\n/\r/\n/U+2028/U+2029 统一换行，其余控制字符折叠）；
+ * 2. 长度闸门：超过 FAILURE_MESSAGE_SCAN_MAX_LENGTH ⇒ 通用文案；
+ * 3. 换行折叠为空格后，**整体**匹配固定白名单；
+ * 4. 不命中 ⇒ 通用文案 `FAILURE_REDACTED_MESSAGE`（宁可少说，绝不原样输出）；
+ * 5. 命中 ⇒ 返回白名单规范文案，防御性截断到 `RECOVERY_MESSAGE_MAX_LENGTH`。
  */
 function recoveryMessageOrNull(value) {
   const raw = textOrNull(value);
   if (raw === null) return null;
-  const cleaned = raw
-    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (cleaned.length === 0) return null;
-  return cleaned.length > RECOVERY_MESSAGE_MAX_LENGTH ? cleaned.slice(0, RECOVERY_MESSAGE_MAX_LENGTH) : cleaned;
+  const normalized = normalizeFailureMessage(raw);
+  // 不可见格式字符（零宽/BOM/变体选择符/孤立代理）⇒ 无法安全判断，整条回退。
+  if (normalized === null) return FAILURE_REDACTED_MESSAGE;
+  if (normalized.length === 0) return null;
+  if (normalized.length > FAILURE_MESSAGE_SCAN_MAX_LENGTH) return FAILURE_REDACTED_MESSAGE;
+  const canonical = canonicalSafeFailureMessage(normalized.replace(/\n/g, " "));
+  if (canonical === null) return FAILURE_REDACTED_MESSAGE;
+  return canonical.length > RECOVERY_MESSAGE_MAX_LENGTH
+    ? canonical.slice(0, RECOVERY_MESSAGE_MAX_LENGTH)
+    : canonical;
 }
 
 /**
@@ -145,9 +601,10 @@ function projectRecovery(value) {
   if (source === undefined) return null;
   const status = source.status === "failed" ? "failed" : source.status === "ok" ? "ok" : "none";
   const rawCode = textOrNull(source.code);
-  // 只有 failed 才保留原因码；形态不合法时退化为稳定的兜底码。
+  // 只有 failed 才保留原因码；精确命中共享允许列表（FAILURE_STABLE_CODES）才保留，
+  // 集合外的任何码（编码载荷/随机串/hex/凭据词/未登记机器码）统一退化为 RESTORE_FAILED。
   const code = status === "failed"
-    ? (rawCode !== null && RECOVERY_CODE_PATTERN.test(rawCode) ? rawCode : "RESTORE_FAILED")
+    ? (rawCode !== null && isStableFailureCode(rawCode) ? rawCode : "RESTORE_FAILED")
     : null;
   return {
     status,
@@ -158,6 +615,21 @@ function projectRecovery(value) {
     // fail-closed 闸门状态是独立事实：即使最近一次恢复成功，也如实投影（正常应为 false）。
     persistenceBlocked: source.persistenceBlocked === true,
   };
+}
+
+/**
+ * usage 字段的可选投影（票据 25）。
+ *
+ * 只输出有实际用量事实（token/请求数/重试数/有效样本）的投影；缺失时**省略整个字段**
+ * 而不是输出 null/0，客户端因此能区分“没有用量数据”和“用量为 0”。
+ * 投影本身由 usage-ledger 的白名单负责，不含 prompt/response/凭据/路径。
+ *
+ * @param {unknown} value - 节点上的 usage 候选。
+ * @returns {object} 可直接展开进节点对象的 { usage } 或空对象。
+ */
+function usageField(value) {
+  const usage = projectUsage(value);
+  return usage !== null && hasUsageMetrics(usage) ? { usage } : {};
 }
 
 /** 从候选字段里取第一个非空字符串，全部缺失时返回 null（不拼接、不猜测）。 */
@@ -206,6 +678,29 @@ function projectRunSummary(value) {
   };
 }
 
+/**
+ * 顶层 roleLabels 投影（票据 27）：只保留「非空字符串 id → 非空字符串显示名」的条目。
+ *
+ * 非法条目静默丢弃：这份映射纯粹用于展示，丢弃不会影响任何权限或状态判定；
+ * 一个条目都没有时返回 null（调用方整块省略），旧客户端保持原生文案。
+ *
+ * @param {unknown} value - 角色 id → 显示名候选。
+ * @returns {Record<string,string>|null} 冻结前的普通对象或 null。
+ */
+function projectRoleLabels(value) {
+  const source = asRecord(value);
+  if (source === undefined) return null;
+  const labels = {};
+  let any = false;
+  for (const [role, label] of Object.entries(source)) {
+    if (typeof role !== "string" || role.length === 0) continue;
+    if (typeof label !== "string" || label.trim().length === 0) continue;
+    labels[role] = label;
+    any = true;
+  }
+  return any ? labels : null;
+}
+
 /** 身份 id 归一：id → sessionId → childId，全部缺失时返回 null。 */
 function identityOf(record) {
   return firstText(record?.id, record?.sessionId, record?.childId);
@@ -240,6 +735,24 @@ function asRecord(value) {
  * - effort：reasoningEffort/effort；
  * - contentSource **只认显式字段**：投影不推断内容来自 goal、用户请求还是 prompt。
  */
+/**
+ * 目标 subagent provider / 继承开关的只读投影（票据 29）。
+ *
+ * 输入是 runtime 已经归一好的 plain 字段（subagentProvider/inheritContext）。
+ * 缺失时整体省略字段，绝不伪造 "spawn"/false：旧记录确实没有这个事实。
+ *
+ * @param {object|undefined} source - 待投影记录。
+ * @returns {object} 可展开的投影字段。
+ */
+function projectSubagentContextFields(source) {
+  const record = asRecord(source);
+  const provider = textOrNull(record?.subagentProvider);
+  return {
+    ...(provider === null ? {} : { subagentProvider: provider }),
+    ...(typeof record?.inheritContext === "boolean" ? { inheritContext: record.inheritContext } : {}),
+  };
+}
+
 function projectSessionNode(record, { kind, id, sessionId }) {
   const source = asRecord(record);
   const status = normalizeStatus(source?.status);
@@ -258,9 +771,21 @@ function projectSessionNode(record, { kind, id, sessionId }) {
     content: firstText(source?.content, source?.prompt),
     contentSource: textOrNull(source?.contentSource),
     role: textOrNull(source?.role),
+    // 角色显示名（票据 27）：自定义角色删除后历史任务仍能显示标签；缺失为 null，
+    // 客户端回退 role 或原生文案，绝不猜一个显示名。
+    roleLabel: textOrNull(source?.roleLabel),
+    // 用量（票据 25）：root/expert 节点都可能带 usage；缺失时整字段省略。
+    ...usageField(source?.usage),
     provider: textOrNull(source?.provider),
     model: textOrNull(source?.model),
     effort: firstText(source?.reasoningEffort, source?.effort),
+    // 实际路由（票据 24）：只有确实记录过 candidateIndex/fallbackCount/
+    // lastRouteErrorCode 时才输出，缺失字段整体省略（不补 0、不猜 primary）。
+    ...projectModelRouteFields(source),
+    // 目标 subagent provider / 继承开关（票据 29）：缺失省略，不伪造 false。
+    ...projectSubagentContextFields(source),
+    // 结构化交付（票据 30）：只读结果与“声明过 schema”的布尔；缺失整体省略。
+    ...structuredProjectionFields(source),
     status,
     running: runningOf(source, status),
     runSummary: projectRunSummary(source?.runSummary),
@@ -269,6 +794,13 @@ function projectSessionNode(record, { kind, id, sessionId }) {
     // 这样客户端可以用同一套「按能力渲染」逻辑处理所有节点，而不需要按 kind 特判。
     capabilities: sessionCapabilities(),
     createdAt: numberOrNull(source?.createdAt),
+    // 会话节点的时间线（票据 12）：DSH 只发布创建时间，没有可信的完成时间。因此
+    // startedAt/lastActivityAt 都取 createdAt，finishedAt/durationMs 恒为 null——客户端
+    // 据此显示「已开始、耗时未知」，绝不用创建时间补一个假的完成时间。
+    startedAt: numberOrNull(source?.createdAt),
+    lastActivityAt: numberOrNull(source?.createdAt),
+    finishedAt: null,
+    durationMs: null,
   };
 }
 
@@ -394,16 +926,40 @@ function normalizeTaskStatus(value) {
 
 /**
  * 单次 attempt 投影（attempt 身份 = attempt 序号 + childId）。
- * 只保留导航与状态：result/error 可能很大，且已有独立读取通道，投影不搬运它们。
+ *
+ * 只保留导航、状态与**受限**失败摘要：result 可能很大且有独立读取通道，投影不搬运；
+ * error 只取 code/name 与 message 首行（见 projectFailure），stack 与完整负载绝不外传。
  */
 function projectAttemptNode(attempt) {
   const source = asRecord(attempt);
+  const status = normalizeStatus(source?.status);
+  // 活动 attempt（queued/waiting/running，含 pending 归一后的 queued）没有完成时间：
+  // 即使输入误带 finishedAt 也丢弃，与 client-expert-group-model.js 的 normalizeAttempt
+  // 同一口径——否则侧栏会把「运行中」渲染成「运行中 已耗时 1.2s」。
+  const stillActive = ACTIVE_STATUS_SET.has(status);
+  const startedAt = numberOrNull(source?.startedAt);
+  const finishedAt = stillActive ? null : numberOrNull(source?.finishedAt);
   return {
     attempt: numberOrNull(source?.attempt),
-    status: normalizeStatus(source?.status),
+    status,
     childId: textOrNull(source?.childId),
-    startedAt: numberOrNull(source?.startedAt),
-    finishedAt: numberOrNull(source?.finishedAt),
+    // 历史 attempt 的角色显示名快照（票据 27）：随 child_models 记录持久化，
+    // 角色后来被删除时仍然可读。
+    roleLabel: textOrNull(source?.roleLabel),
+    // 每次 attempt 的实际路由（票据 24）：恢复/续作只读，不重新选择；缺失省略。
+    ...projectModelRouteFields(source),
+    // 目标 subagent provider / 继承开关（票据 29）：缺失省略，不伪造 false。
+    ...projectSubagentContextFields(source),
+    // 单次 attempt 的用量（票据 25）：来自该 attempt.childId 的 child_models/账本；
+    // 归属未证明的 attempt 不会有 usage，缺失时整字段省略。
+    ...usageField(source?.usage),
+    // 结构化交付（票据 30）：同一 child 的只读结构化结果；缺失省略。
+    ...structuredProjectionFields(source),
+    startedAt,
+    finishedAt,
+    // 单次尝试的耗时与失败摘要：任一输入缺失即为 null（不填 0、不猜原因）。
+    durationMs: stillActive ? null : durationBetween(startedAt, finishedAt),
+    failure: projectFailure(source?.error),
   };
 }
 
@@ -426,6 +982,16 @@ function projectShardNode(shard, inherited = {}) {
   const status = managerStatus === null
     ? latestAttempt?.status ?? "unknown"
     : normalizeStatus(managerStatus);
+  const running = runningOf(source, status);
+  // 时间线字段一次性算出：startedAt/finishedAt/durationMs/lastActivityAt/attemptCount/
+  // retryCount/failure 全部由 attempts、createdAt、updatedAt 与状态推导（见 projectShardTimeline）。
+  const timeline = projectShardTimeline(source, status, attempts, running);
+  // 分片用量（票据 25）：runtime 已按 childId 去重汇总时直接采用；直接调用本投影
+  // （没有 runtime 参与）时从 attempts 的 usage 汇总同一口径，绝不补零。
+  const explicitUsage = projectUsage(source?.usage);
+  const shardUsage = explicitUsage !== null && hasUsageMetrics(explicitUsage)
+    ? explicitUsage
+    : sumUsageByChildId(attempts.map((attempt) => ({ childId: attempt.childId, usage: attempt.usage })));
   return {
     shardId,
     // 主代理提供的分片任务名称优先（投影出的任务行第一行文本）；旧数据没有该字段或
@@ -435,11 +1001,22 @@ function projectShardNode(shard, inherited = {}) {
     // fan-out 一次提交使用同一专家角色；provider/model/effort 则由 runtime 按
     // 最新 attempt child 补齐。旧快照没有分片级字段时再继承父任务元数据。
     role: firstText(source?.role, defaults?.role),
+    // 分片角色显示名：优先分片自己的记录，其次父任务元数据（票据 27）。
+    roleLabel: firstText(source?.roleLabel, defaults?.roleLabel),
     provider: firstText(source?.provider, defaults?.provider),
     model: firstText(source?.model, defaults?.model),
     effort: firstText(source?.reasoningEffort, source?.effort, defaults?.reasoningEffort, defaults?.effort),
+    // 分片实际路由（票据 24）：来自最新 attempt child 的 child_models 记录；缺失省略。
+    ...projectModelRouteFields(source),
+    // 目标 subagent provider / 继承开关（票据 29）：来自同一 child 的 child_models；缺失省略。
+    ...projectSubagentContextFields(source),
+    // 分片用量（票据 25）：没有有效样本时整字段省略。
+    ...(shardUsage === null || !hasUsageMetrics(shardUsage) ? {} : { usage: shardUsage }),
+    // 结构化交付（票据 30）：分片取最新 attempt 的只读结果，不跨 attempt 合并 value。
+    ...(latestAttempt?.structured === undefined ? {} : { structured: latestAttempt.structured }),
+    ...(latestAttempt?.outputSchemaRequested === true ? { outputSchemaRequested: true } : {}),
     status,
-    running: runningOf(source, status),
+    running,
     runSummary: projectRunSummary(source?.runSummary),
     continuable: typeof source?.continuable === "boolean" ? source.continuable : null,
     // shard 能力只覆盖管理层真正拥有的两个动作；缺失（旧 Host/直连投影）时整字段省略，
@@ -450,6 +1027,8 @@ function projectShardNode(shard, inherited = {}) {
     })(),
     childId: latestAttempt?.childId ?? null,
     createdAt: numberOrNull(source?.createdAt),
+    // 票据 12 时间线：字段恒存在（缺失值为 null/0），客户端不需要判断存在性。
+    ...timeline,
     attempts,
   };
 }
@@ -474,6 +1053,44 @@ function projectFanoutNode(task) {
   const parentTaskId = textOrNull(source?.parentTaskId);
   const taskStatus = textOrNull(source?.status);
   const status = normalizeTaskStatus(taskStatus);
+  // 先投影 shards：父任务的 attemptCount/retryCount/failure 是对分片投影结果的汇总，
+  // 因此两者不会出现「父任务与分片对同一份 attempts 各算一遍」的不一致。
+  const shards = asArray(source?.shards).map((shard) => projectShardNode(shard, {
+    role: source?.role,
+    roleLabel: source?.roleLabel,
+    provider: source?.provider,
+    model: source?.model,
+    reasoningEffort: source?.reasoningEffort,
+    effort: source?.effort,
+  }));
+  const timeline = projectFanoutTimeline(source, status, shards);
+  /**
+   * 结构化结果汇总（票据 30）：只保留每个 attempt 自己的只读结果，**绝不合并 value**。
+   * task 节点的 structured 是数组（shardId/attempt/childId/structured），没有结果时整个
+   * 字段省略；outputSchemaRequested 只在至少一个 attempt 声明过时为 true。
+   */
+  const structuredResults = [];
+  let outputSchemaRequested = false;
+  for (const shard of shards) {
+    for (const attempt of Array.isArray(shard?.attempts) ? shard.attempts : []) {
+      if (attempt?.outputSchemaRequested === true) outputSchemaRequested = true;
+      if (attempt?.structured === undefined) continue;
+      structuredResults.push({
+        shardId: shard?.shardId ?? null,
+        attempt: attempt?.attempt ?? null,
+        childId: attempt?.childId ?? null,
+        structured: projectStructuredResult(attempt.structured),
+      });
+    }
+  }
+  // 父任务用量（票据 25）：runtime 汇总值优先；直接调用本投影时按 attempts 的
+  // (childId, usage) 去重汇总，与 runtime 完全同口径。没有有效样本时省略字段。
+  const explicitUsage = projectUsage(source?.usage);
+  const taskUsage = explicitUsage !== null && hasUsageMetrics(explicitUsage)
+    ? explicitUsage
+    : sumUsageByChildId(shards.flatMap((shard) => (
+      Array.isArray(shard.attempts) ? shard.attempts.map((attempt) => ({ childId: attempt.childId, usage: attempt.usage })) : []
+    )));
   return {
     // 父任务 id 本身就是稳定身份，可直接作为节点 id（kind 区分它与专家会话 id）。
     id: parentTaskId,
@@ -481,10 +1098,19 @@ function projectFanoutNode(task) {
     parentTaskId,
     basePrompt: textOrNull(source?.basePrompt),
     role: textOrNull(source?.role),
+    roleLabel: textOrNull(source?.roleLabel),
     status,
     taskStatus,
     running: runningOf(source, status),
     createdAt: numberOrNull(source?.createdAt),
+    // 票据 12 时间线：startedAt/finishedAt/durationMs/lastActivityAt/attemptCount/
+    // retryCount/failure。字段恒存在，缺失值为 null/0（旧输入向后兼容）。
+    ...timeline,
+    // 任务级用量（票据 25）：缺失时整字段省略，客户端显示“用量不可用”而不是 0。
+    ...(taskUsage === null || !hasUsageMetrics(taskUsage) ? {} : { usage: taskUsage }),
+    // 结构化交付（票据 30）：逐 attempt 保留、不合并 value；缺失整体省略。
+    ...(structuredResults.length === 0 ? {} : { structured: structuredResults }),
+    ...(outputSchemaRequested ? { outputSchemaRequested: true } : {}),
     counts: projectCounts(source?.counts),
     // 父任务能力：由 Host 注入（fanoutHost.capabilitiesOf）；旧调用方没有该字段时省略，
     // 保持「不伪造授权」的投影原则。
@@ -492,13 +1118,7 @@ function projectFanoutNode(task) {
       const capabilities = projectCapabilities(source?.capabilities, EXPERT_GROUP_CAPABILITY_ACTIONS);
       return capabilities === null ? {} : { capabilities };
     })(),
-    shards: asArray(source?.shards).map((shard) => projectShardNode(shard, {
-      role: source?.role,
-      provider: source?.provider,
-      model: source?.model,
-      reasoningEffort: source?.reasoningEffort,
-      effort: source?.effort,
-    })),
+    shards,
   };
 }
 
@@ -554,6 +1174,45 @@ function projectChildren(experts, fanoutTasks) {
   return sortByCreatedAt([...expertNodes, ...fanoutNodes]);
 }
 
+// ── 顶层内容摘要 revision（票据 12） ────────────────────────────────────────
+
+/**
+ * 规范化 JSON：对象键按字典序排序，数组保持原序，其余值按 JSON 语义序列化。
+ *
+ * 不能直接用 JSON.stringify：revision 必须只由**内容**决定。投影构造的对象键序虽然稳定，
+ * 但字段书写顺序的调整（或未来白名单增删）不应被误判成「内容变了」；排序后序列化让
+ * revision 与键的书写顺序无关，只有真正的值变化才改变摘要。
+ */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return "[" + value.map((item) => canonicalJson(item)).join(",") + "]";
+  if (value !== null && typeof value === "object") {
+    const parts = Object.keys(value)
+      .sort()
+      .map((key) => JSON.stringify(key) + ":" + canonicalJson(value[key]));
+    return "{" + parts.join(",") + "}";
+  }
+  const serialized = JSON.stringify(value);
+  return serialized === undefined ? "null" : serialized;
+}
+
+/**
+ * 快照内容摘要（顶层 revision，sha256 十六进制）。
+ *
+ * 只排除两个字段：
+ * - `generatedAt`：每次投影都会变的生成时间，与内容无关；
+ * - `revision` 自身：摘要不能包含自己（这里防御性删除，调用顺序改变时同样正确）。
+ *
+ * 其余字段（含 partial、recovery 与整棵 root 子树）全部参与摘要：等价内容得到相同
+ * revision，任何内容变化都会改变它。客户端据此判断「这份快照与上一份是不是同一份内容」，
+ * 不需要自己比较整棵树。
+ */
+function computeSnapshotRevision(snapshot) {
+  const content = { ...snapshot };
+  delete content.generatedAt;
+  delete content.revision;
+  return createHash("sha256").update(canonicalJson(content), "utf8").digest("hex");
+}
+
 /**
  * 构建 Expert Group 快照。
  *
@@ -568,9 +1227,11 @@ function projectChildren(experts, fanoutTasks) {
  * @param {object} [input.recovery] - 可选的恢复状态候选（来自 fanoutHost.restoreStatus()）。
  *   提供时投影为顶层可选 recovery 块；未提供时**整块省略**（旧调用方/旧 Host 兼容，
  *   客户端按缺失回退为「没有恢复错误」）。
+ * @param {object} [input.roleLabels] - 角色 id → 显示名（票据 27，含自定义角色）。
+ *   提供时投影为顶层 roleLabels；未提供/为空时整块省略，客户端回退原生文案。
  * @returns {object} schemaVersion:1 的只读 JSON 树。
  */
-export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks, generatedAt, partial, recovery } = {}) {
+export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks, generatedAt, partial, recovery, roleLabels } = {}) {
   const rootSessionId = assertSessionId(sessionId);
   const declaredRootId = identityOf(root);
   if (declaredRootId !== null && declaredRootId !== rootSessionId) {
@@ -579,11 +1240,14 @@ export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks
     );
   }
   const projectedRecovery = projectRecovery(recovery);
-  return {
+  const projectedRoleLabels = projectRoleLabels(roleLabels);
+  const snapshot = {
     schemaVersion: EXPERT_GROUP_SNAPSHOT_SCHEMA_VERSION,
     sessionId: rootSessionId,
     rootSessionId,
     generatedAt: numberOrNull(generatedAt),
+    // 角色显示名（票据 27）：含自定义角色；schemaVersion 仍为 1（纯增量字段）。
+    ...(projectedRoleLabels === null ? {} : { roleLabels: projectedRoleLabels }),
     // partial 只有明确 true 才为 true：完整快照与旧调用方一律是权威快照（false）。
     partial: partial === true,
     // recovery 是**可选**顶层块：只有调用方提供了恢复状态候选时才出现。它只含
@@ -598,4 +1262,8 @@ export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks
       children: projectChildren(experts, fanoutTasks),
     },
   };
+  // revision 最后写入：它覆盖除 generatedAt/revision 自身之外的全部内容
+  // （见 computeSnapshotRevision）。schemaVersion 仍为 1 —— 新字段全部向后兼容。
+  snapshot.revision = computeSnapshotRevision(snapshot);
+  return snapshot;
 }

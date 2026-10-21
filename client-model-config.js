@@ -1109,22 +1109,31 @@
 
   /**
    * 从两份模型草稿算出"将被删除的档位"，只在保存前用于角色联动守卫。
-   * @param {readonly unknown[]} before
-   * @param {readonly unknown[]} after
-   * @param {{ includeRemovedRows?: boolean }} [options]
-   * @returns {string[]}
+   *
+   * 整行被删除时该行声明的档位随行一起消失，因此**同样计入**删除集合（票据 20）：
+   * 删除一条正被角色默认使用的模型行与删除整个 provider 是同一类破坏，不能因为
+   * "只删了一行"就静默放过。
+   * - 单行删除（卡片上的「删除」）→ 只计入被删那一行的档位；
+   * - 「恢复默认」（draft.models 整个被移除）→ 所有原有行都算删除，与旧行为一致。
+   *
+   * 注意这是**档位级**判定（provider + reasoningEffort），不是模型 id 级判定：
+   * 与既有"取消档位"守卫保持同一粒度，宁可多提示也不静默破坏角色默认配置。
+   *
+   * @param {readonly unknown[]} before - 进入编辑态时的行（继承或用户覆盖）。
+   * @param {readonly unknown[]} after - 当前草稿行。
+   * @returns {string[]} 将随这次保存消失的档位 id（去重、保持出现顺序）。
    */
-  function removedLevelsOf(before, after, options) {
+  function removedLevelsOf(before, after) {
     const levels = new Set();
     const afterIndex = indexModelsById(after);
-    const includeRemovedRows = isPlainObject(options) && options.includeRemovedRows === true;
     for (const row of modelDraftsOf(before)) {
       if (!isNonEmptyString(row.id)) continue;
       const id = row.id.trim();
       const nextRow = afterIndex.get(id);
       const previousLevels = selectedLevelsOf(row.reasoningEfforts);
       if (nextRow === undefined) {
-        if (includeRemovedRows) for (const level of previousLevels) levels.add(level);
+        // 整行被删除：它的档位随之消失，必须参与角色联动守卫。
+        for (const level of previousLevels) levels.add(level);
         continue;
       }
       const nextLevels = selectedLevelsOf(nextRow.reasoningEfforts);
@@ -1190,8 +1199,10 @@
     const rows = catalogTouched
       ? (Array.isArray(draft.models) ? draft.models : [])
       : [];
+    // 档位守卫覆盖两类删除（票据 20）：取消某个档位、删除整行模型（含「恢复默认」
+    // 隐式删除全部行）。删行不再需要 catalogReset 这个额外开关：草稿里的消失即删除。
     const removedLevels = catalogTouched
-      ? removedLevelsOf(source.inheritedModels, rows, { includeRemovedRows: source.catalogReset === true })
+      ? removedLevelsOf(source.inheritedModels, rows)
       : [];
     const affectedRoles = removedLevels.length === 0
       ? []
