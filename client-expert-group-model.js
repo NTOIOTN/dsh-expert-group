@@ -907,6 +907,8 @@
       ...structuredFields(source),
       running: runningOf(status, source.running),
       runSummary: normalizeRunSummary(source.runSummary),
+      // 当前/最近一轮 turn 墙钟（与 DSH 状态行同源）；旧快照缺失时为 null。
+      turnDurationMs: numberOrNull(source.turnDurationMs),
       continuable: typeof source.continuable === "boolean" ? source.continuable : null,
       // shard 能力（票据 09）：只有 Host 给出可判定项时才存在；缺失时渲染层回退状态推导。
       ...(() => {
@@ -1056,6 +1058,8 @@
       lastActivityAt: numberOrNull(source.lastActivityAt) ?? startedAt,
       finishedAt,
       durationMs: numberOrNull(source.durationMs) ?? durationBetween(startedAt, finishedAt),
+      // 当前/最近一轮 turn 墙钟（与 DSH 状态行同源）；旧快照缺失时为 null。
+      turnDurationMs: numberOrNull(source.turnDurationMs),
       children: rawChildren.map((child) => normalizeSessionNode(child, "expert", null, nestedDepth + 1)),
     };
   }
@@ -1613,6 +1617,71 @@ const MESSAGE_CATALOG = Object.freeze({
   "sidebar.recovery.retrying": { zh: "重试中…", en: "Retrying…" },
   "sidebar.recovery.failed": { zh: "任务恢复失败（{code}）", en: "Task recovery failed ({code})" },
   "sidebar.recovery.retryFailed": { zh: "重试未恢复（{code}）", en: "Retry did not recover ({code})" },
+  "sidebar.sessionModel.open": { zh: "会话模型", en: "Session models" },
+  "sidebar.sessionModel.title": { zh: "会话模型", en: "Session models" },
+  "sidebar.sessionModel.hint": {
+    zh: "只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
+    en: "Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the global default again.",
+  },
+  "sidebar.sessionModel.openTitle": {
+    zh: "按会话修改专家模型，不影响全局默认",
+    en: "Change expert models for this session; global defaults are unchanged",
+  },
+  "sidebar.sessionModel.close": { zh: "关闭会话模型", en: "Close session models" },
+  "sidebar.sessionModel.noSession": {
+    zh: "未打开会话：打开一个会话后可在此临时覆盖角色模型。",
+    en: "No open session: open a session to temporarily override role models here.",
+  },
+  "sidebar.sessionModel.child": {
+    zh: "当前是子代理会话，会话级模型覆盖只读。",
+    en: "This is a subagent session; session model overrides are read-only.",
+  },
+  "sidebar.sessionModel.loading": { zh: "正在读取本会话覆盖…", en: "Loading session overrides…" },
+  "sidebar.sessionModel.unavailable": {
+    zh: "本会话覆盖读取失败，请稍后重试。",
+    en: "Failed to read session overrides; please retry later.",
+  },
+  "sidebar.sessionModel.unsupported": {
+    zh: "当前宿主版本不支持会话级模型覆盖。",
+    en: "This host version does not support session model overrides.",
+  },
+  "sidebar.sessionModel.offline": {
+    zh: "会话未运行：会话级覆盖只读。",
+    en: "The session is not running; session overrides are read-only.",
+  },
+  "sidebar.sessionModel.followGlobal": { zh: "跟随全局默认", en: "Follow global default" },
+  "sidebar.sessionModel.override": { zh: "本会话覆盖", en: "Session override" },
+  "sidebar.sessionModel.revision": { zh: "代次 {revision}", en: "Revision {revision}" },
+  "sidebar.sessionModel.provider": { zh: "供应商", en: "Provider" },
+  "sidebar.sessionModel.model": { zh: "模型", en: "Model" },
+  "sidebar.sessionModel.effort": { zh: "思考深度", en: "Reasoning effort" },
+  "sidebar.sessionModel.effortDefault": { zh: "模型默认", en: "Model default" },
+  "sidebar.sessionModel.save": { zh: "保存覆盖", en: "Save override" },
+  "sidebar.sessionModel.clear": { zh: "清除", en: "Clear" },
+  "sidebar.sessionModel.saving": { zh: "保存中…", en: "Saving…" },
+  "sidebar.sessionModel.saved": { zh: "已保存本会话覆盖", en: "Session override saved" },
+  "sidebar.sessionModel.cleared": { zh: "已清除，恢复全局默认", en: "Cleared; global default restored" },
+  "sidebar.sessionModel.conflict": {
+    zh: "其他页面已修改本会话覆盖（当前代次 {revision}）；你的输入已保留，请确认后重试。",
+    en: "Another page changed this session's overrides (current revision {revision}); your input was kept, please review and retry.",
+  },
+  "sidebar.sessionModel.failed": { zh: "保存失败：{message}", en: "Save failed: {message}" },
+  "sidebar.sessionModel.retry": { zh: "重新读取", en: "Reload" },
+  "sidebar.sessionModel.globalSummary": { zh: "全局：{provider} / {model}", en: "Global: {provider} / {model}" },
+  "sidebar.sessionModel.emptyGlobal": { zh: "未配置全局默认", en: "No global default configured" },
+  "sidebar.sessionModel.emptyRoles": { zh: "没有可配置的专家角色。", en: "No configurable expert roles." },
+  "sidebar.sessionModel.columnRole": { zh: "专家", en: "Expert" },
+  "sidebar.sessionModel.columnModel": { zh: "模型选择", en: "Model" },
+  "sidebar.sessionModel.tableLabel": { zh: "会话模型覆盖", en: "Session model overrides" },
+  "sidebar.sessionModel.saveChanges": { zh: "保存", en: "Save" },
+  "sidebar.sessionModel.invalidDraft": {
+    zh: "请为已修改的角色选择供应商和模型。",
+    en: "Choose a provider and model for every edited role.",
+  },
+  "sidebar.sessionModel.clearRole": {
+    zh: "清除{role}的本会话覆盖",
+    en: "Clear the session override for {role}",
+  },
   "settings.title": { zh: "dsh-expert-group", en: "dsh-expert-group" },
   "settings.hint": {
     zh: "专家模型使用 DSH 当前已配置的 provider 和模型目录。",
@@ -1671,52 +1740,6 @@ const MESSAGE_CATALOG = Object.freeze({
   "settings.testNotification.sending": { zh: "发送中…", en: "Sending…" },
   "settings.testNotification.sent": { zh: "已发送测试通知", en: "Test notification sent" },
   "settings.testNotification.disabled": { zh: "通知已关闭，未发送测试通知", en: "Notifications are off; test notification not sent" },
-  "settings.sessionOverride.title": { zh: "仅本会话模型覆盖", en: "Session-only model overrides" },
-  "settings.sessionOverride.hint": {
-    zh: "只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
-    en: "Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the global default again.",
-  },
-  "settings.sessionOverride.noSession": {
-    zh: "未打开会话：打开一个会话后可在此临时覆盖角色模型。",
-    en: "No open session: open a session to temporarily override role models here.",
-  },
-  "settings.sessionOverride.child": {
-    zh: "当前是子代理会话，会话级模型覆盖只读。",
-    en: "This is a subagent session; session model overrides are read-only.",
-  },
-  "settings.sessionOverride.loading": { zh: "正在读取本会话覆盖…", en: "Loading session overrides…" },
-  "settings.sessionOverride.unavailable": {
-    zh: "本会话覆盖读取失败，请稍后重试。",
-    en: "Failed to read session overrides; please retry later.",
-  },
-  "settings.sessionOverride.unsupported": {
-    zh: "当前宿主版本不支持会话级模型覆盖。",
-    en: "This host version does not support session model overrides.",
-  },
-  "settings.sessionOverride.offline": {
-    zh: "会话未运行：会话级覆盖只读。",
-    en: "The session is not running; session overrides are read-only.",
-  },
-  "settings.sessionOverride.followGlobal": { zh: "跟随全局默认", en: "Follow global default" },
-  "settings.sessionOverride.override": { zh: "本会话覆盖", en: "Session override" },
-  "settings.sessionOverride.revision": { zh: "代次 {revision}", en: "Revision {revision}" },
-  "settings.sessionOverride.provider": { zh: "供应商", en: "Provider" },
-  "settings.sessionOverride.model": { zh: "模型", en: "Model" },
-  "settings.sessionOverride.effort": { zh: "思考深度", en: "Reasoning effort" },
-  "settings.sessionOverride.effortDefault": { zh: "模型默认", en: "Model default" },
-  "settings.sessionOverride.save": { zh: "保存覆盖", en: "Save override" },
-  "settings.sessionOverride.clear": { zh: "清除", en: "Clear" },
-  "settings.sessionOverride.saving": { zh: "保存中…", en: "Saving…" },
-  "settings.sessionOverride.saved": { zh: "已保存本会话覆盖", en: "Session override saved" },
-  "settings.sessionOverride.cleared": { zh: "已清除，恢复全局默认", en: "Cleared; global default restored" },
-  "settings.sessionOverride.conflict": {
-    zh: "其他页面已修改本会话覆盖（当前代次 {revision}）；你的输入已保留，请确认后重试。",
-    en: "Another page changed this session's overrides (current revision {revision}); your input was kept, please review and retry.",
-  },
-  "settings.sessionOverride.failed": { zh: "保存失败：{message}", en: "Save failed: {message}" },
-  "settings.sessionOverride.retry": { zh: "重新读取", en: "Reload" },
-  "settings.sessionOverride.globalSummary": { zh: "全局：{provider} / {model}", en: "Global: {provider} / {model}" },
-  "settings.sessionOverride.emptyGlobal": { zh: "未配置全局默认", en: "No global default configured" },
   "announce.start": { zh: "任务开始：{name}", en: "Task started: {name}" },
   "announce.finish": { zh: "任务完成：{name}", en: "Task finished: {name}" },
   "announce.fail": { zh: "任务失败：{name}", en: "Task failed: {name}" },

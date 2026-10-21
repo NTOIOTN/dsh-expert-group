@@ -331,6 +331,46 @@ function latestCommand(session, events = sessionEvents(session), state = toolCal
   return state.calls.length === 0 ? null : toolCommandText(state.calls[state.calls.length - 1].identity);
 }
 
+/**
+ * 当前（或最近一次）turn 的墙钟用时，与 DSH 状态行「用时 …」同源。
+ *
+ * DSH 状态行的计时 = 当前打开 turn 的 turn/start 事件时间 → 现在；已完成轮次
+ * 则显示 turn/end - turn/start。事件 time 由主机以 epoch ms 写入，所以这里复刻
+ * 同一算法：
+ * - 从尾部找最后一个 turn/start 作为起点；
+ * - 再在该起点之后找最后一个 turn/end：找到即已完成轮次，未找到则是 open turn，
+ *   结束时间取构建快照的 nowMs；
+ * - 没有 turn/start 或时间戳非法时返回 null，调用方回退模型用时/会话时间。
+ */
+function turnDurationOf(events, nowMs) {
+  const list = Array.isArray(events) ? events : [];
+  let startAt = null;
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const event = list[index];
+    if (event?.type !== "turn/start") continue;
+    const time = event?.time;
+    if (typeof time === "number" && Number.isFinite(time)) {
+      startAt = time;
+      break;
+    }
+  }
+  if (startAt === null) return null;
+  let endAt = null;
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const event = list[index];
+    if (event?.type === "turn/start") break;
+    if (event?.type !== "turn/end") continue;
+    const time = event?.time;
+    if (typeof time === "number" && Number.isFinite(time)) {
+      endAt = time;
+      break;
+    }
+  }
+  const end = endAt === null ? (typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : null) : endAt;
+  if (end === null) return null;
+  return Math.max(0, end - startAt);
+}
+
 function runSummary(session, status, mode, events = sessionEvents(session)) {
   const state = toolCallState(events);
   return {
@@ -653,15 +693,17 @@ export function createExpertGroupRuntime({
   }
 
   /**
-   * 角色的显示名投影：持久化快照优先（历史任务在角色删除后仍可显示标签），
-   * 其次运行期目录。两者都没有时返回 null。
+   * 角色的显示名投影：运行期目录优先（角色改名/内置角色文案调整后，历史任务同步
+   * 显示当前名称），其次持久化快照（角色已删除时历史任务仍可显示标签）。
+   * 两者都没有时返回 null。
    */
   function roleLabelOf(role, persistedLabel) {
-    const explicit = firstText(persistedLabel);
-    if (explicit !== null) return explicit;
     const roleId = firstText(role);
-    if (roleId === null) return null;
-    return firstText(currentRoleLabels()[roleId]);
+    if (roleId !== null) {
+      const current = firstText(currentRoleLabels()[roleId]);
+      if (current !== null) return current;
+    }
+    return firstText(persistedLabel);
   }
 
   /**
@@ -996,11 +1038,15 @@ export function createExpertGroupRuntime({
       // 结构化交付（票据 30）：只读投影；缺失省略，绝不伪造回退/空值。
       const structured = structuredOfChild(childId, persisted);
       const outputSchemaRequested = outputSchemaRequestedOfChild(childId, persisted);
+      // 当前/最近一轮 turn 的墙钟用时（与 DSH 状态行 "用时 …" 同源）；无 turn 事件时为 null。
+      const turnDurationMs = turnDurationOf(events, now());
       experts.push({
         id: childId,
         kind: "expert",
         sessionId: childId,
         parentSessionId: root.id,
+        // 当前/最近一轮的墙钟用时（与 DSH 状态行同源）；没有 turn 事件时省略。
+        ...(turnDurationMs === null ? {} : { turnDurationMs }),
         // context.label 是最新 accepted dispatch 的短描述；冷恢复再读持久 child model。
         // 降级顺序与完整构建完全一致（描述优先于会话标题），轻量路径只是把读不到的冷会话标题
         // 换成同样语义的可选零 I/O 读面（projectionTitleOf），避免 full 替换 fast 时任务名跳动。
@@ -1133,6 +1179,8 @@ export function createExpertGroupRuntime({
     // 不跨 attempt 合并 value，每个 attempt 自己的 structured 保留在 attempts 里。
     const shardStructured = structuredOfChild(navigationChildId, persisted);
     const shardRequested = outputSchemaRequestedOfChild(navigationChildId, persisted);
+    // 分片最新 child 的当前/最近一轮墙钟（与 DSH 状态行同源）；无 live 会话时省略。
+    const shardTurnDurationMs = turnDurationOf(sessionEvents(ownedChild?.session), now());
     return {
       ...shard,
       childId: ownedChild === undefined ? null : navigationChildId,
@@ -1148,6 +1196,7 @@ export function createExpertGroupRuntime({
       ...(shardUsage === null || !hasUsageMetrics(shardUsage) ? {} : { usage: shardUsage }),
       ...(shardStructured === null ? {} : { structured: shardStructured }),
       ...(shardRequested ? { outputSchemaRequested: true } : {}),
+      ...(shardTurnDurationMs === null ? {} : { turnDurationMs: shardTurnDurationMs }),
       attempts: projectedAttempts,
     };
   }
@@ -1362,9 +1411,12 @@ export function createExpertGroupRuntime({
      * 用户不必等完整快照就能看到错误横幅与重试入口。
      */
     const recovery = recoveryInputFromRestoreStatus(safeCall(() => fanoutHost?.restoreStatus?.(), null));
+    const generatedAt = now();
+    // 根会话当前/最近一轮的墙钟用时（与 DSH 状态行同源）；placeholder root 没有事件时省略。
+    const rootTurnDurationMs = turnDurationOf(rootEvents, generatedAt);
     return buildExpertGroupSnapshot({
       sessionId: id,
-      generatedAt: now(),
+      generatedAt,
       recovery,
       root: {
         id,
@@ -1381,6 +1433,7 @@ export function createExpertGroupRuntime({
         ...(placeholderRoot ? {} : { running: rootStatus === "running" }),
         runSummary: runSummary(session, placeholderRoot ? "unknown" : rootStatus, "one-shot", rootEvents),
         continuable: false,
+        ...(rootTurnDurationMs === null ? {} : { turnDurationMs: rootTurnDurationMs }),
         createdAt: createdAtOf(session?.createdAt, session?.header?.createdAt, header?.createdAt),
       },
       experts,

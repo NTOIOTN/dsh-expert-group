@@ -756,6 +756,9 @@ function projectSubagentContextFields(source) {
 function projectSessionNode(record, { kind, id, sessionId }) {
   const source = asRecord(record);
   const status = normalizeStatus(source?.status);
+  // 当前/最近一轮 turn 的墙钟用时（与 DSH 状态行同源，epoch ms）：缺失时省略字段，
+  // 客户端回退模型用时，绝不补 0。
+  const turnDurationMs = numberOrNull(source?.turnDurationMs);
   return {
     id,
     kind,
@@ -774,6 +777,7 @@ function projectSessionNode(record, { kind, id, sessionId }) {
     // 角色显示名（票据 27）：自定义角色删除后历史任务仍能显示标签；缺失为 null，
     // 客户端回退 role 或原生文案，绝不猜一个显示名。
     roleLabel: textOrNull(source?.roleLabel),
+    ...(turnDurationMs === null ? {} : { turnDurationMs }),
     // 用量（票据 25）：root/expert 节点都可能带 usage；缺失时整字段省略。
     ...usageField(source?.usage),
     provider: textOrNull(source?.provider),
@@ -975,6 +979,8 @@ function projectAttemptNode(attempt) {
 function projectShardNode(shard, inherited = {}) {
   const source = asRecord(shard);
   const defaults = asRecord(inherited);
+  // 分片当前/最近一轮的墙钟用时（与 DSH 状态行同源）：缺失时省略。
+  const turnDurationMs = numberOrNull(source?.turnDurationMs);
   const attempts = asArray(source?.attempts).map((attempt) => projectAttemptNode(attempt));
   const latestAttempt = attempts.length === 0 ? null : attempts[attempts.length - 1];
   const shardId = textOrNull(source?.shardId);
@@ -1006,6 +1012,7 @@ function projectShardNode(shard, inherited = {}) {
     provider: firstText(source?.provider, defaults?.provider),
     model: firstText(source?.model, defaults?.model),
     effort: firstText(source?.reasoningEffort, source?.effort, defaults?.reasoningEffort, defaults?.effort),
+    ...(turnDurationMs === null ? {} : { turnDurationMs }),
     // 分片实际路由（票据 24）：来自最新 attempt child 的 child_models 记录；缺失省略。
     ...projectModelRouteFields(source),
     // 目标 subagent provider / 继承开关（票据 29）：来自同一 child 的 child_models；缺失省略。

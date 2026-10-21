@@ -110,31 +110,6 @@ window.__ModuleLoader__.load({
       "settings.testNotification.sending": "发送中…",
       "settings.testNotification.sent": "已发送测试通知",
       "settings.testNotification.disabled": "通知已关闭，未发送测试通知",
-      "settings.sessionOverride.title": "仅本会话模型覆盖",
-      "settings.sessionOverride.hint": "只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
-      "settings.sessionOverride.noSession": "未打开会话：打开一个会话后可在此临时覆盖角色模型。",
-      "settings.sessionOverride.child": "当前是子代理会话，会话级模型覆盖只读。",
-      "settings.sessionOverride.loading": "正在读取本会话覆盖…",
-      "settings.sessionOverride.unavailable": "本会话覆盖读取失败，请稍后重试。",
-      "settings.sessionOverride.unsupported": "当前宿主版本不支持会话级模型覆盖。",
-      "settings.sessionOverride.offline": "会话未运行：会话级覆盖只读。",
-      "settings.sessionOverride.followGlobal": "跟随全局默认",
-      "settings.sessionOverride.override": "本会话覆盖",
-      "settings.sessionOverride.revision": "代次 {revision}",
-      "settings.sessionOverride.provider": "供应商",
-      "settings.sessionOverride.model": "模型",
-      "settings.sessionOverride.effort": "思考深度",
-      "settings.sessionOverride.effortDefault": "模型默认",
-      "settings.sessionOverride.save": "保存覆盖",
-      "settings.sessionOverride.clear": "清除",
-      "settings.sessionOverride.saving": "保存中…",
-      "settings.sessionOverride.saved": "已保存本会话覆盖",
-      "settings.sessionOverride.cleared": "已清除，恢复全局默认",
-      "settings.sessionOverride.conflict": "其他页面已修改本会话覆盖（当前代次 {revision}）；你的输入已保留，请确认后重试。",
-      "settings.sessionOverride.failed": "保存失败：{message}",
-      "settings.sessionOverride.retry": "重新读取",
-      "settings.sessionOverride.globalSummary": "全局：{provider} / {model}",
-      "settings.sessionOverride.emptyGlobal": "未配置全局默认",
     });
     /** 取一条设置页文案：模型可用时走权威投影；缺失时用 zh 回退表插值（绝不显示键名）。 */
     function settingsText(locale, key, vars) {
@@ -398,25 +373,6 @@ window.__ModuleLoader__.load({
       // 通知事件类型（票据 14）：一组三个复选框，窄屏允许换行。
       ".deg_settings_notification_events_row{display:flex;align-items:center;gap:16px;flex-wrap:wrap;min-width:0}" +
       ".deg_settings_notification_events{display:flex;align-items:center;flex-wrap:wrap;gap:16px 20px;min-width:0}" +
-      // 会话级模型覆盖（票据 21）：每个启用角色一行，保持紧凑的文本编辑面。
-      ".deg_so_section{display:flex;flex-direction:column;gap:10px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}" +
-      ".deg_so_title{font-size:14px;line-height:22px;font-weight:600;margin:0;color:var(--dsw-alias-label-primary)}" +
-      ".deg_so_hint{font-size:12px;line-height:18px;margin:0;color:var(--dsw-alias-label-secondary)}" +
-      ".deg_so_rows{display:flex;flex-direction:column;gap:10px;min-width:0}" +
-      ".deg_so_row{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);min-width:0}" +
-      ".deg_so_row_head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;min-width:0}" +
-      ".deg_so_role{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary)}" +
-      ".deg_so_state{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere;text-align:right}" +
-      ".deg_so_fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr) minmax(0,.9fr);gap:10px;min-width:0}" +
-      ".deg_so_field{display:flex;flex-direction:column;gap:4px;min-width:0}" +
-      ".deg_so_field_label{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}" +
-      ".deg_so_input{width:100%;min-width:0;box-sizing:border-box;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}" +
-      ".deg_so_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}" +
-      ".deg_so_input:disabled{opacity:.5;cursor:not-allowed}" +
-      ".deg_so_actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}" +
-      ".deg_so_actions .deg_btn{flex:0 0 auto;min-width:88px}" +
-      ".deg_so_actions .deg_so_state{margin-right:auto}" +
-      "@media (max-width:520px){.deg_so_fields{grid-template-columns:minmax(0,1fr)}.deg_so_state{text-align:left}}" +
       // 独立诊断区块（票据 14）：只读计数/状态行，使用紧凑两列布局。
       ".deg_settings_diagnostics{display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}" +
       ".deg_settings_diagnostics_title{font-size:14px;line-height:22px;font-weight:600;margin:0;color:var(--dsw-alias-label-primary)}" +
@@ -6914,463 +6870,6 @@ window.__ModuleLoader__.load({
         open ? removeConfirmDialog : null);
     }
 
-    // ── 会话级模型覆盖（票据 21）──────────────────────────────────────────
-    /**
-     * 没有会话列表服务时使用的不变空 store。
-     *
-     * 设置页在真实宿主里总能通过注入的 `sessions` 服务读到会话列表；但契约测试、
-     * 旧宿主与「服务代理拒答」都可能没有它。这里返回一个**引用稳定**的空 store，
-     * 让 useSyncExternalStore 的订阅/快照身份不变，既不会漏 hook，也不会每次渲染
-     * 重新订阅；读取面因此安全降级为「未打开会话」。
-     */
-    const EMPTY_SESSION_LIST_STORE = Object.freeze({
-      subscribe: () => () => {},
-      getSnapshot: () => null,
-    });
-
-    /** 解析 `ctx.sessions.list` 的读取面；缺失/拒答时回退到空 store（绝不抛错）。 */
-    function sessionListStoreOf(ctx) {
-      try {
-        const list = ctx?.sessions?.list;
-        if (list !== null && typeof list === "object"
-          && typeof list.subscribe === "function" && typeof list.getSnapshot === "function") {
-          return {
-            subscribe: (callback) => list.subscribe(callback),
-            getSnapshot: () => list.getSnapshot(),
-          };
-        }
-      } catch { /* Cordis 未声明服务读取即抛错：按没有会话列表降级。 */ }
-      return EMPTY_SESSION_LIST_STORE;
-    }
-
-    /**
-     * 归一一个会话级 selection：只接受非空 provider/model 与可选字符串 effort。
-     * 返回对象始终是新的普通对象，绝不把响应里的未知字段带进 UI 状态。
-     */
-    function normalizeSessionOverrideSelection(selection) {
-      if (selection === null || typeof selection !== "object" || Array.isArray(selection)) return null;
-      if (typeof selection.provider !== "string" || selection.provider.length === 0) return null;
-      if (typeof selection.model !== "string" || selection.model.length === 0) return null;
-      const effort = typeof selection.reasoningEffort === "string" ? selection.reasoningEffort : "";
-      return {
-        provider: selection.provider,
-        model: selection.model,
-        ...(effort.length > 0 ? { reasoningEffort: effort } : {}),
-      };
-    }
-
-    /** 归一「角色 -> selection」映射：只保留已知角色与合法 selection，坏值整条丢弃。 */
-    function normalizeSessionOverrideMap(raw) {
-      const overrides = {};
-      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return overrides;
-      for (const role of PROMPT_ROLE_IDS) {
-        const selection = normalizeSessionOverrideSelection(raw[role]);
-        if (selection !== null) overrides[role] = selection;
-      }
-      return overrides;
-    }
-
-    /**
-     * 归一 session-override-get/set/clear 的成功响应。
-     *
-     * @param {object|null} payload - 已解析的 JSON 响应体。
-     * @returns {{overrides: object, revision: number, live: boolean}|null} 形状非法时返回 null。
-     */
-    function normalizeSessionOverrideView(payload) {
-      if (payload === null || typeof payload !== "object" || payload.ok !== true) return null;
-      if (!Number.isSafeInteger(payload.revision) || payload.revision < 0) return null;
-      return {
-        overrides: normalizeSessionOverrideMap(payload.overrides),
-        revision: payload.revision,
-        live: payload.live === true,
-      };
-    }
-
-    /**
-     * 读取一次会话覆盖 RPC 的结果：成功给出权威视图，失败给出稳定 code 与冲突 details。
-     * 冲突时 details.currentRevision/details.overrides 只用于推进本地基线，绝不覆盖草稿。
-     */
-    async function readSessionOverrideOutcome(response) {
-      let payload = null;
-      try { payload = await response?.json?.(); } catch { payload = null; }
-      if (response?.ok === true && payload?.ok === true) {
-        const view = normalizeSessionOverrideView(payload);
-        if (view === null) return { ok: false, code: "invalid-response", message: null };
-        return { ok: true, ...view };
-      }
-      const issue = payload?.error !== null && typeof payload?.error === "object" ? payload.error : {};
-      const details = issue?.details !== null && typeof issue?.details === "object" ? issue.details : {};
-      return {
-        ok: false,
-        code: typeof issue?.code === "string" ? issue.code : "unknown",
-        message: typeof issue?.message === "string" ? issue.message : null,
-        currentRevision: Number.isSafeInteger(details.currentRevision) && details.currentRevision >= 0
-          ? details.currentRevision
-          : null,
-        overrides: details.overrides === undefined ? null : normalizeSessionOverrideMap(details.overrides),
-      };
-    }
-
-    /** 草稿 -> 可提交 selection：effort 为空表示「模型默认」，请求里不携带该字段。 */
-    function sessionOverrideSelectionOfDraft(draft) {
-      const provider = typeof draft?.provider === "string" ? draft.provider : "";
-      const model = typeof draft?.model === "string" ? draft.model : "";
-      const effort = typeof draft?.reasoningEffort === "string" ? draft.reasoningEffort : "";
-      return { provider, model, ...(effort.length > 0 ? { reasoningEffort: effort } : {}) };
-    }
-
-    /** 逐字段比较两个草稿/选择（effort 缺失与空串等价）。 */
-    function sessionOverrideSelectionEquals(left, right) {
-      return (left?.provider ?? "") === (right?.provider ?? "")
-        && (left?.model ?? "") === (right?.model ?? "")
-        && (left?.reasoningEffort ?? "") === (right?.reasoningEffort ?? "");
-    }
-
-    /**
-     * 「仅本会话模型覆盖」区块（票据 21）。
-     *
-     * 数据边界：
-     * - 只读 session-override-get（打开/切换会话与手动重试）；保存/清除只调用
-     *   session-override-set/clear，绝不复用 settings-commit —— 会话覆盖不是全局设置。
-     * - 代次来自 Host 的持久化 revision；冲突时保留当前草稿，只把权威 revision/覆盖
-     *   推进到本地基线并提示，绝不自动覆盖用户输入。
-     * - live=false（会话未运行）与子代理会话一律只读；宿主未声明 capability 时整个
-     *   区块降级为不可用提示，不发任何 RPC。
-     *
-     * 渲染粒度：每个启用角色一行，provider/model 用文本输入 + 目录 datalist（紧凑、
-     * 不复制角色表那套三下拉逻辑），effort 用该模型声明的档位下拉。
-     */
-    function useSessionOverrideSection({ ctx, sessionList, roles, providerGroups, globalDefaults, t, hostMeta, hostMetaError }) {
-      const sessionEntries = react.useMemo(() => readEntries(sessionList?.byId), [sessionList]);
-      const currentSessionId = currentSessionIdOf(sessionList ?? {});
-      const rootId = react.useMemo(
-        () => rootSessionIdOf(sessionEntries, currentSessionId),
-        [sessionEntries, currentSessionId],
-      );
-      const childSession = rootId !== void 0 && currentSessionId !== rootId;
-      const capabilityChecked = hostMeta !== null && hostMeta !== undefined;
-      const capabilitySupported = hostMeta?.capabilities?.sessionOverride === true;
-      /**
-       * meta 读取失败时能力未知：不再无限停留在"正在读取"，而是**实测**一次
-       * session-override-get。新宿主即使 meta 失败也能正常返回；旧宿主会对未知 action
-       * 回 bad-request，据此降级为"宿主版本不支持"（比一直转圈更诚实）。
-       */
-      const capabilityProbe = !capabilityChecked && hostMetaError !== null && hostMetaError !== undefined;
-      const [state, setState] = react.useState(() => ({
-        status: "idle", overrides: {}, revision: 0, live: false,
-      }));
-      const [drafts, setDrafts] = react.useState({});
-      const [busyRole, setBusyRole] = react.useState(null);
-      const [notice, setNotice] = react.useState(null);
-      const [reloadToken, setReloadToken] = react.useState(0);
-      const requestSerial = react.useRef(0);
-      const loadedSessionRef = react.useRef(void 0);
-
-      react.useEffect(() => {
-        // 会话切换/关闭：直接收敛为对应的只读态，并取消任何在途请求的写入资格。
-        if (rootId === void 0 || childSession) {
-          requestSerial.current += 1;
-          loadedSessionRef.current = void 0;
-          setDrafts({});
-          setNotice(null);
-          setState({ status: rootId === void 0 ? "no-session" : "child", overrides: {}, revision: 0, live: false });
-          return () => {};
-        }
-        if (capabilityChecked && !capabilitySupported) {
-          requestSerial.current += 1;
-          setState({ status: "unsupported", overrides: {}, revision: 0, live: false });
-          return () => {};
-        }
-        if (!capabilityChecked && !capabilityProbe) {
-          // meta 还在读取且没有失败：先保持加载态，不先发一个大概率 400 的 RPC。
-          setState((previous) => previous.status === "ready"
-            ? previous
-            : { status: "loading", overrides: {}, revision: 0, live: false });
-          return () => {};
-        }
-        let cancelled = false;
-        requestSerial.current += 1;
-        const serial = requestSerial.current;
-        setState((previous) => previous.status === "ready"
-          ? { ...previous, status: "loading" }
-          : { status: "loading", overrides: {}, revision: 0, live: false });
-        void requestPluginRpc(ctx?.connection, { action: "session-override-get", sessionId: rootId })
-          .then(readSessionOverrideOutcome)
-          .then((outcome) => {
-            if (cancelled || serial !== requestSerial.current) return;
-            if (outcome.ok !== true) {
-              // 能力未知（meta 失败）时的探测：旧宿主对未知 action 回 bad-request，
-              // 此时按"版本不支持"呈现；其余失败仍给出可重试的读取错误。
-              setState({
-                status: !capabilityChecked && outcome.code === "bad-request" ? "unsupported" : "error",
-                overrides: {},
-                revision: 0,
-                live: false,
-              });
-              return;
-            }
-            // 只有会话真的换了才清草稿：同一会话的手动重读必须保留用户未提交的输入。
-            if (loadedSessionRef.current !== rootId) setDrafts({});
-            loadedSessionRef.current = rootId;
-            setState({ status: "ready", overrides: outcome.overrides, revision: outcome.revision, live: outcome.live });
-          })
-          .catch(() => {
-            if (cancelled || serial !== requestSerial.current) return;
-            setState({ status: "error", overrides: {}, revision: 0, live: false });
-          });
-        return () => { cancelled = true; };
-      }, [rootId, childSession, capabilityChecked, capabilitySupported, capabilityProbe, reloadToken, ctx]);
-
-      /** 冲突/普通失败都只更新提示；草稿在任何失败路径上都不清空。 */
-      const applyFailure = (outcome, role) => {
-        if (outcome.code === "session-override-conflict") {
-          setState((previous) => ({
-            ...previous,
-            status: "ready",
-            revision: Number.isSafeInteger(outcome.currentRevision) ? outcome.currentRevision : previous.revision,
-            overrides: outcome.overrides ?? previous.overrides,
-          }));
-          setNotice({
-            kind: "conflict",
-            role,
-            text: t("settings.sessionOverride.conflict", {
-              revision: Number.isSafeInteger(outcome.currentRevision) ? outcome.currentRevision : "?",
-            }),
-          });
-          return;
-        }
-        setNotice({
-          kind: "error",
-          role,
-          text: outcome.message !== null
-            ? t("settings.sessionOverride.failed", { message: outcome.message })
-            : t("settings.sessionOverride.unavailable"),
-        });
-      };
-
-      const applySuccess = (outcome, role, kind) => {
-        setState({ status: "ready", overrides: outcome.overrides, revision: outcome.revision, live: outcome.live });
-        setDrafts((previous) => {
-          if (!Object.prototype.hasOwnProperty.call(previous, role)) return previous;
-          const next = { ...previous };
-          delete next[role];
-          return next;
-        });
-        setNotice({ kind, role, revision: outcome.revision });
-      };
-
-      const submitRole = async (role, action) => {
-        if (busyRole !== null || state.status !== "ready" || state.live !== true) return;
-        const draft = drafts[role] ?? null;
-        const selection = action === "set" ? sessionOverrideSelectionOfDraft(draft) : null;
-        if (action === "set" && (draft === null || selection.provider.length === 0 || selection.model.length === 0)) return;
-        setBusyRole(role);
-        setNotice(null);
-        try {
-          const body = {
-            action: action === "set" ? "session-override-set" : "session-override-clear",
-            sessionId: rootId,
-            role,
-            expectedRevision: state.revision,
-          };
-          if (action === "set") body.selection = selection;
-          const outcome = await readSessionOverrideOutcome(
-            await requestPluginRpc(ctx?.connection, body),
-          );
-          if (outcome.ok === true) applySuccess(outcome, role, action === "set" ? "saved" : "cleared");
-          else applyFailure(outcome, role);
-        } catch {
-          setNotice({ kind: "error", role, text: t("settings.sessionOverride.unavailable") });
-        } finally {
-          setBusyRole(null);
-        }
-      };
-
-      const editableOf = (role) => {
-        if (Object.prototype.hasOwnProperty.call(drafts, role)) return drafts[role];
-        const effective = state.overrides[role] ?? normalizeSessionOverrideSelection(globalDefaults?.[role]) ?? null;
-        return {
-          provider: effective?.provider ?? "",
-          model: effective?.model ?? "",
-          reasoningEffort: effective?.reasoningEffort ?? "",
-        };
-      };
-
-      const updateDraft = (role, field, value) => {
-        setDrafts((previous) => {
-          const base = Object.prototype.hasOwnProperty.call(previous, role) ? previous[role] : editableOf(role);
-          const next = { ...base, [field]: value };
-          // 改模型时如果旧档位不被新模型支持，回落到「模型默认」而不是提交非法 effort。
-          if (field === "model") {
-            const provider = next.provider;
-            const model = providerGroups.find((group) => group?.id === provider)
-              ?.models?.find((entry) => entry?.id === value);
-            const efforts = Array.isArray(model?.reasoning?.efforts) ? model.reasoning.efforts : [];
-            if (next.reasoningEffort !== "" && !efforts.some((effort) => effort?.id === next.reasoningEffort)) {
-              next.reasoningEffort = "";
-            }
-          }
-          return { ...previous, [role]: next };
-        });
-        setNotice(null);
-      };
-
-      const readOnlyReasons = {
-        "no-session": t("settings.sessionOverride.noSession"),
-        child: t("settings.sessionOverride.child"),
-        unsupported: t("settings.sessionOverride.unsupported"),
-        error: t("settings.sessionOverride.unavailable"),
-        loading: t("settings.sessionOverride.loading"),
-      };
-      const readOnlyHint = state.status === "ready" && state.live !== true
-        ? t("settings.sessionOverride.offline")
-        : (readOnlyReasons[state.status] ?? null);
-      const writable = state.status === "ready" && state.live === true && busyRole === null;
-
-      const rows = writable === false && state.status !== "ready"
-        ? []
-        : roles.map((role) => {
-          const current = state.overrides[role] ?? null;
-          const globalDefault = normalizeSessionOverrideSelection(globalDefaults?.[role]);
-          const editable = editableOf(role);
-          const effectiveSaved = current ?? globalDefault;
-          const dirty = Object.prototype.hasOwnProperty.call(drafts, role)
-            && !sessionOverrideSelectionEquals(drafts[role], effectiveSaved);
-          const valid = editable.provider.length > 0 && editable.model.length > 0;
-          const roleLabel = SETTINGS_ROLE_LABELS[role] ?? role;
-          const providerGroup = providerGroups.find((group) => group?.id === editable.provider);
-          const modelEntry = providerGroup?.models?.find((entry) => entry?.id === editable.model);
-          const efforts = Array.isArray(modelEntry?.reasoning?.efforts) ? modelEntry.reasoning.efforts : [];
-          const effortOptions = [];
-          if (efforts.length > 0) {
-            effortOptions.push(react.createElement("option", { key: "__default", value: "" }, t("settings.sessionOverride.effortDefault")));
-            for (const effort of efforts) {
-              effortOptions.push(react.createElement("option", { key: effort.id, value: effort.id }, effort.name ?? effort.id));
-            }
-            // 历史/手写 effort 不在当前目录里时仍原样显示，避免下拉静默改值。
-            if (editable.reasoningEffort !== "" && !efforts.some((effort) => effort?.id === editable.reasoningEffort)) {
-              effortOptions.push(react.createElement("option", { key: "__stale", value: editable.reasoningEffort }, editable.reasoningEffort + "（不可用）"));
-            }
-          } else {
-            effortOptions.push(react.createElement("option", { key: "__unsupported", value: "" },
-              editable.provider ? t("settings.sessionOverride.effortDefault") : t("settings.sessionOverride.effort")));
-          }
-          const statusText = current !== null
-            ? t("settings.sessionOverride.override") + "：" + current.provider + " / " + current.model
-              + (current.reasoningEffort ? " / " + current.reasoningEffort : "")
-            : t("settings.sessionOverride.followGlobal")
-              + (globalDefault ? "（" + t("settings.sessionOverride.globalSummary", {
-                provider: globalDefault.provider,
-                model: globalDefault.model,
-              }) + "）" : "（" + t("settings.sessionOverride.emptyGlobal") + "）");
-          return react.createElement("div", {
-            key: role,
-            className: "deg_so_row",
-            "data-deg-session-override-role": role,
-            "data-deg-session-override-state": current !== null ? "override" : "follow",
-          },
-            react.createElement("div", { className: "deg_so_row_head" },
-              react.createElement("span", { className: "deg_so_role" }, roleLabel),
-              react.createElement("span", { className: "deg_so_state", "data-deg-session-override-status": "summary" }, statusText)),
-            // 模型候选只做输入提示：datalist 复用同一份模型目录，不复制角色表的三下拉逻辑。
-            react.createElement("datalist", { id: "deg-so-model-options-" + role },
-              sessionOverrideModelOptions(role, editable.provider, providerGroups).map((entry) => react.createElement(
-                "option",
-                { key: entry.id, value: entry.id },
-                entry.name ?? entry.id,
-              ))),
-            react.createElement("div", { className: "deg_so_fields" },
-              react.createElement("label", { className: "deg_so_field" },
-                react.createElement("span", { className: "deg_so_field_label" }, t("settings.sessionOverride.provider")),
-                react.createElement("input", {
-                  type: "text",
-                  className: "deg_so_input",
-                  list: "deg-so-provider-options",
-                  autoComplete: "off",
-                  "aria-label": roleLabel + " " + t("settings.sessionOverride.provider"),
-                  value: editable.provider,
-                  disabled: !writable,
-                  onChange: (event) => updateDraft(role, "provider", event.target.value),
-                })),
-              react.createElement("label", { className: "deg_so_field" },
-                react.createElement("span", { className: "deg_so_field_label" }, t("settings.sessionOverride.model")),
-                react.createElement("input", {
-                  type: "text",
-                  className: "deg_so_input",
-                  list: "deg-so-model-options-" + role,
-                  autoComplete: "off",
-                  "aria-label": roleLabel + " " + t("settings.sessionOverride.model"),
-                  value: editable.model,
-                  disabled: !writable,
-                  onChange: (event) => updateDraft(role, "model", event.target.value),
-                })),
-              react.createElement("label", { className: "deg_so_field" },
-                react.createElement("span", { className: "deg_so_field_label" }, t("settings.sessionOverride.effort")),
-                react.createElement("select", {
-                  className: "deg_so_input",
-                  "aria-label": roleLabel + " " + t("settings.sessionOverride.effort"),
-                  value: editable.reasoningEffort,
-                  disabled: !writable || efforts.length === 0,
-                  onChange: (event) => updateDraft(role, "reasoningEffort", event.target.value),
-                }, effortOptions))),
-            react.createElement("div", { className: "deg_so_actions" },
-              react.createElement("span", { className: "deg_so_state", "data-deg-session-override-revision": state.revision },
-                t("settings.sessionOverride.revision", { revision: state.revision })),
-              react.createElement("button", {
-                type: "button",
-                className: "deg_btn",
-                "data-deg-session-override-clear": role,
-                "aria-label": roleLabel + " " + t("settings.sessionOverride.clear"),
-                disabled: !writable || current === null,
-                onClick: () => submitRole(role, "clear"),
-              }, busyRole === role ? t("settings.sessionOverride.saving") : t("settings.sessionOverride.clear")),
-              react.createElement("button", {
-                type: "button",
-                className: "deg_btn deg_btn_primary",
-                "data-deg-session-override-save": role,
-                "aria-label": roleLabel + " " + t("settings.sessionOverride.save"),
-                disabled: !writable || !dirty || !valid,
-                onClick: () => submitRole(role, "set"),
-              }, busyRole === role ? t("settings.sessionOverride.saving") : t("settings.sessionOverride.save"))));
-        });
-
-      const noticeText = notice === null
-        ? null
-        : notice.kind === "saved"
-          ? t("settings.sessionOverride.saved")
-          : notice.kind === "cleared"
-            ? t("settings.sessionOverride.cleared")
-            : notice.text;
-
-      return react.createElement("section", {
-        className: "deg_so_section",
-        "data-deg-session-override": "section",
-        "data-deg-session-override-section-state": state.status,
-        "aria-label": t("settings.sessionOverride.title"),
-      },
-        react.createElement("h3", { className: "deg_so_title" }, t("settings.sessionOverride.title")),
-        react.createElement("p", { className: "deg_so_hint" }, t("settings.sessionOverride.hint")),
-        readOnlyHint === null ? null : react.createElement("p", {
-          className: "deg_so_hint",
-          "data-deg-session-override-readonly": state.status,
-        }, readOnlyHint),
-        state.status === "error" ? react.createElement("button", {
-          type: "button",
-          className: "deg_btn",
-          "data-deg-session-override-retry": "true",
-          onClick: () => setReloadToken((value) => value + 1),
-        }, t("settings.sessionOverride.retry")) : null,
-        noticeText === null ? null : react.createElement("p", {
-          className: notice?.kind === "error" || notice?.kind === "conflict" ? "deg_settings_error" : "deg_settings_status",
-          role: "status",
-          "data-deg-session-override-notice": notice?.kind ?? "none",
-        }, noticeText),
-        rows.length === 0 ? null : react.createElement("div", { className: "deg_so_rows" },
-          react.createElement("datalist", { id: "deg-so-provider-options" },
-            providerGroups.map((group) => react.createElement("option", { key: group.id, value: group.id }, group.name ?? group.id))),
-          ...rows));
-    }
-
     // ── 模型候选与自动降级（票据 24）─────────────────────────────────────────
 
     /**
@@ -8132,15 +7631,6 @@ window.__ModuleLoader__.load({
                       currency: entry.cost.currency,
                     })))))));
     }
-    /** 每个角色行的模型候选 datalist：跟随当前 provider 过滤，provider 为空时列出全部。 */
-    function sessionOverrideModelOptions(role, provider, providerGroups) {
-      void role;
-      const group = providerGroups.find((entry) => entry?.id === provider);
-      const models = group === undefined
-        ? providerGroups.flatMap((entry) => (Array.isArray(entry?.models) ? entry.models : []))
-        : (Array.isArray(group.models) ? group.models : []);
-      return models;
-    }
 
     /**
      * 专家设置页。
@@ -8161,13 +7651,6 @@ window.__ModuleLoader__.load({
       // 任何 RPC/轮询，也不会因为打开设置页而触碰通知权限或专家任务。
       const [hostMeta, refreshHostMeta, hostMetaError] = useHostMeta(ctx);
       const roles = useEnabledSettingsRoles(hostMeta);
-      /**
-       * 会话级覆盖区块的会话来源（票据 21）：与侧栏/原生状态桥订阅同一条
-       * `ctx.sessions.list`。服务缺失时 sessionListStoreOf 返回引用稳定的空 store，
-       * 区块因此显示"未打开会话"而不是抛错或凭空猜一个会话 id；这里不新增轮询。
-       */
-      const sessionListStore = react.useMemo(() => sessionListStoreOf(ctx), [ctx]);
-      const sessionList = react.useSyncExternalStore(sessionListStore.subscribe, sessionListStore.getSnapshot);
       /**
        * 诊断报告（票据 14）：从同一次 meta 读取派生。
        *
@@ -8636,25 +8119,6 @@ window.__ModuleLoader__.load({
         for (const role of roles) if (!next.includes(role)) next.push(role);
         return next;
       }, [roles]);
-      /**
-       * 会话级覆盖（票据 21）：作为**自定义 hook** 在任何提前返回之前调用。
-       *
-       * 设置页有三种提前返回（loading / unavailable / 提示词编辑态）；hook 必须与它们
-       * 之前的状态无关地每次都执行，否则从 loading 过渡到 ready 时会出现 hook 数量
-       * 变化（React 硬性禁止）。因此这里先调用 hook 拿到分区节点，只在就绪分支渲染。
-       */
-      const sessionOverrideSection = useSessionOverrideSection({
-        ctx,
-        sessionList,
-        // 票据 21 的会话覆盖仍只覆盖内置角色：自定义角色属于票据 27 的全局模型面，
-        // 不在本轮扩大会话级覆盖语义（其读取归一也按内置角色表过滤）。
-        roles: roles.filter((role) => PROMPT_ROLE_IDS.includes(role)),
-        providerGroups,
-        globalDefaults: normalizeSettingsDraft(settingsSnapshot.value, roles).defaults,
-        t,
-        hostMeta,
-        hostMetaError,
-      });
 
       /**
        * 目录可用性：`status === "ready"`，或**已有成功目录缓存**（groups 非空）。
@@ -9585,8 +9049,6 @@ window.__ModuleLoader__.load({
               providerGroups.map((group) => react.createElement("option", { key: group.id, value: group.id }, group.name ?? group.id))))),
         react.createElement("div", { className: "deg_settings_table_wrap" },
           react.createElement("div", { className: "deg_settings_table" }, header, rows)),
-        // 会话级覆盖紧跟在角色模型表之后：它只替换本会话该角色的主选择。
-        sessionOverrideSection,
         // 模型候选与自动降级（票据 24）：主选择来自 defaults，候选是全局有序列表。
         renderModelCandidatesSection({
           t: tExtra,
@@ -10944,6 +10406,12 @@ window.__ModuleLoader__.load({
           resolveRootSessionId: expertGroupRootSessionIdOf,
           sessions: ctx.sessions,
           slots: ctx.slots,
+          /**
+           * 侧边栏「会话模型」复用设置页**同一份**模型目录 store（provider/model 的 datalist
+           * 与思考深度档位都来自它）。目录的加载/刷新仍由该 store 单飞管理，侧栏只读
+           * getSnapshot/subscribe，绝不自己再建一份目录或发额外请求。
+           */
+          modelCatalog,
           // 浏览器 confirm 是同步 API，Panel 以 Promise/boolean 双兼容方式消费。
           confirm: (message) => typeof globalThis.confirm === "function" && globalThis.confirm(message) === true,
           /**
@@ -11163,12 +10631,6 @@ window.__ModuleLoader__.load({
     ]);
     // 只读能力矩阵与诊断面：设置页、维护者与测试共用同一份纯函数实现。
     exports.describeExpertGroupClientCapabilities = describeExpertGroupClientCapabilities;
-    /**
-     * 会话级覆盖的读取面归一（票据 21）：与设置页共用同一实现，测试据此断言
-     * 非法/越界响应不会被渲染成可编辑状态。
-     */
-    exports.normalizeSessionOverrideView = normalizeSessionOverrideView;
-    exports.normalizeSessionOverrideSelection = normalizeSessionOverrideSelection;
     exports.describeExpertGroupDiagnostics = describeExpertGroupDiagnostics;
     /**
      * 设置页导航行品牌图标（DOM 适配）的公开面：

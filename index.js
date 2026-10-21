@@ -6899,7 +6899,9 @@ export default {
       let header;
       try { header = agent?.session?.requestHeader?.(); } catch { header = undefined; }
       const config = header?.config;
-      const roleLabel = firstNonEmptyText(persisted?.roleLabel, role === null ? null : roleLabelOfRole(role));
+      // 显示名跟随当前角色目录（内置角色已统一为英文）；仅当角色已删除（目录里没有该 id）时
+      // 才回退 child_models 的持久化快照，保证历史任务仍有标签可显示。
+      const roleLabel = firstNonEmptyText(role === null ? null : roleLabelOfRole(role), persisted?.roleLabel);
       const provider = firstNonEmptyText(persisted?.provider, config?.provider, agent?.options?.provider);
       const model = firstNonEmptyText(persisted?.model, config?.model, agent?.options?.model);
       return {
@@ -12032,7 +12034,8 @@ export default {
       source,
       sessionQuery: () => expertGroupSessionQuery,
       // 角色显示名（票据 27）：每次构建现读运行期目录，因此新增/删除自定义角色后
-      // 侧栏标签立即跟随；历史节点仍优先使用 child_models 里的持久化 roleLabel。
+      // 侧栏标签立即跟随；历史节点在角色仍存在时也使用当前目录标签，角色删除后才回退
+    // child_models 里的持久化 roleLabel。
       roleLabels: () => roleLabelsProjection(),
       // 用量（票据 25）：live 账本优先于持久化记录，去抖窗口内的最新值也能进入快照；
       // runtime 只读该投影，不参与计量与刷盘。
@@ -15495,8 +15498,11 @@ export default {
             roles,
             activeRoles: roles,
             // 角色只读投影（票据 27）：含自定义角色。客户端据此渲染设置页角色表与侧栏标签；
-            // roleLabels 是显示名（中文），roleDescriptions 是职责摘要（设置页提示）。
+            // roleLabels 是显示名（英文，与角色状态标签一致），roleDescriptions 是职责摘要（设置页提示）。
             roleLabels: roleLabelsProjection(),
+            // 「会话模型」的全局默认读面：与 resolveRole 同源（snap.defaults），侧边栏据此显示
+            // 「跟随全局默认」。这里只是只读投影，不改 get/session-override-* 的任何行为。
+            roleDefaults: snap.defaults ?? {},
             roleDescriptions: roleDescriptionsOf(roleCatalog().records()),
             // 设置页「自定义角色」编辑器的数据源：与保存/运行期目录同源的定义映射。
             customRoles: snap.customRoles ?? {},

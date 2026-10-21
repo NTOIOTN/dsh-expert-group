@@ -566,6 +566,7 @@ status,
 ...structuredFields(source),
 running:runningOf(status,source.running),
 runSummary:normalizeRunSummary(source.runSummary),
+turnDurationMs:numberOrNull(source.turnDurationMs),
 continuable:typeof source.continuable==="boolean"?source.continuable:null,
 ...(()=>{
 const capabilities=normalizeCapabilities(source.capabilities,SHARD_CAPABILITY_ACTIONS);
@@ -687,6 +688,7 @@ startedAt,
 lastActivityAt:numberOrNull(source.lastActivityAt)??startedAt,
 finishedAt,
 durationMs:numberOrNull(source.durationMs)??durationBetween(startedAt,finishedAt),
+turnDurationMs:numberOrNull(source.turnDurationMs),
 children:rawChildren.map((child)=>normalizeSessionNode(child,"expert",null,nestedDepth+1)),
 };
 }
@@ -1147,6 +1149,71 @@ en:"Last update time (when this data was rendered)",
 "sidebar.recovery.retrying":{zh:"重试中…",en:"Retrying…"},
 "sidebar.recovery.failed":{zh:"任务恢复失败（{code}）",en:"Task recovery failed ({code})"},
 "sidebar.recovery.retryFailed":{zh:"重试未恢复（{code}）",en:"Retry did not recover ({code})"},
+"sidebar.sessionModel.open":{zh:"会话模型",en:"Session models"},
+"sidebar.sessionModel.title":{zh:"会话模型",en:"Session models"},
+"sidebar.sessionModel.hint":{
+zh:"只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
+en:"Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the global default again.",
+},
+"sidebar.sessionModel.openTitle":{
+zh:"按会话修改专家模型，不影响全局默认",
+en:"Change expert models for this session; global defaults are unchanged",
+},
+"sidebar.sessionModel.close":{zh:"关闭会话模型",en:"Close session models"},
+"sidebar.sessionModel.noSession":{
+zh:"未打开会话：打开一个会话后可在此临时覆盖角色模型。",
+en:"No open session: open a session to temporarily override role models here.",
+},
+"sidebar.sessionModel.child":{
+zh:"当前是子代理会话，会话级模型覆盖只读。",
+en:"This is a subagent session; session model overrides are read-only.",
+},
+"sidebar.sessionModel.loading":{zh:"正在读取本会话覆盖…",en:"Loading session overrides…"},
+"sidebar.sessionModel.unavailable":{
+zh:"本会话覆盖读取失败，请稍后重试。",
+en:"Failed to read session overrides; please retry later.",
+},
+"sidebar.sessionModel.unsupported":{
+zh:"当前宿主版本不支持会话级模型覆盖。",
+en:"This host version does not support session model overrides.",
+},
+"sidebar.sessionModel.offline":{
+zh:"会话未运行：会话级覆盖只读。",
+en:"The session is not running; session overrides are read-only.",
+},
+"sidebar.sessionModel.followGlobal":{zh:"跟随全局默认",en:"Follow global default"},
+"sidebar.sessionModel.override":{zh:"本会话覆盖",en:"Session override"},
+"sidebar.sessionModel.revision":{zh:"代次 {revision}",en:"Revision {revision}"},
+"sidebar.sessionModel.provider":{zh:"供应商",en:"Provider"},
+"sidebar.sessionModel.model":{zh:"模型",en:"Model"},
+"sidebar.sessionModel.effort":{zh:"思考深度",en:"Reasoning effort"},
+"sidebar.sessionModel.effortDefault":{zh:"模型默认",en:"Model default"},
+"sidebar.sessionModel.save":{zh:"保存覆盖",en:"Save override"},
+"sidebar.sessionModel.clear":{zh:"清除",en:"Clear"},
+"sidebar.sessionModel.saving":{zh:"保存中…",en:"Saving…"},
+"sidebar.sessionModel.saved":{zh:"已保存本会话覆盖",en:"Session override saved"},
+"sidebar.sessionModel.cleared":{zh:"已清除，恢复全局默认",en:"Cleared; global default restored"},
+"sidebar.sessionModel.conflict":{
+zh:"其他页面已修改本会话覆盖（当前代次 {revision}）；你的输入已保留，请确认后重试。",
+en:"Another page changed this session's overrides (current revision {revision}); your input was kept, please review and retry.",
+},
+"sidebar.sessionModel.failed":{zh:"保存失败：{message}",en:"Save failed: {message}"},
+"sidebar.sessionModel.retry":{zh:"重新读取",en:"Reload"},
+"sidebar.sessionModel.globalSummary":{zh:"全局：{provider} / {model}",en:"Global: {provider} / {model}"},
+"sidebar.sessionModel.emptyGlobal":{zh:"未配置全局默认",en:"No global default configured"},
+"sidebar.sessionModel.emptyRoles":{zh:"没有可配置的专家角色。",en:"No configurable expert roles."},
+"sidebar.sessionModel.columnRole":{zh:"专家",en:"Expert"},
+"sidebar.sessionModel.columnModel":{zh:"模型选择",en:"Model"},
+"sidebar.sessionModel.tableLabel":{zh:"会话模型覆盖",en:"Session model overrides"},
+"sidebar.sessionModel.saveChanges":{zh:"保存",en:"Save"},
+"sidebar.sessionModel.invalidDraft":{
+zh:"请为已修改的角色选择供应商和模型。",
+en:"Choose a provider and model for every edited role.",
+},
+"sidebar.sessionModel.clearRole":{
+zh:"清除{role}的本会话覆盖",
+en:"Clear the session override for {role}",
+},
 "settings.title":{zh:"dsh-expert-group",en:"dsh-expert-group"},
 "settings.hint":{
 zh:"专家模型使用 DSH 当前已配置的 provider 和模型目录。",
@@ -1203,52 +1270,6 @@ en:"The host provided no diagnostics; only client capabilities are shown below."
 "settings.testNotification.sending":{zh:"发送中…",en:"Sending…"},
 "settings.testNotification.sent":{zh:"已发送测试通知",en:"Test notification sent"},
 "settings.testNotification.disabled":{zh:"通知已关闭，未发送测试通知",en:"Notifications are off; test notification not sent"},
-"settings.sessionOverride.title":{zh:"仅本会话模型覆盖",en:"Session-only model overrides"},
-"settings.sessionOverride.hint":{
-zh:"只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
-en:"Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the global default again.",
-},
-"settings.sessionOverride.noSession":{
-zh:"未打开会话：打开一个会话后可在此临时覆盖角色模型。",
-en:"No open session: open a session to temporarily override role models here.",
-},
-"settings.sessionOverride.child":{
-zh:"当前是子代理会话，会话级模型覆盖只读。",
-en:"This is a subagent session; session model overrides are read-only.",
-},
-"settings.sessionOverride.loading":{zh:"正在读取本会话覆盖…",en:"Loading session overrides…"},
-"settings.sessionOverride.unavailable":{
-zh:"本会话覆盖读取失败，请稍后重试。",
-en:"Failed to read session overrides; please retry later.",
-},
-"settings.sessionOverride.unsupported":{
-zh:"当前宿主版本不支持会话级模型覆盖。",
-en:"This host version does not support session model overrides.",
-},
-"settings.sessionOverride.offline":{
-zh:"会话未运行：会话级覆盖只读。",
-en:"The session is not running; session overrides are read-only.",
-},
-"settings.sessionOverride.followGlobal":{zh:"跟随全局默认",en:"Follow global default"},
-"settings.sessionOverride.override":{zh:"本会话覆盖",en:"Session override"},
-"settings.sessionOverride.revision":{zh:"代次 {revision}",en:"Revision {revision}"},
-"settings.sessionOverride.provider":{zh:"供应商",en:"Provider"},
-"settings.sessionOverride.model":{zh:"模型",en:"Model"},
-"settings.sessionOverride.effort":{zh:"思考深度",en:"Reasoning effort"},
-"settings.sessionOverride.effortDefault":{zh:"模型默认",en:"Model default"},
-"settings.sessionOverride.save":{zh:"保存覆盖",en:"Save override"},
-"settings.sessionOverride.clear":{zh:"清除",en:"Clear"},
-"settings.sessionOverride.saving":{zh:"保存中…",en:"Saving…"},
-"settings.sessionOverride.saved":{zh:"已保存本会话覆盖",en:"Session override saved"},
-"settings.sessionOverride.cleared":{zh:"已清除，恢复全局默认",en:"Cleared; global default restored"},
-"settings.sessionOverride.conflict":{
-zh:"其他页面已修改本会话覆盖（当前代次 {revision}）；你的输入已保留，请确认后重试。",
-en:"Another page changed this session's overrides (current revision {revision}); your input was kept, please review and retry.",
-},
-"settings.sessionOverride.failed":{zh:"保存失败：{message}",en:"Save failed: {message}"},
-"settings.sessionOverride.retry":{zh:"重新读取",en:"Reload"},
-"settings.sessionOverride.globalSummary":{zh:"全局：{provider} / {model}",en:"Global: {provider} / {model}"},
-"settings.sessionOverride.emptyGlobal":{zh:"未配置全局默认",en:"No global default configured"},
 "announce.start":{zh:"任务开始：{name}",en:"Task started: {name}"},
 "announce.finish":{zh:"任务完成：{name}",en:"Task finished: {name}"},
 "announce.fail":{zh:"任务失败：{name}",en:"Task failed: {name}"},
@@ -1492,7 +1513,6 @@ if(typeof value!=="string"||value.trim()==="")return fallback;
 return value.trim();
 }
 const HOST_META_ROLE_LIMIT=32;
-const DISPATCH_AFFECTED_PATH_LIMIT=64;
 function normalizeHostMeta(value){
 const source=object(value);
 const roles=[];
@@ -1508,6 +1528,7 @@ const concurrency=object(fanout.concurrency);
 return{
 roles,
 roleLabels:object(source.roleLabels),
+roleDefaults:object(source.roleDefaults),
 modelPrices:Array.isArray(source.modelPrices)?source.modelPrices:[],
 usage:object(source.usage),
 throttle:Object.keys(concurrency.throttle===undefined?{}:object(concurrency.throttle)).length===0
@@ -1516,30 +1537,71 @@ throttle:Object.keys(concurrency.throttle===undefined?{}:object(concurrency.thro
 capabilities:object(source.capabilities),
 };
 }
-function newDispatchRequestId(){
-try{
-if(typeof globalThis.crypto?.randomUUID==="function")return"ui-"+globalThis.crypto.randomUUID();
-}catch{/* 老宿主没有 randomUUID：退回时间戳 + 随机后缀。 */}
-return"ui-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,10);
+const SESSION_MODEL_ROLE_FALLBACK=Object.freeze(["explorer","librarian","oracle","designer","fixer","observer"]);
+function normalizeSessionModelSelection(selection){
+if(selection===null||typeof selection!=="object"||Array.isArray(selection))return null;
+if(typeof selection.provider!=="string"||selection.provider.length===0)return null;
+if(typeof selection.model!=="string"||selection.model.length===0)return null;
+const effort=typeof selection.reasoningEffort==="string"?selection.reasoningEffort:"";
+return{
+provider:selection.provider,
+model:selection.model,
+...(effort.length>0?{reasoningEffort:effort}:{}),
+};
 }
-function parsePathList(value,limit){
-if(typeof value!=="string"||value.trim()==="")return[];
-const max=Number.isSafeInteger(limit)&&limit>0?limit:DISPATCH_AFFECTED_PATH_LIMIT;
-const paths=[];
-for(const part of value.split(/[\n,;]/)){
-const path=part.trim();
-if(path===""||paths.indexOf(path)!==-1)continue;
-paths.push(path);
-if(paths.length>=max)break;
+function normalizeSessionModelOverrides(raw,roles){
+const overrides={};
+const source=raw!==null&&typeof raw==="object"&&Array.isArray(raw)!==true?raw:{};
+for(const role of Array.isArray(roles)?roles:[]){
+const selection=normalizeSessionModelSelection(source[role]);
+if(selection!==null)overrides[role]=selection;
 }
-return paths;
+return overrides;
 }
-function parsePositiveInteger(value){
-if(value===undefined||value===null)return null;
-const raw=typeof value==="number"?value:String(value).trim();
-if(raw==="")return null;
-const parsed=Number(raw);
-return Number.isSafeInteger(parsed)&&parsed>0?parsed:null;
+function normalizeSessionModelView(body,roles){
+const source=object(body);
+if(source.ok!==true)return null;
+if(Number.isSafeInteger(source.revision)!==true||source.revision<0)return null;
+return{
+overrides:normalizeSessionModelOverrides(source.overrides,roles),
+revision:source.revision,
+live:source.live===true,
+};
+}
+function sessionModelSelectionOfDraft(draft){
+const provider=typeof draft?.provider==="string"?draft.provider:"";
+const model=typeof draft?.model==="string"?draft.model:"";
+const effort=typeof draft?.reasoningEffort==="string"?draft.reasoningEffort:"";
+return{provider,model,...(effort.length>0?{reasoningEffort:effort}:{})};
+}
+function sessionModelSelectionEquals(left,right){
+return(left?.provider??"")===(right?.provider??"")
+&&(left?.model??"")===(right?.model??"")
+&&(left?.reasoningEffort??"")===(right?.reasoningEffort??"");
+}
+function sessionModelModelOptions(provider,groups){
+const source=Array.isArray(groups)?groups:[];
+const group=source.find((entry)=>text(object(entry).id,null)===provider);
+const models=[];
+const pool=group===undefined
+?source.flatMap((entry)=>(Array.isArray(object(entry).models)?object(entry).models:[]))
+:(Array.isArray(object(group).models)?object(group).models:[]);
+for(const entry of pool){
+const item=object(entry);
+const id=text(item.id,null);
+if(id===null||models.some((existing)=>existing.id===id))continue;
+models.push(item);
+}
+return models;
+}
+function sessionModelRolesOf(metaValue){
+const source=metaValue===null||metaValue===undefined?{}:object(metaValue);
+const roles=[];
+for(const entry of Array.isArray(source.roles)?source.roles:[]){
+const role=text(entry,null);
+if(role!==null&&roles.indexOf(role)===-1)roles.push(role);
+}
+return roles.length===0?SESSION_MODEL_ROLE_FALLBACK.slice():roles;
 }
 function snapshotHasUsageFact(value,depth=0){
 if(depth>8||value===null||typeof value!=="object")return false;
@@ -2338,9 +2400,10 @@ tag.textContent=[
 ".deg_expert_group_error{display:flex;align-items:center;gap:4px;padding:6px 0;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));font-size:11px}",
 ".deg_expert_group_count{margin-left:auto;color:var(--dsw-alias-label-secondary);font-size:11px;font-weight:400}",
 ".deg_expert_group_cell{display:flex;flex-direction:column;min-width:0}",
-".deg_expert_group_metrics{display:flex;flex-wrap:wrap;align-items:center;gap:2px 6px;min-width:0;padding:2px 0 0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
+".deg_expert_group_metrics{display:flex;flex-wrap:wrap;align-items:center;gap:2px 0;min-width:0;padding:2px 0 0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
 ".deg_expert_group_metrics_part{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
-".deg_expert_group_metrics_separator{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
+".deg_expert_group_metrics_separator{flex:0 0 auto;white-space:pre;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
+".deg_expert_group_metrics_part+.deg_expert_group_retry_warning{margin-left:6px}",
 ".deg_expert_group_retry_warning{flex:0 0 auto;box-sizing:border-box;padding:0 4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);border-radius:4px;color:var(--dsw-alias-state-warning-primary,#f59e0b);font-weight:600;line-height:14px}",
 ".deg_expert_group_failure{flex:1 1 100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
 ".deg_expert_group_attempts{display:flex;flex-direction:column;gap:0;min-width:0;margin:2px 0;padding:0 0 0 6px;border-inline-start:1px solid var(--dsw-alias-border-l2)}",
@@ -2353,31 +2416,35 @@ tag.textContent=[
 ".deg_expert_group_structured{min-width:0;margin:2px 0 0;padding:2px 4px;border-inline-start:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:15px;overflow-wrap:anywhere;max-height:84px;overflow:auto}",
 ".deg_expert_group_structured[data-fallback=true]{border-inline-start-color:var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
 ".deg_expert_group_shard_extra{display:flex;flex-direction:column;min-width:0}",
-".deg_expert_group_dispatch{margin:4px 0 0;padding:6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);font-size:11px}",
-".deg_expert_group_dispatch_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
-".deg_expert_group_dispatch_row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:4px 8px;margin-top:4px}",
-".deg_expert_group_dispatch_field{display:flex;flex:1 1 120px;flex-direction:column;gap:2px;min-width:0;margin-top:4px}",
-".deg_expert_group_dispatch_label{color:var(--dsw-alias-label-secondary);font-size:11px}",
-".deg_expert_group_dispatch_input{box-sizing:border-box;width:100%;min-width:0;padding:2px 4px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:11px;line-height:16px}",
-".deg_expert_group_dispatch_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_dispatch_textarea{resize:vertical;min-height:40px}",
-".deg_expert_group_dispatch_check{display:inline-flex;align-items:center;gap:4px;margin-top:4px;color:var(--dsw-alias-label-secondary)}",
-".deg_expert_group_dispatch_shards{display:flex;flex-direction:column;gap:4px;margin-top:4px}",
-".deg_expert_group_dispatch_shard{display:flex;flex-direction:column;padding:4px;border:1px dashed var(--dsw-alias-border-l2);border-radius:5px}",
-".deg_expert_group_dispatch_shard_head{display:flex;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
-".deg_expert_group_dispatch_actions{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}",
-".deg_expert_group_dispatch_error{margin-top:4px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));overflow-wrap:anywhere}",
-".deg_expert_group_dispatch_notice{margin-top:4px;color:var(--dsw-alias-label-secondary)}",
-".deg_expert_group_templates{margin-top:6px;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2)}",
-".deg_expert_group_templates_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
-".deg_expert_group_template{display:flex;flex-direction:column;gap:2px;margin-top:4px;padding:4px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px}",
-".deg_expert_group_template_name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}",
-".deg_expert_group_template_meta{color:var(--dsw-alias-label-secondary)}",
-".deg_expert_group_template_preview{min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));max-height:48px;overflow:auto}",
-".deg_expert_group_template_actions{display:flex;flex-wrap:wrap;gap:4px;margin-top:2px}",
-".deg_expert_group_templates_empty{color:var(--dsw-alias-label-secondary);margin-top:4px}",
-".deg_expert_group_dispatch_receipt{margin:4px 0 0;padding:5px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;color:var(--dsw-alias-label-secondary);font-size:11px;overflow-wrap:anywhere}",
-".deg_expert_group_dispatch_receipt>div:first-child{color:var(--dsw-alias-label-primary);font-weight:600}",
+".deg_expert_group_session_model_dialog{position:fixed;inset:0;margin:auto;box-sizing:border-box;width:min(920px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100vh - 48px);padding:0;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;box-shadow:0 18px 48px rgba(0,0,0,.28);overflow:hidden}",
+".deg_expert_group_session_model_dialog[open]{display:flex;flex-direction:column}",
+".deg_expert_group_session_model_dialog::backdrop{background:rgba(0,0,0,.42)}",
+".deg_expert_group_session_model_header{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:0 0 auto;padding:12px 14px 6px;font-weight:600}",
+".deg_expert_group_session_model_title{flex:1 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;font-weight:600}",
+".deg_expert_group_session_model_body{flex:1 1 auto;min-height:0;overflow:auto;padding:0 14px 8px}",
+".deg_expert_group_session_model_hint{margin:0 0 8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}",
+".deg_expert_group_session_model_notice{margin:0 0 8px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
+".deg_expert_group_session_model_notice_error{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}",
+".deg_expert_group_session_model_scroll{overflow-x:auto}",
+".deg_expert_group_session_model_table{display:grid;grid-template-columns:minmax(84px,.6fr) minmax(132px,.82fr) minmax(210px,1.5fr) minmax(96px,.62fr);min-width:540px;align-items:center}",
+".deg_expert_group_session_model_row{display:contents}",
+".deg_expert_group_session_model_head_cell{min-width:0;padding:8px 6px 6px;border-bottom:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;font-weight:600}",
+".deg_expert_group_session_model_cell{display:flex;align-items:center;min-width:0;padding:8px 6px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
+".deg_expert_group_session_model_cell select{width:100%;min-width:0;box-sizing:border-box;padding:5px 6px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2,transparent);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}",
+".deg_expert_group_session_model_cell select:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}",
+".deg_expert_group_session_model_cell select:disabled{opacity:.5;cursor:not-allowed}",
+".deg_expert_group_session_model_pill{display:flex;align-items:center;justify-content:space-between;gap:4px;flex:0 0 74px;width:74px;height:28px;min-height:28px;padding:2px 4px 2px 6px;box-sizing:border-box;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}",
+".deg_expert_group_session_model_pill_label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+".deg_expert_group_session_model_clear{display:inline-flex;align-items:center;justify-content:center;flex:0 0 16px;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:16px;cursor:pointer}",
+".deg_expert_group_session_model_clear:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+".deg_expert_group_session_model_clear:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}",
+".deg_expert_group_session_model_clear:disabled{opacity:.4;cursor:not-allowed}",
+".deg_expert_group_session_model_footer{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:0 0 auto;padding:10px 14px;border-top:1px solid var(--dsw-alias-border-l2)}",
+".deg_expert_group_session_model_revision{flex:0 1 auto;min-width:0;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums;font-size:12px}",
+".deg_expert_group_session_model_invalid{flex:1 1 160px;min-width:0;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));font-size:12px;line-height:18px;overflow-wrap:anywhere}",
+".deg_expert_group_session_model_spacer{flex:1 1 auto}",
+".deg_expert_group_session_model_primary{box-sizing:border-box;height:28px;padding:0 12px;border:1px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-radius:6px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));color:var(--dsw-alias-bg-layer-1,#fff);font:inherit;font-size:12px;font-weight:600;cursor:pointer}",
+".deg_expert_group_session_model_primary:disabled{opacity:.45;cursor:not-allowed}",
 ".deg_expert_group_attempt_index{flex:0 0 auto;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums}",
 ".deg_expert_group_attempt_status{flex:0 0 auto;font-weight:600}",
 ".deg_expert_group_attempt[data-status=failed] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=timed_out] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=interrupted] .deg_expert_group_attempt_status{color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
@@ -3371,23 +3438,39 @@ const meta=metaPair[0];
 const setMeta=metaPair[1];
 const metaStateRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
 metaStateRef.current=meta;
-const dispatchDraftPair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
-const dispatchDraft=dispatchDraftPair[0];
-const setDispatchDraft=dispatchDraftPair[1];
-const dispatchReceiptPair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
-const dispatchReceipt=dispatchReceiptPair[0];
-const setDispatchReceipt=dispatchReceiptPair[1];
-const dispatchErrorPair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
-const dispatchError=dispatchErrorPair[0];
-const setDispatchError=dispatchErrorPair[1];
-const templateNoticePair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
-const templateNotice=templateNoticePair[0];
-const setTemplateNotice=templateNoticePair[1];
-const templatesPair=typeof react.useState==="function"
-?react.useState({status:"idle",templates:[],count:0,limit:32,message:null})
-:[{status:"idle",templates:[],count:0,limit:32,message:null},()=>{}];
-const templatesState=templatesPair[0];
-const setTemplatesState=templatesPair[1];
+const sessionModelOpenPair=typeof react.useState==="function"?react.useState(false):[false,()=>{}];
+const sessionModelOpen=sessionModelOpenPair[0];
+const setSessionModelOpen=sessionModelOpenPair[1];
+const sessionModelStatePair=typeof react.useState==="function"
+?react.useState({status:"idle",overrides:{},revision:0,live:false})
+:[{status:"idle",overrides:{},revision:0,live:false},()=>{}];
+const sessionModelState=sessionModelStatePair[0];
+const setSessionModelState=sessionModelStatePair[1];
+const sessionModelDraftsPair=typeof react.useState==="function"?react.useState({}):[{},()=>{}];
+const sessionModelDrafts=sessionModelDraftsPair[0];
+const setSessionModelDrafts=sessionModelDraftsPair[1];
+const sessionModelSavingPair=typeof react.useState==="function"?react.useState(false):[false,()=>{}];
+const sessionModelSaving=sessionModelSavingPair[0];
+const setSessionModelSaving=sessionModelSavingPair[1];
+const sessionModelNoticePair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
+const sessionModelNotice=sessionModelNoticePair[0];
+const setSessionModelNotice=sessionModelNoticePair[1];
+const sessionModelReloadPair=typeof react.useState==="function"?react.useState(0):[0,()=>{}];
+const sessionModelReloadToken=sessionModelReloadPair[0];
+const setSessionModelReloadToken=sessionModelReloadPair[1];
+const sessionModelRequestSerialRef=typeof react.useRef==="function"?react.useRef(0):{current:0};
+const sessionModelLoadedRootRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const sessionModelCatalogPair=typeof react.useState==="function"
+?react.useState({groups:[],status:"idle"})
+:[{groups:[],status:"idle"},()=>{}];
+const sessionModelCatalog=sessionModelCatalogPair[0];
+const setSessionModelCatalog=sessionModelCatalogPair[1];
+const sessionModelEntryRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const sessionModelWasOpenRef=typeof react.useRef==="function"?react.useRef(false):{current:false};
+const sessionModelDialogRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const sessionModelSurfaceRef=typeof react.useRef==="function"
+?react.useRef({rootSessionId:null,sidebarSessionId:null})
+:{current:{rootSessionId:null,sidebarSessionId:null}};
 const announcerRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
 const announcementPair=typeof react.useState==="function"?react.useState(""):["",()=>{}];
 const announcement=announcementPair[0];
@@ -3551,24 +3634,17 @@ const currentRootRef=typeof react.useRef==="function"?react.useRef(rootSessionId
 currentRootRef.current=rootSessionId;
 const currentSidebarSessionRef=typeof react.useRef==="function"?react.useRef(sidebarSessionId):{current:sidebarSessionId};
 currentSidebarSessionRef.current=sidebarSessionId;
-const metaRequestRef=typeof react.useRef==="function"?react.useRef({inFlight:false}):{current:{inFlight:false}};
+const metaRequestRef=typeof react.useRef==="function"?react.useRef({inFlight:false,promise:null}):{current:{inFlight:false,promise:null}};
 const metaAutoAttemptRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
 const metaRefreshRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const templatesRequestRef=typeof react.useRef==="function"?react.useRef({inFlight:false}):{current:{inFlight:false}};
-const displayErrorMessage=(error)=>{
-const api=modelApi();
-const raw=error instanceof Error?error.message:String(error);
-const code=text(object(error).code,null);
-const combined=code===null?raw:code+" · "+raw;
-return typeof api?.redactDisplayText==="function"
-?(api.redactDisplayText(combined,200)||combined)
-:combined.slice(0,200);
-};
 const loadMeta=async()=>{
 if(mountedRef.current!==true)return null;
 const request=metaRequestRef.current;
-if(request.inFlight===true)return null;
+if(request.inFlight===true){
+return typeof request.promise?.then==="function"?request.promise:null;
+}
 request.inFlight=true;
+const pending=(async()=>{
 try{
 const body=await callRpc(config,contextRef.current,{action:"meta"},{},(value)=>object(value));
 if(mountedRef.current!==true)return null;
@@ -3579,43 +3655,322 @@ return normalized;
 return null;
 }finally{
 request.inFlight=false;
+request.promise=null;
 }
+})();
+request.promise=pending;
+return pending;
 };
 metaRefreshRef.current=loadMeta;
-const loadTemplates=async()=>{
-if(mountedRef.current!==true)return null;
-const targetSessionId=typeof currentRootRef.current==="string"?currentRootRef.current:"";
-if(targetSessionId==="")return null;
-const request=templatesRequestRef.current;
-if(request.inFlight===true)return null;
-request.inFlight=true;
-setTemplatesState((previous)=>({...previous,status:"loading",message:null}));
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(sessionModelOpen!==true)return()=>{};
+const targetSessionId=rootSessionId;
+const previousSurface=sessionModelSurfaceRef.current;
+const surfaceChanged=previousSurface.rootSessionId!==rootSessionId
+||previousSurface.sidebarSessionId!==sidebarSessionId;
+sessionModelSurfaceRef.current={rootSessionId,sidebarSessionId};
+if(surfaceChanged===true)setSessionModelSaving(false);
+if(sessionModelLoadedRootRef.current!==targetSessionId)setSessionModelNotice(null);
+if(targetSessionId===""||sidebarSessionId!==targetSessionId){
+sessionModelRequestSerialRef.current+=1;
+sessionModelLoadedRootRef.current=null;
+setSessionModelDrafts({});
+setSessionModelNotice(null);
+setSessionModelSaving(false);
+setSessionModelState({
+status:targetSessionId===""?"no-session":"child",
+overrides:{},
+revision:0,
+live:false,
+});
+return()=>{};
+}
+let cancelled=false;
+sessionModelRequestSerialRef.current+=1;
+const serial=sessionModelRequestSerialRef.current;
+setSessionModelState((previous)=>(previous.status==="ready"
+?{...previous,status:"loading"}
+:{status:"loading",overrides:{},revision:0,live:false}));
+void(async()=>{
+try{
+const pending=config.modelCatalog?.load?.();
+if(pending!==null&&pending!==undefined&&typeof pending.catch==="function")pending.catch(()=>{});
+}catch{/* 目录加载失败不阻塞覆盖读取：输入框仍可手填。 */}
+const loaded=await loadMeta();
+if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
+const effectiveMeta=loaded!==null?loaded:metaStateRef.current;
+if(effectiveMeta!==null&&effectiveMeta.capabilities.sessionOverride!==true){
+setSessionModelState({status:"unsupported",overrides:{},revision:0,live:false});
+return;
+}
+let body;
+try{
+body=await callRpc(
+config,
+contextRef.current,
+{action:"session-override-get",sessionId:targetSessionId},
+{},
+(value)=>object(value),
+);
+}catch(error){
+if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
+const code=text(object(error).code,null);
+setSessionModelState({
+status:code==="bad-request"&&effectiveMeta===null?"unsupported":"error",
+overrides:{},
+revision:0,
+live:false,
+});
+return;
+}
+if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
+const roles=sessionModelRolesOf(effectiveMeta);
+const view=normalizeSessionModelView(body,roles);
+if(view===null){
+setSessionModelState({status:"error",overrides:{},revision:0,live:false});
+return;
+}
+if(sessionModelLoadedRootRef.current!==targetSessionId)setSessionModelDrafts({});
+sessionModelLoadedRootRef.current=targetSessionId;
+setSessionModelState({status:"ready",overrides:view.overrides,revision:view.revision,live:view.live});
+})();
+return()=>{cancelled=true;};
+},[sessionModelOpen,rootSessionId,sidebarSessionId,sessionModelReloadToken,config]);
+}
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(sessionModelOpen!==true)return()=>{};
+const catalog=config.modelCatalog;
+if(catalog===null||catalog===undefined||typeof catalog!=="object")return()=>{};
+const read=()=>{
+if(mountedRef.current!==true)return;
+try{
+const snapshot=typeof catalog.getSnapshot==="function"?catalog.getSnapshot():null;
+const source=object(snapshot);
+setSessionModelCatalog({
+groups:Array.isArray(source.groups)?source.groups:[],
+status:text(source.status,"idle"),
+});
+}catch{
+setSessionModelCatalog({groups:[],status:"error"});
+}
+};
+read();
+let unsubscribe=null;
+try{
+if(typeof catalog.subscribe==="function")unsubscribe=catalog.subscribe(read);
+}catch{unsubscribe=null;}
+return()=>{if(typeof unsubscribe==="function")unsubscribe();};
+},[sessionModelOpen,config]);
+}
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(sessionModelOpen!==true)return;
+const node=sessionModelDialogRef.current;
+if(node===null||node===undefined)return;
+if(node.open===true)return;
+try{
+if(typeof node.showModal==="function")node.showModal();
+}catch{/* 宿主拒绝 showModal（已打开/非活动文档）时保持当前可见性。 */}
+},[sessionModelOpen]);
+}
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+const wasOpen=sessionModelWasOpenRef.current===true;
+sessionModelWasOpenRef.current=sessionModelOpen===true;
+if(wasOpen!==true||sessionModelOpen===true)return;
+const entry=sessionModelEntryRef.current;
+try{
+if(entry!==null&&entry!==undefined&&typeof entry.focus==="function")entry.focus();
+}catch{/* 宿主拒绝聚焦时忽略：关闭已经生效，焦点位置不是阻断条件。 */}
+},[sessionModelOpen]);
+}
+const updateSessionModelDraft=(role,field,value)=>{
+setSessionModelDrafts((previous)=>{
+const base=Object.prototype.hasOwnProperty.call(previous,role)
+?previous[role]
+:(()=>{
+const effective=sessionModelState.overrides[role]
+??normalizeSessionModelSelection(metaStateRef.current?.roleDefaults?.[role]);
+return{
+provider:effective?.provider??"",
+model:effective?.model??"",
+reasoningEffort:effective?.reasoningEffort??"",
+};
+})();
+const next={...base,[field]:value};
+const groups=sessionModelCatalog.groups;
+if(field==="provider"){
+const models=value===""?[]:sessionModelModelOptions(value,groups);
+const stillAvailable=next.model!==""
+&&models.some((candidate)=>text(object(candidate).id,null)===next.model);
+if(stillAvailable!==true){
+next.model="";
+next.reasoningEffort="";
+}
+}else if(field==="model"){
+const entry=sessionModelModelOptions(next.provider,groups)
+.find((candidate)=>text(object(candidate).id,null)===value);
+const defaultEffort=text(object(entry?.reasoning).defaultEffort,null);
+next.reasoningEffort=defaultEffort===null?"":defaultEffort;
+const efforts=Array.isArray(entry?.reasoning?.efforts)?entry.reasoning.efforts:[];
+if(next.reasoningEffort!==""
+&&efforts.every((effort)=>text(object(effort).id,null)!==next.reasoningEffort)){
+next.reasoningEffort="";
+}
+}
+return{...previous,[role]:next};
+});
+setSessionModelNotice(null);
+};
+const sessionModelBaselineOf=(role)=>sessionModelState.overrides[role]
+??normalizeSessionModelSelection(object(metaStateRef.current?.roleDefaults)[role]);
+const sessionModelPendingChanges=()=>{
+const changes=[];
+for(const role of sessionModelRolesOf(metaStateRef.current)){
+if(Object.prototype.hasOwnProperty.call(sessionModelDrafts,role)!==true)continue;
+const selection=sessionModelSelectionOfDraft(sessionModelDrafts[role]);
+if(selection.provider.length===0||selection.model.length===0)continue;
+if(sessionModelSelectionEquals(selection,sessionModelBaselineOf(role)))continue;
+changes.push({role,selection});
+}
+return changes;
+};
+const sessionModelHasInvalidDraft=()=>{
+for(const role of sessionModelRolesOf(metaStateRef.current)){
+if(Object.prototype.hasOwnProperty.call(sessionModelDrafts,role)!==true)continue;
+const selection=sessionModelSelectionOfDraft(sessionModelDrafts[role]);
+if(selection.provider.length===0||selection.model.length===0)return true;
+}
+return false;
+};
+const applySessionModelView=(view,role)=>{
+setSessionModelState({status:"ready",overrides:view.overrides,revision:view.revision,live:view.live});
+setSessionModelDrafts((previous)=>{
+if(Object.prototype.hasOwnProperty.call(previous,role)!==true)return previous;
+const next={...previous};
+delete next[role];
+return next;
+});
+};
+const settleSessionModelFailure=(error,role)=>{
+const roles=sessionModelRolesOf(metaStateRef.current);
+const code=text(object(error).code,null);
+const details=object(object(error).details);
+if(code==="session-override-conflict"){
+const currentRevision=Number.isSafeInteger(details.currentRevision)&&details.currentRevision>=0
+?details.currentRevision
+:null;
+const overrides=details.overrides===undefined
+?null
+:normalizeSessionModelOverrides(details.overrides,roles);
+setSessionModelState((previous)=>({
+...previous,
+status:"ready",
+revision:currentRevision===null?previous.revision:currentRevision,
+overrides:overrides===null?previous.overrides:overrides,
+}));
+setSessionModelNotice({
+kind:"conflict",
+role,
+text:t("sidebar.sessionModel.conflict",{
+revision:currentRevision===null?"?":currentRevision,
+}),
+});
+return;
+}
+const message=text(object(error).message,null);
+setSessionModelNotice({
+kind:"error",
+role,
+text:message===null
+?t("sidebar.sessionModel.unavailable")
+:t("sidebar.sessionModel.failed",{message}),
+});
+};
+const sessionModelWriteReady=()=>mountedRef.current===true
+&&sessionModelState.status==="ready"
+&&sessionModelState.live===true
+&&sessionModelSaving!==true
+&&rootSessionId!==""
+&&sidebarSessionId===rootSessionId;
+const commitSessionModelChanges=async()=>{
+if(sessionModelWriteReady()!==true)return;
+if(sessionModelHasInvalidDraft())return;
+const changes=sessionModelPendingChanges();
+if(changes.length===0)return;
+const targetSessionId=rootSessionId;
+const roles=sessionModelRolesOf(metaStateRef.current);
+setSessionModelSaving(true);
+setSessionModelNotice(null);
+let revision=sessionModelState.revision;
+try{
+for(const change of changes){
+const body=await callRpc(
+config,
+contextRef.current,
+{
+action:"session-override-set",
+sessionId:targetSessionId,
+role:change.role,
+expectedRevision:revision,
+selection:change.selection,
+},
+{},
+(value)=>object(value),
+);
+if(sidebarSurfaceStillCurrent()!==true)return;
+const view=normalizeSessionModelView(body,roles);
+if(view===null){
+setSessionModelNotice({kind:"error",role:change.role,text:t("sidebar.sessionModel.unavailable")});
+return;
+}
+revision=view.revision;
+applySessionModelView(view,change.role);
+}
+if(sidebarSurfaceStillCurrent()!==true)return;
+setSessionModelNotice({kind:"saved",revision});
+}catch(error){
+if(sidebarSurfaceStillCurrent()!==true)return;
+settleSessionModelFailure(error,changes[changes.length-1]?.role??null);
+}finally{
+if(sidebarSurfaceStillCurrent()===true)setSessionModelSaving(false);
+}
+};
+const clearSessionModelRole=async(role)=>{
+if(sessionModelWriteReady()!==true)return;
+if(sessionModelState.overrides[role]===undefined)return;
+const targetSessionId=rootSessionId;
+const roles=sessionModelRolesOf(metaStateRef.current);
+setSessionModelSaving(true);
+setSessionModelNotice(null);
 try{
 const body=await callRpc(
 config,
 contextRef.current,
-{action:"fanout-template-list",sessionId:targetSessionId},
+{
+action:"session-override-clear",
+sessionId:targetSessionId,
+role,
+expectedRevision:sessionModelState.revision,
+},
 {},
 (value)=>object(value),
 );
-if(mountedRef.current!==true||currentRootRef.current!==targetSessionId)return null;
-const templates=Array.isArray(body.templates)?body.templates.slice(0,32):[];
-const count=Number.isSafeInteger(body.count)&&body.count>=0?body.count:templates.length;
-const limit=Number.isSafeInteger(body.limit)&&body.limit>0?body.limit:32;
-setTemplatesState({status:"ready",templates,count,limit,message:null});
-return body;
+if(sidebarSurfaceStillCurrent()!==true)return;
+const view=normalizeSessionModelView(body,roles);
+if(view===null){
+setSessionModelNotice({kind:"error",role,text:t("sidebar.sessionModel.unavailable")});
+return;
+}
+applySessionModelView(view,role);
+setSessionModelNotice({kind:"cleared",role,revision:view.revision});
 }catch(error){
-if(mountedRef.current!==true)return null;
-const message=displayErrorMessage(error);
-setTemplatesState((previous)=>({...previous,status:"error",message}));
-const source=rpcFailureKindOf(error)===RPC_FAILURE_TRANSPORT
-?PANEL_ERROR_SOURCES.rpc
-:PANEL_ERROR_SOURCES.action;
-const at=Date.now();
-setState((previous)=>({...previous,error:{source,message,at}}));
-return null;
+if(sidebarSurfaceStillCurrent()!==true)return;
+settleSessionModelFailure(error,role);
 }finally{
-request.inFlight=false;
+if(sidebarSurfaceStillCurrent()===true)setSessionModelSaving(false);
 }
 };
 const surfaceTokenScopeRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
@@ -6283,7 +6638,10 @@ const usage=dshUsage!==null?dshUsage:usageOf(source);
 const measuredTps=dshThroughputOf(dsh);
 const dshLlmMs=dsh===null?null:dsh.llmMs;
 const dshDuration=dshLlmMs!==null&&dshLlmMs>0?dshLlmMs:null;
-const durationMs=dshDuration!==null?dshDuration:durationOfNode(source,runtimeStatus,sessionId);
+const turnDurationMs=finiteNumber(source.turnDurationMs);
+const durationMs=turnDurationMs!==null
+?turnDurationMs
+:(dshDuration!==null?dshDuration:durationOfNode(source,runtimeStatus,sessionId));
 const summary=typeof api?.summarizeUsageMetrics==="function"
 ?api.summarizeUsageMetrics(usage,{
 durationMs,
@@ -6299,7 +6657,7 @@ segments.push(react.createElement("span",{
 key:key+"-separator",
 className:"deg_expert_group_metrics_separator",
 "aria-hidden":"true",
-},"·"));
+}," · "));
 }
 segments.push(react.createElement("span",{
 key,
@@ -6309,7 +6667,12 @@ title:typeof titleValue==="string"?titleValue:textValue,
 };
 if(summary!==null){
 const toolDurationText=dsh===null||dsh.toolMs===null?null:formatCompactDuration(dsh.toolMs);
+const modelDurationText=dshDuration===null?null:formatCompactDuration(dshDuration);
 const durationTitle=summary.durationText===null?null
+:turnDurationMs!==null
+?"本轮用时 "+summary.durationText
++(modelDurationText===null?"":" · 模型用时 "+modelDurationText)
++(toolDurationText===null?"":" · 工具调用用时 "+toolDurationText)
 :dshDuration!==null
 ?"模型用时 "+summary.durationText+(toolDurationText===null?"":" · 工具调用用时 "+toolDurationText)
 :"运行时间 "+summary.durationText;
@@ -6634,252 +6997,6 @@ if(stillCurrent!==true)return;
 bump((value)=>value+1);
 await refreshRef.current();
 };
-const lastDispatchRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const emptyDispatchShard=()=>({name:"",prompt:"",affectedPaths:"",outputSchema:"",timeoutMs:""});
-const dispatchValidationError=(message)=>({error:message});
-const dispatchRoleChoices=()=>{
-const roles=[];
-const add=(role)=>{
-const id=text(role,null);
-if(id!==null&&roles.indexOf(id)===-1)roles.push(id);
-};
-if(meta!==null)for(const role of meta.roles)add(role);
-if(roles.length===0){
-const collect=(nodes,depth)=>{
-if(depth>8)return;
-for(const node of Array.isArray(nodes)?nodes:[]){
-const source=object(node);
-add(source.role);
-collect(source.children,depth+1);
-for(const shard of Array.isArray(source.shards)?source.shards:[])add(object(shard).role);
-}
-};
-collect(snapshot===null?[]:object(snapshot.root).children,0);
-}
-return roles;
-};
-const openDispatch=()=>{
-setDispatchError(null);
-setDispatchReceipt(null);
-setTemplateNotice(null);
-setDispatchDraft((previous)=>previous!==null?previous:{
-mode:"single",
-role:dispatchRoleChoices()[0]??"",
-prompt:"",
-basePrompt:"",
-shards:[emptyDispatchShard()],
-allowOverlap:false,
-concurrencyLimit:"",
-timeoutMs:"",
-name:"",
-});
-if(metaStateRef.current===null)void loadMeta();
-void loadTemplates();
-};
-const closeDispatch=()=>{
-setDispatchDraft(null);
-setDispatchError(null);
-};
-const updateDispatch=(patch)=>setDispatchDraft((previous)=>(
-previous===null?previous:{...previous,...object(patch)}
-));
-const updateDispatchShard=(index,patch)=>setDispatchDraft((previous)=>{
-if(previous===null)return previous;
-const shards=previous.shards.map((shard,position)=>(position===index?{...shard,...object(patch)}:shard));
-return{...previous,shards};
-});
-const addDispatchShard=()=>setDispatchDraft((previous)=>(
-previous===null?previous:{...previous,shards:previous.shards.concat([emptyDispatchShard()])}
-));
-const removeDispatchShard=(index)=>setDispatchDraft((previous)=>{
-if(previous===null||previous.shards.length<=1)return previous;
-return{...previous,shards:previous.shards.filter((_shard,position)=>position!==index)};
-});
-const buildDispatchShards=(draft)=>{
-const rows=Array.isArray(draft.shards)?draft.shards:[];
-if(rows.length===0)return dispatchValidationError("至少需要一个分片");
-const shards=[];
-for(let index=0;index<rows.length;index+=1){
-const row=object(rows[index]);
-const prompt=typeof row.prompt==="string"?row.prompt:"";
-if(prompt.trim()==="")return dispatchValidationError("分片 "+(index+1)+" 需要非空任务提示");
-const entry={prompt};
-const name=text(row.name,null);
-if(name!==null)entry.name=name;
-const affectedPaths=parsePathList(row.affectedPaths);
-if(affectedPaths.length>0)entry.affectedPaths=affectedPaths;
-const schemaText=typeof row.outputSchema==="string"?row.outputSchema.trim():"";
-if(schemaText!==""){
-let schema;
-try{schema=JSON.parse(schemaText);}catch{return dispatchValidationError("分片 "+(index+1)+" 的 outputSchema 不是合法 JSON");}
-if(schema===null||typeof schema!=="object"||Array.isArray(schema)){
-return dispatchValidationError("分片 "+(index+1)+" 的 outputSchema 必须是 JSON 对象");
-}
-entry.outputSchema=schema;
-}
-const shardTimeout=parsePositiveInteger(row.timeoutMs);
-if(shardTimeout!==null)entry.timeoutMs=shardTimeout;
-shards.push(entry);
-}
-return{shards};
-};
-const dispatchExtras=(draft)=>{
-const extras={allowOverlap:draft.allowOverlap===true};
-const timeoutMs=parsePositiveInteger(draft.timeoutMs);
-if(timeoutMs!==null)extras.timeoutMs=timeoutMs;
-const concurrencyLimit=parsePositiveInteger(draft.concurrencyLimit);
-if(concurrencyLimit!==null)extras.concurrencyLimit=concurrencyLimit;
-return extras;
-};
-const buildDispatchRequest=(draft)=>{
-const source=object(draft);
-const mode=source.mode==="fanout"?"fanout":"single";
-const role=text(source.role,null);
-if(role===null)return dispatchValidationError("请选择专家角色");
-const request={
-action:"fanout-dispatch",
-mode,
-role,
-...dispatchExtras(source),
-requestId:newDispatchRequestId(),
-};
-if(mode==="single"){
-const prompt=typeof source.prompt==="string"?source.prompt:"";
-if(prompt.trim()==="")return dispatchValidationError("请输入任务提示");
-request.prompt=prompt;
-return{request};
-}
-const basePrompt=typeof source.basePrompt==="string"?source.basePrompt:"";
-if(basePrompt.trim()==="")return dispatchValidationError("请输入公共目标");
-const built=buildDispatchShards(source);
-if(built.error!==undefined)return built;
-request.basePrompt=basePrompt;
-request.shards=built.shards;
-return{request};
-};
-const buildTemplateRequest=(draft)=>{
-const source=object(draft);
-const name=text(source.name,null);
-if(name===null)return dispatchValidationError("请填写模板名称");
-const mode=source.mode==="fanout"?"fanout":"single";
-const request={action:"fanout-template-save",name,...dispatchExtras(source)};
-const role=text(source.role,null);
-if(role===null)return dispatchValidationError("请选择专家角色");
-request.role=role;
-if(mode==="single"){
-const prompt=typeof source.prompt==="string"?source.prompt:"";
-if(prompt.trim()==="")return dispatchValidationError("请输入任务提示");
-request.prompt=prompt;
-return{request};
-}
-const basePrompt=typeof source.basePrompt==="string"?source.basePrompt:"";
-if(basePrompt.trim()==="")return dispatchValidationError("请输入公共目标");
-const built=buildDispatchShards(source);
-if(built.error!==undefined)return built;
-request.basePrompt=basePrompt;
-request.shards=built.shards;
-return{request};
-};
-const dispatchReceiptOf=(value)=>{
-const source=object(value);
-const continuation=object(source.continuation);
-return{
-parentTaskId:text(source.parentTaskId,null),
-mode:text(source.mode,null),
-role:text(source.role,null),
-duplicate:source.duplicate===true,
-round:finiteNumber(source.round),
-continuation:Object.keys(continuation).length===0?null:{
-parentTaskId:text(continuation.parentTaskId,null),
-round:finiteNumber(continuation.round),
-running:continuation.running===true,
-reusable:continuation.reusable===true,
-},
-};
-};
-const submitDispatch=async()=>{
-if(dispatchDraft===null||pendingSet.current.has("dispatch"))return;
-const built=buildDispatchRequest(dispatchDraft);
-if(built.error!==undefined){setDispatchError(built.error);return;}
-setDispatchError(null);
-setTemplateNotice(null);
-const result=await runAction(built.request,"dispatch",false,"",{
-includeErrorCode:true,
-safeMessage:true,
-refreshMeta:true,
-});
-if(result===null)return;
-const replayable={...built.request};
-delete replayable.requestId;
-lastDispatchRef.current=replayable;
-setDispatchReceipt(dispatchReceiptOf(result));
-setDispatchDraft(null);
-};
-const replayLastDispatch=async()=>{
-const last=object(lastDispatchRef.current);
-if(text(last.action,null)!=="fanout-dispatch")return;
-if(pendingSet.current.has("dispatch-replay"))return;
-setDispatchError(null);
-setTemplateNotice(null);
-const result=await runAction({...last,requestId:newDispatchRequestId()},"dispatch-replay",false,"",{
-includeErrorCode:true,
-safeMessage:true,
-refreshMeta:true,
-});
-if(result===null)return;
-setDispatchReceipt(dispatchReceiptOf(result));
-};
-const saveDispatchTemplate=async()=>{
-if(dispatchDraft===null||pendingSet.current.has("template-save"))return;
-const built=buildTemplateRequest(dispatchDraft);
-if(built.error!==undefined){setDispatchError(built.error);return;}
-setDispatchError(null);
-setTemplateNotice(null);
-const result=await runAction(built.request,"template-save",false,"",{
-includeErrorCode:true,
-safeMessage:true,
-});
-if(result===null)return;
-const count=Number.isSafeInteger(result.count)?result.count:null;
-setTemplateNotice(count===null?"模板已保存":"模板已保存（共 "+count+" 个）");
-await loadTemplates();
-};
-const dispatchTemplateById=async(template)=>{
-const id=text(object(template).id,null);
-if(id===null)return;
-const key="template-dispatch:"+id;
-if(pendingSet.current.has(key))return;
-setDispatchError(null);
-setTemplateNotice(null);
-const result=await runAction(
-{action:"fanout-template-dispatch",templateId:id,requestId:newDispatchRequestId()},
-key,
-false,
-"",
-{includeErrorCode:true,safeMessage:true,refreshMeta:true},
-);
-if(result===null)return;
-setDispatchReceipt(dispatchReceiptOf(result));
-setDispatchDraft(null);
-};
-const deleteTemplateById=async(template)=>{
-const id=text(object(template).id,null);
-if(id===null)return;
-const key="template-delete:"+id;
-if(pendingSet.current.has(key))return;
-const title=text(object(template).name,id);
-setTemplateNotice(null);
-const result=await runAction(
-{action:"fanout-template-delete",templateId:id},
-key,
-true,
-"确认删除模板 "+title+"？",
-{includeErrorCode:true,safeMessage:true},
-);
-if(result===null)return;
-setTemplateNotice("模板已删除");
-await loadTemplates();
-};
 const renderAction=(label,Icon,onClick,pending)=>react.createElement("button",{
 type:"button",className:"deg_expert_group_action",title:pending?label+"（处理中）":label,
 "aria-label":pending?label+"（处理中）":label,"aria-busy":pending||undefined,disabled:pending,onClick,
@@ -7024,226 +7141,331 @@ const visibleIdleChildren=filterActive===true?idleChildren.filter((node)=>passes
 const rootBatchSlot=filterActive===true?null:renderSidebarBatchSlot(runningSidebarResourceAddresses(),"运行中的子代理");
 const idleBatchSlot=filterActive===true?null:renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren),t("sidebar.idleGroup.name"));
 const root=snapshot?.root;
-const renderDispatchField=(label,control)=>react.createElement("label",{className:"deg_expert_group_dispatch_field"},
-react.createElement("span",{className:"deg_expert_group_dispatch_label"},label),
-control);
-const renderDispatchForm=()=>{
-if(dispatchDraft===null)return null;
-const draft=dispatchDraft;
-const roles=dispatchRoleChoices();
-const pending=pendingSet.current.has("dispatch");
-const saving=pendingSet.current.has("template-save");
-const mode=draft.mode==="fanout"?"fanout":"single";
-const shards=Array.isArray(draft.shards)?draft.shards:[];
-const textInput=(label,ariaLabel,value,onChange)=>renderDispatchField(label,react.createElement("input",{
-type:"text",
-className:"deg_expert_group_dispatch_input",
-"aria-label":ariaLabel,
-value:value,
-onChange:(event)=>onChange(event?.target?.value??""),
-}));
-const option=(value,label)=>react.createElement("option",{key:value,value},label);
-const promptValue=mode==="single"?draft.prompt:draft.basePrompt;
-const promptControl=react.createElement("textarea",{
-className:"deg_expert_group_dispatch_input deg_expert_group_dispatch_textarea",
-"aria-label":mode==="single"?"任务提示":"公共目标",
-rows:3,
-value:promptValue,
-onChange:(event)=>{
-const value=event?.target?.value??"";
-updateDispatch(mode==="single"?{prompt:value}:{basePrompt:value});
-},
-});
-const shardSection=mode==="fanout"
-?react.createElement("div",{className:"deg_expert_group_dispatch_shards",role:"group","aria-label":"分片列表"},
-...shards.map((value,index)=>{
-const shard=object(value);
-return react.createElement("div",{
-key:"dispatch-shard-"+index,
-className:"deg_expert_group_dispatch_shard",
-role:"group",
-"aria-label":"分片 "+(index+1),
-},
-react.createElement("div",{className:"deg_expert_group_dispatch_shard_head"},
-react.createElement("span",null,"分片 "+(index+1)),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":"删除分片 "+(index+1),
-disabled:shards.length<=1,
-onClick:()=>removeDispatchShard(index),
-},"删除")),
-textInput("名称","分片 "+(index+1)+" 名称",text(shard.name,""),
-(next)=>updateDispatchShard(index,{name:next})),
-renderDispatchField("任务提示",react.createElement("textarea",{
-className:"deg_expert_group_dispatch_input deg_expert_group_dispatch_textarea",
-"aria-label":"分片 "+(index+1)+" 任务提示",
-rows:2,
-value:typeof shard.prompt==="string"?shard.prompt:"",
-onChange:(event)=>updateDispatchShard(index,{prompt:event?.target?.value??""}),
-})),
-textInput("影响范围（逗号/换行分隔）","分片 "+(index+1)+" 影响范围",typeof shard.affectedPaths==="string"?shard.affectedPaths:"",
-(next)=>updateDispatchShard(index,{affectedPaths:next})),
-renderDispatchField("outputSchema（可选 JSON 对象）",react.createElement("textarea",{
-className:"deg_expert_group_dispatch_input deg_expert_group_dispatch_textarea",
-"aria-label":"分片 "+(index+1)+" 输出 schema",
-rows:2,
-value:typeof shard.outputSchema==="string"?shard.outputSchema:"",
-onChange:(event)=>updateDispatchShard(index,{outputSchema:event?.target?.value??""}),
-})),
-textInput("超时（毫秒，可选）","分片 "+(index+1)+" 超时",typeof shard.timeoutMs==="string"?shard.timeoutMs:String(shard.timeoutMs??""),
-(next)=>updateDispatchShard(index,{timeoutMs:next})));
-}),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":"添加分片",
-onClick:addDispatchShard,
-},"添加分片"))
-:null;
-return react.createElement("section",{
-className:"deg_expert_group_dispatch",
-role:"form",
-"aria-label":"新建任务",
-"data-mode":mode,
-},
-react.createElement("div",{className:"deg_expert_group_dispatch_head"},
-react.createElement("span",null,"新建任务"),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":"关闭新建任务",
-onClick:closeDispatch,
-},"关闭")),
-react.createElement("div",{className:"deg_expert_group_dispatch_row"},
-renderDispatchField("模式",react.createElement("select",{
-className:"deg_expert_group_filter",
-"aria-label":"派发模式",
-value:mode,
-onChange:(event)=>updateDispatch({mode:event?.target?.value==="fanout"?"fanout":"single"}),
-},option("single","单专家"),option("fanout","fan-out"))),
-renderDispatchField("角色",react.createElement("select",{
-className:"deg_expert_group_filter",
-"aria-label":"派发角色",
-value:text(draft.role,""),
-onChange:(event)=>updateDispatch({role:event?.target?.value??""}),
-},
-roles.length===0?option("","（暂无可用角色）"):null,
-...roles.map((role)=>option(role,roleLabelFor(role,null)??role))))),
-renderDispatchField(mode==="single"?"任务提示":"公共目标",promptControl),
-shardSection,
-react.createElement("div",{className:"deg_expert_group_dispatch_row"},
-react.createElement("label",{className:"deg_expert_group_dispatch_check"},
-react.createElement("input",{
-type:"checkbox",
-"aria-label":"允许影响范围重叠",
-checked:draft.allowOverlap===true,
-onChange:(event)=>updateDispatch({allowOverlap:event?.target?.checked===true}),
-}),
-react.createElement("span",null,"允许影响范围重叠")),
-textInput("并发上限","并发上限",String(draft.concurrencyLimit??""),
-(next)=>updateDispatch({concurrencyLimit:next})),
-textInput("任务超时（毫秒）","任务超时",String(draft.timeoutMs??""),
-(next)=>updateDispatch({timeoutMs:next}))),
-textInput("模板名称（保存模板时必填）","模板名称",String(draft.name??""),
-(next)=>updateDispatch({name:next})),
-dispatchError===null
+const renderSessionModelDialog=()=>{
+if(sessionModelOpen!==true)return null;
+const status=sessionModelState.status;
+const roles=sessionModelRolesOf(meta);
+const groups=Array.isArray(sessionModelCatalog.groups)?sessionModelCatalog.groups:[];
+const writable=status==="ready"&&sessionModelState.live===true&&sessionModelSaving!==true;
+const readOnlyReasons={
+"no-session":t("sidebar.sessionModel.noSession"),
+child:t("sidebar.sessionModel.child"),
+loading:t("sidebar.sessionModel.loading"),
+unsupported:t("sidebar.sessionModel.unsupported"),
+error:t("sidebar.sessionModel.unavailable"),
+unavailable:t("sidebar.sessionModel.unavailable"),
+};
+const readOnlyHint=status==="ready"
+?(sessionModelState.live===true?null:t("sidebar.sessionModel.offline"))
+:(readOnlyReasons[status]??null);
+const noticeText=sessionModelNotice===null
 ?null
-:react.createElement("div",{className:"deg_expert_group_dispatch_error",role:"alert"},dispatchError),
-react.createElement("div",{className:"deg_expert_group_dispatch_actions"},
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":"派发任务",
-"aria-busy":pending||undefined,
-disabled:pending,
-onClick:()=>{void submitDispatch();},
-},pending?"派发中…":"派发"),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":"保存为模板",
-"aria-busy":saving||undefined,
-disabled:saving,
-onClick:()=>{void saveDispatchTemplate();},
-},saving?"保存中…":"保存为模板")),
-templateNotice===null?null:react.createElement("div",{className:"deg_expert_group_dispatch_notice",role:"status"},templateNotice),
-renderTemplates());
+:sessionModelNotice.kind==="saved"
+?t("sidebar.sessionModel.saved")
+:sessionModelNotice.kind==="cleared"
+?t("sidebar.sessionModel.cleared")
+:sessionModelNotice.text;
+const noticeError=sessionModelNotice?.kind==="error"||sessionModelNotice?.kind==="conflict";
+const changes=status==="ready"?sessionModelPendingChanges():[];
+const invalidDraft=status==="ready"&&sessionModelHasInvalidDraft();
+const canSave=writable===true&&changes.length>0&&invalidDraft!==true;
+const closeDialog=(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+setSessionModelOpen(false);
 };
-const renderTemplates=()=>{
-if(dispatchDraft===null)return null;
-const status=templatesState.status;
-const templates=templatesState.templates.slice(0,32);
-const rows=templates.map((value)=>{
-const template=object(value);
-const id=text(template.id,null);
-const title=text(template.name,"（未命名模板）");
-const role=text(template.role,null);
-const roleText=roleLabelFor(role,null)??"—";
-const mode=template.mode==="fanout"?"fan-out":"单专家";
-const shardCount=Array.isArray(template.shards)?template.shards.length:0;
-const hasSchema=Array.isArray(template.shards)&&template.shards.some((shard)=>object(shard).hasOutputSchema===true);
-const preview=text(template.preview,null);
-const dispatching=id===null||pendingSet.current.has("template-dispatch:"+id);
-const deleting=id===null||pendingSet.current.has("template-delete:"+id);
-return react.createElement("div",{
-key:id??title+"-"+String(template.createdAt),
-className:"deg_expert_group_template",
-role:"listitem",
-"data-template-id":id??undefined,
-},
-react.createElement("div",{className:"deg_expert_group_template_name",title},title),
-react.createElement("div",{className:"deg_expert_group_template_meta"},
-mode+" · "+roleText+(mode==="fan-out"?" · "+shardCount+" 分片":"")+(hasSchema?" · 含输出契约":"")),
-preview===null?null:react.createElement("div",{className:"deg_expert_group_template_preview",title:preview},preview),
-react.createElement("div",{className:"deg_expert_group_template_actions"},
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":"从模板派发 "+title,
-disabled:dispatching,
-onClick:()=>{void dispatchTemplateById(template);},
-},"从模板派发"),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":"删除模板 "+title,
-disabled:deleting,
-onClick:()=>{void deleteTemplateById(template);},
-},"删除")));
-});
-return react.createElement("div",{className:"deg_expert_group_templates",role:"group","aria-label":"任务模板"},
-react.createElement("div",{className:"deg_expert_group_templates_head"},
-react.createElement("span",null,"模板 "+templatesState.count+"/"+templatesState.limit),
-status==="loading"?react.createElement("span",{role:"status"},"读取中…"):null),
-status==="error"&&templatesState.message!==null
-?react.createElement("div",{className:"deg_expert_group_dispatch_error",role:"status"},templatesState.message)
-:null,
-status==="ready"&&rows.length===0
-?react.createElement("div",{className:"deg_expert_group_templates_empty"},"还没有保存的模板")
-:null,
-...rows);
+const optionOf=(value,label,disabled)=>react.createElement("option",{
+key:"opt:"+(disabled===true?"disabled:":"")+value,
+value,
+...(disabled===true?{disabled:true}:{}),
+},label);
+const headRow=react.createElement("div",{
+key:"__head",
+className:"deg_expert_group_session_model_row",
+role:"row",
+"data-deg-session-model-head":"true",
+},[
+react.createElement("span",{
+key:"role",
+role:"columnheader",
+className:"deg_expert_group_session_model_head_cell",
+},t("sidebar.sessionModel.columnRole")),
+react.createElement("span",{
+key:"provider",
+role:"columnheader",
+className:"deg_expert_group_session_model_head_cell",
+},t("sidebar.sessionModel.provider")),
+react.createElement("span",{
+key:"model",
+role:"columnheader",
+className:"deg_expert_group_session_model_head_cell",
+},t("sidebar.sessionModel.columnModel")),
+react.createElement("span",{
+key:"effort",
+role:"columnheader",
+className:"deg_expert_group_session_model_head_cell",
+},t("sidebar.sessionModel.effort")),
+]);
+const rows=[];
+if(status==="ready"){
+for(const role of roles){
+const current=sessionModelState.overrides[role]??null;
+const globalDefault=normalizeSessionModelSelection(object(meta?.roleDefaults)[role]);
+const hasDraft=Object.prototype.hasOwnProperty.call(sessionModelDrafts,role);
+const baseline=current??globalDefault;
+const editable=hasDraft
+?sessionModelDrafts[role]
+:{
+provider:baseline?.provider??"",
+model:baseline?.model??"",
+reasoningEffort:baseline?.reasoningEffort??"",
 };
-const renderDispatchReceipt=()=>{
-if(dispatchReceipt===null)return null;
-const receipt=dispatchReceipt;
-const continuation=object(receipt.continuation);
-const roleText=roleLabelFor(receipt.role,null)??receipt.role??"—";
-const lines=[
-"已派发父任务："+(receipt.parentTaskId??"—")+" · 角色 "+roleText+(receipt.mode==="fanout"?" · fan-out":" · 单专家"),
-];
-if(receipt.duplicate===true)lines.push("Host 判定为重复提交（幂等命中，未新建任务）");
-if(Object.keys(continuation).length>0){
-lines.push("续作句柄：parentTaskId "+(text(continuation.parentTaskId,null)??"—")
-+(finiteNumber(continuation.round)===null?"":" · 第 "+finiteNumber(continuation.round)+" 轮")
-+" · "+(continuation.running===true?"运行中":(continuation.reusable===true?"可续作":"已结束")));
+const providerValue=typeof editable.provider==="string"?editable.provider:"";
+const modelValue=typeof editable.model==="string"?editable.model:"";
+const effortValue=typeof editable.reasoningEffort==="string"?editable.reasoningEffort:"";
+const roleLabel=roleLabelFor(role,null)??role;
+const providerGroup=groups.find((group)=>text(object(group).id,null)===providerValue);
+const models=sessionModelModelOptions(providerValue,groups);
+const modelEntry=models.find((candidate)=>text(object(candidate).id,null)===modelValue);
+const reasoningRaw=modelEntry?.reasoning;
+const reasoning=reasoningRaw!==null&&typeof reasoningRaw==="object"&&Array.isArray(reasoningRaw)!==true
+?reasoningRaw
+:null;
+const efforts=Array.isArray(reasoning?.efforts)?reasoning.efforts:[];
+const providerOptions=[optionOf("","未选择供应商")];
+if(providerValue!==""&&providerGroup===undefined){
+providerOptions.push(optionOf(providerValue,providerValue+"（不可用）",true));
 }
-return react.createElement("div",{
-className:"deg_expert_group_dispatch_receipt",
+for(const group of groups){
+const id=text(object(group).id,null);
+if(id===null||id==="")continue;
+providerOptions.push(optionOf(id,text(object(group).name,null)??id));
+}
+const modelOptions=[];
+if(providerValue===""){
+modelOptions.push(optionOf("","先选择供应商",true));
+}else{
+modelOptions.push(optionOf("","未选择模型"));
+if(modelValue!==""&&modelEntry===undefined){
+modelOptions.push(optionOf(modelValue,modelValue+"（不可用）",true));
+}
+for(const candidate of models){
+const id=text(object(candidate).id,null);
+if(id===null||id==="")continue;
+modelOptions.push(optionOf(id,text(object(candidate).name,null)??id));
+}
+}
+const effortOptions=[];
+if(reasoning===null){
+effortOptions.push(optionOf("",providerValue===""?"先选择模型":"模型无思考深度",true));
+}else{
+effortOptions.push(optionOf("",t("sidebar.sessionModel.effortDefault")));
+for(const effort of efforts){
+const id=text(object(effort).id,null);
+if(id===null||id==="")continue;
+effortOptions.push(optionOf(id,text(object(effort).name,null)??id));
+}
+if(effortValue!==""
+&&efforts.every((effort)=>text(object(effort).id,null)!==effortValue)){
+effortOptions.push(optionOf(effortValue,effortValue+"（不可用）",true));
+}
+}
+const pillChildren=[
+react.createElement("span",{
+key:"label",
+className:"deg_expert_group_session_model_pill_label",
+title:roleLabel,
+},roleLabel),
+];
+if(current!==null){
+pillChildren.push(react.createElement("button",{
+key:"clear",
+type:"button",
+className:"deg_expert_group_session_model_clear",
+"data-deg-session-model-clear":role,
+"aria-label":t("sidebar.sessionModel.clearRole",{role:roleLabel}),
+title:t("sidebar.sessionModel.clearRole",{role:roleLabel}),
+disabled:writable!==true,
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+void clearSessionModelRole(role);
+},
+},"×"));
+}
+rows.push(react.createElement("div",{
+key:role,
+className:"deg_expert_group_session_model_row",
+role:"row",
+"data-deg-session-model-role":role,
+"data-deg-session-model-state":current!==null?"override":"follow",
+},[
+react.createElement("div",{
+key:"role",
+role:"cell",
+className:"deg_expert_group_session_model_cell",
+},react.createElement("span",{className:"deg_expert_group_session_model_pill"},pillChildren)),
+react.createElement("div",{
+key:"provider",
+role:"cell",
+className:"deg_expert_group_session_model_cell",
+},react.createElement("select",{
+className:"deg_expert_group_session_model_select",
+"aria-label":roleLabel+" "+t("sidebar.sessionModel.provider"),
+"data-deg-session-model-field":"provider",
+value:providerValue,
+disabled:writable!==true,
+onChange:(event)=>updateSessionModelDraft(role,"provider",event?.target?.value??""),
+},providerOptions)),
+react.createElement("div",{
+key:"model",
+role:"cell",
+className:"deg_expert_group_session_model_cell",
+},react.createElement("select",{
+className:"deg_expert_group_session_model_select",
+"aria-label":roleLabel+" "+t("sidebar.sessionModel.columnModel"),
+"data-deg-session-model-field":"model",
+value:modelValue,
+disabled:writable!==true||providerValue===""||providerGroup===undefined,
+onChange:(event)=>updateSessionModelDraft(role,"model",event?.target?.value??""),
+},modelOptions)),
+react.createElement("div",{
+key:"effort",
+role:"cell",
+className:"deg_expert_group_session_model_cell",
+},react.createElement("select",{
+className:"deg_expert_group_session_model_select",
+"aria-label":roleLabel+" "+t("sidebar.sessionModel.effort"),
+"data-deg-session-model-field":"effort",
+value:effortValue,
+disabled:writable!==true||reasoning===null||modelValue==="",
+onChange:(event)=>updateSessionModelDraft(role,"reasoningEffort",event?.target?.value??""),
+},effortOptions)),
+]));
+}
+}
+const bodyChildren=[
+react.createElement("p",{key:"hint",className:"deg_expert_group_session_model_hint"},
+t("sidebar.sessionModel.hint")),
+];
+if(readOnlyHint!==null){
+bodyChildren.push(react.createElement("div",{
+key:"readonly",
+className:"deg_expert_group_session_model_hint",
+"data-deg-session-model-readonly":status,
+},readOnlyHint));
+}
+if(status==="error"){
+bodyChildren.push(react.createElement("button",{
+key:"retry",
+type:"button",
+className:"deg_expert_group_export_button",
+"data-deg-session-model-retry":"true",
+"aria-label":t("sidebar.sessionModel.retry"),
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+setSessionModelReloadToken((value)=>value+1);
+},
+},t("sidebar.sessionModel.retry")));
+}
+if(noticeText!==null){
+bodyChildren.push(react.createElement("div",{
+key:"notice",
+className:noticeError
+?"deg_expert_group_session_model_notice deg_expert_group_session_model_notice_error"
+:"deg_expert_group_session_model_notice",
 role:"status",
-"data-parent-task-id":receipt.parentTaskId??undefined,
-title:lines.join(" "),
-},...lines.map((line,index)=>react.createElement("div",{key:"receipt-line-"+index},line)));
+"data-deg-session-model-notice":sessionModelNotice?.kind??"none",
+},noticeText));
+}
+if(roles.length===0){
+bodyChildren.push(react.createElement("div",{
+key:"empty",
+className:"deg_expert_group_session_model_hint",
+},t("sidebar.sessionModel.emptyRoles")));
+}
+if(status==="ready"){
+bodyChildren.push(react.createElement("div",{
+key:"table",
+className:"deg_expert_group_session_model_scroll",
+},react.createElement("div",{
+role:"table",
+"aria-label":t("sidebar.sessionModel.tableLabel"),
+className:"deg_expert_group_session_model_table",
+},[headRow,...rows])));
+}
+const footer=react.createElement("footer",{
+key:"footer",
+className:"deg_expert_group_session_model_footer",
+},[
+react.createElement("span",{
+key:"revision",
+className:"deg_expert_group_session_model_revision",
+"data-deg-session-model-revision":sessionModelState.revision,
+},t("sidebar.sessionModel.revision",{revision:sessionModelState.revision})),
+invalidDraft===true
+?react.createElement("span",{
+key:"invalid",
+className:"deg_expert_group_session_model_invalid",
+role:"status",
+"data-deg-session-model-invalid":"true",
+},t("sidebar.sessionModel.invalidDraft"))
+:null,
+react.createElement("span",{key:"spacer",className:"deg_expert_group_session_model_spacer"}),
+react.createElement("button",{
+key:"close",
+type:"button",
+className:"deg_expert_group_export_button",
+"data-deg-session-model-close":"footer",
+onClick:closeDialog,
+},t("sidebar.sessionModel.close")),
+react.createElement("button",{
+key:"save",
+type:"button",
+className:"deg_expert_group_session_model_primary",
+"data-deg-session-model-save":"true",
+"aria-label":t("sidebar.sessionModel.saveChanges"),
+disabled:canSave!==true,
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+void commitSessionModelChanges();
+},
+},t("sidebar.sessionModel.saveChanges")),
+]);
+return react.createElement("dialog",{
+id:"deg-session-model-dialog",
+className:"deg_expert_group_session_model_dialog",
+"aria-labelledby":"deg-session-model-title",
+"data-deg-session-model":"dialog",
+"data-deg-session-model-state":status,
+ref:sessionModelDialogRef,
+onCancel:closeDialog,
+onClose:()=>{setSessionModelOpen(false);},
+onClick:(event)=>{
+if(sessionModelDialogRef.current!==null
+&&event?.target===sessionModelDialogRef.current){
+setSessionModelOpen(false);
+}
+},
+},
+react.createElement("header",{className:"deg_expert_group_session_model_header"},
+react.createElement("h2",{
+id:"deg-session-model-title",
+className:"deg_expert_group_session_model_title",
+},t("sidebar.sessionModel.title")),
+react.createElement("button",{
+type:"button",
+className:"deg_expert_group_export_button",
+"data-deg-session-model-close":"true",
+"aria-label":t("sidebar.sessionModel.close"),
+onClick:closeDialog,
+},"×")),
+react.createElement("div",{
+className:"deg_expert_group_session_model_body",
+},bodyChildren),
+footer);
 };
 const renderToolbar=()=>{
 if(snapshot===null)return null;
@@ -7291,28 +7513,18 @@ react.createElement("option",{key:"__all_statuses",value:""},t("sidebar.filter.a
 react.createElement("button",{
 type:"button",
 className:"deg_expert_group_export_button",
-"aria-label":"新建任务",
-title:"手动派发单专家或 fan-out 任务",
+"aria-label":t("sidebar.sessionModel.open"),
+"aria-expanded":sessionModelOpen,
+"aria-haspopup":"dialog",
+"aria-controls":"deg-session-model-dialog",
+ref:sessionModelEntryRef,
+title:t("sidebar.sessionModel.openTitle"),
 onClick:(event)=>{
 event?.preventDefault?.();
 event?.stopPropagation?.();
-openDispatch();
+setSessionModelOpen((previous)=>previous!==true);
 },
-},"新建任务"),
-lastDispatchRef.current===null
-?null
-:react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":"重放上次派发",
-title:"用上一次成功派发的参数再派发一次（新任务）",
-disabled:pendingSet.current.has("dispatch-replay"),
-onClick:(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-void replayLastDispatch();
-},
-},"重放上次"));
+},t("sidebar.sessionModel.open")));
 };
 const rootOpen=root===null?true:expand(root);
 const idleGroupVisible=!(filterActive===true&&visibleIdleChildren.length===0);
@@ -7376,8 +7588,6 @@ const body=viewState.loading&&snapshot===null
 ?react.createElement("div",{className:"deg_expert_group_empty"},t("sidebar.empty"))
 :react.createElement("div",{className:"deg_expert_group_tree"},
 renderToolbar(),
-renderDispatchForm(),
-renderDispatchReceipt(),
 react.createElement("div",{className:"deg_expert_group_tree_items",role:"tree","aria-label":"专家任务树"},
 react.createElement("div",{className:"deg_expert_group_node deg_expert_group_node_root",role:"none","data-root":"true"},
 react.createElement("div",{
@@ -7467,7 +7677,8 @@ className:"deg_expert_group_error",
 "data-error-source":panelError.source,
 title:panelError.message,
 },panelErrorLabel),
-refreshButton),recoveryBanner,body);
+refreshButton),recoveryBanner,body,
+renderSessionModelDialog());
 }
 Panel.displayName="ExpertGroupPanel";
 return Panel;
@@ -10666,31 +10877,6 @@ const SETTINGS_ZH_FALLBACK=Object.freeze({
 "settings.testNotification.sending":"发送中…",
 "settings.testNotification.sent":"已发送测试通知",
 "settings.testNotification.disabled":"通知已关闭，未发送测试通知",
-"settings.sessionOverride.title":"仅本会话模型覆盖",
-"settings.sessionOverride.hint":"只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
-"settings.sessionOverride.noSession":"未打开会话：打开一个会话后可在此临时覆盖角色模型。",
-"settings.sessionOverride.child":"当前是子代理会话，会话级模型覆盖只读。",
-"settings.sessionOverride.loading":"正在读取本会话覆盖…",
-"settings.sessionOverride.unavailable":"本会话覆盖读取失败，请稍后重试。",
-"settings.sessionOverride.unsupported":"当前宿主版本不支持会话级模型覆盖。",
-"settings.sessionOverride.offline":"会话未运行：会话级覆盖只读。",
-"settings.sessionOverride.followGlobal":"跟随全局默认",
-"settings.sessionOverride.override":"本会话覆盖",
-"settings.sessionOverride.revision":"代次 {revision}",
-"settings.sessionOverride.provider":"供应商",
-"settings.sessionOverride.model":"模型",
-"settings.sessionOverride.effort":"思考深度",
-"settings.sessionOverride.effortDefault":"模型默认",
-"settings.sessionOverride.save":"保存覆盖",
-"settings.sessionOverride.clear":"清除",
-"settings.sessionOverride.saving":"保存中…",
-"settings.sessionOverride.saved":"已保存本会话覆盖",
-"settings.sessionOverride.cleared":"已清除，恢复全局默认",
-"settings.sessionOverride.conflict":"其他页面已修改本会话覆盖（当前代次 {revision}）；你的输入已保留，请确认后重试。",
-"settings.sessionOverride.failed":"保存失败：{message}",
-"settings.sessionOverride.retry":"重新读取",
-"settings.sessionOverride.globalSummary":"全局：{provider} / {model}",
-"settings.sessionOverride.emptyGlobal":"未配置全局默认",
 });
 function settingsText(locale,key,vars){
 const model=localeModelApi();
@@ -10934,24 +11120,6 @@ const css=""+
 "@media (max-width:520px){.deg_settings_notification_row{flex-wrap:wrap;row-gap:12px}.deg_settings_notification_row>.deg_settings_control{flex-basis:100%}}"+
 ".deg_settings_notification_events_row{display:flex;align-items:center;gap:16px;flex-wrap:wrap;min-width:0}"+
 ".deg_settings_notification_events{display:flex;align-items:center;flex-wrap:wrap;gap:16px 20px;min-width:0}"+
-".deg_so_section{display:flex;flex-direction:column;gap:10px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}"+
-".deg_so_title{font-size:14px;line-height:22px;font-weight:600;margin:0;color:var(--dsw-alias-label-primary)}"+
-".deg_so_hint{font-size:12px;line-height:18px;margin:0;color:var(--dsw-alias-label-secondary)}"+
-".deg_so_rows{display:flex;flex-direction:column;gap:10px;min-width:0}"+
-".deg_so_row{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);min-width:0}"+
-".deg_so_row_head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;min-width:0}"+
-".deg_so_role{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary)}"+
-".deg_so_state{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere;text-align:right}"+
-".deg_so_fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr) minmax(0,.9fr);gap:10px;min-width:0}"+
-".deg_so_field{display:flex;flex-direction:column;gap:4px;min-width:0}"+
-".deg_so_field_label{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}"+
-".deg_so_input{width:100%;min-width:0;box-sizing:border-box;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}"+
-".deg_so_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}"+
-".deg_so_input:disabled{opacity:.5;cursor:not-allowed}"+
-".deg_so_actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}"+
-".deg_so_actions .deg_btn{flex:0 0 auto;min-width:88px}"+
-".deg_so_actions .deg_so_state{margin-right:auto}"+
-"@media (max-width:520px){.deg_so_fields{grid-template-columns:minmax(0,1fr)}.deg_so_state{text-align:left}}"+
 ".deg_settings_diagnostics{display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}"+
 ".deg_settings_diagnostics_title{font-size:14px;line-height:22px;font-weight:600;margin:0;color:var(--dsw-alias-label-primary)}"+
 ".deg_settings_diagnostic_group{display:flex;flex-direction:column;gap:6px;min-width:0}"+
@@ -15803,389 +15971,6 @@ react.createElement(ModelConfigDisclosure,{section,onToggle:()=>setOpen((value)=
 body,
 open?removeConfirmDialog:null);
 }
-const EMPTY_SESSION_LIST_STORE=Object.freeze({
-subscribe:()=>()=>{},
-getSnapshot:()=>null,
-});
-function sessionListStoreOf(ctx){
-try{
-const list=ctx?.sessions?.list;
-if(list!==null&&typeof list==="object"
-&&typeof list.subscribe==="function"&&typeof list.getSnapshot==="function"){
-return{
-subscribe:(callback)=>list.subscribe(callback),
-getSnapshot:()=>list.getSnapshot(),
-};
-}
-}catch{/* Cordis 未声明服务读取即抛错：按没有会话列表降级。 */}
-return EMPTY_SESSION_LIST_STORE;
-}
-function normalizeSessionOverrideSelection(selection){
-if(selection===null||typeof selection!=="object"||Array.isArray(selection))return null;
-if(typeof selection.provider!=="string"||selection.provider.length===0)return null;
-if(typeof selection.model!=="string"||selection.model.length===0)return null;
-const effort=typeof selection.reasoningEffort==="string"?selection.reasoningEffort:"";
-return{
-provider:selection.provider,
-model:selection.model,
-...(effort.length>0?{reasoningEffort:effort}:{}),
-};
-}
-function normalizeSessionOverrideMap(raw){
-const overrides={};
-if(raw===null||typeof raw!=="object"||Array.isArray(raw))return overrides;
-for(const role of PROMPT_ROLE_IDS){
-const selection=normalizeSessionOverrideSelection(raw[role]);
-if(selection!==null)overrides[role]=selection;
-}
-return overrides;
-}
-function normalizeSessionOverrideView(payload){
-if(payload===null||typeof payload!=="object"||payload.ok!==true)return null;
-if(!Number.isSafeInteger(payload.revision)||payload.revision<0)return null;
-return{
-overrides:normalizeSessionOverrideMap(payload.overrides),
-revision:payload.revision,
-live:payload.live===true,
-};
-}
-async function readSessionOverrideOutcome(response){
-let payload=null;
-try{payload=await response?.json?.();}catch{payload=null;}
-if(response?.ok===true&&payload?.ok===true){
-const view=normalizeSessionOverrideView(payload);
-if(view===null)return{ok:false,code:"invalid-response",message:null};
-return{ok:true,...view};
-}
-const issue=payload?.error!==null&&typeof payload?.error==="object"?payload.error:{};
-const details=issue?.details!==null&&typeof issue?.details==="object"?issue.details:{};
-return{
-ok:false,
-code:typeof issue?.code==="string"?issue.code:"unknown",
-message:typeof issue?.message==="string"?issue.message:null,
-currentRevision:Number.isSafeInteger(details.currentRevision)&&details.currentRevision>=0
-?details.currentRevision
-:null,
-overrides:details.overrides===undefined?null:normalizeSessionOverrideMap(details.overrides),
-};
-}
-function sessionOverrideSelectionOfDraft(draft){
-const provider=typeof draft?.provider==="string"?draft.provider:"";
-const model=typeof draft?.model==="string"?draft.model:"";
-const effort=typeof draft?.reasoningEffort==="string"?draft.reasoningEffort:"";
-return{provider,model,...(effort.length>0?{reasoningEffort:effort}:{})};
-}
-function sessionOverrideSelectionEquals(left,right){
-return(left?.provider??"")===(right?.provider??"")
-&&(left?.model??"")===(right?.model??"")
-&&(left?.reasoningEffort??"")===(right?.reasoningEffort??"");
-}
-function useSessionOverrideSection({ctx,sessionList,roles,providerGroups,globalDefaults,t,hostMeta,hostMetaError}){
-const sessionEntries=react.useMemo(()=>readEntries(sessionList?.byId),[sessionList]);
-const currentSessionId=currentSessionIdOf(sessionList??{});
-const rootId=react.useMemo(
-()=>rootSessionIdOf(sessionEntries,currentSessionId),
-[sessionEntries,currentSessionId],
-);
-const childSession=rootId!==void 0&&currentSessionId!==rootId;
-const capabilityChecked=hostMeta!==null&&hostMeta!==undefined;
-const capabilitySupported=hostMeta?.capabilities?.sessionOverride===true;
-const capabilityProbe=!capabilityChecked&&hostMetaError!==null&&hostMetaError!==undefined;
-const[state,setState]=react.useState(()=>({
-status:"idle",overrides:{},revision:0,live:false,
-}));
-const[drafts,setDrafts]=react.useState({});
-const[busyRole,setBusyRole]=react.useState(null);
-const[notice,setNotice]=react.useState(null);
-const[reloadToken,setReloadToken]=react.useState(0);
-const requestSerial=react.useRef(0);
-const loadedSessionRef=react.useRef(void 0);
-react.useEffect(()=>{
-if(rootId===void 0||childSession){
-requestSerial.current+=1;
-loadedSessionRef.current=void 0;
-setDrafts({});
-setNotice(null);
-setState({status:rootId===void 0?"no-session":"child",overrides:{},revision:0,live:false});
-return()=>{};
-}
-if(capabilityChecked&&!capabilitySupported){
-requestSerial.current+=1;
-setState({status:"unsupported",overrides:{},revision:0,live:false});
-return()=>{};
-}
-if(!capabilityChecked&&!capabilityProbe){
-setState((previous)=>previous.status==="ready"
-?previous
-:{status:"loading",overrides:{},revision:0,live:false});
-return()=>{};
-}
-let cancelled=false;
-requestSerial.current+=1;
-const serial=requestSerial.current;
-setState((previous)=>previous.status==="ready"
-?{...previous,status:"loading"}
-:{status:"loading",overrides:{},revision:0,live:false});
-void requestPluginRpc(ctx?.connection,{action:"session-override-get",sessionId:rootId})
-.then(readSessionOverrideOutcome)
-.then((outcome)=>{
-if(cancelled||serial!==requestSerial.current)return;
-if(outcome.ok!==true){
-setState({
-status:!capabilityChecked&&outcome.code==="bad-request"?"unsupported":"error",
-overrides:{},
-revision:0,
-live:false,
-});
-return;
-}
-if(loadedSessionRef.current!==rootId)setDrafts({});
-loadedSessionRef.current=rootId;
-setState({status:"ready",overrides:outcome.overrides,revision:outcome.revision,live:outcome.live});
-})
-.catch(()=>{
-if(cancelled||serial!==requestSerial.current)return;
-setState({status:"error",overrides:{},revision:0,live:false});
-});
-return()=>{cancelled=true;};
-},[rootId,childSession,capabilityChecked,capabilitySupported,capabilityProbe,reloadToken,ctx]);
-const applyFailure=(outcome,role)=>{
-if(outcome.code==="session-override-conflict"){
-setState((previous)=>({
-...previous,
-status:"ready",
-revision:Number.isSafeInteger(outcome.currentRevision)?outcome.currentRevision:previous.revision,
-overrides:outcome.overrides??previous.overrides,
-}));
-setNotice({
-kind:"conflict",
-role,
-text:t("settings.sessionOverride.conflict",{
-revision:Number.isSafeInteger(outcome.currentRevision)?outcome.currentRevision:"?",
-}),
-});
-return;
-}
-setNotice({
-kind:"error",
-role,
-text:outcome.message!==null
-?t("settings.sessionOverride.failed",{message:outcome.message})
-:t("settings.sessionOverride.unavailable"),
-});
-};
-const applySuccess=(outcome,role,kind)=>{
-setState({status:"ready",overrides:outcome.overrides,revision:outcome.revision,live:outcome.live});
-setDrafts((previous)=>{
-if(!Object.prototype.hasOwnProperty.call(previous,role))return previous;
-const next={...previous};
-delete next[role];
-return next;
-});
-setNotice({kind,role,revision:outcome.revision});
-};
-const submitRole=async(role,action)=>{
-if(busyRole!==null||state.status!=="ready"||state.live!==true)return;
-const draft=drafts[role]??null;
-const selection=action==="set"?sessionOverrideSelectionOfDraft(draft):null;
-if(action==="set"&&(draft===null||selection.provider.length===0||selection.model.length===0))return;
-setBusyRole(role);
-setNotice(null);
-try{
-const body={
-action:action==="set"?"session-override-set":"session-override-clear",
-sessionId:rootId,
-role,
-expectedRevision:state.revision,
-};
-if(action==="set")body.selection=selection;
-const outcome=await readSessionOverrideOutcome(
-await requestPluginRpc(ctx?.connection,body),
-);
-if(outcome.ok===true)applySuccess(outcome,role,action==="set"?"saved":"cleared");
-else applyFailure(outcome,role);
-}catch{
-setNotice({kind:"error",role,text:t("settings.sessionOverride.unavailable")});
-}finally{
-setBusyRole(null);
-}
-};
-const editableOf=(role)=>{
-if(Object.prototype.hasOwnProperty.call(drafts,role))return drafts[role];
-const effective=state.overrides[role]??normalizeSessionOverrideSelection(globalDefaults?.[role])??null;
-return{
-provider:effective?.provider??"",
-model:effective?.model??"",
-reasoningEffort:effective?.reasoningEffort??"",
-};
-};
-const updateDraft=(role,field,value)=>{
-setDrafts((previous)=>{
-const base=Object.prototype.hasOwnProperty.call(previous,role)?previous[role]:editableOf(role);
-const next={...base,[field]:value};
-if(field==="model"){
-const provider=next.provider;
-const model=providerGroups.find((group)=>group?.id===provider)
-?.models?.find((entry)=>entry?.id===value);
-const efforts=Array.isArray(model?.reasoning?.efforts)?model.reasoning.efforts:[];
-if(next.reasoningEffort!==""&&!efforts.some((effort)=>effort?.id===next.reasoningEffort)){
-next.reasoningEffort="";
-}
-}
-return{...previous,[role]:next};
-});
-setNotice(null);
-};
-const readOnlyReasons={
-"no-session":t("settings.sessionOverride.noSession"),
-child:t("settings.sessionOverride.child"),
-unsupported:t("settings.sessionOverride.unsupported"),
-error:t("settings.sessionOverride.unavailable"),
-loading:t("settings.sessionOverride.loading"),
-};
-const readOnlyHint=state.status==="ready"&&state.live!==true
-?t("settings.sessionOverride.offline")
-:(readOnlyReasons[state.status]??null);
-const writable=state.status==="ready"&&state.live===true&&busyRole===null;
-const rows=writable===false&&state.status!=="ready"
-?[]
-:roles.map((role)=>{
-const current=state.overrides[role]??null;
-const globalDefault=normalizeSessionOverrideSelection(globalDefaults?.[role]);
-const editable=editableOf(role);
-const effectiveSaved=current??globalDefault;
-const dirty=Object.prototype.hasOwnProperty.call(drafts,role)
-&&!sessionOverrideSelectionEquals(drafts[role],effectiveSaved);
-const valid=editable.provider.length>0&&editable.model.length>0;
-const roleLabel=SETTINGS_ROLE_LABELS[role]??role;
-const providerGroup=providerGroups.find((group)=>group?.id===editable.provider);
-const modelEntry=providerGroup?.models?.find((entry)=>entry?.id===editable.model);
-const efforts=Array.isArray(modelEntry?.reasoning?.efforts)?modelEntry.reasoning.efforts:[];
-const effortOptions=[];
-if(efforts.length>0){
-effortOptions.push(react.createElement("option",{key:"__default",value:""},t("settings.sessionOverride.effortDefault")));
-for(const effort of efforts){
-effortOptions.push(react.createElement("option",{key:effort.id,value:effort.id},effort.name??effort.id));
-}
-if(editable.reasoningEffort!==""&&!efforts.some((effort)=>effort?.id===editable.reasoningEffort)){
-effortOptions.push(react.createElement("option",{key:"__stale",value:editable.reasoningEffort},editable.reasoningEffort+"（不可用）"));
-}
-}else{
-effortOptions.push(react.createElement("option",{key:"__unsupported",value:""},
-editable.provider?t("settings.sessionOverride.effortDefault"):t("settings.sessionOverride.effort")));
-}
-const statusText=current!==null
-?t("settings.sessionOverride.override")+"："+current.provider+" / "+current.model
-+(current.reasoningEffort?" / "+current.reasoningEffort:"")
-:t("settings.sessionOverride.followGlobal")
-+(globalDefault?"（"+t("settings.sessionOverride.globalSummary",{
-provider:globalDefault.provider,
-model:globalDefault.model,
-})+"）":"（"+t("settings.sessionOverride.emptyGlobal")+"）");
-return react.createElement("div",{
-key:role,
-className:"deg_so_row",
-"data-deg-session-override-role":role,
-"data-deg-session-override-state":current!==null?"override":"follow",
-},
-react.createElement("div",{className:"deg_so_row_head"},
-react.createElement("span",{className:"deg_so_role"},roleLabel),
-react.createElement("span",{className:"deg_so_state","data-deg-session-override-status":"summary"},statusText)),
-react.createElement("datalist",{id:"deg-so-model-options-"+role},
-sessionOverrideModelOptions(role,editable.provider,providerGroups).map((entry)=>react.createElement(
-"option",
-{key:entry.id,value:entry.id},
-entry.name??entry.id,
-))),
-react.createElement("div",{className:"deg_so_fields"},
-react.createElement("label",{className:"deg_so_field"},
-react.createElement("span",{className:"deg_so_field_label"},t("settings.sessionOverride.provider")),
-react.createElement("input",{
-type:"text",
-className:"deg_so_input",
-list:"deg-so-provider-options",
-autoComplete:"off",
-"aria-label":roleLabel+" "+t("settings.sessionOverride.provider"),
-value:editable.provider,
-disabled:!writable,
-onChange:(event)=>updateDraft(role,"provider",event.target.value),
-})),
-react.createElement("label",{className:"deg_so_field"},
-react.createElement("span",{className:"deg_so_field_label"},t("settings.sessionOverride.model")),
-react.createElement("input",{
-type:"text",
-className:"deg_so_input",
-list:"deg-so-model-options-"+role,
-autoComplete:"off",
-"aria-label":roleLabel+" "+t("settings.sessionOverride.model"),
-value:editable.model,
-disabled:!writable,
-onChange:(event)=>updateDraft(role,"model",event.target.value),
-})),
-react.createElement("label",{className:"deg_so_field"},
-react.createElement("span",{className:"deg_so_field_label"},t("settings.sessionOverride.effort")),
-react.createElement("select",{
-className:"deg_so_input",
-"aria-label":roleLabel+" "+t("settings.sessionOverride.effort"),
-value:editable.reasoningEffort,
-disabled:!writable||efforts.length===0,
-onChange:(event)=>updateDraft(role,"reasoningEffort",event.target.value),
-},effortOptions))),
-react.createElement("div",{className:"deg_so_actions"},
-react.createElement("span",{className:"deg_so_state","data-deg-session-override-revision":state.revision},
-t("settings.sessionOverride.revision",{revision:state.revision})),
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-"data-deg-session-override-clear":role,
-"aria-label":roleLabel+" "+t("settings.sessionOverride.clear"),
-disabled:!writable||current===null,
-onClick:()=>submitRole(role,"clear"),
-},busyRole===role?t("settings.sessionOverride.saving"):t("settings.sessionOverride.clear")),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_btn_primary",
-"data-deg-session-override-save":role,
-"aria-label":roleLabel+" "+t("settings.sessionOverride.save"),
-disabled:!writable||!dirty||!valid,
-onClick:()=>submitRole(role,"set"),
-},busyRole===role?t("settings.sessionOverride.saving"):t("settings.sessionOverride.save"))));
-});
-const noticeText=notice===null
-?null
-:notice.kind==="saved"
-?t("settings.sessionOverride.saved")
-:notice.kind==="cleared"
-?t("settings.sessionOverride.cleared")
-:notice.text;
-return react.createElement("section",{
-className:"deg_so_section",
-"data-deg-session-override":"section",
-"data-deg-session-override-section-state":state.status,
-"aria-label":t("settings.sessionOverride.title"),
-},
-react.createElement("h3",{className:"deg_so_title"},t("settings.sessionOverride.title")),
-react.createElement("p",{className:"deg_so_hint"},t("settings.sessionOverride.hint")),
-readOnlyHint===null?null:react.createElement("p",{
-className:"deg_so_hint",
-"data-deg-session-override-readonly":state.status,
-},readOnlyHint),
-state.status==="error"?react.createElement("button",{
-type:"button",
-className:"deg_btn",
-"data-deg-session-override-retry":"true",
-onClick:()=>setReloadToken((value)=>value+1),
-},t("settings.sessionOverride.retry")):null,
-noticeText===null?null:react.createElement("p",{
-className:notice?.kind==="error"||notice?.kind==="conflict"?"deg_settings_error":"deg_settings_status",
-role:"status",
-"data-deg-session-override-notice":notice?.kind??"none",
-},noticeText),
-rows.length===0?null:react.createElement("div",{className:"deg_so_rows"},
-react.createElement("datalist",{id:"deg-so-provider-options"},
-providerGroups.map((group)=>react.createElement("option",{key:group.id,value:group.id},group.name??group.id))),
-...rows));
-}
 function normalizePreflightEntry(entry){
 if(entry===null||typeof entry!=="object"||Array.isArray(entry))return null;
 const effort=typeof entry.reasoningEffort==="string"&&entry.reasoningEffort.length>0?entry.reasoningEffort:null;
@@ -16838,14 +16623,6 @@ cost:formatCostAmount(entry.cost.totalCost),
 currency:entry.cost.currency,
 })))))));
 }
-function sessionOverrideModelOptions(role,provider,providerGroups){
-void role;
-const group=providerGroups.find((entry)=>entry?.id===provider);
-const models=group===undefined
-?providerGroups.flatMap((entry)=>(Array.isArray(entry?.models)?entry.models:[]))
-:(Array.isArray(group.models)?group.models:[]);
-return models;
-}
 function DshExpertGroupSettings({settingsForm,modelCatalog,modelConfigHost,ctx}){
 const subscribe=react.useMemo(()=>settingsForm.subscribe.bind(settingsForm),[settingsForm]);
 const getSnapshot=react.useMemo(()=>settingsForm.getSnapshot.bind(settingsForm),[settingsForm]);
@@ -16855,8 +16632,6 @@ const catalogGetSnapshot=react.useMemo(()=>modelCatalog.getSnapshot.bind(modelCa
 const directoryState=react.useSyncExternalStore(catalogSubscribe,catalogGetSnapshot);
 const[hostMeta,refreshHostMeta,hostMetaError]=useHostMeta(ctx);
 const roles=useEnabledSettingsRoles(hostMeta);
-const sessionListStore=react.useMemo(()=>sessionListStoreOf(ctx),[ctx]);
-const sessionList=react.useSyncExternalStore(sessionListStore.subscribe,sessionListStore.getSnapshot);
 const uiLocale=resolveSettingsLocale(ctx);
 const t=(key,vars)=>settingsText(uiLocale,key,vars);
 const tExtra=(key,vars)=>settingsExtraText(uiLocale,key,vars);
@@ -17210,16 +16985,6 @@ const next=[...PROMPT_ROLE_IDS];
 for(const role of roles)if(!next.includes(role))next.push(role);
 return next;
 },[roles]);
-const sessionOverrideSection=useSessionOverrideSection({
-ctx,
-sessionList,
-roles:roles.filter((role)=>PROMPT_ROLE_IDS.includes(role)),
-providerGroups,
-globalDefaults:normalizeSettingsDraft(settingsSnapshot.value,roles).defaults,
-t,
-hostMeta,
-hostMetaError,
-});
 const catalogAvailable=directoryState.status==="ready"||groups.length>0;
 const unifiedProvider=unifiedProviderOf(draft.defaults,roles,draft.provider);
 const save=async({retry=false}={})=>{
@@ -18013,7 +17778,6 @@ react.createElement("option",{value:""},t("settings.noProvider")),
 providerGroups.map((group)=>react.createElement("option",{key:group.id,value:group.id},group.name??group.id))))),
 react.createElement("div",{className:"deg_settings_table_wrap"},
 react.createElement("div",{className:"deg_settings_table"},header,rows)),
-sessionOverrideSection,
 renderModelCandidatesSection({
 t:tExtra,
 roles,
@@ -18988,6 +18752,7 @@ requestPluginRpc,
 resolveRootSessionId:expertGroupRootSessionIdOf,
 sessions:ctx.sessions,
 slots:ctx.slots,
+modelCatalog,
 confirm:(message)=>typeof globalThis.confirm==="function"&&globalThis.confirm(message)===true,
 getAutoOpenSubagentSidebar:()=>readAutoOpenSubagentSidebar(),
 setAutoOpenSubagentSidebar:(next)=>commitAutoOpenSubagentSidebar(next),
@@ -19150,8 +18915,6 @@ exports.MODEL_REASONING_EFFORTS=Object.freeze([
 "off","minimal","low","medium","high","xhigh","max",
 ]);
 exports.describeExpertGroupClientCapabilities=describeExpertGroupClientCapabilities;
-exports.normalizeSessionOverrideView=normalizeSessionOverrideView;
-exports.normalizeSessionOverrideSelection=normalizeSessionOverrideSelection;
 exports.describeExpertGroupDiagnostics=describeExpertGroupDiagnostics;
 exports.describeDegPluginDetailSummary=describeDegPluginDetailSummary;
 exports.resolveDegSettingsSectionOpener=resolveDegSettingsSectionOpener;

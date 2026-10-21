@@ -432,8 +432,9 @@ function normalizeRecord(input) {
   }
   const id = normalizeText(input.id, "id", input.id);
   const label = normalizeText(input.label, "label", id);
-  // statusLabel 是页面运行状态文案使用的英文标签（"Explorer running..."），与中文
-  // 显示名分离；浏览器 bundle 无法 import 本模块，因此这里是唯一权威来源。
+  // statusLabel 是页面运行状态文案使用的英文标签（"Explorer running..."）；
+  // label 是界面与 root prompt 使用的显示名（同样为英文）。浏览器 bundle 无法
+  // import 本模块，因此这里是唯一权威来源。
   const statusLabel = normalizeText(input.statusLabel, "statusLabel", id);
   const description = normalizeText(input.description, "description", id);
   const toolName = normalizeText(input.toolName, "toolName", id);
@@ -564,7 +565,7 @@ export const ROLE_REGISTRY = createRoleRegistry([
   {
     id: "explorer",
     statusLabel: "Explorer",
-    label: "侦察员 (Explorer)",
+    label: "Explorer",
     description: "只读代码库侦察：查清未知入口、跨目录符号/调用方/模式/测试等事实，并给出位置与缺口。任务信息：给待解问题与判断范围即可，不需要先替专家解出完整方案。",
     optional: false,
     readOnly: true,
@@ -574,7 +575,7 @@ export const ROLE_REGISTRY = createRoleRegistry([
   {
     id: "librarian",
     statusLabel: "Librarian",
-    label: "资料员 (Librarian)",
+    label: "Librarian",
     description: "只读外部文档调研：查证库 API、版本差异、官方文档与上游真实用法，给出带来源与版本号的结论。任务信息：给待解问题与判断范围即可，不需要先替专家解出完整方案。",
     optional: false,
     readOnly: true,
@@ -584,7 +585,7 @@ export const ROLE_REGISTRY = createRoleRegistry([
   {
     id: "oracle",
     statusLabel: "Oracle",
-    label: "先知 (Oracle)",
+    label: "Oracle",
     description: "只读架构与调试顾问：在架构、高风险决策与疑难调试前期给出判断，并回答待裁决问题及其理由与风险；用户要求代码审查或重大高风险实现完成后也由它审查。任务信息：给待解问题与判断范围即可，不需要先替专家解出完整方案。",
     optional: false,
     readOnly: true,
@@ -594,7 +595,7 @@ export const ROLE_REGISTRY = createRoleRegistry([
   {
     id: "designer",
     statusLabel: "Designer",
-    label: "设计师 (Designer)",
+    label: "Designer",
     description: "UI/UX 与视觉实现专家：在约束内拥有布局、交互、视觉层级与响应式/可访问性判断，并产出打磨过的界面实现。任务信息：给待解问题与判断范围即可，不需要先替专家解出完整方案。",
     optional: false,
     readOnly: false,
@@ -604,7 +605,7 @@ export const ROLE_REGISTRY = createRoleRegistry([
   {
     id: "fixer",
     statusLabel: "Fixer",
-    label: "修理工 (Fixer)",
+    label: "Fixer",
     description: "已定方案的实现、重复修改、迁移与测试补齐（含单文件的大量工作）：可读取本地上下文并按现有模式作局部实现，交付可验证的结果；需求、公共行为与架构约束的变更由主代理决定。任务信息：实施任务必须给已定方向（既定方案、允许范围与预期验证）。",
     optional: false,
     readOnly: false,
@@ -614,7 +615,7 @@ export const ROLE_REGISTRY = createRoleRegistry([
   {
     id: "observer",
     statusLabel: "Observer",
-    label: "观察员 (Observer)",
+    label: "Observer",
     description: "只读视觉分析：只对 Host 提供的 durable 图片附件（截图、图表、图示，以及以合法图片形式呈现的 PDF 页面）输出结构化视觉事实报告。任务信息：只给视觉分析目标即可，不需要主任务上下文。",
     optional: true,
     readOnly: true,

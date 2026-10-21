@@ -388,8 +388,6 @@
 
   /** meta.activeRoles/roles 的条目上限：Host 侧最多 16 个自定义 + 6 个内置角色。 */
   const HOST_META_ROLE_LIMIT = 32;
-  /** 手动派发单个分片的 affectedPaths 上限（与 fan-out 工具面同量级，Host 仍是最终裁决）。 */
-  const DISPATCH_AFFECTED_PATH_LIMIT = 64;
 
   /**
    * 宿主 meta 的只读归一（票据 25/26/27）。
@@ -417,6 +415,11 @@
     return {
       roles,
       roleLabels: object(source.roleLabels),
+      /**
+       * 全局角色默认（与 Host 的 resolveRole 同源）：侧栏「会话模型」据此显示「跟随全局默认」。
+       * 原样保留映射形状，逐角色合法性由 normalizeSessionModelSelection 在消费点再校验。
+       */
+      roleDefaults: object(source.roleDefaults),
       modelPrices: Array.isArray(source.modelPrices) ? source.modelPrices : [],
       usage: object(source.usage),
       throttle: Object.keys(concurrency.throttle === undefined ? {} : object(concurrency.throttle)).length === 0
@@ -426,38 +429,105 @@
     };
   }
 
-  /** 手册派发/模板 RPC 的幂等 requestId：宿主只把它当作去重键，不参与存储路径。 */
-  function newDispatchRequestId() {
-    try {
-      if (typeof globalThis.crypto?.randomUUID === "function") return "ui-" + globalThis.crypto.randomUUID();
-    } catch { /* 老宿主没有 randomUUID：退回时间戳 + 随机后缀。 */ }
-    return "ui-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  // ── 侧栏「会话模型」：与设置页同一套会话级覆盖语义的纯函数投影 ─────────────
+  //
+  // 侧边栏与设置页是两个独立客户端组件（classic bundle，无法互相 import），因此这里保留
+  // 一组**形状收敛**的纯函数：不发 RPC、不读写宿主状态，只把注入值收敛成有界结构。
+  // 所有读写仍走 callRpc 这唯一入口，语义与设置页 useSessionOverrideSection 逐条对齐。
+
+  /** meta.roles 缺失/为空时的回退角色表（与 Host 内置角色同源，顺序即展示顺序）。 */
+  const SESSION_MODEL_ROLE_FALLBACK = Object.freeze(["explorer", "librarian", "oracle", "designer", "fixer", "observer"]);
+
+  /**
+   * 归一一个会话级 selection：只接受非空 provider/model 与可选字符串 effort。
+   *
+   * 返回的始终是新的普通对象：响应里的未知字段不会被带进 UI 状态，也不会被回写进请求体。
+   */
+  function normalizeSessionModelSelection(selection) {
+    if (selection === null || typeof selection !== "object" || Array.isArray(selection)) return null;
+    if (typeof selection.provider !== "string" || selection.provider.length === 0) return null;
+    if (typeof selection.model !== "string" || selection.model.length === 0) return null;
+    const effort = typeof selection.reasoningEffort === "string" ? selection.reasoningEffort : "";
+    return {
+      provider: selection.provider,
+      model: selection.model,
+      ...(effort.length > 0 ? { reasoningEffort: effort } : {}),
+    };
+  }
+
+  /** 归一「角色 -> selection」映射：只保留给定角色的合法 selection，坏值整条丢弃。 */
+  function normalizeSessionModelOverrides(raw, roles) {
+    const overrides = {};
+    const source = raw !== null && typeof raw === "object" && Array.isArray(raw) !== true ? raw : {};
+    for (const role of Array.isArray(roles) ? roles : []) {
+      const selection = normalizeSessionModelSelection(source[role]);
+      if (selection !== null) overrides[role] = selection;
+    }
+    return overrides;
   }
 
   /**
-   * 逗号/换行/分号分隔的路径列表归一：去空白、去空项、去重、限条数。
-   * 只做客户端整理；合法性与写冲突检查仍由 Host 的 same validateSubmitInput 裁决。
+   * 归一 session-override-get/set/clear 的成功响应。
+   *
+   * 只有 ok===true 且 revision 是非负安全整数才算成功；其余一律返回 null 由调用方降级为
+   * 「读取失败」而不是伪造一份空覆盖。
    */
-  function parsePathList(value, limit) {
-    if (typeof value !== "string" || value.trim() === "") return [];
-    const max = Number.isSafeInteger(limit) && limit > 0 ? limit : DISPATCH_AFFECTED_PATH_LIMIT;
-    const paths = [];
-    for (const part of value.split(/[\n,;]/)) {
-      const path = part.trim();
-      if (path === "" || paths.indexOf(path) !== -1) continue;
-      paths.push(path);
-      if (paths.length >= max) break;
-    }
-    return paths;
+  function normalizeSessionModelView(body, roles) {
+    const source = object(body);
+    if (source.ok !== true) return null;
+    if (Number.isSafeInteger(source.revision) !== true || source.revision < 0) return null;
+    return {
+      overrides: normalizeSessionModelOverrides(source.overrides, roles),
+      revision: source.revision,
+      live: source.live === true,
+    };
   }
 
-  /** 正安全整数输入（表单里的字符串或数字）：空串/非法/非正返回 null（不猜默认值）。 */
-  function parsePositiveInteger(value) {
-    if (value === undefined || value === null) return null;
-    const raw = typeof value === "number" ? value : String(value).trim();
-    if (raw === "") return null;
-    const parsed = Number(raw);
-    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+  /** 草稿 -> 可提交 selection：effort 为空表示「模型默认」，请求里不携带该字段。 */
+  function sessionModelSelectionOfDraft(draft) {
+    const provider = typeof draft?.provider === "string" ? draft.provider : "";
+    const model = typeof draft?.model === "string" ? draft.model : "";
+    const effort = typeof draft?.reasoningEffort === "string" ? draft.reasoningEffort : "";
+    return { provider, model, ...(effort.length > 0 ? { reasoningEffort: effort } : {}) };
+  }
+
+  /** 逐字段比较两个草稿/选择（effort 缺失与空串等价）。 */
+  function sessionModelSelectionEquals(left, right) {
+    return (left?.provider ?? "") === (right?.provider ?? "")
+      && (left?.model ?? "") === (right?.model ?? "")
+      && (left?.reasoningEffort ?? "") === (right?.reasoningEffort ?? "");
+  }
+
+  /**
+   * 角色行的模型候选：provider 非空时取该 group 的 models，否则汇总全部 group 的 models。
+   *
+   * 只按 id 去重、保持目录声明顺序：候选只用于输入提示（datalist），不参与任何校验。
+   */
+  function sessionModelModelOptions(provider, groups) {
+    const source = Array.isArray(groups) ? groups : [];
+    const group = source.find((entry) => text(object(entry).id, null) === provider);
+    const models = [];
+    const pool = group === undefined
+      ? source.flatMap((entry) => (Array.isArray(object(entry).models) ? object(entry).models : []))
+      : (Array.isArray(object(group).models) ? object(group).models : []);
+    for (const entry of pool) {
+      const item = object(entry);
+      const id = text(item.id, null);
+      if (id === null || models.some((existing) => existing.id === id)) continue;
+      models.push(item);
+    }
+    return models;
+  }
+
+  /** 角色清单：meta.roles 优先（保持 Host 顺序、去重），缺失/为空时回退内置角色表。 */
+  function sessionModelRolesOf(metaValue) {
+    const source = metaValue === null || metaValue === undefined ? {} : object(metaValue);
+    const roles = [];
+    for (const entry of Array.isArray(source.roles) ? source.roles : []) {
+      const role = text(entry, null);
+      if (role !== null && roles.indexOf(role) === -1) roles.push(role);
+    }
+    return roles.length === 0 ? SESSION_MODEL_ROLE_FALLBACK.slice() : roles;
   }
 
   /**
@@ -1590,8 +1660,8 @@
    * Host 结构化拒绝（ok:false）对应的 Error。
    *
    * message 与既有行为逐字一致（测试与用户可见文案都依赖它）；额外把稳定 code/details
-   * 挂成**不可枚举**属性：既有 deepEqual / 文案断言不受影响，而手动派发等需要按来源
-   * 展示 code 的入口可以读取它。details 只由消费方按白名单读取，绝不整段渲染。
+   * 挂成**不可枚举**属性：既有 deepEqual / 文案断言不受影响，而「会话模型」等需要按
+   * 稳定 code 分支的入口可以读取它。details 只由消费方按白名单读取，绝不整段渲染。
    */
   function rpcBusinessError(errorBlock) {
     const block = object(errorBlock);
@@ -1906,9 +1976,15 @@
       ".deg_expert_group_cell{display:flex;flex-direction:column;min-width:0}",
       // 任务行用量摘要条：用时 / tok/s / tok / 命中 / context + 多次重试徽标 / 失败摘要。
       // 窄右栏时按 flex-wrap 换行；每一段自身单行省略，完整文本仍在 tooltip 里。
-      ".deg_expert_group_metrics{display:flex;flex-wrap:wrap;align-items:center;gap:2px 6px;min-width:0;padding:2px 0 0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
+      // 分隔符左右间距由 separator 自身文本的空格提供（与元数据行的 " · " 完全一致），
+      // 因此列方向 gap 归零；否则 flex gap 会让第三行看起来比第二行更宽。
+      ".deg_expert_group_metrics{display:flex;flex-wrap:wrap;align-items:center;gap:2px 0;min-width:0;padding:2px 0 0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
       ".deg_expert_group_metrics_part{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
-      ".deg_expert_group_metrics_separator{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
+      // pre 保留 separator 文本首尾的空格，避免 flex item 折叠首尾空白。
+      ".deg_expert_group_metrics_separator{flex:0 0 auto;white-space:pre;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
+      // 「多次重试」徽标：列 gap 归零后由这里补回与最后一段之间的 6px 间距；
+      // 只有前一个兄弟是摘要段时才生效，避免仅渲染徽标时多出左侧留白。
+      ".deg_expert_group_metrics_part+.deg_expert_group_retry_warning{margin-left:6px}",
       // 「多次重试」徽标：只在 retryCount 达到阈值时出现，文案不暗示存在已知的 maxAttempts。
       ".deg_expert_group_retry_warning{flex:0 0 auto;box-sizing:border-box;padding:0 4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);border-radius:4px;color:var(--dsw-alias-state-warning-primary,#f59e0b);font-weight:600;line-height:14px}",
       // 受限失败摘要：稳定 code + 一行 message（模型已脱敏/截断），固定单行省略。
@@ -1927,32 +2003,44 @@
       ".deg_expert_group_structured{min-width:0;margin:2px 0 0;padding:2px 4px;border-inline-start:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:15px;overflow-wrap:anywhere;max-height:84px;overflow:auto}",
       ".deg_expert_group_structured[data-fallback=true]{border-inline-start-color:var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
       ".deg_expert_group_shard_extra{display:flex;flex-direction:column;min-width:0}",
-      // ── 票据 28：新建任务表单、模板库与回执 ────────────────────────────────
-      ".deg_expert_group_dispatch{margin:4px 0 0;padding:6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);font-size:11px}",
-      ".deg_expert_group_dispatch_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
-      ".deg_expert_group_dispatch_row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:4px 8px;margin-top:4px}",
-      ".deg_expert_group_dispatch_field{display:flex;flex:1 1 120px;flex-direction:column;gap:2px;min-width:0;margin-top:4px}",
-      ".deg_expert_group_dispatch_label{color:var(--dsw-alias-label-secondary);font-size:11px}",
-      ".deg_expert_group_dispatch_input{box-sizing:border-box;width:100%;min-width:0;padding:2px 4px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:11px;line-height:16px}",
-      ".deg_expert_group_dispatch_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-      ".deg_expert_group_dispatch_textarea{resize:vertical;min-height:40px}",
-      ".deg_expert_group_dispatch_check{display:inline-flex;align-items:center;gap:4px;margin-top:4px;color:var(--dsw-alias-label-secondary)}",
-      ".deg_expert_group_dispatch_shards{display:flex;flex-direction:column;gap:4px;margin-top:4px}",
-      ".deg_expert_group_dispatch_shard{display:flex;flex-direction:column;padding:4px;border:1px dashed var(--dsw-alias-border-l2);border-radius:5px}",
-      ".deg_expert_group_dispatch_shard_head{display:flex;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
-      ".deg_expert_group_dispatch_actions{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}",
-      ".deg_expert_group_dispatch_error{margin-top:4px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));overflow-wrap:anywhere}",
-      ".deg_expert_group_dispatch_notice{margin-top:4px;color:var(--dsw-alias-label-secondary)}",
-      ".deg_expert_group_templates{margin-top:6px;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2)}",
-      ".deg_expert_group_templates_head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:4px;font-weight:600}",
-      ".deg_expert_group_template{display:flex;flex-direction:column;gap:2px;margin-top:4px;padding:4px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px}",
-      ".deg_expert_group_template_name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}",
-      ".deg_expert_group_template_meta{color:var(--dsw-alias-label-secondary)}",
-      ".deg_expert_group_template_preview{min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));max-height:48px;overflow:auto}",
-      ".deg_expert_group_template_actions{display:flex;flex-wrap:wrap;gap:4px;margin-top:2px}",
-      ".deg_expert_group_templates_empty{color:var(--dsw-alias-label-secondary);margin-top:4px}",
-      ".deg_expert_group_dispatch_receipt{margin:4px 0 0;padding:5px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;color:var(--dsw-alias-label-secondary);font-size:11px;overflow-wrap:anywhere}",
-      ".deg_expert_group_dispatch_receipt>div:first-child{color:var(--dsw-alias-label-primary);font-weight:600}",
+      // ── 「会话模型」弹窗（本会话覆盖；表格密度与设置页角色模型表一致）──────────
+      // 原生 <dialog> 进入 top layer：不被右栏容器的 overflow/transform 裁剪。
+      // display:flex 只在 [open] 时生效——否则会盖掉 UA 的 dialog:not([open]){display:none}。
+      ".deg_expert_group_session_model_dialog{position:fixed;inset:0;margin:auto;box-sizing:border-box;width:min(920px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100vh - 48px);padding:0;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;box-shadow:0 18px 48px rgba(0,0,0,.28);overflow:hidden}",
+      ".deg_expert_group_session_model_dialog[open]{display:flex;flex-direction:column}",
+      ".deg_expert_group_session_model_dialog::backdrop{background:rgba(0,0,0,.42)}",
+      // 头/体/脚三段：体是唯一滚动区，头脚常驻（窄屏也不会把保存按钮挤出视口）。
+      ".deg_expert_group_session_model_header{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:0 0 auto;padding:12px 14px 6px;font-weight:600}",
+      ".deg_expert_group_session_model_title{flex:1 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;font-weight:600}",
+      ".deg_expert_group_session_model_body{flex:1 1 auto;min-height:0;overflow:auto;padding:0 14px 8px}",
+      ".deg_expert_group_session_model_hint{margin:0 0 8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}",
+      ".deg_expert_group_session_model_notice{margin:0 0 8px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
+      ".deg_expert_group_session_model_notice_error{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}",
+      // 表格：单一 grid 承载表头与行（行用 display:contents 参与同一套列宽），
+      // 外层只负责横向滚动；列宽与设置页四列表一致的最小宽度约束。
+      ".deg_expert_group_session_model_scroll{overflow-x:auto}",
+      ".deg_expert_group_session_model_table{display:grid;grid-template-columns:minmax(84px,.6fr) minmax(132px,.82fr) minmax(210px,1.5fr) minmax(96px,.62fr);min-width:540px;align-items:center}",
+      ".deg_expert_group_session_model_row{display:contents}",
+      ".deg_expert_group_session_model_head_cell{min-width:0;padding:8px 6px 6px;border-bottom:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;font-weight:600}",
+      ".deg_expert_group_session_model_cell{display:flex;align-items:center;min-width:0;padding:8px 6px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
+      ".deg_expert_group_session_model_cell select{width:100%;min-width:0;box-sizing:border-box;padding:5px 6px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2,transparent);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}",
+      ".deg_expert_group_session_model_cell select:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}",
+      ".deg_expert_group_session_model_cell select:disabled{opacity:.5;cursor:not-allowed}",
+      // 角色 pill：与设置页 .deg_settings_role_button 同尺寸（74×28、圆角 6、1px 描边）。
+      ".deg_expert_group_session_model_pill{display:flex;align-items:center;justify-content:space-between;gap:4px;flex:0 0 74px;width:74px;height:28px;min-height:28px;padding:2px 4px 2px 6px;box-sizing:border-box;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}",
+      ".deg_expert_group_session_model_pill_label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+      // 覆盖行的「×」：只在该行确有本会话覆盖时出现，点击立即清除该角色覆盖。
+      ".deg_expert_group_session_model_clear{display:inline-flex;align-items:center;justify-content:center;flex:0 0 16px;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:16px;cursor:pointer}",
+      ".deg_expert_group_session_model_clear:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+      ".deg_expert_group_session_model_clear:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}",
+      ".deg_expert_group_session_model_clear:disabled{opacity:.4;cursor:not-allowed}",
+      ".deg_expert_group_session_model_footer{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:0 0 auto;padding:10px 14px;border-top:1px solid var(--dsw-alias-border-l2)}",
+      ".deg_expert_group_session_model_revision{flex:0 1 auto;min-width:0;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums;font-size:12px}",
+      ".deg_expert_group_session_model_invalid{flex:1 1 160px;min-width:0;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));font-size:12px;line-height:18px;overflow-wrap:anywhere}",
+      ".deg_expert_group_session_model_spacer{flex:1 1 auto}",
+      // 主按钮（保存）：只在这个弹窗里使用，比工具条小按钮稍大、强调色跟随主题。
+      ".deg_expert_group_session_model_primary{box-sizing:border-box;height:28px;padding:0 12px;border:1px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-radius:6px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));color:var(--dsw-alias-bg-layer-1,#fff);font:inherit;font-size:12px;font-weight:600;cursor:pointer}",
+      ".deg_expert_group_session_model_primary:disabled{opacity:.45;cursor:not-allowed}",
       ".deg_expert_group_attempt_index{flex:0 0 auto;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums}",
       ".deg_expert_group_attempt_status{flex:0 0 auto;font-weight:600}",
       ".deg_expert_group_attempt[data-status=failed] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=timed_out] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=interrupted] .deg_expert_group_attempt_status{color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
@@ -1965,7 +2053,7 @@
       // fan-out 标题列：标题 + 时间线/计数/失败摘要纵向排列，标题行仍可点击导航。
       ".deg_expert_group_fanout_title{display:flex;flex-direction:column;min-width:0}",
       ".deg_expert_group_fanout_title>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
-      // 搜索/过滤/手动派发工具条：位于任务树顶部，只在快照已上屏时出现。
+      // 搜索/过滤/会话模型工具条：位于任务树顶部，只在快照已上屏时出现。
       ".deg_expert_group_toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:5px 0 2px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
       ".deg_expert_group_search{flex:1 1 120px;min-width:0;box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px}",
       ".deg_expert_group_filter{flex:0 1 auto;min-width:0;box-sizing:border-box;height:24px;padding:0 2px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px;color-scheme:light}",
@@ -3809,12 +3897,11 @@
       /**
        * 票据 25/26/27/28 的客户端读面状态。
        *
-       * - meta：宿主 meta（角色清单/显示名/单价/限流诊断/全局用量）。**懒加载**：只有用户
-       *   打开「诊断」或「新建任务」，或快照第一次出现用量事实时才读一次；挂载与轮询路径
+       * - meta：宿主 meta（角色清单/显示名/全局默认/单价/限流诊断/全局用量）。**懒加载**：只有
+       *   用户打开「诊断」或「会话模型」，或快照第一次出现用量事实时才读一次；挂载与轮询路径
        *   不新增任何请求，既有请求计数契约不变。
-       * - dispatch：新建任务内联表单（null = 关闭）；回执与本地校验错误分开存放——
-       *   Host 结构化拒绝仍走标题栏错误槽（唯一错误面），本地解析错误只落在表单内。
-       * - templates：模板库只读摘要（Host 已限定 ≤32，客户端再截断一次）。
+       * - sessionModel：侧栏「会话模型」弹窗（本会话 provider/model/思考深度覆盖）。
+       *   展开状态是纯本地 UI 状态：关闭时不发 session-override-* RPC、也不订阅模型目录。
        */
       const metaPair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
       const meta = metaPair[0];
@@ -3822,23 +3909,84 @@
       // 事件路径（runAction 的尾随刷新）读取的是**当前渲染**的 meta，用 ref 同步写入。
       const metaStateRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
       metaStateRef.current = meta;
-      const dispatchDraftPair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
-      const dispatchDraft = dispatchDraftPair[0];
-      const setDispatchDraft = dispatchDraftPair[1];
-      const dispatchReceiptPair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
-      const dispatchReceipt = dispatchReceiptPair[0];
-      const setDispatchReceipt = dispatchReceiptPair[1];
-      const dispatchErrorPair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
-      const dispatchError = dispatchErrorPair[0];
-      const setDispatchError = dispatchErrorPair[1];
-      const templateNoticePair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
-      const templateNotice = templateNoticePair[0];
-      const setTemplateNotice = templateNoticePair[1];
-      const templatesPair = typeof react.useState === "function"
-        ? react.useState({ status: "idle", templates: [], count: 0, limit: 32, message: null })
-        : [{ status: "idle", templates: [], count: 0, limit: 32, message: null }, () => {}];
-      const templatesState = templatesPair[0];
-      const setTemplatesState = templatesPair[1];
+      /**
+       * 「会话模型」编辑区的读写状态机（语义与设置页 useSessionOverrideSection 一致）：
+       *
+       * - status：idle / loading / ready / no-session / child / unsupported / error；
+       * - overrides：Host 权威投影（role -> selection），只在本会话确实有覆盖时才有条目；
+       * - revision：Host 持久化代次，保存/清除都作为 expectedRevision 提交（CAS 栅栏）；
+       * - live：会话是否在运行；false 时整块只读（Host 不接受离线会话的覆盖写入）。
+       */
+      const sessionModelOpenPair = typeof react.useState === "function" ? react.useState(false) : [false, () => {}];
+      const sessionModelOpen = sessionModelOpenPair[0];
+      const setSessionModelOpen = sessionModelOpenPair[1];
+      const sessionModelStatePair = typeof react.useState === "function"
+        ? react.useState({ status: "idle", overrides: {}, revision: 0, live: false })
+        : [{ status: "idle", overrides: {}, revision: 0, live: false }, () => {}];
+      const sessionModelState = sessionModelStatePair[0];
+      const setSessionModelState = sessionModelStatePair[1];
+      /**
+       * 未提交的编辑草稿（role -> {provider, model, reasoningEffort}）。
+       *
+       * 只有「用户确实改过」的角色才在这里有条目：没有条目的行直接显示权威覆盖或全局默认。
+       * 覆盖/保存失败路径**绝不清空**草稿，冲突提示就是让用户在保留输入的前提下重试。
+       */
+      const sessionModelDraftsPair = typeof react.useState === "function" ? react.useState({}) : [{}, () => {}];
+      const sessionModelDrafts = sessionModelDraftsPair[0];
+      const setSessionModelDrafts = sessionModelDraftsPair[1];
+      /**
+       * 整批写入在途标记（保存/清除共用一把锁）。
+       *
+       * 弹窗一次可能提交多个角色（按角色展示顺序串行），因此不再按角色记账：只要有一轮
+       * session-override-* 在途中，整块表格就锁成只读，避免用户在一次多角色提交的中途再改草稿
+       * 或再点保存，制造必然冲突的重复提交。
+       */
+      const sessionModelSavingPair = typeof react.useState === "function" ? react.useState(false) : [false, () => {}];
+      const sessionModelSaving = sessionModelSavingPair[0];
+      const setSessionModelSaving = sessionModelSavingPair[1];
+      const sessionModelNoticePair = typeof react.useState === "function" ? react.useState(null) : [null, () => {}];
+      const sessionModelNotice = sessionModelNoticePair[0];
+      const setSessionModelNotice = sessionModelNoticePair[1];
+      // 「重新读取」只递增这个令牌：effect 依赖它，手动重读不会改动其它任何状态。
+      const sessionModelReloadPair = typeof react.useState === "function" ? react.useState(0) : [0, () => {}];
+      const sessionModelReloadToken = sessionModelReloadPair[0];
+      const setSessionModelReloadToken = sessionModelReloadPair[1];
+      /** 请求代次：每次新读取都递增，迟到的旧响应按序号丢弃（关闭/切会话后绝不写状态）。 */
+      const sessionModelRequestSerialRef = typeof react.useRef === "function" ? react.useRef(0) : { current: 0 };
+      /** 最近一次成功读取覆盖的 root：只有它变了才清空草稿（手动重读保留用户输入）。 */
+      const sessionModelLoadedRootRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      /**
+       * 注入的模型目录快照（设置页同一份 store）：{groups, status}。
+       *
+       * 只用于 provider/model 的 datalist 与思考深度档位；目录缺失时输入框照常可手填，
+       * effort 下拉退化为「模型默认」且禁用，绝不伪造候选。
+       */
+      const sessionModelCatalogPair = typeof react.useState === "function"
+        ? react.useState({ groups: [], status: "idle" })
+        : [{ groups: [], status: "idle" }, () => {}];
+      const sessionModelCatalog = sessionModelCatalogPair[0];
+      const setSessionModelCatalog = sessionModelCatalogPair[1];
+      /**
+       * 「会话模型」入口按钮 / 弹窗节点的 DOM 引用与上一帧的展开状态（无障碍焦点归还）。
+       *
+       * 关闭弹窗后焦点必须回到入口按钮，否则键盘用户会掉回文档开头；但**首次挂载**时
+       * 弹窗从未打开过，绝不能抢用户当前的焦点，因此用 wasOpen 记录上一帧状态，只在
+       * 「上一帧打开 → 这一帧关闭」这一次转换上归还焦点。
+       * 测试替身里 ref 不会真正挂载（current 恒为 null），调用方必须做可选调用。
+       */
+      const sessionModelEntryRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      const sessionModelWasOpenRef = typeof react.useRef === "function" ? react.useRef(false) : { current: false };
+      /** 原生 dialog 节点：打开时调用 showModal() 进入 top layer（不被右栏容器裁剪）。 */
+      const sessionModelDialogRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
+      /**
+       * 读取 effect 上一次作用的 surface 身份（root + sidebar session）。
+       *
+       * 值变化 = 用户切走了（root A→B、root→子会话、子会话→root，含 A→B→A）：旧 surface 的
+       * 在途保存不得继续把新 surface 的按钮锁在「保存中」，因此变化时清空 busy。
+       */
+      const sessionModelSurfaceRef = typeof react.useRef === "function"
+        ? react.useRef({ rootSessionId: null, sidebarSessionId: null })
+        : { current: { rootSessionId: null, sidebarSessionId: null } };
 
       /**
        * 任务状态播报（票据 18）：{ rootSessionId, tasks }。
@@ -4077,96 +4225,461 @@
        * 读失败一律静默保持 null（UI 回退角色 id / 「未配置单价，不估算」），绝不写标题栏
        * 错误槽——否则一次诊断读取失败会让用户以为任务树坏了。
        */
-      const metaRequestRef = typeof react.useRef === "function" ? react.useRef({ inFlight: false }) : { current: { inFlight: false } };
+      const metaRequestRef = typeof react.useRef === "function" ? react.useRef({ inFlight: false, promise: null }) : { current: { inFlight: false, promise: null } };
       /** 已经为哪个 root 触发过「快照有用量 ⇒ 自动读 meta」，每个 root 最多一次。 */
       const metaAutoAttemptRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
       /** runAction 尾随刷新使用的 meta 刷新入口（每次渲染同步写入，避免闭包陈旧）。 */
       const metaRefreshRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
-      /** 模板库请求的单飞标记：打开表单/保存/删除后不会并发堆请求。 */
-      const templatesRequestRef = typeof react.useRef === "function" ? react.useRef({ inFlight: false }) : { current: { inFlight: false } };
-
-      /**
-       * 可读错误文案（票据 28）：折叠控制字符、脱敏绝对路径并截断；有稳定 code 时置于最前。
-       * 只用于客户端自造提示（模板列表/本地校验），Host 结构化拒绝仍走 runAction 的错误槽。
-       */
-      const displayErrorMessage = (error) => {
-        const api = modelApi();
-        const raw = error instanceof Error ? error.message : String(error);
-        const code = text(object(error).code, null);
-        const combined = code === null ? raw : code + " · " + raw;
-        return typeof api?.redactDisplayText === "function"
-          ? (api.redactDisplayText(combined, 200) || combined)
-          : combined.slice(0, 200);
-      };
 
       /**
        * 读取宿主 meta（唯一入口，单飞）。
        *
        * 只在明确的用户读面或快照出现用量事实时调用；返回值只给调用方做「读到了/没读到」
        * 判定，失败静默（UI 保持「角色 id / 未配置单价」的保守显示）。
+       *
+       * 单飞的返回语义必须是「共享同一个在途 Promise」而不是 null：null 会被调用方读成
+       * 「这次没拿到（能力未知）」，于是「会话模型」会在 meta 还在路上的时候多发一次
+       * session-override-get —— 这是一次纯浪费的请求，而旧宿主可能对未知 action 回
+       * bad-request，把界面错误地降级成 unsupported。调用方 await 同一个 Promise 才能等到
+       * 真正的能力声明。
        */
       const loadMeta = async () => {
         if (mountedRef.current !== true) return null;
         const request = metaRequestRef.current;
-        if (request.inFlight === true) return null;
-        request.inFlight = true;
-        try {
-          const body = await callRpc(config, contextRef.current, { action: "meta" }, {}, (value) => object(value));
-          if (mountedRef.current !== true) return null;
-          const normalized = normalizeHostMeta(body);
-          setMeta(normalized);
-          return normalized;
-        } catch {
-          // 旁路读面失败不写错误槽：角色 id 与「未配置单价，不估算」仍是诚实显示。
-          return null;
-        } finally {
-          request.inFlight = false;
+        if (request.inFlight === true) {
+          // 兼容没有 promise 字段的旧状态形状：拿不到共享句柄时仍退回 null ——
+          // 宁可让调用方按「能力未知」走实测 get，也绝不让它永久挂起。
+          return typeof request.promise?.then === "function" ? request.promise : null;
         }
+        request.inFlight = true;
+        const pending = (async () => {
+          try {
+            const body = await callRpc(config, contextRef.current, { action: "meta" }, {}, (value) => object(value));
+            if (mountedRef.current !== true) return null;
+            const normalized = normalizeHostMeta(body);
+            setMeta(normalized);
+            return normalized;
+          } catch {
+            // 旁路读面失败不写错误槽：角色 id 与「未配置单价，不估算」仍是诚实显示。
+            // 失败仍返回 null：调用方保留下游「meta 失败 ⇒ 实测一次 get」的降级路径。
+            return null;
+          } finally {
+            // 只有真正发起请求的这一支负责清账；所有等待方共享同一个已结算的 Promise。
+            request.inFlight = false;
+            request.promise = null;
+          }
+        })();
+        request.promise = pending;
+        return pending;
       };
       metaRefreshRef.current = loadMeta;
 
       /**
-       * 读取模板库摘要（票据 28，单飞）。
+       * 「会话模型」读取 effect：展开编辑区、切换 root、点「重新读取」各跑一次。
        *
-       * Host 只回有界摘要（不含 outputSchema 原文/凭据/路径全文），客户端再截断到 32 条。
-       * 失败写进模板区的小字 + 标题栏错误槽（与动作失败共用同一个错误面）。
+       * 边界（与设置页 useSessionOverrideSection 逐条对齐）：
+       * - 折叠时直接返回：不发 session-override-* RPC、也不读 meta；
+       * - 没有 root（未打开会话）⇒ no-session；当前视图是子代理会话 ⇒ child，两者都不发 RPC；
+       * - 否则先读 meta（复用单飞 loadMeta，失败时用渲染期快照 metaStateRef 兜底）再判能力：
+       *   Host 明确声明不支持时降级为 unsupported，绝不发一个大概率被拒的请求；
+       * - 请求代次 + cancelled 标记丢弃迟到响应：关闭/切会话/连续重读都不会把旧结果写回界面。
        */
-      const loadTemplates = async () => {
-        if (mountedRef.current !== true) return null;
-        const targetSessionId = typeof currentRootRef.current === "string" ? currentRootRef.current : "";
-        if (targetSessionId === "") return null;
-        const request = templatesRequestRef.current;
-        if (request.inFlight === true) return null;
-        request.inFlight = true;
-        setTemplatesState((previous) => ({ ...previous, status: "loading", message: null }));
+      if (typeof react.useEffect === "function") {
+        react.useEffect(() => {
+          if (sessionModelOpen !== true) return () => {};
+          const targetSessionId = rootSessionId;
+          // surface 身份变化（含 root→子会话、子会话→root、A→B→A）都算「换了一块界面」：
+          // 旧 surface 的在途写入再也不会被采纳，它的保存锁必须立刻释放，否则新 surface
+          // 的保存/清除按钮会被一条已经不属于这里的请求一直锁住。
+          const previousSurface = sessionModelSurfaceRef.current;
+          const surfaceChanged = previousSurface.rootSessionId !== rootSessionId
+            || previousSurface.sidebarSessionId !== sidebarSessionId;
+          sessionModelSurfaceRef.current = { rootSessionId, sidebarSessionId };
+          if (surfaceChanged === true) setSessionModelSaving(false);
+          // 旧 root 的成功/冲突/失败提示不属于新 surface：root 一变立即清掉，
+          // 不等新 root 的读取结果（新读取可能失败、也可能很慢，旧提示不能一直挂着）。
+          // 草稿仍只在真正读到权威覆盖后才清（同一 root 的手动重读必须保留用户输入）。
+          if (sessionModelLoadedRootRef.current !== targetSessionId) setSessionModelNotice(null);
+          if (targetSessionId === "" || sidebarSessionId !== targetSessionId) {
+            sessionModelRequestSerialRef.current += 1;
+            sessionModelLoadedRootRef.current = null;
+            setSessionModelDrafts({});
+            setSessionModelNotice(null);
+            setSessionModelSaving(false);
+            setSessionModelState({
+              status: targetSessionId === "" ? "no-session" : "child",
+              overrides: {},
+              revision: 0,
+              live: false,
+            });
+            return () => {};
+          }
+          let cancelled = false;
+          sessionModelRequestSerialRef.current += 1;
+          const serial = sessionModelRequestSerialRef.current;
+          // 保留上一份覆盖数据只把状态切到 loading：重读期间界面不闪成空表。
+          setSessionModelState((previous) => (previous.status === "ready"
+            ? { ...previous, status: "loading" }
+            : { status: "loading", overrides: {}, revision: 0, live: false }));
+          void (async () => {
+            // 模型目录与 meta 并行读取：目录只做输入提示，慢一点不影响覆盖读取。
+            try {
+              const pending = config.modelCatalog?.load?.();
+              if (pending !== null && pending !== undefined && typeof pending.catch === "function") pending.catch(() => {});
+            } catch { /* 目录加载失败不阻塞覆盖读取：输入框仍可手填。 */ }
+            const loaded = await loadMeta();
+            if (cancelled === true || serial !== sessionModelRequestSerialRef.current) return;
+            const effectiveMeta = loaded !== null ? loaded : metaStateRef.current;
+            if (effectiveMeta !== null && effectiveMeta.capabilities.sessionOverride !== true) {
+              setSessionModelState({ status: "unsupported", overrides: {}, revision: 0, live: false });
+              return;
+            }
+            let body;
+            try {
+              body = await callRpc(
+                config,
+                contextRef.current,
+                { action: "session-override-get", sessionId: targetSessionId },
+                {},
+                (value) => object(value),
+              );
+            } catch (error) {
+              if (cancelled === true || serial !== sessionModelRequestSerialRef.current) return;
+              // 能力未知（meta 读失败）时旧宿主会对未知 action 回 bad-request：按「版本不支持」呈现，
+              // 比一直停在「读取失败」更诚实。
+              const code = text(object(error).code, null);
+              setSessionModelState({
+                status: code === "bad-request" && effectiveMeta === null ? "unsupported" : "error",
+                overrides: {},
+                revision: 0,
+                live: false,
+              });
+              return;
+            }
+            if (cancelled === true || serial !== sessionModelRequestSerialRef.current) return;
+            const roles = sessionModelRolesOf(effectiveMeta);
+            const view = normalizeSessionModelView(body, roles);
+            if (view === null) {
+              setSessionModelState({ status: "error", overrides: {}, revision: 0, live: false });
+              return;
+            }
+            // 只有 root 真的换了才清草稿：同一会话的手动重读必须保留用户未提交的输入。
+            if (sessionModelLoadedRootRef.current !== targetSessionId) setSessionModelDrafts({});
+            sessionModelLoadedRootRef.current = targetSessionId;
+            setSessionModelState({ status: "ready", overrides: view.overrides, revision: view.revision, live: view.live });
+          })();
+          return () => { cancelled = true; };
+        }, [sessionModelOpen, rootSessionId, sidebarSessionId, sessionModelReloadToken, config]);
+      }
+
+      /**
+       * 模型目录订阅（只在本区展开时）：目录 store 与设置页是同一份单飞实例。
+       *
+       * 这里只做只读订阅（getSnapshot + subscribe）；目录的加载/刷新仍由该 store 自己管理。
+       * 折叠或卸载即退订，避免面板常驻时白跑回调。
+       */
+      if (typeof react.useEffect === "function") {
+        react.useEffect(() => {
+          if (sessionModelOpen !== true) return () => {};
+          const catalog = config.modelCatalog;
+          if (catalog === null || catalog === undefined || typeof catalog !== "object") return () => {};
+          const read = () => {
+            if (mountedRef.current !== true) return;
+            try {
+              const snapshot = typeof catalog.getSnapshot === "function" ? catalog.getSnapshot() : null;
+              const source = object(snapshot);
+              setSessionModelCatalog({
+                groups: Array.isArray(source.groups) ? source.groups : [],
+                status: text(source.status, "idle"),
+              });
+            } catch {
+              // 目录读取抛错按「没有目录」降级：输入框仍可手填，绝不伪造候选。
+              setSessionModelCatalog({ groups: [], status: "error" });
+            }
+          };
+          read();
+          let unsubscribe = null;
+          try {
+            if (typeof catalog.subscribe === "function") unsubscribe = catalog.subscribe(read);
+          } catch { unsubscribe = null; }
+          return () => { if (typeof unsubscribe === "function") unsubscribe(); };
+        }, [sessionModelOpen, config]);
+      }
+
+      /**
+       * 打开时把 dialog 真正弹到 top layer。
+       *
+       * 必须走原生 showModal()：右栏容器带 overflow/transform，普通定位的浮层会被裁剪，
+       * 只有 top layer 能覆盖整页。已打开（node.open === true）不重复调用（showModal 对
+       * 已打开对话框会抛 InvalidStateError）；ref 未挂载、宿主不支持 showModal（测试替身 /
+       * 极旧 WebView）时静默跳过——弹窗内容仍然渲染在树里，绝不因为缺少 DOM 能力而报错。
+       */
+      if (typeof react.useEffect === "function") {
+        react.useEffect(() => {
+          if (sessionModelOpen !== true) return;
+          const node = sessionModelDialogRef.current;
+          if (node === null || node === undefined) return;
+          if (node.open === true) return;
+          try {
+            if (typeof node.showModal === "function") node.showModal();
+          } catch { /* 宿主拒绝 showModal（已打开/非活动文档）时保持当前可见性。 */ }
+        }, [sessionModelOpen]);
+      }
+
+      /**
+       * 关闭弹窗后把焦点还给入口按钮（无障碍：键盘用户不能掉回文档开头）。
+       *
+       * 只在「上一帧打开 → 这一帧关闭」这一次转换上执行：首次挂载时 wasOpen=false，
+       * 用户从未打开过，绝不抢焦点。ref 在测试替身里不会真正挂载（current 为 null），
+       * 因此用可选调用 + try/catch：任何宿主上焦点归还失败都不得让关闭语义崩掉。
+       */
+      if (typeof react.useEffect === "function") {
+        react.useEffect(() => {
+          const wasOpen = sessionModelWasOpenRef.current === true;
+          sessionModelWasOpenRef.current = sessionModelOpen === true;
+          if (wasOpen !== true || sessionModelOpen === true) return;
+          const entry = sessionModelEntryRef.current;
+          try {
+            if (entry !== null && entry !== undefined && typeof entry.focus === "function") entry.focus();
+          } catch { /* 宿主拒绝聚焦时忽略：关闭已经生效，焦点位置不是阻断条件。 */ }
+        }, [sessionModelOpen]);
+      }
+
+      /** 角色行草稿：只记录用户实际改过的字段，未改过的行始终跟随权威值。 */
+      const updateSessionModelDraft = (role, field, value) => {
+        setSessionModelDrafts((previous) => {
+          const base = Object.prototype.hasOwnProperty.call(previous, role)
+            ? previous[role]
+            : (() => {
+              const effective = sessionModelState.overrides[role]
+                ?? normalizeSessionModelSelection(metaStateRef.current?.roleDefaults?.[role]);
+              return {
+                provider: effective?.provider ?? "",
+                model: effective?.model ?? "",
+                reasoningEffort: effective?.reasoningEffort ?? "",
+              };
+            })();
+          const next = { ...base, [field]: value };
+          const groups = sessionModelCatalog.groups;
+          if (field === "provider") {
+            // 换供应商：旧模型仍存在于新供应商目录下就保留，否则 model/effort 一起清空
+            // （保留一个换了供应商却仍指向旧模型的草稿，只会在保存时被 Host 拒绝）。
+            // 清空供应商时模型必须一起清空：模型候选只属于具体 provider，绝不跨 provider 复用。
+            const models = value === "" ? [] : sessionModelModelOptions(value, groups);
+            const stillAvailable = next.model !== ""
+              && models.some((candidate) => text(object(candidate).id, null) === next.model);
+            if (stillAvailable !== true) {
+              next.model = "";
+              next.reasoningEffort = "";
+            }
+          } else if (field === "model") {
+            // 换模型：思考深度跟随新模型的 defaultEffort；没有声明就回到「模型默认」。
+            const entry = sessionModelModelOptions(next.provider, groups)
+              .find((candidate) => text(object(candidate).id, null) === value);
+            const defaultEffort = text(object(entry?.reasoning).defaultEffort, null);
+            next.reasoningEffort = defaultEffort === null ? "" : defaultEffort;
+            const efforts = Array.isArray(entry?.reasoning?.efforts) ? entry.reasoning.efforts : [];
+            if (next.reasoningEffort !== ""
+              && efforts.every((effort) => text(object(effort).id, null) !== next.reasoningEffort)) {
+              next.reasoningEffort = "";
+            }
+          }
+          return { ...previous, [role]: next };
+        });
+        setSessionModelNotice(null);
+      };
+
+      /** 某个角色的「权威基线」：本会话覆盖优先，否则全局默认（都没有则空选择）。 */
+      const sessionModelBaselineOf = (role) => sessionModelState.overrides[role]
+        ?? normalizeSessionModelSelection(object(metaStateRef.current?.roleDefaults)[role]);
+
+      /**
+       * 当前可提交的改动（按角色展示顺序，串行提交）。
+       *
+       * 只把「确有草稿、provider/model 都非空、且与权威基线不同」的角色算作改动：
+       * 用户点开过下拉但最终选回原值的行不产生请求。
+       */
+      const sessionModelPendingChanges = () => {
+        const changes = [];
+        for (const role of sessionModelRolesOf(metaStateRef.current)) {
+          if (Object.prototype.hasOwnProperty.call(sessionModelDrafts, role) !== true) continue;
+          const selection = sessionModelSelectionOfDraft(sessionModelDrafts[role]);
+          if (selection.provider.length === 0 || selection.model.length === 0) continue;
+          if (sessionModelSelectionEquals(selection, sessionModelBaselineOf(role))) continue;
+          changes.push({ role, selection });
+        }
+        return changes;
+      };
+
+      /** 本地校验：任一草稿缺 provider/model 就不允许保存（按钮禁用 + 底部提示）。 */
+      const sessionModelHasInvalidDraft = () => {
+        for (const role of sessionModelRolesOf(metaStateRef.current)) {
+          if (Object.prototype.hasOwnProperty.call(sessionModelDrafts, role) !== true) continue;
+          const selection = sessionModelSelectionOfDraft(sessionModelDrafts[role]);
+          if (selection.provider.length === 0 || selection.model.length === 0) return true;
+        }
+        return false;
+      };
+
+      /** 写成功后的统一收口：刷新权威投影 + 删除该角色草稿。 */
+      const applySessionModelView = (view, role) => {
+        setSessionModelState({ status: "ready", overrides: view.overrides, revision: view.revision, live: view.live });
+        // 只有成功路径才删除该角色的草稿：失败/冲突必须保留用户输入。
+        setSessionModelDrafts((previous) => {
+          if (Object.prototype.hasOwnProperty.call(previous, role) !== true) return previous;
+          const next = { ...previous };
+          delete next[role];
+          return next;
+        });
+      };
+
+      /**
+       * 冲突/失败回执的统一收口（保存与清除共用，调用方已过 surface 闸门）。
+       *
+       * 冲突语义（与设置页一致）：Host 的 revision CAS 失败时返回 session-override-conflict
+       * 与 details.currentRevision/overrides。此时**保留未提交草稿**，只把本地基线推进到权威值
+       * 并显示带当前代次的提示；其它错误同样只提示、绝不清空输入。
+       */
+      const settleSessionModelFailure = (error, role) => {
+        const roles = sessionModelRolesOf(metaStateRef.current);
+        const code = text(object(error).code, null);
+        const details = object(object(error).details);
+        if (code === "session-override-conflict") {
+          const currentRevision = Number.isSafeInteger(details.currentRevision) && details.currentRevision >= 0
+            ? details.currentRevision
+            : null;
+          const overrides = details.overrides === undefined
+            ? null
+            : normalizeSessionModelOverrides(details.overrides, roles);
+          setSessionModelState((previous) => ({
+            ...previous,
+            status: "ready",
+            revision: currentRevision === null ? previous.revision : currentRevision,
+            overrides: overrides === null ? previous.overrides : overrides,
+          }));
+          setSessionModelNotice({
+            kind: "conflict",
+            role,
+            text: t("sidebar.sessionModel.conflict", {
+              revision: currentRevision === null ? "?" : currentRevision,
+            }),
+          });
+          return;
+        }
+        const message = text(object(error).message, null);
+        setSessionModelNotice({
+          kind: "error",
+          role,
+          text: message === null
+            ? t("sidebar.sessionModel.unavailable")
+            : t("sidebar.sessionModel.failed", { message }),
+        });
+      };
+
+      /** 保存/清除的公共前置条件：可写、会话在运行、没有别的写入在途、且当前就是 root 视图。 */
+      const sessionModelWriteReady = () => mountedRef.current === true
+        && sessionModelState.status === "ready"
+        && sessionModelState.live === true
+        && sessionModelSaving !== true
+        && rootSessionId !== ""
+        && sidebarSessionId === rootSessionId;
+
+      /**
+       * 提交底部「保存」：按角色展示顺序串行发送 session-override-set。
+       *
+       * 代次是唯一的并发栅栏：每个请求的 expectedRevision 都用上一次响应的 revision
+       * （首个用打开时读到的 revision）。任何一次冲突/失败都立即停止后续请求，保留未提交草稿；
+       * 只有全部成功才提示 saved。await 之后一律先过 sidebarSurfaceStillCurrent()：
+       * 闸门只丢弃本地 UI 写入，Host 写入仍按 CAS 落库，重新打开时以权威读取为准。
+       */
+      const commitSessionModelChanges = async () => {
+        if (sessionModelWriteReady() !== true) return;
+        if (sessionModelHasInvalidDraft()) return;
+        const changes = sessionModelPendingChanges();
+        if (changes.length === 0) return;
+        const targetSessionId = rootSessionId;
+        const roles = sessionModelRolesOf(metaStateRef.current);
+        setSessionModelSaving(true);
+        setSessionModelNotice(null);
+        let revision = sessionModelState.revision;
+        try {
+          for (const change of changes) {
+            const body = await callRpc(
+              config,
+              contextRef.current,
+              {
+                action: "session-override-set",
+                sessionId: targetSessionId,
+                role: change.role,
+                expectedRevision: revision,
+                selection: change.selection,
+              },
+              {},
+              (value) => object(value),
+            );
+            if (sidebarSurfaceStillCurrent() !== true) return;
+            const view = normalizeSessionModelView(body, roles);
+            if (view === null) {
+              setSessionModelNotice({ kind: "error", role: change.role, text: t("sidebar.sessionModel.unavailable") });
+              return;
+            }
+            revision = view.revision;
+            applySessionModelView(view, change.role);
+          }
+          if (sidebarSurfaceStillCurrent() !== true) return;
+          setSessionModelNotice({ kind: "saved", revision });
+        } catch (error) {
+          // 失败/冲突回执走同一道 surface 闸门：旧 surface 的错误绝不写进新 surface 的提示槽。
+          if (sidebarSurfaceStillCurrent() !== true) return;
+          settleSessionModelFailure(error, changes[changes.length - 1]?.role ?? null);
+        } finally {
+          // 锁按 surface 归属释放：A 会话的迟到回执不得提前解除 B 会话正在进行的保存锁。
+          if (sidebarSurfaceStillCurrent() === true) setSessionModelSaving(false);
+        }
+      };
+
+      /**
+       * 行内「×」：立即清除该角色的本会话覆盖。
+       *
+       * 与批量保存共用同一把 sessionModelSaving 锁；成功用响应刷新状态并删掉该行草稿，
+       * 冲突/失败按保存同一套语义收口（保留草稿、推进基线、只提示）。
+       */
+      const clearSessionModelRole = async (role) => {
+        if (sessionModelWriteReady() !== true) return;
+        if (sessionModelState.overrides[role] === undefined) return;
+        const targetSessionId = rootSessionId;
+        const roles = sessionModelRolesOf(metaStateRef.current);
+        setSessionModelSaving(true);
+        setSessionModelNotice(null);
         try {
           const body = await callRpc(
             config,
             contextRef.current,
-            { action: "fanout-template-list", sessionId: targetSessionId },
+            {
+              action: "session-override-clear",
+              sessionId: targetSessionId,
+              role,
+              expectedRevision: sessionModelState.revision,
+            },
             {},
             (value) => object(value),
           );
-          if (mountedRef.current !== true || currentRootRef.current !== targetSessionId) return null;
-          const templates = Array.isArray(body.templates) ? body.templates.slice(0, 32) : [];
-          const count = Number.isSafeInteger(body.count) && body.count >= 0 ? body.count : templates.length;
-          const limit = Number.isSafeInteger(body.limit) && body.limit > 0 ? body.limit : 32;
-          setTemplatesState({ status: "ready", templates, count, limit, message: null });
-          return body;
+          if (sidebarSurfaceStillCurrent() !== true) return;
+          const view = normalizeSessionModelView(body, roles);
+          if (view === null) {
+            setSessionModelNotice({ kind: "error", role, text: t("sidebar.sessionModel.unavailable") });
+            return;
+          }
+          applySessionModelView(view, role);
+          setSessionModelNotice({ kind: "cleared", role, revision: view.revision });
         } catch (error) {
-          if (mountedRef.current !== true) return null;
-          const message = displayErrorMessage(error);
-          setTemplatesState((previous) => ({ ...previous, status: "error", message }));
-          const source = rpcFailureKindOf(error) === RPC_FAILURE_TRANSPORT
-            ? PANEL_ERROR_SOURCES.rpc
-            : PANEL_ERROR_SOURCES.action;
-          const at = Date.now();
-          setState((previous) => ({ ...previous, error: { source, message, at } }));
-          return null;
+          if (sidebarSurfaceStillCurrent() !== true) return;
+          settleSessionModelFailure(error, role);
         } finally {
-          request.inFlight = false;
+          if (sidebarSurfaceStillCurrent() === true) setSessionModelSaving(false);
         }
       };
+
       /**
        * surface 身份令牌：给每一条「跨 await 的异步动作」用的**不可复用**身份。
        *
@@ -9069,7 +9582,12 @@
         const measuredTps = dshThroughputOf(dsh);
         const dshLlmMs = dsh === null ? null : dsh.llmMs;
         const dshDuration = dshLlmMs !== null && dshLlmMs > 0 ? dshLlmMs : null;
-        const durationMs = dshDuration !== null ? dshDuration : durationOfNode(source, runtimeStatus, sessionId);
+        // 用时口径（用户要求）：优先使用 Host 由 turn/start → now（或 turn/end）计算的
+        // 墙钟，与 DSH 状态行「用时 …」同源；旧快照没有该字段时才回退模型用时/会话时间。
+        const turnDurationMs = finiteNumber(source.turnDurationMs);
+        const durationMs = turnDurationMs !== null
+          ? turnDurationMs
+          : (dshDuration !== null ? dshDuration : durationOfNode(source, runtimeStatus, sessionId));
         const summary = typeof api?.summarizeUsageMetrics === "function"
           ? api.summarizeUsageMetrics(usage, {
             durationMs,
@@ -9085,7 +9603,7 @@
               key: key + "-separator",
               className: "deg_expert_group_metrics_separator",
               "aria-hidden": "true",
-            }, "·"));
+            }, " · "));
           }
           segments.push(react.createElement("span", {
             key,
@@ -9096,10 +9614,17 @@
         if (summary !== null) {
           // 用时 tooltip：DSH 显示「模型用时」，并补充工具调用用时；回退 DEG 时仍写「运行时间」。
           const toolDurationText = dsh === null || dsh.toolMs === null ? null : formatCompactDuration(dsh.toolMs);
+          const modelDurationText = dshDuration === null ? null : formatCompactDuration(dshDuration);
+          // 墙钟口径下 tooltip 主文案写「本轮用时」，并把模型/工具用时作为补充信息保留；
+          // 旧快照仍沿用「模型用时 / 运行时间」的既有文案。
           const durationTitle = summary.durationText === null ? null
-            : dshDuration !== null
-              ? "模型用时 " + summary.durationText + (toolDurationText === null ? "" : " · 工具调用用时 " + toolDurationText)
-              : "运行时间 " + summary.durationText;
+            : turnDurationMs !== null
+              ? "本轮用时 " + summary.durationText
+                + (modelDurationText === null ? "" : " · 模型用时 " + modelDurationText)
+                + (toolDurationText === null ? "" : " · 工具调用用时 " + toolDurationText)
+              : dshDuration !== null
+                ? "模型用时 " + summary.durationText + (toolDurationText === null ? "" : " · 工具调用用时 " + toolDurationText)
+                : "运行时间 " + summary.durationText;
           pushSegment("duration", summary.durationText === null ? null : "用时" + summary.durationText, durationTitle);
           pushSegment("throughput", summary.throughputText,
             summary.throughputText === null ? null : (measuredTps === null ? "平均吞吐 " : "输出速度 ") + summary.throughputText);
@@ -9492,7 +10017,7 @@
             const refreshMeta = metaRefreshRef.current;
             if (typeof refreshMeta === "function") void refreshMeta();
           }
-          // 票据 28：把回执原样交给调用方（手动派发需要 parentTaskId/continuation）。
+          // 把回执原样交给调用方：动作自己决定是否消费回执字段（取消/重试不消费）。
           return result;
         } catch (error) {
           // 卸载后的失败没有可展示的错误面，静默丢弃，绝不 setState。
@@ -9506,7 +10031,7 @@
             const clean = redact === null ? message : redact(message, 200);
             message = clean === "" ? message : clean;
           }
-          // 票据 28：派发类动作把 Host 的稳定 code 放在最前面，用户可按来源核对
+          // includeErrorCode：把 Host 的稳定 code 放在最前面，用户可按来源核对
           // （客户端仍然只展示文案，不解析 code 做业务判断）。其它动作保持既有原文。
           const code = actionOptions.includeErrorCode === true ? text(object(error).code, null) : null;
           if (code !== null) message = code + " · " + message;
@@ -9575,286 +10100,6 @@
         // 无论成功还是失败都刷新：成功让横幅随 recovery=ok 消失，失败则把 Host 重新记录的
         // 原因码/任务树取回来（失败原因码仍以 snapshot.recovery 为权威）。
         await refreshRef.current();
-      };
-
-      // ── 票据 28：手动派发与任务模板（全部复用 runAction / callRpc / refresh / 错误槽） ──
-      //
-      // 关键边界：
-      // 1) 唯一写路径是 runAction：它已经负责 pending 去重、root 切换后的目标重读、卸载后放弃、
-      //    尾随快照刷新与错误来源分档；这里**不新建第二套请求/刷新逻辑**。
-      // 2) 派发请求体与 fan-out 工具面同字段（role/prompt|basePrompt/shards/allowOverlap/
-      //    timeoutMs/concurrencyLimit/requestId），outputSchema 只作为表单输入透传，Host 再校验。
-      // 3) 只读角色能否派发完全由 Host 裁决：客户端只展示 Host 的拒绝（按来源进入错误槽），
-      //    绝不自行放行或改写角色权限。
-      /** 上一次成功派发的请求体（仅内存；用于「重放上次」，不含 requestId/凭据）。 */
-      const lastDispatchRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
-
-      const emptyDispatchShard = () => ({ name: "", prompt: "", affectedPaths: "", outputSchema: "", timeoutMs: "" });
-      const dispatchValidationError = (message) => ({ error: message });
-
-      /** 角色候选：meta.activeRoles 优先，meta 未就绪时用当前快照里实际出现的角色（含自定义角色）。 */
-      const dispatchRoleChoices = () => {
-        const roles = [];
-        const add = (role) => {
-          const id = text(role, null);
-          if (id !== null && roles.indexOf(id) === -1) roles.push(id);
-        };
-        if (meta !== null) for (const role of meta.roles) add(role);
-        if (roles.length === 0) {
-          const collect = (nodes, depth) => {
-            if (depth > 8) return;
-            for (const node of Array.isArray(nodes) ? nodes : []) {
-              const source = object(node);
-              add(source.role);
-              collect(source.children, depth + 1);
-              for (const shard of Array.isArray(source.shards) ? source.shards : []) add(object(shard).role);
-            }
-          };
-          collect(snapshot === null ? [] : object(snapshot.root).children, 0);
-        }
-        return roles;
-      };
-
-      const openDispatch = () => {
-        setDispatchError(null);
-        setDispatchReceipt(null);
-        setTemplateNotice(null);
-        setDispatchDraft((previous) => previous !== null ? previous : {
-          mode: "single",
-          role: dispatchRoleChoices()[0] ?? "",
-          prompt: "",
-          basePrompt: "",
-          shards: [emptyDispatchShard()],
-          allowOverlap: false,
-          concurrencyLimit: "",
-          timeoutMs: "",
-          name: "",
-        });
-        // 用户明确打开派发表单 ⇒ 按需读一次角色清单/单价（已有 meta 则复用）与模板库；
-        // 失败静默降级，绝不阻塞表单本身。
-        if (metaStateRef.current === null) void loadMeta();
-        void loadTemplates();
-      };
-      const closeDispatch = () => {
-        setDispatchDraft(null);
-        setDispatchError(null);
-      };
-      const updateDispatch = (patch) => setDispatchDraft((previous) => (
-        previous === null ? previous : { ...previous, ...object(patch) }
-      ));
-      const updateDispatchShard = (index, patch) => setDispatchDraft((previous) => {
-        if (previous === null) return previous;
-        const shards = previous.shards.map((shard, position) => (position === index ? { ...shard, ...object(patch) } : shard));
-        return { ...previous, shards };
-      });
-      const addDispatchShard = () => setDispatchDraft((previous) => (
-        previous === null ? previous : { ...previous, shards: previous.shards.concat([emptyDispatchShard()]) }
-      ));
-      const removeDispatchShard = (index) => setDispatchDraft((previous) => {
-        // 至少保留一个分片：空列表对 Host 是 INVALID_SHARDS，客户端不制造这种提交。
-        if (previous === null || previous.shards.length <= 1) return previous;
-        return { ...previous, shards: previous.shards.filter((_shard, position) => position !== index) };
-      });
-
-      /** 分片表单 → Host 分片结构；任一字段非法时只返回可读错误，不发请求。 */
-      const buildDispatchShards = (draft) => {
-        const rows = Array.isArray(draft.shards) ? draft.shards : [];
-        if (rows.length === 0) return dispatchValidationError("至少需要一个分片");
-        const shards = [];
-        for (let index = 0; index < rows.length; index += 1) {
-          const row = object(rows[index]);
-          const prompt = typeof row.prompt === "string" ? row.prompt : "";
-          if (prompt.trim() === "") return dispatchValidationError("分片 " + (index + 1) + " 需要非空任务提示");
-          const entry = { prompt };
-          const name = text(row.name, null);
-          if (name !== null) entry.name = name;
-          const affectedPaths = parsePathList(row.affectedPaths);
-          if (affectedPaths.length > 0) entry.affectedPaths = affectedPaths;
-          // outputSchema 是可选 JSON 对象；原文只存在于输入框，绝不写进回执/模板列表展示。
-          const schemaText = typeof row.outputSchema === "string" ? row.outputSchema.trim() : "";
-          if (schemaText !== "") {
-            let schema;
-            try { schema = JSON.parse(schemaText); } catch { return dispatchValidationError("分片 " + (index + 1) + " 的 outputSchema 不是合法 JSON"); }
-            if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
-              return dispatchValidationError("分片 " + (index + 1) + " 的 outputSchema 必须是 JSON 对象");
-            }
-            entry.outputSchema = schema;
-          }
-          const shardTimeout = parsePositiveInteger(row.timeoutMs);
-          if (shardTimeout !== null) entry.timeoutMs = shardTimeout;
-          shards.push(entry);
-        }
-        return { shards };
-      };
-
-      /** 派发/模板共用的可选字段：allowOverlap + 任务级 timeoutMs/concurrencyLimit。 */
-      const dispatchExtras = (draft) => {
-        const extras = { allowOverlap: draft.allowOverlap === true };
-        const timeoutMs = parsePositiveInteger(draft.timeoutMs);
-        if (timeoutMs !== null) extras.timeoutMs = timeoutMs;
-        const concurrencyLimit = parsePositiveInteger(draft.concurrencyLimit);
-        if (concurrencyLimit !== null) extras.concurrencyLimit = concurrencyLimit;
-        return extras;
-      };
-
-      const buildDispatchRequest = (draft) => {
-        const source = object(draft);
-        const mode = source.mode === "fanout" ? "fanout" : "single";
-        const role = text(source.role, null);
-        if (role === null) return dispatchValidationError("请选择专家角色");
-        const request = {
-          action: "fanout-dispatch",
-          mode,
-          role,
-          ...dispatchExtras(source),
-          // 每次提交生成新 requestId：Host 用它做幂等去重（重复提交返回同一 parentTaskId）。
-          requestId: newDispatchRequestId(),
-        };
-        if (mode === "single") {
-          const prompt = typeof source.prompt === "string" ? source.prompt : "";
-          if (prompt.trim() === "") return dispatchValidationError("请输入任务提示");
-          request.prompt = prompt;
-          return { request };
-        }
-        const basePrompt = typeof source.basePrompt === "string" ? source.basePrompt : "";
-        if (basePrompt.trim() === "") return dispatchValidationError("请输入公共目标");
-        const built = buildDispatchShards(source);
-        if (built.error !== undefined) return built;
-        request.basePrompt = basePrompt;
-        request.shards = built.shards;
-        return { request };
-      };
-
-      const buildTemplateRequest = (draft) => {
-        const source = object(draft);
-        const name = text(source.name, null);
-        if (name === null) return dispatchValidationError("请填写模板名称");
-        const mode = source.mode === "fanout" ? "fanout" : "single";
-        const request = { action: "fanout-template-save", name, ...dispatchExtras(source) };
-        const role = text(source.role, null);
-        if (role === null) return dispatchValidationError("请选择专家角色");
-        request.role = role;
-        if (mode === "single") {
-          const prompt = typeof source.prompt === "string" ? source.prompt : "";
-          if (prompt.trim() === "") return dispatchValidationError("请输入任务提示");
-          request.prompt = prompt;
-          return { request };
-        }
-        const basePrompt = typeof source.basePrompt === "string" ? source.basePrompt : "";
-        if (basePrompt.trim() === "") return dispatchValidationError("请输入公共目标");
-        const built = buildDispatchShards(source);
-        if (built.error !== undefined) return built;
-        request.basePrompt = basePrompt;
-        request.shards = built.shards;
-        return { request };
-      };
-
-      /** 派发回执的有界投影：只保留 parentTaskId/轮次/续作句柄的标量字段。 */
-      const dispatchReceiptOf = (value) => {
-        const source = object(value);
-        const continuation = object(source.continuation);
-        return {
-          parentTaskId: text(source.parentTaskId, null),
-          mode: text(source.mode, null),
-          role: text(source.role, null),
-          duplicate: source.duplicate === true,
-          round: finiteNumber(source.round),
-          continuation: Object.keys(continuation).length === 0 ? null : {
-            parentTaskId: text(continuation.parentTaskId, null),
-            round: finiteNumber(continuation.round),
-            running: continuation.running === true,
-            reusable: continuation.reusable === true,
-          },
-        };
-      };
-
-      const submitDispatch = async () => {
-        if (dispatchDraft === null || pendingSet.current.has("dispatch")) return;
-        const built = buildDispatchRequest(dispatchDraft);
-        if (built.error !== undefined) { setDispatchError(built.error); return; }
-        setDispatchError(null);
-        setTemplateNotice(null);
-        const result = await runAction(built.request, "dispatch", false, "", {
-          includeErrorCode: true,
-          safeMessage: true,
-          refreshMeta: true,
-        });
-        if (result === null) return;
-        // 去掉 requestId 后留作「重放上次」的基线（重放会生成新的 requestId，不是幂等命中）。
-        const replayable = { ...built.request };
-        delete replayable.requestId;
-        lastDispatchRef.current = replayable;
-        setDispatchReceipt(dispatchReceiptOf(result));
-        setDispatchDraft(null);
-      };
-
-      const replayLastDispatch = async () => {
-        const last = object(lastDispatchRef.current);
-        if (text(last.action, null) !== "fanout-dispatch") return;
-        if (pendingSet.current.has("dispatch-replay")) return;
-        setDispatchError(null);
-        setTemplateNotice(null);
-        const result = await runAction({ ...last, requestId: newDispatchRequestId() }, "dispatch-replay", false, "", {
-          includeErrorCode: true,
-          safeMessage: true,
-          refreshMeta: true,
-        });
-        if (result === null) return;
-        setDispatchReceipt(dispatchReceiptOf(result));
-      };
-
-      const saveDispatchTemplate = async () => {
-        if (dispatchDraft === null || pendingSet.current.has("template-save")) return;
-        const built = buildTemplateRequest(dispatchDraft);
-        if (built.error !== undefined) { setDispatchError(built.error); return; }
-        setDispatchError(null);
-        setTemplateNotice(null);
-        const result = await runAction(built.request, "template-save", false, "", {
-          includeErrorCode: true,
-          safeMessage: true,
-        });
-        if (result === null) return;
-        const count = Number.isSafeInteger(result.count) ? result.count : null;
-        setTemplateNotice(count === null ? "模板已保存" : "模板已保存（共 " + count + " 个）");
-        await loadTemplates();
-      };
-
-      const dispatchTemplateById = async (template) => {
-        const id = text(object(template).id, null);
-        if (id === null) return;
-        const key = "template-dispatch:" + id;
-        if (pendingSet.current.has(key)) return;
-        setDispatchError(null);
-        setTemplateNotice(null);
-        const result = await runAction(
-          { action: "fanout-template-dispatch", templateId: id, requestId: newDispatchRequestId() },
-          key,
-          false,
-          "",
-          { includeErrorCode: true, safeMessage: true, refreshMeta: true },
-        );
-        if (result === null) return;
-        setDispatchReceipt(dispatchReceiptOf(result));
-        setDispatchDraft(null);
-      };
-
-      const deleteTemplateById = async (template) => {
-        const id = text(object(template).id, null);
-        if (id === null) return;
-        const key = "template-delete:" + id;
-        if (pendingSet.current.has(key)) return;
-        const title = text(object(template).name, id);
-        setTemplateNotice(null);
-        const result = await runAction(
-          { action: "fanout-template-delete", templateId: id },
-          key,
-          true,
-          "确认删除模板 " + title + "？",
-          { includeErrorCode: true, safeMessage: true },
-        );
-        if (result === null) return;
-        setTemplateNotice("模板已删除");
-        await loadTemplates();
       };
 
       const renderAction = (label, Icon, onClick, pending) => react.createElement("button", {
@@ -10070,245 +10315,372 @@
       const idleBatchSlot = filterActive === true ? null : renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren), t("sidebar.idleGroup.name"));
       const root = snapshot?.root;
       /**
-       * 顶部工具条（票据 12）：搜索输入 + 角色筛选 + 状态筛选 + 手动派发入口。
+       * 顶部工具条（票据 12）：搜索输入 + 角色筛选 + 状态筛选 + 「会话模型」入口。
        *
        * 只在快照已上屏时渲染（skeleton/空态没有可过滤的内容）；输入/下拉只改内存过滤状态，
-       * 手动派发只读本地表单或调用既有 RPC。角色候选从当前快照里现算
-       * （普通专家、fan-out 父任务与分片），而不是写死词表。
+       * 「会话模型」按钮只切换本地折叠状态（真正的读写都发生在它自己的 effect 里）。
+       * 角色候选从当前快照里现算（普通专家、fan-out 父任务与分片），而不是写死词表。
        */
-      /** 表单字段容器（label + 控件）；控件自身负责 aria-label 与受控值。 */
-      const renderDispatchField = (label, control) => react.createElement("label", { className: "deg_expert_group_dispatch_field" },
-        react.createElement("span", { className: "deg_expert_group_dispatch_label" }, label),
-        control);
-
       /**
-       * 票据 28：新建任务内联表单。
+       * 侧栏「会话模型」弹窗：按角色编辑**本会话**的 provider/model/思考深度。
        *
-       * 字段与 fan-out 工具面一致：mode/role/prompt|basePrompt/分片（name/prompt/affectedPaths/
-       * outputSchema/timeout）/allowOverlap/concurrencyLimit/timeoutMs/模板名称。
-       * 「至少一个分片」「非法 JSON」等本地错误只显示在表单内；Host 的结构化拒绝走错误槽。
+       * 与设置页「角色模型」表同一套数据与视觉（专家 | 供应商 | 模型选择 | 思考深度）：
+       * - 关闭时返回 null，且不发起任何 session-override-* RPC；
+       * - 弹窗是原生 <dialog>，由 showModal() 放进 top layer（右栏容器的 overflow/transform
+       *   裁剪不到它）；关闭按钮 / ESC / 点 backdrop / 状态同步都回到 sessionModelOpen；
+       * - 每行显示值 = 草稿 ?? 本会话覆盖 ?? 全局默认（meta.roleDefaults）；
+       * - 只有 status=ready 且 live=true（会话在运行）且没有写入在途时才可编辑；
+       * - 底部「保存」整批提交改动（按角色展示顺序串行），行内「×」立即清除该角色覆盖。
        */
-      const renderDispatchForm = () => {
-        if (dispatchDraft === null) return null;
-        const draft = dispatchDraft;
-        const roles = dispatchRoleChoices();
-        const pending = pendingSet.current.has("dispatch");
-        const saving = pendingSet.current.has("template-save");
-        const mode = draft.mode === "fanout" ? "fanout" : "single";
-        const shards = Array.isArray(draft.shards) ? draft.shards : [];
-        const textInput = (label, ariaLabel, value, onChange) => renderDispatchField(label, react.createElement("input", {
-          type: "text",
-          className: "deg_expert_group_dispatch_input",
-          "aria-label": ariaLabel,
-          value: value,
-          onChange: (event) => onChange(event?.target?.value ?? ""),
-        }));
-        const option = (value, label) => react.createElement("option", { key: value, value }, label);
-        const promptValue = mode === "single" ? draft.prompt : draft.basePrompt;
-        const promptControl = react.createElement("textarea", {
-          className: "deg_expert_group_dispatch_input deg_expert_group_dispatch_textarea",
-          "aria-label": mode === "single" ? "任务提示" : "公共目标",
-          rows: 3,
-          value: promptValue,
-          onChange: (event) => {
-            const value = event?.target?.value ?? "";
-            updateDispatch(mode === "single" ? { prompt: value } : { basePrompt: value });
-          },
-        });
-        const shardSection = mode === "fanout"
-          ? react.createElement("div", { className: "deg_expert_group_dispatch_shards", role: "group", "aria-label": "分片列表" },
-            ...shards.map((value, index) => {
-              const shard = object(value);
-              return react.createElement("div", {
-                key: "dispatch-shard-" + index,
-                className: "deg_expert_group_dispatch_shard",
-                role: "group",
-                "aria-label": "分片 " + (index + 1),
-              },
-              react.createElement("div", { className: "deg_expert_group_dispatch_shard_head" },
-                react.createElement("span", null, "分片 " + (index + 1)),
-                react.createElement("button", {
-                  type: "button",
-                  className: "deg_expert_group_export_button",
-                  "aria-label": "删除分片 " + (index + 1),
-                  disabled: shards.length <= 1,
-                  onClick: () => removeDispatchShard(index),
-                }, "删除")),
-              textInput("名称", "分片 " + (index + 1) + " 名称", text(shard.name, ""),
-                (next) => updateDispatchShard(index, { name: next })),
-              renderDispatchField("任务提示", react.createElement("textarea", {
-                className: "deg_expert_group_dispatch_input deg_expert_group_dispatch_textarea",
-                "aria-label": "分片 " + (index + 1) + " 任务提示",
-                rows: 2,
-                value: typeof shard.prompt === "string" ? shard.prompt : "",
-                onChange: (event) => updateDispatchShard(index, { prompt: event?.target?.value ?? "" }),
-              })),
-              textInput("影响范围（逗号/换行分隔）", "分片 " + (index + 1) + " 影响范围", typeof shard.affectedPaths === "string" ? shard.affectedPaths : "",
-                (next) => updateDispatchShard(index, { affectedPaths: next })),
-              renderDispatchField("outputSchema（可选 JSON 对象）", react.createElement("textarea", {
-                className: "deg_expert_group_dispatch_input deg_expert_group_dispatch_textarea",
-                "aria-label": "分片 " + (index + 1) + " 输出 schema",
-                rows: 2,
-                value: typeof shard.outputSchema === "string" ? shard.outputSchema : "",
-                onChange: (event) => updateDispatchShard(index, { outputSchema: event?.target?.value ?? "" }),
-              })),
-              textInput("超时（毫秒，可选）", "分片 " + (index + 1) + " 超时", typeof shard.timeoutMs === "string" ? shard.timeoutMs : String(shard.timeoutMs ?? ""),
-                (next) => updateDispatchShard(index, { timeoutMs: next })));
-            }),
-            react.createElement("button", {
-              type: "button",
-              className: "deg_expert_group_export_button",
-              "aria-label": "添加分片",
-              onClick: addDispatchShard,
-            }, "添加分片"))
-          : null;
-        return react.createElement("section", {
-          className: "deg_expert_group_dispatch",
-          role: "form",
-          "aria-label": "新建任务",
-          "data-mode": mode,
-        },
-        react.createElement("div", { className: "deg_expert_group_dispatch_head" },
-          react.createElement("span", null, "新建任务"),
-          react.createElement("button", {
-            type: "button",
-            className: "deg_expert_group_export_button",
-            "aria-label": "关闭新建任务",
-            onClick: closeDispatch,
-          }, "关闭")),
-        react.createElement("div", { className: "deg_expert_group_dispatch_row" },
-          renderDispatchField("模式", react.createElement("select", {
-            className: "deg_expert_group_filter",
-            "aria-label": "派发模式",
-            value: mode,
-            onChange: (event) => updateDispatch({ mode: event?.target?.value === "fanout" ? "fanout" : "single" }),
-          }, option("single", "单专家"), option("fanout", "fan-out"))),
-          renderDispatchField("角色", react.createElement("select", {
-            className: "deg_expert_group_filter",
-            "aria-label": "派发角色",
-            value: text(draft.role, ""),
-            onChange: (event) => updateDispatch({ role: event?.target?.value ?? "" }),
-          },
-          roles.length === 0 ? option("", "（暂无可用角色）") : null,
-          ...roles.map((role) => option(role, roleLabelFor(role, null) ?? role))))),
-        renderDispatchField(mode === "single" ? "任务提示" : "公共目标", promptControl),
-        shardSection,
-        react.createElement("div", { className: "deg_expert_group_dispatch_row" },
-          react.createElement("label", { className: "deg_expert_group_dispatch_check" },
-            react.createElement("input", {
-              type: "checkbox",
-              "aria-label": "允许影响范围重叠",
-              checked: draft.allowOverlap === true,
-              onChange: (event) => updateDispatch({ allowOverlap: event?.target?.checked === true }),
-            }),
-            react.createElement("span", null, "允许影响范围重叠")),
-          textInput("并发上限", "并发上限", String(draft.concurrencyLimit ?? ""),
-            (next) => updateDispatch({ concurrencyLimit: next })),
-          textInput("任务超时（毫秒）", "任务超时", String(draft.timeoutMs ?? ""),
-            (next) => updateDispatch({ timeoutMs: next }))),
-        textInput("模板名称（保存模板时必填）", "模板名称", String(draft.name ?? ""),
-          (next) => updateDispatch({ name: next })),
-        dispatchError === null
+      const renderSessionModelDialog = () => {
+        if (sessionModelOpen !== true) return null;
+        const status = sessionModelState.status;
+        const roles = sessionModelRolesOf(meta);
+        const groups = Array.isArray(sessionModelCatalog.groups) ? sessionModelCatalog.groups : [];
+        // 唯一可写判据：Host 读面成功、会话在运行、且没有批量写入在途。
+        const writable = status === "ready" && sessionModelState.live === true && sessionModelSaving !== true;
+        const readOnlyReasons = {
+          "no-session": t("sidebar.sessionModel.noSession"),
+          child: t("sidebar.sessionModel.child"),
+          loading: t("sidebar.sessionModel.loading"),
+          unsupported: t("sidebar.sessionModel.unsupported"),
+          error: t("sidebar.sessionModel.unavailable"),
+          unavailable: t("sidebar.sessionModel.unavailable"),
+        };
+        // ready + live=false 是「会话未运行」；其余按状态取固定文案。idle（刚打开、effect 还没跑）
+        // 不提示，避免闪一行会被立刻替换掉的只读文案。
+        const readOnlyHint = status === "ready"
+          ? (sessionModelState.live === true ? null : t("sidebar.sessionModel.offline"))
+          : (readOnlyReasons[status] ?? null);
+        const noticeText = sessionModelNotice === null
           ? null
-          : react.createElement("div", { className: "deg_expert_group_dispatch_error", role: "alert" }, dispatchError),
-        react.createElement("div", { className: "deg_expert_group_dispatch_actions" },
-          react.createElement("button", {
-            type: "button",
-            className: "deg_expert_group_export_button",
-            "aria-label": "派发任务",
-            "aria-busy": pending || undefined,
-            disabled: pending,
-            onClick: () => { void submitDispatch(); },
-          }, pending ? "派发中…" : "派发"),
-          react.createElement("button", {
-            type: "button",
-            className: "deg_expert_group_export_button",
-            "aria-label": "保存为模板",
-            "aria-busy": saving || undefined,
-            disabled: saving,
-            onClick: () => { void saveDispatchTemplate(); },
-          }, saving ? "保存中…" : "保存为模板")),
-        templateNotice === null ? null : react.createElement("div", { className: "deg_expert_group_dispatch_notice", role: "status" }, templateNotice),
-        renderTemplates());
-      };
+          : sessionModelNotice.kind === "saved"
+            ? t("sidebar.sessionModel.saved")
+            : sessionModelNotice.kind === "cleared"
+              ? t("sidebar.sessionModel.cleared")
+              : sessionModelNotice.text;
+        const noticeError = sessionModelNotice?.kind === "error" || sessionModelNotice?.kind === "conflict";
+        // 底部保存按钮的可点条件：有可提交改动且所有草稿都合法（provider/model 都非空）。
+        const changes = status === "ready" ? sessionModelPendingChanges() : [];
+        const invalidDraft = status === "ready" && sessionModelHasInvalidDraft();
+        const canSave = writable === true && changes.length > 0 && invalidDraft !== true;
+        const closeDialog = (event) => {
+          event?.preventDefault?.();
+          event?.stopPropagation?.();
+          setSessionModelOpen(false);
+        };
+        /** 下拉选项：disabled 项只用于「目录外的历史值/占位说明」，不会被用户选中提交。 */
+        const optionOf = (value, label, disabled) => react.createElement("option", {
+          key: "opt:" + (disabled === true ? "disabled:" : "") + value,
+          value,
+          ...(disabled === true ? { disabled: true } : {}),
+        }, label);
+        const headRow = react.createElement("div", {
+          key: "__head",
+          className: "deg_expert_group_session_model_row",
+          role: "row",
+          "data-deg-session-model-head": "true",
+        }, [
+          react.createElement("span", {
+            key: "role",
+            role: "columnheader",
+            className: "deg_expert_group_session_model_head_cell",
+          }, t("sidebar.sessionModel.columnRole")),
+          react.createElement("span", {
+            key: "provider",
+            role: "columnheader",
+            className: "deg_expert_group_session_model_head_cell",
+          }, t("sidebar.sessionModel.provider")),
+          react.createElement("span", {
+            key: "model",
+            role: "columnheader",
+            className: "deg_expert_group_session_model_head_cell",
+          }, t("sidebar.sessionModel.columnModel")),
+          react.createElement("span", {
+            key: "effort",
+            role: "columnheader",
+            className: "deg_expert_group_session_model_head_cell",
+          }, t("sidebar.sessionModel.effort")),
+        ]);
+        const rows = [];
+        if (status === "ready") {
+          for (const role of roles) {
+            const current = sessionModelState.overrides[role] ?? null;
+            const globalDefault = normalizeSessionModelSelection(object(meta?.roleDefaults)[role]);
+            const hasDraft = Object.prototype.hasOwnProperty.call(sessionModelDrafts, role);
+            const baseline = current ?? globalDefault;
+            const editable = hasDraft
+              ? sessionModelDrafts[role]
+              : {
+                provider: baseline?.provider ?? "",
+                model: baseline?.model ?? "",
+                reasoningEffort: baseline?.reasoningEffort ?? "",
+              };
+            const providerValue = typeof editable.provider === "string" ? editable.provider : "";
+            const modelValue = typeof editable.model === "string" ? editable.model : "";
+            const effortValue = typeof editable.reasoningEffort === "string" ? editable.reasoningEffort : "";
+            const roleLabel = roleLabelFor(role, null) ?? role;
+            const providerGroup = groups.find((group) => text(object(group).id, null) === providerValue);
+            const models = sessionModelModelOptions(providerValue, groups);
+            const modelEntry = models.find((candidate) => text(object(candidate).id, null) === modelValue);
+            // 只把「模型确实声明了 reasoning 对象」当成有档位：目录里没有该模型时绝不能
+            // 用空对象占位，否则 effort 下拉会从「无思考深度」退化成可选的「模型默认」。
+            const reasoningRaw = modelEntry?.reasoning;
+            const reasoning = reasoningRaw !== null && typeof reasoningRaw === "object" && Array.isArray(reasoningRaw) !== true
+              ? reasoningRaw
+              : null;
+            const efforts = Array.isArray(reasoning?.efforts) ? reasoning.efforts : [];
 
-      /** 票据 28：模板库列表（有界摘要；不显示 outputSchema 原文）。 */
-      const renderTemplates = () => {
-        if (dispatchDraft === null) return null;
-        const status = templatesState.status;
-        const templates = templatesState.templates.slice(0, 32);
-        const rows = templates.map((value) => {
-          const template = object(value);
-          const id = text(template.id, null);
-          const title = text(template.name, "（未命名模板）");
-          const role = text(template.role, null);
-          const roleText = roleLabelFor(role, null) ?? "—";
-          const mode = template.mode === "fanout" ? "fan-out" : "单专家";
-          const shardCount = Array.isArray(template.shards) ? template.shards.length : 0;
-          const hasSchema = Array.isArray(template.shards) && template.shards.some((shard) => object(shard).hasOutputSchema === true);
-          const preview = text(template.preview, null);
-          const dispatching = id === null || pendingSet.current.has("template-dispatch:" + id);
-          const deleting = id === null || pendingSet.current.has("template-delete:" + id);
-          return react.createElement("div", {
-            key: id ?? title + "-" + String(template.createdAt),
-            className: "deg_expert_group_template",
-            role: "listitem",
-            "data-template-id": id ?? undefined,
-          },
-          react.createElement("div", { className: "deg_expert_group_template_name", title }, title),
-          react.createElement("div", { className: "deg_expert_group_template_meta" },
-            mode + " · " + roleText + (mode === "fan-out" ? " · " + shardCount + " 分片" : "") + (hasSchema ? " · 含输出契约" : "")),
-          preview === null ? null : react.createElement("div", { className: "deg_expert_group_template_preview", title: preview }, preview),
-          react.createElement("div", { className: "deg_expert_group_template_actions" },
-            react.createElement("button", {
-              type: "button",
-              className: "deg_expert_group_export_button",
-              "aria-label": "从模板派发 " + title,
-              disabled: dispatching,
-              onClick: () => { void dispatchTemplateById(template); },
-            }, "从模板派发"),
-            react.createElement("button", {
-              type: "button",
-              className: "deg_expert_group_export_button",
-              "aria-label": "删除模板 " + title,
-              disabled: deleting,
-              onClick: () => { void deleteTemplateById(template); },
-            }, "删除")));
-        });
-        return react.createElement("div", { className: "deg_expert_group_templates", role: "group", "aria-label": "任务模板" },
-          react.createElement("div", { className: "deg_expert_group_templates_head" },
-            react.createElement("span", null, "模板 " + templatesState.count + "/" + templatesState.limit),
-            status === "loading" ? react.createElement("span", { role: "status" }, "读取中…") : null),
-          status === "error" && templatesState.message !== null
-            ? react.createElement("div", { className: "deg_expert_group_dispatch_error", role: "status" }, templatesState.message)
-            : null,
-          status === "ready" && rows.length === 0
-            ? react.createElement("div", { className: "deg_expert_group_templates_empty" }, "还没有保存的模板")
-            : null,
-          ...rows);
-      };
+            // provider：空值 + 目录外的当前值（disabled）+ 目录项。
+            const providerOptions = [optionOf("", "未选择供应商")];
+            if (providerValue !== "" && providerGroup === undefined) {
+              providerOptions.push(optionOf(providerValue, providerValue + "（不可用）", true));
+            }
+            for (const group of groups) {
+              const id = text(object(group).id, null);
+              // 空 id 与「未选择供应商」同值，会生成重复 key/重复选项：目录坏项直接跳过。
+              if (id === null || id === "") continue;
+              providerOptions.push(optionOf(id, text(object(group).name, null) ?? id));
+            }
 
-      /** 票据 28：派发回执（parentTaskId + continuation 摘要；不展开完整句柄）。 */
-      const renderDispatchReceipt = () => {
-        if (dispatchReceipt === null) return null;
-        const receipt = dispatchReceipt;
-        const continuation = object(receipt.continuation);
-        const roleText = roleLabelFor(receipt.role, null) ?? receipt.role ?? "—";
-        const lines = [
-          "已派发父任务：" + (receipt.parentTaskId ?? "—") + " · 角色 " + roleText + (receipt.mode === "fanout" ? " · fan-out" : " · 单专家"),
-        ];
-        if (receipt.duplicate === true) lines.push("Host 判定为重复提交（幂等命中，未新建任务）");
-        if (Object.keys(continuation).length > 0) {
-          lines.push("续作句柄：parentTaskId " + (text(continuation.parentTaskId, null) ?? "—")
-            + (finiteNumber(continuation.round) === null ? "" : " · 第 " + finiteNumber(continuation.round) + " 轮")
-            + " · " + (continuation.running === true ? "运行中" : (continuation.reusable === true ? "可续作" : "已结束")));
+            // model：未选 provider 时只有一个禁用占位；否则空值 + 目录外当前值（disabled）+ 该 provider 的目录项。
+            const modelOptions = [];
+            if (providerValue === "") {
+              modelOptions.push(optionOf("", "先选择供应商", true));
+            } else {
+              modelOptions.push(optionOf("", "未选择模型"));
+              if (modelValue !== "" && modelEntry === undefined) {
+                modelOptions.push(optionOf(modelValue, modelValue + "（不可用）", true));
+              }
+              for (const candidate of models) {
+                const id = text(object(candidate).id, null);
+                if (id === null || id === "") continue;
+                modelOptions.push(optionOf(id, text(object(candidate).name, null) ?? id));
+              }
+            }
+
+            // effort：模型没声明 reasoning 时只有一个禁用占位（与设置页同文案规则）。
+            const effortOptions = [];
+            if (reasoning === null) {
+              effortOptions.push(optionOf("", providerValue === "" ? "先选择模型" : "模型无思考深度", true));
+            } else {
+              effortOptions.push(optionOf("", t("sidebar.sessionModel.effortDefault")));
+              for (const effort of efforts) {
+                const id = text(object(effort).id, null);
+                if (id === null || id === "") continue;
+                effortOptions.push(optionOf(id, text(object(effort).name, null) ?? id));
+              }
+              // 历史/手写 effort 不在当前目录里时仍原样显示，避免下拉静默改值。
+              if (effortValue !== ""
+                && efforts.every((effort) => text(object(effort).id, null) !== effortValue)) {
+                effortOptions.push(optionOf(effortValue, effortValue + "（不可用）", true));
+              }
+            }
+
+            // 角色 pill：有本会话覆盖时额外渲染「×」（点击立即清除该角色覆盖）。
+            const pillChildren = [
+              react.createElement("span", {
+                key: "label",
+                className: "deg_expert_group_session_model_pill_label",
+                title: roleLabel,
+              }, roleLabel),
+            ];
+            if (current !== null) {
+              pillChildren.push(react.createElement("button", {
+                key: "clear",
+                type: "button",
+                className: "deg_expert_group_session_model_clear",
+                "data-deg-session-model-clear": role,
+                "aria-label": t("sidebar.sessionModel.clearRole", { role: roleLabel }),
+                title: t("sidebar.sessionModel.clearRole", { role: roleLabel }),
+                disabled: writable !== true,
+                onClick: (event) => {
+                  event?.preventDefault?.();
+                  event?.stopPropagation?.();
+                  void clearSessionModelRole(role);
+                },
+              }, "×"));
+            }
+
+            rows.push(react.createElement("div", {
+              key: role,
+              className: "deg_expert_group_session_model_row",
+              role: "row",
+              "data-deg-session-model-role": role,
+              "data-deg-session-model-state": current !== null ? "override" : "follow",
+            }, [
+              react.createElement("div", {
+                key: "role",
+                role: "cell",
+                className: "deg_expert_group_session_model_cell",
+              }, react.createElement("span", { className: "deg_expert_group_session_model_pill" }, pillChildren)),
+              react.createElement("div", {
+                key: "provider",
+                role: "cell",
+                className: "deg_expert_group_session_model_cell",
+              }, react.createElement("select", {
+                className: "deg_expert_group_session_model_select",
+                "aria-label": roleLabel + " " + t("sidebar.sessionModel.provider"),
+                "data-deg-session-model-field": "provider",
+                value: providerValue,
+                disabled: writable !== true,
+                onChange: (event) => updateSessionModelDraft(role, "provider", event?.target?.value ?? ""),
+              }, providerOptions)),
+              react.createElement("div", {
+                key: "model",
+                role: "cell",
+                className: "deg_expert_group_session_model_cell",
+              }, react.createElement("select", {
+                className: "deg_expert_group_session_model_select",
+                "aria-label": roleLabel + " " + t("sidebar.sessionModel.columnModel"),
+                "data-deg-session-model-field": "model",
+                value: modelValue,
+                disabled: writable !== true || providerValue === "" || providerGroup === undefined,
+                onChange: (event) => updateSessionModelDraft(role, "model", event?.target?.value ?? ""),
+              }, modelOptions)),
+              react.createElement("div", {
+                key: "effort",
+                role: "cell",
+                className: "deg_expert_group_session_model_cell",
+              }, react.createElement("select", {
+                className: "deg_expert_group_session_model_select",
+                "aria-label": roleLabel + " " + t("sidebar.sessionModel.effort"),
+                "data-deg-session-model-field": "effort",
+                value: effortValue,
+                // 模型没有 reasoning 时只有一个禁用占位：绝不提交非法 effort。
+                disabled: writable !== true || reasoning === null || modelValue === "",
+                onChange: (event) => updateSessionModelDraft(role, "reasoningEffort", event?.target?.value ?? ""),
+              }, effortOptions)),
+            ]));
+          }
         }
-        return react.createElement("div", {
-          className: "deg_expert_group_dispatch_receipt",
-          role: "status",
-          "data-parent-task-id": receipt.parentTaskId ?? undefined,
-          title: lines.join(" "),
-        }, ...lines.map((line, index) => react.createElement("div", { key: "receipt-line-" + index }, line)));
+        const bodyChildren = [
+          react.createElement("p", { key: "hint", className: "deg_expert_group_session_model_hint" },
+            t("sidebar.sessionModel.hint")),
+        ];
+        if (readOnlyHint !== null) {
+          bodyChildren.push(react.createElement("div", {
+            key: "readonly",
+            className: "deg_expert_group_session_model_hint",
+            "data-deg-session-model-readonly": status,
+          }, readOnlyHint));
+        }
+        // 读取失败才给「重新读取」：它只递增重读令牌，不会把当前草稿冲掉。
+        if (status === "error") {
+          bodyChildren.push(react.createElement("button", {
+            key: "retry",
+            type: "button",
+            className: "deg_expert_group_export_button",
+            "data-deg-session-model-retry": "true",
+            "aria-label": t("sidebar.sessionModel.retry"),
+            onClick: (event) => {
+              event?.preventDefault?.();
+              event?.stopPropagation?.();
+              setSessionModelReloadToken((value) => value + 1);
+            },
+          }, t("sidebar.sessionModel.retry")));
+        }
+        if (noticeText !== null) {
+          bodyChildren.push(react.createElement("div", {
+            key: "notice",
+            className: noticeError
+              ? "deg_expert_group_session_model_notice deg_expert_group_session_model_notice_error"
+              : "deg_expert_group_session_model_notice",
+            role: "status",
+            "data-deg-session-model-notice": sessionModelNotice?.kind ?? "none",
+          }, noticeText));
+        }
+        if (roles.length === 0) {
+          bodyChildren.push(react.createElement("div", {
+            key: "empty",
+            className: "deg_expert_group_session_model_hint",
+          }, t("sidebar.sessionModel.emptyRoles")));
+        }
+        if (status === "ready") {
+          bodyChildren.push(react.createElement("div", {
+            key: "table",
+            className: "deg_expert_group_session_model_scroll",
+          }, react.createElement("div", {
+            role: "table",
+            "aria-label": t("sidebar.sessionModel.tableLabel"),
+            className: "deg_expert_group_session_model_table",
+          }, [headRow, ...rows])));
+        }
+        const footer = react.createElement("footer", {
+          key: "footer",
+          className: "deg_expert_group_session_model_footer",
+        }, [
+          react.createElement("span", {
+            key: "revision",
+            className: "deg_expert_group_session_model_revision",
+            "data-deg-session-model-revision": sessionModelState.revision,
+          }, t("sidebar.sessionModel.revision", { revision: sessionModelState.revision })),
+          invalidDraft === true
+            ? react.createElement("span", {
+              key: "invalid",
+              className: "deg_expert_group_session_model_invalid",
+              role: "status",
+              "data-deg-session-model-invalid": "true",
+            }, t("sidebar.sessionModel.invalidDraft"))
+            : null,
+          react.createElement("span", { key: "spacer", className: "deg_expert_group_session_model_spacer" }),
+          react.createElement("button", {
+            key: "close",
+            type: "button",
+            className: "deg_expert_group_export_button",
+            "data-deg-session-model-close": "footer",
+            onClick: closeDialog,
+          }, t("sidebar.sessionModel.close")),
+          react.createElement("button", {
+            key: "save",
+            type: "button",
+            className: "deg_expert_group_session_model_primary",
+            "data-deg-session-model-save": "true",
+            "aria-label": t("sidebar.sessionModel.saveChanges"),
+            disabled: canSave !== true,
+            onClick: (event) => {
+              event?.preventDefault?.();
+              event?.stopPropagation?.();
+              void commitSessionModelChanges();
+            },
+          }, t("sidebar.sessionModel.saveChanges")),
+        ]);
+        return react.createElement("dialog", {
+          id: "deg-session-model-dialog",
+          className: "deg_expert_group_session_model_dialog",
+          "aria-labelledby": "deg-session-model-title",
+          "data-deg-session-model": "dialog",
+          "data-deg-session-model-state": status,
+          ref: sessionModelDialogRef,
+          // ESC：dialog 会先派发 cancel，默认行为是关闭；这里接管成「同步本地状态」。
+          onCancel: closeDialog,
+          // 任何原因导致的关闭（含未来的 dialog.close()）都同步回本地状态。
+          onClose: () => { setSessionModelOpen(false); },
+          // 点 backdrop 时事件目标就是 dialog 自身；点内部内容不关闭。
+          onClick: (event) => {
+            if (sessionModelDialogRef.current !== null
+              && event?.target === sessionModelDialogRef.current) {
+              setSessionModelOpen(false);
+            }
+          },
+        },
+          react.createElement("header", { className: "deg_expert_group_session_model_header" },
+            react.createElement("h2", {
+              id: "deg-session-model-title",
+              className: "deg_expert_group_session_model_title",
+            }, t("sidebar.sessionModel.title")),
+            react.createElement("button", {
+              type: "button",
+              className: "deg_expert_group_export_button",
+              "data-deg-session-model-close": "true",
+              "aria-label": t("sidebar.sessionModel.close"),
+              onClick: closeDialog,
+            }, "×")),
+          // 滚动只发生在这里；弹窗身份标记只在 dialog 根节点上（data-deg-session-model="dialog"）。
+          react.createElement("div", {
+            className: "deg_expert_group_session_model_body",
+          }, bodyChildren),
+          footer);
       };
 
       const renderToolbar = () => {
@@ -10358,33 +10730,25 @@
             react.createElement("option", { key: "__all_statuses", value: "" }, t("sidebar.filter.allStatuses")),
             ...STATUS_FILTER_OPTIONS.map((option) => react.createElement("option", { key: option.value, value: option.value }, option.label)),
           ]),
-          // 票据 28：手动派发入口（新建任务 / 重放上次）在工具条上；
-          // 两者都只读本地状态或调用已有 RPC。
+          // 「会话模型」入口：只切换本地打开状态，弹窗自己的 effect 读写 session-override-*；
+          // 按钮定位与原来的手动派发入口逐字对齐。
           react.createElement("button", {
             type: "button",
             className: "deg_expert_group_export_button",
-            "aria-label": "新建任务",
-            title: "手动派发单专家或 fan-out 任务",
+            "aria-label": t("sidebar.sessionModel.open"),
+            "aria-expanded": sessionModelOpen,
+            // 弹窗语义：告诉辅助技术这个按钮会打开一个 dialog，并指向它的稳定 id。
+            "aria-haspopup": "dialog",
+            "aria-controls": "deg-session-model-dialog",
+            // 关闭时由焦点归还 effect 把焦点放回这个节点。
+            ref: sessionModelEntryRef,
+            title: t("sidebar.sessionModel.openTitle"),
             onClick: (event) => {
               event?.preventDefault?.();
               event?.stopPropagation?.();
-              openDispatch();
+              setSessionModelOpen((previous) => previous !== true);
             },
-          }, "新建任务"),
-          lastDispatchRef.current === null
-            ? null
-            : react.createElement("button", {
-              type: "button",
-              className: "deg_expert_group_export_button",
-              "aria-label": "重放上次派发",
-              title: "用上一次成功派发的参数再派发一次（新任务）",
-              disabled: pendingSet.current.has("dispatch-replay"),
-              onClick: (event) => {
-                event?.preventDefault?.();
-                event?.stopPropagation?.();
-                void replayLastDispatch();
-              },
-            }, "重放上次"));
+          }, t("sidebar.sessionModel.open")));
       };
       const rootOpen = root === null ? true : expand(root);
       // 根层的可见兄弟集合（票据 18）：普通/空闲成员之外，空闲分组本身也是根的一个可见子项。
@@ -10479,10 +10843,6 @@
           ? react.createElement("div", { className: "deg_expert_group_empty" }, t("sidebar.empty"))
           : react.createElement("div", { className: "deg_expert_group_tree" },
             renderToolbar(),
-            // 票据 28：新建任务表单与派发回执都在工具条之下、任务树之上；
-            // 两者只在对应显式状态打开时渲染，默认（没有交互）DOM 与既有面板一致。
-            renderDispatchForm(),
-            renderDispatchReceipt(),
             // 树语义（票据 18）：role=tree 只包住真正的树项，工具条（role=search）留在树外，
             // 避免辅助技术把搜索框当成树的子项。aria-label 给整棵树一个稳定名称。
             react.createElement("div", { className: "deg_expert_group_tree_items", role: "tree", "aria-label": "专家任务树" },
@@ -10600,7 +10960,9 @@
               "data-error-source": panelError.source,
               title: panelError.message,
             }, panelErrorLabel),
-          refreshButton), recoveryBanner, body);
+          refreshButton), recoveryBanner, body,
+        // 「会话模型」弹窗挂在任务树之后：只在打开时渲染（关闭态 DOM 与既有面板一致）。
+        renderSessionModelDialog());
     }
     Panel.displayName = "ExpertGroupPanel";
     return Panel;
