@@ -120,24 +120,18 @@ window.__ModuleLoader__.load({
      * 绝不渲染键名或空串；默认 zh 与既有文案逐字不变。
      */
     const SETTINGS_EXTRA_MESSAGES = Object.freeze({
-      "settings.modelCandidates.title": { zh: "模型候选与自动降级" },
-      "settings.modelCandidates.hint": { zh: "候选在专家详情页按角色配置；这里设置启动失败时的降级次数上限。" },
-      // 详情页候选区说明：{limit} 由当前草稿的自动降级上限填充，绝不写死默认值。
-      "settings.modelCandidates.detailHint": { zh: "每个角色先使用角色默认模型；启动失败时按顺序降级到候选（最多 {limit} 次）。" },
       "settings.modelCandidates.fallbackLimit": { zh: "自动降级上限" },
       "settings.modelCandidates.fallbackLimit.title": { zh: "0 = 不降级；默认 2；最多 4。只影响保存之后创建的尝试。" },
-      "settings.modelCandidates.primary": { zh: "主选择" },
-      "settings.modelCandidates.primary.none": { zh: "尚未配置主选择" },
-      "settings.modelCandidates.empty": { zh: "还没有候选" },
-      "settings.modelCandidates.add": { zh: "添加候选" },
-      "settings.modelCandidates.limit": { zh: "每个角色最多 8 个候选" },
-      "settings.modelCandidates.provider": { zh: "供应商" },
-      "settings.modelCandidates.model": { zh: "模型" },
-      "settings.modelCandidates.effort": { zh: "思考深度" },
-      "settings.modelCandidates.up": { zh: "上移" },
-      "settings.modelCandidates.down": { zh: "下移" },
-      "settings.modelCandidates.remove": { zh: "删除" },
-      "settings.modelCandidates.row": { zh: "候选 {index}" },
+      // 模型页签：页签名称只由位置推导（第一页恒为「主模型」），拖动只改层的顺序、不改名称。
+      "settings.modelTabs.primary": { zh: "主模型" },
+      "settings.modelTabs.candidate": { zh: "候选{index}" },
+      "settings.modelTabs.add": { zh: "添加候选页" },
+      "settings.modelTabs.add.title": { zh: "把主模型页六个角色的选择复制到新的候选页" },
+      "settings.modelTabs.limit": { zh: "最多 3 个候选页（共 4 页）" },
+      "settings.modelTabs.remove": { zh: "删除这个候选页" },
+      "settings.modelTabs.remove.title": { zh: "删除候选页" },
+      "settings.modelTabs.remove.message": { zh: "删除「候选{index}」会同时删除六个专家在该层的模型配置；保存后生效。" },
+      "settings.modelCandidates.limit": { zh: "每个角色最多 3 个候选" },
       "settings.modelCandidates.error.incomplete": { zh: "候选第 {index} 行需要同时填写供应商和模型" },
       "settings.modelCandidates.error.duplicate": { zh: "候选第 {index} 行与前面的候选重复" },
     });
@@ -390,23 +384,24 @@ window.__ModuleLoader__.load({
        ".deg_pd_note{min-width:0;flex:1 1 220px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}" +
        // 窄屏将状态移到 Provider/模型下一行，避免六角色被三列硬挤成不可读的省略号。
        "@media (max-width:480px){.deg_pd_roles_header,.deg_pd_role{grid-template-columns:minmax(72px,auto) minmax(0,1fr);column-gap:8px}.deg_pd_roles_header{padding-top:5px}.deg_pd_roles_header span:last-child{grid-column:2;text-align:left}.deg_pd_role{align-items:start;row-gap:2px;padding:7px 0}.deg_pd_role_name{grid-row:1 / span 2;align-self:start}.deg_pd_role_value{white-space:normal;overflow-wrap:anywhere;text-overflow:clip}.deg_pd_role_state{grid-column:2;justify-self:start;text-align:left}}" +
-      // ── 模型候选与自动降级（票据 24）────────────────────────────────────────
-      ".deg_mcand_section{display:flex;flex-direction:column;gap:10px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}" +
-      ".deg_mcand_title{font-size:14px;line-height:22px;font-weight:600;margin:0}" +
-      ".deg_mcand_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}" +
-      ".deg_mcand_role{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px}" +
-      // 角色名与主选择同一行：左侧名称、右侧可收缩换行的主选择文案（基线对齐）。
-      ".deg_mcand_role_head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;min-width:0}" +
-      ".deg_mcand_role_name{flex:0 0 auto;font-size:13px;line-height:20px;font-weight:600}" +
-      ".deg_mcand_primary{min-width:0;margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);text-align:right;overflow-wrap:anywhere}" +
-      ".deg_mcand_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) minmax(0,.7fr) auto;align-items:center;gap:6px;min-width:0}" +
-      // 候选行的三个下拉与设置页角色表同形（边框/背景/字号一致），宽度随网格收缩。
-      ".deg_mcand_row select{width:100%;min-width:0;box-sizing:border-box;padding:5px 7px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}" +
-      ".deg_mcand_actions{display:flex;align-items:center;gap:4px}" +
-      ".deg_mcand_actions .deg_btn{flex:0 0 auto;min-width:auto;width:26px;height:26px;padding:0;line-height:1}" +
-      ".deg_mcand_empty{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}" +
-      ".deg_mcand_row select:disabled{opacity:.5;cursor:not-allowed}" +
-      "@media (max-width:640px){.deg_mcand_row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}";
+      // ── 模型页签（主模型 / 候选1..3）：页签名只由位置推导，拖动排序只改本地草稿 ──────
+      ".deg_settings_model_tabs{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0;padding:0 0 8px;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
+      // 页签本体是 div[role=tab]（内部还有 × 按钮，不能嵌套 button）；touch-action 让触屏拖动不被滚动抢走。
+      ".deg_settings_model_tab{display:inline-flex;align-items:center;gap:6px;height:28px;box-sizing:border-box;padding:0 10px;color:var(--dsw-alias-label-secondary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:13px;line-height:20px;cursor:pointer;user-select:none;touch-action:none}" +
+      ".deg_settings_model_tab:hover{background:var(--dsw-alias-interactive-bg-hover)}" +
+      ".deg_settings_model_tab:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}" +
+      ".deg_settings_model_tab[aria-selected=true]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-secondary,var(--dsw-alias-bg-layer-2));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}" +
+      // 拖动中的页签半透明，明确「这一页正被拿走」而不是选中态。
+      ".deg_settings_model_tab[data-dragging=true]{opacity:.55;cursor:grabbing}" +
+      ".deg_settings_model_tab_remove{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:14px;line-height:1;cursor:pointer}" +
+      ".deg_settings_model_tab_remove:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}" +
+      ".deg_settings_model_tab_remove:disabled{opacity:.45;cursor:not-allowed}" +
+      ".deg_settings_model_tab_add{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px dashed var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:16px;line-height:1;cursor:pointer}" +
+      ".deg_settings_model_tab_add:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}" +
+      ".deg_settings_model_tab_add:disabled{opacity:.45;cursor:not-allowed}" +
+      // 落点指示：拖动时在插入边界画一条 2px 竖条，松手前就能看出新位置。
+      ".deg_settings_model_tab_drop{flex:0 0 2px;align-self:stretch;min-height:24px;border-radius:1px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      "@media (max-width:520px){.deg_settings_model_tabs{gap:4px}}";
 
 
     const cssTagId = "dsh-expert-group/settings.module.css";
@@ -2670,11 +2665,13 @@ window.__ModuleLoader__.load({
 
     // ── 票据 24：候选模型与降级上限的归一、校验（设置页草稿与提交共用）──────────
     //
-    // 上限与 Host 完全一致：候选 8、降级上限 4（默认 2）。
+    // 候选上限 3 与「主模型 + 3 个候选页」的页签上限一一对应，降级上限 4（默认 2）。
     // 这些常量只用于客户端预校验与 UI 限制，权威拒绝仍在 Host 的 settings-commit。
-    const MAX_MODEL_CANDIDATES_PER_ROLE = 8;
+    const MAX_MODEL_CANDIDATES_PER_ROLE = 3;
     const MAX_MODEL_FALLBACK_LIMIT = 4;
     const DEFAULT_MODEL_FALLBACK_LIMIT = 2;
+    /** 页签页数上限：主模型页 + 最多 3 个候选页 = 4 页。 */
+    const MAX_MODEL_PAGES = MAX_MODEL_CANDIDATES_PER_ROLE + 1;
 
     /** 降级上限只接受 0..4 的安全整数；缺失/非法按默认 2 归一（与 Host 读取面一致）。 */
     function normalizeModelFallbackLimitDraft(value) {
@@ -2683,9 +2680,9 @@ window.__ModuleLoader__.load({
     /**
      * 单条候选归一：只保留 provider/model 字符串与可选非空 effort。
      *
-     * 与 defaults 的读取归一不同，这里**不丢弃空串**：设置页新增的候选行在用户填写前
-     * 就是 {provider:"", model:""}，读取归一若丢掉它，草稿与源看起来相同（保存按钮会
-     * 错误地保持禁用）。空串行由保存前的 validateModelCandidateRows 明确拒绝。
+     * 与 defaults 的读取归一不同，这里**不丢弃空串**：页签里的候选层在用户填写前
+     * 就是 {provider:"", model:""}，读取归一若丢掉它，草稿与源看起来相同（页数会塌陷，
+     * 保存按钮也会错误地保持禁用）。空行 = 未配置，提交前由 compactModelCandidatesDraft 裁掉。
      */
     function normalizeModelCandidateSelection(entry) {
       if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return null;
@@ -2694,7 +2691,7 @@ window.__ModuleLoader__.load({
       return { provider: entry.provider, model: entry.model, ...(reasoningEffort.length > 0 ? { reasoningEffort } : {}) };
     }
     /**
-     * 角色 -> 有序候选映射归一；只保留内置角色键，每角色最多 8 条。
+     * 角色 -> 有序候选映射归一；只保留内置角色键，每角色最多 3 条（与页签上限一致）。
      *
      * 旧文档里可能残留已删除的自定义角色键；Host 的 settings-commit 对未知角色键严格
      * 拒绝（整次 400），因此读取面就先丢弃，保证升级后保存旧候选不会把设置写坏。
@@ -2720,8 +2717,180 @@ window.__ModuleLoader__.load({
       return (selection?.provider ?? "") + "\u0000" + (selection?.model ?? "") + "\u0000" + (typeof selection?.reasoningEffort === "string" ? selection.reasoningEffort : "");
     }
     /**
-     * 候选草稿的保存前校验（fail-closed，绝不静默丢弃用户输入）：行必须同时有
-     * provider/model，同一角色候选去重，角色级最多 8 条。
+     * 模型页签的「页 → 层」映射（票据 24 重排的唯一数据语义）。
+     *
+     * - 页 0 = defaults[role]；页 i（i >= 1）= candidates[role][i - 1]；
+     * - 页数完全由草稿推导（不落盘、不额外存 UI 状态），删除/裁剪候选后页签自动收敛；
+     * - 页签名称只由位置推导，拖动重排改变的是「整层」的顺序，不是某一行的数据。
+     */
+    function modelPageCountOf(draft) {
+      let longest = 0;
+      for (const role of SETTINGS_ROLE_IDS) {
+        const list = draft?.candidates?.[role];
+        if (Array.isArray(list)) longest = Math.max(longest, list.length);
+      }
+      return Math.min(MAX_MODEL_PAGES, Math.max(1, 1 + longest));
+    }
+    /**
+     * 参与层重排的角色集合：内置六角色 + 草稿里已经存在的其它键。
+     *
+     * 内置角色必须在列，否则「拖动重排」会漏掉当前没有任何配置的角色，导致层的边界错位；
+     * 历史文档里的未知角色键一并保留，重排不得顺手丢掉用户已有的数据。
+     */
+    function modelLayerRolesOf(draft) {
+      const roles = [...SETTINGS_ROLE_IDS];
+      for (const source of [draft?.defaults, draft?.candidates]) {
+        if (source === null || source === void 0 || typeof source !== "object") continue;
+        for (const role of Object.keys(source)) if (!roles.includes(role)) roles.push(role);
+      }
+      return roles;
+    }
+    /** 读某一层某角色的选择：页 0 读 defaults，页 i 读 candidates[i - 1]；未配置返回 null。 */
+    function modelLayerSelectionOf(draft, role, page) {
+      if (!Number.isSafeInteger(page) || page < 0) return null;
+      const source = page === 0
+        ? draft?.defaults?.[role]
+        : (Array.isArray(draft?.candidates?.[role]) ? draft.candidates[role][page - 1] : void 0);
+      return source !== null && source !== void 0 && typeof source === "object" && !Array.isArray(source) ? source : null;
+    }
+    /**
+     * 写某一层某角色的选择：页 0 写 defaults（空值 = 删掉该行），页 i 写 candidates[i - 1]。
+     *
+     * 候选层必须把数组补到目标索引（中间层用空行占位），否则读写会落在不同的页上；
+     * 空行只是**草稿**占位，提交前由 compactModelCandidatesDraft 按「未配置不写入」裁掉，
+     * 因此 Host 永远不会收到空 selection（Host 的写面会整次拒绝空条目）。
+     */
+    function setModelLayerSelection(draft, role, page, selection) {
+      if (!Number.isSafeInteger(page) || page < 0) return draft;
+      const normalized = selection !== null && typeof selection === "object" && !Array.isArray(selection) ? selection : null;
+      if (page === 0) {
+        const defaults = { ...(draft?.defaults ?? {}) };
+        if (normalized === null) delete defaults[role];
+        else defaults[role] = normalized;
+        return { ...draft, defaults };
+      }
+      const candidates = { ...(draft?.candidates ?? {}) };
+      const list = Array.isArray(candidates[role]) ? candidates[role].slice() : [];
+      while (list.length < page - 1) list.push({ provider: "", model: "" });
+      list[page - 1] = normalized === null ? { provider: "", model: "" } : normalized;
+      candidates[role] = list;
+      return { ...draft, candidates };
+    }
+    /** 当前层的「角色 → 选择」映射：统一供应商与整层重排都基于它计算。 */
+    function modelLayerMapOf(draft, page) {
+      const map = {};
+      for (const role of modelLayerRolesOf(draft)) {
+        const selection = modelLayerSelectionOf(draft, role, page);
+        if (selection !== null) map[role] = selection;
+      }
+      return map;
+    }
+    /**
+     * 按「层数组」整体写回草稿（拖动排序的唯一写入口）。
+     *
+     * 第 0 层写 defaults；候选层保持页与索引一一对应：最后一个有内容的层决定数组长度，
+     * 中间缺口用空行占位（提交前再裁剪）。写入的都是深拷贝，避免新旧层共享同一个对象。
+     */
+    function writeModelLayers(draft, layers) {
+      const defaults = {};
+      const candidates = {};
+      for (const role of modelLayerRolesOf(draft)) {
+        const primary = layers[0]?.[role] ?? null;
+        if (primary !== null && primary !== void 0) defaults[role] = { ...primary };
+        let last = 0;
+        for (let page = 1; page < layers.length; page += 1) {
+          const selection = layers[page]?.[role];
+          if (selection !== null && selection !== void 0) last = page;
+        }
+        if (last >= 1) {
+          const list = [];
+          for (let page = 1; page <= last; page += 1) {
+            const selection = layers[page]?.[role] ?? null;
+            list.push(selection === null ? { provider: "", model: "" } : { ...selection });
+          }
+          candidates[role] = list;
+        }
+      }
+      return { ...draft, defaults, candidates };
+    }
+    /** 拖动页签：把 from 层整层移动到 to 位置，其余层顺移（主模型页也可以移动）。 */
+    function reorderModelLayers(draft, from, to) {
+      const count = modelPageCountOf(draft);
+      if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to)) return draft;
+      if (from < 0 || from >= count || to < 0 || to >= count || from === to) return draft;
+      const layers = [];
+      for (let page = 0; page < count; page += 1) layers.push(modelLayerMapOf(draft, page));
+      const [moved] = layers.splice(from, 1);
+      layers.splice(to, 0, moved);
+      return writeModelLayers(draft, layers);
+    }
+    /**
+     * 「+」新建候选页：深拷贝主模型页六个角色的选择（provider/model/reasoningEffort）。
+     *
+     * 达到 MAX_MODEL_PAGES 后不再新增（按钮同时禁用）；拷贝是深拷贝，新页与主模型页
+     * 互不影响。主模型页空着的角色写空行占位，保证新页在草稿里立刻出现（保存时按未配置裁掉）。
+     */
+    function addModelCandidatePage(draft) {
+      const count = modelPageCountOf(draft);
+      if (count >= MAX_MODEL_PAGES) return draft;
+      const candidates = { ...(draft?.candidates ?? {}) };
+      for (const role of modelLayerRolesOf(draft)) {
+        const primary = modelLayerSelectionOf(draft, role, 0);
+        const list = Array.isArray(candidates[role]) ? candidates[role].slice() : [];
+        while (list.length < count - 1) list.push({ provider: "", model: "" });
+        list[count - 1] = primary === null ? { provider: "", model: "" } : { ...primary };
+        candidates[role] = list;
+      }
+      return { ...draft, candidates };
+    }
+    /**
+     * 删除一个候选页：所有角色同步删掉该索引项（页与层始终一一对应）。
+     *
+     * 主模型页不可删除（页签上没有 ×），由调用方保证 page >= 1；某角色在该层没有配置时跳过。
+     */
+    function removeModelCandidatePage(draft, page) {
+      if (!Number.isSafeInteger(page) || page < 1) return draft;
+      const candidates = { ...(draft?.candidates ?? {}) };
+      for (const [role, value] of Object.entries(candidates)) {
+        if (!Array.isArray(value)) continue;
+        const list = value.slice();
+        if (list.length >= page) list.splice(page - 1, 1);
+        if (list.length > 0) candidates[role] = list;
+        else delete candidates[role];
+      }
+      return { ...draft, candidates };
+    }
+    /**
+     * 提交前裁剪候选：provider 与 model 皆空的行 = 该层该角色未配置，整行不写入。
+     *
+     * 为什么必须裁掉而不是留给 Host：Host 的 settings-commit 会对变更角色的每一条候选做
+     * 目录解析，空 selection 会被整次拒绝（400）；「空行允许保存」因此只能在客户端表达成
+     * 「不写这一条」。行序保持稳定，剩下的都是真正的配置。
+     */
+    function compactModelCandidatesDraft(candidates) {
+      const source = candidates !== null && typeof candidates === "object" && !Array.isArray(candidates) ? candidates : {};
+      const compacted = {};
+      for (const [role, list] of Object.entries(source)) {
+        if (!Array.isArray(list)) continue;
+        const rows = [];
+        for (const entry of list) {
+          const selection = normalizeModelCandidateSelection(entry);
+          if (selection === null) continue;
+          // 全空行 = 未配置：该层该角色不写入。
+          if (selection.provider.length === 0 && selection.model.length === 0) continue;
+          rows.push(selection);
+        }
+        if (rows.length > 0) compacted[role] = rows;
+      }
+      return compacted;
+    }
+    /**
+     * 候选草稿的保存前校验（fail-closed，绝不静默丢弃用户输入）。
+     *
+     * - 全空行 = 未配置：允许保存（提交前会被裁掉，该层该角色不写入）；
+     * - 半填行（只有 provider 或只有 model）仍然报错：写进 Host 只会换来一次整保存失败，
+     *   这里提前给出可读原因；
+     * - 同一角色内已配置的候选不得重复；角色级最多 MAX_MODEL_CANDIDATES_PER_ROLE 条。
      */
     function validateModelCandidateRows(candidates) {
       const source = candidates !== null && typeof candidates === "object" ? candidates : {};
@@ -2731,7 +2900,9 @@ window.__ModuleLoader__.load({
         const seen = new Set();
         for (let index = 0; index < list.length; index += 1) {
           const selection = normalizeModelCandidateSelection(list[index]);
-          if (selection === null || selection.provider.length === 0 || selection.model.length === 0) return { ok: false, code: "incomplete", role, index: index + 1 };
+          if (selection === null) return { ok: false, code: "incomplete", role, index: index + 1 };
+          if (selection.provider.length === 0 && selection.model.length === 0) continue;
+          if (selection.provider.length === 0 || selection.model.length === 0) return { ok: false, code: "incomplete", role, index: index + 1 };
           const key = modelCandidateKeyOf(selection);
           if (seen.has(key)) return { ok: false, code: "duplicate", role, index: index + 1 };
           seen.add(key);
@@ -5688,193 +5859,6 @@ window.__ModuleLoader__.load({
         open ? removeConfirmDialog : null);
     }
 
-    // ── 模型候选与自动降级（票据 24）─────────────────────────────────────────
-    //
-    // 预检 UI 已按用户要求整体移除：客户端不再调用 Host 的 model-preflight RPC
-    // （后端 RPC 保留为兼容面），候选只用与设置页角色表一致的下拉框编辑。
-
-    /**
-     * 模型候选的草稿编辑动作（票据 24）。
-     *
-     * 候选只在专家详情页按当前角色编辑，因此所有动作都只改 draft.candidates[role]：
-     * 主选择（defaults）与全局自动降级上限各有唯一编辑面，候选动作绝不顺带改写它们。
-     * provider/model 的选择语义与设置页角色表逐条一致（同名迁移、defaultEffort、effort 保留规则）。
-     */
-    function createModelCandidateActions(editDraft, providerGroups) {
-      const groups = Array.isArray(providerGroups) ? providerGroups : [];
-      const updateList = (role, update) => editDraft((previous) => {
-        const map = { ...(previous.candidates ?? {}) };
-        map[role] = update(Array.isArray(map[role]) ? map[role].slice() : []);
-        return { ...previous, candidates: map };
-      });
-      const updateCandidate = (role, index, update) => updateList(role, (list) => list.map((entry, position) => {
-        if (position !== index) return entry;
-        return update(normalizeModelCandidateSelection(entry) ?? { provider: "", model: "" });
-      }));
-      return {
-        /** 换供应商：按显示名迁移同名模型，迁移不到就清空模型；清空供应商即清空整行。 */
-        selectCandidateProvider(role, index, provider) {
-          updateCandidate(role, index, (current) => {
-            if (!provider) return { provider: "", model: "" };
-            if (provider === current.provider) return current;
-            return migrateSettingsSelection(current, provider, groups) ?? { provider, model: "" };
-          });
-        },
-        /** 换模型：空值 = 清空模型；有效模型带上目录声明的 defaultEffort（未声明则不带）。 */
-        selectCandidateModel(role, index, modelId) {
-          updateCandidate(role, index, (current) => {
-            const provider = current.provider;
-            if (!provider) return current;
-            if (!modelId) return { provider, model: "" };
-            const model = groups.find((group) => group.id === provider)?.models?.find((entry) => entry.id === modelId);
-            if (!model) return current;
-            const next = { provider, model: model.id };
-            if (typeof model.reasoning?.defaultEffort === "string") next.reasoningEffort = model.reasoning.defaultEffort;
-            return next;
-          });
-        },
-        /** 换思考深度：空值删除该字段（模型默认），否则写入；provider/model 不变。 */
-        selectCandidateEffort(role, index, effort) {
-          updateCandidate(role, index, (current) => {
-            const next = { ...current };
-            if (typeof effort === "string" && effort.length > 0) next.reasoningEffort = effort;
-            else delete next.reasoningEffort;
-            return next;
-          });
-        },
-        addCandidate(role) {
-          updateList(role, (list) => (list.length >= MAX_MODEL_CANDIDATES_PER_ROLE ? list : [...list, { provider: "", model: "" }]));
-        },
-        removeCandidate(role, index) {
-          updateList(role, (list) => list.filter((unused, position) => position !== index));
-        },
-        moveCandidate(role, index, delta) {
-          updateList(role, (list) => {
-            const target = index + delta;
-            if (target < 0 || target >= list.length) return list;
-            const next = list.slice();
-            const [item] = next.splice(index, 1);
-            next.splice(target, 0, item);
-            return next;
-          });
-        },
-      };
-    }
-    /**
-     * 渲染单个角色的候选卡片（票据 24）。
-     *
-     * 角色名与主选择同一行（左侧名称、右侧「主选择：…」）。候选行与设置页角色表一致，
-     * 用三个下拉框（供应商 / 模型选择 / 思考深度）编辑；目录不可用时下拉禁用，但仍以
-     * 「（不可用）」选项显示已保存值，绝不静默丢弃存量配置。
-     */
-    function renderModelCandidateCard({ t, role, draft, providerGroups, catalogAvailable, actions, saving, readOnly, roleLabelOf }) {
-      const h = react.createElement;
-      const groups = Array.isArray(providerGroups) ? providerGroups : [];
-      const candidateMap = draft.candidates !== null && typeof draft.candidates === "object" ? draft.candidates : {};
-      const defaults = draft.defaults !== null && typeof draft.defaults === "object" ? draft.defaults : {};
-      const roleLabel = roleLabelOf(role);
-      const list = Array.isArray(candidateMap[role]) ? candidateMap[role] : [];
-      const primary = defaults[role] !== null && typeof defaults[role] === "object" ? defaults[role] : null;
-      const candidateRows = list.map((candidate, index) => {
-        const selection = normalizeModelCandidateSelection(candidate) ?? { provider: "", model: "" };
-        const rowProvider = typeof selection.provider === "string" ? selection.provider : "";
-        const providerGroup = groups.find((group) => group.id === rowProvider);
-        const rowModels = Array.isArray(providerGroup?.models) ? providerGroup.models : [];
-        const currentModel = rowModels.find((model) => model.id === selection.model);
-        const reasoning = currentModel?.reasoning;
-        // option 与禁用条件与设置页角色表逐条一致：库存不可用值用 disabled 项兜底显示。
-        const providerOptions = [
-          h("option", { key: "__empty-provider", value: "" }, "未选择供应商"),
-          ...(rowProvider && providerGroup === undefined
-            ? [h("option", { key: "__unavailable-provider", value: rowProvider, disabled: true }, rowProvider + "（不可用）")]
-            : []),
-          ...groups.map((group) => h("option", { key: group.id, value: group.id }, group.name ?? group.id)),
-        ];
-        const modelOptions = [];
-        if (!rowProvider) {
-          modelOptions.push(h("option", { key: "__provider", value: "" }, "先选择供应商"));
-        } else {
-          modelOptions.push(h("option", { key: "__empty", value: "" }, "未选择模型"));
-          if (selection.model && currentModel === undefined) {
-            modelOptions.push(h("option", { key: "__unavailable", value: selection.model, disabled: true }, selection.model + "（不可用）"));
-          }
-          for (const model of rowModels) modelOptions.push(h("option", { key: model.id, value: model.id }, model.name ?? model.id));
-        }
-        const effortOptions = [];
-        if (reasoning) {
-          effortOptions.push(h("option", { key: "__default", value: "" }, "模型默认"));
-          for (const effort of reasoning.efforts ?? []) effortOptions.push(h("option", { key: effort.id, value: effort.id }, effort.name ?? effort.id));
-        } else {
-          effortOptions.push(h("option", { key: "__unsupported", value: "" }, rowProvider ? "模型无思考深度" : "先选择模型"));
-        }
-        const name = roleLabel + " " + t("settings.modelCandidates.row", { index: index + 1 });
-        const rowKey = role + ":" + index;
-        return h("div", { key: role + "-candidate-" + index, className: "deg_mcand_row", "data-deg-candidate-row": rowKey },
-          h("select", {
-            className: "deg_mcand_provider_select",
-            "data-deg-candidate-provider": rowKey,
-            "aria-label": name + " " + t("settings.modelCandidates.provider"),
-            value: rowProvider,
-            disabled: saving || readOnly || !catalogAvailable,
-            onChange: (event) => actions.selectCandidateProvider(role, index, event.target.value),
-          }, providerOptions),
-          h("select", {
-            className: "deg_mcand_model_select",
-            "data-deg-candidate-model": rowKey,
-            "aria-label": name + " " + t("settings.modelCandidates.model"),
-            value: selection.model,
-            disabled: saving || readOnly || !catalogAvailable || !rowProvider || providerGroup === undefined,
-            onChange: (event) => actions.selectCandidateModel(role, index, event.target.value),
-          }, modelOptions),
-          h("select", {
-            className: "deg_mcand_effort_select",
-            "data-deg-candidate-effort": rowKey,
-            "aria-label": name + " " + t("settings.modelCandidates.effort"),
-            value: selection.reasoningEffort ?? "",
-            disabled: saving || readOnly || !catalogAvailable || !selection.model || reasoning === undefined,
-            onChange: (event) => actions.selectCandidateEffort(role, index, event.target.value),
-          }, effortOptions),
-          h("div", { className: "deg_mcand_actions" },
-            h("button", { type: "button", className: "deg_btn", "data-deg-candidate-up": rowKey, "aria-label": name + " " + t("settings.modelCandidates.up"), disabled: saving || readOnly || index === 0, onClick: () => actions.moveCandidate(role, index, -1) }, "↑"),
-            h("button", { type: "button", className: "deg_btn", "data-deg-candidate-down": rowKey, "aria-label": name + " " + t("settings.modelCandidates.down"), disabled: saving || readOnly || index === list.length - 1, onClick: () => actions.moveCandidate(role, index, 1) }, "↓"),
-            h("button", { type: "button", className: "deg_btn", "data-deg-candidate-remove": rowKey, "aria-label": name + " " + t("settings.modelCandidates.remove"), disabled: saving || readOnly, onClick: () => actions.removeCandidate(role, index) }, "×")));
-      });
-      const primaryValue = primary !== null && typeof primary.provider === "string" && primary.provider.length > 0 && typeof primary.model === "string" && primary.model.length > 0
-        ? primary.provider + " / " + primary.model + (typeof primary.reasoningEffort === "string" && primary.reasoningEffort.length > 0 ? " / " + primary.reasoningEffort : "")
-        : t("settings.modelCandidates.primary.none");
-      return h("div", { key: role, className: "deg_mcand_role", "data-deg-candidates-role": role },
-        // 角色名与主选择同一行：左侧名称、右侧只读的主选择文案（不再拼任何预检状态）。
-        h("div", { className: "deg_mcand_role_head" },
-          h("span", { className: "deg_mcand_role_name" }, roleLabel),
-          h("span", { className: "deg_mcand_primary", "data-deg-candidate-primary": role },
-            t("settings.modelCandidates.primary") + "：" + primaryValue)),
-        candidateRows.length > 0 ? candidateRows : h("p", { className: "deg_mcand_empty", "data-deg-candidate-empty": role }, t("settings.modelCandidates.empty")),
-        h("button", {
-          type: "button", className: "deg_btn", "data-deg-candidate-add": role,
-          "aria-label": roleLabel + " " + t("settings.modelCandidates.add"),
-          title: list.length >= MAX_MODEL_CANDIDATES_PER_ROLE ? t("settings.modelCandidates.limit") : null,
-          disabled: saving || readOnly || list.length >= MAX_MODEL_CANDIDATES_PER_ROLE,
-          onClick: () => actions.addCandidate(role),
-        }, t("settings.modelCandidates.add")));
-    }
-    /**
-     * 渲染专家详情页的「模型候选」编辑区（票据 24）。
-     *
-     * UI 位置：提示词文本域与错误提示之间，只覆盖当前打开的角色。候选下拉与设置页角色表
-     * 一致；预检 UI 已按用户要求移除（Host 的 model-preflight RPC 保留为兼容面，客户端
-     * 不再调用，打开详情页不产生额外 RPC）。设置页列表只保留全局自动降级上限。
-     */
-    function renderModelCandidatesPanel({ t, role, draft, providerGroups, catalogAvailable, saving, readOnly, error, actions, roleLabelOf }) {
-      const h = react.createElement;
-      // {limit} 用当前草稿的上限：用户在设置页改过但尚未保存时，说明与数字输入保持一致。
-      const limit = Number.isSafeInteger(draft.fallbackLimit) ? draft.fallbackLimit : DEFAULT_MODEL_FALLBACK_LIMIT;
-      return h("section", { className: "deg_mcand_section", "data-deg-model-candidates": "role", "aria-label": t("settings.modelCandidates.title") },
-        h("h3", { className: "deg_mcand_title" }, t("settings.modelCandidates.title")),
-        h("p", { className: "deg_mcand_hint" }, t("settings.modelCandidates.detailHint", { limit })),
-        error === null || error === undefined ? null : h("p", { className: "deg_settings_error", role: "alert", "data-deg-model-candidates-error": "true" }, error),
-        renderModelCandidateCard({ t, role, draft, providerGroups, catalogAvailable, actions, saving, readOnly, roleLabelOf }));
-    }
-
     /**
      * 专家设置页。
      *
@@ -5923,6 +5907,22 @@ window.__ModuleLoader__.load({
       }, [modelCatalog]);
       const [draft, setDraft] = react.useState(() => normalizeSettingsDraft(settingsSnapshot.value, roles));
       const [candidatesError, setCandidatesError] = react.useState(null);
+      /**
+       * 模型页签的纯 UI 状态（绝不落盘）。
+       *
+       * - selectedModelPage：当前页（默认 0 = 主模型页），刷新/重挂载后回到主模型页；
+       * - modelTabDrag：拖动反馈（是否在拖 + 插入边界），只影响渲染；
+       * - modelPageDeleteIntent：删除候选页的确认框目标页，null = 未打开；
+       * - 指针会话的原始数据放 ref：pointermove 高频，且拖动期间的中间值不参与渲染；
+       * - modelTabSuppressClickRef：拖动结束后抑制一次 click，避免"松手同时切页"。
+       */
+      const [selectedModelPage, setSelectedModelPage] = react.useState(0);
+      const [modelTabDrag, setModelTabDrag] = react.useState(null);
+      const [modelPageDeleteIntent, setModelPageDeleteIntent] = react.useState(null);
+      const modelTabRefs = react.useRef({});
+      const modelTabDragRef = react.useRef(null);
+      const modelTabSuppressClickRef = react.useRef(false);
+      const modelPageDeleteCancelRef = react.useRef(null);
       const [dirty, setDirty] = react.useState(false);
       const [saving, setSaving] = react.useState(false);
       const [error, setError] = react.useState(null);
@@ -6268,8 +6268,156 @@ window.__ModuleLoader__.load({
        *   绝不能用"曾经 ready 过"这类会跨 reset 残留的记忆。
        */
       const catalogAvailable = directoryState.status === "ready" || groups.length > 0;
-      // 统一选择器只反映当前展示角色的共同 provider；混合状态使用空值映射到“无”。
-      const unifiedProvider = unifiedProviderOf(draft.defaults, roles, draft.provider);
+      /**
+       * 页签与当前层的派生视图（票据 24 重排：候选与子代理模型选择合并成多页签）。
+       *
+       * 页数由草稿推导，`currentModelPage` 永远收敛到合法页：删除最后一页或保存后数组变短时
+       * 界面自动回落到主模型页，绝不去渲染一个不存在的层。
+       */
+      const modelPageCount = modelPageCountOf(draft);
+      const currentModelPage = Math.min(selectedModelPage, modelPageCount - 1);
+      const currentModelLayer = modelLayerMapOf(draft, currentModelPage);
+      // 统一选择器只反映**当前页**的共同 provider；候选页没有历史顶层 provider 可回退。
+      const unifiedProvider = unifiedProviderOf(currentModelLayer, roles, currentModelPage === 0 ? draft.provider : "");
+      /** 页签名称只由位置推导：第一页恒为「主模型」，其余按候选序号。 */
+      const modelPageLabelOf = (page) => (page === 0
+        ? tExtra("settings.modelTabs.primary")
+        : tExtra("settings.modelTabs.candidate", { index: page }));
+
+      /** 切换页签：纯 UI 状态（不写草稿、不落盘）。 */
+      const selectModelPage = (page) => {
+        if (modelTabSuppressClickRef.current === true) return;
+        if (!Number.isSafeInteger(page) || page < 0 || page >= modelPageCount) return;
+        setSelectedModelPage(page);
+      };
+      /** 「+」新建候选页：深拷贝主模型页的选择，并立刻切到新页。 */
+      const addModelPage = () => {
+        if (saving || settingsReadOnly || modelPageCount >= MAX_MODEL_PAGES) return;
+        const nextIndex = modelPageCount;
+        editDraft((previous) => addModelCandidatePage(previous));
+        setSelectedModelPage(nextIndex);
+      };
+      /** 打开删除确认框：只有候选页有 ×，主模型页不可删除。 */
+      const requestModelPageDelete = (page) => {
+        if (saving || settingsReadOnly || !Number.isSafeInteger(page) || page < 1) return;
+        setModelPageDeleteIntent({ page });
+      };
+      const cancelModelPageDelete = () => {
+        setModelPageDeleteIntent(null);
+      };
+      /** 确认删除：所有角色同步删掉该索引项；删除当前页后回到主模型页。 */
+      const confirmModelPageDelete = () => {
+        const intent = modelPageDeleteIntent;
+        if (intent === null) return;
+        setModelPageDeleteIntent(null);
+        editDraft((previous) => removeModelCandidatePage(previous, intent.page));
+        setSelectedModelPage((previous) => (previous === intent.page
+          ? 0
+          : previous > intent.page ? previous - 1 : previous));
+      };
+
+      /**
+       * 页签拖动的指针手势（自研 pointer 事件，不引入第三方依赖）。
+       *
+       * 交互边界：
+       * - 指针移动超过 4px 才进入拖拽，pointerdown 本身仍是普通点击；
+       * - 拖动期间只更新落点指示，**不**切换当前页（切页只由 click 触发）；
+       * - 松手时按插入边界整层重排：主模型页也能拖，落点决定新位置，其余页顺移；
+       * - pointercancel 或卸载一律取消本次拖动，不写草稿。
+       */
+      const MODEL_TAB_DRAG_THRESHOLD = 4;
+      /** 指针 x → 插入边界（0..页数）：落在某个页签前半区就插在它前面。 */
+      const modelTabDropIndexOf = (clientX) => {
+        const refs = modelTabRefs.current ?? {};
+        for (let page = 0; page < modelPageCount; page += 1) {
+          const element = refs[page];
+          const rect = typeof element?.getBoundingClientRect === "function" ? element.getBoundingClientRect() : null;
+          if (rect === null || rect === void 0) continue;
+          const left = Number(rect.left);
+          const width = Number(rect.width);
+          // 无布局信息（测试替身/隐藏容器）时跳过：落点退化为"不移动"，绝不猜一个位置。
+          if (!Number.isFinite(left) || !Number.isFinite(width) || width <= 0) continue;
+          if (Number(clientX) < left + width / 2) return page;
+        }
+        return modelPageCount;
+      };
+      const beginModelTabDrag = (page, event) => {
+        if (saving || settingsReadOnly) return;
+        if (event === null || typeof event !== "object") return;
+        // 只响应主键：右键/中键不进入拖拽，也不抢浏览器菜单。
+        if (typeof event.button === "number" && event.button !== 0) return;
+        const doc = typeof document === "undefined" ? null : document;
+        if (doc === null || typeof doc.addEventListener !== "function") return;
+        const startX = Number(event.clientX);
+        const startY = Number(event.clientY);
+        if (!Number.isFinite(startX) || !Number.isFinite(startY)) return;
+        const session = { page, startX, startY, active: false, dropIndex: page, detach: null };
+        const onMove = (moveEvent) => {
+          const current = modelTabDragRef.current;
+          if (current === null) return;
+          const x = Number(moveEvent?.clientX);
+          const y = Number(moveEvent?.clientY);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+          if (current.active !== true) {
+            // 阈值内仍算点击：不 preventDefault，页签的 click 事件照常到达。
+            if (Math.abs(x - current.startX) + Math.abs(y - current.startY) < MODEL_TAB_DRAG_THRESHOLD) return;
+            current.active = true;
+            modelTabSuppressClickRef.current = true;
+          }
+          // 只有真正进入拖拽后才阻止默认行为（文本选择/触屏滚动）。
+          moveEvent?.preventDefault?.();
+          current.dropIndex = modelTabDropIndexOf(x);
+          setModelTabDrag({ page: current.page, dropIndex: current.dropIndex, active: true });
+        };
+        const onEnd = (endEvent) => {
+          const current = modelTabDragRef.current;
+          modelTabDragRef.current = null;
+          try {
+            doc.removeEventListener("pointermove", onMove);
+            doc.removeEventListener("pointerup", onEnd);
+            doc.removeEventListener("pointercancel", onEnd);
+          } catch { /* 监听清理失败不影响后续手势。 */ }
+          setModelTabDrag(null);
+          if (current === null || current.active !== true) {
+            // 未越过阈值：这是一次点击，交给 click 处理（绝不写草稿）。
+            modelTabSuppressClickRef.current = false;
+            return;
+          }
+          endEvent?.preventDefault?.();
+          const from = current.page;
+          // 插入边界 → 目标页：移走自己后，右侧边界整体左移一位；取消手势落回原页。
+          const target = endEvent?.type === "pointercancel"
+            ? from
+            : (current.dropIndex > from ? current.dropIndex - 1 : current.dropIndex);
+          if (target !== from) {
+            editDraft((previous) => reorderModelLayers(previous, from, target));
+            setSelectedModelPage(target);
+          }
+          // click 在 pointerup 之后派发：用一次宏任务清掉抑制标记，避免误切页签。
+          if (typeof globalThis?.setTimeout === "function") globalThis.setTimeout(() => { modelTabSuppressClickRef.current = false; }, 0);
+          else modelTabSuppressClickRef.current = false;
+        };
+        doc.addEventListener("pointermove", onMove);
+        doc.addEventListener("pointerup", onEnd);
+        doc.addEventListener("pointercancel", onEnd);
+        session.detach = () => {
+          doc.removeEventListener("pointermove", onMove);
+          doc.removeEventListener("pointerup", onEnd);
+          doc.removeEventListener("pointercancel", onEnd);
+        };
+        modelTabDragRef.current = session;
+      };
+      // 卸载时摘掉可能仍在监听中的指针监听（拖动中切 section / 关闭设置页）。
+      react.useEffect(() => () => {
+        const session = modelTabDragRef.current;
+        modelTabDragRef.current = null;
+        try { session?.detach?.(); } catch { /* 卸载路径不抛错。 */ }
+      }, []);
+      // 删除确认打开后焦点落在「取消」：破坏性动作不抢默认焦点（与删除 provider 同一模式）。
+      react.useEffect(() => {
+        if (modelPageDeleteIntent === null) return;
+        try { modelPageDeleteCancelRef.current?.focus?.(); } catch { /* 不支持 focus 的嵌入宿主仍可键盘点击。 */ }
+      }, [modelPageDeleteIntent]);
 
       const save = async ({ retry = false } = {}) => {
         if (!hasUnsavedChanges || saving || settingsSnapshot.writable !== true) return false;
@@ -6338,11 +6486,12 @@ window.__ModuleLoader__.load({
          * 票据 24：候选与降级上限只在**真正变化**时进入候选；校验也只覆盖本次变更
          * （未编辑角色的存量失效候选不得阻塞其它字段保存）。
          *
-         * 详情页的 normalizedDraft 是「最新 source + 本地修改」的合成草稿：未修改的候选
-         * 与 source 相同，比较结果自然为 false；本地新增/删除/排序才会触发提交与校验。
+         * 页签草稿里的「空行」只是占位（中间层对齐用），提交前必须由
+         * compactModelCandidatesDraft 按「该层该角色未配置 = 不写入」裁掉：
+         * Host 会对变更角色的每一条候选做目录解析，空 selection 会被整次拒绝。
          */
         const sourceCandidates = normalizeModelCandidatesDraft(authorityValue?.candidates);
-        const candidateCandidates = normalizeModelCandidatesDraft(normalizedDraft.candidates);
+        const candidateCandidates = compactModelCandidatesDraft(normalizeModelCandidatesDraft(normalizedDraft.candidates));
         const candidatesChanged = !settingsDraftEqual(candidateCandidates, sourceCandidates);
         if (candidatesChanged) {
           const validation = validateModelCandidateRows(candidateCandidates);
@@ -6715,20 +6864,7 @@ window.__ModuleLoader__.load({
               "aria-live": "polite",
             }, String(promptValidation.count) + " / " + String(promptMaxGraphemes)),
             promptStatusMessage === null ? null : react.createElement("p", { className: "deg_prompt_status", role: "status" }, promptStatusMessage)),
-        // 模型候选（票据 24 重排）：显示在文本域与错误提示之间，只覆盖当前角色。
-        // 预检 UI 已移除：打开详情页不发起任何额外 RPC。
-        renderModelCandidatesPanel({
-          t: tExtra,
-          role: selectedPromptRole,
-          draft,
-          providerGroups,
-          catalogAvailable,
-          saving,
-          readOnly: settingsReadOnly,
-          error: candidatesError,
-          actions: createModelCandidateActions(editDraft, providerGroups),
-          roleLabelOf,
-        }),
+        // 候选区块按要求整块删除：详情页只保留提示词编辑，候选统一在设置页页签里维护。
         promptErrorMessage === null ? null : react.createElement("p", {
           id: "deg-prompt-error-" + selectedPromptRole,
           className: "deg_settings_error",
@@ -6861,7 +6997,8 @@ window.__ModuleLoader__.load({
       const rows = modelRowRoles.map((role) => {
         const roleLabel = roleLabelOf(role);
         const roleEnabled = roles.includes(role);
-        const selection = draft.defaults[role] ?? null;
+        // 单元格一律读写**当前页**对应的层：主模型页 → defaults，候选页 → candidates[i - 1]。
+        const selection = modelLayerSelectionOf(draft, role, currentModelPage);
         const rowProvider = typeof selection?.provider === "string" ? selection.provider : "";
         const rowProviderGroup = providerGroups.find((group) => group.id === rowProvider);
         const rowModels = rowProviderGroup?.models ?? [];
@@ -6898,43 +7035,55 @@ window.__ModuleLoader__.load({
         const updateProvider = (event) => {
           const provider = event.target.value;
           editDraft((previous) => {
-            const defaults = { ...previous.defaults };
-            if (!provider) {
-              delete defaults[role];
-            } else if (provider !== defaults[role]?.provider) {
-              defaults[role] = migrateSettingsSelection(defaults[role], provider, providerGroups)
-                ?? { provider, model: "" };
+            const current = modelLayerSelectionOf(previous, role, currentModelPage);
+            const currentProvider = typeof current?.provider === "string" ? current.provider : "";
+            // 选中同一个供应商 = 没有变化：不制造脏值。
+            if (provider === currentProvider) return previous;
+            if (currentModelPage === 0) {
+              // 主模型页：沿用历史语义——空值删掉该行，换供应商按显示名迁移同名模型。
+              const next = !provider
+                ? null
+                : (migrateSettingsSelection(current, provider, providerGroups) ?? { provider, model: "" });
+              // 行级 provider 一旦存在就拥有优先权，顶层统一值顺带清空。
+              return { ...setModelLayerSelection(previous, role, 0, next), provider: "" };
             }
-            return { ...previous, provider: "", defaults };
+            // 候选页：与主模型页同一套联动，只作用于当前层；空值 = 清空该层该角色。
+            const next = !provider
+              ? { provider: "", model: "" }
+              : (migrateSettingsSelection(current, provider, providerGroups) ?? { provider, model: "" });
+            return setModelLayerSelection(previous, role, currentModelPage, next);
           });
         };
         const updateModel = (event) => {
           const modelId = event.target.value;
           editDraft((previous) => {
-            const defaults = { ...previous.defaults };
-            const provider = defaults[role]?.provider ?? "";
+            const current = modelLayerSelectionOf(previous, role, currentModelPage);
+            const provider = typeof current?.provider === "string" ? current.provider : "";
             if (!provider) return previous;
             if (!modelId) {
-              defaults[role] = { provider, model: "" };
-            } else {
-              const model = providerGroups.find((group) => group.id === provider)?.models?.find((candidate) => candidate.id === modelId);
-              if (!model) return previous;
-              const next = { provider, model: model.id };
-              if (typeof model.reasoning?.defaultEffort === "string") next.reasoningEffort = model.reasoning.defaultEffort;
-              defaults[role] = next;
+              // 清空模型保留 provider（用户可以先选供应商再选模型）。
+              if (typeof current?.model === "string" && current.model.length === 0) return previous;
+              return setModelLayerSelection(previous, role, currentModelPage, { provider, model: "" });
             }
-            return { ...previous, defaults };
+            const model = providerGroups.find((group) => group.id === provider)?.models?.find((candidate) => candidate.id === modelId);
+            if (!model) return previous;
+            const selected = { provider, model: model.id };
+            // 与既有角色表一致：目录声明 defaultEffort 时才带思考深度，否则保持未指定。
+            if (typeof model.reasoning?.defaultEffort === "string") selected.reasoningEffort = model.reasoning.defaultEffort;
+            return setModelLayerSelection(previous, role, currentModelPage, selected);
           });
         };
         const updateReasoning = (event) => {
+          const effort = event.target.value;
           editDraft((previous) => {
-            const defaults = { ...previous.defaults };
-            if (!defaults[role] || !defaults[role].model) return previous;
-            const next = { ...defaults[role] };
-            if (event.target.value) next.reasoningEffort = event.target.value;
+            const current = modelLayerSelectionOf(previous, role, currentModelPage);
+            if (current === null || typeof current.model !== "string" || current.model.length === 0) return previous;
+            const next = { ...current };
+            // 空值 = 删除字段（模型默认），与既有角色表一致。
+            if (effort) next.reasoningEffort = effort;
             else delete next.reasoningEffort;
-            defaults[role] = next;
-            return { ...previous, defaults };
+            if (next.reasoningEffort === current.reasoningEffort) return previous;
+            return setModelLayerSelection(previous, role, currentModelPage, next);
           });
         };
         // 提示词入口只对 Host 投影声明的角色开放（只应是内置角色）；投影缺失时
@@ -7003,6 +7152,140 @@ window.__ModuleLoader__.load({
         (type) => draft.notificationEvents[type] === true,
       ).length;
       const notificationEventsTriggerLabel = t("settings.notificationEvents") + " (" + notificationEventsEnabledCount + ")";
+      /**
+       * 页签行（票据 24 重排）：主模型 / 候选1..3 / +。
+       *
+       * - 页签名只由位置推导，拖动重排不会改名；
+       * - 候选页页签带 ×（主模型页不显示 ×），点击打开确认框；
+       * - 拖动时在插入边界渲染一条 2px 落点竖条（data-deg-model-tab-drop）；
+       * - 达到 4 页后 + 禁用（title 说明上限），与 MAX_MODEL_PAGES 同一口径。
+       */
+      const modelTabChildren = [];
+      for (let page = 0; page < modelPageCount; page += 1) {
+        if (modelTabDrag?.active === true && modelTabDrag.dropIndex === page) {
+          modelTabChildren.push(react.createElement("span", {
+            key: "drop-" + page,
+            className: "deg_settings_model_tab_drop",
+            "data-deg-model-tab-drop": String(page),
+            "aria-hidden": "true",
+          }));
+        }
+        const label = modelPageLabelOf(page);
+        const selected = page === currentModelPage;
+        const dragging = modelTabDrag?.active === true && modelTabDrag.page === page;
+        modelTabChildren.push(react.createElement("div", {
+          key: "page-" + page,
+          ref: (node) => { modelTabRefs.current[page] = node; },
+          className: "deg_settings_model_tab",
+          role: "tab",
+          // 页签是 div[role=tab]（内部还有 × 按钮，不能嵌套 button）；键盘用 Enter/Space 切换。
+          tabIndex: selected ? 0 : -1,
+          "aria-selected": selected,
+          "data-deg-model-tab": page,
+          "data-dragging": dragging ? "true" : void 0,
+          title: label,
+          onPointerDown: (event) => beginModelTabDrag(page, event),
+          onClick: () => selectModelPage(page),
+          onKeyDown: (event) => {
+            if (event?.key !== "Enter" && event?.key !== " ") return;
+            event.preventDefault?.();
+            selectModelPage(page);
+          },
+        },
+          react.createElement("span", { className: "deg_settings_model_tab_label" }, label),
+          page === 0 ? null : react.createElement("button", {
+            type: "button",
+            className: "deg_settings_model_tab_remove",
+            "data-deg-model-tab-remove": page,
+            "aria-label": label + " " + tExtra("settings.modelTabs.remove"),
+            disabled: saving || settingsReadOnly,
+            // × 自己处理点击，绝不触发页签切换/拖动。
+            onPointerDown: (event) => event?.stopPropagation?.(),
+            onClick: (event) => {
+              event?.stopPropagation?.();
+              requestModelPageDelete(page);
+            },
+          }, "×")));
+      }
+      if (modelTabDrag?.active === true && modelTabDrag.dropIndex === modelPageCount) {
+        modelTabChildren.push(react.createElement("span", {
+          key: "drop-end",
+          className: "deg_settings_model_tab_drop",
+          "data-deg-model-tab-drop": String(modelPageCount),
+          "aria-hidden": "true",
+        }));
+      }
+      modelTabChildren.push(react.createElement("button", {
+        key: "add-page",
+        type: "button",
+        className: "deg_settings_model_tab_add",
+        "data-deg-model-tab-add": "true",
+        "aria-label": tExtra("settings.modelTabs.add"),
+        title: modelPageCount >= MAX_MODEL_PAGES ? tExtra("settings.modelTabs.limit") : tExtra("settings.modelTabs.add.title"),
+        disabled: saving || settingsReadOnly || modelPageCount >= MAX_MODEL_PAGES,
+        onClick: () => addModelPage(),
+      }, "+"));
+      const modelTabRow = react.createElement("div", {
+        className: "deg_settings_model_tabs",
+        "data-deg-model-tabs": "true",
+        role: "tablist",
+        "aria-label": tExtra("settings.modelTabs.primary") + " / " + tExtra("settings.modelTabs.candidate", { index: MAX_MODEL_CANDIDATES_PER_ROLE }),
+      }, modelTabChildren);
+      /**
+       * 删除候选页确认框：复用未保存弹窗的 `deg_prompt_dialog_backdrop` / `deg_prompt_dialog`
+       * 与 `data-deg-dialog-action` 键位模式；打开后焦点落在「取消」。
+       * 文案说明会影响六个角色在该层的配置，避免用户以为只删一个角色。
+       */
+      const modelPageDeleteDialog = modelPageDeleteIntent === null ? null : react.createElement("div", {
+        className: "deg_prompt_dialog_backdrop",
+        onClick: () => cancelModelPageDelete(),
+      },
+        react.createElement("div", {
+          className: "deg_prompt_dialog",
+          role: "dialog",
+          "aria-modal": "true",
+          "aria-label": tExtra("settings.modelTabs.remove.title"),
+          onClick: (event) => event?.stopPropagation?.(),
+          onKeyDown: (event) => {
+            if (event?.key === "Escape") {
+              event.preventDefault?.();
+              event.stopPropagation?.();
+              cancelModelPageDelete();
+              return;
+            }
+            if (event?.key !== "Tab") return;
+            const controls = Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]") ?? []);
+            if (controls.length === 0) return;
+            const current = controls.indexOf(typeof document === "undefined" ? null : document.activeElement);
+            const nextIndex = event.shiftKey
+              ? (current <= 0 ? controls.length - 1 : current - 1)
+              : (current >= controls.length - 1 ? 0 : current + 1);
+            event.preventDefault?.();
+            try { controls[nextIndex]?.focus?.(); } catch { /* 无 DOM 焦点时保持可点击按钮。 */ }
+          },
+        },
+          react.createElement("h3", null, tExtra("settings.modelTabs.remove.title")),
+          react.createElement("p", null, tExtra("settings.modelTabs.remove.message", { index: modelPageDeleteIntent.page })),
+          react.createElement("div", { className: "deg_prompt_dialog_actions" },
+            react.createElement("button", {
+              type: "button",
+              className: "deg_btn",
+              "data-deg-dialog-action": "cancel",
+              "data-deg-model-tab-delete-cancel": "true",
+              // 破坏性动作不抢默认焦点。
+              autoFocus: true,
+              ref: modelPageDeleteCancelRef,
+              disabled: saving,
+              onClick: () => cancelModelPageDelete(),
+            }, "取消"),
+            react.createElement("button", {
+              type: "button",
+              className: "deg_btn deg_btn_primary",
+              "data-deg-dialog-action": "confirm",
+              "data-deg-model-tab-delete-confirm": "true",
+              disabled: saving,
+              onClick: () => confirmModelPageDelete(),
+            }, "删除"))));
       return react.createElement("div", { className: "deg_settings" },
         react.createElement("h2", { className: "deg_settings_title" }, t("settings.title")),
         react.createElement("p", { className: "deg_settings_hint" }, t("settings.hint")),
@@ -7096,8 +7379,8 @@ window.__ModuleLoader__.load({
                 }),
                 react.createElement("span", { className: "deg_settings_label" }, t("settings.notificationEvent." + type)))))
               : null)),
-        // 统一供应商与自动降级上限合为一行：两组左对齐、组间距 32px，标签紧贴各自控件；
-        // 说明文案紧随其后，角色表格仍在说明文案之后。
+        // 统一供应商与自动降级上限合为一行：两组左对齐、组间距 32px，标签紧贴各自控件。
+        // 统一供应商只作用于**当前显示页**；说明文案已按要求整段删除，行后直接是页签行。
         react.createElement("div", { className: "deg_settings_row deg_settings_unified_row" },
           react.createElement("div", { className: "deg_settings_provider_group" },
             react.createElement("label", { className: "deg_settings_label", htmlFor: "deg-settings-provider" }, t("settings.unifiedProvider")),
@@ -7109,6 +7392,19 @@ window.__ModuleLoader__.load({
                 disabled: saving || !catalogAvailable,
                 onChange: (event) => editDraft((previous) => {
                   const provider = event.target.value;
+                  if (currentModelPage !== 0) {
+                    // 候选页：统一供应商只改**当前层**六个可见角色的 provider，绝不碰 defaults。
+                    // 「无」只表示当前页没有统一值：既不删行也不写草稿（与主模型页的“无”同语义）。
+                    if (!provider) return previous;
+                    let next = previous;
+                    for (const role of settingsRolesForProvider(roles)) {
+                      const current = modelLayerSelectionOf(next, role, currentModelPage);
+                      // 与单元格换供应商同一套显示名迁移规则；迁移不到就保留 provider、清空模型。
+                      const migrated = migrateSettingsSelection(current, provider, providerGroups) ?? { provider, model: "" };
+                      next = setModelLayerSelection(next, role, currentModelPage, migrated);
+                    }
+                    return next;
+                  }
                   if (!provider) {
                     // “无”仅表示未统一/混合状态，不删除任何专家行的 provider；旧文档只有顶层
                     // provider 且没有可见行时也保留它，避免选择器动作破坏迁移来源。
@@ -7127,8 +7423,8 @@ window.__ModuleLoader__.load({
               },
                 react.createElement("option", { value: "" }, t("settings.noProvider")),
                 providerGroups.map((group) => react.createElement("option", { key: group.id, value: group.id }, group.name ?? group.id))))),
-          // 自动降级上限（票据 24 重排）：候选改在专家详情页按角色维护，设置页只保留
-          // 启动失败时的全局降级次数上限；草稿/保存字段与校验语义保持原样。
+          // 自动降级上限（票据 24 重排）：候选改在页签里按层维护，这里只保留启动失败时的
+          // 全局降级次数上限；草稿/保存字段与校验语义保持原样。
           react.createElement("div", { className: "deg_settings_fallback_group" },
             react.createElement("label", { className: "deg_settings_label", htmlFor: "deg-settings-model-fallback-limit" }, tExtra("settings.modelCandidates.fallbackLimit")),
             react.createElement("div", { className: "deg_settings_control" },
@@ -7145,7 +7441,8 @@ window.__ModuleLoader__.load({
                   editDraft((previous) => ({ ...previous, fallbackLimit: raw === "" ? "" : Number.isFinite(number) ? Math.round(number) : previous.fallbackLimit }));
                 },
               })))),
-        react.createElement("p", { className: "deg_settings_hint" }, tExtra("settings.modelCandidates.hint")),
+        // 说明文案按用户要求整段删除（不加替代说明）：统一行之后直接是页签行，再往下是角色表格。
+        modelTabRow,
         react.createElement("div", { className: "deg_settings_table_wrap" },
           react.createElement("div", { className: "deg_settings_table" }, header, rows)),
         react.createElement("div", { className: "deg_settings_row deg_settings_management_row" },
@@ -7206,8 +7503,16 @@ window.__ModuleLoader__.load({
                 }));
               },
             }))),
+        // 候选校验错误（半填行等）：候选改在页签里编辑后，错误必须在这里可见，否则用户看不到原因。
+        candidatesError === null || candidatesError === void 0 ? null : react.createElement("p", {
+          className: "deg_settings_error",
+          role: "alert",
+          "data-deg-model-candidates-error": "true",
+        }, candidatesError),
         directoryState.error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, directoryState.error) : null,
         error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, error) : null,
+        // 删除候选页的确认框（未打开时为 null，与未保存弹窗同一渲染方式）。
+        modelPageDeleteDialog,
         react.createElement("div", { className: "deg_settings_footer" },
           react.createElement("span", { className: "deg_settings_status", role: "status" }, saved ? t("settings.saved") : hasUnsavedChanges ? t("settings.unsaved") : ""),
           react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving, onClick: discard }, t("settings.discard")),
@@ -8530,6 +8835,14 @@ window.__ModuleLoader__.load({
     exports.normalizeModelCandidatesDraft = normalizeModelCandidatesDraft;
     exports.normalizeModelFallbackLimitDraft = normalizeModelFallbackLimitDraft;
     exports.validateModelCandidateRows = validateModelCandidateRows;
+    // 模型页签的「页 → 层」纯函数面（界面与测试共用同一实现，不复制数据语义）。
+    exports.modelPageCountOf = modelPageCountOf;
+    exports.modelLayerSelectionOf = modelLayerSelectionOf;
+    exports.setModelLayerSelection = setModelLayerSelection;
+    exports.reorderModelLayers = reorderModelLayers;
+    exports.addModelCandidatePage = addModelCandidatePage;
+    exports.removeModelCandidatePage = removeModelCandidatePage;
+    exports.compactModelCandidatesDraft = compactModelCandidatesDraft;
     exports.SETTINGS_EXTRA_MESSAGES = SETTINGS_EXTRA_MESSAGES;
     exports.settingsExtraText = settingsExtraText;
     exports.countUnicodeGraphemes = countUnicodeGraphemes;

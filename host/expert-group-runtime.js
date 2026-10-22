@@ -21,6 +21,7 @@ import {
   EXPERT_ROUTE_MARKER,
   EXPERT_SUBAGENT_PROVIDER_MARKER,
   EXPERT_INHERIT_CONTEXT_MARKER,
+  persistedModelRouteIsAuthoritative,
   projectModelRouteFields,
 } from "../shared.js";
 import { hasUsageMetrics, projectUsage, sumUsageByChildId } from "./usage-ledger.js";
@@ -415,19 +416,36 @@ function modelMetadata(agent, persisted, context) {
   // 实际路由（票据 24）：持久化 child_models 是权威；live child 在持久化落地前
   // 可从 agentOptions marker 读到同一份值。缺失字段整体省略，绝不补 0。
   const marker = safeCall(() => agent?.options?.[EXPERT_ROUTE_MARKER], undefined);
+  /**
+   * 运行期降级的原子性：持久化记录带实际路由快照时，provider/model/effort 必须与
+   * candidateIndex/fallbackCount 一样整体取持久化值。请求头与 agent.options 在降级后
+   * 仍是主模型（route 覆盖只影响 agent/request 的返回值，下一次请求前 header 不会变），
+   * 混用会渲染成「候选索引 + 主模型」，候选未声明 effort 时还会把旧档位读回来。
+   * 旧记录（无路由快照）继续沿用 header → options → 持久化 的既有优先级。
+   */
+  const routePinned = persistedModelRouteIsAuthoritative(persisted);
   return {
-    provider: firstText(config.provider, agent?.options?.provider, context?.provider, persisted?.provider),
-    model: firstText(config.model, agent?.options?.model, context?.model, persisted?.model),
-    effort: firstText(
-      config.reasoningEffort,
-      config.reasoning_effort,
-      agent?.options?.reasoningEffort,
-      agent?.options?.__degExpertEffort,
-      context?.reasoningEffort,
-      persisted?.reasoningEffort,
-    ),
-    ...projectModelRouteFields(persisted),
+    provider: routePinned
+      ? firstText(persisted?.provider)
+      : firstText(config.provider, agent?.options?.provider, context?.provider, persisted?.provider),
+    model: routePinned
+      ? firstText(persisted?.model)
+      : firstText(config.model, agent?.options?.model, context?.model, persisted?.model),
+    effort: routePinned
+      ? firstText(persisted?.reasoningEffort)
+      : firstText(
+        config.reasoningEffort,
+        config.reasoning_effort,
+        agent?.options?.reasoningEffort,
+        agent?.options?.__degExpertEffort,
+        context?.reasoningEffort,
+        persisted?.reasoningEffort,
+      ),
+    // 先后顺序很重要：child_models 是**运行期**权威（启动前降级与运行期降级都会写它，
+    // 后者只能改写持久化快照、绝不修改 agent.options），因此持久化字段必须覆盖
+    // admission 时的 marker；marker 只在持久化字段缺失时（写入尚未落地/旧记录）补齐。
     ...projectModelRouteFields(marker),
+    ...projectModelRouteFields(persisted),
     // 目标 subagent provider / 继承开关（票据 29）：缺失省略，不伪造 false。
     ...subagentContextFields(persisted, agent, context),
   };

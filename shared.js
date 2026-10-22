@@ -3899,8 +3899,18 @@ export function snapshotRunningRootDescendants(list, rootId, options = {}) {
 export const DEFAULT_MODEL_FALLBACK_LIMIT = 2;
 /** 自动降级上限的硬上限：防止链式降级放大成本。 */
 export const MAX_MODEL_FALLBACK_LIMIT = 4;
-/** 每个角色允许配置的候选模型数量上限。 */
-export const MAX_MODEL_CANDIDATES_PER_ROLE = 8;
+/**
+ * 每个角色允许配置的候选模型数量上限。
+ *
+ * 这是**唯一**来源：设置读取归一（裁剪）、写入校验（拒绝）与路由计划共用同一个值，
+ * 客户端设置页也从同一语义取上限（客户端常量需与这里保持一致）。
+ *
+ * 3 是设置页按角色分页签后的可用范围：
+ * - 写入面：超过上限必须整次拒绝保存（不做静默丢弃，否则用户以为配置已生效）；
+ * - 读取面：旧版本允许配置到 8 条，升级后存量文档必须**静默裁剪**为前 N 条
+ *   （保持原顺序），绝不因为存量超限让设置页打不开。
+ */
+export const MAX_MODEL_CANDIDATES_PER_ROLE = 3;
 
 /** 全部候选都不可用时使用的稳定错误码（ValidationError.code）。 */
 export const MODEL_CANDIDATES_EXHAUSTED = "MODEL_CANDIDATES_EXHAUSTED";
@@ -3950,6 +3960,50 @@ const PRECHECK_MODEL_ROUTE_ERROR_CODE_SET = new Set([
   MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_REASONING_EFFORT,
   MODEL_ROUTE_ERROR_CODES.UNSUPPORTED_CAPABILITY,
 ]);
+
+/**
+ * 运行期模型失败中「重试无意义」的确定性错误码集合（运行期降级的触发分类）。
+ *
+ * 与 REQUEST_RETRYABLE_FAILURE_CODES 的关系：后者回答「值不值得再发一次请求」，
+ * 这里回答「是不是换一个模型才可能成功」。两个集合**刻意重叠**（AUTH/UNAUTHORIZED/
+ * FORBIDDEN/INVALID_REQUEST/NO_PROVIDER/NO_ADAPTER/UNKNOWN_MODEL/MODEL_NOT_FOUND
+ * 既在宿主重试白名单里，又是确定性失败），因此运行期降级判定必须先看本集合：
+ * 有候选可切时立即切换，不把当前模型的 5 次预算浪费在必然复现的错误上；
+ * 没有候选可切时才退回既有请求级重试/终态语义（保持 root 与「未配置候选」的行为）。
+ *
+ * QUOTA/INVALID_CREDENTIAL 等未列入：用户确认的确定性集合只包含下列码，
+ * 其余错误一律按现有瞬态/未知语义处理，避免擅自扩大「换模型」的触发面。
+ */
+export const DETERMINISTIC_MODEL_FAILURE_CODES = Object.freeze([
+  "MODEL_NOT_FOUND",
+  "UNKNOWN_MODEL",
+  "NO_PROVIDER",
+  "NO_ADAPTER",
+  "AUTH",
+  "UNAUTHORIZED",
+  "FORBIDDEN",
+  "INVALID_REQUEST",
+  /**
+   * 上下文窗口超限（dsh-llm 的 provider-neutral 稳定码）。
+   *
+   * 只认**结构化码**，绝不解析 message 文本：上下文超限在换到上下文窗口更大的
+   * 候选后确实可能成功，但它也可能来自单个超长工具结果——因此仍按「确定性失败」
+   * 立即换候选，最终由候选链耗尽后的既有失败语义收口。
+   */
+  "CONTEXT_WINDOW_EXCEEDED",
+]);
+
+/**
+ * 判断一次 request-error 的结构化 failure 是否属于确定性失败（运行期降级触发）。
+ * @param {object} [failure] - 公开 agent/request-error payload 的 failure。
+ * @returns {boolean} code 明确属于确定性集合时返回 true。
+ */
+export function isDeterministicModelFailure(failure) {
+  return failure !== null
+    && typeof failure === "object"
+    && typeof failure.code === "string"
+    && DETERMINISTIC_MODEL_FAILURE_CODES.includes(failure.code);
+}
 
 /**
  * agentOptions 上的实际路由 marker。
@@ -4034,11 +4088,31 @@ export function normalizeModelSelection(selection) {
  *
  * 规范化 effort 指 undefined/null/空串视为同一档“未指定”；这样重复候选判定不会因为
  * 旧配置里的空串 effort 与缺省字段不同而漏判。非对象/缺 provider/model 返回空串。
+ *
+ * 注意：这是**设置面**的比较键（含 effort），用于拒绝完全重复的候选行；
+ * 运行期「候选链」使用的是 {@link modelRouteKeyOf}（忽略 effort），两者刻意不同。
  */
 export function modelSelectionKeyOf(selection) {
   const normalized = normalizeModelSelection(selection);
   if (normalized === undefined) return "";
   return normalized.provider + "\u0000" + normalized.model + "\u0000" + (normalized.reasoningEffort ?? "");
+}
+
+/**
+ * 运行期路由身份键：provider + model（**刻意忽略 reasoningEffort**）。
+ *
+ * 为什么忽略 effort：运行期降级的语义是「换模型」。同一 provider+model 只改思考档位
+ * 不构成可切换的候选——它既不能占用 fallbackLimit（否则真实备用模型会被截掉），
+ * 也不该在运行期被当成「下一个候选」（否则会在同一模型上来回切换、白白消耗预算）。
+ * 预检计划（buildModelRoutePlan）与运行期判定（nextModelCandidateOf）共用本键，
+ * 保证「配置里能被计划的候选」与「运行期能被切到的候选」是同一集合。
+ *
+ * 非对象/缺 provider/model 返回空串，调用方必须把空串视为「不可用」。
+ */
+export function modelRouteKeyOf(selection) {
+  const normalized = normalizeModelSelection(selection);
+  if (normalized === undefined) return "";
+  return normalized.provider + "\u0000" + normalized.model;
 }
 
 /** 稳定错误码准入：只接受本模块声明的枚举，拒绝把任意字符串写进快照。 */
@@ -4172,8 +4246,9 @@ export function modelRouteErrorMessage(code) {
  * 构造有序路由计划：[primary, candidate1, candidate2, ...]。
  *
  * - 最多 1 + fallbackLimit 个可尝试项；fallbackLimit=0 时只有 primary；
- * - 与 primary 或更早候选完全重复（同一 provider+model+规范化 effort）的候选项被跳过，
- *   且不占用降级次数；
+ * - 与 primary 或更早候选**同 provider+model**（忽略 effort）的候选项被跳过，
+ *   且不占用降级次数——运行期只按模型切换，effort-only 候选永远不可能被切到，
+ *   让它占预算会把真实备用模型挤出计划（见 {@link modelRouteKeyOf}）；
  * - candidateIndex 保留候选在**原始配置里的位置**（primary=0，第一个候选=1），
  *   因此重复项被跳过后，实际使用的候选索引仍然可解释。
  *
@@ -4187,12 +4262,12 @@ export function buildModelRoutePlan(primary, candidates, fallbackLimit) {
   const normalizedPrimary = normalizeModelSelection(primary);
   const plan = [{ selection: normalizedPrimary ?? primary, candidateIndex: 0 }];
   const seen = new Set();
-  if (normalizedPrimary !== undefined) seen.add(modelSelectionKeyOf(normalizedPrimary));
+  if (normalizedPrimary !== undefined) seen.add(modelRouteKeyOf(normalizedPrimary));
   const list = Array.isArray(candidates) ? candidates.slice(0, MAX_MODEL_CANDIDATES_PER_ROLE) : [];
   let added = 0;
   for (let index = 0; index < list.length && added < limit; index += 1) {
     const normalized = normalizeModelSelection(list[index]);
-    const key = normalized === undefined ? "" : modelSelectionKeyOf(normalized);
+    const key = normalized === undefined ? "" : modelRouteKeyOf(normalized);
     if (key.length > 0 && seen.has(key)) continue;
     if (key.length > 0) seen.add(key);
     plan.push({ selection: normalized ?? list[index], candidateIndex: index + 1 });
@@ -4237,6 +4312,27 @@ export function normalizeModelRouteMarker(value) {
     fallbackCount: value.fallbackCount,
     ...(lastRouteErrorCode === undefined ? {} : { lastRouteErrorCode }),
   };
+}
+
+/**
+ * 持久化 child_models 记录里的「实际路由快照」是否足以覆盖 live 投影。
+ *
+ * 判定条件：provider/model 都是非空字符串，且至少有一个路由字段
+ * （candidateIndex/fallbackCount/lastRouteErrorCode）。命中时 provider/model/effort
+ * 必须**整体**取持久化值，绝不能把 candidateIndex（来自快照）与 provider/model
+ * （来自旧 request header / agent.options）混在一行显示——运行期降级只更新持久化
+ * 快照，混用会渲染成「候选索引 + 主模型 + 旧 effort」。
+ *
+ * 旧记录（没有路由字段）返回 false，投影继续沿用既有的 header → options 优先级。
+ *
+ * @param {unknown} record - child_models 持久化记录。
+ * @returns {boolean} 持久化路由快照是否权威。
+ */
+export function persistedModelRouteIsAuthoritative(record) {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) return false;
+  if (typeof record.provider !== "string" || record.provider.length === 0) return false;
+  if (typeof record.model !== "string" || record.model.length === 0) return false;
+  return Object.keys(projectModelRouteFields(record)).length > 0;
 }
 
 /**

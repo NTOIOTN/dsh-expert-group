@@ -10863,23 +10863,17 @@ return value===void 0||value===null?match:String(value);
 });
 }
 const SETTINGS_EXTRA_MESSAGES=Object.freeze({
-"settings.modelCandidates.title":{zh:"模型候选与自动降级"},
-"settings.modelCandidates.hint":{zh:"候选在专家详情页按角色配置；这里设置启动失败时的降级次数上限。"},
-"settings.modelCandidates.detailHint":{zh:"每个角色先使用角色默认模型；启动失败时按顺序降级到候选（最多 {limit} 次）。"},
 "settings.modelCandidates.fallbackLimit":{zh:"自动降级上限"},
 "settings.modelCandidates.fallbackLimit.title":{zh:"0 = 不降级；默认 2；最多 4。只影响保存之后创建的尝试。"},
-"settings.modelCandidates.primary":{zh:"主选择"},
-"settings.modelCandidates.primary.none":{zh:"尚未配置主选择"},
-"settings.modelCandidates.empty":{zh:"还没有候选"},
-"settings.modelCandidates.add":{zh:"添加候选"},
-"settings.modelCandidates.limit":{zh:"每个角色最多 8 个候选"},
-"settings.modelCandidates.provider":{zh:"供应商"},
-"settings.modelCandidates.model":{zh:"模型"},
-"settings.modelCandidates.effort":{zh:"思考深度"},
-"settings.modelCandidates.up":{zh:"上移"},
-"settings.modelCandidates.down":{zh:"下移"},
-"settings.modelCandidates.remove":{zh:"删除"},
-"settings.modelCandidates.row":{zh:"候选 {index}"},
+"settings.modelTabs.primary":{zh:"主模型"},
+"settings.modelTabs.candidate":{zh:"候选{index}"},
+"settings.modelTabs.add":{zh:"添加候选页"},
+"settings.modelTabs.add.title":{zh:"把主模型页六个角色的选择复制到新的候选页"},
+"settings.modelTabs.limit":{zh:"最多 3 个候选页（共 4 页）"},
+"settings.modelTabs.remove":{zh:"删除这个候选页"},
+"settings.modelTabs.remove.title":{zh:"删除候选页"},
+"settings.modelTabs.remove.message":{zh:"删除「候选{index}」会同时删除六个专家在该层的模型配置；保存后生效。"},
+"settings.modelCandidates.limit":{zh:"每个角色最多 3 个候选"},
 "settings.modelCandidates.error.incomplete":{zh:"候选第 {index} 行需要同时填写供应商和模型"},
 "settings.modelCandidates.error.duplicate":{zh:"候选第 {index} 行与前面的候选重复"},
 });
@@ -11101,20 +11095,20 @@ const css=""+
 ".deg_pd_actions .deg_pd_open:disabled{opacity:1;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));background:transparent;border-color:var(--dsw-alias-border-l2)}"+
 ".deg_pd_note{min-width:0;flex:1 1 220px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}"+
 "@media (max-width:480px){.deg_pd_roles_header,.deg_pd_role{grid-template-columns:minmax(72px,auto) minmax(0,1fr);column-gap:8px}.deg_pd_roles_header{padding-top:5px}.deg_pd_roles_header span:last-child{grid-column:2;text-align:left}.deg_pd_role{align-items:start;row-gap:2px;padding:7px 0}.deg_pd_role_name{grid-row:1 / span 2;align-self:start}.deg_pd_role_value{white-space:normal;overflow-wrap:anywhere;text-overflow:clip}.deg_pd_role_state{grid-column:2;justify-self:start;text-align:left}}"+
-".deg_mcand_section{display:flex;flex-direction:column;gap:10px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}"+
-".deg_mcand_title{font-size:14px;line-height:22px;font-weight:600;margin:0}"+
-".deg_mcand_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}"+
-".deg_mcand_role{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px}"+
-".deg_mcand_role_head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;min-width:0}"+
-".deg_mcand_role_name{flex:0 0 auto;font-size:13px;line-height:20px;font-weight:600}"+
-".deg_mcand_primary{min-width:0;margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);text-align:right;overflow-wrap:anywhere}"+
-".deg_mcand_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) minmax(0,.7fr) auto;align-items:center;gap:6px;min-width:0}"+
-".deg_mcand_row select{width:100%;min-width:0;box-sizing:border-box;padding:5px 7px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}"+
-".deg_mcand_actions{display:flex;align-items:center;gap:4px}"+
-".deg_mcand_actions .deg_btn{flex:0 0 auto;min-width:auto;width:26px;height:26px;padding:0;line-height:1}"+
-".deg_mcand_empty{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}"+
-".deg_mcand_row select:disabled{opacity:.5;cursor:not-allowed}"+
-"@media (max-width:640px){.deg_mcand_row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}";
+".deg_settings_model_tabs{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0;padding:0 0 8px;border-bottom:1px solid var(--dsw-alias-border-l2)}"+
+".deg_settings_model_tab{display:inline-flex;align-items:center;gap:6px;height:28px;box-sizing:border-box;padding:0 10px;color:var(--dsw-alias-label-secondary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:13px;line-height:20px;cursor:pointer;user-select:none;touch-action:none}"+
+".deg_settings_model_tab:hover{background:var(--dsw-alias-interactive-bg-hover)}"+
+".deg_settings_model_tab:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}"+
+".deg_settings_model_tab[aria-selected=true]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-secondary,var(--dsw-alias-bg-layer-2));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}"+
+".deg_settings_model_tab[data-dragging=true]{opacity:.55;cursor:grabbing}"+
+".deg_settings_model_tab_remove{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:14px;line-height:1;cursor:pointer}"+
+".deg_settings_model_tab_remove:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}"+
+".deg_settings_model_tab_remove:disabled{opacity:.45;cursor:not-allowed}"+
+".deg_settings_model_tab_add{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px dashed var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:16px;line-height:1;cursor:pointer}"+
+".deg_settings_model_tab_add:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}"+
+".deg_settings_model_tab_add:disabled{opacity:.45;cursor:not-allowed}"+
+".deg_settings_model_tab_drop{flex:0 0 2px;align-self:stretch;min-height:24px;border-radius:1px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}"+
+"@media (max-width:520px){.deg_settings_model_tabs{gap:4px}}";
 const cssTagId="dsh-expert-group/settings.module.css";
 const cssInjectedDocuments=typeof WeakSet==="function"?new WeakSet():null;
 function ensurePluginStylesheet(){
@@ -12745,9 +12739,10 @@ return Number.isSafeInteger(value)&&value>=1000&&value<=86400000&&value%1000===0
 ?value
 :DEFAULT_ROLE_TIMEOUT_MS;
 }
-const MAX_MODEL_CANDIDATES_PER_ROLE=8;
+const MAX_MODEL_CANDIDATES_PER_ROLE=3;
 const MAX_MODEL_FALLBACK_LIMIT=4;
 const DEFAULT_MODEL_FALLBACK_LIMIT=2;
+const MAX_MODEL_PAGES=MAX_MODEL_CANDIDATES_PER_ROLE+1;
 function normalizeModelFallbackLimitDraft(value){
 return Number.isSafeInteger(value)&&value>=0&&value<=MAX_MODEL_FALLBACK_LIMIT?value:DEFAULT_MODEL_FALLBACK_LIMIT;
 }
@@ -12775,6 +12770,126 @@ return candidates;
 function modelCandidateKeyOf(selection){
 return(selection?.provider??"")+"\u0000"+(selection?.model??"")+"\u0000"+(typeof selection?.reasoningEffort==="string"?selection.reasoningEffort:"");
 }
+function modelPageCountOf(draft){
+let longest=0;
+for(const role of SETTINGS_ROLE_IDS){
+const list=draft?.candidates?.[role];
+if(Array.isArray(list))longest=Math.max(longest,list.length);
+}
+return Math.min(MAX_MODEL_PAGES,Math.max(1,1+longest));
+}
+function modelLayerRolesOf(draft){
+const roles=[...SETTINGS_ROLE_IDS];
+for(const source of[draft?.defaults,draft?.candidates]){
+if(source===null||source===void 0||typeof source!=="object")continue;
+for(const role of Object.keys(source))if(!roles.includes(role))roles.push(role);
+}
+return roles;
+}
+function modelLayerSelectionOf(draft,role,page){
+if(!Number.isSafeInteger(page)||page<0)return null;
+const source=page===0
+?draft?.defaults?.[role]
+:(Array.isArray(draft?.candidates?.[role])?draft.candidates[role][page-1]:void 0);
+return source!==null&&source!==void 0&&typeof source==="object"&&!Array.isArray(source)?source:null;
+}
+function setModelLayerSelection(draft,role,page,selection){
+if(!Number.isSafeInteger(page)||page<0)return draft;
+const normalized=selection!==null&&typeof selection==="object"&&!Array.isArray(selection)?selection:null;
+if(page===0){
+const defaults={...(draft?.defaults??{})};
+if(normalized===null)delete defaults[role];
+else defaults[role]=normalized;
+return{...draft,defaults};
+}
+const candidates={...(draft?.candidates??{})};
+const list=Array.isArray(candidates[role])?candidates[role].slice():[];
+while(list.length<page-1)list.push({provider:"",model:""});
+list[page-1]=normalized===null?{provider:"",model:""}:normalized;
+candidates[role]=list;
+return{...draft,candidates};
+}
+function modelLayerMapOf(draft,page){
+const map={};
+for(const role of modelLayerRolesOf(draft)){
+const selection=modelLayerSelectionOf(draft,role,page);
+if(selection!==null)map[role]=selection;
+}
+return map;
+}
+function writeModelLayers(draft,layers){
+const defaults={};
+const candidates={};
+for(const role of modelLayerRolesOf(draft)){
+const primary=layers[0]?.[role]??null;
+if(primary!==null&&primary!==void 0)defaults[role]={...primary};
+let last=0;
+for(let page=1;page<layers.length;page+=1){
+const selection=layers[page]?.[role];
+if(selection!==null&&selection!==void 0)last=page;
+}
+if(last>=1){
+const list=[];
+for(let page=1;page<=last;page+=1){
+const selection=layers[page]?.[role]??null;
+list.push(selection===null?{provider:"",model:""}:{...selection});
+}
+candidates[role]=list;
+}
+}
+return{...draft,defaults,candidates};
+}
+function reorderModelLayers(draft,from,to){
+const count=modelPageCountOf(draft);
+if(!Number.isSafeInteger(from)||!Number.isSafeInteger(to))return draft;
+if(from<0||from>=count||to<0||to>=count||from===to)return draft;
+const layers=[];
+for(let page=0;page<count;page+=1)layers.push(modelLayerMapOf(draft,page));
+const[moved]=layers.splice(from,1);
+layers.splice(to,0,moved);
+return writeModelLayers(draft,layers);
+}
+function addModelCandidatePage(draft){
+const count=modelPageCountOf(draft);
+if(count>=MAX_MODEL_PAGES)return draft;
+const candidates={...(draft?.candidates??{})};
+for(const role of modelLayerRolesOf(draft)){
+const primary=modelLayerSelectionOf(draft,role,0);
+const list=Array.isArray(candidates[role])?candidates[role].slice():[];
+while(list.length<count-1)list.push({provider:"",model:""});
+list[count-1]=primary===null?{provider:"",model:""}:{...primary};
+candidates[role]=list;
+}
+return{...draft,candidates};
+}
+function removeModelCandidatePage(draft,page){
+if(!Number.isSafeInteger(page)||page<1)return draft;
+const candidates={...(draft?.candidates??{})};
+for(const[role,value]of Object.entries(candidates)){
+if(!Array.isArray(value))continue;
+const list=value.slice();
+if(list.length>=page)list.splice(page-1,1);
+if(list.length>0)candidates[role]=list;
+else delete candidates[role];
+}
+return{...draft,candidates};
+}
+function compactModelCandidatesDraft(candidates){
+const source=candidates!==null&&typeof candidates==="object"&&!Array.isArray(candidates)?candidates:{};
+const compacted={};
+for(const[role,list]of Object.entries(source)){
+if(!Array.isArray(list))continue;
+const rows=[];
+for(const entry of list){
+const selection=normalizeModelCandidateSelection(entry);
+if(selection===null)continue;
+if(selection.provider.length===0&&selection.model.length===0)continue;
+rows.push(selection);
+}
+if(rows.length>0)compacted[role]=rows;
+}
+return compacted;
+}
 function validateModelCandidateRows(candidates){
 const source=candidates!==null&&typeof candidates==="object"?candidates:{};
 for(const[role,list]of Object.entries(source)){
@@ -12783,7 +12898,9 @@ if(list.length>MAX_MODEL_CANDIDATES_PER_ROLE)return{ok:false,code:"limit",role,i
 const seen=new Set();
 for(let index=0;index<list.length;index+=1){
 const selection=normalizeModelCandidateSelection(list[index]);
-if(selection===null||selection.provider.length===0||selection.model.length===0)return{ok:false,code:"incomplete",role,index:index+1};
+if(selection===null)return{ok:false,code:"incomplete",role,index:index+1};
+if(selection.provider.length===0&&selection.model.length===0)continue;
+if(selection.provider.length===0||selection.model.length===0)return{ok:false,code:"incomplete",role,index:index+1};
 const key=modelCandidateKeyOf(selection);
 if(seen.has(key))return{ok:false,code:"duplicate",role,index:index+1};
 seen.add(key);
@@ -15027,160 +15144,6 @@ react.createElement(ModelConfigDisclosure,{section,onToggle:()=>setOpen((value)=
 body,
 open?removeConfirmDialog:null);
 }
-function createModelCandidateActions(editDraft,providerGroups){
-const groups=Array.isArray(providerGroups)?providerGroups:[];
-const updateList=(role,update)=>editDraft((previous)=>{
-const map={...(previous.candidates??{})};
-map[role]=update(Array.isArray(map[role])?map[role].slice():[]);
-return{...previous,candidates:map};
-});
-const updateCandidate=(role,index,update)=>updateList(role,(list)=>list.map((entry,position)=>{
-if(position!==index)return entry;
-return update(normalizeModelCandidateSelection(entry)??{provider:"",model:""});
-}));
-return{
-selectCandidateProvider(role,index,provider){
-updateCandidate(role,index,(current)=>{
-if(!provider)return{provider:"",model:""};
-if(provider===current.provider)return current;
-return migrateSettingsSelection(current,provider,groups)??{provider,model:""};
-});
-},
-selectCandidateModel(role,index,modelId){
-updateCandidate(role,index,(current)=>{
-const provider=current.provider;
-if(!provider)return current;
-if(!modelId)return{provider,model:""};
-const model=groups.find((group)=>group.id===provider)?.models?.find((entry)=>entry.id===modelId);
-if(!model)return current;
-const next={provider,model:model.id};
-if(typeof model.reasoning?.defaultEffort==="string")next.reasoningEffort=model.reasoning.defaultEffort;
-return next;
-});
-},
-selectCandidateEffort(role,index,effort){
-updateCandidate(role,index,(current)=>{
-const next={...current};
-if(typeof effort==="string"&&effort.length>0)next.reasoningEffort=effort;
-else delete next.reasoningEffort;
-return next;
-});
-},
-addCandidate(role){
-updateList(role,(list)=>(list.length>=MAX_MODEL_CANDIDATES_PER_ROLE?list:[...list,{provider:"",model:""}]));
-},
-removeCandidate(role,index){
-updateList(role,(list)=>list.filter((unused,position)=>position!==index));
-},
-moveCandidate(role,index,delta){
-updateList(role,(list)=>{
-const target=index+delta;
-if(target<0||target>=list.length)return list;
-const next=list.slice();
-const[item]=next.splice(index,1);
-next.splice(target,0,item);
-return next;
-});
-},
-};
-}
-function renderModelCandidateCard({t,role,draft,providerGroups,catalogAvailable,actions,saving,readOnly,roleLabelOf}){
-const h=react.createElement;
-const groups=Array.isArray(providerGroups)?providerGroups:[];
-const candidateMap=draft.candidates!==null&&typeof draft.candidates==="object"?draft.candidates:{};
-const defaults=draft.defaults!==null&&typeof draft.defaults==="object"?draft.defaults:{};
-const roleLabel=roleLabelOf(role);
-const list=Array.isArray(candidateMap[role])?candidateMap[role]:[];
-const primary=defaults[role]!==null&&typeof defaults[role]==="object"?defaults[role]:null;
-const candidateRows=list.map((candidate,index)=>{
-const selection=normalizeModelCandidateSelection(candidate)??{provider:"",model:""};
-const rowProvider=typeof selection.provider==="string"?selection.provider:"";
-const providerGroup=groups.find((group)=>group.id===rowProvider);
-const rowModels=Array.isArray(providerGroup?.models)?providerGroup.models:[];
-const currentModel=rowModels.find((model)=>model.id===selection.model);
-const reasoning=currentModel?.reasoning;
-const providerOptions=[
-h("option",{key:"__empty-provider",value:""},"未选择供应商"),
-...(rowProvider&&providerGroup===undefined
-?[h("option",{key:"__unavailable-provider",value:rowProvider,disabled:true},rowProvider+"（不可用）")]
-:[]),
-...groups.map((group)=>h("option",{key:group.id,value:group.id},group.name??group.id)),
-];
-const modelOptions=[];
-if(!rowProvider){
-modelOptions.push(h("option",{key:"__provider",value:""},"先选择供应商"));
-}else{
-modelOptions.push(h("option",{key:"__empty",value:""},"未选择模型"));
-if(selection.model&&currentModel===undefined){
-modelOptions.push(h("option",{key:"__unavailable",value:selection.model,disabled:true},selection.model+"（不可用）"));
-}
-for(const model of rowModels)modelOptions.push(h("option",{key:model.id,value:model.id},model.name??model.id));
-}
-const effortOptions=[];
-if(reasoning){
-effortOptions.push(h("option",{key:"__default",value:""},"模型默认"));
-for(const effort of reasoning.efforts??[])effortOptions.push(h("option",{key:effort.id,value:effort.id},effort.name??effort.id));
-}else{
-effortOptions.push(h("option",{key:"__unsupported",value:""},rowProvider?"模型无思考深度":"先选择模型"));
-}
-const name=roleLabel+" "+t("settings.modelCandidates.row",{index:index+1});
-const rowKey=role+":"+index;
-return h("div",{key:role+"-candidate-"+index,className:"deg_mcand_row","data-deg-candidate-row":rowKey},
-h("select",{
-className:"deg_mcand_provider_select",
-"data-deg-candidate-provider":rowKey,
-"aria-label":name+" "+t("settings.modelCandidates.provider"),
-value:rowProvider,
-disabled:saving||readOnly||!catalogAvailable,
-onChange:(event)=>actions.selectCandidateProvider(role,index,event.target.value),
-},providerOptions),
-h("select",{
-className:"deg_mcand_model_select",
-"data-deg-candidate-model":rowKey,
-"aria-label":name+" "+t("settings.modelCandidates.model"),
-value:selection.model,
-disabled:saving||readOnly||!catalogAvailable||!rowProvider||providerGroup===undefined,
-onChange:(event)=>actions.selectCandidateModel(role,index,event.target.value),
-},modelOptions),
-h("select",{
-className:"deg_mcand_effort_select",
-"data-deg-candidate-effort":rowKey,
-"aria-label":name+" "+t("settings.modelCandidates.effort"),
-value:selection.reasoningEffort??"",
-disabled:saving||readOnly||!catalogAvailable||!selection.model||reasoning===undefined,
-onChange:(event)=>actions.selectCandidateEffort(role,index,event.target.value),
-},effortOptions),
-h("div",{className:"deg_mcand_actions"},
-h("button",{type:"button",className:"deg_btn","data-deg-candidate-up":rowKey,"aria-label":name+" "+t("settings.modelCandidates.up"),disabled:saving||readOnly||index===0,onClick:()=>actions.moveCandidate(role,index,-1)},"↑"),
-h("button",{type:"button",className:"deg_btn","data-deg-candidate-down":rowKey,"aria-label":name+" "+t("settings.modelCandidates.down"),disabled:saving||readOnly||index===list.length-1,onClick:()=>actions.moveCandidate(role,index,1)},"↓"),
-h("button",{type:"button",className:"deg_btn","data-deg-candidate-remove":rowKey,"aria-label":name+" "+t("settings.modelCandidates.remove"),disabled:saving||readOnly,onClick:()=>actions.removeCandidate(role,index)},"×")));
-});
-const primaryValue=primary!==null&&typeof primary.provider==="string"&&primary.provider.length>0&&typeof primary.model==="string"&&primary.model.length>0
-?primary.provider+" / "+primary.model+(typeof primary.reasoningEffort==="string"&&primary.reasoningEffort.length>0?" / "+primary.reasoningEffort:"")
-:t("settings.modelCandidates.primary.none");
-return h("div",{key:role,className:"deg_mcand_role","data-deg-candidates-role":role},
-h("div",{className:"deg_mcand_role_head"},
-h("span",{className:"deg_mcand_role_name"},roleLabel),
-h("span",{className:"deg_mcand_primary","data-deg-candidate-primary":role},
-t("settings.modelCandidates.primary")+"："+primaryValue)),
-candidateRows.length>0?candidateRows:h("p",{className:"deg_mcand_empty","data-deg-candidate-empty":role},t("settings.modelCandidates.empty")),
-h("button",{
-type:"button",className:"deg_btn","data-deg-candidate-add":role,
-"aria-label":roleLabel+" "+t("settings.modelCandidates.add"),
-title:list.length>=MAX_MODEL_CANDIDATES_PER_ROLE?t("settings.modelCandidates.limit"):null,
-disabled:saving||readOnly||list.length>=MAX_MODEL_CANDIDATES_PER_ROLE,
-onClick:()=>actions.addCandidate(role),
-},t("settings.modelCandidates.add")));
-}
-function renderModelCandidatesPanel({t,role,draft,providerGroups,catalogAvailable,saving,readOnly,error,actions,roleLabelOf}){
-const h=react.createElement;
-const limit=Number.isSafeInteger(draft.fallbackLimit)?draft.fallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT;
-return h("section",{className:"deg_mcand_section","data-deg-model-candidates":"role","aria-label":t("settings.modelCandidates.title")},
-h("h3",{className:"deg_mcand_title"},t("settings.modelCandidates.title")),
-h("p",{className:"deg_mcand_hint"},t("settings.modelCandidates.detailHint",{limit})),
-error===null||error===undefined?null:h("p",{className:"deg_settings_error",role:"alert","data-deg-model-candidates-error":"true"},error),
-renderModelCandidateCard({t,role,draft,providerGroups,catalogAvailable,actions,saving,readOnly,roleLabelOf}));
-}
 function DshExpertGroupSettings({settingsForm,modelCatalog,modelConfigHost,ctx}){
 const subscribe=react.useMemo(()=>settingsForm.subscribe.bind(settingsForm),[settingsForm]);
 const getSnapshot=react.useMemo(()=>settingsForm.getSnapshot.bind(settingsForm),[settingsForm]);
@@ -15212,6 +15175,13 @@ void modelCatalog.load();
 },[modelCatalog]);
 const[draft,setDraft]=react.useState(()=>normalizeSettingsDraft(settingsSnapshot.value,roles));
 const[candidatesError,setCandidatesError]=react.useState(null);
+const[selectedModelPage,setSelectedModelPage]=react.useState(0);
+const[modelTabDrag,setModelTabDrag]=react.useState(null);
+const[modelPageDeleteIntent,setModelPageDeleteIntent]=react.useState(null);
+const modelTabRefs=react.useRef({});
+const modelTabDragRef=react.useRef(null);
+const modelTabSuppressClickRef=react.useRef(false);
+const modelPageDeleteCancelRef=react.useRef(null);
 const[dirty,setDirty]=react.useState(false);
 const[saving,setSaving]=react.useState(false);
 const[error,setError]=react.useState(null);
@@ -15450,7 +15420,123 @@ for(const role of roles)if(!next.includes(role))next.push(role);
 return next;
 },[roles]);
 const catalogAvailable=directoryState.status==="ready"||groups.length>0;
-const unifiedProvider=unifiedProviderOf(draft.defaults,roles,draft.provider);
+const modelPageCount=modelPageCountOf(draft);
+const currentModelPage=Math.min(selectedModelPage,modelPageCount-1);
+const currentModelLayer=modelLayerMapOf(draft,currentModelPage);
+const unifiedProvider=unifiedProviderOf(currentModelLayer,roles,currentModelPage===0?draft.provider:"");
+const modelPageLabelOf=(page)=>(page===0
+?tExtra("settings.modelTabs.primary")
+:tExtra("settings.modelTabs.candidate",{index:page}));
+const selectModelPage=(page)=>{
+if(modelTabSuppressClickRef.current===true)return;
+if(!Number.isSafeInteger(page)||page<0||page>=modelPageCount)return;
+setSelectedModelPage(page);
+};
+const addModelPage=()=>{
+if(saving||settingsReadOnly||modelPageCount>=MAX_MODEL_PAGES)return;
+const nextIndex=modelPageCount;
+editDraft((previous)=>addModelCandidatePage(previous));
+setSelectedModelPage(nextIndex);
+};
+const requestModelPageDelete=(page)=>{
+if(saving||settingsReadOnly||!Number.isSafeInteger(page)||page<1)return;
+setModelPageDeleteIntent({page});
+};
+const cancelModelPageDelete=()=>{
+setModelPageDeleteIntent(null);
+};
+const confirmModelPageDelete=()=>{
+const intent=modelPageDeleteIntent;
+if(intent===null)return;
+setModelPageDeleteIntent(null);
+editDraft((previous)=>removeModelCandidatePage(previous,intent.page));
+setSelectedModelPage((previous)=>(previous===intent.page
+?0
+:previous>intent.page?previous-1:previous));
+};
+const MODEL_TAB_DRAG_THRESHOLD=4;
+const modelTabDropIndexOf=(clientX)=>{
+const refs=modelTabRefs.current??{};
+for(let page=0;page<modelPageCount;page+=1){
+const element=refs[page];
+const rect=typeof element?.getBoundingClientRect==="function"?element.getBoundingClientRect():null;
+if(rect===null||rect===void 0)continue;
+const left=Number(rect.left);
+const width=Number(rect.width);
+if(!Number.isFinite(left)||!Number.isFinite(width)||width<=0)continue;
+if(Number(clientX)<left+width/2)return page;
+}
+return modelPageCount;
+};
+const beginModelTabDrag=(page,event)=>{
+if(saving||settingsReadOnly)return;
+if(event===null||typeof event!=="object")return;
+if(typeof event.button==="number"&&event.button!==0)return;
+const doc=typeof document==="undefined"?null:document;
+if(doc===null||typeof doc.addEventListener!=="function")return;
+const startX=Number(event.clientX);
+const startY=Number(event.clientY);
+if(!Number.isFinite(startX)||!Number.isFinite(startY))return;
+const session={page,startX,startY,active:false,dropIndex:page,detach:null};
+const onMove=(moveEvent)=>{
+const current=modelTabDragRef.current;
+if(current===null)return;
+const x=Number(moveEvent?.clientX);
+const y=Number(moveEvent?.clientY);
+if(!Number.isFinite(x)||!Number.isFinite(y))return;
+if(current.active!==true){
+if(Math.abs(x-current.startX)+Math.abs(y-current.startY)<MODEL_TAB_DRAG_THRESHOLD)return;
+current.active=true;
+modelTabSuppressClickRef.current=true;
+}
+moveEvent?.preventDefault?.();
+current.dropIndex=modelTabDropIndexOf(x);
+setModelTabDrag({page:current.page,dropIndex:current.dropIndex,active:true});
+};
+const onEnd=(endEvent)=>{
+const current=modelTabDragRef.current;
+modelTabDragRef.current=null;
+try{
+doc.removeEventListener("pointermove",onMove);
+doc.removeEventListener("pointerup",onEnd);
+doc.removeEventListener("pointercancel",onEnd);
+}catch{/* 监听清理失败不影响后续手势。 */}
+setModelTabDrag(null);
+if(current===null||current.active!==true){
+modelTabSuppressClickRef.current=false;
+return;
+}
+endEvent?.preventDefault?.();
+const from=current.page;
+const target=endEvent?.type==="pointercancel"
+?from
+:(current.dropIndex>from?current.dropIndex-1:current.dropIndex);
+if(target!==from){
+editDraft((previous)=>reorderModelLayers(previous,from,target));
+setSelectedModelPage(target);
+}
+if(typeof globalThis?.setTimeout==="function")globalThis.setTimeout(()=>{modelTabSuppressClickRef.current=false;},0);
+else modelTabSuppressClickRef.current=false;
+};
+doc.addEventListener("pointermove",onMove);
+doc.addEventListener("pointerup",onEnd);
+doc.addEventListener("pointercancel",onEnd);
+session.detach=()=>{
+doc.removeEventListener("pointermove",onMove);
+doc.removeEventListener("pointerup",onEnd);
+doc.removeEventListener("pointercancel",onEnd);
+};
+modelTabDragRef.current=session;
+};
+react.useEffect(()=>()=>{
+const session=modelTabDragRef.current;
+modelTabDragRef.current=null;
+try{session?.detach?.();}catch{/* 卸载路径不抛错。 */}
+},[]);
+react.useEffect(()=>{
+if(modelPageDeleteIntent===null)return;
+try{modelPageDeleteCancelRef.current?.focus?.();}catch{/* 不支持 focus 的嵌入宿主仍可键盘点击。 */}
+},[modelPageDeleteIntent]);
 const save=async({retry=false}={})=>{
 if(!hasUnsavedChanges||saving||settingsSnapshot.writable!==true)return false;
 if(modelFieldsChanged&&!catalogAvailable)return false;
@@ -15492,7 +15578,7 @@ const sourceHasPromptOverrides=authorityValue!==null&&authorityValue!==void 0
 const promptChanged=!promptOverridesEqual(candidatePromptOverrides,sourcePromptOverrides);
 const includePromptOverrides=sourceHasPromptOverrides||promptTouchedRoles.length>0;
 const sourceCandidates=normalizeModelCandidatesDraft(authorityValue?.candidates);
-const candidateCandidates=normalizeModelCandidatesDraft(normalizedDraft.candidates);
+const candidateCandidates=compactModelCandidatesDraft(normalizeModelCandidatesDraft(normalizedDraft.candidates));
 const candidatesChanged=!settingsDraftEqual(candidateCandidates,sourceCandidates);
 if(candidatesChanged){
 const validation=validateModelCandidateRows(candidateCandidates);
@@ -15791,18 +15877,6 @@ role:"status",
 "aria-live":"polite",
 },String(promptValidation.count)+" / "+String(promptMaxGraphemes)),
 promptStatusMessage===null?null:react.createElement("p",{className:"deg_prompt_status",role:"status"},promptStatusMessage)),
-renderModelCandidatesPanel({
-t:tExtra,
-role:selectedPromptRole,
-draft,
-providerGroups,
-catalogAvailable,
-saving,
-readOnly:settingsReadOnly,
-error:candidatesError,
-actions:createModelCandidateActions(editDraft,providerGroups),
-roleLabelOf,
-}),
 promptErrorMessage===null?null:react.createElement("p",{
 id:"deg-prompt-error-"+selectedPromptRole,
 className:"deg_settings_error",
@@ -15927,7 +16001,7 @@ react.createElement("span",{className:"deg_settings_table_head"},"思考深度")
 const rows=modelRowRoles.map((role)=>{
 const roleLabel=roleLabelOf(role);
 const roleEnabled=roles.includes(role);
-const selection=draft.defaults[role]??null;
+const selection=modelLayerSelectionOf(draft,role,currentModelPage);
 const rowProvider=typeof selection?.provider==="string"?selection.provider:"";
 const rowProviderGroup=providerGroups.find((group)=>group.id===rowProvider);
 const rowModels=rowProviderGroup?.models??[];
@@ -15964,43 +16038,48 @@ effortOptions.push(react.createElement("option",{key:"__unsupported",value:""},r
 const updateProvider=(event)=>{
 const provider=event.target.value;
 editDraft((previous)=>{
-const defaults={...previous.defaults};
-if(!provider){
-delete defaults[role];
-}else if(provider!==defaults[role]?.provider){
-defaults[role]=migrateSettingsSelection(defaults[role],provider,providerGroups)
-??{provider,model:""};
+const current=modelLayerSelectionOf(previous,role,currentModelPage);
+const currentProvider=typeof current?.provider==="string"?current.provider:"";
+if(provider===currentProvider)return previous;
+if(currentModelPage===0){
+const next=!provider
+?null
+:(migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""});
+return{...setModelLayerSelection(previous,role,0,next),provider:""};
 }
-return{...previous,provider:"",defaults};
+const next=!provider
+?{provider:"",model:""}
+:(migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""});
+return setModelLayerSelection(previous,role,currentModelPage,next);
 });
 };
 const updateModel=(event)=>{
 const modelId=event.target.value;
 editDraft((previous)=>{
-const defaults={...previous.defaults};
-const provider=defaults[role]?.provider??"";
+const current=modelLayerSelectionOf(previous,role,currentModelPage);
+const provider=typeof current?.provider==="string"?current.provider:"";
 if(!provider)return previous;
 if(!modelId){
-defaults[role]={provider,model:""};
-}else{
+if(typeof current?.model==="string"&&current.model.length===0)return previous;
+return setModelLayerSelection(previous,role,currentModelPage,{provider,model:""});
+}
 const model=providerGroups.find((group)=>group.id===provider)?.models?.find((candidate)=>candidate.id===modelId);
 if(!model)return previous;
-const next={provider,model:model.id};
-if(typeof model.reasoning?.defaultEffort==="string")next.reasoningEffort=model.reasoning.defaultEffort;
-defaults[role]=next;
-}
-return{...previous,defaults};
+const selected={provider,model:model.id};
+if(typeof model.reasoning?.defaultEffort==="string")selected.reasoningEffort=model.reasoning.defaultEffort;
+return setModelLayerSelection(previous,role,currentModelPage,selected);
 });
 };
 const updateReasoning=(event)=>{
+const effort=event.target.value;
 editDraft((previous)=>{
-const defaults={...previous.defaults};
-if(!defaults[role]||!defaults[role].model)return previous;
-const next={...defaults[role]};
-if(event.target.value)next.reasoningEffort=event.target.value;
+const current=modelLayerSelectionOf(previous,role,currentModelPage);
+if(current===null||typeof current.model!=="string"||current.model.length===0)return previous;
+const next={...current};
+if(effort)next.reasoningEffort=effort;
 else delete next.reasoningEffort;
-defaults[role]=next;
-return{...previous,defaults};
+if(next.reasoningEffort===current.reasoningEffort)return previous;
+return setModelLayerSelection(previous,role,currentModelPage,next);
 });
 };
 const promptEntryAvailable=promptRoleIds.includes(role);
@@ -16063,6 +16142,124 @@ const notificationEventsEnabledCount=NOTIFICATION_EVENT_TYPES.filter(
 (type)=>draft.notificationEvents[type]===true,
 ).length;
 const notificationEventsTriggerLabel=t("settings.notificationEvents")+" ("+notificationEventsEnabledCount+")";
+const modelTabChildren=[];
+for(let page=0;page<modelPageCount;page+=1){
+if(modelTabDrag?.active===true&&modelTabDrag.dropIndex===page){
+modelTabChildren.push(react.createElement("span",{
+key:"drop-"+page,
+className:"deg_settings_model_tab_drop",
+"data-deg-model-tab-drop":String(page),
+"aria-hidden":"true",
+}));
+}
+const label=modelPageLabelOf(page);
+const selected=page===currentModelPage;
+const dragging=modelTabDrag?.active===true&&modelTabDrag.page===page;
+modelTabChildren.push(react.createElement("div",{
+key:"page-"+page,
+ref:(node)=>{modelTabRefs.current[page]=node;},
+className:"deg_settings_model_tab",
+role:"tab",
+tabIndex:selected?0:-1,
+"aria-selected":selected,
+"data-deg-model-tab":page,
+"data-dragging":dragging?"true":void 0,
+title:label,
+onPointerDown:(event)=>beginModelTabDrag(page,event),
+onClick:()=>selectModelPage(page),
+onKeyDown:(event)=>{
+if(event?.key!=="Enter"&&event?.key!==" ")return;
+event.preventDefault?.();
+selectModelPage(page);
+},
+},
+react.createElement("span",{className:"deg_settings_model_tab_label"},label),
+page===0?null:react.createElement("button",{
+type:"button",
+className:"deg_settings_model_tab_remove",
+"data-deg-model-tab-remove":page,
+"aria-label":label+" "+tExtra("settings.modelTabs.remove"),
+disabled:saving||settingsReadOnly,
+onPointerDown:(event)=>event?.stopPropagation?.(),
+onClick:(event)=>{
+event?.stopPropagation?.();
+requestModelPageDelete(page);
+},
+},"×")));
+}
+if(modelTabDrag?.active===true&&modelTabDrag.dropIndex===modelPageCount){
+modelTabChildren.push(react.createElement("span",{
+key:"drop-end",
+className:"deg_settings_model_tab_drop",
+"data-deg-model-tab-drop":String(modelPageCount),
+"aria-hidden":"true",
+}));
+}
+modelTabChildren.push(react.createElement("button",{
+key:"add-page",
+type:"button",
+className:"deg_settings_model_tab_add",
+"data-deg-model-tab-add":"true",
+"aria-label":tExtra("settings.modelTabs.add"),
+title:modelPageCount>=MAX_MODEL_PAGES?tExtra("settings.modelTabs.limit"):tExtra("settings.modelTabs.add.title"),
+disabled:saving||settingsReadOnly||modelPageCount>=MAX_MODEL_PAGES,
+onClick:()=>addModelPage(),
+},"+"));
+const modelTabRow=react.createElement("div",{
+className:"deg_settings_model_tabs",
+"data-deg-model-tabs":"true",
+role:"tablist",
+"aria-label":tExtra("settings.modelTabs.primary")+" / "+tExtra("settings.modelTabs.candidate",{index:MAX_MODEL_CANDIDATES_PER_ROLE}),
+},modelTabChildren);
+const modelPageDeleteDialog=modelPageDeleteIntent===null?null:react.createElement("div",{
+className:"deg_prompt_dialog_backdrop",
+onClick:()=>cancelModelPageDelete(),
+},
+react.createElement("div",{
+className:"deg_prompt_dialog",
+role:"dialog",
+"aria-modal":"true",
+"aria-label":tExtra("settings.modelTabs.remove.title"),
+onClick:(event)=>event?.stopPropagation?.(),
+onKeyDown:(event)=>{
+if(event?.key==="Escape"){
+event.preventDefault?.();
+event.stopPropagation?.();
+cancelModelPageDelete();
+return;
+}
+if(event?.key!=="Tab")return;
+const controls=Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]")??[]);
+if(controls.length===0)return;
+const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
+const nextIndex=event.shiftKey
+?(current<=0?controls.length-1:current-1)
+:(current>=controls.length-1?0:current+1);
+event.preventDefault?.();
+try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
+},
+},
+react.createElement("h3",null,tExtra("settings.modelTabs.remove.title")),
+react.createElement("p",null,tExtra("settings.modelTabs.remove.message",{index:modelPageDeleteIntent.page})),
+react.createElement("div",{className:"deg_prompt_dialog_actions"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+"data-deg-dialog-action":"cancel",
+"data-deg-model-tab-delete-cancel":"true",
+autoFocus:true,
+ref:modelPageDeleteCancelRef,
+disabled:saving,
+onClick:()=>cancelModelPageDelete(),
+},"取消"),
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+"data-deg-dialog-action":"confirm",
+"data-deg-model-tab-delete-confirm":"true",
+disabled:saving,
+onClick:()=>confirmModelPageDelete(),
+},"删除"))));
 return react.createElement("div",{className:"deg_settings"},
 react.createElement("h2",{className:"deg_settings_title"},t("settings.title")),
 react.createElement("p",{className:"deg_settings_hint"},t("settings.hint")),
@@ -16160,6 +16357,16 @@ value:unifiedProvider,
 disabled:saving||!catalogAvailable,
 onChange:(event)=>editDraft((previous)=>{
 const provider=event.target.value;
+if(currentModelPage!==0){
+if(!provider)return previous;
+let next=previous;
+for(const role of settingsRolesForProvider(roles)){
+const current=modelLayerSelectionOf(next,role,currentModelPage);
+const migrated=migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""};
+next=setModelLayerSelection(next,role,currentModelPage,migrated);
+}
+return next;
+}
 if(!provider){
 const hasVisibleProvider=settingsRolesForProvider(roles).some((role)=>{
 const value=previous.defaults?.[role]?.provider;
@@ -16192,7 +16399,7 @@ const number=raw===""?null:Number(raw);
 editDraft((previous)=>({...previous,fallbackLimit:raw===""?"":Number.isFinite(number)?Math.round(number):previous.fallbackLimit}));
 },
 })))),
-react.createElement("p",{className:"deg_settings_hint"},tExtra("settings.modelCandidates.hint")),
+modelTabRow,
 react.createElement("div",{className:"deg_settings_table_wrap"},
 react.createElement("div",{className:"deg_settings_table"},header,rows)),
 react.createElement("div",{className:"deg_settings_row deg_settings_management_row"},
@@ -16247,8 +16454,14 @@ roleTimeoutMs:raw===""
 }));
 },
 }))),
+candidatesError===null||candidatesError===void 0?null:react.createElement("p",{
+className:"deg_settings_error",
+role:"alert",
+"data-deg-model-candidates-error":"true",
+},candidatesError),
 directoryState.error?react.createElement("p",{className:"deg_settings_error",role:"status"},directoryState.error):null,
 error?react.createElement("p",{className:"deg_settings_error",role:"status"},error):null,
+modelPageDeleteDialog,
 react.createElement("div",{className:"deg_settings_footer"},
 react.createElement("span",{className:"deg_settings_status",role:"status"},saved?t("settings.saved"):hasUnsavedChanges?t("settings.unsaved"):""),
 react.createElement("button",{type:"button",className:"deg_btn",disabled:!hasUnsavedChanges||saving,onClick:discard},t("settings.discard")),
@@ -17166,6 +17379,13 @@ exports.normalizeSettingsDraft=normalizeSettingsDraft;
 exports.normalizeModelCandidatesDraft=normalizeModelCandidatesDraft;
 exports.normalizeModelFallbackLimitDraft=normalizeModelFallbackLimitDraft;
 exports.validateModelCandidateRows=validateModelCandidateRows;
+exports.modelPageCountOf=modelPageCountOf;
+exports.modelLayerSelectionOf=modelLayerSelectionOf;
+exports.setModelLayerSelection=setModelLayerSelection;
+exports.reorderModelLayers=reorderModelLayers;
+exports.addModelCandidatePage=addModelCandidatePage;
+exports.removeModelCandidatePage=removeModelCandidatePage;
+exports.compactModelCandidatesDraft=compactModelCandidatesDraft;
 exports.SETTINGS_EXTRA_MESSAGES=SETTINGS_EXTRA_MESSAGES;
 exports.settingsExtraText=settingsExtraText;
 exports.countUnicodeGraphemes=countUnicodeGraphemes;

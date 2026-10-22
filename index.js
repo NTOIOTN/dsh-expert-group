@@ -56,10 +56,14 @@ import {
   // Host 投影模块共用同一套判定，避免出现两份候选顺序与错误分类实现。
   DEFAULT_MODEL_FALLBACK_LIMIT, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_CANDIDATES_PER_ROLE,
   MODEL_CANDIDATES_EXHAUSTED, MODEL_ROUTE_OK, MODEL_ROUTE_NOT_CONFIGURED, MODEL_ROUTE_ERROR_CODES,
-  EXPERT_ROUTE_MARKER, normalizeModelFallbackLimit, normalizeModelSelection, modelSelectionKeyOf,
+  EXPERT_ROUTE_MARKER, normalizeModelFallbackLimit, normalizeModelSelection, modelSelectionKeyOf, modelRouteKeyOf,
+  persistedModelRouteIsAuthoritative,
   normalizeModelRouteErrorCode, classifyModelRouteError, modelRouteErrorCodeOf,
   isPrecheckModelRouteFailure, isModelRouteErrorCode, modelRouteErrorMessage, buildModelRoutePlan,
   projectModelRouteFields, normalizeModelRouteMarker, modelRouteFieldsFromRecord,
+  // 运行期降级（本次票据）：确定性失败集合只来自 shared.js，Host 与测试共用同一份分类，
+  // 避免出现「测试认为该换模型、生产认为该重试」的第二套判定。
+  isDeterministicModelFailure,
   // 上下文继承（票据 29）：marker 名、稳定错误码与允许角色集合都来自 shared.js，
   // 组合根、恢复模块与快照投影共用同一份字面量，避免出现第二套拼写。
   EXPERT_SUBAGENT_PROVIDER_MARKER, EXPERT_INHERIT_CONTEXT_MARKER,
@@ -1853,6 +1857,9 @@ const Config = z.object({
   // 模型候选与启动前 fallback（票据 24）：候选是全局配置，按角色有序排列；
   // 会话覆盖只替换主选择（defaults/session_overrides），绝不修改这里。
   // 读取面把非法值归一为空映射/默认 2，不阻塞设置读取；严格拒绝落在 DEG 提交端点。
+  // 注意：这里刻意**不**声明每角色长度上限（MAX_MODEL_CANDIDATES_PER_ROLE）——
+  // 旧文档可能存着超过上限的候选，schema 一旦收紧会让整份设置文档解析失败；
+  // 上限只由写面校验与读取裁剪共同负责。
   candidates: z.dict(z.array(ROLE_SELECTION)).default({}).volatile(),
   fallbackLimit: z.number().step(1).min(0).max(MAX_MODEL_FALLBACK_LIMIT).default(DEFAULT_MODEL_FALLBACK_LIMIT).volatile(),
   /**
@@ -2085,8 +2092,13 @@ function pruneDefaultPromptOverrides(overrides, defaultPersonaOf = (role) => DEF
  * 模型候选的读取归一（票据 24）。
  *
  * 设置读取面必须对所有历史/外部写入保持宽容：非对象、未知角色、非数组、非法
- * selection 一律丢弃；单角色候选截到上限 8。写入面的严格拒绝不在这里，而在
- * DEG 自有 settings-commit 内——读坏值不得让设置页打不开。
+ * selection 一律丢弃；单角色候选截到 MAX_MODEL_CANDIDATES_PER_ROLE（当前 3）条。
+ * 写入面的严格拒绝不在这里，而在 DEG 自有 settings-commit 内——读坏值不得让设置页打不开。
+ *
+ * 向后兼容：旧版本允许每个角色配置到 8 条候选。升级后读取这类存量文档时，这里
+ * 只保留**前 N 条（保持原顺序）**并静默丢弃其余，不抛错、不产生诊断——读取面一旦
+ * 报错，用户连设置页都打不开，也就无法把配置改回合法状态。真正的拒绝只发生在
+ * 用户下一次显式保存时（assertModelCandidatesCandidate）。
  */
 function normalizeModelCandidatesForRead(value, allowedRoles = STATUS_ROLE_IDS) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
@@ -5931,13 +5943,32 @@ export default {
       return { agent, record };
     }
 
-    function hostRetryCountFor(session, turn, step) {
+    /**
+     * 读取 Host 在本次 turn/step 里已经消耗的重试次数。
+     *
+     * provider 可选：运行期降级后「每个模型各自有 5 次预算」，而 Host 的 llm/retry
+     * 事件在同一个 step 里会按不同 provider 交替出现（durable 事件 data.provider 由
+     * dsh-llm-retry 写入）。传入当前模型 provider 时只统计该 provider 的事件，
+     * 避免上一个模型消耗的 5 次把新候选立刻顶成 exhausted；不传时保持旧语义
+     * （统计整个 step，root 与既有调用点行为不变）。
+     *
+     * @param {object} session - durable Session。
+     * @param {number} turn - 当前 turn。
+     * @param {number} step - 当前 step。
+     * @param {string} [provider] - 当前模型 provider；省略表示不区分 provider。
+     * @returns {number} Host 已记录的最大 retry 序号（没有记录返回 0）。
+     */
+    function hostRetryCountFor(session, turn, step, provider) {
       const events = Array.isArray(session?.events) ? session.events : [];
+      const scopeProvider = typeof provider === "string" && provider.length > 0 ? provider : void 0;
       let count = 0;
       for (const event of events) {
         if (event?.type !== "llm/retry"
           || event.data?.turn !== turn
           || event.data?.step !== step) continue;
+        // provider 未知（旧事件/测试替身）时只在「不限定 provider」的调用里计入，
+        // 限定 provider 的调用必须精确匹配，绝不猜测归属。
+        if (scopeProvider !== void 0 && event.data?.provider !== scopeProvider) continue;
         const retry = event.data?.retry;
         if (Number.isSafeInteger(retry) && retry > count) count = retry;
       }
@@ -5947,6 +5978,349 @@ export default {
     function requestRetryStateIsExhausted(agent, session, turn) {
       const state = requestRetryStates.get(agent);
       return state?.session === session && state.turn === turn && state.exhausted === true;
+    }
+
+    // ── 运行期模型降级：候选路由覆盖 + 失败预算状态机 ────────────────────────
+    //
+    // 目标：把「降级到候选模型」从启动前预检扩展到**运行中**的模型失败。
+    // 三条硬边界（与既有语义对齐，不在本层改变）：
+    // 1. 同一子代理会话内继续：只覆盖 route，不重建 child、不重建 Session，
+    //    因此上下文（messages/tools/system prompt）原样保留；
+    // 2. 不修改 agent.options：Host 的 agent/request waterfall 每次尝试都会重新调用，
+    //    覆盖只通过该 waterfall 的返回值生效，真实 provider/model 由 route 决定；
+    // 3. 不写私有事件：可见性只更新 DEG 自己的 child_models 快照。
+
+    /**
+     * Agent 对象 -> 运行期降级状态（WeakMap）。
+     *
+     * 为什么用 WeakMap + Agent 对象身份：
+     * - cold-resume/replacement 会创建新的 Agent，新 Agent 天然获得全新预算与候选链快照，
+     *   旧 Agent 的迟到 hook 既取不到状态也无法污染新代际；
+     * - 只保存 route 覆盖 / 候选位置 / 已降级次数与候选链快照，绝不保存 prompt、
+     *   凭据或 failure 原文；
+     * - 与 requestRetryStates（per turn/step 预算）分工不同：链状态跨 step 存活，
+     *   因为「这个 child 已经换到第几个候选」属于 Agent 生命周期事实。
+     */
+    const modelFallbackStates = new WeakMap();
+
+    /**
+     * Agent -> agent/request route 覆盖 listener 的 disposer。
+     *
+     * 安装是幂等的（同一 Agent 只装一次）；Agent 销毁时必须显式摘除，
+     * 避免本表继续持有已销毁 Agent 的 listener 引用。
+     */
+    const modelFallbackRouteDisposers = new WeakMap();
+
+    /** 从 agent.options 读取 admission/恢复写入的真实路由（含显式 effort）。 */
+    function admissionModelRouteOf(agent) {
+      const provider = agent?.options?.provider;
+      const model = agent?.options?.model;
+      if (typeof provider !== "string" || provider.length === 0) return void 0;
+      if (typeof model !== "string" || model.length === 0) return void 0;
+      const effort = agent?.options?.[EFFORT_MARKER];
+      return {
+        provider,
+        model,
+        ...(typeof effort === "string" && effort.length > 0 ? { reasoningEffort: effort } : {}),
+      };
+    }
+
+    /**
+     * 两条路由是否指向同一个模型。
+     *
+     * effort 不参与判定：降级的目标是「换模型」，同一 provider+model 只改 effort
+     * 不构成一次降级，也不允许被候选链当成新候选重复消耗次数。
+     */
+    function sameModelRoute(left, right) {
+      return left !== void 0
+        && right !== void 0
+        && left.provider === right.provider
+        && left.model === right.model;
+    }
+
+    /** 当前生效路由：运行期覆盖优先，否则就是 admission/恢复写入的 options 路由。 */
+    function currentModelRouteOf(agent, chain) {
+      return chain?.override !== void 0 ? chain.override : admissionModelRouteOf(agent);
+    }
+
+    /**
+     * 请求级重试 + 运行期降级的统一目标判定。
+     *
+     * 与 requestRetryTarget 的唯一差异：并行 fan-out 分片 child 没有 DEG 的
+     * recovery record（它们由 fan-out 自己的 attempt 账本管理），因此这里用
+     * 「fan-out marker + 持久化 fan-out 身份 + live activation + live 父 root」
+     * 四重证据补上目标判定，让分片也获得同一套请求级重试与运行期降级。
+     * 证据强度与专家 child 对齐：任何一环不成立都返回 undefined（回到 Host 默认行为），
+     * 绝不靠 role/parentId 这类可复制 metadata 猜测身份。
+     *
+     * root 仍由 requestRetryTarget 命中（既有重试语义完全不变），但它没有角色候选链，
+     * modelFallbackChainFor 会返回 undefined，运行期降级对 root 恒不生效。
+     *
+     * 候选链存在与否同时决定请求级预算的归属（见 modelFallbackChainFor 的注释）：
+     * 有候选链时插件按 AUTO_RECOVERY_LIMIT 管理「每个模型 5 次」，没有候选链时
+     * 完全保持 Host retryPolicy 与既有终态语义。
+     *
+     * @param {object} agent - request-error payload 上的 exact Agent。
+     * @returns {{agent:object, role:string|undefined}|undefined}
+     */
+    function requestFallbackTarget(agent) {
+      const expert = requestRetryTarget(agent);
+      if (expert !== void 0) {
+        return {
+          agent,
+          role: firstNonEmptyText(expert.record?.role, agent?.options?.[ROLE_MARKER]) ?? void 0,
+        };
+      }
+      if (typeof agent?.id !== "string") return void 0;
+      let persisted;
+      try { persisted = source()?.childModels?.[agent.id]; } catch { persisted = void 0; }
+      if (!isFanoutAgent(agent) && !isFanoutIdentity(persisted)) return void 0;
+      const activation = childActivationStates.get(agent.id);
+      if (activation?.agent !== agent || activation.status !== "live") return void 0;
+      const parentId = firstNonEmptyText(
+        agent?.options?.[FANOUT_PARENT_AGENT_MARKER],
+        persisted?.fanoutParentAgentId,
+        persisted?.parentId,
+        agent?.options?.[PARENT_MARKER],
+      );
+      if (parentId === null) return void 0;
+      if (!isLiveRootAgent(host.lineage.activeRoot(parentId))) return void 0;
+      return {
+        agent,
+        role: firstNonEmptyText(agent?.options?.[ROLE_MARKER], persisted?.role) ?? void 0,
+      };
+    }
+
+    /**
+     * 在候选链里定位当前路由的位置；找不到返回 -1（表示「不在链上」）。
+     *
+     * 恢复策略（cold-resume 序号可能过期）：先按 provider+model 在**新计划**里精确匹配；
+     * 匹配不到时才考虑复用持久化序号，并且必须校验该序号指向的计划项与当前路由
+     * 同 provider+model——用户在中途改过候选列表时，旧序号可能指向完全不同的模型，
+     * 直接复用会把「降级到第 2 个候选」错记成「当前就在第 2 个候选」。校验失败返回 -1
+     * 表示「明确从头开始」：nextModelCandidateOf 会从计划头扫描，并靠 triedRoutes
+     * 跳过当前路由，绝不回到同一个失败模型。
+     */
+    function modelRouteIndexInPlan(plan, route, marker, recordedRoute) {
+      if (route !== void 0) {
+        for (let index = 0; index < plan.length; index += 1) {
+          if (sameModelRoute(plan[index]?.selection, route)) return index;
+        }
+      }
+      const markerIndex = Number.isSafeInteger(marker?.candidateIndex)
+        ? marker.candidateIndex
+        : Number.isSafeInteger(recordedRoute?.candidateIndex)
+          ? recordedRoute.candidateIndex
+          : void 0;
+      if (markerIndex !== void 0 && markerIndex >= 0 && markerIndex < plan.length
+        && sameModelRoute(plan[markerIndex]?.selection, route)) return markerIndex;
+      return -1;
+    }
+
+    /**
+     * 惰性构建某个 child 的候选链快照（按 Agent 缓存，只建一次）。
+     *
+     * 一致性边界（明确取舍，避免用户中途改配置把同一 child 的降级序列打乱）：
+     * - primary 优先取 admission 写入的 requestedPrimary（已包含会话覆盖），
+     *   其次取 agent.options 的真实路由；两者都不存在时不做任何降级；
+     * - 候选列表与 fallbackLimit 取**首次需要降级那一刻**的全局 settings 快照，
+     *   之后随 Agent 固定：同一 child 的 candidateIndex/fallbackCount 必须单调、
+     *   可解释，不能因为用户在运行中途改候选/改上限而跳变或回退；
+     * - 新 child、以及 cold-resume 产生的新 Agent 会按当时的 settings 重新构建链，
+     *   因此用户中途修改候选只影响之后创建的 child（与 persona/deny 的既有边界一致）。
+     * 读源不可用时按「没有候选」处理：绝不凭空降级，也绝不因为读配置失败而改变
+     * 既有请求级重试/终态语义。
+     *
+     * @param {object} agent - exact Agent。
+     * @param {{role?:string}} target - requestFallbackTarget 的结果。
+     * @returns {object|undefined} 链状态；无角色/无 primary 时返回 undefined。
+     */
+    function modelFallbackChainFor(agent, target) {
+      const cached = modelFallbackStates.get(agent);
+      if (cached !== void 0) return cached;
+      const role = typeof target?.role === "string" && target.role.length > 0 ? target.role : void 0;
+      if (role === void 0) return void 0;
+      let persisted;
+      try { persisted = typeof agent?.id === "string" ? source()?.childModels?.[agent.id] : void 0; } catch { persisted = void 0; }
+      const marker = normalizeModelRouteMarker(agent?.options?.[EXPERT_ROUTE_MARKER]);
+      const recordedRoute = modelRouteFieldsFromRecord(persisted);
+      const requestedPrimary = marker?.requestedPrimary ?? recordedRoute.requestedPrimary;
+      const primary = requestedPrimary ?? admissionModelRouteOf(agent);
+      if (primary === void 0) return void 0;
+      let candidates = [];
+      let fallbackLimit = DEFAULT_MODEL_FALLBACK_LIMIT;
+      try {
+        const snapshot = source();
+        candidates = Array.isArray(snapshot?.candidates?.[role]) ? snapshot.candidates[role] : [];
+        fallbackLimit = normalizeModelFallbackLimit(snapshot?.fallbackLimit);
+      } catch { /* 读源不可用：保持空候选/默认上限，等价于「不降级」。 */ }
+      const planInfo = buildModelRoutePlan(primary, candidates, fallbackLimit);
+      const route = admissionModelRouteOf(agent);
+      const index = modelRouteIndexInPlan(planInfo.plan, route, marker, recordedRoute);
+      const persistedFallbackCount = Number.isSafeInteger(marker?.fallbackCount) && marker.fallbackCount >= 0
+        ? marker.fallbackCount
+        : Number.isSafeInteger(recordedRoute?.fallbackCount) && recordedRoute.fallbackCount >= 0
+          ? recordedRoute.fallbackCount
+          : void 0;
+      const chain = {
+        role,
+        plan: planInfo.plan,
+        fallbackLimit: planInfo.fallbackLimit,
+        index,
+        // 已试过的路由键：index 已知时由单调前进保证不回头；index 未知（设置已改到
+        // 找不到当前路由）时用它兜住，避免在两个候选之间来回 ping-pong 消耗预算。
+        // 去重口径与运行期一致：provider+model（忽略 effort），effort-only 变化
+        // 不构成一次切换（见 shared.js modelRouteKeyOf 的注释）。
+        triedRoutes: new Set(route === void 0 ? [] : [modelRouteKeyOf(route)]),
+        override: void 0,
+        // admission 阶段（启动前预检）已经消耗的降级次数；运行期降级与它共用同一上限。
+        baselineFallbacks: persistedFallbackCount ?? (index >= 0 ? index : 0),
+        switches: 0,
+      };
+      modelFallbackStates.set(agent, chain);
+      return chain;
+    }
+
+    /**
+     * 选取候选链里的下一个模型。
+     *
+     * 预算边界：buildModelRoutePlan 已按 fallbackLimit 截断计划，这里再校验
+     * 「admission 降级次数 + 运行期降级次数 + 1 <= fallbackLimit」，两道条件同时满足
+     * 才允许切换——这样即使 settings 在运行中途被改大，也不会让已有 child 越界降级。
+     *
+     * @param {object} chain - 链状态。
+     * @param {object} currentRoute - 当前生效路由。
+     * @returns {{index:number, candidateIndex:number, selection:object}|undefined}
+     */
+    function nextModelCandidateOf(chain, currentRoute) {
+      const start = chain.index >= 0 ? chain.index + 1 : 0;
+      for (let index = start; index < chain.plan.length; index += 1) {
+        const selection = normalizeModelSelection(chain.plan[index]?.selection);
+        if (selection === void 0) continue;
+        if (sameModelRoute(selection, currentRoute)) continue;
+        // 已试路由按 provider+model 去重：同一模型换 effort 不是一次有效切换。
+        if (chain.triedRoutes.has(modelRouteKeyOf(selection))) continue;
+        if (chain.baselineFallbacks + chain.switches + 1 > chain.fallbackLimit) return void 0;
+        return { index, candidateIndex: chain.plan[index].candidateIndex, selection };
+      }
+      return void 0;
+    }
+
+    /**
+     * 安装运行期 route 覆盖（幂等）。
+     *
+     * 与 installEffortInjection 并排安装在同一 Agent 的 scoped ctx 上；prepend:true
+     * 让本 listener 处于最外层：先让内层（effort 注入 / 宿主 model-selection）算出
+     * route，最后再整体覆盖 provider/model/effort，避免 effort 注入把失败模型的
+     * 推理档位重新补回候选路由。
+     *
+     * 只读取插件自己的 WeakMap 状态；没有覆盖时原样透传 resolved，绝不改变
+     * 未降级 child（以及 root）的既有请求形状。
+     *
+     * @param {object} agent - exact Agent。
+     * @returns {boolean} 已安装（或已装过）返回 true。
+     */
+    function installModelFallbackRouteOverride(agent) {
+      if (typeof agent?.ctx?.on !== "function") return false;
+      if (modelFallbackRouteDisposers.has(agent)) return true;
+      const dispose = agent.ctx.on("agent/request", async (_payload, next) => {
+        const resolved = await next();
+        const override = modelFallbackStates.get(agent)?.override;
+        if (override === void 0 || resolved === null || typeof resolved !== "object") return resolved;
+        const effort = typeof override.reasoningEffort === "string" && override.reasoningEffort.length > 0
+          ? override.reasoningEffort
+          : void 0;
+        const routeMatched = resolved.provider === override.provider && resolved.model === override.model;
+        const effortMatched = effort === void 0
+          ? resolved.reasoningEffort === void 0
+          : resolved.reasoningEffort === effort;
+        if (routeMatched && effortMatched) return resolved;
+        // 与宿主 installModelSelection 同一语义：覆盖 provider/model 时丢弃继承的
+        // reasoningEffort；候选未声明 effort 就交还 adapter 解析默认档，绝不把
+        // 另一个 provider/失败模型的档位带过去（那会变成 INVALID_REQUEST 或静默降档）。
+        const { reasoningEffort: _inheritedEffort, ...rest } = resolved;
+        return {
+          ...rest,
+          provider: override.provider,
+          model: override.model,
+          ...(effort === void 0 ? {} : { reasoningEffort: effort }),
+        };
+      }, { prepend: true });
+      modelFallbackRouteDisposers.set(agent, dispose);
+      return true;
+    }
+
+    /**
+     * 把候选切换写进 child_models 快照（侧栏/用量统计的可见性来源）。
+     *
+     * 旁路持久化：写入失败只由 writeChildModelPatch 内部告警，绝不让「快照没写上」
+     * 把一次已经生效的降级回滚成失败。写入走同一串行队列，因此不会与 usage/
+     * structured 等其它 child_models patch 互相覆盖。
+     *
+     * 刻意省略 lastRouteErrorCode：运行期失败码（429/5xx/TIMEOUT/…）不在
+     * MODEL_ROUTE_ERROR_CODES 的稳定枚举里，硬塞会让投影把「限流」误读成「模型不可用」；
+     * 预检阶段写入的旧值原样保留。
+     *
+     * @param {object} agent - exact Agent。
+     * @param {object} chain - 链状态。
+     * @param {{index:number, candidateIndex:number, selection:object}} next - 选中的候选。
+     */
+    function writeModelRouteSnapshot(agent, chain, next) {
+      if (typeof agent?.id !== "string") return;
+      const effort = typeof next.selection.reasoningEffort === "string" && next.selection.reasoningEffort.length > 0
+        ? next.selection.reasoningEffort
+        : void 0;
+      void writeChildModelPatch(agent.id, {
+        provider: next.selection.provider,
+        model: next.selection.model,
+        ...(effort === void 0 ? {} : { reasoningEffort: effort }),
+        candidateIndex: next.candidateIndex,
+        fallbackCount: chain.baselineFallbacks + chain.switches,
+      }, effort === void 0
+        // 候选未声明 effort：**显式删除**旧档位（浅合并会保留主模型/上一个候选的
+        // reasoningEffort，投影就会显示「候选模型 + 主模型思考档」）。删除后运行期
+        // route 覆盖同样会清空继承 effort，由新 provider 自行解析默认档。
+        ? { remove: ["reasoningEffort"] }
+        : undefined).catch(() => { /* 旁路持久化失败已由 writeChildModelPatch 记录，绝不向上抛。 */ });
+    }
+
+    /**
+     * 尝试降级到候选链里的下一个模型。
+     *
+     * 只修改插件自己的状态并返回 true；由调用方返回 {kind:"retry"} 让 Host 重新
+     * prepareRequest —— 下一次尝试会重新走 agent/request waterfall，从而拿到覆盖后的
+     * provider/model，同一 Session、同一 child、上下文完全保留。
+     *
+     * 并发/竞态：本函数只由 request-error hook 在 activeKey 临界区内调用（同一 turn/step
+     * 一次只有一个失败在处理）；状态写入是同步的，因此不会有两个失败同时抢到同一个
+     * 候选位置；持久化是异步旁路，不参与竞争。
+     *
+     * @param {object} agent - exact Agent。
+     * @param {{role?:string}} target - requestFallbackTarget 的结果。
+     * @param {object} state - 当前 turn/step 的请求级重试状态。
+     * @returns {boolean} true = 已切换（调用方应返回 retry）。
+     */
+    function switchToNextModelCandidate(agent, target, state) {
+      const chain = modelFallbackChainFor(agent, target);
+      if (chain === void 0 || chain.plan.length <= 1) return false;
+      const currentRoute = currentModelRouteOf(agent, chain);
+      if (currentRoute === void 0) return false;
+      const next = nextModelCandidateOf(chain, currentRoute);
+      if (next === void 0) return false;
+      // 覆盖必须真有落点：拿不到 scoped ctx 时拒绝切换，否则 loop 会用同一路由重发，
+      // 把候选预算白白耗在同一个失败模型上。
+      if (installModelFallbackRouteOverride(agent) !== true) return false;
+      chain.index = next.index;
+      chain.override = { ...next.selection };
+      chain.switches += 1;
+      chain.triedRoutes.add(modelRouteKeyOf(next.selection));
+      // 新候选重新获得完整请求级预算。取消语义：调用方必须先排除 signal.aborted
+      // （本函数只处理真实失败），因此这里不会把用户中断当成降级触发。
+      state.retryCount = 0;
+      state.exhausted = false;
+      state.generation = Number.isSafeInteger(state.generation) ? state.generation + 1 : 1;
+      writeModelRouteSnapshot(agent, chain, next);
+      return true;
     }
 
     function clearRequestRetryStateForSessionEvent(session, event) {
@@ -5961,8 +6335,15 @@ export default {
       const type = event?.type;
       if (type === "turn/start" || type === "step/start") {
         resetRequestRetryState(state, session, event.data?.turn, event.data?.step);
-      } else if (type === "turn/end" || (type === "step/end" && state.exhausted !== true)) {
-        requestRetryStates.delete(agent);
+      } else if (type === "turn/end" || type === "step/end") {
+        // 终态（exhausted）必须活到 turn/end 真正被结算：handoff admission 会把
+        // handleChildTurnEnd 推迟到父 inbox settlement 之后，而本函数在 turn/end
+        // 事件的 finally 里同步执行；若在这里无条件删除状态，延迟结算的
+        // handleChildTurnEnd 会读到 requestRetryExhausted=false，把一次不可恢复的
+        // 模型失败当成可恢复失败继续自动续跑。新 turn/start（或 step/start）会
+        // resetRequestRetryState 清掉 exhausted，因此不会跨 turn 抑制恢复；
+        // Agent 销毁时 invalidateRequestRetryState 也会删除，不会泄漏。
+        if (state.exhausted !== true) requestRetryStates.delete(agent);
       }
     }
 
@@ -6731,9 +7112,17 @@ export default {
      * options.rethrow=true 只给需要感知失败的调用方（用量账本的重试、结构化结果的
      * 有界重试）使用：默认仍是"记录健康度 + 告警后吞掉"，不允许旁路持久化失败升级成
      * child/task 生命周期异常。
+     *
+     * options.remove 是显式删除键（运行期降级清理旧 reasoningEffort）：浅合并无法表达
+     * 「删除」（schema 不允许 null，写 undefined 又可能被序列化丢弃或保留半截键），
+     * 因此在同一临界区内先合并再按键删除，保证 provider/model/candidateIndex/
+     * fallbackCount/reasoningEffort 五者在一次 durable 写入里原子更新。
      */
     function writeChildModelPatch(childId, patch, options) {
       const rethrow = options?.rethrow === true;
+      const removeKeys = Array.isArray(options?.remove)
+        ? options.remove.filter((key) => typeof key === "string" && key.length > 0)
+        : [];
       return enqueueWrite(async () => {
         const binding = host.storage.active();
         if (binding?.childAuthoritative !== true) throw new Error("storage domain is not ready for child model write");
@@ -6741,7 +7130,9 @@ export default {
         const incomingAt = patch?.lastDispatch?.acceptedAt;
         const currentAt = current?.lastDispatch?.acceptedAt;
         if (Number.isSafeInteger(incomingAt) && Number.isSafeInteger(currentAt) && currentAt > incomingAt) return;
-        await putChildDomain(binding, childId, { ...current, ...patch });
+        const merged = { ...current, ...patch };
+        for (const key of removeKeys) delete merged[key];
+        await putChildDomain(binding, childId, merged);
       }).then(() => {
         observeStorageWrite(true, void 0, "child_models");
       }, (error) => {
@@ -7678,7 +8069,8 @@ export default {
     }
 
     /**
-     * 候选映射的结构校验（票据 24）：普通对象、已知角色、数组、最多 8 条。
+     * 候选映射的结构校验（票据 24）：普通对象、已知角色、数组、每角色最多
+     * MAX_MODEL_CANDIDATES_PER_ROLE（当前 3）条。
      * 单条 selection 的形状/目录解析在 validateModelCandidatesCandidate 内逐条执行；
      * 只有变更中的角色才走真实解析，未变更角色的存量失效值不阻塞保存。
      */
@@ -7874,7 +8266,7 @@ export default {
         ? normalizePromptOverrideCandidate(candidate[PROMPT_OVERRIDES_SETTINGS_KEY], candidateRoleIds)
         : void 0;
       // 候选映射（票据 24）：缺字段 = 旧客户端，不写 patch、保持原值；显式提供时先做
-      // 结构校验（unknown role/非数组/超过 8 条），再只解析变更中的角色。
+      // 结构校验（unknown role/非数组/超过每角色上限），再只解析变更中的角色。
       const hasCandidates = candidate.candidates !== void 0;
       if (hasCandidates) assertModelCandidatesCandidate(candidate.candidates, candidateRoleIds);
       // 自动降级上限：缺字段不写 patch；显式提供时只接受 0..4 的安全整数。
@@ -8474,6 +8866,10 @@ export default {
         }).then(() => flushPendingStructuredPatch(agent.id));
       }
       installEffortInjection(agent, effort);
+      // 运行期降级：只给专家 child 装 route 覆盖（与 effort 注入并排，幂等）。
+      // root 永远没有候选链，装上去只会给每次请求多一层空转发，因此不装。
+      // 未降级时 listener 原样透传，不改变任何既有请求形状。
+      if (isExpertChild === true) installModelFallbackRouteOverride(agent);
     });
     ctx.on("agent/disposed", ({ agent }) => {
       const expertGuardCleanup = expertReportGuardDisposers.get(agent);
@@ -8554,17 +8950,32 @@ export default {
         effortDisposers.delete(agent);
         try { dispose(); } catch {}
       }
+      // 运行期降级状态只绑定 exact Agent：销毁即摘除 listener 与链快照，迟到 hook
+      // 既不会复活旧预算，也不会把覆盖应用到同 id 的新代际。
+      const fallbackDispose = modelFallbackRouteDisposers.get(agent);
+      if (fallbackDispose !== void 0) {
+        modelFallbackRouteDisposers.delete(agent);
+        try { fallbackDispose(); } catch {}
+      }
+      modelFallbackStates.delete(agent);
     });
 
     /**
-     * 在公开 agent/request-error waterfall 上接管插件 root 与专家 child 的结构化
-     * 瞬态错误。使用 prepend 保证该边界先于 Host listener：Host 已有 llm/retry
+     * 在公开 agent/request-error waterfall 上接管插件 root / 专家 child / fan-out
+     * 分片的模型失败。使用 prepend 保证该边界先于 Host listener：Host 已有 llm/retry
      * 负责退避时只复用其返回值；Host 未处理的 code 由公开 async hook 使用
      * payload.signal 等待有界退避。这里绝不调用 prompt、私有 steer 或内部 API。
+     *
+     * 运行期降级（本次票据）接在原有预算语义上，触发点只有三个：
+     * 1. 确定性失败（模型不存在/无 adapter/鉴权失败/上下文超限）→ 立即换候选；
+     * 2. Host retryPolicy 声明该 code 归它管理、但它已拒绝/耗尽重试 → 换候选；
+     * 3. 插件自己的请求级预算（AUTO_RECOVERY_LIMIT）耗尽 → 换候选。
+     * 三个触发点都只在「存在下一个候选且总降级次数未超 fallbackLimit」时生效；
+     * 否则保持原有 exhausted/终态语义。取消（signal aborted）永不降级。
      */
     ctx.on("agent/request-error", async (payload, next) => {
       const agent = payload?.agent;
-      const target = requestRetryTarget(agent);
+      const target = requestFallbackTarget(agent);
       if (target === void 0) return typeof next === "function" ? next() : void 0;
       const session = agent?.session;
       const turn = payload?.turn;
@@ -8573,8 +8984,25 @@ export default {
         || !Number.isSafeInteger(turn) || !Number.isSafeInteger(step)) return void 0;
 
       const state = requestRetryStateFor(agent, session, turn, step);
-      const hostCount = hostRetryCountFor(session, turn, step);
-      if (hostCount > state.retryCount) state.retryCount = Math.min(hostCount, AUTO_RECOVERY_LIMIT);
+      // 候选链惰性构建：没有角色（root/未知 child）、没有候选或读源失败时返回 undefined，
+      // 后续所有 switchToNextModelCandidate 调用都会直接返回 false，等价于「不降级」。
+      const fallbackChain = modelFallbackChainFor(agent, target);
+      const currentRoute = currentModelRouteOf(agent, fallbackChain);
+      // 是否存在运行期候选链（primary 之外还有可尝试的候选）。它同时决定预算归属：
+      // 有候选时由插件管理「每个模型 5 次」；没有候选时保持 Host 预算与既有终态语义。
+      const fallbackManaged = fallbackChain !== void 0 && fallbackChain.plan.length > 1;
+      // 预算按「当前模型 provider」统计（仅非候选链路径使用）：durable llm/retry 事件
+      // 只有 provider 字段，无法区分同一 provider 下的不同模型。
+      const budgetProvider = currentRoute?.provider
+        ?? (typeof payload?.provider === "string" && payload.provider.length > 0 ? payload.provider : void 0);
+      // P1-1：候选链存在（fallbackManaged）时，每个模型的重试预算由插件**本地**计数，
+      // 绝不从 session 级 durable 事件恢复——否则同 provider 的新候选会继承前一个模型
+      // 已消耗的 5 次重试，切过去立刻被视为耗尽。没有候选链的 root/child 保持既有语义
+      // （从宿主事件恢复，尊重 Host maxRetries 的权威性）。
+      if (fallbackManaged !== true) {
+        const hostCount = hostRetryCountFor(session, turn, step, budgetProvider);
+        if (hostCount > state.retryCount) state.retryCount = Math.min(hostCount, AUTO_RECOVERY_LIMIT);
+      }
       const failure = payload?.failure;
       if (state.exhausted === true) return void 0;
       if (markRequestRetryEvent(state, payload, failure)) return void 0;
@@ -8589,6 +9017,20 @@ export default {
           if (state.retryCount > 0) state.exhausted = true;
           return void 0;
         }
+        if (isDeterministicModelFailure(failure)) {
+          // 确定性失败：重试必然复现，有候选就立即换模型，不浪费当前模型的预算。
+          if (switchToNextModelCandidate(agent, target, state)) return { kind: "retry" };
+          if (fallbackManaged === true) {
+            // P1-2：候选链存在但已无下一候选（含降级预算耗尽）——这是整条链的终态。
+            // 必须显式置 exhausted：MODEL_NOT_FOUND / NO_ADAPTER 等可重试码不在 turn
+            // 永久错误码表里，若不置位，turn/end 的 requestRetryExhausted 为 false，
+            // 一次不可恢复的模型失败会被当成可恢复失败继续自动续跑。
+            state.exhausted = true;
+            return void 0;
+          }
+          // 没有候选链的 root/child：保留既有语义——可重试码继续走下面的预算路径，
+          // 不可重试码由下面的终态分支收口（不在此处改变公共行为）。
+        }
         if (!isTransientRequestFailure(failure)) {
           // 已经发生过请求级重试后又出现永久/未知失败时，不能再落入 child
           // continuation，把同一失败计两遍；没有前置请求重试则保留既有终态语义。
@@ -8598,7 +9040,11 @@ export default {
 
         const hostOwnsCode = requestRetryPolicyCoversFailure(payload?.retryPolicy, failure);
         let delegated;
-        if (typeof next === "function") {
+        // 候选链存在时，当前模型的 5 次预算由插件兜底：预算已耗尽就不再委托 Host
+        // （mode:"always" 的 retryPolicy 会无限重试，跳过委托才能在预算边界换模型）。
+        // 没有候选链的 child 完全保持既有委托语义，绝不改变 Host maxRetries 的权威性。
+        const skipDelegation = fallbackManaged === true && state.retryCount >= AUTO_RECOVERY_LIMIT;
+        if (typeof next === "function" && skipDelegation !== true) {
           try {
             delegated = await next();
           } catch (error) {
@@ -8607,25 +9053,33 @@ export default {
             ctx.logger.warn("dsh-expert-group: request retry downstream listener failed: " + (error instanceof Error ? error.message : String(error)));
           }
         }
-        const currentTarget = requestRetryTarget(agent);
+        const currentTarget = requestFallbackTarget(agent);
         if (currentTarget === void 0 || requestRetryStates.get(agent) !== state
           || state.session !== session || payload?.signal?.aborted === true) return void 0;
 
         if (delegated?.kind === "retry") {
           // Host 已完成 durable llm/retry 记录与退避；只同步总预算，绝不再发第二次。
-          state.retryCount = Math.min(Math.max(state.retryCount + 1, hostRetryCountFor(session, turn, step)), AUTO_RECOVERY_LIMIT);
+          // 候选链：本地 +1（不从宿主事件恢复，避免继承同 provider 前一个模型的计数）；
+          // 非候选链：保留「取本地与宿主事件较大值」的既有语义。
+          const hostRetry = fallbackManaged === true ? 0 : hostRetryCountFor(session, turn, step, budgetProvider);
+          state.retryCount = Math.min(Math.max(state.retryCount + 1, hostRetry), AUTO_RECOVERY_LIMIT);
           return delegated;
         }
 
-        if (hostOwnsCode) {
+        if (hostOwnsCode && fallbackManaged !== true) {
           // retryPolicy 明确声明该 code 归 Host 管理时，undefined 表示 Host
-          // 已拒绝/耗尽 retry；插件不得补发 action 突破 Host maxRetries。
+          // 已拒绝/耗尽 retry；没有候选链时插件不得补发 action 突破 Host maxRetries
+          // （既有语义，root 与「未配置候选」的 child 行为完全不变）。
+          // 有候选链时预算由插件自己管理（见下面的预算分支），因此不在这里终态化。
           state.exhausted = true;
           return void 0;
         }
 
         const nextRetry = state.retryCount + 1;
         if (!Number.isSafeInteger(nextRetry) || nextRetry > AUTO_RECOVERY_LIMIT) {
+          // 当前模型的 5 次预算耗尽：有候选就切换，让 loop 用新 route 重发；
+          // 候选链也耗尽时保持原有语义（exhausted 阻止自动恢复，并原样上抛失败）。
+          if (switchToNextModelCandidate(agent, target, state)) return { kind: "retry" };
           state.exhausted = true;
           return void 0;
         }
@@ -11676,6 +12130,9 @@ export default {
         registerPluginExpertChildAgent(agent);
         installExpertReportGuardForAgent(agent, { role, parentId, source: "fanout" });
         installEffortInjection(agent, resolveEffortOf(agent));
+        // fan-out 分片 child 同样安装运行期 route 覆盖：分片是独立 child，降级只在
+        // 该分片自己会话内生效，不会影响其它分片或父任务的重试预算。
+        installModelFallbackRouteOverride(agent);
         if (typeof agent?.id === "string") childActivationStates.set(agent.id, { agent, status: "live" });
         const childId = typeof agent?.id === "string" ? agent.id : void 0;
         const provider = agent?.options?.provider;
@@ -16004,22 +16461,39 @@ export default {
           if (isChild) {
             // 优先在线 agent 的实际请求头，其次在线 agent 的 options，
             // 最后落到持久化记录——保证子代理结束后仍能显示当时使用的模型与思考深度。
+            //
+            // 例外（运行期降级）：持久化记录带**实际路由快照**（candidateIndex/
+            // fallbackCount 与 provider/model）时，provider/model/effort 必须整体取
+            // 同一份快照。运行期降级只改 child_models、绝不改 agent.options，请求头也
+            // 只在下一次请求后才更新；混用会让详情页短暂显示「候选索引 + 主模型 + 旧
+            // effort」，而删掉的 effort 又会从 header/options 里被读回来。
             const header = agent?.session?.requestHeader?.();
             const config = header?.config;
+            const persistedRouteAuthoritative = persistedModelRouteIsAuthoritative(recorded);
             send(200, {
               ok: true,
               kind: "child",
               child: {
-                provider: config?.provider ?? agent?.options?.provider ?? recorded?.provider ?? "",
-                model: config?.model ?? agent?.options?.model ?? recorded?.model ?? "",
-                reasoningEffort: config?.reasoningEffort ?? agent?.options?.[EFFORT_MARKER] ?? recorded?.reasoningEffort,
+                provider: persistedRouteAuthoritative
+                  ? recorded.provider
+                  : config?.provider ?? agent?.options?.provider ?? recorded?.provider ?? "",
+                model: persistedRouteAuthoritative
+                  ? recorded.model
+                  : config?.model ?? agent?.options?.model ?? recorded?.model ?? "",
+                reasoningEffort: persistedRouteAuthoritative
+                  ? recorded?.reasoningEffort
+                  : config?.reasoningEffort ?? agent?.options?.[EFFORT_MARKER] ?? recorded?.reasoningEffort,
                 // 子代理角色：优先在线 agent 的 options marker，其次持久化记录；
                 // 缺失时留空（客户端隐藏角色前缀，显示与旧版一致）。
                 role: agent?.options?.[ROLE_MARKER] ?? recorded?.role,
                 // 实际路由（票据 24）：只回传确实记录过的字段；缺失时省略而不是伪造 0。
+                // 持久化记录是**运行期**权威：运行期降级只更新 child_models（绝不改
+                // agent.options），因此 recorded 必须覆盖 admission marker，marker 只在
+                // 持久化字段缺失（写入尚未落地/旧记录）时补齐。
                 ...(() => {
-                  const marked = routeFieldsOfMarker(agent?.options?.[EXPERT_ROUTE_MARKER]);
-                  return Object.keys(marked).length > 0 ? marked : modelRouteFieldsFromRecord(recorded);
+                  const persistedRoute = modelRouteFieldsFromRecord(recorded);
+                  if (Object.keys(persistedRoute).length > 0) return persistedRoute;
+                  return routeFieldsOfMarker(agent?.options?.[EXPERT_ROUTE_MARKER]);
                 })(),
                 // 用量（票据 25）：live 账本优先（去抖窗口内也最新），其次 child_models.usage；
                 // 缺失为 null，客户端据此显示“用量不可用”，绝不显示 0 成本。
