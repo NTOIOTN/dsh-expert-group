@@ -33,9 +33,7 @@ export const ORCHESTRATOR_ROLES = Object.freeze(listRoles().map((entry) => entry
  * 提示词体积纪律（票据 22）：注册表摘要已经承载职责说明与能力描述，这里只保留
  * 派发/不派发真正需要的英文关键词，不再逐条复述职责全文。
  *
- * 自定义角色（票据 27）没有手工维护的 lane：它们的职责由用户在设置里声明，
- * 因此 lane 由 description 派生（见 customRoleLane），只在运行期目录里出现时
- * 才进入提示词。内置角色的 lane 仍是模块常量，注册表新增内置角色却缺 lane 时显式失败。
+ * lane 是模块常量：注册表新增内置角色却缺 lane 时显式失败，绝不静默漏进 root prompt。
  */
 const ROLE_LANES = {
   explorer: [
@@ -83,29 +81,10 @@ for (const entry of listRoles()) {
   }
 }
 
-/**
- * 自定义角色的通用 lane：职责来自设置里的 description，派发规则使用中性英文表述。
- *
- * 为什么不给自定义角色也要求用户写 lane：lane 是内部提示词结构，用户只声明职责；
- * 把 description 原文作为 lane 首行既保留用户语义，又让 root 看到与内置角色同形的
- * 「Delegation when / not」边界。
- *
- * @param {object} entry - 自定义角色记录。
- * @returns {string[]} lane 文本行。
- */
-function customRoleLane(entry) {
-  return [
-    "- Lane: " + entry.description,
-    "- Delegate when: the work matches this role's stated responsibility and one independent child can complete it end to end",
-    "- Do not delegate when: the work does not match this responsibility, or it needs root permissions, user confirmation, or further delegation",
-  ];
-}
-
-/** 角色的 lane 文本：内置角色用常量表，自定义角色由 description 派生。 */
-function laneOf(entry, role) {
+/** 内置角色的 lane 文本：来自模块常量表，缺失时显式失败。 */
+function laneOf(role) {
   const lane = ROLE_LANES[role];
   if (Array.isArray(lane)) return lane;
-  if (entry?.custom === true) return customRoleLane(entry);
   throw new Error("orchestrator 缺少注册角色的 lane 描述: " + String(role));
 }
 
@@ -321,7 +300,7 @@ function buildOrchestratorPromptTemplate(enabledRoles, providerReady, observerPr
   // 注册表是角色身份与职责的唯一来源。
   const roleText = enabledRoles.map((role) => {
     const entry = registry.require(role);
-    return ["@" + entry.toolName, "- Role: " + entry.label + " — " + entry.description, ...laneOf(entry, role)].join("\n");
+    return ["@" + entry.toolName, "- Role: " + entry.label + " — " + entry.description, ...laneOf(role)].join("\n");
   }).join("\n\n")
     + (fanoutAvailable ? "\n\n" + FANOUT_DESCRIPTION.join("\n") : "");
   const unavailable = providerReady

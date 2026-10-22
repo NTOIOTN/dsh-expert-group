@@ -1241,6 +1241,10 @@ en:"Automatically open running subagent sidebar sessions",
 "settings.noProvider":{zh:"无",en:"None"},
 "settings.observerPreferred":{zh:"Observer优先",en:"Prefer Observer"},
 "settings.concurrencyLimit":{zh:"单个角色并发上限",en:"Per-role concurrency limit"},
+"settings.concurrencyLimit.title":{
+zh:"取值范围 1–64 的整数；默认 20；保存后生效",
+en:"An integer from 1–64; defaults to 20; takes effect after saving",
+},
 "settings.roleTimeout":{zh:"角色默认超时 (s)",en:"Default role timeout (s)"},
 "settings.roleTimeout.title":{
 zh:"默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
@@ -1251,25 +1255,6 @@ en:"Defaults to 10 hours (36000 s); 0 disables it; enabled values are 1–86400 
 "settings.discard":{zh:"放弃修改",en:"Discard changes"},
 "settings.saved":{zh:"已保存",en:"Saved"},
 "settings.unsaved":{zh:"有未保存的修改",en:"Unsaved changes"},
-"settings.diagnostics.title":{zh:"诊断与通知状态",en:"Diagnostics and notification status"},
-"settings.diagnostics.capabilities":{zh:"能力矩阵",en:"Capabilities"},
-"settings.diagnostics.runtime":{zh:"运行时诊断",en:"Runtime diagnostics"},
-"settings.diagnostics.budget":{zh:"预算用量与最近违规",en:"Budget usage and latest violation"},
-"settings.diagnostics.persistence":{zh:"持久化与恢复",en:"Persistence and recovery"},
-"settings.diagnostics.notifications":{zh:"通知投递",en:"Notification delivery"},
-"settings.diagnostics.loading":{zh:"正在读取宿主诊断…",en:"Loading host diagnostics…"},
-"settings.diagnostics.unavailable":{
-zh:"宿主诊断不可用；以下只显示客户端能力。",
-en:"Host diagnostics are unavailable; only client capabilities are shown below.",
-},
-"settings.diagnostics.absent":{
-zh:"宿主未提供诊断数据；以下只显示客户端能力。",
-en:"The host provided no diagnostics; only client capabilities are shown below.",
-},
-"settings.testNotification":{zh:"发送测试通知",en:"Send test notification"},
-"settings.testNotification.sending":{zh:"发送中…",en:"Sending…"},
-"settings.testNotification.sent":{zh:"已发送测试通知",en:"Test notification sent"},
-"settings.testNotification.disabled":{zh:"通知已关闭，未发送测试通知",en:"Notifications are off; test notification not sent"},
 "announce.start":{zh:"任务开始：{name}",en:"Task started: {name}"},
 "announce.finish":{zh:"任务完成：{name}",en:"Task finished: {name}"},
 "announce.fail":{zh:"任务失败：{name}",en:"Task failed: {name}"},
@@ -10857,6 +10842,7 @@ const SETTINGS_ZH_FALLBACK=Object.freeze({
 "settings.noProvider":"无",
 "settings.observerPreferred":"Observer优先",
 "settings.concurrencyLimit":"单个角色并发上限",
+"settings.concurrencyLimit.title":"取值范围 1–64 的整数；默认 20；保存后生效",
 "settings.roleTimeout":"角色默认超时 (s)",
 "settings.roleTimeout.title":"默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
 "settings.save":"保存",
@@ -10864,19 +10850,6 @@ const SETTINGS_ZH_FALLBACK=Object.freeze({
 "settings.discard":"放弃修改",
 "settings.saved":"已保存",
 "settings.unsaved":"有未保存的修改",
-"settings.diagnostics.title":"诊断与通知状态",
-"settings.diagnostics.capabilities":"能力矩阵",
-"settings.diagnostics.runtime":"运行时诊断",
-"settings.diagnostics.budget":"预算用量与最近违规",
-"settings.diagnostics.persistence":"持久化与恢复",
-"settings.diagnostics.notifications":"通知投递",
-"settings.diagnostics.loading":"正在读取宿主诊断…",
-"settings.diagnostics.unavailable":"宿主诊断不可用；以下只显示客户端能力。",
-"settings.diagnostics.absent":"宿主未提供诊断数据；以下只显示客户端能力。",
-"settings.testNotification":"发送测试通知",
-"settings.testNotification.sending":"发送中…",
-"settings.testNotification.sent":"已发送测试通知",
-"settings.testNotification.disabled":"通知已关闭，未发送测试通知",
 });
 function settingsText(locale,key,vars){
 const model=localeModelApi();
@@ -10891,16 +10864,10 @@ return value===void 0||value===null?match:String(value);
 }
 const SETTINGS_EXTRA_MESSAGES=Object.freeze({
 "settings.modelCandidates.title":{zh:"模型候选与自动降级"},
-"settings.modelCandidates.hint":{zh:"每个角色先使用角色默认模型；启动前失败时按顺序降级到候选，最多 fallbackLimit 次。候选是全局配置。"},
+"settings.modelCandidates.hint":{zh:"候选在专家详情页按角色配置；这里设置启动失败时的降级次数上限。"},
+"settings.modelCandidates.detailHint":{zh:"每个角色先使用角色默认模型；启动失败时按顺序降级到候选（最多 {limit} 次）。"},
 "settings.modelCandidates.fallbackLimit":{zh:"自动降级上限"},
 "settings.modelCandidates.fallbackLimit.title":{zh:"0 = 不降级；默认 2；最多 4。只影响保存之后创建的尝试。"},
-"settings.modelCandidates.preflight":{zh:"预检"},
-"settings.modelCandidates.preflight.running":{zh:"预检中…"},
-"settings.modelCandidates.preflight.ok":{zh:"预检通过"},
-"settings.modelCandidates.preflight.failed":{zh:"预检失败：{message}"},
-"settings.modelCandidates.preflight.stale":{zh:"预检结果已过期，请重新预检"},
-"settings.modelCandidates.preflight.unavailable":{zh:"当前宿主不支持模型预检"},
-"settings.modelCandidates.preflight.error":{zh:"预检请求失败：{message}"},
 "settings.modelCandidates.primary":{zh:"主选择"},
 "settings.modelCandidates.primary.none":{zh:"尚未配置主选择"},
 "settings.modelCandidates.empty":{zh:"还没有候选"},
@@ -10913,123 +10880,8 @@ const SETTINGS_EXTRA_MESSAGES=Object.freeze({
 "settings.modelCandidates.down":{zh:"下移"},
 "settings.modelCandidates.remove":{zh:"删除"},
 "settings.modelCandidates.row":{zh:"候选 {index}"},
-"settings.modelCandidates.image.supported":{zh:"image 输入：支持"},
-"settings.modelCandidates.image.unsupported":{zh:"image 输入：不支持"},
-"settings.modelCandidates.image.unknown":{zh:"image 输入：未知"},
 "settings.modelCandidates.error.incomplete":{zh:"候选第 {index} 行需要同时填写供应商和模型"},
 "settings.modelCandidates.error.duplicate":{zh:"候选第 {index} 行与前面的候选重复"},
-"settings.customRoles.title":{zh:"自定义角色"},
-"settings.customRoles.hint":{zh:"自定义角色与内置角色共用注册、人格、权限、模型与恢复路径；保存时严格校验，缺失只读性或工具拒绝会被拒绝。"},
-"settings.customRoles.builtin":{zh:"内置角色（只读）"},
-"settings.customRoles.custom":{zh:"自定义角色"},
-"settings.customRoles.empty":{zh:"还没有自定义角色"},
-"settings.customRoles.add":{zh:"新增自定义角色"},
-"settings.customRoles.remove":{zh:"删除角色"},
-"settings.customRoles.id":{zh:"角色标识"},
-"settings.customRoles.id.hint":{zh:"小写字母开头，仅小写字母、数字与连字符，长度 2–32；仅新增时可填写。"},
-"settings.customRoles.label":{zh:"显示名"},
-"settings.customRoles.statusLabel":{zh:"状态标签"},
-"settings.customRoles.description":{zh:"职责描述"},
-"settings.customRoles.readOnly":{zh:"权限"},
-"settings.customRoles.readOnly.empty":{zh:"请选择只读或可写"},
-"settings.customRoles.readOnly.readOnly":{zh:"只读"},
-"settings.customRoles.readOnly.writable":{zh:"可写"},
-"settings.customRoles.toolDeny":{zh:"工具拒绝（每行一个工具名）"},
-"settings.customRoles.toolDeny.hint":{zh:"允许为空，但字段必须存在；空白行会被忽略。"},
-"settings.customRoles.persona":{zh:"人格（可选）"},
-"settings.customRoles.error.readOnly":{zh:"自定义角色“{role}”必须显式选择只读或可写"},
-"settings.customRoles.error.toolDeny":{zh:"自定义角色“{role}”必须显式提交工具拒绝列表（允许为空）"},
-"settings.customRoles.error.id":{zh:"自定义角色标识“{id}”不合法：必须小写字母开头、仅小写字母/数字/连字符，长度 2–32"},
-"settings.customRoles.error.idBuiltin":{zh:"自定义角色标识不得覆盖内置角色：{id}"},
-"settings.customRoles.error.idDuplicate":{zh:"自定义角色标识重复：{id}"},
-"settings.customRoles.error.label":{zh:"自定义角色“{role}”的显示名不能为空且不超过 64 字符"},
-"settings.customRoles.error.description":{zh:"自定义角色“{role}”的职责描述不能为空且不超过 500 字符"},
-"settings.customRoles.error.statusLabel":{zh:"自定义角色“{role}”的状态标签不超过 32 字符"},
-"settings.customRoles.error.persona":{zh:"自定义角色“{role}”的人格不超过 8000 字符"},
-"settings.customRoles.error.toolDenyEntry":{zh:"自定义角色“{role}”的工具拒绝最多 64 条，单条不超过 128 字符"},
-"settings.customRoles.error.limit":{zh:"自定义角色最多 16 个"},
-"settings.customRoles.error.host":{zh:"宿主拒绝保存：{message}"},
-"settings.customRoles.inUse":{zh:"仍有活动任务引用该角色，宿主已拒绝删除：{message}"},
-"settings.limits.title":{zh:"并发与背压"},
-"settings.limits.hint":{zh:"「单个角色并发上限」是默认值；下面的逐角色与逐 provider 上限会覆盖它。排队不占名额，名额只在分片进入运行态时占用。"},
-"settings.limits.roleTitle":{zh:"逐角色并发上限"},
-"settings.limits.roleHint":{zh:"留空 = 使用默认值（当前 {fallback}）；启用值为 1–64 的整数。"},
-"settings.limits.roleLimit":{zh:"并发上限"},
-"settings.limits.providerTitle":{zh:"逐 provider 并发上限"},
-"settings.limits.providerHint":{zh:"单位是同时运行的分片数；0 或留空 = 不限制；启用值为 1–64 的整数。保存时不校验模型目录。"},
-"settings.limits.providerName":{zh:"provider 名称"},
-"settings.limits.providerLimit":{zh:"上限"},
-"settings.limits.add":{zh:"添加 provider 上限"},
-"settings.limits.remove":{zh:"删除该行"},
-"settings.limits.empty":{zh:"还没有 provider 上限行"},
-"settings.limits.rowLimit":{zh:"provider 上限最多 32 行"},
-"settings.limits.unlimited":{zh:"不限制"},
-"settings.limits.unknown":{zh:"未知"},
-"settings.limits.never":{zh:"从未"},
-"settings.limits.liveTitle":{zh:"运行时排队与放行（只读）"},
-"settings.limits.liveProvidersTitle":{zh:"生效的 provider 上限"},
-"settings.limits.liveProvidersEmpty":{zh:"宿主未提供 provider 上限投影（或未配置）。"},
-"settings.limits.liveUnknown":{zh:"宿主未提供运行时限流诊断，排队与预计等待为未知。"},
-"settings.limits.liveEmpty":{zh:"当前没有被限流或排队的角色/provider。"},
-"settings.limits.throttleLine":{zh:"运行 {running} · 排队 {queued} · 上限 {limit} · 预计等待 {eta}（{etaSource}） · 最近限流 {last}"},
-"settings.limits.etaSource.average":{zh:"历史均值"},
-"settings.limits.etaSource.unknown":{zh:"样本不足"},
-"settings.limits.etaHint":{zh:"预计等待来自历史均值（至少需要 {samples} 个样本）；样本不足时显示“未知”，它不是承诺值。"},
-"settings.limits.invalidTitle":{zh:"已忽略的限流配置（读取期）"},
-"settings.limits.invalidRow":{zh:"{field}：{target} → {reason}"},
-"settings.limits.reason.invalid_limit":{zh:"值不在合法范围内"},
-"settings.limits.reason.unknown_role":{zh:"未知角色"},
-"settings.limits.reason.invalid_key":{zh:"provider 键为空"},
-"settings.limits.reason.invalid_shape":{zh:"结构不合法"},
-"settings.limits.error.roleLimit":{zh:"{role}：并发上限必须是 1–64 的整数（留空 = 使用默认值）"},
-"settings.limits.error.providerEmpty":{zh:"provider 上限第 {index} 行缺少 provider 名称"},
-"settings.limits.error.providerTooLong":{zh:"provider 上限第 {index} 行的名称超过 128 字符"},
-"settings.limits.error.providerDuplicate":{zh:"provider 上限第 {index} 行与前面的 provider 重复"},
-"settings.limits.error.providerLimit":{zh:"provider 上限第 {index} 行必须是 0–64 的整数（留空 = 不限制）"},
-"settings.inherit.title":{zh:"上下文继承"},
-"settings.inherit.hint":{zh:"开启后专家会继承父会话已完成 turn 的前缀，减少重复说明；继承会增加输入 token 成本（按继承到的前缀大小计），因此默认关闭。"},
-"settings.inherit.cost":{zh:"只继承已完成 turn 的前缀，不包含进行中 turn、未完成工具输出与隐藏消息；Observer 始终隔离。"},
-"settings.inherit.toggle":{zh:"继承父会话上下文"},
-"settings.inherit.on":{zh:"已开启"},
-"settings.inherit.off":{zh:"关闭（默认）"},
-"settings.inherit.unavailableTitle":{zh:"不提供继承的角色"},
-"settings.inherit.observer":{zh:"Observer：只接收视觉任务，强制隔离，不接收用户上下文。"},
-"settings.inherit.custom":{zh:"{role}：自定义角色不提供上下文继承。"},
-"settings.inherit.requirement":{zh:"实际能否继承还取决于宿主是否提供合格的 fork provider；不满足时派发会显式失败并提示重新派发。"},
-"settings.usage.title":{zh:"用量与单价"},
-"settings.usage.hint":{zh:"用量来自宿主已有的 usage 事件（只读，不含提示词、响应、凭据与路径）；单价只用于可选的成本估算。"},
-"settings.usage.totals":{zh:"合计"},
-"settings.usage.byRole":{zh:"按角色"},
-"settings.usage.byProvider":{zh:"按提供方"},
-"settings.usage.byModel":{zh:"按模型"},
-"settings.usage.byProviderModel":{zh:"按提供方+模型"},
-"settings.usage.groupOverflow":{zh:"其他组合（不估算）"},
-"settings.usage.recent":{zh:"最近任务（最多 16 条）"},
-"settings.usage.empty":{zh:"宿主还没有可用的用量样本。"},
-"settings.usage.line":{zh:"输入 {input} · 输出 {output} token｜请求 {requests} · 重试 {retries}{run}"},
-"settings.usage.runSuffix":{zh:"｜耗时 {run}"},
-"settings.usage.priceTitle":{zh:"每模型单价（每百万 token）"},
-"settings.usage.priceHint":{zh:"金额为每百万 token 的单价，币种默认 USD；provider+model 不能重复。空行或非法金额会阻止保存。"},
-"settings.usage.priceProvider":{zh:"provider"},
-"settings.usage.priceModel":{zh:"model"},
-"settings.usage.priceInput":{zh:"输入单价/百万 token"},
-"settings.usage.priceOutput":{zh:"输出单价/百万 token"},
-"settings.usage.priceCurrency":{zh:"币种"},
-"settings.usage.priceAdd":{zh:"添加单价"},
-"settings.usage.priceRemove":{zh:"删除该单价"},
-"settings.usage.priceEmpty":{zh:"还没有配置单价：只显示 token 与请求数，不估算成本。"},
-"settings.usage.noPrice":{zh:"没有匹配的单价：不估算成本（绝不显示假成本）。"},
-"settings.usage.estimateTitle":{zh:"按单价估算（示例）"},
-"settings.usage.estimateHint":{zh:"计算方式：计费输入 token ÷ 1,000,000 × 输入单价 + 输出 token ÷ 1,000,000 × 输出单价，保留 4 位小数。这是估算，不是账单。"},
-"settings.usage.estimateRow":{zh:"{model}：约 {cost} {currency}"},
-"settings.usage.estimateNoSample":{zh:"单价已配置，但还没有匹配到该 provider+model 的用量样本。"},
-"settings.usage.estimateMissingProviderModel":{zh:"宿主未提供 provider 级聚合（旧版本），暂不估算成本；用量展示不受影响。"},
-"settings.usage.error.limit":{zh:"单价最多 64 条"},
-"settings.usage.error.incomplete":{zh:"单价第 {index} 行必须同时填写 provider 与 model"},
-"settings.usage.error.tooLong":{zh:"单价第 {index} 行的 provider/model 超过 128 字符"},
-"settings.usage.error.rate":{zh:"单价第 {index} 行的输入/输出单价必须是 ≥0 的数字（每百万 token）"},
-"settings.usage.error.currency":{zh:"单价第 {index} 行的币种最多 8 字符（留空 = USD）"},
-"settings.usage.error.duplicate":{zh:"单价第 {index} 行与前面的 provider+model 重复"},
 });
 function settingsExtraText(locale,key,vars){
 const entry=SETTINGS_EXTRA_MESSAGES[key];
@@ -11046,13 +10898,18 @@ const css=""+
 ".deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}"+
 ".deg_settings_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}"+
 ".deg_settings_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);align-items:center;gap:20px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}"+
-".deg_settings_task_row{display:flex;align-items:center;gap:28px;min-height:29px}"+
+".deg_settings_task_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:28px;row-gap:12px;min-height:29px}"+
 ".deg_settings_task_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}"+
-".deg_settings_management_row{display:flex;align-items:center;justify-content:space-between;column-gap:24px;row-gap:12px;min-width:0}"+
+".deg_settings_unified_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:32px;row-gap:12px;min-width:0}"+
+".deg_settings_provider_group,.deg_settings_fallback_group{display:flex;align-items:center;gap:10px;min-width:0;flex:0 1 auto}"+
+".deg_settings_provider_group>.deg_settings_label,.deg_settings_fallback_group>.deg_settings_label{flex:0 0 auto;white-space:nowrap}"+
+".deg_settings_provider_group>.deg_settings_control{flex:0 1 auto;min-width:0}"+
+".deg_settings_provider_group select.deg_settings_provider_select{flex:0 1 176px;width:176px;min-width:0;max-width:200px}"+
+"@media (max-width:520px){.deg_settings_unified_row{column-gap:20px;row-gap:12px}.deg_settings_provider_group{flex:1 1 100%}}"+
+".deg_settings_management_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:32px;row-gap:12px;min-width:0}"+
 ".deg_settings_management_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}"+
-".deg_settings_limits{display:flex;align-items:center;justify-content:flex-end;gap:26px;min-width:0}"+
-".deg_settings_limits>.deg_settings_control{flex:0 0 auto;justify-self:auto;min-width:max-content;white-space:nowrap;height:29px;box-sizing:border-box}"+
-"@media (max-width:520px){.deg_settings_management_row{flex-wrap:wrap;justify-content:flex-start}.deg_settings_limits{flex-wrap:wrap;justify-content:flex-start;gap:16px 26px}}"+
+".deg_settings_management_row>.deg_settings_control{flex:0 0 auto;min-width:max-content;white-space:nowrap;height:29px;box-sizing:border-box}"+
+"@media (max-width:520px){.deg_settings_management_row{column-gap:20px;row-gap:12px}}"+
 ".deg_settings_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}"+
 ".deg_settings_control{display:flex;align-items:center;gap:10px;min-width:0}"+
 ".deg_settings_control input[type=range]{width:100%;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}"+
@@ -11089,9 +10946,6 @@ const css=""+
 ".deg_prompt_counter{display:flex;justify-content:flex-end;margin-top:-8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}"+
 ".deg_prompt_counter_warning{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-secondary))}"+
 ".deg_prompt_counter_error{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}"+
-".deg_prompt_readonly{padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}"+
-".deg_prompt_readonly strong{display:block;margin-bottom:4px;color:var(--dsw-alias-label-primary);font-weight:600}"+
-".deg_prompt_readonly p{margin:0}"+
 ".deg_prompt_status{min-height:18px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}"+
 ".deg_prompt_footer{display:flex;align-items:center;gap:8px;padding-top:4px}"+
 ".deg_prompt_footer .deg_btn{flex:0 0 auto;min-width:88px}"+
@@ -11111,24 +10965,22 @@ const css=""+
 ".deg_prompt_dialog h3{margin:0 0 8px;font-size:16px;line-height:24px;color:var(--dsw-alias-label-primary)}"+
 ".deg_prompt_dialog p{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}"+
 ".deg_prompt_dialog_actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-top:18px}"+
-".deg_settings_notification_row{display:flex;align-items:center;gap:16px;min-width:0;white-space:nowrap}"+
+".deg_settings_notification_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:24px;row-gap:12px;min-width:0;white-space:nowrap}"+
 ".deg_settings_notification_row>.deg_settings_checkbox{flex:0 0 auto}"+
-".deg_settings_notification_row>.deg_settings_control{flex:1 1 auto;min-width:0}"+
+".deg_settings_notification_row>.deg_settings_control{flex:1 1 220px;min-width:160px}"+
 ".deg_settings_notification_row>.deg_settings_control .deg_settings_label{flex:0 0 auto;white-space:nowrap}"+
 ".deg_settings_notification_row>.deg_settings_control input[type=range]{flex:1 1 auto;min-width:48px}"+
 ".deg_settings_notification_row>.deg_settings_control input[type=number]{flex:0 0 72px;width:72px}"+
-"@media (max-width:520px){.deg_settings_notification_row{flex-wrap:wrap;row-gap:12px}.deg_settings_notification_row>.deg_settings_control{flex-basis:100%}}"+
-".deg_settings_notification_events_row{display:flex;align-items:center;gap:16px;flex-wrap:wrap;min-width:0}"+
-".deg_settings_notification_events{display:flex;align-items:center;flex-wrap:wrap;gap:16px 20px;min-width:0}"+
-".deg_settings_diagnostics{display:flex;flex-direction:column;gap:12px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}"+
-".deg_settings_diagnostics_title{font-size:14px;line-height:22px;font-weight:600;margin:0;color:var(--dsw-alias-label-primary)}"+
-".deg_settings_diagnostic_group{display:flex;flex-direction:column;gap:6px;min-width:0}"+
-".deg_settings_diagnostic_group_title{font-size:12px;line-height:18px;font-weight:600;margin:0;color:var(--dsw-alias-label-secondary)}"+
-".deg_settings_diagnostic_row{display:flex;align-items:center;justify-content:space-between;gap:16px;min-width:0;font-size:12px;line-height:18px}"+
-".deg_settings_diagnostic_label{color:var(--dsw-alias-label-secondary);min-width:0;overflow-wrap:anywhere}"+
-".deg_settings_diagnostic_value{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;overflow-wrap:anywhere;text-align:right}"+
-".deg_settings_notification_test{justify-content:flex-start;flex-wrap:wrap}"+
-".deg_settings_notification_test .deg_btn{flex:0 0 auto;min-width:112px}"+
+".deg_settings_events_dropdown{position:relative;flex:0 0 auto;min-width:0}"+
+".deg_settings_events_trigger{display:inline-flex;align-items:center;gap:6px;height:29px;box-sizing:border-box;padding:0 10px;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:13px;line-height:20px;white-space:nowrap;cursor:pointer}"+
+".deg_settings_events_trigger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}"+
+".deg_settings_events_trigger:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}"+
+".deg_settings_events_trigger:disabled{opacity:.45;cursor:not-allowed}"+
+".deg_settings_events_count{color:var(--dsw-alias-label-secondary)}"+
+".deg_settings_events_caret{display:inline-block;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1;transform:translateY(1px)}"+
+".deg_settings_events_panel{position:absolute;top:calc(100% + 6px);right:0;z-index:20;display:flex;flex-direction:column;gap:8px;min-width:180px;box-sizing:border-box;padding:10px 12px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;box-shadow:0 8px 20px rgba(0,0,0,.16)}"+
+".deg_settings_events_panel .deg_settings_checkbox{height:20px}"+
+"@media (max-width:520px){.deg_settings_notification_row{flex-wrap:wrap;row-gap:12px}.deg_settings_notification_row>.deg_settings_control{flex-basis:100%}.deg_settings_events_dropdown{flex:1 1 100%}.deg_settings_events_panel{left:0;right:auto}}"+
 ".deg_subagent_metadata{display:block;box-sizing:border-box;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary,var(--dsw-alias-label-primary));font-size:11px;line-height:16px}"+
 ".deg_full_system_prompt_root[data-open]{padding-bottom:4px}"+
 ".deg_full_system_prompt_chevron{color:var(--dsw-alias-label-secondary)}"+
@@ -11249,55 +11101,20 @@ const css=""+
 ".deg_pd_actions .deg_pd_open:disabled{opacity:1;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));background:transparent;border-color:var(--dsw-alias-border-l2)}"+
 ".deg_pd_note{min-width:0;flex:1 1 220px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}"+
 "@media (max-width:480px){.deg_pd_roles_header,.deg_pd_role{grid-template-columns:minmax(72px,auto) minmax(0,1fr);column-gap:8px}.deg_pd_roles_header{padding-top:5px}.deg_pd_roles_header span:last-child{grid-column:2;text-align:left}.deg_pd_role{align-items:start;row-gap:2px;padding:7px 0}.deg_pd_role_name{grid-row:1 / span 2;align-self:start}.deg_pd_role_value{white-space:normal;overflow-wrap:anywhere;text-overflow:clip}.deg_pd_role_state{grid-column:2;justify-self:start;text-align:left}}"+
-".deg_mcand_section,.deg_cr_section{display:flex;flex-direction:column;gap:10px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}"+
-".deg_mcand_title,.deg_cr_title{font-size:14px;line-height:22px;font-weight:600;margin:0}"+
-".deg_mcand_hint,.deg_cr_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}"+
-".deg_mcand_limit{display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0}"+
+".deg_mcand_section{display:flex;flex-direction:column;gap:10px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}"+
+".deg_mcand_title{font-size:14px;line-height:22px;font-weight:600;margin:0}"+
+".deg_mcand_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}"+
 ".deg_mcand_role{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px}"+
-".deg_mcand_role_head{display:flex;align-items:center;gap:8px;min-width:0}"+
-".deg_mcand_role_name{font-size:13px;line-height:20px;font-weight:600}"+
-".deg_mcand_primary{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0;overflow-wrap:anywhere}"+
+".deg_mcand_role_head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;min-width:0}"+
+".deg_mcand_role_name{flex:0 0 auto;font-size:13px;line-height:20px;font-weight:600}"+
+".deg_mcand_primary{min-width:0;margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);text-align:right;overflow-wrap:anywhere}"+
 ".deg_mcand_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) minmax(0,.7fr) auto;align-items:center;gap:6px;min-width:0}"+
-".deg_mcand_row input{width:100%;min-width:0;box-sizing:border-box;padding:5px 7px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);font:inherit;font-size:12px;line-height:18px}"+
+".deg_mcand_row select{width:100%;min-width:0;box-sizing:border-box;padding:5px 7px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}"+
 ".deg_mcand_actions{display:flex;align-items:center;gap:4px}"+
 ".deg_mcand_actions .deg_btn{flex:0 0 auto;min-width:auto;width:26px;height:26px;padding:0;line-height:1}"+
-".deg_mcand_status{grid-column:1/-1;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}"+
-".deg_mcand_status[data-deg-candidate-ok=true]{color:var(--dsw-alias-state-success-primary,#22c55e)}"+
-".deg_mcand_status[data-deg-candidate-ok=false]{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}"+
 ".deg_mcand_empty{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}"+
-".deg_cr_list{display:flex;flex-direction:column;gap:6px;margin:0;padding:0;list-style:none}"+
-".deg_cr_builtin{display:flex;gap:8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);min-width:0}"+
-".deg_cr_builtin_name{flex:0 0 auto;color:var(--dsw-alias-label-primary)}"+
-".deg_cr_row{display:grid;grid-template-columns:minmax(120px,.8fr) minmax(0,1fr);gap:8px 10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;min-width:0}"+
-".deg_cr_field{display:flex;flex-direction:column;gap:4px;min-width:0}"+
-".deg_cr_field_label{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}"+
-".deg_cr_row input,.deg_cr_row select,.deg_cr_row textarea{width:100%;min-width:0;box-sizing:border-box;padding:5px 7px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2);font:inherit;font-size:12px;line-height:18px}"+
-".deg_cr_row textarea{min-height:52px;resize:vertical}"+
-".deg_cr_row input:disabled,.deg_cr_row select:disabled,.deg_cr_row textarea:disabled,.deg_mcand_row input:disabled{opacity:.5;cursor:not-allowed}"+
-".deg_cr_row_wide{grid-column:1/-1}"+
-".deg_cr_row_head{display:flex;align-items:center;gap:8px;grid-column:1/-1;min-width:0}"+
-".deg_cr_row_head .deg_btn{margin-left:auto;min-width:auto}"+
-".deg_cr_row_id{font-size:12px;line-height:18px;font-family:var(--ds-font-family-code,inherit)}"+
-".deg_cr_actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}"+
-".deg_extra_section{display:flex;flex-direction:column;gap:10px;padding-top:16px;border-top:1px solid var(--dsw-alias-border-l2)}"+
-".deg_extra_title{font-size:14px;line-height:22px;font-weight:600;margin:0}"+
-".deg_extra_subtitle{font-size:12px;line-height:18px;font-weight:600;margin:0;color:var(--dsw-alias-label-primary)}"+
-".deg_extra_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}"+
-".deg_extra_block{display:flex;flex-direction:column;gap:8px;min-width:0}"+
-".deg_extra_rows{display:flex;flex-direction:column;gap:6px;min-width:0}"+
-".deg_extra_row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;min-width:0}"+
-".deg_extra_row_provider{grid-template-columns:minmax(0,1fr) 84px auto}"+
-".deg_extra_row_price{grid-template-columns:minmax(0,1.1fr) minmax(0,1.1fr) minmax(0,.8fr) minmax(0,.8fr) 66px auto}"+
-".deg_extra_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);min-width:0;overflow-wrap:anywhere}"+
-".deg_extra_value{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere;text-align:right}"+
-".deg_extra_empty{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}"+
-".deg_extra_row input{width:100%;min-width:0;box-sizing:border-box;padding:5px 7px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}"+
-".deg_extra_row input:disabled{opacity:.5;cursor:not-allowed}"+
-".deg_extra_row .deg_btn{flex:0 0 auto;min-width:auto;width:26px;height:26px;padding:0;line-height:1}"+
-".deg_extra_actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}"+
-".deg_extra_actions .deg_btn{flex:0 0 auto}"+
-".deg_extra_diag{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);margin:0;overflow-wrap:anywhere}"+
-"@media (max-width:640px){.deg_mcand_row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.deg_cr_row{grid-template-columns:minmax(0,1fr)}.deg_extra_row_price{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.deg_extra_value{text-align:left}}";
+".deg_mcand_row select:disabled{opacity:.5;cursor:not-allowed}"+
+"@media (max-width:640px){.deg_mcand_row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}";
 const cssTagId="dsh-expert-group/settings.module.css";
 const cssInjectedDocuments=typeof WeakSet==="function"?new WeakSet():null;
 function ensurePluginStylesheet(){
@@ -12757,7 +12574,6 @@ const SETTINGS_REQUIRED_ROLE_IDS=SETTINGS_ROLE_IDS.filter((role)=>role!=="observ
 const PROMPT_ROLE_IDS=SETTINGS_ROLE_IDS;
 const DEFAULT_PROMPT_MAX_GRAPHEMES=32000;
 const PROMPT_WARNING_RATIO=0.9;
-const PROMPT_DISCIPLINE_HINT="固定执行纪律不可编辑：它由 child 的 persona/system context 与 scoped 工具策略在运行时注入，不写进任务提示词；内容包含叶子 worker、工具与权限边界、continuable child 约束、交付协议和中文输出要求。";
 const GRAPHEME_SEGMENTER_CACHE=new Map();
 function graphemeSegmenterOf(locale,granularity){
 const key=(locale===undefined?"":String(locale))+"\u0000"+String(granularity);
@@ -12906,8 +12722,21 @@ function clampNotificationVolume(value){
 const number=Number(value);
 return Number.isFinite(number)?Math.min(100,Math.max(0,Math.round(number))):100;
 }
+const DEFAULT_ROLE_CONCURRENCY_LIMIT=20;
+const LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT=10;
+const CONFIG_MIGRATION_VERSION=1;
 function normalizeRoleConcurrencyLimit(value){
-return Number.isSafeInteger(value)&&value>=1&&value<=64?value:10;
+return Number.isSafeInteger(value)&&value>=1&&value<=64
+?value
+:DEFAULT_ROLE_CONCURRENCY_LIMIT;
+}
+function effectiveRoleConcurrencyLimit(source){
+const limit=normalizeRoleConcurrencyLimit(source?.roleConcurrencyLimit);
+const rawVersion=source?.configMigrationVersion;
+const version=Number.isSafeInteger(rawVersion)&&rawVersion>=0?rawVersion:0;
+return version<CONFIG_MIGRATION_VERSION&&limit===LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT
+?DEFAULT_ROLE_CONCURRENCY_LIMIT
+:limit;
 }
 const DEFAULT_ROLE_TIMEOUT_MS=36000000;
 function normalizeRoleTimeoutMs(value){
@@ -12919,9 +12748,6 @@ return Number.isSafeInteger(value)&&value>=1000&&value<=86400000&&value%1000===0
 const MAX_MODEL_CANDIDATES_PER_ROLE=8;
 const MAX_MODEL_FALLBACK_LIMIT=4;
 const DEFAULT_MODEL_FALLBACK_LIMIT=2;
-const MAX_CUSTOM_ROLES=16;
-const CUSTOM_ROLE_FIELD_LIMITS=Object.freeze({label:64,statusLabel:32,description:500,persona:8000,toolDenyEntries:64,toolName:128});
-const CUSTOM_ROLE_ID_PATTERN=/^[a-z][a-z0-9-]{1,31}$/;
 function normalizeModelFallbackLimitDraft(value){
 return Number.isSafeInteger(value)&&value>=0&&value<=MAX_MODEL_FALLBACK_LIMIT?value:DEFAULT_MODEL_FALLBACK_LIMIT;
 }
@@ -12936,6 +12762,7 @@ const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:
 const candidates={};
 for(const[role,list]of Object.entries(source)){
 if(typeof role!=="string"||role.length===0||!Array.isArray(list))continue;
+if(!SETTINGS_ROLE_IDS.includes(role))continue;
 const normalized=[];
 for(const entry of list.slice(0,MAX_MODEL_CANDIDATES_PER_ROLE)){
 const selection=normalizeModelCandidateSelection(entry);
@@ -12964,500 +12791,9 @@ seen.add(key);
 }
 return{ok:true,code:null,role:null,index:0};
 }
-function customRoleToolDenyLinesOf(text){
-if(typeof text!=="string")return[];
-return text.split(/\r?\n/).map((line)=>line.trim()).filter((line)=>line.length>0);
-}
-function normalizeCustomRoleDefinitionDraft(id,definition){
-if(typeof id!=="string"||!CUSTOM_ROLE_ID_PATTERN.test(id))return null;
-if(definition===null||typeof definition!=="object"||Array.isArray(definition))return null;
-if(typeof definition.label!=="string"||definition.label.trim().length===0)return null;
-if(typeof definition.description!=="string"||definition.description.length===0)return null;
-return{
-label:definition.label,
-...(typeof definition.statusLabel==="string"&&definition.statusLabel.length>0?{statusLabel:definition.statusLabel}:{}),
-description:definition.description,
-...(typeof definition.readOnly==="boolean"?{readOnly:definition.readOnly}:{}),
-...(Array.isArray(definition.toolDeny)&&definition.toolDeny.every((entry)=>typeof entry==="string")?{toolDeny:definition.toolDeny.slice()}:{}),
-...(typeof definition.persona==="string"&&definition.persona.length>0?{persona:definition.persona}:{}),
-};
-}
-function normalizeCustomRolesDraft(value){
-const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
-const roles={};
-for(const id of Object.keys(source).sort()){
-const definition=normalizeCustomRoleDefinitionDraft(id,source[id]);
-if(definition!==null)roles[id]=definition;
-}
-return roles;
-}
-let customRoleRowSequence=0;
-function createCustomRoleRow(definition,id=""){
-customRoleRowSequence+=1;
-return{
-key:"role-row-"+customRoleRowSequence,id,isNew:id.length===0,
-label:typeof definition?.label==="string"?definition.label:"",
-statusLabel:typeof definition?.statusLabel==="string"?definition.statusLabel:"",
-description:typeof definition?.description==="string"?definition.description:"",
-readOnly:typeof definition?.readOnly==="boolean"?String(definition.readOnly):"",
-toolDenyText:Array.isArray(definition?.toolDeny)?definition.toolDeny.join("\n"):null,
-persona:typeof definition?.persona==="string"?definition.persona:"",
-};
-}
-function customRoleRowsFromDocument(value){
-return Object.entries(normalizeCustomRolesDraft(value)).map(([id,definition])=>createCustomRoleRow(definition,id));
-}
-function customRoleRowDefinition(row){
-const id=typeof row?.id==="string"?row.id.trim():"";
-if(id.length===0)return null;
-const label=typeof row.label==="string"?row.label.trim():"";
-const statusLabel=typeof row.statusLabel==="string"?row.statusLabel.trim():"";
-const description=typeof row.description==="string"?row.description:"";
-const readOnly=row.readOnly==="true"?true:(row.readOnly==="false"?false:void 0);
-const toolDeny=typeof row.toolDenyText!=="string"?void 0:customRoleToolDenyLinesOf(row.toolDenyText);
-const persona=typeof row.persona==="string"?row.persona:"";
-return{
-id,
-definition:{
-label,...(statusLabel.length>0?{statusLabel}:{}),description,
-...(readOnly===void 0?{}:{readOnly}),...(toolDeny===void 0?{}:{toolDeny}),
-...(persona.length>0?{persona}:{}),
-},
-};
-}
-function customRolesDocumentOfRows(rows){
-const byId={};
-for(const row of Array.isArray(rows)?rows:[]){
-const built=customRoleRowDefinition(row);
-if(built!==null)byId[built.id]=built.definition;
-}
-const document={};
-for(const id of Object.keys(byId).sort())document[id]=byId[id];
-return document;
-}
-function validateCustomRoleRows(rows,options={}){
-const list=Array.isArray(rows)?rows:[];
-const builtinIds=Array.isArray(options.builtinIds)?options.builtinIds:SETTINGS_ROLE_IDS;
-if(list.length>MAX_CUSTOM_ROLES)return{ok:false,code:"limit",role:"",id:""};
-const seen=new Set();
-for(const row of list){
-const id=typeof row?.id==="string"?row.id.trim():"";
-if(!CUSTOM_ROLE_ID_PATTERN.test(id))return{ok:false,code:"id",role:id,id};
-if(builtinIds.includes(id))return{ok:false,code:"idBuiltin",role:id,id};
-if(seen.has(id))return{ok:false,code:"idDuplicate",role:id,id};
-seen.add(id);
-const checks=[
-["label",typeof row.label==="string"?row.label.trim().length:0,CUSTOM_ROLE_FIELD_LIMITS.label,true],
-["description",typeof row.description==="string"?row.description.length:0,CUSTOM_ROLE_FIELD_LIMITS.description,true],
-["statusLabel",typeof row.statusLabel==="string"?row.statusLabel.trim().length:0,CUSTOM_ROLE_FIELD_LIMITS.statusLabel,false],
-["persona",typeof row.persona==="string"?row.persona.length:0,CUSTOM_ROLE_FIELD_LIMITS.persona,false],
-];
-for(const[code,length,max,required]of checks){
-if((required&&length===0)||length>max)return{ok:false,code,role:id,id};
-}
-if(row.readOnly!=="true"&&row.readOnly!=="false")return{ok:false,code:"readOnly",role:id,id};
-if(typeof row.toolDenyText!=="string")return{ok:false,code:"toolDeny",role:id,id};
-const denyLines=customRoleToolDenyLinesOf(row.toolDenyText);
-if(denyLines.length>CUSTOM_ROLE_FIELD_LIMITS.toolDenyEntries||denyLines.some((line)=>line.length>CUSTOM_ROLE_FIELD_LIMITS.toolName))return{ok:false,code:"toolDenyEntry",role:id,id};
-}
-return{ok:true,code:null,role:null,id:""};
-}
 function modelCandidatesErrorMessage(t,roleLabelOf,validation){
 if(validation.code==="limit")return t("settings.modelCandidates.limit");
 return(typeof roleLabelOf==="function"?roleLabelOf(validation.role):validation.role)+"："+t("settings.modelCandidates.error."+(validation.code??"incomplete"),{index:validation.index});
-}
-function customRoleValidationMessage(t,validation){
-return t("settings.customRoles.error."+(validation.code??"host"),{
-role:validation.role!==undefined&&validation.role!==""?validation.role:"?",
-id:validation.id!==undefined&&validation.id!==""?validation.id:(validation.role||"?"),
-});
-}
-function customRoleHostErrorMessage(t,cause,message){
-const code=typeof cause?.code==="string"?cause.code:"";
-return code==="CUSTOM_ROLE_IN_USE"||/拒绝删除|仍在使用|in use/i.test(message)
-?t("settings.customRoles.inUse",{message})
-:t("settings.customRoles.error.host",{message});
-}
-const MIN_ROLE_LIMIT=1;
-const MAX_ROLE_LIMIT=64;
-const MIN_PROVIDER_CONCURRENCY_LIMIT=0;
-const MAX_PROVIDER_CONCURRENCY_LIMIT=64;
-const MAX_MODEL_PRICES=64;
-const MAX_PROVIDER_LIMIT_ROWS=32;
-const MAX_MODEL_PRICE_TEXT_CHARS=128;
-const MAX_MODEL_PRICE_CURRENCY_CHARS=8;
-const DEFAULT_MODEL_PRICE_CURRENCY="USD";
-const CONTEXT_INHERITANCE_ROLE_IDS=Object.freeze(STATUS_ROLE_IDS.filter((role)=>role!=="observer"));
-function roleLimitAllowedRoles(roles){
-const allowed=new Set(SETTINGS_ROLE_IDS);
-for(const role of Array.isArray(roles)?roles:[]){
-if(typeof role==="string"&&role.length>0)allowed.add(role);
-}
-return allowed;
-}
-function normalizeRoleLimitsDraft(value,roles){
-const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
-const allowed=roleLimitAllowedRoles(roles);
-const limits={};
-for(const role of Object.keys(source).sort()){
-if(!allowed.has(role))continue;
-const limit=source[role];
-if(typeof limit!=="number"||!Number.isFinite(limit))continue;
-limits[role]=limit;
-}
-return limits;
-}
-function validateRoleLimitsDocument(limits){
-const source=limits!==null&&typeof limits==="object"&&!Array.isArray(limits)?limits:{};
-for(const role of Object.keys(source)){
-const limit=source[role];
-if(!Number.isSafeInteger(limit)||limit<MIN_ROLE_LIMIT||limit>MAX_ROLE_LIMIT){
-return{ok:false,code:"roleLimit",role,index:0};
-}
-}
-return{ok:true,code:null,role:null,index:0};
-}
-function normalizeProviderLimitsDraft(value){
-const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
-const limits={};
-for(const provider of Object.keys(source).sort()){
-if(typeof provider!=="string"||provider.trim().length===0)continue;
-const limit=source[provider];
-if(typeof limit!=="number"||!Number.isFinite(limit))continue;
-limits[provider]=limit;
-}
-return limits;
-}
-let providerLimitRowSequence=0;
-function createProviderLimitRow(provider,limit){
-providerLimitRowSequence+=1;
-return{
-key:"provider-limit-row-"+providerLimitRowSequence,
-provider:typeof provider==="string"?provider:"",
-limit:typeof limit==="number"?limit:"",
-};
-}
-function providerLimitRowsOfDocument(value){
-return Object.entries(normalizeProviderLimitsDraft(value)).map(([provider,limit])=>createProviderLimitRow(provider,limit));
-}
-function providerLimitsDocumentOfRows(rows){
-const document={};
-for(const row of Array.isArray(rows)?rows:[]){
-const provider=typeof row?.provider==="string"?row.provider.trim():"";
-const blankLimit=row?.limit===""||row?.limit===null||row?.limit===void 0;
-if(provider.length===0&&blankLimit)continue;
-document[provider]=blankLimit?0:row.limit;
-}
-const sorted={};
-for(const provider of Object.keys(document).sort())sorted[provider]=document[provider];
-return sorted;
-}
-function validateProviderLimitRows(rows){
-const document=providerLimitsDocumentOfRows(rows);
-const seen=new Set();
-let index=0;
-for(const row of Array.isArray(rows)?rows:[]){
-const provider=typeof row?.provider==="string"?row.provider.trim():"";
-const blankLimit=row?.limit===""||row?.limit===null||row?.limit===void 0;
-if(provider.length===0&&blankLimit)continue;
-index+=1;
-if(provider.length===0)return{ok:false,code:"providerEmpty",index};
-if(provider.length>MAX_MODEL_PRICE_TEXT_CHARS)return{ok:false,code:"providerTooLong",index};
-if(seen.has(provider))return{ok:false,code:"providerDuplicate",index};
-seen.add(provider);
-const limit=document[provider];
-if(!Number.isSafeInteger(limit)||limit<MIN_PROVIDER_CONCURRENCY_LIMIT||limit>MAX_PROVIDER_CONCURRENCY_LIMIT){
-return{ok:false,code:"providerLimit",index};
-}
-}
-return{ok:true,code:null,index:0};
-}
-function normalizeInheritContextDraft(value){
-const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
-const enabled={};
-for(const role of CONTEXT_INHERITANCE_ROLE_IDS){
-if(source[role]===true)enabled[role]=true;
-}
-return enabled;
-}
-function normalizePriceAmountDraft(value){
-return typeof value==="number"&&Number.isFinite(value)&&value>=0?value:"";
-}
-function normalizeModelPriceDraftEntry(entry){
-if(entry===null||typeof entry!=="object"||Array.isArray(entry))return null;
-if(typeof entry.provider!=="string"||typeof entry.model!=="string")return null;
-return{
-provider:entry.provider,
-model:entry.model,
-inputPerMillion:normalizePriceAmountDraft(entry.inputPerMillion),
-outputPerMillion:normalizePriceAmountDraft(entry.outputPerMillion),
-currency:typeof entry.currency==="string"?entry.currency:"",
-};
-}
-function normalizeModelPricesDraft(value){
-if(!Array.isArray(value))return[];
-const prices=[];
-for(const entry of value.slice(0,MAX_MODEL_PRICES)){
-const normalized=normalizeModelPriceDraftEntry(entry);
-if(normalized!==null)prices.push(normalized);
-}
-return prices;
-}
-function modelPricesDocumentOfDraft(rows){
-return(Array.isArray(rows)?rows:[]).map((row)=>({
-provider:typeof row?.provider==="string"?row.provider.trim():"",
-model:typeof row?.model==="string"?row.model.trim():"",
-inputPerMillion:typeof row?.inputPerMillion==="number"?row.inputPerMillion:Number.NaN,
-outputPerMillion:typeof row?.outputPerMillion==="number"?row.outputPerMillion:Number.NaN,
-currency:typeof row?.currency==="string"&&row.currency.trim().length>0
-?row.currency.trim()
-:DEFAULT_MODEL_PRICE_CURRENCY,
-}));
-}
-function validateModelPricesDraft(rows){
-const list=Array.isArray(rows)?rows:[];
-if(list.length>MAX_MODEL_PRICES)return{ok:false,code:"limit",index:0};
-const seen=new Set();
-for(let position=0;position<list.length;position+=1){
-const row=list[position];
-const index=position+1;
-const provider=typeof row?.provider==="string"?row.provider.trim():"";
-const model=typeof row?.model==="string"?row.model.trim():"";
-if(provider.length===0||model.length===0)return{ok:false,code:"incomplete",index};
-if(provider.length>MAX_MODEL_PRICE_TEXT_CHARS||model.length>MAX_MODEL_PRICE_TEXT_CHARS)return{ok:false,code:"tooLong",index};
-for(const field of["inputPerMillion","outputPerMillion"]){
-const amount=row?.[field];
-if(typeof amount!=="number"||!Number.isFinite(amount)||amount<0)return{ok:false,code:"rate",index};
-}
-const currency=typeof row?.currency==="string"?row.currency.trim():"";
-if(currency.length>MAX_MODEL_PRICE_CURRENCY_CHARS)return{ok:false,code:"currency",index};
-const key=provider+"\u0000"+model;
-if(seen.has(key))return{ok:false,code:"duplicate",index};
-seen.add(key);
-}
-return{ok:true,code:null,index:0};
-}
-const MAX_USAGE_PROVIDER_MODEL_GROUPS=64;
-const USAGE_METRIC_FIELDS=Object.freeze([
-{id:"inputTokens",kind:"token"},
-{id:"outputTokens",kind:"token"},
-{id:"cacheReadTokens",kind:"token"},
-{id:"cacheWriteTokens",kind:"token"},
-{id:"reasoningTokens",kind:"token"},
-{id:"billedInputTokens",kind:"token"},
-{id:"totalTokens",kind:"token"},
-{id:"requests",kind:"count"},
-{id:"retries",kind:"count"},
-{id:"fallbacks",kind:"count"},
-{id:"runMs",kind:"duration"},
-]);
-function normalizeUsageMetricsOf(value){
-if(value===null||typeof value!=="object"||Array.isArray(value))return{};
-const metrics={};
-for(const field of USAGE_METRIC_FIELDS){
-const raw=value[field.id];
-if(field.kind==="duration"){
-if(typeof raw==="number"&&Number.isFinite(raw)&&raw>=0)metrics[field.id]=raw;
-continue;
-}
-if(typeof raw==="number"&&Number.isSafeInteger(raw)&&raw>=0)metrics[field.id]=raw;
-}
-for(const field of["provider","model","role","roleLabel"]){
-if(typeof value[field]==="string"&&value[field].length>0)metrics[field]=value[field].slice(0,MAX_MODEL_PRICE_TEXT_CHARS);
-}
-return metrics;
-}
-function normalizeUsageSummaryOf(value){
-const metrics=normalizeUsageMetricsOf(value);
-return Object.keys(metrics).length===0?null:metrics;
-}
-function usageGroupTextOf(value){
-if(typeof value!=="string")return null;
-const textValue=value.trim();
-if(textValue.length===0)return null;
-const normalized=textValue.includes("\u0000")
-?textValue.replace(/\u0000/g,"\uFFFD")
-:textValue;
-return normalized.slice(0,MAX_MODEL_PRICE_TEXT_CHARS);
-}
-function usageProviderModelKey(provider,model,overflow){
-return"pm:"+provider.length+":"+provider+":"+model.length+":"+model
-+":"+(overflow===true?"1":"0");
-}
-function normalizeUsageProviderModelGroups(input){
-const rows=[];
-const seen=new Set();
-const pushRow=(rawProvider,rawModel,rawUsage,rawOverflow)=>{
-if(rows.length>=MAX_USAGE_PROVIDER_MODEL_GROUPS)return;
-const usage=normalizeUsageSummaryOf(rawUsage);
-if(usage===null)return;
-const usageProvider=usageGroupTextOf(usage.provider);
-if(usageProvider!==null)usage.provider=usageProvider;
-const usageModel=usageGroupTextOf(usage.model);
-if(usageModel!==null)usage.model=usageModel;
-const provider=usageGroupTextOf(rawProvider)??"unknown";
-const model=usageGroupTextOf(rawModel)??"unknown";
-const overflow=rawOverflow===true;
-const key=usageProviderModelKey(provider,model,overflow);
-if(seen.has(key))return;
-seen.add(key);
-rows.push({key,provider,model,overflow,usage});
-};
-if(Array.isArray(input)){
-for(const entry of input.slice(0,MAX_USAGE_PROVIDER_MODEL_GROUPS)){
-if(entry===null||typeof entry!=="object")continue;
-pushRow(entry.provider,entry.model,entry.usage,entry.overflow===true);
-}
-return rows;
-}
-if(input===null||typeof input!=="object")return rows;
-for(const rawKey of Object.keys(input).slice(0,MAX_USAGE_PROVIDER_MODEL_GROUPS)){
-const nulCount=(rawKey.match(/\u0000/g)??[]).length;
-if(nulCount>1)continue;
-const separator=nulCount===1?"\u0000":(rawKey.includes("/")?"/":null);
-const index=separator===null?-1:rawKey.indexOf(separator);
-pushRow(
-index<0?"":rawKey.slice(0,index),
-index<0?rawKey:rawKey.slice(index+separator.length),
-input[rawKey],
-false,
-);
-}
-return rows;
-}
-function normalizeUsageView(value){
-const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
-const groupsOf=(input)=>{
-const map=input!==null&&typeof input==="object"&&!Array.isArray(input)?input:{};
-const rows=[];
-for(const key of Object.keys(map)){
-if(rows.length>=32)break;
-const usage=normalizeUsageSummaryOf(map[key]);
-if(usage===null)continue;
-rows.push({key:String(key).slice(0,MAX_MODEL_PRICE_TEXT_CHARS),usage});
-}
-return rows;
-};
-const recentTasks=[];
-for(const entry of(Array.isArray(source.recentTasks)?source.recentTasks:[]).slice(0,16)){
-const usage=normalizeUsageSummaryOf(entry?.usage);
-if(usage===null)continue;
-recentTasks.push({
-role:typeof entry?.role==="string"?entry.role.slice(0,MAX_MODEL_PRICE_TEXT_CHARS):"",
-roleLabel:typeof entry?.roleLabel==="string"?entry.roleLabel.slice(0,MAX_MODEL_PRICE_TEXT_CHARS):"",
-provider:typeof entry?.provider==="string"?entry.provider.slice(0,MAX_MODEL_PRICE_TEXT_CHARS):"",
-model:typeof entry?.model==="string"?entry.model.slice(0,MAX_MODEL_PRICE_TEXT_CHARS):"",
-usage,
-});
-}
-const providerModelSource=source.byProviderModel;
-const hasProviderModelGroups=Array.isArray(providerModelSource)
-||(providerModelSource!==null&&typeof providerModelSource==="object");
-return{
-totals:normalizeUsageSummaryOf(source.totals),
-byRole:groupsOf(source.byRole),
-byProvider:groupsOf(source.byProvider),
-byModel:groupsOf(source.byModel),
-byProviderModel:normalizeUsageProviderModelGroups(providerModelSource),
-hasProviderModelGroups,
-recentTasks,
-};
-}
-function nonNegativeIntegerOrNull(value){
-return typeof value==="number"&&Number.isSafeInteger(value)&&value>=0?value:null;
-}
-function normalizeThrottleDiagnosticsView(value){
-if(value===null||value===void 0||typeof value!=="object"||Array.isArray(value))return null;
-const rowsOf=(list,keyField)=>{
-const rows=[];
-for(const entry of(Array.isArray(list)?list:[]).slice(0,16)){
-if(entry===null||typeof entry!=="object")continue;
-const key=typeof entry[keyField]==="string"?entry[keyField]:"";
-if(key.length===0)continue;
-rows.push({
-key:key.slice(0,64),
-limit:nonNegativeIntegerOrNull(entry.limit),
-running:nonNegativeIntegerOrNull(entry.running),
-queued:nonNegativeIntegerOrNull(entry.queued),
-samples:nonNegativeIntegerOrNull(entry.samples),
-lastThrottledAt:nonNegativeIntegerOrNull(entry.lastThrottledAt),
-etaMs:nonNegativeIntegerOrNull(entry.etaMs),
-etaSource:entry.etaSource==="historical-average"?"historical-average":"unknown",
-});
-}
-return rows;
-};
-return{
-roles:rowsOf(value.roles,"role"),
-providers:rowsOf(value.providers,"provider"),
-etaMinSamples:nonNegativeIntegerOrNull(value.etaMinSamples)??0,
-};
-}
-function normalizeConcurrencyProvidersView(value){
-const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
-const rows=[];
-for(const provider of Object.keys(source).sort()){
-if(rows.length>=32)break;
-if(provider.length===0)continue;
-const limit=nonNegativeIntegerOrNull(source[provider]);
-if(limit===null)continue;
-rows.push({provider:provider.slice(0,64),limit});
-}
-return rows;
-}
-function normalizeLimitDiagnosticsView(value){
-const source=value!==null&&typeof value==="object"?value:{};
-const project=(list,keyField)=>{
-const rows=[];
-for(const entry of(Array.isArray(list)?list:[]).slice(0,16)){
-if(entry===null||typeof entry!=="object")continue;
-rows.push({
-field:diagnosticTextOf(entry.field,"unknown"),
-target:typeof entry[keyField]==="string"?entry[keyField].slice(0,64):"",
-reason:diagnosticTextOf(entry.reason,"unknown"),
-});
-}
-return rows;
-};
-return{roleLimits:project(source.roleLimits,"role"),providerLimits:project(source.providerLimits,"provider")};
-}
-function estimateUsageCostOf(usage,price){
-const metrics=normalizeUsageMetricsOf(usage);
-const input=typeof metrics.billedInputTokens==="number"?metrics.billedInputTokens:metrics.inputTokens;
-const output=metrics.outputTokens;
-if(typeof input!=="number"||typeof output!=="number")return null;
-if(price===null||typeof price!=="object")return null;
-const inputRate=price.inputPerMillion;
-const outputRate=price.outputPerMillion;
-if(typeof inputRate!=="number"||!Number.isFinite(inputRate)||inputRate<0)return null;
-if(typeof outputRate!=="number"||!Number.isFinite(outputRate)||outputRate<0)return null;
-const currency=typeof price.currency==="string"&&price.currency.trim().length>0
-?price.currency.trim()
-:DEFAULT_MODEL_PRICE_CURRENCY;
-const inputCost=(input/1000000)*inputRate;
-const outputCost=(output/1000000)*outputRate;
-return{currency,inputCost,outputCost,totalCost:inputCost+outputCost};
-}
-function formatUsageCount(value){
-return typeof value==="number"&&Number.isFinite(value)?String(value):"—";
-}
-function formatUsageDuration(ms){
-if(typeof ms!=="number"||!Number.isFinite(ms)||ms<0)return"—";
-if(ms<1000)return Math.round(ms)+"ms";
-if(ms<60000)return(Math.round(ms/100)/10)+"s";
-if(ms<3600000)return(Math.round(ms/600)/100)+"min";
-return(Math.round(ms/36000)/100)+"h";
-}
-function formatCostAmount(value){
-return typeof value==="number"&&Number.isFinite(value)?value.toFixed(4):"—";
-}
-function formatDiagnosticTimestamp(ms){
-if(!Number.isSafeInteger(ms)||ms<0)return null;
-try{
-return new Date(ms).toISOString().replace("T"," ").slice(0,19)+" UTC";
-}catch{
-return null;
-}
 }
 function normalizeSettingsDraft(value,roles,allowLegacyProviderFallback=true){
 const source=value&&typeof value==="object"?value:{};
@@ -13500,7 +12836,7 @@ defaults,
 notificationEnabled:source.notificationEnabled!==false,
 notificationVolume:clampNotificationVolume(source.notificationVolume),
 notificationEvents:normalizeNotificationEvents(source.notificationEvents),
-roleConcurrencyLimit:normalizeRoleConcurrencyLimit(source.roleConcurrencyLimit),
+roleConcurrencyLimit:effectiveRoleConcurrencyLimit(source),
 roleTimeoutMs:normalizeRoleTimeoutMs(source.roleTimeoutMs),
 observerPreferred:source.observerPreferred===true,
 taskManagementEnabled:source.taskManagementEnabled!==false,
@@ -13511,25 +12847,40 @@ autoOpenSubagentSidebar:source.autoOpenSubagentSidebar===true,
 ...(Object.prototype.hasOwnProperty.call(source,"fallbackLimit")
 ?{fallbackLimit:normalizeModelFallbackLimitDraft(source.fallbackLimit)}
 :{}),
-...(Object.prototype.hasOwnProperty.call(source,"customRoles")
-?{customRoles:normalizeCustomRolesDraft(source.customRoles)}
-:{}),
-...(Object.prototype.hasOwnProperty.call(source,"roleLimits")
-?{roleLimits:normalizeRoleLimitsDraft(source.roleLimits,roles)}
-:{}),
-...(Object.prototype.hasOwnProperty.call(source,"providerLimits")
-?{providerLimits:normalizeProviderLimitsDraft(source.providerLimits)}
-:{}),
-...(Object.prototype.hasOwnProperty.call(source,"inheritContext")
-?{inheritContext:normalizeInheritContextDraft(source.inheritContext)}
-:{}),
-...(Object.prototype.hasOwnProperty.call(source,"modelPrices")
-?{modelPrices:normalizeModelPricesDraft(source.modelPrices)}
-:{}),
 };
 }
 function settingsDraftEqual(left,right){
 return JSON.stringify(left)===JSON.stringify(right);
+}
+const SETTINGS_DRAFT_MERGE_FIELDS=Object.freeze([
+"provider",
+"defaults",
+"notificationEnabled",
+"notificationVolume",
+"notificationEvents",
+"roleConcurrencyLimit",
+"roleTimeoutMs",
+"observerPreferred",
+"taskManagementEnabled",
+"autoOpenSubagentSidebar",
+"candidates",
+"fallbackLimit",
+]);
+function mergeSettingsDraftOverSource(source,local,baseline){
+const merged={...source};
+for(const field of SETTINGS_DRAFT_MERGE_FIELDS){
+const hasLocal=Object.prototype.hasOwnProperty.call(local,field);
+const hasBaseline=Object.prototype.hasOwnProperty.call(baseline,field);
+if(hasLocal!==hasBaseline){
+if(hasLocal)merged[field]=local[field];
+else delete merged[field];
+continue;
+}
+if(!hasLocal)continue;
+if(settingsDraftEqual(local[field],baseline[field]))continue;
+merged[field]=local[field];
+}
+return merged;
 }
 function createSettingsModelCatalog(ctx){
 let state={groups:[],status:"idle",error:null};
@@ -13763,306 +13114,11 @@ function useEnabledSettingsRoles(hostMeta){
 return react.useMemo(()=>{
 const configuredRoles=Array.isArray(hostMeta?.activeRoles)?hostMeta.activeRoles:hostMeta?.roles;
 if(!Array.isArray(configuredRoles))return SETTINGS_REQUIRED_ROLE_IDS;
-const customIds=hostMeta?.customRoles!==null&&typeof hostMeta?.customRoles==="object"
-?Object.keys(hostMeta.customRoles)
-:[];
 const enabled=configuredRoles.filter((role)=>typeof role==="string"&&role.length>0
-&&(SETTINGS_ROLE_IDS.includes(role)||customIds.includes(role)));
+&&SETTINGS_ROLE_IDS.includes(role));
 if(hostMeta?.enableObserver===true&&!enabled.includes("observer"))enabled.push("observer");
 return enabled.filter((role,index)=>enabled.indexOf(role)===index);
 },[hostMeta]);
-}
-const DIAGNOSTIC_STATUS_VALUES=Object.freeze(["available","degraded","absent","unknown"]);
-const DIAGNOSTIC_TEXT_PATTERN=/^[A-Za-z0-9_./-]{1,48}$/;
-function diagnosticStatusOf(value){
-return DIAGNOSTIC_STATUS_VALUES.includes(value)?value:"unknown";
-}
-function diagnosticTextOf(value,fallback=null){
-return typeof value==="string"&&DIAGNOSTIC_TEXT_PATTERN.test(value)?value:fallback;
-}
-function diagnosticCountOf(value){
-return Number.isSafeInteger(value)&&value>=0?value:0;
-}
-function diagnosticFlagOf(value){
-return value===true;
-}
-function readClientService(ctx,name){
-try{
-const value=typeof ctx?.get==="function"?ctx.get(name):null;
-if(value)return value;
-}catch{/* 服务未安装或代理拒答。 */}
-try{
-return ctx?.[name]??null;
-}catch{
-return null;
-}
-}
-function readClientMethod(target,name){
-try{
-const value=target?.[name];
-return typeof value==="function"?value:void 0;
-}catch{
-return void 0;
-}
-}
-function describeExpertGroupClientCapabilities(ctx){
-const better=readClientService(ctx,"betterSidebar");
-const sidebarRight=readClientService(ctx,"sidebarRight");
-const layout=readClientService(ctx,"layout");
-const slots=ctx?.slots;
-const betterOpen=better!==null&&readClientMethod(better,"openTab")!==void 0;
-const nativeOpen=sidebarRight!==null&&readClientMethod(sidebarRight,"openTab")!==void 0;
-const nativeLegacy=sidebarRight!==null&&readClientMethod(sidebarRight,"openTabIn")!==void 0;
-const layoutAction=readClientMethod(layout,"openRightbar");
-const layoutPanels=layout!==null&&readClientMethod(layout?.panels,"setRightbar")!==void 0;
-return Object.freeze([
-{
-id:"connection",
-label:"Connection RPC",
-required:true,
-status:readClientMethod(ctx?.connection?.rpc,"call")===void 0?"degraded":"available",
-detail:readClientMethod(ctx?.connection?.rpc,"call")===void 0?"legacy-http":"connection-rpc",
-},
-{
-id:"slots",
-label:"客户端 Slot 注册",
-required:true,
-status:readClientMethod(slots,"register")!==void 0&&readClientMethod(slots,"inject")!==void 0
-?"available"
-:"absent",
-detail:"settings-and-overlay",
-},
-{
-id:"betterSidebar",
-label:"better-sidebar 页面",
-required:false,
-status:better===null?"absent":betterOpen?"available":"degraded",
-detail:better===null?"not-installed-no-native-fallback":betterOpen?"openTab":"openTab-missing",
-},
-{
-id:"nativeSidebar",
-label:"原生右侧栏",
-required:false,
-status:nativeOpen?"available":nativeLegacy?"degraded":"absent",
-detail:nativeOpen?"scoped-openTab":nativeLegacy?"legacy-openTabIn":"unavailable",
-},
-{
-id:"openTab",
-label:"公开 openTab 接缝",
-required:false,
-status:betterOpen||nativeOpen?"available":nativeLegacy?"degraded":"absent",
-detail:betterOpen
-?"better-sidebar-openTab"
-:nativeOpen?"sidebarRight-openTab":nativeLegacy?"legacy-openTabIn":"unavailable",
-},
-{
-id:"layout",
-label:"布局动作",
-required:false,
-status:layoutAction!==void 0?"available":layoutPanels?"degraded":"absent",
-detail:layoutAction!==void 0?"openRightbar":layoutPanels?"panels-setRightbar-only":"unavailable",
-},
-{
-id:"taskSidebar",
-label:"任务侧栏注册",
-required:false,
-status:typeof expertGroupSidebar?.installExpertGroupSidebar==="function"?"available":"absent",
-detail:"expert-group-page",
-},
-]);
-}
-const HOST_DIAGNOSTIC_FIELDS=Object.freeze([
-{id:"activeChildren",label:"活动专家 child",path:["children","active"],kind:"count"},
-{id:"trackedChildren",label:"已登记 child",path:["children","tracked"],kind:"count"},
-{id:"fanoutActiveParents",label:"进行中的父任务",path:["fanout","activeParents"],kind:"count"},
-{id:"fanoutQueuedShards",label:"fan-out 排队分片",path:["fanout","queuedShards"],kind:"count"},
-{id:"fanoutRunningShards",label:"fan-out 运行分片",path:["fanout","runningShards"],kind:"count"},
-{id:"roleConcurrencyDefault",label:"角色并发默认上限",path:["fanout","concurrency","default"],kind:"count"},
-{id:"recoveryRebuilds",label:"待重建恢复",path:["recovery","rebuilds"],kind:"count"},
-{id:"recoveryContexts",label:"恢复上下文",path:["recovery","trackedContexts"],kind:"count"},
-{id:"pendingSettingsWrites",label:"在途 settings 写入",path:["settings","pendingWrites"],kind:"count"},
-{id:"settingsGeneration",label:"模型目录代次",path:["settings","generation"],kind:"count"},
-{id:"storageGeneration",label:"storage generation",path:["storage","generation"],kind:"count"},
-{id:"handoffPending",label:"pending admission",path:["handoff","pending"],kind:"count"},
-{id:"notificationRoots",label:"已登记通知根会话",path:["notifications","roots"],kind:"count"},
-{id:"fanoutRestorePending",label:"fan-out 待恢复",path:["fanout","restorePending"],kind:"flag"},
-{id:"storageStatus",label:"storage 状态",path:["storage","status"],kind:"token"},
-]);
-const HOST_BUDGET_FIELDS=Object.freeze([
-{id:"budgetTasks",label:"预算用量：父任务",path:["tasks"],kind:"count",source:"budget"},
-{id:"budgetEvents",label:"预算用量：事件条数",path:["events"],kind:"count",source:"budget"},
-{id:"budgetEventBytes",label:"预算用量：事件字节",path:["eventBytes"],kind:"count",source:"budget"},
-{id:"budgetMaxTasks",label:"预算上限：父任务",path:["limits","maxTasks"],kind:"count",source:"budget"},
-{id:"budgetMaxSnapshotBytes",label:"预算上限：快照字节",path:["limits","maxSnapshotBytes"],kind:"count",source:"budget"},
-{id:"budgetMaxEventHistory",label:"预算上限：事件条数",path:["limits","maxEventHistory"],kind:"count",source:"budget"},
-{id:"budgetMaxEventHistoryBytes",label:"预算上限：事件字节",path:["limits","maxEventHistoryBytes"],kind:"count",source:"budget"},
-{id:"fanoutEventsRetained",label:"已保留 fan-out 事件",path:["fanout","events","retained"],kind:"count"},
-{id:"fanoutEventsDropped",label:"已裁剪 fan-out 事件",path:["fanout","events","dropped"],kind:"count"},
-{id:"lastBudgetCode",label:"最近预算违规码",path:["persistence","lastBudgetViolation","code"],kind:"token"},
-{id:"lastBudgetResource",label:"最近预算违规资源",path:["persistence","lastBudgetViolation","resource"],kind:"token"},
-{id:"lastBudgetPhase",label:"最近预算违规阶段",path:["persistence","lastBudgetViolation","phase"],kind:"token"},
-{id:"lastBudgetLimit",label:"最近违规上限",path:["persistence","lastBudgetViolation","limit"],kind:"count"},
-{id:"lastBudgetReceived",label:"最近违规实测值",path:["persistence","lastBudgetViolation","receivedBytes"],kind:"count"},
-{id:"lastBudgetRecoverable",label:"最近违规可恢复",path:["persistence","lastBudgetViolation","recoverable"],kind:"flag"},
-]);
-const HOST_PERSISTENCE_FIELDS=Object.freeze([
-{id:"persistenceLastResult",label:"持久化结果",path:["persistence","lastResult"],kind:"token"},
-{id:"persistenceReason",label:"持久化原因",path:["persistence","reason"],kind:"token"},
-{id:"persistenceCategory",label:"持久化失败分类",path:["persistence","category"],kind:"token"},
-{id:"persistenceConsecutiveFailures",label:"连续持久化失败",path:["persistence","consecutiveFailures"],kind:"count"},
-{id:"persistenceBlocked",label:"持久化阻塞",path:["persistence","blocked"],kind:"token"},
-{id:"persistenceRestoreCode",label:"最近恢复错误码",path:["persistence","restore","code"],kind:"token"},
-]);
-const HOST_NOTIFICATION_FIELDS=Object.freeze([
-{id:"toastStatus",label:"通知通道状态",path:["notifications","systemToast","status"],kind:"token"},
-{id:"toastPlatform",label:"通知平台",path:["notifications","systemToast","platform"],kind:"token"},
-{id:"toastVersion",label:"通知适配器版本",path:["notifications","systemToast","version"],kind:"count"},
-{id:"toastSent",label:"已发送通知",path:["notifications","systemToast","sent"],kind:"count"},
-{id:"toastFailed",label:"失败投递",path:["notifications","systemToast","failed"],kind:"count"},
-{id:"toastDropped",label:"丢弃投递",path:["notifications","systemToast","dropped"],kind:"count"},
-{id:"toastLastReason",label:"最近投递结果",path:["notifications","systemToast","lastReason"],kind:"token"},
-{id:"toastAumidResolved",label:"通知身份已解析",path:["notifications","systemToast","aumidResolved"],kind:"flag"},
-]);
-const HOST_CAPABILITY_FIELDS=Object.freeze([
-{key:"rootTurnWait",id:"host.rootTurnWait",label:"Root turn 等待（session-activity）"},
-{key:"connectionRpc",id:"host.connectionRpc",label:"Connection RPC 通道"},
-{key:"storageDomain",id:"host.storageDomain",label:"storage domain 绑定"},
-{key:"attachments",id:"host.attachments",label:"附件/图片规范化"},
-{key:"sessionQuery",id:"host.sessionQuery",label:"冷会话读取"},
-]);
-function hostCapabilityStatusOf(status){
-if(status==="available"||status==="ready")return"available";
-if(status==="incomplete"||status==="degraded"||status==="fail-closed"||status==="legacy"||status==="partial")return"degraded";
-if(status==="absent"||status==="missing"||status==="none"||status==="unavailable")return"absent";
-return"unknown";
-}
-function readDiagnosticPath(source,path){
-let current=source;
-for(const key of path){
-if(current===null||typeof current!=="object")return void 0;
-current=current[key];
-}
-return current;
-}
-function describeExpertGroupDiagnostics({clientCapabilities=[],hostMeta=null}={}){
-const host=hostMeta!==null&&typeof hostMeta==="object"?hostMeta:{};
-const hostCapabilities=host.capabilities!==null&&typeof host.capabilities==="object"?host.capabilities:null;
-const hostDiagnostics=host.diagnostics!==null&&typeof host.diagnostics==="object"?host.diagnostics:null;
-const hostBudget=host.budget!==null&&typeof host.budget==="object"?host.budget:null;
-const capabilityEntries=[];
-const clientList=Array.isArray(clientCapabilities)?clientCapabilities:[];
-for(const entry of clientList){
-if(entry===null||typeof entry!=="object")continue;
-capabilityEntries.push({
-id:diagnosticTextOf(entry.id,"client.unknown"),
-label:typeof entry.label==="string"?entry.label.slice(0,32):"客户端能力",
-required:diagnosticFlagOf(entry.required),
-status:diagnosticStatusOf(entry.status),
-detail:diagnosticTextOf(entry.detail,null),
-scope:"client",
-});
-}
-if(hostCapabilities!==null){
-const hostEntries=hostCapabilities.host;
-for(const field of HOST_CAPABILITY_FIELDS){
-const entry=hostEntries!==null&&typeof hostEntries==="object"?hostEntries[field.key]:void 0;
-if(entry===null||typeof entry!=="object")continue;
-capabilityEntries.push({
-id:field.id,
-label:field.label,
-required:diagnosticFlagOf(entry.required),
-status:hostCapabilityStatusOf(entry.status),
-detail:diagnosticTextOf(entry.degradation,null),
-scope:"host",
-});
-}
-}
-function diagnosticRowOf(field,value){
-if(field.kind==="flag")return{id:field.id,label:field.label,value:diagnosticFlagOf(value),kind:"flag"};
-if(field.kind==="token")return{id:field.id,label:field.label,value:diagnosticTextOf(value,"none"),kind:"token"};
-return{id:field.id,label:field.label,value:diagnosticCountOf(value),kind:"count"};
-}
-function readDiagnosticGroup(fields){
-const rows=[];
-for(const field of fields){
-const source=field.source==="budget"?hostBudget:hostDiagnostics;
-rows.push(diagnosticRowOf(field,readDiagnosticPath(source,field.path)));
-}
-return rows;
-}
-const runtime=readDiagnosticGroup(HOST_DIAGNOSTIC_FIELDS);
-const roleLimits=readDiagnosticPath(hostDiagnostics,["fanout","concurrency","roles"]);
-const roleEntries=[];
-if(roleLimits!==null&&typeof roleLimits==="object"&&!Array.isArray(roleLimits)){
-for(const role of Object.keys(roleLimits).sort()){
-if(!/^[A-Za-z][A-Za-z0-9_-]{0,23}$/.test(role))continue;
-if(!Number.isSafeInteger(roleLimits[role]))continue;
-roleEntries.push({id:"roleLimit."+role,label:role+" 并发上限",value:roleLimits[role],kind:"count"});
-}
-}
-const recentErrors=readDiagnosticPath(hostDiagnostics,["rpc","recentErrors"]);
-const rpcErrors=[];
-if(Array.isArray(recentErrors)){
-for(const entry of recentErrors.slice(0,8)){
-const code=diagnosticTextOf(entry?.code,null);
-if(code===null)continue;
-rpcErrors.push({code,count:diagnosticCountOf(entry?.count)});
-}
-}
-const budget=hostBudget===null&&hostDiagnostics===null?[]:readDiagnosticGroup(HOST_BUDGET_FIELDS);
-const persistence=hostDiagnostics===null?[]:readDiagnosticGroup(HOST_PERSISTENCE_FIELDS);
-const notifications=hostDiagnostics===null?[]:readDiagnosticGroup(HOST_NOTIFICATION_FIELDS);
-return Object.freeze({
-version:2,
-hostAvailable:hostDiagnostics!==null,
-capabilities:Object.freeze(capabilityEntries.map((entry)=>Object.freeze(entry))),
-runtime:Object.freeze([...runtime,...roleEntries].map((entry)=>Object.freeze(entry))),
-budget:Object.freeze(budget.map((entry)=>Object.freeze(entry))),
-persistence:Object.freeze(persistence.map((entry)=>Object.freeze(entry))),
-notifications:Object.freeze(notifications.map((entry)=>Object.freeze(entry))),
-rpcErrors:Object.freeze(rpcErrors.map((entry)=>Object.freeze(entry)))
-});
-}
-function renderDiagnosticCapability(entry){
-return react.createElement("div",{
-key:entry.id,
-className:"deg_settings_diagnostic_row",
-"data-deg-capability":entry.id,
-"data-deg-status":entry.status,
-"data-deg-required":entry.required?"true":"false",
-"data-deg-scope":entry.scope,
-},
-react.createElement("span",{className:"deg_settings_diagnostic_label"},entry.label+(entry.required?"（必需）":"")),
-react.createElement("span",{className:"deg_settings_diagnostic_value"},
-entry.detail===null?entry.status:entry.status+" · "+entry.detail));
-}
-function renderDiagnosticRuntime(entry){
-const value=entry.kind==="flag"?(entry.value===true?"是":"否"):String(entry.value);
-return react.createElement("div",{
-key:entry.id,
-className:"deg_settings_diagnostic_row",
-"data-deg-diagnostic":entry.id,
-"data-deg-value":value,
-},
-react.createElement("span",{className:"deg_settings_diagnostic_label"},entry.label),
-react.createElement("span",{className:"deg_settings_diagnostic_value"},value));
-}
-function renderDiagnosticGroup(title,id,entries,renderEntry){
-if(!Array.isArray(entries)||entries.length===0)return null;
-return react.createElement("div",{
-key:id,
-className:"deg_settings_diagnostic_group",
-"data-deg-diagnostic-group":id,
-},
-react.createElement("h4",{className:"deg_settings_diagnostic_group_title"},title),
-entries.map(renderEntry));
-}
-function notificationTestStatusText(state){
-if(state===null)return"";
-if(state.pending===true)return"发送中…";
-if(state.shown===true)return"已发送测试通知";
-if(state.reason==="disabled")return"通知已关闭，未发送测试通知";
-return"发送失败（"+(state.reason??"unknown")+"）";
 }
 const MODEL_CONFIG_GLOBAL_KEY="dsh-expert-group/client-model-config";
 const CUSTOM_PROVIDER_NS="llm-pi-ai";
@@ -15971,125 +15027,53 @@ react.createElement(ModelConfigDisclosure,{section,onToggle:()=>setOpen((value)=
 body,
 open?removeConfirmDialog:null);
 }
-function normalizePreflightEntry(entry){
-if(entry===null||typeof entry!=="object"||Array.isArray(entry))return null;
-const effort=typeof entry.reasoningEffort==="string"&&entry.reasoningEffort.length>0?entry.reasoningEffort:null;
-const image=entry.image==="supported"||entry.image==="unsupported"||entry.image==="unknown"
-?entry.image
-:"unknown";
-const inputModalities=[];
-if(Array.isArray(entry.inputModalities)){
-for(const modality of entry.inputModalities){
-if(typeof modality!=="string")continue;
-if(!inputModalities.includes(modality))inputModalities.push(modality);
-}
-}
-return{
-provider:typeof entry.provider==="string"?entry.provider:"",
-model:typeof entry.model==="string"?entry.model:"",
-reasoningEffort:effort,ok:entry.ok===true,
-code:typeof entry.code==="string"?entry.code:"",
-message:typeof entry.message==="string"?entry.message:"",
-image,
-inputModalities,
-};
-}
-function normalizeModelPreflightView(payload){
-if(payload===null||typeof payload!=="object"||payload.ok!==true)return null;
-if(typeof payload.role!=="string"||payload.role.length===0||!Array.isArray(payload.candidates))return null;
-const primary=normalizePreflightEntry(payload.primary);
-if(primary===null)return null;
-const candidates=[];
-for(const entry of payload.candidates){
-const normalized=normalizePreflightEntry(entry);
-if(normalized!==null)candidates.push(normalized);
-}
-return{role:payload.role,primary,candidates,...(Number.isSafeInteger(payload.fallbackLimit)?{fallbackLimit:payload.fallbackLimit}:{})};
-}
-async function readModelPreflightOutcome(response){
-let payload=null;
-try{payload=await response?.json?.();}catch{payload=null;}
-if(response?.ok===true&&payload?.ok===true){
-const view=normalizeModelPreflightView(payload);
-return view===null?{ok:false,code:"invalid-response",message:null}:{ok:true,view};
-}
-const issue=payload?.error!==null&&typeof payload?.error==="object"?payload.error:{};
-return{ok:false,code:typeof issue?.code==="string"?issue.code:"unknown",message:typeof issue?.message==="string"?issue.message:null};
-}
-function modelCandidatesSignatureOf(list){
-if(!Array.isArray(list))return"[]";
-return JSON.stringify(list.map((entry)=>{
-const selection=normalizeModelCandidateSelection(entry);
-return selection===null?null:[selection.provider,selection.model,selection.reasoningEffort??""];
-}));
-}
-function useModelCandidatesPreflight({ctx,enabled,roles,draftRef,rolesKey}){
-const[state,setState]=react.useState(()=>({byRole:{}}));
-const serialsRef=react.useRef({});
-const runRole=async(role,list)=>{
-const serial=(serialsRef.current[role]??0)+1;
-serialsRef.current[role]=serial;
-const signature=modelCandidatesSignatureOf(list);
-setState((previous)=>({byRole:{...previous.byRole,[role]:{status:"loading",signature,view:null,message:null}}}));
-try{
-const selections=(Array.isArray(list)?list:[]).map((entry)=>normalizeModelCandidateSelection(entry)).filter((entry)=>entry!==null);
-const outcome=await readModelPreflightOutcome(await requestPluginRpc(ctx?.connection,{action:"model-preflight",role,candidates:selections}));
-if(serialsRef.current[role]!==serial)return;
-setState((previous)=>({byRole:{...previous.byRole,[role]:outcome.ok===true
-?{status:"ready",signature,view:outcome.view,message:null}
-:{status:outcome.code==="bad-request"?"unsupported":"error",signature,view:null,message:outcome.message}}}));
-}catch{
-if(serialsRef.current[role]!==serial)return;
-setState((previous)=>({byRole:{...previous.byRole,[role]:{status:"error",signature,view:null,message:null}}}));
-}
-};
-const runAll=()=>{
-for(const role of Array.isArray(roles)?roles:[])void runRole(role,draftRef.current?.candidates?.[role]??[]);
-};
-react.useEffect(()=>{
-if(enabled!==true)return()=>{};
-const list=Array.isArray(roles)?roles:[];
-for(const role of list)void runRole(role,draftRef.current?.candidates?.[role]??[]);
-return()=>{for(const role of list)serialsRef.current[role]=(serialsRef.current[role]??0)+1;};
-},[enabled,rolesKey]);
-return{byRole:state.byRole,runRole,runAll};
-}
-function preflightImageText(t,image){
-if(image==="supported")return t("settings.modelCandidates.image.supported");
-if(image==="unsupported")return t("settings.modelCandidates.image.unsupported");
-return t("settings.modelCandidates.image.unknown");
-}
-function preflightStatusText(t,entry,result){
-if(entry===undefined)return null;
-if(entry.status==="loading")return t("settings.modelCandidates.preflight.running");
-if(entry.status==="unsupported")return t("settings.modelCandidates.preflight.unavailable");
-if(entry.status==="error")return entry.message===null
-?t("settings.modelCandidates.preflight.unavailable")
-:t("settings.modelCandidates.preflight.error",{message:entry.message});
-if(result===undefined||result===null)return null;
-if(result.ok===true)return t("settings.modelCandidates.preflight.ok");
-return t("settings.modelCandidates.preflight.failed",{message:result.message.length>0?result.message:result.code});
-}
-function renderModelCandidatesSection({t,roles,draft,providerGroups,preflight,saving,readOnly,error,editDraft,roleLabelOf}){
-const h=react.createElement;
-const candidateMap=draft.candidates!==null&&typeof draft.candidates==="object"?draft.candidates:{};
-const defaults=draft.defaults!==null&&typeof draft.defaults==="object"?draft.defaults:{};
-const fallbackLimit=Number.isSafeInteger(draft.fallbackLimit)?draft.fallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT;
+function createModelCandidateActions(editDraft,providerGroups){
+const groups=Array.isArray(providerGroups)?providerGroups:[];
 const updateList=(role,update)=>editDraft((previous)=>{
 const map={...(previous.candidates??{})};
 map[role]=update(Array.isArray(map[role])?map[role].slice():[]);
 return{...previous,candidates:map};
 });
-const editCandidate=(role,index,field,value)=>updateList(role,(list)=>list.map((entry,position)=>{
+const updateCandidate=(role,index,update)=>updateList(role,(list)=>list.map((entry,position)=>{
 if(position!==index)return entry;
-const base=normalizeModelCandidateSelection(entry)??{provider:"",model:""};
-const next={...base,[field]:value};
-if(typeof next.reasoningEffort!=="string"||next.reasoningEffort.length===0)delete next.reasoningEffort;
-return next;
+return update(normalizeModelCandidateSelection(entry)??{provider:"",model:""});
 }));
-const addCandidate=(role)=>updateList(role,(list)=>(list.length>=MAX_MODEL_CANDIDATES_PER_ROLE?list:[...list,{provider:"",model:""}]));
-const removeCandidate=(role,index)=>updateList(role,(list)=>list.filter((unused,position)=>position!==index));
-const moveCandidate=(role,index,delta)=>updateList(role,(list)=>{
+return{
+selectCandidateProvider(role,index,provider){
+updateCandidate(role,index,(current)=>{
+if(!provider)return{provider:"",model:""};
+if(provider===current.provider)return current;
+return migrateSettingsSelection(current,provider,groups)??{provider,model:""};
+});
+},
+selectCandidateModel(role,index,modelId){
+updateCandidate(role,index,(current)=>{
+const provider=current.provider;
+if(!provider)return current;
+if(!modelId)return{provider,model:""};
+const model=groups.find((group)=>group.id===provider)?.models?.find((entry)=>entry.id===modelId);
+if(!model)return current;
+const next={provider,model:model.id};
+if(typeof model.reasoning?.defaultEffort==="string")next.reasoningEffort=model.reasoning.defaultEffort;
+return next;
+});
+},
+selectCandidateEffort(role,index,effort){
+updateCandidate(role,index,(current)=>{
+const next={...current};
+if(typeof effort==="string"&&effort.length>0)next.reasoningEffort=effort;
+else delete next.reasoningEffort;
+return next;
+});
+},
+addCandidate(role){
+updateList(role,(list)=>(list.length>=MAX_MODEL_CANDIDATES_PER_ROLE?list:[...list,{provider:"",model:""}]));
+},
+removeCandidate(role,index){
+updateList(role,(list)=>list.filter((unused,position)=>position!==index));
+},
+moveCandidate(role,index,delta){
+updateList(role,(list)=>{
 const target=index+delta;
 if(target<0||target>=list.length)return list;
 const next=list.slice();
@@ -16097,531 +15081,105 @@ const[item]=next.splice(index,1);
 next.splice(target,0,item);
 return next;
 });
-const rows=[];
-for(const role of Array.isArray(roles)?roles:[]){
+},
+};
+}
+function renderModelCandidateCard({t,role,draft,providerGroups,catalogAvailable,actions,saving,readOnly,roleLabelOf}){
+const h=react.createElement;
+const groups=Array.isArray(providerGroups)?providerGroups:[];
+const candidateMap=draft.candidates!==null&&typeof draft.candidates==="object"?draft.candidates:{};
+const defaults=draft.defaults!==null&&typeof draft.defaults==="object"?draft.defaults:{};
 const roleLabel=roleLabelOf(role);
 const list=Array.isArray(candidateMap[role])?candidateMap[role]:[];
 const primary=defaults[role]!==null&&typeof defaults[role]==="object"?defaults[role]:null;
-const entry=preflight?.byRole?.[role];
-const stale=entry!==undefined&&entry.status==="ready"&&entry.signature!==modelCandidatesSignatureOf(list);
-const settled=entry?.status==="ready"?{status:"ready"}:entry;
-const primaryText=preflightStatusText(t,settled,entry?.view?.primary);
-const primaryResult=stale?null:entry?.view?.primary;
 const candidateRows=list.map((candidate,index)=>{
 const selection=normalizeModelCandidateSelection(candidate)??{provider:"",model:""};
-const result=stale?null:entry?.view?.candidates?.[index];
-const status=stale?t("settings.modelCandidates.preflight.stale"):preflightStatusText(t,entry,result);
+const rowProvider=typeof selection.provider==="string"?selection.provider:"";
+const providerGroup=groups.find((group)=>group.id===rowProvider);
+const rowModels=Array.isArray(providerGroup?.models)?providerGroup.models:[];
+const currentModel=rowModels.find((model)=>model.id===selection.model);
+const reasoning=currentModel?.reasoning;
+const providerOptions=[
+h("option",{key:"__empty-provider",value:""},"未选择供应商"),
+...(rowProvider&&providerGroup===undefined
+?[h("option",{key:"__unavailable-provider",value:rowProvider,disabled:true},rowProvider+"（不可用）")]
+:[]),
+...groups.map((group)=>h("option",{key:group.id,value:group.id},group.name??group.id)),
+];
+const modelOptions=[];
+if(!rowProvider){
+modelOptions.push(h("option",{key:"__provider",value:""},"先选择供应商"));
+}else{
+modelOptions.push(h("option",{key:"__empty",value:""},"未选择模型"));
+if(selection.model&&currentModel===undefined){
+modelOptions.push(h("option",{key:"__unavailable",value:selection.model,disabled:true},selection.model+"（不可用）"));
+}
+for(const model of rowModels)modelOptions.push(h("option",{key:model.id,value:model.id},model.name??model.id));
+}
+const effortOptions=[];
+if(reasoning){
+effortOptions.push(h("option",{key:"__default",value:""},"模型默认"));
+for(const effort of reasoning.efforts??[])effortOptions.push(h("option",{key:effort.id,value:effort.id},effort.name??effort.id));
+}else{
+effortOptions.push(h("option",{key:"__unsupported",value:""},rowProvider?"模型无思考深度":"先选择模型"));
+}
 const name=roleLabel+" "+t("settings.modelCandidates.row",{index:index+1});
-return h("div",{key:role+"-candidate-"+index,className:"deg_mcand_row","data-deg-candidate-row":role+":"+index},
-h("input",{type:"text",autoComplete:"off",list:"deg-mcand-provider-options","aria-label":name+" "+t("settings.modelCandidates.provider"),value:selection.provider,disabled:saving||readOnly,onChange:(event)=>editCandidate(role,index,"provider",event.target.value)}),
-h("input",{type:"text",autoComplete:"off",list:"deg-mcand-model-options-"+role,"aria-label":name+" "+t("settings.modelCandidates.model"),value:selection.model,disabled:saving||readOnly,onChange:(event)=>editCandidate(role,index,"model",event.target.value)}),
-h("input",{type:"text",autoComplete:"off",list:"deg-mcand-effort-options-"+role+"-"+index,"aria-label":name+" "+t("settings.modelCandidates.effort"),value:selection.reasoningEffort??"",disabled:saving||readOnly,onChange:(event)=>editCandidate(role,index,"reasoningEffort",event.target.value)}),
+const rowKey=role+":"+index;
+return h("div",{key:role+"-candidate-"+index,className:"deg_mcand_row","data-deg-candidate-row":rowKey},
+h("select",{
+className:"deg_mcand_provider_select",
+"data-deg-candidate-provider":rowKey,
+"aria-label":name+" "+t("settings.modelCandidates.provider"),
+value:rowProvider,
+disabled:saving||readOnly||!catalogAvailable,
+onChange:(event)=>actions.selectCandidateProvider(role,index,event.target.value),
+},providerOptions),
+h("select",{
+className:"deg_mcand_model_select",
+"data-deg-candidate-model":rowKey,
+"aria-label":name+" "+t("settings.modelCandidates.model"),
+value:selection.model,
+disabled:saving||readOnly||!catalogAvailable||!rowProvider||providerGroup===undefined,
+onChange:(event)=>actions.selectCandidateModel(role,index,event.target.value),
+},modelOptions),
+h("select",{
+className:"deg_mcand_effort_select",
+"data-deg-candidate-effort":rowKey,
+"aria-label":name+" "+t("settings.modelCandidates.effort"),
+value:selection.reasoningEffort??"",
+disabled:saving||readOnly||!catalogAvailable||!selection.model||reasoning===undefined,
+onChange:(event)=>actions.selectCandidateEffort(role,index,event.target.value),
+},effortOptions),
 h("div",{className:"deg_mcand_actions"},
-h("button",{type:"button",className:"deg_btn","data-deg-candidate-up":role+":"+index,"aria-label":name+" "+t("settings.modelCandidates.up"),disabled:saving||readOnly||index===0,onClick:()=>moveCandidate(role,index,-1)},"↑"),
-h("button",{type:"button",className:"deg_btn","data-deg-candidate-down":role+":"+index,"aria-label":name+" "+t("settings.modelCandidates.down"),disabled:saving||readOnly||index===list.length-1,onClick:()=>moveCandidate(role,index,1)},"↓"),
-h("button",{type:"button",className:"deg_btn","data-deg-candidate-remove":role+":"+index,"aria-label":name+" "+t("settings.modelCandidates.remove"),disabled:saving||readOnly,onClick:()=>removeCandidate(role,index)},"×")),
-status===null?null:h("span",{
-className:"deg_mcand_status",
-"data-deg-candidate-status":role+":"+index,
-"data-deg-candidate-ok":result===null||result===undefined?"unknown":String(result.ok===true),
-},status+(result!==null&&result!==undefined&&result.ok!==true&&result.code.length>0?"（"+result.code+"）":"")),
-result===null||result===undefined?null:h("span",{
-className:"deg_mcand_capability",
-"data-deg-candidate-image":role+":"+index,
-},preflightImageText(t,result.image)));
+h("button",{type:"button",className:"deg_btn","data-deg-candidate-up":rowKey,"aria-label":name+" "+t("settings.modelCandidates.up"),disabled:saving||readOnly||index===0,onClick:()=>actions.moveCandidate(role,index,-1)},"↑"),
+h("button",{type:"button",className:"deg_btn","data-deg-candidate-down":rowKey,"aria-label":name+" "+t("settings.modelCandidates.down"),disabled:saving||readOnly||index===list.length-1,onClick:()=>actions.moveCandidate(role,index,1)},"↓"),
+h("button",{type:"button",className:"deg_btn","data-deg-candidate-remove":rowKey,"aria-label":name+" "+t("settings.modelCandidates.remove"),disabled:saving||readOnly,onClick:()=>actions.removeCandidate(role,index)},"×")));
 });
 const primaryValue=primary!==null&&typeof primary.provider==="string"&&primary.provider.length>0&&typeof primary.model==="string"&&primary.model.length>0
 ?primary.provider+" / "+primary.model+(typeof primary.reasoningEffort==="string"&&primary.reasoningEffort.length>0?" / "+primary.reasoningEffort:"")
 :t("settings.modelCandidates.primary.none");
-rows.push(h("div",{key:role,className:"deg_mcand_role","data-deg-candidates-role":role},
-h("div",{className:"deg_mcand_role_head"},h("span",{className:"deg_mcand_role_name"},roleLabel)),
-h("p",{className:"deg_mcand_primary","data-deg-candidate-primary":role},
-t("settings.modelCandidates.primary")+"："+primaryValue+(primaryText===null?"":" · "+primaryText),
-primaryResult===null||primaryResult===undefined?null:" · ",
-primaryResult===null||primaryResult===undefined?null:h("span",{
-className:"deg_mcand_capability",
-"data-deg-candidate-image":role+":primary",
-},preflightImageText(t,primaryResult.image))),
+return h("div",{key:role,className:"deg_mcand_role","data-deg-candidates-role":role},
+h("div",{className:"deg_mcand_role_head"},
+h("span",{className:"deg_mcand_role_name"},roleLabel),
+h("span",{className:"deg_mcand_primary","data-deg-candidate-primary":role},
+t("settings.modelCandidates.primary")+"："+primaryValue)),
 candidateRows.length>0?candidateRows:h("p",{className:"deg_mcand_empty","data-deg-candidate-empty":role},t("settings.modelCandidates.empty")),
 h("button",{
 type:"button",className:"deg_btn","data-deg-candidate-add":role,
 "aria-label":roleLabel+" "+t("settings.modelCandidates.add"),
 title:list.length>=MAX_MODEL_CANDIDATES_PER_ROLE?t("settings.modelCandidates.limit"):null,
 disabled:saving||readOnly||list.length>=MAX_MODEL_CANDIDATES_PER_ROLE,
-onClick:()=>addCandidate(role),
-},t("settings.modelCandidates.add"))));
+onClick:()=>actions.addCandidate(role),
+},t("settings.modelCandidates.add")));
 }
-return h("section",{className:"deg_mcand_section","data-deg-model-candidates":"section","aria-label":t("settings.modelCandidates.title")},
+function renderModelCandidatesPanel({t,role,draft,providerGroups,catalogAvailable,saving,readOnly,error,actions,roleLabelOf}){
+const h=react.createElement;
+const limit=Number.isSafeInteger(draft.fallbackLimit)?draft.fallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT;
+return h("section",{className:"deg_mcand_section","data-deg-model-candidates":"role","aria-label":t("settings.modelCandidates.title")},
 h("h3",{className:"deg_mcand_title"},t("settings.modelCandidates.title")),
-h("p",{className:"deg_mcand_hint"},t("settings.modelCandidates.hint")),
-h("div",{className:"deg_mcand_limit"},
-h("label",{className:"deg_settings_control",htmlFor:"deg-settings-model-fallback-limit"},
-h("span",{className:"deg_settings_label"},t("settings.modelCandidates.fallbackLimit")),
-h("input",{
-id:"deg-settings-model-fallback-limit",type:"number",min:0,max:MAX_MODEL_FALLBACK_LIMIT,step:1,inputMode:"numeric",
-"aria-label":t("settings.modelCandidates.fallbackLimit"),title:t("settings.modelCandidates.fallbackLimit.title"),
-value:draft.fallbackLimit===void 0?fallbackLimit:draft.fallbackLimit,disabled:saving||readOnly,
-onChange:(event)=>{
-const raw=event.target.value;
-const number=raw===""?null:Number(raw);
-editDraft((previous)=>({...previous,fallbackLimit:raw===""?"":Number.isFinite(number)?Math.round(number):previous.fallbackLimit}));
-},
-})),
-h("button",{type:"button",className:"deg_btn","data-deg-model-preflight":"all",disabled:(Array.isArray(roles)?roles:[]).length===0,onClick:()=>preflight.runAll()},t("settings.modelCandidates.preflight"))),
+h("p",{className:"deg_mcand_hint"},t("settings.modelCandidates.detailHint",{limit})),
 error===null||error===undefined?null:h("p",{className:"deg_settings_error",role:"alert","data-deg-model-candidates-error":"true"},error),
-h("datalist",{id:"deg-mcand-provider-options"},providerGroups.map((group)=>h("option",{key:group.id,value:group.id},group.name??group.id))),
-rows);
-}
-function renderCustomRolesSection({t,rows,error,hostMeta,roleLabelOf,saving,readOnly,onAdd,onEdit,onRemove}){
-const h=react.createElement;
-const field=(key,label,wide,control)=>h("label",{key,className:wide?"deg_cr_field deg_cr_row_wide":"deg_cr_field"},
-h("span",{className:"deg_cr_field_label"},label),control);
-const customRows=rows.map((row)=>{
-const id=typeof row.id==="string"?row.id.trim():"";
-const display=id.length>0?id:t("settings.customRoles.id");
-const fieldInput=(key,label)=>h("input",{
-type:"text",autoComplete:"off","data-deg-custom-role-field":key,"aria-label":display+" "+label,
-value:row[key],disabled:saving||readOnly,onChange:(event)=>onEdit(row.key,key,event.target.value),
-});
-return h("div",{key:row.key,className:"deg_cr_row","data-deg-custom-role-row":row.key,"data-deg-custom-role-id":id},
-h("div",{className:"deg_cr_row_head"},
-row.isNew
-?h("input",{type:"text",autoComplete:"off","data-deg-custom-role-field":"id","aria-label":t("settings.customRoles.id"),placeholder:t("settings.customRoles.id"),value:row.id,disabled:saving||readOnly,onChange:(event)=>onEdit(row.key,"id",event.target.value)})
-:h("code",{className:"deg_cr_row_id","data-deg-custom-role-field":"id"},id),
-h("button",{type:"button",className:"deg_btn","data-deg-custom-role-remove":row.key,"aria-label":display+" "+t("settings.customRoles.remove"),disabled:saving||readOnly,onClick:()=>onRemove(row.key)},t("settings.customRoles.remove"))),
-field("label",t("settings.customRoles.label"),false,fieldInput("label",t("settings.customRoles.label"))),
-field("readOnly",t("settings.customRoles.readOnly"),false,
-h("select",{"data-deg-custom-role-field":"readOnly","aria-label":display+" "+t("settings.customRoles.readOnly"),value:row.readOnly,disabled:saving||readOnly,onChange:(event)=>onEdit(row.key,"readOnly",event.target.value)},
-h("option",{value:""},t("settings.customRoles.readOnly.empty")),
-h("option",{value:"true"},t("settings.customRoles.readOnly.readOnly")),
-h("option",{value:"false"},t("settings.customRoles.readOnly.writable")))),
-field("statusLabel",t("settings.customRoles.statusLabel"),false,fieldInput("statusLabel",t("settings.customRoles.statusLabel"))),
-field("description",t("settings.customRoles.description"),false,fieldInput("description",t("settings.customRoles.description"))),
-field("toolDeny",t("settings.customRoles.toolDeny"),true,
-h("textarea",{"data-deg-custom-role-field":"toolDeny","aria-label":display+" "+t("settings.customRoles.toolDeny"),"aria-describedby":"deg-cr-tool-deny-hint",value:row.toolDenyText??"",disabled:saving||readOnly,onChange:(event)=>onEdit(row.key,"toolDenyText",event.target.value)})),
-field("persona",t("settings.customRoles.persona"),true,
-h("textarea",{"data-deg-custom-role-field":"persona","aria-label":display+" "+t("settings.customRoles.persona"),value:row.persona,disabled:saving||readOnly,onChange:(event)=>onEdit(row.key,"persona",event.target.value)})));
-});
-return h("section",{className:"deg_cr_section","data-deg-custom-roles":"section","aria-label":t("settings.customRoles.title")},
-h("h3",{className:"deg_cr_title"},t("settings.customRoles.title")),
-h("p",{className:"deg_cr_hint"},t("settings.customRoles.hint")),
-h("p",{className:"deg_cr_hint","data-deg-custom-roles-builtin-hint":"true"},t("settings.customRoles.builtin")),
-h("ul",{className:"deg_cr_list","data-deg-custom-roles-builtin":"list"},...SETTINGS_ROLE_IDS.map((role)=>h("li",{
-key:role,className:"deg_cr_builtin","data-deg-custom-role-builtin":role,
-},
-h("span",{className:"deg_cr_builtin_name"},roleLabelOf(role)),
-h("span",{className:"deg_cr_builtin_desc"},typeof hostMeta?.roleDescriptions?.[role]==="string"?hostMeta.roleDescriptions[role]:"")))),
-h("p",{className:"deg_cr_hint"},t("settings.customRoles.custom")),
-rows.length===0?h("p",{className:"deg_mcand_empty","data-deg-custom-roles-empty":"true"},t("settings.customRoles.empty")):h("div",{className:"deg_cr_list"},...customRows),
-h("p",{className:"deg_cr_hint",id:"deg-cr-tool-deny-hint"},t("settings.customRoles.toolDeny.hint")),
-h("div",{className:"deg_cr_actions"},
-h("button",{type:"button",className:"deg_btn","data-deg-custom-role-add":"true",disabled:saving||readOnly||rows.length>=MAX_CUSTOM_ROLES,onClick:onAdd},t("settings.customRoles.add")),
-h("span",{className:"deg_cr_hint"},t("settings.customRoles.id.hint"))),
-error===null||error===undefined?null:h("p",{className:"deg_settings_error",role:"alert","data-deg-custom-role-error":"true"},error));
-}
-const LIMIT_DIAGNOSTIC_REASONS=Object.freeze(["invalid_limit","unknown_role","invalid_key","invalid_shape"]);
-function renderConcurrencyLimitsSection({
-t,roles,draft,providerLimitRows,hostMeta,error,saving,readOnly,roleLabelOf,
-onEditRoleLimit,onAddProviderLimit,onEditProviderLimit,onRemoveProviderLimit,
-}){
-const h=react.createElement;
-const roleLimits=draft?.roleLimits!==null&&typeof draft?.roleLimits==="object"?draft.roleLimits:{};
-const defaultLimit=normalizeRoleConcurrencyLimit(draft?.roleConcurrencyLimit);
-const concurrency=readDiagnosticPath(hostMeta?.diagnostics,["fanout","concurrency"]);
-const liveProviders=normalizeConcurrencyProvidersView(concurrency?.providers);
-const throttle=normalizeThrottleDiagnosticsView(concurrency?.throttle);
-const limitDiagnostics=normalizeLimitDiagnosticsView(hostMeta?.limitDiagnostics);
-const reasonTextOf=(reason)=>(LIMIT_DIAGNOSTIC_REASONS.includes(reason)?t("settings.limits.reason."+reason):reason);
-const diagnosticRows=[];
-for(const entry of limitDiagnostics.roleLimits){
-diagnosticRows.push({id:"roleLimits:"+diagnosticRows.length,field:"roleLimits",target:entry.target,reason:entry.reason});
-}
-for(const entry of limitDiagnostics.providerLimits){
-diagnosticRows.push({id:"providerLimits:"+diagnosticRows.length,field:"providerLimits",target:entry.target,reason:entry.reason});
-}
-const throttleRowOf=(kind,row)=>h("div",{
-key:kind+":"+row.key,
-className:"deg_extra_row",
-"data-deg-throttle":kind+":"+row.key,
-"data-deg-throttle-limit":row.limit===null?"":String(row.limit),
-"data-deg-throttle-running":row.running===null?"":String(row.running),
-"data-deg-throttle-queued":row.queued===null?"":String(row.queued),
-"data-deg-throttle-eta":row.etaMs===null?"unknown":String(row.etaMs),
-"data-deg-throttle-eta-source":row.etaSource,
-"data-deg-throttle-last":row.lastThrottledAt===null?"none":String(row.lastThrottledAt),
-},
-h("span",{className:"deg_extra_label"},kind==="role"?roleLabelOf(row.key):row.key),
-h("span",{className:"deg_extra_value"},t("settings.limits.throttleLine",{
-running:formatUsageCount(row.running),
-queued:formatUsageCount(row.queued),
-limit:row.limit===0?t("settings.limits.unlimited"):formatUsageCount(row.limit),
-eta:row.etaMs===null?t("settings.limits.unknown"):formatUsageDuration(row.etaMs),
-etaSource:row.etaSource==="historical-average"
-?t("settings.limits.etaSource.average")
-:t("settings.limits.etaSource.unknown"),
-last:row.lastThrottledAt===null
-?t("settings.limits.never")
-:(formatDiagnosticTimestamp(row.lastThrottledAt)??t("settings.limits.unknown")),
-})));
-const roleRows=settingsRolesForProvider(roles).map((role)=>h("div",{
-key:role,className:"deg_extra_row","data-deg-role-limit-row":role,
-},
-h("span",{className:"deg_extra_label"},roleLabelOf(role)),
-h("input",{
-type:"number",
-min:MIN_ROLE_LIMIT,
-max:MAX_ROLE_LIMIT,
-step:1,
-inputMode:"numeric",
-"aria-label":roleLabelOf(role)+" "+t("settings.limits.roleLimit"),
-"data-deg-role-limit":role,
-placeholder:String(defaultLimit),
-value:typeof roleLimits[role]==="number"?roleLimits[role]:"",
-disabled:saving||readOnly,
-onChange:(event)=>onEditRoleLimit(role,event.target.value),
-})));
-const providerRows=(Array.isArray(providerLimitRows)?providerLimitRows:[]).map((row,index)=>h("div",{
-key:row.key,className:"deg_extra_row deg_extra_row_provider","data-deg-provider-limit-row":row.key,
-},
-h("input",{
-type:"text",
-autoComplete:"off",
-"data-deg-provider-limit-field":"provider",
-"aria-label":t("settings.limits.providerName")+" "+(index+1),
-placeholder:t("settings.limits.providerName"),
-value:row.provider,
-disabled:saving||readOnly,
-onChange:(event)=>onEditProviderLimit(row.key,"provider",event.target.value),
-}),
-h("input",{
-type:"number",
-min:MIN_PROVIDER_CONCURRENCY_LIMIT,
-max:MAX_PROVIDER_CONCURRENCY_LIMIT,
-step:1,
-inputMode:"numeric",
-"data-deg-provider-limit-field":"limit",
-"aria-label":t("settings.limits.providerLimit")+" "+(index+1),
-title:t("settings.limits.providerHint"),
-value:row.limit===""?"":row.limit,
-disabled:saving||readOnly,
-onChange:(event)=>onEditProviderLimit(row.key,"limit",event.target.value),
-}),
-h("button",{
-type:"button",
-className:"deg_btn",
-"data-deg-provider-limit-remove":row.key,
-"aria-label":t("settings.limits.remove"),
-disabled:saving||readOnly,
-onClick:()=>onRemoveProviderLimit(row.key),
-},"×")));
-return h("section",{
-className:"deg_extra_section",
-"data-deg-limits":"section",
-"aria-label":t("settings.limits.title"),
-},
-h("h3",{className:"deg_extra_title"},t("settings.limits.title")),
-h("p",{className:"deg_extra_hint"},t("settings.limits.hint")),
-h("div",{className:"deg_extra_block"},
-h("h4",{className:"deg_extra_subtitle"},t("settings.limits.roleTitle")),
-h("p",{className:"deg_extra_hint"},t("settings.limits.roleHint",{fallback:defaultLimit})),
-h("div",{className:"deg_extra_rows"},...roleRows)),
-h("div",{className:"deg_extra_block"},
-h("h4",{className:"deg_extra_subtitle"},t("settings.limits.providerTitle")),
-h("p",{className:"deg_extra_hint"},t("settings.limits.providerHint")),
-providerRows.length===0
-?h("p",{className:"deg_extra_empty","data-deg-provider-limit-empty":"true"},t("settings.limits.empty"))
-:h("div",{className:"deg_extra_rows"},...providerRows),
-h("div",{className:"deg_extra_actions"},
-h("button",{
-type:"button",
-className:"deg_btn",
-"data-deg-provider-limit-add":"true",
-disabled:saving||readOnly||providerRows.length>=MAX_PROVIDER_LIMIT_ROWS,
-title:providerRows.length>=MAX_PROVIDER_LIMIT_ROWS?t("settings.limits.rowLimit"):null,
-onClick:onAddProviderLimit,
-},t("settings.limits.add")))),
-error===null||error===undefined
-?null
-:h("p",{className:"deg_settings_error",role:"alert","data-deg-limits-error":"true"},error),
-h("div",{className:"deg_extra_block","data-deg-limits-live":"true"},
-h("h4",{className:"deg_extra_subtitle"},t("settings.limits.liveTitle")),
-h("h4",{className:"deg_extra_subtitle"},t("settings.limits.liveProvidersTitle")),
-liveProviders.length===0
-?h("p",{className:"deg_extra_empty","data-deg-concurrency-provider-empty":"true"},t("settings.limits.liveProvidersEmpty"))
-:h("div",{className:"deg_extra_rows"},...liveProviders.map((row)=>h("div",{
-key:row.provider,className:"deg_extra_row","data-deg-concurrency-provider":row.provider,
-"data-deg-concurrency-provider-limit":String(row.limit),
-},
-h("span",{className:"deg_extra_label"},row.provider),
-h("span",{className:"deg_extra_value"},row.limit===0?t("settings.limits.unlimited"):String(row.limit))))),
-throttle===null
-?h("p",{className:"deg_extra_empty","data-deg-throttle-unavailable":"true"},t("settings.limits.liveUnknown"))
-:(throttle.roles.length===0&&throttle.providers.length===0
-?h("p",{className:"deg_extra_empty","data-deg-throttle-empty":"true"},t("settings.limits.liveEmpty"))
-:h("div",{className:"deg_extra_rows"},
-...throttle.roles.map((row)=>throttleRowOf("role",row)),
-...throttle.providers.map((row)=>throttleRowOf("provider",row)))),
-throttle===null
-?null
-:h("p",{className:"deg_extra_hint","data-deg-throttle-eta-hint":"true"},
-t("settings.limits.etaHint",{samples:throttle.etaMinSamples})),
-diagnosticRows.length===0
-?null
-:h("div",{className:"deg_extra_block","data-deg-limit-diagnostics":"true"},
-h("h4",{className:"deg_extra_subtitle"},t("settings.limits.invalidTitle")),
-h("div",{className:"deg_extra_rows"},...diagnosticRows.map((entry)=>h("p",{
-key:entry.id,className:"deg_extra_diag","data-deg-limit-diagnostic":entry.id,
-},t("settings.limits.invalidRow",{
-field:entry.field,
-target:entry.target.length>0?entry.target:"—",
-reason:reasonTextOf(entry.reason),
-})))))));
-}
-function renderInheritContextSection({t,roles,draft,saving,readOnly,roleLabelOf,onToggle}){
-const h=react.createElement;
-const inherit=draft?.inheritContext!==null&&typeof draft?.inheritContext==="object"?draft.inheritContext:{};
-const rows=CONTEXT_INHERITANCE_ROLE_IDS.map((role)=>h("div",{
-key:role,className:"deg_extra_row","data-deg-inherit-row":role,
-},
-h("label",{className:"deg_settings_checkbox"},
-h("input",{
-type:"checkbox",
-"aria-label":roleLabelOf(role)+" "+t("settings.inherit.toggle"),
-"data-deg-inherit-context":role,
-checked:inherit[role]===true,
-disabled:saving||readOnly,
-onChange:(event)=>onToggle(role,event.target.checked===true),
-}),
-h("span",{className:"deg_settings_label"},roleLabelOf(role))),
-h("span",{
-className:"deg_extra_value",
-"data-deg-inherit-state":inherit[role]===true?"on":"off",
-},inherit[role]===true?t("settings.inherit.on"):t("settings.inherit.off"))));
-const unavailable=[{
-key:"observer",
-text:t("settings.inherit.observer"),
-}];
-for(const role of settingsRolesForProvider(roles)){
-if(CONTEXT_INHERITANCE_ROLE_IDS.includes(role)||role==="observer")continue;
-unavailable.push({key:role,text:t("settings.inherit.custom",{role:roleLabelOf(role)})});
-}
-return h("section",{
-className:"deg_extra_section",
-"data-deg-context-inheritance":"section",
-"aria-label":t("settings.inherit.title"),
-},
-h("h3",{className:"deg_extra_title"},t("settings.inherit.title")),
-h("p",{className:"deg_extra_hint"},t("settings.inherit.hint")),
-h("p",{className:"deg_extra_hint","data-deg-inherit-cost":"true"},t("settings.inherit.cost")),
-h("div",{className:"deg_extra_rows"},...rows),
-h("div",{className:"deg_extra_block","data-deg-inherit-unavailable-list":"true"},
-h("h4",{className:"deg_extra_subtitle"},t("settings.inherit.unavailableTitle")),
-h("div",{className:"deg_extra_rows"},...unavailable.map((entry)=>h("p",{
-key:entry.key,className:"deg_extra_diag","data-deg-inherit-unavailable":entry.key,
-},entry.text)))),
-h("p",{className:"deg_extra_hint"},t("settings.inherit.requirement")));
-}
-function usageSummaryText(t,usage){
-const run=typeof usage.runMs==="number"
-?t("settings.usage.runSuffix",{run:formatUsageDuration(usage.runMs)})
-:"";
-return t("settings.usage.line",{
-input:formatUsageCount(usage.inputTokens),
-output:formatUsageCount(usage.outputTokens),
-requests:formatUsageCount(usage.requests),
-retries:formatUsageCount(usage.retries),
-run,
-});
-}
-function usageProviderModelLabelOf(t,group){
-if(group.overflow===true)return t("settings.usage.groupOverflow");
-return group.provider+" · "+group.model;
-}
-function renderUsageSection({t,draft,hostMeta,error,saving,readOnly,roleLabelOf,onAddPrice,onEditPrice,onRemovePrice}){
-const h=react.createElement;
-const priceRows=normalizeModelPricesDraft(draft?.modelPrices);
-const usage=normalizeUsageView(hostMeta?.usage);
-const validPrices=priceRows.filter((row)=>row.provider.trim().length>0
-&&row.model.trim().length>0
-&&typeof row.inputPerMillion==="number"
-&&typeof row.outputPerMillion==="number");
-const estimates=[];
-for(const price of validPrices){
-const provider=price.provider.trim();
-const model=price.model.trim();
-const group=usage.byProviderModel.find((entry)=>entry.overflow!==true
-&&entry.provider===provider
-&&entry.model===model);
-if(group===undefined)continue;
-const cost=estimateUsageCostOf(group.usage,{
-inputPerMillion:price.inputPerMillion,
-outputPerMillion:price.outputPerMillion,
-currency:price.currency,
-});
-if(cost===null)continue;
-estimates.push({
-key:usageProviderModelKey(provider,model,false),
-id:provider+"/"+model,
-label:provider+" · "+model,
-provider,
-model,
-cost,
-});
-}
-const providerModelMissing=validPrices.length>0&&usage.hasProviderModelGroups!==true;
-const priceRowNodes=priceRows.map((row,index)=>h("div",{
-key:"model-price-"+index,className:"deg_extra_row deg_extra_row_price","data-deg-model-price-row":String(index),
-},
-h("input",{
-type:"text",autoComplete:"off","data-deg-model-price-field":"provider",
-"aria-label":t("settings.usage.priceProvider")+" "+(index+1),
-placeholder:t("settings.usage.priceProvider"),value:row.provider,
-disabled:saving||readOnly,
-onChange:(event)=>onEditPrice(index,"provider",event.target.value),
-}),
-h("input",{
-type:"text",autoComplete:"off","data-deg-model-price-field":"model",
-"aria-label":t("settings.usage.priceModel")+" "+(index+1),
-placeholder:t("settings.usage.priceModel"),value:row.model,
-disabled:saving||readOnly,
-onChange:(event)=>onEditPrice(index,"model",event.target.value),
-}),
-h("input",{
-type:"number",min:0,step:"any",inputMode:"decimal","data-deg-model-price-field":"inputPerMillion",
-"aria-label":t("settings.usage.priceInput")+" "+(index+1),
-placeholder:t("settings.usage.priceInput"),value:row.inputPerMillion,
-disabled:saving||readOnly,
-onChange:(event)=>onEditPrice(index,"inputPerMillion",event.target.value),
-}),
-h("input",{
-type:"number",min:0,step:"any",inputMode:"decimal","data-deg-model-price-field":"outputPerMillion",
-"aria-label":t("settings.usage.priceOutput")+" "+(index+1),
-placeholder:t("settings.usage.priceOutput"),value:row.outputPerMillion,
-disabled:saving||readOnly,
-onChange:(event)=>onEditPrice(index,"outputPerMillion",event.target.value),
-}),
-h("input",{
-type:"text",autoComplete:"off","data-deg-model-price-field":"currency",
-"aria-label":t("settings.usage.priceCurrency")+" "+(index+1),
-placeholder:DEFAULT_MODEL_PRICE_CURRENCY,value:row.currency,
-disabled:saving||readOnly,
-onChange:(event)=>onEditPrice(index,"currency",event.target.value),
-}),
-h("button",{
-type:"button",className:"deg_btn","data-deg-model-price-remove":String(index),
-"aria-label":t("settings.usage.priceRemove"),disabled:saving||readOnly,
-onClick:()=>onRemovePrice(index),
-},"×")));
-const usageRows=(id,rows,labelOf)=>(rows.length===0?null:h("div",{
-key:id,className:"deg_extra_block","data-deg-usage-group-block":id,
-},
-h("h4",{className:"deg_extra_subtitle"},t("settings.usage."+id)),
-h("div",{className:"deg_extra_rows"},...rows.map((entry)=>h("div",{
-key:id+":"+entry.key,className:"deg_extra_row","data-deg-usage-group":id+":"+entry.key,
-},
-h("span",{className:"deg_extra_label"},labelOf(entry.key)),
-h("span",{className:"deg_extra_value"},usageSummaryText(t,entry.usage)))))));
-const providerModelRows=usage.byProviderModel.length===0?null:h("div",{
-key:"byProviderModel",className:"deg_extra_block","data-deg-usage-group-block":"byProviderModel",
-},
-h("h4",{className:"deg_extra_subtitle"},t("settings.usage.byProviderModel")),
-h("div",{className:"deg_extra_rows"},...usage.byProviderModel.map((group)=>h("div",{
-key:"byProviderModel:"+group.key,
-className:"deg_extra_row",
-"data-deg-usage-group":group.overflow===true
-?"byProviderModel:__overflow__"
-:"byProviderModel:"+group.provider+"/"+group.model,
-"data-deg-usage-group-key":group.key,
-"data-deg-usage-group-overflow":group.overflow===true?"true":undefined,
-},
-h("span",{className:"deg_extra_label"},usageProviderModelLabelOf(t,group)),
-h("span",{className:"deg_extra_value"},usageSummaryText(t,group.usage))))));
-const recentRows=usage.recentTasks.map((task,index)=>h("div",{
-key:"recent-"+index,className:"deg_extra_row","data-deg-usage-recent":String(index),
-},
-h("span",{className:"deg_extra_label"},
-(task.roleLabel.length>0?task.roleLabel:(task.role.length>0?roleLabelOf(task.role):t("settings.limits.unknown")))
-+(task.model.length>0?" · "+task.model:"")),
-h("span",{className:"deg_extra_value"},usageSummaryText(t,task.usage))));
-const hasUsage=usage.totals!==null||usage.byRole.length>0||usage.byProvider.length>0
-||usage.byModel.length>0||usage.recentTasks.length>0;
-return h("section",{
-className:"deg_extra_section",
-"data-deg-usage":"section",
-"aria-label":t("settings.usage.title"),
-},
-h("h3",{className:"deg_extra_title"},t("settings.usage.title")),
-h("p",{className:"deg_extra_hint"},t("settings.usage.hint")),
-h("div",{className:"deg_extra_block","data-deg-model-prices":"true"},
-h("h4",{className:"deg_extra_subtitle"},t("settings.usage.priceTitle")),
-h("p",{className:"deg_extra_hint"},t("settings.usage.priceHint")),
-priceRowNodes.length===0
-?h("p",{className:"deg_extra_empty","data-deg-model-price-empty":"true"},t("settings.usage.priceEmpty"))
-:h("div",{className:"deg_extra_rows"},...priceRowNodes),
-h("div",{className:"deg_extra_actions"},
-h("button",{
-type:"button",className:"deg_btn","data-deg-model-price-add":"true",
-disabled:saving||readOnly||priceRows.length>=MAX_MODEL_PRICES,
-title:priceRows.length>=MAX_MODEL_PRICES?t("settings.usage.error.limit"):null,
-onClick:onAddPrice,
-},t("settings.usage.priceAdd")))),
-error===null||error===undefined
-?null
-:h("p",{className:"deg_settings_error",role:"alert","data-deg-model-price-error":"true"},error),
-h("div",{className:"deg_extra_block","data-deg-usage-readonly":"true"},
-h("h4",{className:"deg_extra_subtitle"},t("settings.usage.totals")),
-hasUsage===false
-?h("p",{className:"deg_extra_empty","data-deg-usage-empty":"true"},t("settings.usage.empty"))
-:h("div",{className:"deg_extra_block"},
-usage.totals===null
-?null
-:h("div",{
-className:"deg_extra_row","data-deg-usage-total":"true",
-"data-deg-usage-input":String(usage.totals.inputTokens??""),
-"data-deg-usage-output":String(usage.totals.outputTokens??""),
-"data-deg-usage-requests":String(usage.totals.requests??""),
-"data-deg-usage-retries":String(usage.totals.retries??""),
-},
-h("span",{className:"deg_extra_label"},t("settings.usage.totals")),
-h("span",{className:"deg_extra_value"},usageSummaryText(t,usage.totals))),
-usageRows("byRole",usage.byRole,roleLabelOf),
-usageRows("byProvider",usage.byProvider,(key)=>key),
-usageRows("byModel",usage.byModel,(key)=>key),
-providerModelRows,
-usage.recentTasks.length===0
-?null
-:h("div",{className:"deg_extra_block","data-deg-usage-recent-block":"true"},
-h("h4",{className:"deg_extra_subtitle"},t("settings.usage.recent")),
-h("div",{className:"deg_extra_rows"},...recentRows)))),
-validPrices.length===0
-?h("p",{className:"deg_extra_hint","data-deg-usage-no-price":"true"},t("settings.usage.noPrice"))
-:providerModelMissing===true
-?h("div",{className:"deg_extra_block","data-deg-usage-estimate-hint":"true"},
-h("h4",{className:"deg_extra_subtitle"},t("settings.usage.estimateTitle")),
-h("p",{className:"deg_extra_hint"},t("settings.usage.estimateHint")),
-h("p",{className:"deg_extra_empty","data-deg-usage-provider-model-missing":"true"},
-t("settings.usage.estimateMissingProviderModel")))
-:h("div",{className:"deg_extra_block","data-deg-usage-estimate-hint":"true"},
-h("h4",{className:"deg_extra_subtitle"},t("settings.usage.estimateTitle")),
-h("p",{className:"deg_extra_hint"},t("settings.usage.estimateHint")),
-estimates.length===0
-?h("p",{className:"deg_extra_empty","data-deg-usage-estimate-empty":"true"},t("settings.usage.estimateNoSample"))
-:h("div",{className:"deg_extra_rows"},...estimates.map((entry)=>h("div",{
-key:entry.key,
-className:"deg_extra_row",
-"data-deg-usage-estimate":entry.id,
-"data-deg-usage-estimate-key":entry.key,
-"data-deg-usage-estimate-provider":entry.provider,
-"data-deg-usage-estimate-model":entry.model,
-"data-deg-usage-estimate-cost":formatCostAmount(entry.cost.totalCost),
-},
-h("span",{className:"deg_extra_label"},entry.label),
-h("span",{className:"deg_extra_value"},
-t("settings.usage.estimateRow",{
-model:entry.label,
-cost:formatCostAmount(entry.cost.totalCost),
-currency:entry.cost.currency,
-})))))));
+renderModelCandidateCard({t,role,draft,providerGroups,catalogAvailable,actions,saving,readOnly,roleLabelOf}));
 }
 function DshExpertGroupSettings({settingsForm,modelCatalog,modelConfigHost,ctx}){
 const subscribe=react.useMemo(()=>settingsForm.subscribe.bind(settingsForm),[settingsForm]);
@@ -16639,30 +15197,6 @@ const roleLabelOf=(role)=>{
 const label=hostMeta?.roleLabels?.[role];
 return typeof label==="string"&&label.length>0?label:(SETTINGS_ROLE_LABELS[role]??role);
 };
-const diagnosticsReport=react.useMemo(
-()=>describeExpertGroupDiagnostics({
-clientCapabilities:describeExpertGroupClientCapabilities(ctx),
-hostMeta,
-}),
-[ctx,hostMeta],
-);
-const[notificationTest,setNotificationTest]=react.useState(null);
-const sendTestNotification=async()=>{
-if(notificationTest?.pending===true)return;
-setNotificationTest({pending:true,shown:false,reason:null});
-try{
-const response=await requestPluginRpc(ctx?.connection,{action:"notification-test"});
-const json=response.ok===true?await response.json():null;
-const result=json?.ok===true&&json.test!==null&&typeof json.test==="object"?json.test:null;
-setNotificationTest({
-pending:false,
-shown:result?.shown===true,
-reason:diagnosticTextOf(result?.reason,"unknown"),
-});
-}catch{
-setNotificationTest({pending:false,shown:false,reason:"unknown"});
-}
-};
 const promptRoleIds=react.useMemo(()=>{
 const declared=hostMeta?.rolePrompts?.roles;
 if(!Array.isArray(declared))return PROMPT_ROLE_IDS;
@@ -16677,17 +15211,7 @@ react.useEffect(()=>{
 void modelCatalog.load();
 },[modelCatalog]);
 const[draft,setDraft]=react.useState(()=>normalizeSettingsDraft(settingsSnapshot.value,roles));
-const[customRoleRows,setCustomRoleRows]=react.useState(
-()=>customRoleRowsFromDocument(settingsSnapshot.value?.customRoles),
-);
-const[customRoleError,setCustomRoleError]=react.useState(null);
 const[candidatesError,setCandidatesError]=react.useState(null);
-const[providerLimitRows,setProviderLimitRows]=react.useState(
-()=>providerLimitRowsOfDocument(settingsSnapshot.value?.providerLimits),
-);
-const[limitsError,setLimitsError]=react.useState(null);
-const[modelPricesError,setModelPricesError]=react.useState(null);
-const removedCustomRoleRowsRef=react.useRef([]);
 const[dirty,setDirty]=react.useState(false);
 const[saving,setSaving]=react.useState(false);
 const[error,setError]=react.useState(null);
@@ -16703,15 +15227,10 @@ const[externalSettingsChanged,setExternalSettingsChanged]=react.useState(false);
 const[leaveIntent,setLeaveIntent]=react.useState(null);
 const leaveTriggerRef=react.useRef(null);
 const leaveCancelRef=react.useRef(null);
-const draftRef=react.useRef(draft);
-draftRef.current=draft;
-const candidatesPreflight=useModelCandidatesPreflight({
-ctx,
-enabled:settingsSnapshot.status==="ready",
-roles,
-draftRef,
-rolesKey:roles.join("|"),
-});
+const[notificationEventsOpen,setNotificationEventsOpen]=react.useState(false);
+const notificationEventsRootRef=react.useRef(null);
+const notificationEventsTriggerRef=react.useRef(null);
+const notificationEventsPanelRef=react.useRef(null);
 const promptProjection=localPromptProjection!==null
 &&Number.isSafeInteger(localPromptProjection.revision)
 &&localPromptProjection.revision>settingsSnapshot.revision
@@ -16727,55 +15246,46 @@ const promptTextOf=(role)=>{
 if(Object.prototype.hasOwnProperty.call(promptDrafts,role))return promptDrafts[role];
 return promptEntryOf(baselineProjection,role)?.effective??"";
 };
-const sourcePromptOverrides=normalizePromptOverrides(settingsSnapshot.value?.promptOverrides,promptMaxGraphemes,promptRoleIds);
 const promptTouchedRoles=Object.keys(promptTouched).filter((role)=>promptRoleIds.includes(role));
 const promptDirty=baselineProjection!==null&&promptRoleIds.some((role)=>{
 if(!Object.prototype.hasOwnProperty.call(promptTouched,role))return false;
 const entry=promptEntryOf(baselineProjection,role);
 return entry!==null&&promptTextOf(role)!==entry.effective;
 });
-const settingsDirty=!settingsDraftEqual(
-normalizeSettingsDraft(draft,roles,false),
-normalizeSettingsDraft(settingsSnapshot.value,roles,false),
-);
-const sourceCustomRoles=normalizeCustomRolesDraft(settingsSnapshot.value?.customRoles);
-const candidateCustomRoles=customRolesDocumentOfRows(customRoleRows);
-const customRolesDirty=!settingsDraftEqual(candidateCustomRoles,sourceCustomRoles);
-const sourceProviderLimits=normalizeProviderLimitsDraft(settingsSnapshot.value?.providerLimits);
-const candidateProviderLimits=providerLimitsDocumentOfRows(providerLimitRows);
-const providerLimitsDirty=!settingsDraftEqual(candidateProviderLimits,sourceProviderLimits);
-const customRoleRowsPending=customRoleRows.some((row)=>row.isNew
-&&(row.id.trim().length>0||row.label.trim().length>0||row.description.length>0||row.readOnly!==""));
-const hasUnsavedChanges=settingsDirty||promptDirty||customRolesDirty||customRoleRowsPending
-||providerLimitsDirty;
-const editorHasUnsavedChanges=selectedPromptRole===null?hasUnsavedChanges:promptDirty;
-const promptOnlyDraft=selectedPromptRole!==null&&promptTouchedRoles.length>0;
+const committedAuthorityRef=react.useRef(null);
+const committedSnapshotLagging=committedAuthorityRef.current!==null
+&&Number.isSafeInteger(committedAuthorityRef.current.revision)
+&&(!Number.isSafeInteger(settingsSnapshot.revision)
+||settingsSnapshot.revision<committedAuthorityRef.current.revision);
+const authorityValue=committedSnapshotLagging?committedAuthorityRef.current.value:settingsSnapshot.value;
+const sourcePromptOverrides=normalizePromptOverrides(authorityValue?.promptOverrides,promptMaxGraphemes,promptRoleIds);
+const localDraft=normalizeSettingsDraft(draft,roles,false);
+const sourceDraftForDirty=normalizeSettingsDraft(authorityValue,roles,false);
+const settingsDirty=!settingsDraftEqual(localDraft,sourceDraftForDirty);
+const hasUnsavedChanges=settingsDirty||promptDirty;
+const editorHasUnsavedChanges=hasUnsavedChanges;
+const sourceDraftForSave=normalizeSettingsDraft(authorityValue,roles);
+const editorEntryValue=selectedPromptRole!==null&&editorBaseline?.role===selectedPromptRole
+?editorBaseline.value
+:authorityValue;
+const editorEntryDraft=normalizeSettingsDraft(editorEntryValue,roles,false);
+const effectiveDraft=selectedPromptRole!==null
+?mergeSettingsDraftOverSource(sourceDraftForSave,localDraft,editorEntryDraft)
+:localDraft;
 const modelFieldsChanged=react.useMemo(()=>{
-if(promptOnlyDraft)return false;
-const sourceValue=normalizeSettingsDraft(settingsSnapshot.value,roles);
-const normalizedValue=normalizeSettingsDraft(draft,roles,false);
-if(!settingsDraftEqual(normalizedValue.defaults,sourceValue.defaults))return true;
-return unifiedProviderOf(
-normalizedValue.defaults,
-roles,
-typeof draft.provider==="string"?draft.provider:"",
-)!==unifiedProviderOf(sourceValue.defaults,roles,sourceValue.provider);
-},[draft,roles,settingsSnapshot.value,promptOnlyDraft]);
+if(!settingsDraftEqual(effectiveDraft.defaults,sourceDraftForSave.defaults))return true;
+return unifiedProviderOf(effectiveDraft.defaults,roles,effectiveDraft.provider)
+!==unifiedProviderOf(sourceDraftForSave.defaults,roles,sourceDraftForSave.provider);
+},[effectiveDraft,sourceDraftForSave,roles]);
 react.useEffect(()=>{
-if(!dirty){
-setDraft(normalizeSettingsDraft(settingsSnapshot.value,roles));
+if(dirty)return;
+if(committedSnapshotLagging)return;
+setDraft(normalizeSettingsDraft(authorityValue,roles));
 setPromptDrafts({});
 setPromptTouched({});
 setPromptError(null);
-setCustomRoleRows(customRoleRowsFromDocument(settingsSnapshot.value?.customRoles));
-removedCustomRoleRowsRef.current=[];
-setCustomRoleError(null);
 setCandidatesError(null);
-setProviderLimitRows(providerLimitRowsOfDocument(settingsSnapshot.value?.providerLimits));
-setLimitsError(null);
-setModelPricesError(null);
-}
-},[dirty,settingsSnapshot.value,roles,promptMaxGraphemes]);
+},[dirty,settingsSnapshot.value,settingsSnapshot.revision,roles,promptMaxGraphemes,committedSnapshotLagging,authorityValue]);
 react.useEffect(()=>{
 if(selectedPromptRole===null||editorBaseline?.role!==selectedPromptRole)return;
 if(editorBaseline.projection===null&&hostPromptProjection!==null){
@@ -16786,8 +15296,10 @@ return;
 }
 if(Number.isSafeInteger(localPromptProjection?.revision)
 &&localPromptProjection.revision>settingsSnapshot.revision)return;
-if(!Number.isSafeInteger(settingsSnapshot.revision)||settingsSnapshot.revision===editorBaseline.revision)return;
-if(promptDirty){
+if(!Number.isSafeInteger(settingsSnapshot.revision))return;
+if(settingsSnapshot.revision===editorBaseline.revision)return;
+if(Number.isSafeInteger(editorBaseline.revision)&&settingsSnapshot.revision<editorBaseline.revision)return;
+if(hasUnsavedChanges||dirty){
 setExternalSettingsChanged(true);
 return;
 }
@@ -16812,7 +15324,7 @@ setError(null);
 setPromptError(null);
 setSettingsConflict(null);
 setExternalSettingsChanged(false);
-},[selectedPromptRole,editorBaseline,localPromptProjection,settingsSnapshot.revision,settingsSnapshot.value,hostPromptProjection,promptDirty,roles]);
+},[selectedPromptRole,editorBaseline,localPromptProjection,settingsSnapshot.revision,settingsSnapshot.value,hostPromptProjection,hasUnsavedChanges,dirty,roles]);
 react.useEffect(()=>{
 if(selectedPromptRole===null||!editorHasUnsavedChanges)return;
 const target=typeof globalThis?.addEventListener==="function"
@@ -16827,6 +15339,42 @@ return"";
 target.addEventListener("beforeunload",onBeforeUnload);
 return()=>target.removeEventListener?.("beforeunload",onBeforeUnload);
 },[selectedPromptRole,editorHasUnsavedChanges]);
+react.useEffect(()=>{
+if(!notificationEventsOpen)return undefined;
+const restoreTriggerFocus=()=>{
+try{notificationEventsTriggerRef.current?.focus?.();}catch{/* 无 DOM 的宿主忽略 */}
+};
+const closeAndRestoreFocus=()=>{
+setNotificationEventsOpen(false);
+restoreTriggerFocus();
+};
+const onPointerDown=(event)=>{
+const root=notificationEventsRootRef.current;
+const target=event?.target;
+if(root!==null&&root!==void 0&&typeof root.contains==="function"
+&&target!==null&&target!==void 0&&root.contains(target))return;
+closeAndRestoreFocus();
+};
+const onKeyDown=(event)=>{
+if(event?.key!=="Escape")return;
+event.preventDefault?.();
+closeAndRestoreFocus();
+};
+const doc=typeof document==="undefined"?null:document;
+if(doc===null||typeof doc.addEventListener!=="function")return undefined;
+doc.addEventListener("mousedown",onPointerDown);
+doc.addEventListener("keydown",onKeyDown);
+return()=>{
+doc.removeEventListener?.("mousedown",onPointerDown);
+doc.removeEventListener?.("keydown",onKeyDown);
+};
+},[notificationEventsOpen]);
+react.useEffect(()=>{
+if(!notificationEventsOpen)return;
+const panel=notificationEventsPanelRef.current;
+if(panel===null||panel===void 0||typeof panel.querySelector!=="function")return;
+try{panel.querySelector("input[type=checkbox]")?.focus?.();}catch{/* 忽略不可聚焦的宿主 */}
+},[notificationEventsOpen]);
 const editDraft=(update)=>{
 setDirty(true);
 setSaved(false);
@@ -16834,90 +15382,6 @@ setError(null);
 setPromptError(null);
 setDraft((previous)=>update(previous));
 };
-const touchCustomRoles=()=>{setDirty(true);setSaved(false);setError(null);setCustomRoleError(null);};
-const editCustomRoleRow=(key,field,value)=>{
-touchCustomRoles();
-setCustomRoleRows((previous)=>previous.map((row)=>(row.key===key?{...row,[field]:value}:row)));
-};
-const addCustomRoleRow=()=>{
-touchCustomRoles();
-setCustomRoleRows((previous)=>(previous.length>=MAX_CUSTOM_ROLES?previous:[...previous,createCustomRoleRow({toolDeny:[]},"")]));
-};
-const removeCustomRoleRow=(key)=>{
-touchCustomRoles();
-setCustomRoleRows((previous)=>{
-const removed=previous.find((row)=>row.key===key);
-if(removed!==undefined&&!removedCustomRoleRowsRef.current.some((row)=>row.key===removed.key)){
-removedCustomRoleRowsRef.current=[...removedCustomRoleRowsRef.current,removed];
-}
-return previous.filter((row)=>row.key!==key);
-});
-};
-const touchProviderLimitRows=()=>{
-setDirty(true);setSaved(false);setError(null);setLimitsError(null);
-};
-const editProviderLimitRow=(key,field,value)=>{
-touchProviderLimitRows();
-setProviderLimitRows((previous)=>previous.map((row)=>{
-if(row.key!==key)return row;
-if(field!=="limit")return{...row,[field]:typeof value==="string"?value:""};
-const text=typeof value==="string"?value.trim():"";
-if(text==="")return{...row,limit:""};
-const number=Number(text);
-return{...row,limit:Number.isFinite(number)?number:""};
-}));
-};
-const addProviderLimitRow=()=>{
-touchProviderLimitRows();
-setProviderLimitRows((previous)=>(previous.length>=MAX_PROVIDER_LIMIT_ROWS
-?previous
-:[...previous,createProviderLimitRow("","")]));
-};
-const removeProviderLimitRow=(key)=>{
-touchProviderLimitRows();
-setProviderLimitRows((previous)=>previous.filter((row)=>row.key!==key));
-};
-const editRoleLimit=(role,raw)=>{
-const text=typeof raw==="string"?raw.trim():"";
-editDraft((previous)=>{
-const map={...(previous.roleLimits??{})};
-if(text===""){
-delete map[role];
-return{...previous,roleLimits:map};
-}
-const number=Number(text);
-if(!Number.isFinite(number))return previous;
-map[role]=number;
-return{...previous,roleLimits:map};
-});
-};
-const toggleInheritContext=(role,enabled)=>{
-if(!CONTEXT_INHERITANCE_ROLE_IDS.includes(role))return;
-editDraft((previous)=>{
-const map={...(previous.inheritContext??{})};
-if(enabled===true)map[role]=true;
-else delete map[role];
-return{...previous,inheritContext:map};
-});
-};
-const updateModelPrices=(update)=>editDraft((previous)=>({
-...previous,
-modelPrices:update(normalizeModelPricesDraft(previous.modelPrices)),
-}));
-const editModelPrice=(index,field,raw)=>updateModelPrices((list)=>list.map((row,position)=>{
-if(position!==index)return row;
-if(field==="inputPerMillion"||field==="outputPerMillion"){
-const text=typeof raw==="string"?raw.trim():"";
-if(text==="")return{...row,[field]:""};
-const number=Number(text);
-return{...row,[field]:Number.isFinite(number)?number:""};
-}
-return{...row,[field]:typeof raw==="string"?raw:""};
-}));
-const addModelPrice=()=>updateModelPrices((list)=>(list.length>=MAX_MODEL_PRICES
-?list
-:[...list,{provider:"",model:"",inputPerMillion:"",outputPerMillion:"",currency:DEFAULT_MODEL_PRICE_CURRENCY}]));
-const removeModelPrice=(index)=>updateModelPrices((list)=>list.filter((unused,position)=>position!==index));
 const captureEditorBaseline=(role)=>{
 if(role===null)return null;
 return{
@@ -16988,15 +15452,14 @@ return next;
 const catalogAvailable=directoryState.status==="ready"||groups.length>0;
 const unifiedProvider=unifiedProviderOf(draft.defaults,roles,draft.provider);
 const save=async({retry=false}={})=>{
-const promptOnlySave=promptOnlyDraft;
 if(!hasUnsavedChanges||saving||settingsSnapshot.writable!==true)return false;
-if(!promptOnlySave&&modelFieldsChanged&&!catalogAvailable)return false;
-const source=normalizeSettingsDraft(settingsSnapshot.value,roles);
-const normalizedDraft=promptOnlySave?source:normalizeSettingsDraft(draft,roles,false);
+if(modelFieldsChanged&&!catalogAvailable)return false;
+const source=sourceDraftForSave;
+const normalizedDraft=effectiveDraft;
 const sourceProvider=unifiedProviderOf(source.defaults,roles,source.provider);
-const draftProviderIntent=promptOnlySave?sourceProvider:(typeof draft.provider==="string"?draft.provider:"");
+const draftProviderIntent=typeof effectiveDraft.provider==="string"?effectiveDraft.provider:"";
 const draftProvider=unifiedProviderOf(normalizedDraft.defaults,roles,draftProviderIntent);
-const modelChanged=promptOnlySave?false:modelFieldsChanged&&catalogAvailable;
+const modelChanged=modelFieldsChanged&&catalogAvailable;
 const candidatePromptOverrides={...sourcePromptOverrides};
 if(promptTouchedRoles.length>0){
 if(promptProjection===null){
@@ -17023,68 +15486,21 @@ if(text===entry.defaultPersona)delete candidatePromptOverrides[role];
 else candidatePromptOverrides[role]=text;
 }
 }
-const sourceHasPromptOverrides=settingsSnapshot.value!==null
-&&typeof settingsSnapshot.value==="object"
-&&Object.prototype.hasOwnProperty.call(settingsSnapshot.value,"promptOverrides");
+const sourceHasPromptOverrides=authorityValue!==null&&authorityValue!==void 0
+&&typeof authorityValue==="object"
+&&Object.prototype.hasOwnProperty.call(authorityValue,"promptOverrides");
 const promptChanged=!promptOverridesEqual(candidatePromptOverrides,sourcePromptOverrides);
 const includePromptOverrides=sourceHasPromptOverrides||promptTouchedRoles.length>0;
-const sourceCandidates=normalizeModelCandidatesDraft(settingsSnapshot.value?.candidates);
+const sourceCandidates=normalizeModelCandidatesDraft(authorityValue?.candidates);
 const candidateCandidates=normalizeModelCandidatesDraft(normalizedDraft.candidates);
-const candidatesChanged=promptOnlySave!==true&&!settingsDraftEqual(candidateCandidates,sourceCandidates);
+const candidatesChanged=!settingsDraftEqual(candidateCandidates,sourceCandidates);
 if(candidatesChanged){
 const validation=validateModelCandidateRows(candidateCandidates);
 if(validation.ok!==true){setCandidatesError(modelCandidatesErrorMessage(tExtra,roleLabelOf,validation));return false;}
 }
-const sourceFallbackLimit=normalizeSettingsDraft(settingsSnapshot.value,roles).fallbackLimit;
+const sourceFallbackLimit=source.fallbackLimit;
 const candidateFallbackLimit=normalizedDraft.fallbackLimit;
-const fallbackLimitChanged=promptOnlySave!==true&&candidateFallbackLimit!==void 0&&candidateFallbackLimit!==sourceFallbackLimit;
-const rowsBeforeSave=customRoleRows;
-const includeCustomRoles=promptOnlySave!==true&&(customRolesDirty||customRoleRowsPending);
-if(includeCustomRoles){
-const validation=validateCustomRoleRows(customRoleRows,{builtinIds:SETTINGS_ROLE_IDS});
-if(validation.ok!==true){setCustomRoleError(customRoleValidationMessage(tExtra,validation));return false;}
-}
-const sourceRoleLimits=normalizeRoleLimitsDraft(source.roleLimits,roles);
-const draftRoleLimits=normalizeRoleLimitsDraft(normalizedDraft.roleLimits,roles);
-const roleLimitsChanged=promptOnlySave!==true
-&&Object.prototype.hasOwnProperty.call(normalizedDraft,"roleLimits")
-&&!settingsDraftEqual(draftRoleLimits,sourceRoleLimits);
-if(roleLimitsChanged){
-const validation=validateRoleLimitsDocument(draftRoleLimits);
-if(validation.ok!==true){
-setLimitsError(tExtra("settings.limits.error.roleLimit",{role:roleLabelOf(validation.role)}));
-return false;
-}
-}
-const providerRowsBeforeSave=providerLimitRows;
-const providerLimitsChanged=promptOnlySave!==true&&providerLimitsDirty;
-const candidateProviderLimitsDocument=providerLimitsDocumentOfRows(providerLimitRows);
-if(providerLimitsChanged){
-const validation=validateProviderLimitRows(providerLimitRows);
-if(validation.ok!==true){
-setLimitsError(tExtra("settings.limits.error."+validation.code,{index:validation.index}));
-return false;
-}
-}
-const sourceInheritContext=normalizeInheritContextDraft(source.inheritContext);
-const draftInheritContext=normalizeInheritContextDraft(normalizedDraft.inheritContext);
-const inheritContextChanged=promptOnlySave!==true
-&&Object.prototype.hasOwnProperty.call(normalizedDraft,"inheritContext")
-&&!settingsDraftEqual(draftInheritContext,sourceInheritContext);
-const sourceModelPrices=normalizeModelPricesDraft(source.modelPrices);
-const draftModelPrices=normalizeModelPricesDraft(normalizedDraft.modelPrices);
-const modelPricesChanged=promptOnlySave!==true
-&&Object.prototype.hasOwnProperty.call(normalizedDraft,"modelPrices")
-&&!settingsDraftEqual(draftModelPrices,sourceModelPrices);
-let candidateModelPricesDocument=[];
-if(modelPricesChanged){
-const validation=validateModelPricesDraft(draftModelPrices);
-if(validation.ok!==true){
-setModelPricesError(tExtra("settings.usage.error."+validation.code,{index:validation.index}));
-return false;
-}
-candidateModelPricesDocument=modelPricesDocumentOfDraft(draftModelPrices);
-}
+const fallbackLimitChanged=candidateFallbackLimit!==void 0&&candidateFallbackLimit!==sourceFallbackLimit;
 const candidate={
 ...normalizedDraft,
 provider:modelChanged?draftProvider:sourceProvider,
@@ -17094,19 +15510,9 @@ provider:modelChanged?draftProvider:sourceProvider,
 ...(fallbackLimitChanged
 ?{fallbackLimit:typeof candidateFallbackLimit==="number"?candidateFallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT}
 :{}),
-...(includeCustomRoles?{customRoles:candidateCustomRoles}:{}),
-...(roleLimitsChanged?{roleLimits:draftRoleLimits}:{}),
-...(providerLimitsChanged?{providerLimits:candidateProviderLimitsDocument}:{}),
-...(inheritContextChanged?{inheritContext:draftInheritContext}:{}),
-...(modelPricesChanged?{modelPrices:candidateModelPricesDocument}:{}),
 };
 if(!candidatesChanged)delete candidate.candidates;
 if(!fallbackLimitChanged)delete candidate.fallbackLimit;
-if(!includeCustomRoles)delete candidate.customRoles;
-if(!roleLimitsChanged)delete candidate.roleLimits;
-if(!providerLimitsChanged)delete candidate.providerLimits;
-if(!inheritContextChanged)delete candidate.inheritContext;
-if(!modelPricesChanged)delete candidate.modelPrices;
 const ops=[];
 if(modelChanged){
 ops.push({op:"set",path:["provider"],value:candidate.provider});
@@ -17161,17 +15567,9 @@ if(!settingsDraftEqual(candidateCandidates[role]??null,sourceCandidates[role]??n
 }
 }
 if(fallbackLimitChanged)changed.push("fallbackLimit");
-if(includeCustomRoles)changed.push("customRoles");
-if(roleLimitsChanged)changed.push("roleLimits");
-if(providerLimitsChanged)changed.push("providerLimits");
-if(inheritContextChanged)changed.push("inheritContext");
-if(modelPricesChanged)changed.push("modelPrices");
-const expectedRevision=retry===true
+const expectedRevision=retry===true||selectedPromptRole===null||!Number.isSafeInteger(editorBaseline?.revision)
 ?settingsSnapshot.revision
-:selectedPromptRole!==null&&promptTouchedRoles.length>0
-&&Number.isSafeInteger(editorBaseline?.revision)
-?editorBaseline.revision
-:settingsSnapshot.revision;
+:editorBaseline.revision;
 setSaving(true);
 setSaved(false);
 setError(null);
@@ -17179,8 +15577,7 @@ setPromptError(null);
 try{
 let accepted;
 let committed=null;
-if(ops.length>0||candidatesChanged||fallbackLimitChanged||includeCustomRoles
-||roleLimitsChanged||providerLimitsChanged||inheritContextChanged||modelPricesChanged){
+if(ops.length>0||candidatesChanged||fallbackLimitChanged){
 committed=await commitSettingsCandidate(candidate,expectedRevision,globalThis.fetch,ctx?.connection,roles,changed);
 accepted=committed.settings;
 }else{
@@ -17200,37 +15597,23 @@ if(Object.prototype.hasOwnProperty.call(acceptedDraft,field))return;
 if(hadField!==true)return;
 acceptedDraft[field]=value;
 };
-keepNewField("roleLimits",
-roleLimitsChanged||Object.prototype.hasOwnProperty.call(source,"roleLimits"),
-roleLimitsChanged?draftRoleLimits:sourceRoleLimits);
-keepNewField("providerLimits",
-providerLimitsChanged||Object.prototype.hasOwnProperty.call(source,"providerLimits"),
-providerLimitsChanged?candidateProviderLimitsDocument:sourceProviderLimits);
-keepNewField("inheritContext",
-inheritContextChanged||Object.prototype.hasOwnProperty.call(source,"inheritContext"),
-inheritContextChanged?draftInheritContext:sourceInheritContext);
-keepNewField("modelPrices",
-modelPricesChanged||Object.prototype.hasOwnProperty.call(source,"modelPrices"),
-modelPricesChanged?candidateModelPricesDocument:sourceModelPrices);
+keepNewField("candidates",
+candidatesChanged||Object.prototype.hasOwnProperty.call(source,"candidates"),
+candidatesChanged?candidateCandidates:sourceCandidates);
+keepNewField("fallbackLimit",
+fallbackLimitChanged||Object.prototype.hasOwnProperty.call(source,"fallbackLimit"),
+fallbackLimitChanged
+?(typeof candidateFallbackLimit==="number"?candidateFallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT)
+:sourceFallbackLimit);
 }
 setDraft(acceptedDraft);
 setPromptDrafts({});
 setPromptTouched({});
 setCandidatesError(null);
-if(accepted!==null&&typeof accepted==="object"&&accepted.customRoles!==void 0){
-setCustomRoleRows(customRoleRowsFromDocument(accepted.customRoles));
-}else if(includeCustomRoles){
-setCustomRoleRows(customRoleRowsFromDocument(candidateCustomRoles));
-}
-setCustomRoleError(null);
-removedCustomRoleRowsRef.current=[];
-setProviderLimitRows(providerLimitRowsOfDocument(
-acceptedDraft!==null&&typeof acceptedDraft==="object"?acceptedDraft.providerLimits:void 0,
-));
-setLimitsError(null);
-setModelPricesError(null);
-if(includeCustomRoles)refreshHostMeta();
-if(roleLimitsChanged||providerLimitsChanged)refreshHostMeta();
+const committedRevision=Number.isSafeInteger(committed?.revision)
+?committed.revision
+:settingsSnapshot.revision;
+committedAuthorityRef.current={revision:committedRevision,value:acceptedDraft};
 const responseProjection=normalizeRolePromptProjection(committed?.rolePrompts,accepted,true,promptRoleIds);
 let acceptedProjection=responseProjection??promptProjection;
 if(acceptedProjection!==null){
@@ -17241,18 +15624,15 @@ const text=Object.prototype.hasOwnProperty.call(acceptedPromptOverrides,role)
 :entry?.defaultPersona??promptTextOf(role);
 acceptedProjection=updateRolePromptProjection(acceptedProjection,role,text);
 }
-const committedRevision=Number.isSafeInteger(committed?.revision)
-?committed.revision
-:settingsSnapshot.revision;
 setLocalPromptProjection({revision:committedRevision,projection:acceptedProjection});
+}
 if(selectedPromptRole!==null){
 setEditorBaseline({
 role:selectedPromptRole,
-value:accepted,
+value:acceptedDraft,
 revision:committedRevision,
-projection:acceptedProjection,
+projection:acceptedProjection??editorBaseline?.projection??null,
 });
-}
 }
 setSettingsConflict(null);
 setExternalSettingsChanged(false);
@@ -17266,20 +15646,6 @@ if(cause?.code==="settings-conflict"){
 setSettingsConflict({revision:cause.currentRevision,message});
 }
 if(promptTouchedRoles.length>0)setPromptError(message);
-if(includeCustomRoles){
-setCustomRoleRows(rowsBeforeSave);
-if(removedCustomRoleRowsRef.current.length>0){
-const removed=removedCustomRoleRowsRef.current;
-removedCustomRoleRowsRef.current=[];
-setCustomRoleRows((previous)=>{
-const restored=previous.slice();
-for(const row of removed)if(!restored.some((entry)=>entry.key===row.key))restored.push(row);
-return restored;
-});
-}
-setCustomRoleError(customRoleHostErrorMessage(tExtra,cause,message));
-}
-setProviderLimitRows(providerRowsBeforeSave);
 return false;
 }finally{
 setSaving(false);
@@ -17287,22 +15653,18 @@ setSaving(false);
 };
 const discard=()=>{
 const snapshot=settingsForm.getSnapshot();
-const refreshedProjection=normalizeRolePromptProjection(hostMeta?.rolePrompts,snapshot.value,true,promptRoleIds)??promptProjection;
-setDraft(normalizeSettingsDraft(snapshot.value,roles));
-setCustomRoleRows(customRoleRowsFromDocument(snapshot.value?.customRoles));
-removedCustomRoleRowsRef.current=[];
-setCustomRoleError(null);
+const refreshedProjection=normalizeRolePromptProjection(hostMeta?.rolePrompts,authorityValue,true,promptRoleIds)??promptProjection;
+setDraft(normalizeSettingsDraft(authorityValue,roles));
 setCandidatesError(null);
-setProviderLimitRows(providerLimitRowsOfDocument(snapshot.value?.providerLimits));
-setLimitsError(null);
-setModelPricesError(null);
 setPromptDrafts({});
 setPromptTouched({});
 if(selectedPromptRole!==null&&refreshedProjection!==null){
 setEditorBaseline({
 role:selectedPromptRole,
-value:snapshot.value,
-revision:Number.isSafeInteger(snapshot.revision)?snapshot.revision:null,
+value:authorityValue,
+revision:Number.isSafeInteger(committedAuthorityRef.current?.revision)&&committedSnapshotLagging
+?committedAuthorityRef.current.revision
+:(Number.isSafeInteger(snapshot.revision)?snapshot.revision:null),
 projection:refreshedProjection,
 });
 }
@@ -17429,9 +15791,18 @@ role:"status",
 "aria-live":"polite",
 },String(promptValidation.count)+" / "+String(promptMaxGraphemes)),
 promptStatusMessage===null?null:react.createElement("p",{className:"deg_prompt_status",role:"status"},promptStatusMessage)),
-react.createElement("div",{className:"deg_prompt_readonly"},
-react.createElement("strong",null,"固定执行纪律"),
-react.createElement("p",null,PROMPT_DISCIPLINE_HINT)),
+renderModelCandidatesPanel({
+t:tExtra,
+role:selectedPromptRole,
+draft,
+providerGroups,
+catalogAvailable,
+saving,
+readOnly:settingsReadOnly,
+error:candidatesError,
+actions:createModelCandidateActions(editDraft,providerGroups),
+roleLabelOf,
+}),
 promptErrorMessage===null?null:react.createElement("p",{
 id:"deg-prompt-error-"+selectedPromptRole,
 className:"deg_settings_error",
@@ -17447,7 +15818,7 @@ settingsConflict===null?null:react.createElement("div",{className:"deg_prompt_co
 react.createElement("p",{className:"deg_settings_error"},"保存遇到配置冲突，请选择下一步。"),
 react.createElement("div",{className:"deg_prompt_dialog_actions"},
 react.createElement("button",{type:"button",className:"deg_btn",disabled:saving,onClick:loadLatestPromptSettings},"加载最新配置"),
-react.createElement("button",{type:"button",className:"deg_btn deg_btn_primary",disabled:saving,onClick:retryPromptSave},"继续使用当前提示词重试"))),
+react.createElement("button",{type:"button",className:"deg_btn deg_btn_primary",disabled:saving,onClick:retryPromptSave},"继续使用当前修改重试"))),
 react.createElement("div",{className:"deg_prompt_footer"},
 react.createElement("button",{
 type:"button",
@@ -17460,7 +15831,8 @@ react.createElement("span",{className:"deg_prompt_status",role:"status","aria-li
 react.createElement("button",{
 type:"button",
 className:"deg_btn deg_btn_primary",
-disabled:!promptDirty||!promptValidation.ok||saving||settingsReadOnly||promptLoading||baselineProjection?.customizable!==true,
+disabled:!hasUnsavedChanges||!promptValidation.ok||saving
+||settingsReadOnly||promptLoading||baselineProjection?.customizable!==true,
 onClick:save,
 },saving?"保存中…":"保存"),
 react.createElement("button",{
@@ -17475,7 +15847,7 @@ react.createElement("div",{
 className:"deg_prompt_dialog",
 role:"dialog",
 "aria-modal":"true",
-"aria-label":"未保存的提示词修改",
+"aria-label":"未保存的修改",
 onKeyDown:(event)=>{
 if(event.key==="Escape"){
 event.preventDefault?.();
@@ -17493,7 +15865,7 @@ event.preventDefault?.();
 try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
 },
 },
-react.createElement("h3",null,"未保存的提示词修改"),
+react.createElement("h3",null,"未保存的修改"),
 react.createElement("p",null,"离开前请选择如何处理当前草稿。"),
 react.createElement("div",{className:"deg_prompt_dialog_actions"},
 leaveIntent.kind==="restore-default"
@@ -17686,6 +16058,11 @@ host:modelConfigHost,
 roleDefaults:normalizeSettingsDraft(settingsSnapshot.value,roles).defaults,
 roleLabelOf,
 });
+const fallbackLimitDraft=Number.isSafeInteger(draft.fallbackLimit)?draft.fallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT;
+const notificationEventsEnabledCount=NOTIFICATION_EVENT_TYPES.filter(
+(type)=>draft.notificationEvents[type]===true,
+).length;
+const notificationEventsTriggerLabel=t("settings.notificationEvents")+" ("+notificationEventsEnabledCount+")";
 return react.createElement("div",{className:"deg_settings"},
 react.createElement("h2",{className:"deg_settings_title"},t("settings.title")),
 react.createElement("p",{className:"deg_settings_hint"},t("settings.hint")),
@@ -17735,11 +16112,31 @@ type:"number",min:0,max:100,step:1,
 value:draft.notificationVolume,
 disabled:saving,
 onChange:(event)=>editDraft((previous)=>({...previous,notificationVolume:clampNotificationVolume(event.target.value)})),
-}))),
-react.createElement("div",{className:"deg_settings_row deg_settings_notification_events_row"},
-react.createElement("span",{className:"deg_settings_label"},t("settings.notificationEvents")),
-react.createElement("div",{className:"deg_settings_notification_events"},
-NOTIFICATION_EVENT_TYPES.map((type)=>react.createElement("label",{key:type,className:"deg_settings_checkbox"},
+})),
+react.createElement("div",{className:"deg_settings_events_dropdown",ref:notificationEventsRootRef},
+react.createElement("button",{
+type:"button",
+className:"deg_settings_events_trigger",
+id:"deg-settings-notification-events-trigger",
+ref:notificationEventsTriggerRef,
+"aria-label":notificationEventsTriggerLabel,
+"aria-haspopup":"true",
+"aria-expanded":notificationEventsOpen?"true":"false",
+"aria-controls":"deg-settings-notification-events-panel",
+disabled:saving,
+onClick:()=>setNotificationEventsOpen((previous)=>!previous),
+},
+react.createElement("span",{className:"deg_settings_events_label"},t("settings.notificationEvents")),
+react.createElement("span",{className:"deg_settings_events_count","aria-hidden":"true"},"("+notificationEventsEnabledCount+")"),
+react.createElement("span",{className:"deg_settings_events_caret","aria-hidden":"true"},"▾")),
+notificationEventsOpen
+?react.createElement("div",{
+className:"deg_settings_events_panel",
+id:"deg-settings-notification-events-panel",
+ref:notificationEventsPanelRef,
+role:"group",
+"aria-label":t("settings.notificationEvents"),
+},NOTIFICATION_EVENT_TYPES.map((type)=>react.createElement("label",{key:type,className:"deg_settings_checkbox"},
 react.createElement("input",{
 type:"checkbox",
 "aria-label":t("settings.notificationEvent."+type+".aria"),
@@ -17750,12 +16147,15 @@ onChange:(event)=>editDraft((previous)=>({
 notificationEvents:{...previous.notificationEvents,[type]:event.target.checked===true},
 })),
 }),
-react.createElement("span",{className:"deg_settings_label"},t("settings.notificationEvent."+type)))))),
-react.createElement("div",{className:"deg_settings_row"},
+react.createElement("span",{className:"deg_settings_label"},t("settings.notificationEvent."+type)))))
+:null)),
+react.createElement("div",{className:"deg_settings_row deg_settings_unified_row"},
+react.createElement("div",{className:"deg_settings_provider_group"},
 react.createElement("label",{className:"deg_settings_label",htmlFor:"deg-settings-provider"},t("settings.unifiedProvider")),
 react.createElement("div",{className:"deg_settings_control"},
 react.createElement("select",{
 id:"deg-settings-provider",
+className:"deg_settings_provider_select",
 value:unifiedProvider,
 disabled:saving||!catalogAvailable,
 onChange:(event)=>editDraft((previous)=>{
@@ -17776,79 +16176,36 @@ defaults:syncSettingsDefaultsProvider(previous.defaults,provider,providerGroups,
 },
 react.createElement("option",{value:""},t("settings.noProvider")),
 providerGroups.map((group)=>react.createElement("option",{key:group.id,value:group.id},group.name??group.id))))),
+react.createElement("div",{className:"deg_settings_fallback_group"},
+react.createElement("label",{className:"deg_settings_label",htmlFor:"deg-settings-model-fallback-limit"},tExtra("settings.modelCandidates.fallbackLimit")),
+react.createElement("div",{className:"deg_settings_control"},
+react.createElement("input",{
+id:"deg-settings-model-fallback-limit",
+type:"number",min:0,max:MAX_MODEL_FALLBACK_LIMIT,step:1,inputMode:"numeric",
+"aria-label":tExtra("settings.modelCandidates.fallbackLimit"),
+title:tExtra("settings.modelCandidates.fallbackLimit.title"),
+value:draft.fallbackLimit===void 0?fallbackLimitDraft:draft.fallbackLimit,
+disabled:saving||settingsReadOnly,
+onChange:(event)=>{
+const raw=event.target.value;
+const number=raw===""?null:Number(raw);
+editDraft((previous)=>({...previous,fallbackLimit:raw===""?"":Number.isFinite(number)?Math.round(number):previous.fallbackLimit}));
+},
+})))),
+react.createElement("p",{className:"deg_settings_hint"},tExtra("settings.modelCandidates.hint")),
 react.createElement("div",{className:"deg_settings_table_wrap"},
 react.createElement("div",{className:"deg_settings_table"},header,rows)),
-renderModelCandidatesSection({
-t:tExtra,
-roles,
-draft,
-providerGroups,
-preflight:candidatesPreflight,
-saving,
-readOnly:settingsReadOnly,
-error:candidatesError,
-editDraft,
-roleLabelOf,
-}),
-renderCustomRolesSection({
-t:tExtra,
-rows:customRoleRows,
-error:customRoleError,
-hostMeta,
-roleLabelOf,
-saving,
-readOnly:settingsReadOnly,
-onAdd:addCustomRoleRow,
-onEdit:editCustomRoleRow,
-onRemove:removeCustomRoleRow,
-}),
-renderConcurrencyLimitsSection({
-t:tExtra,
-roles,
-draft,
-providerLimitRows,
-hostMeta,
-error:limitsError,
-saving,
-readOnly:settingsReadOnly,
-roleLabelOf,
-onEditRoleLimit:editRoleLimit,
-onAddProviderLimit:addProviderLimitRow,
-onEditProviderLimit:editProviderLimitRow,
-onRemoveProviderLimit:removeProviderLimitRow,
-}),
-renderInheritContextSection({
-t:tExtra,
-roles,
-draft,
-saving,
-readOnly:settingsReadOnly,
-roleLabelOf,
-onToggle:toggleInheritContext,
-}),
-renderUsageSection({
-t:tExtra,
-draft,
-hostMeta,
-error:modelPricesError,
-saving,
-readOnly:settingsReadOnly,
-roleLabelOf,
-onAddPrice:addModelPrice,
-onEditPrice:editModelPrice,
-onRemovePrice:removeModelPrice,
-}),
 react.createElement("div",{className:"deg_settings_row deg_settings_management_row"},
 react.createElement("label",{className:"deg_settings_checkbox"},
 react.createElement("input",{type:"checkbox","aria-label":t("settings.observerPreferred"),checked:draft.observerPreferred,disabled:saving,onChange:(event)=>editDraft((previous)=>({...previous,observerPreferred:event.target.checked}))}),
 react.createElement("span",{className:"deg_settings_label"},t("settings.observerPreferred"))),
-react.createElement("div",{className:"deg_settings_limits"},
 react.createElement("label",{className:"deg_settings_control",htmlFor:"deg-settings-role-concurrency-limit"},
 react.createElement("span",{className:"deg_settings_label"},t("settings.concurrencyLimit")),
 react.createElement("input",{
 id:"deg-settings-role-concurrency-limit",
 type:"number",
 "aria-label":t("settings.concurrencyLimit"),
+title:t("settings.concurrencyLimit.title"),
 min:1,
 max:64,
 step:1,
@@ -17889,43 +16246,7 @@ roleTimeoutMs:raw===""
 :Number.isFinite(seconds)?Math.round(seconds)*1000:previous.roleTimeoutMs,
 }));
 },
-})))),
-react.createElement("section",{
-className:"deg_settings_diagnostics",
-"data-deg-diagnostics":"section",
-"aria-label":t("settings.diagnostics.title"),
-},
-react.createElement("h3",{className:"deg_settings_diagnostics_title"},t("settings.diagnostics.title")),
-diagnosticsReport.hostAvailable!==true
-?react.createElement("p",{className:"deg_settings_hint"},
-hostMeta===null
-?(hostMetaError===null?t("settings.diagnostics.loading"):t("settings.diagnostics.unavailable"))
-:t("settings.diagnostics.absent"))
-:null,
-renderDiagnosticGroup(t("settings.diagnostics.capabilities"),"capabilities",diagnosticsReport.capabilities,renderDiagnosticCapability),
-renderDiagnosticGroup(t("settings.diagnostics.runtime"),"runtime",diagnosticsReport.runtime,renderDiagnosticRuntime),
-renderDiagnosticGroup(t("settings.diagnostics.budget"),"budget",diagnosticsReport.budget,renderDiagnosticRuntime),
-renderDiagnosticGroup(t("settings.diagnostics.persistence"),"persistence",diagnosticsReport.persistence,renderDiagnosticRuntime),
-react.createElement("div",{
-className:"deg_settings_diagnostic_group",
-"data-deg-diagnostic-group":"notifications",
-},
-react.createElement("h4",{className:"deg_settings_diagnostic_group_title"},t("settings.diagnostics.notifications")),
-diagnosticsReport.notifications.map(renderDiagnosticRuntime),
-react.createElement("div",{className:"deg_settings_diagnostic_row deg_settings_notification_test"},
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-"aria-label":t("settings.testNotification"),
-"data-deg-notification-test":notificationTest?.pending===true?"pending":"idle",
-disabled:notificationTest?.pending===true,
-onClick:sendTestNotification,
-},notificationTest?.pending===true?t("settings.testNotification.sending"):t("settings.testNotification")),
-react.createElement("span",{
-className:"deg_settings_diagnostic_value",
-role:"status",
-"data-deg-notification-test-status":notificationTestStatusText(notificationTest),
-},notificationTestStatusText(notificationTest))))),
+}))),
 directoryState.error?react.createElement("p",{className:"deg_settings_error",role:"status"},directoryState.error):null,
 error?react.createElement("p",{className:"deg_settings_error",role:"status"},error):null,
 react.createElement("div",{className:"deg_settings_footer"},
@@ -18845,28 +17166,6 @@ exports.normalizeSettingsDraft=normalizeSettingsDraft;
 exports.normalizeModelCandidatesDraft=normalizeModelCandidatesDraft;
 exports.normalizeModelFallbackLimitDraft=normalizeModelFallbackLimitDraft;
 exports.validateModelCandidateRows=validateModelCandidateRows;
-exports.normalizeModelPreflightView=normalizeModelPreflightView;
-exports.normalizeCustomRolesDraft=normalizeCustomRolesDraft;
-exports.customRoleRowsFromDocument=customRoleRowsFromDocument;
-exports.customRolesDocumentOfRows=customRolesDocumentOfRows;
-exports.validateCustomRoleRows=validateCustomRoleRows;
-exports.normalizeRoleLimitsDraft=normalizeRoleLimitsDraft;
-exports.validateRoleLimitsDocument=validateRoleLimitsDocument;
-exports.normalizeProviderLimitsDraft=normalizeProviderLimitsDraft;
-exports.providerLimitRowsOfDocument=providerLimitRowsOfDocument;
-exports.providerLimitsDocumentOfRows=providerLimitsDocumentOfRows;
-exports.validateProviderLimitRows=validateProviderLimitRows;
-exports.normalizeInheritContextDraft=normalizeInheritContextDraft;
-exports.CONTEXT_INHERITANCE_ROLE_IDS=CONTEXT_INHERITANCE_ROLE_IDS;
-exports.normalizeModelPricesDraft=normalizeModelPricesDraft;
-exports.modelPricesDocumentOfDraft=modelPricesDocumentOfDraft;
-exports.validateModelPricesDraft=validateModelPricesDraft;
-exports.normalizeUsageView=normalizeUsageView;
-exports.estimateUsageCostOf=estimateUsageCostOf;
-exports.normalizeThrottleDiagnosticsView=normalizeThrottleDiagnosticsView;
-exports.normalizeConcurrencyProvidersView=normalizeConcurrencyProvidersView;
-exports.normalizeLimitDiagnosticsView=normalizeLimitDiagnosticsView;
-exports.formatUsageDuration=formatUsageDuration;
 exports.SETTINGS_EXTRA_MESSAGES=SETTINGS_EXTRA_MESSAGES;
 exports.settingsExtraText=settingsExtraText;
 exports.countUnicodeGraphemes=countUnicodeGraphemes;
@@ -18914,8 +17213,6 @@ exports.createModelConfigHost=createModelConfigHost;
 exports.MODEL_REASONING_EFFORTS=Object.freeze([
 "off","minimal","low","medium","high","xhigh","max",
 ]);
-exports.describeExpertGroupClientCapabilities=describeExpertGroupClientCapabilities;
-exports.describeExpertGroupDiagnostics=describeExpertGroupDiagnostics;
 exports.describeDegPluginDetailSummary=describeDegPluginDetailSummary;
 exports.resolveDegSettingsSectionOpener=resolveDegSettingsSectionOpener;
 exports.DEG_PLUGIN_DETAIL_SLOT_NAME=DEG_PLUGIN_DETAIL_SLOT_NAME;

@@ -75,46 +75,24 @@ export const READONLY_DENY = [
 ];
 
 /**
- * 运行期角色工具名扩展：自定义角色把 id 同时用作工具名，因此所有专家 child（无论
- * 内置还是自定义、只读还是可写）都必须把「自定义角色工具」与「Harness 外层入口
- * subagent_<id>」加入自己的委派 deny，否则新增角色会成为一个可绕过 parent 的入口。
+ * 单个内置角色的完整 deny 候选。
  *
- * 只接受注册表记录（而不是设置原始值）：调用方必须先走 createRoleRegistry 归一。
- * @param {object[]} [records] - 运行期注册表记录。
- * @returns {string[]} 需要并入委派 deny 的额外工具名（未去重，交给最终 Set 收敛）。
- */
-export function customRoleDenyExtensions(records) {
-  const names = [];
-  for (const entry of Array.isArray(records) ? records : []) {
-    if (entry?.custom !== true || typeof entry.id !== "string" || entry.id.length === 0) continue;
-    names.push(typeof entry.toolName === "string" && entry.toolName.length > 0 ? entry.toolName : entry.id);
-    names.push("subagent_" + entry.id);
-  }
-  return names;
-}
-
-/**
- * 单个角色的完整 deny 候选（票据 27）。
- *
- * 组合规则与内置角色完全同源，绝不为自定义角色新增「默认放开」路径：
- * - 只读角色：READONLY_DENY（已含委派与 root-only） + 自身 toolDeny + 运行期扩展；
- * - 可写角色：EXPERT_DELEGATION_DENY + ROOT_ONLY_TOOL_DENY + 自身 toolDeny + 运行期扩展。
+ * - 只读角色：READONLY_DENY（已含委派与 root-only）；
+ * - 可写角色：EXPERT_DELEGATION_DENY + ROOT_ONLY_TOOL_DENY。
  * 未知角色由调用方按只读处理（fail-closed），这里不提供默认分支。
  *
  * @param {object|undefined} entry - 注册表记录。
- * @param {string[]} [extensions] - customRoleDenyExtensions() 的结果。
  * @returns {string[]} 去重后的 deny 候选（仍需按宿主可见性过滤）。
  */
-export function expertDenyCandidates(entry, extensions = []) {
+export function expertDenyCandidates(entry) {
   // 未知/缺失记录一律按只读处理（fail-closed）：绝不能因为查询不到角色就给出更宽的集合。
   const base = entry === void 0 || entry === null || entry.readOnly === true
     ? READONLY_DENY
     : [...EXPERT_DELEGATION_DENY, ...ROOT_ONLY_TOOL_DENY];
-  const own = Array.isArray(entry?.toolDeny) ? entry.toolDeny : [];
-  return [...new Set([...base, ...own, ...(Array.isArray(extensions) ? extensions : [])])];
+  return [...new Set(base)];
 }
 
-/** 注册表记录 → 显示名映射（冻结副本）；自定义角色与内置角色同源投影。 */
+/** 注册表记录 → 显示名映射（冻结副本）。 */
 export function roleLabelsOf(records) {
   const map = {};
   for (const entry of Array.isArray(records) ? records : []) {
@@ -2830,8 +2808,8 @@ export function countPromptGraphemes(text) {
  * - 超过 grapheme 上限的文本被丢弃（Host 在写入边界会显式拒绝，这里只保证读取安全）。
  *
  * @param {unknown} value - settings 文档里的 promptOverrides 原始值。
- * @param {readonly string[]} [allowedRoles] - 允许的角色集合；运行期目录（内置 + 自定义）
- *   由调用方传入，缺省为内置六角色。自定义角色的提示词覆盖因此走同一条读取归一。
+ * @param {readonly string[]} [allowedRoles] - 允许的角色集合；运行期目录由调用方传入，
+ *   缺省为内置六角色。
  * @returns {Record<string,string>} 归一后的普通对象（含 0 个键表示无覆盖）。
  */
 export function normalizePromptOverrides(value, allowedRoles = STATUS_ROLE_IDS) {
@@ -3490,6 +3468,10 @@ export const MESSAGE_CATALOG = Object.freeze({
   "settings.noProvider": { zh: "无", en: "None" },
   "settings.observerPreferred": { zh: "Observer优先", en: "Prefer Observer" },
   "settings.concurrencyLimit": { zh: "单个角色并发上限", en: "Per-role concurrency limit" },
+  "settings.concurrencyLimit.title": {
+    zh: "取值范围 1–64 的整数；默认 20；保存后生效",
+    en: "An integer from 1–64; defaults to 20; takes effect after saving",
+  },
   "settings.roleTimeout": { zh: "角色默认超时 (s)", en: "Default role timeout (s)" },
   "settings.roleTimeout.title": {
     zh: "默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
@@ -3500,25 +3482,6 @@ export const MESSAGE_CATALOG = Object.freeze({
   "settings.discard": { zh: "放弃修改", en: "Discard changes" },
   "settings.saved": { zh: "已保存", en: "Saved" },
   "settings.unsaved": { zh: "有未保存的修改", en: "Unsaved changes" },
-  "settings.diagnostics.title": { zh: "诊断与通知状态", en: "Diagnostics and notification status" },
-  "settings.diagnostics.capabilities": { zh: "能力矩阵", en: "Capabilities" },
-  "settings.diagnostics.runtime": { zh: "运行时诊断", en: "Runtime diagnostics" },
-  "settings.diagnostics.budget": { zh: "预算用量与最近违规", en: "Budget usage and latest violation" },
-  "settings.diagnostics.persistence": { zh: "持久化与恢复", en: "Persistence and recovery" },
-  "settings.diagnostics.notifications": { zh: "通知投递", en: "Notification delivery" },
-  "settings.diagnostics.loading": { zh: "正在读取宿主诊断…", en: "Loading host diagnostics…" },
-  "settings.diagnostics.unavailable": {
-    zh: "宿主诊断不可用；以下只显示客户端能力。",
-    en: "Host diagnostics are unavailable; only client capabilities are shown below.",
-  },
-  "settings.diagnostics.absent": {
-    zh: "宿主未提供诊断数据；以下只显示客户端能力。",
-    en: "The host provided no diagnostics; only client capabilities are shown below.",
-  },
-  "settings.testNotification": { zh: "发送测试通知", en: "Send test notification" },
-  "settings.testNotification.sending": { zh: "发送中…", en: "Sending…" },
-  "settings.testNotification.sent": { zh: "已发送测试通知", en: "Test notification sent" },
-  "settings.testNotification.disabled": { zh: "通知已关闭，未发送测试通知", en: "Notifications are off; test notification not sent" },
   "announce.start": { zh: "任务开始：{name}", en: "Task started: {name}" },
   "announce.finish": { zh: "任务完成：{name}", en: "Task finished: {name}" },
   "announce.fail": { zh: "任务失败：{name}", en: "Task failed: {name}" },
@@ -4034,7 +3997,7 @@ export const CONTEXT_INHERITANCE_ERROR_CODES = Object.freeze({
  * 允许开启上下文继承的内置角色集合（票据 29）。
  *
  * 只包含内置非 Observer 角色：Observer 的安全边界是“只接收视觉任务、不接收用户上下文”，
- * 自定义角色也必须显式走后续票据的权限模型，因此二者一律不允许出现在设置映射里。
+ * 因此不允许出现在设置映射里。
  */
 export const CONTEXT_INHERITANCE_ROLE_IDS = Object.freeze(ROLES.slice());
 

@@ -774,8 +774,8 @@ function projectSessionNode(record, { kind, id, sessionId }) {
     content: firstText(source?.content, source?.prompt),
     contentSource: textOrNull(source?.contentSource),
     role: textOrNull(source?.role),
-    // 角色显示名（票据 27）：自定义角色删除后历史任务仍能显示标签；缺失为 null，
-    // 客户端回退 role 或原生文案，绝不猜一个显示名。
+    // 角色显示名（票据 27）：角色被删除后（包括历史上已删除的自定义角色），
+    // 历史任务仍能显示标签；缺失为 null，客户端回退 role 或原生文案，绝不猜一个显示名。
     roleLabel: textOrNull(source?.roleLabel),
     ...(turnDurationMs === null ? {} : { turnDurationMs }),
     // 用量（票据 25）：root/expert 节点都可能带 usage；缺失时整字段省略。
@@ -1234,7 +1234,8 @@ function computeSnapshotRevision(snapshot) {
  * @param {object} [input.recovery] - 可选的恢复状态候选（来自 fanoutHost.restoreStatus()）。
  *   提供时投影为顶层可选 recovery 块；未提供时**整块省略**（旧调用方/旧 Host 兼容，
  *   客户端按缺失回退为「没有恢复错误」）。
- * @param {object} [input.roleLabels] - 角色 id → 显示名（票据 27，含自定义角色）。
+ * @param {object} [input.roleLabels] - 角色 id → 显示名（票据 27，含历史角色显示名，
+ *   包括已删除角色的持久化标签）。
  *   提供时投影为顶层 roleLabels；未提供/为空时整块省略，客户端回退原生文案。
  * @returns {object} schemaVersion:1 的只读 JSON 树。
  */
@@ -1253,7 +1254,8 @@ export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks
     sessionId: rootSessionId,
     rootSessionId,
     generatedAt: numberOrNull(generatedAt),
-    // 角色显示名（票据 27）：含自定义角色；schemaVersion 仍为 1（纯增量字段）。
+    // 角色显示名（票据 27）：含历史角色显示名（包括已删除角色的持久化标签）；
+    // schemaVersion 仍为 1（纯增量字段）。
     ...(projectedRoleLabels === null ? {} : { roleLabels: projectedRoleLabels }),
     // partial 只有明确 true 才为 true：完整快照与旧调用方一律是权威快照（false）。
     partial: partial === true,

@@ -48,9 +48,9 @@ import {
   STATUS_ROLE_IDS, PROMPT_OVERRIDES_SETTINGS_KEY, PROMPT_OVERRIDE_MAX_GRAPHEMES,
   PROMPT_OVERRIDE_INVALID_CODE, PROMPT_OVERRIDE_UNKNOWN_ROLE_CODE,
   normalizePromptOverrides, promptOverrideFor, countPromptGraphemes,
-  // 自定义角色（票据 27）：deny 组合与角色显示名投影只来自 shared.js 的纯函数，
-  // 保证工具面、guard 与 RPC 元数据使用同一套规则。
-  expertDenyCandidates, customRoleDenyExtensions, roleLabelsOf, roleDescriptionsOf, roleStatusLabelsOf,
+  // deny 组合与角色显示名投影只来自 shared.js 的纯函数，保证工具面、guard 与
+  // RPC 元数据使用同一套规则。
+  expertDenyCandidates, roleLabelsOf, roleDescriptionsOf, roleStatusLabelsOf,
   resolveHostLocale, translateMessage,
   // 模型候选与启动前 fallback（票据 24）：纯函数/常量只来自 shared.js，组合根与
   // Host 投影模块共用同一套判定，避免出现两份候选顺序与错误分类实现。
@@ -70,15 +70,7 @@ import {
   STRUCTURED_RESULT_FALLBACK_REASONS, utf8ByteLength, projectStructuredResult,
   structuredProjectionFields,
 } from "./shared.js";
-import {
-  createRoleRegistry,
-  customRoleRecords,
-  normalizeCustomRoleDefinitions,
-  assertCustomRoleDefinitions,
-  customRoleDefinitionsDocument,
-  ROLE_REGISTRY,
-  RoleRegistryError,
-} from "./role-registry.js";
+import { ROLE_REGISTRY } from "./role-registry.js";
 import {
   channelEndpointFromPath,
   createConnectionRpcHandler,
@@ -88,6 +80,7 @@ import {
 } from "./rpc-host.js";
 import { createHostComposition } from "./host/composition.js";
 import { createSettingsRuntimeModule, SettingsDirectoryChangedError } from "./host/settings-runtime.js";
+import { findSettingsDescriptor } from "./host/settings-source.js";
 import { createRecoveryModule } from "./host/recovery.js";
 import { createRootTurnWaitRegistry } from "./host/turn-wait.js";
 import { createFanoutRuntimeModule } from "./host/fanout-runtime.js";
@@ -768,44 +761,18 @@ function ensureExpertSendMessageDenied(toolFilter) {
 }
 
 /**
- * 运行期角色目录（票据 27）：内置 6 角色 + 设置里声明的自定义角色。
+ * 当前生效的角色目录：内置六角色注册表（模块常量）。
  *
- * 为什么不是模块级常量：自定义角色来自 settings，只有插件实例在 settings 读源绑定后
- * 才知道完整集合。这里用一个**实例栈**暴露「当前运行期目录」给模块级的 guard 与
- * 身份判定函数（它们不持有 apply 闭包），同时在插件卸载时精确出栈，避免测试/多实例
- * 场景互相污染。栈为空时一律回落到内置注册表（绝不出现「没有目录 = 放开权限」）。
- *
- * 目录只由 createRoleRegistry 构造：内置记录在前、自定义记录按 id 字典序追加，
- * 两边都走同一条 fail-closed 归一，因此不存在第二套角色校验。
+ * 自定义角色能力已删除，角色集合不再随设置变化；模块级 guard 与身份判定
+ * （它们不持有 apply 闭包）仍统一读这一份目录，未知角色按 fail-closed 处理。
  */
-const runtimeRoleCatalogStack = [];
-
-/** 当前生效的运行期角色目录（栈顶；空栈回落到内置注册表）。 */
 function currentRoleCatalog() {
-  return runtimeRoleCatalogStack.length === 0
-    ? ROLE_REGISTRY
-    : runtimeRoleCatalogStack[runtimeRoleCatalogStack.length - 1].registry;
+  return ROLE_REGISTRY;
 }
 
-/** 注册一个实例级目录持有者（apply 时调用；卸载时精确出栈）。 */
-function pushRuntimeRoleCatalog(holder) {
-  runtimeRoleCatalogStack.push(holder);
-}
-
-/** 注销目录持有者：只移除同一个对象，迟到的其它实例不会误删当前栈顶。 */
-function popRuntimeRoleCatalog(holder) {
-  const index = runtimeRoleCatalogStack.lastIndexOf(holder);
-  if (index !== -1) runtimeRoleCatalogStack.splice(index, 1);
-}
-
-/** 角色记录查询（内置与自定义同源）；未知角色返回 undefined。 */
+/** 角色记录查询；未知角色返回 undefined。 */
 function roleCatalogEntry(role) {
   return currentRoleCatalog().get(role);
-}
-
-/** 运行期自定义角色的工具名扩展（角色工具 + subagent_<id>），供委派 deny 使用。 */
-function runtimeCustomRoleToolNames() {
-  return customRoleDenyExtensions(currentRoleCatalog().records());
 }
 
 /** 子代理 child.options 上携带的推理深度 marker，避免依赖未公开的 AgentOptions.reasoningEffort。 */
@@ -863,10 +830,9 @@ function validPersonaMarker(value) {
 }
 
 /**
- * 角色是否是当前运行期目录里的专家角色。
+ * 角色是否是内置目录里的专家角色。
  *
- * 内置与自定义角色同源：目录由 createRoleRegistry 构造，因此这里既不会把未知角色
- * 当成专家（避免为无关 child 安装 guard），也不会漏掉自定义角色。
+ * 这里不会把未知角色当成专家（避免为无关 child 安装 guard）。
  */
 function isRegisteredExpertRole(role) {
   return typeof role === "string" && role.length > 0 && currentRoleCatalog().has(role);
@@ -875,9 +841,9 @@ function isRegisteredExpertRole(role) {
 /**
  * 持久化 child_models 记录上的插件 admission 证据。
  *
- * 用途（票据 27）：自定义角色可能在 child 创建后被删除；此时角色已不在运行期目录里，
- * 但该 child 的恢复/guard 不能因此失去人格与 deny 边界。只有**插件写入**的 deny/persona
- * 快照才能作为证据（live marker 上的任意 role 字符串不算），因此 spoof metadata 仍然无效。
+ * 用途：历史 child 的冷恢复无法再从当前目录重建人格/deny 边界时，只有**插件写入**的
+ * deny/persona 快照才能作为证据（live marker 上的任意 role 字符串不算），因此
+ * spoof metadata 仍然无效。
  *
  * @param {unknown} record - child_models 快照记录。
  * @returns {boolean} 该记录是否带有 DEG admission 写入的边界快照。
@@ -916,8 +882,8 @@ function isPluginExpertChildRecord(record) {
     && typeof record === "object"
     && !Array.isArray(record)
     && typeof record.role === "string"
-    // 角色仍在运行期目录，或记录带有插件 admission 写入的 deny/persona 快照
-    // （自定义角色创建后被删除的冷恢复路径）。两者都不满足时不是插件专家身份。
+    // 角色仍在内置目录，或记录带有插件 admission 写入的 deny/persona 快照
+    // （冷恢复路径）。两者都不满足时不是插件专家身份。
     && (isRegisteredExpertRole(record.role) || hasPluginAdmissionProof(record))
     && typeof record.parentId === "string"
     && record.parentId.length > 0
@@ -946,8 +912,8 @@ export function resolveExpertReportIdentity(options, childId, readChildModel) {
     role: record.role,
     parentId: record.parentId,
     source: "snapshot",
-    // 自定义角色被删除后的冷恢复：记录里的 deny/persona 快照证明它曾通过 DEG
-    // admission。只有 true 才写入，保持既有身份形状（历史测试逐键断言）。
+    // 冷恢复：记录里的 deny/persona 快照证明它曾通过 DEG admission。
+    // 只有 true 才写入，保持既有身份形状（历史测试逐键断言）。
     ...(hasPluginAdmissionProof(record) ? { admissionProof: true } : {}),
   };
 }
@@ -1019,15 +985,12 @@ const MAX_EXPERT_DENY_MARKER_ENTRIES = 512;
  * report/delegation/root-only 工具。run_code 是 Code Mode 展示传输，保持既有放行语义。
  */
 function expertGuardDenyNames(options, identity) {
-  // 只读性来自运行期目录；未知角色（含已删除的自定义角色）按只读处理（fail-closed）。
+  // 只读性来自内置角色目录；未知角色按只读处理（fail-closed）。
   const roleEntry = roleCatalogEntry(identity?.role);
   const fallback = roleEntry === void 0 || roleEntry.readOnly === true
     ? READONLY_DENY
     : [...EXPERT_DELEGATION_DENY, ...ROOT_ONLY_TOOL_DENY];
-  // 自定义角色（票据 27）：自身 toolDeny 与运行期角色工具名始终叠加，
-  // 因此只读自定义角色仍被写工具拒绝，可写自定义角色也不能再委派/调用 root-only 工具。
-  const ownDeny = Array.isArray(roleEntry?.toolDeny) ? roleEntry.toolDeny : [];
-  const denyNames = new Set(ensureExpertSendMessageDenied([...fallback, ...ownDeny]).filter((name) => name !== "run_code"));
+  const denyNames = new Set(ensureExpertSendMessageDenied([...fallback]).filter((name) => name !== "run_code"));
   const marked = options?.[DENY_MARKER];
   if (marked === void 0) return denyNames;
   const policyNames = new Set([
@@ -1035,15 +998,11 @@ function expertGuardDenyNames(options, identity) {
     ...ROOT_ONLY_TOOL_DENY,
     ...READONLY_DENY,
     "send_message",
-    // marker 里可能合法地包含自定义角色的 toolDeny 与运行期角色工具名：
-    // 它们是 admission 时由同一套规则算出的候选，不能因"不在静态清单里"被判成伪造。
-    ...ownDeny,
-    ...runtimeCustomRoleToolNames(),
   ]);
   if (!Array.isArray(marked) || marked.length === 0 || marked.length > MAX_EXPERT_DENY_MARKER_ENTRIES) return void 0;
-  // 自定义角色删除后的恢复：角色已不在目录，它自己的非 MCP toolDeny 名称无法再用当前目录
-  // 证明合法。此时只接受带 admission 证据的身份（插件写入的 deny/persona 快照），并且仍然
-  // 只**追加** deny —— 多一个拒绝名称不会放大权限，缺少名称也不会绕过下面的静态 fallback。
+  // 历史 child 的 marker 可能携带 admission 时的 deny 快照：只接受带 admission 证据的身份
+  // （插件写入的 deny/persona 快照），并且仍然只**追加** deny —— 多一个拒绝名称不会放大权限，
+  // 缺少名称也不会绕过下面的静态 fallback。
   const trustedMarker = identity?.admissionProof === true;
   for (const name of marked) {
     // 动态 MCP 名称由 readonly admission 的 schema 快照产生；其余名称必须属于
@@ -1664,7 +1623,24 @@ const DEFAULT_NOTIFICATION_EVENTS = Object.freeze({ completed: true, waiting: tr
  * 常量与归一函数都来自 host/system-toast.js，保证设置读取面与投递面用的是同一套规则。
  */
 const DEFAULT_NOTIFICATION_VOLUME_SETTING = DEFAULT_NOTIFICATION_VOLUME;
-const DEFAULT_ROLE_CONCURRENCY_LIMIT = 10;
+/**
+ * per-role 并发上限的默认值（未显式保存 `roleConcurrencyLimit` 时使用）。
+ *
+ * 与客户端展示/归一（client.js 的 normalizeRoleConcurrencyLimit）和设置页 title 文案
+ * 保持同一数值；只影响没有该字段的历史配置，已显式保存的旧值仍按原值生效。
+ */
+const DEFAULT_ROLE_CONCURRENCY_LIMIT = 20;
+/**
+ * 内部配置迁移目标版本（持久化在 settings.configMigrationVersion）。
+ *
+ * 版本 1 = 「旧默认并发上限 10 → 20」的**读取别名 + 首次保存落标记**方案：
+ * - 标记缺失/小于该版本时，读取面把恰好等于旧默认值 10 的配置按 20 展示与调度；
+ * - 第一次 settings-commit 会把标记与其它字段写进同一份 patch；
+ * - 标记落盘后 10 原样保留，用户可随时手动改回 10。
+ */
+const CONFIG_MIGRATION_VERSION = 1;
+/** 旧默认并发上限：只有恰好等于该值的配置才会被读取别名按 20 解释。 */
+const LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT = 10;
 /**
  * 角色级默认超时（毫秒，票据 06）：默认 10 小时，显式 0 = 不启用。
  *
@@ -1680,6 +1656,33 @@ function normalizeRoleConcurrencyLimit(value) {
     : DEFAULT_ROLE_CONCURRENCY_LIMIT;
 }
 
+/** 读取面归一：内部迁移版本（缺省/非法按 0 处理，与 Host 首次保存的补写规则一致）。 */
+function normalizeConfigMigrationVersion(snapshot) {
+  const rawVersion = snapshot?.configMigrationVersion;
+  return Number.isSafeInteger(rawVersion) && rawVersion >= 0 ? rawVersion : 0;
+}
+
+/**
+ * 读取面归一：把「旧默认值 10 + 尚未落迁移标记」解释为新默认值 20。
+ *
+ * 背景：默认值从 10 调整为 20 后，旧 profile 里显式保存的 10 在标记缺失时必须按 20
+ * 展示与调度，否则用户升级后仍会看到/使用旧默认值。标记只在**首次保存**时随 patch
+ * 落盘（不依赖启动期 describe 可见性）；标记落盘后 10 原样保留，用户之后手动改回
+ * 10 不会被再次改写。
+ *
+ * 这是纯读取别名：绝不改写写入值，用户自定义的其它合法值完全不受影响。
+ *
+ * @param {object|undefined} snapshot - 已保存的 settings 文档（或已归一快照）。
+ * @returns {number} 1~64 的生效并发上限。
+ */
+function normalizeRoleConcurrencyLimitForRead(snapshot) {
+  const limit = normalizeRoleConcurrencyLimit(snapshot?.roleConcurrencyLimit);
+  return normalizeConfigMigrationVersion(snapshot) < CONFIG_MIGRATION_VERSION
+    && limit === LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT
+    ? DEFAULT_ROLE_CONCURRENCY_LIMIT
+    : limit;
+}
+
 /**
  * 读取面诊断条数上限（票据 26）：非法 roleLimits/providerLimits 条目只保留有界摘要，
  * 诊断面因此不随用户写坏多少键而增长。
@@ -1689,7 +1692,7 @@ const LIMIT_DIAGNOSTIC_LIMIT = 16;
 /**
  * 读取面归一：roleLimits（逐角色并发上限映射，票据 26）。
  *
- * 语义与其它设置读取面一致（票据 27 的自定义角色同款）：
+ * 语义与其它设置读取面一致：
  * - 缺字段（旧配置/旧客户端）= 空映射，不是错误；
  * - 非法/越界值、未知角色键**丢弃并诊断**，绝不让设置页因一份坏文档打不开；
  * - 写入面（settings-commit）仍严格拒绝整份候选，读取面的宽容只服务历史文档
@@ -1791,7 +1794,7 @@ function normalizeNotificationEvents(value) {
  * 插件组合 Config。
  *
  * 前两个字段是插件启停配置（普通 Config）：它们是部署期行为，不是设置页的即时偏好。
- * 其余十一个字段是设置页可即时修改的偏好，必须标记 `.volatile()`：DSH 0.1.7 的
+ * 其余字段是设置页可即时修改的偏好，必须标记 `.volatile()`：DSH 0.1.7 的
  * `ctx.settings` 只把「本条目 Config 上的 volatile 字段」投影成可编辑表单，并且
  * **只有声明了 volatile 字段的条目才会出现在 `describe()` 中**；写入非 volatile
  * 路径会被宿主直接拒绝。
@@ -1799,7 +1802,8 @@ function normalizeNotificationEvents(value) {
  * 字段语义与默认值必须与设置页的读取面一致：`describe()` 返回的 value 是
  * defaults resolved 后的结果（provider 空字符串表示用户尚未选择 provider，
  * promptOverrides 空对象表示全部跟随代码默认 persona）。运行期读源由
- * host/settings-source 从 describe() 取得，提交端点只写这十一个字段。
+ * host/settings-source 从 describe() 取得，提交端点只写设置页可改的偏好字段
+ * （`configMigrationVersion` 例外：它是内部迁移版本，不对用户展示、也不在提交端点写入面内）。
  */
 const Config = z.object({
   // 主代理能力默认启用；false 可用于仅使用专家工具的兼容部署。
@@ -1819,6 +1823,15 @@ const Config = z.object({
     failed: z.boolean().default(true),
   }).default({}).volatile(),
   roleConcurrencyLimit: z.number().step(1).min(1).max(64).default(DEFAULT_ROLE_CONCURRENCY_LIMIT).volatile(),
+  /**
+   * 内部配置迁移版本（volatile 只是让宿主允许插件写入并投影 describe）。
+   *
+   * 0 = 尚未落下标记；1 = 已落标记（当前只包含旧默认并发上限 10 → 20 的读取别名）。
+   * 该字段不在设置页展示，也不进入 settings-commit 的候选；它由 Host 在首次成功
+   * 保存时与其它字段写入同一份 patch，用来关闭读取别名：标记落盘后，用户手动把
+   * roleConcurrencyLimit 改回 10 会原样保留，绝不会被再次解释成 20。
+   */
+  configMigrationVersion: z.number().step(1).min(0).default(0).volatile(),
   /**
    * 逐角色并发上限覆盖（票据 26）：roleId -> 1..64。未出现的角色落到 roleConcurrencyLimit。
    *
@@ -1863,17 +1876,10 @@ const Config = z.object({
   // 使用代码里的默认 persona；这里只做类型层（角色键与长度）校验，写入边界的
   // 语义校验在 DEG 自有提交端点内（宿主新契约没有 validate 钩子）。
   promptOverrides: z.dict(z.string()).default({}).volatile(),
-  // 自定义角色（票据 27）：roleId -> definition。
-  // - 这里只声明「任意值字典」：字段级 fail-closed 校验（readOnly 必须布尔、toolDeny 必须
-  //   显式字符串数组、未知字段拒绝、id/长度/数量上限、不得覆盖内置与保留名）由 DEG 自有
-  //   提交端点调用 role-registry 的 assertCustomRoleDefinitions 完成；读取面由
-  //   normalizeCustomRoleDefinitions 丢弃非法条目并诊断。
-  // - 缺字段 = 旧配置/旧客户端：读取为空，保存时保持已有自定义角色（不删除）。
-  customRoles: z.dict(z.any()).default({}).volatile(),
   /**
    * 角色级上下文继承开关（票据 29）：roleId -> boolean。
    *
-   * - 只有内置非 Observer 角色可开启；Observer/未知/自定义角色由 DEG 自有提交端点
+   * - 只有内置非 Observer 角色可开启；Observer/未知角色由 DEG 自有提交端点
    *   整次拒绝（fail-closed），读取面对外部坏值丢弃并诊断；
    * - 缺字段 = 旧配置/旧客户端：读取为空映射（全部关闭），保存时保持已有映射；
    * - 显式空对象 = 全部关闭（与缺字段语义不同）。volatile 是设置页可即时修改的前提。
@@ -1958,8 +1964,8 @@ export const DOMAIN_CHILD_MODEL_RECORD = domainZ.object({
     messageId: domainZ.string().optional(),
     acceptedAt: domainZ.number().int().nonnegative().optional(),
   }).optional(),
-  // 角色显示名快照（票据 27）：自定义角色被删除后历史任务仍能显示标签；
-  // 与 role 同层持久化，投影只读不改写。缺失时投影回落运行期目录或 null。
+  // 角色显示名快照：历史记录在角色不再可用时仍能显示标签；
+  // 与 role 同层持久化，投影只读不改写。缺失时投影回落内置目录或 null。
   roleLabel: domainZ.string().optional(),
   /**
    * 用量账本（票据 25）：可选、有界、只读持久化值。
@@ -2062,9 +2068,6 @@ const EXPERT_STORAGE_DOMAIN_SPEC = defineDomain({
  *
  * 比较是**逐字精确比较**，不做 trim 或空白折叠：首尾空白不同的文本仍算自定义覆盖。
  *
- * 自定义角色（票据 27）的默认 persona 是 persona ?? description，由调用方传入同一解析
- * 函数，因此「覆盖恰好等于自定义角色默认值」同样折算成没有覆盖。
- *
  * @param {Record<string,string>} overrides - 已归一（角色键合法、非空白、未超上限）的覆盖映射。
  * @param {(role: string) => string|undefined} [defaultPersonaOf] - 角色默认 persona 解析。
  * @returns {Record<string,string>} 删除默认副本后的映射。
@@ -2104,23 +2107,10 @@ function normalizeModelCandidatesForRead(value, allowedRoles = STATUS_ROLE_IDS) 
 }
 
 /**
- * 自定义角色读取归一（fail-soft）：非法条目丢弃并返回诊断。
- *
- * 读取面绝不因为一个坏定义阻塞整份设置；写入面（assertCustomRoleDefinitions）对同一批
- * 规则显式拒绝。诊断只含角色 id、稳定 code 与人类可读消息，不含用户正文。
- *
- * @param {unknown} value - settings 里的 customRoles 原始值。
- * @returns {{definitions: Record<string, object>, diagnostics: Array<object>}} 归一结果。
- */
-function normalizeCustomRolesForRead(value) {
-  return normalizeCustomRoleDefinitions(value);
-}
-
-/**
  * 上下文继承映射的读取归一（票据 29，fail-soft）。
  *
- * 读取面必须对历史文档、外部写入与旧客户端保持宽容：非法键（Observer、未知角色、
- * 自定义角色）与非布尔值一律丢弃并返回稳定诊断；合法值只保留显式 true（显式 false
+ * 读取面必须对历史文档、外部写入与旧客户端保持宽容：非法键（Observer、未知角色）
+ * 与非布尔值一律丢弃并返回稳定诊断；合法值只保留显式 true（显式 false
  * 与缺失同义，都是“关闭”）。缺字段 = 空映射 = 全部关闭（旧配置兼容）。
  *
  * 写入面（assertInheritContextCandidate）对同一批规则显式拒绝，绝不静默丢键。
@@ -2184,7 +2174,7 @@ function projectInheritContextDiagnostics(value) {
  *
  * 规则：
  * - 值必须是普通对象（数组/null 都拒绝）；
- * - 键必须是内置非 Observer 角色：Observer 的安全边界、未知角色与自定义角色一律拒绝；
+ * - 键必须是内置非 Observer 角色：Observer 的安全边界与未知角色一律拒绝；
  * - 值必须是布尔；显式 false 被接受并归一成“关闭”（不写入映射）；
  * - 空对象是合法的“清空全部”，与缺字段（保持原值）语义不同。
  *
@@ -2211,27 +2201,6 @@ function assertInheritContextCandidate(value) {
     if (enabled === true) normalized[role] = true;
   }
   return normalized;
-}
-
-/**
- * 读取期自定义角色诊断的有界投影（meta 用）。
- *
- * 只保留角色 id、稳定 code 与截断后的人类可读消息：不含用户正文、不随条目数无界增长。
- * @param {unknown} value - normalizeSnapshot 的 customRoleDiagnostics。
- * @returns {object[]} 冻结的只读诊断数组（最多 32 条）。
- */
-function projectCustomRoleDiagnostics(value) {
-  const list = Array.isArray(value) ? value : [];
-  const projected = [];
-  for (const entry of list.slice(0, 32)) {
-    if (entry === null || typeof entry !== "object") continue;
-    projected.push(Object.freeze({
-      role: typeof entry.role === "string" ? entry.role : "",
-      code: typeof entry.code === "string" ? entry.code : "INVALID_CUSTOM_ROLE",
-      message: typeof entry.message === "string" ? entry.message.slice(0, 240) : "",
-    }));
-  }
-  return Object.freeze(projected);
 }
 
 /**
@@ -2339,14 +2308,10 @@ function normalizeSnapshot(snapshot, visibleRoles) {
     ? inferredProvider
     : legacyProvider;
   const volume = Number(snapshot?.notificationVolume);
-  // 自定义角色（票据 27）：读取面先归一，非法条目丢弃并诊断；这里的 definitions 也是
-  // 运行期目录的唯一来源（activeRoles/describeRolePrompts/RPC meta 全部基于它重建）。
-  const customRoleRead = normalizeCustomRolesForRead(snapshot?.customRoles);
-  // 对外投影使用「文档形状」（不含派生 id）：设置页编辑器读到的就是它保存时的字段集合。
-  const customRoles = customRoleDefinitionsDocument(customRoleRead.definitions);
-  const knownRoleIds = Object.freeze([...STATUS_ROLE_IDS, ...Object.keys(customRoles)]);
+  // 角色集合固定为内置六角色（自定义角色能力已删除）。
+  const knownRoleIds = STATUS_ROLE_IDS;
   /**
-   * 并发映射读取面（票据 26）：角色键按**本快照自己的角色集**校验（含自定义角色），
+   * 并发映射读取面（票据 26）：角色键按内置角色集校验，
    * provider 键只要求非空字符串。非法条目丢弃并诊断，缺字段 = 空映射（旧配置兼容）。
    */
   const roleLimitsRead = normalizeRoleLimitsForRead(snapshot?.roleLimits, knownRoleIds);
@@ -2369,21 +2334,20 @@ function normalizeSnapshot(snapshot, visibleRoles) {
     // 用户文本保留原始首尾空白与换行：归一绝不 trim 已接受的覆盖。
     promptOverrides: pruneDefaultPromptOverrides(
       normalizePromptOverrides(snapshot?.[PROMPT_OVERRIDES_SETTINGS_KEY], knownRoleIds),
-      (role) => {
-        const definition = customRoles[role];
-        if (definition !== undefined) {
-          return typeof definition.persona === "string" && definition.persona.length > 0
-            ? definition.persona
-            : definition.description;
-        }
-        return DEFAULT_EXPERT_PERSONA[role];
-      },
+      (role) => DEFAULT_EXPERT_PERSONA[role],
     ),
     notificationEnabled: snapshot?.notificationEnabled !== false,
     notificationVolume: Number.isFinite(volume) ? Math.min(100, Math.max(0, Math.round(volume))) : 100,
     // 通知事件类型（票据 14）：旧文档缺字段 => 三个类别全开（历史行为）。
     notificationEvents: normalizeNotificationEvents(snapshot?.notificationEvents),
-    roleConcurrencyLimit: normalizeRoleConcurrencyLimit(snapshot?.roleConcurrencyLimit),
+    // 读取别名：旧默认值 10 + 标记缺失 => 20；标记落盘后 10 原样保留。
+    roleConcurrencyLimit: normalizeRoleConcurrencyLimitForRead(snapshot),
+    /**
+     * 内部迁移标记（只读）：读取别名必须幂等。readStorageSnapshot 会对已归一快照再做
+     * 一次防御性归一，如果这里丢掉标记，"标记=1 + 10" 会在第二次归一里被重新解释成
+     * 20（meta 与调度器读到的值不一致）。它不是设置页字段，也不进入提交候选。
+     */
+    configMigrationVersion: normalizeConfigMigrationVersion(snapshot),
     /**
      * 逐角色并发上限（票据 26）：旧配置缺字段 => 空映射（全部落到 roleConcurrencyLimit
      * 默认值），读取面非法条目已被丢弃，调度器因此永远拿不到越界值。
@@ -2410,12 +2374,7 @@ function normalizeSnapshot(snapshot, visibleRoles) {
     // 角色默认超时：旧配置/非法值归一为 0（不启用），不阻断读取。
     roleTimeoutMs: normalizeRoleTimeoutMs(snapshot?.roleTimeoutMs),
     // 模型候选（票据 24）：非法读取值回退为空映射；缺字段的旧配置同样为空。
-    // 角色集合含自定义角色（票据 27）：新角色的候选不会被读取面丢弃。
     candidates: normalizeModelCandidatesForRead(snapshot?.candidates, knownRoleIds),
-    // 自定义角色定义（票据 27）：空对象表示没有自定义角色（旧配置天然兼容）。
-    customRoles,
-    // 读取期丢弃的自定义角色诊断（只读；RPC meta 投影有界副本）。
-    customRoleDiagnostics: Object.freeze(customRoleRead.diagnostics.slice()),
     // 自动降级上限：缺失/非法回退默认 2，读取面永远给出 0..4 的合法整数。
     fallbackLimit: normalizeModelFallbackLimit(snapshot?.fallbackLimit),
     // 单价（票据 25）：只读归一后的数组（每项 provider/model/inputPerMillion/
@@ -2473,6 +2432,22 @@ export default {
       settingsRuntime.updateAtGeneration(patch, expectedRevision, generation);
     const agents = ctx.agents;
     const settings = ctx.settings;
+    /**
+     * 本次 settings-commit 是否需要落下配置迁移标记（读取面别名的持久化开关）。
+     *
+     * 只在**真正保存**时读一次当前文档，因此不依赖启动期 describe 是否已投影本条目：
+     * 桌面版 apply 阶段 describe 里可能还没有本插件条目，启动写回会静默跳过。
+     * describe 不可读/条目缺失按缺省版本 0 处理——这一次保存顺手补上标记；
+     * 读取路径永远不会触发写入。
+     *
+     * @returns {boolean} true = patch 里追加 configMigrationVersion。
+     */
+    function configMigrationPending() {
+      const descriptor = findSettingsDescriptor(settings, SETTINGS_NAMESPACE);
+      const rawVersion = descriptor?.value?.configMigrationVersion;
+      const version = Number.isSafeInteger(rawVersion) && rawVersion >= 0 ? rawVersion : 0;
+      return version < CONFIG_MIGRATION_VERSION;
+    }
     const webServer = ctx.webServer;
     // 注意：本插件**不再调用 goals.pause / goals.resume**（旧 goal handoff 已整体删除）。
     // root 等待语义完全由「保持当前 turn 打开」实现（见 host/turn-wait.js）。
@@ -2488,42 +2463,23 @@ export default {
     // 生命周期清理：卸载后不再保留任何错误类别记录（诊断只是内存投影，不落盘）。
     ctx.effect(() => () => rpcErrorTracker.clear(), "dsh-expert-group: rpc error diagnostics");
 
-    /**
-     * 运行期角色目录持有者（票据 27）：内置 6 角色 + 设置里的自定义角色。
-     *
-     * 目录在 settings 读源绑定后由 settingsSource().customRoles 重建，并在每次成功保存后
-     * 立即重建；工具面、fan-out 枚举、RPC meta、编排提示词、persona 与权限判定全部读
-     * 这一份 registry，因此新增/删除角色无需重启，也不会出现第二份角色清单。
-     * 卸载时精确出栈：模块级 guard 随即回落到内置注册表（fail-closed）。
-     */
-    const runtimeCatalog = { registry: ROLE_REGISTRY, diagnostics: [] };
-    // 工具面装配完成标记：settings 注入回调可能早于 apply 末尾的工具挂载，因此
-    // 目录重建只在标记为 true 后同步工具/提示词；否则由 apply 末尾统一按新目录挂载。
+    // 工具面装配完成标记：settings 注入回调可能早于 apply 末尾的工具挂载。
     let roleToolsReady = false;
-    // 角色目录变化会改变侧栏快照里的 roleLabels：装配完成后由这里触发一次全量失效，
-    // 避免新增/删除角色后 ≤5s 的缓存把旧标签继续返回给客户端。
-    let invalidateAllRoleSnapshots = null;
-    pushRuntimeRoleCatalog(runtimeCatalog);
-    ctx.effect(() => () => {
-      popRuntimeRoleCatalog(runtimeCatalog);
-      // 出栈后运行期目录只服务本次实例；保留内置注册表，绝不把自定义角色泄漏给后续实例。
-      runtimeCatalog.registry = ROLE_REGISTRY;
-    }, "dsh-expert-group: runtime role catalog");
 
-    /** 当前运行期角色目录（本次插件实例的唯一角色来源）。 */
-    const roleCatalog = () => runtimeCatalog.registry;
+    /** 角色目录：内置六角色注册表（模块常量，自定义角色能力已删除）。 */
+    const roleCatalog = () => ROLE_REGISTRY;
 
     /**
-     * 当前已启用的角色名：默认角色 + 显式启用的可选角色 + 全部自定义角色。
+     * 当前已启用的角色名：默认角色 + 显式启用的可选角色。
      * Observer 的裸 Config 默认禁用（Config.enableObserver 默认 false），
-     * bundle patch 可以把它覆盖为 true；自定义角色不可选，恒启用。
+     * bundle patch 可以把它覆盖为 true。
      */
     const activeRoles = () => roleCatalog().enabledIds({ enableObserver: config.enableObserver === true });
     /** 角色是否在当前启用集合内（fan-out 派发、模型预检、设置保存共用）。 */
     const isActiveRole = (role) => activeRoles().includes(role);
-    /** 运行期目录的角色显示名映射（含自定义角色，供快照与 RPC 只读投影）。 */
+    /** 角色显示名映射（供快照与 RPC 只读投影）。 */
     const roleLabelsProjection = () => roleLabelsOf(roleCatalog().records());
-    /** 单个角色显示名；未知/已删除角色返回 undefined（历史标签由持久化快照提供）。 */
+    /** 单个角色显示名；未知角色返回 undefined（历史标签由持久化快照提供）。 */
     const roleLabelOfRole = (role) => roleCatalog().get(role)?.label;
 
     /** 同父代理 + 同角色的委派跟踪器：串行临界区 / child 复用 / 任务去重（LRU 32）。 */
@@ -5788,8 +5744,8 @@ export default {
         agent?.id,
         (childId) => source().childModels?.[childId],
       );
-      // 自定义角色被删除后的冷恢复（票据 27）：身份来自调用方快照时补上 admission 证据，
-      // 否则 guard 会因运行期目录已无该角色而整体跳过，等于丢掉 deny/persona 边界。
+      // 冷恢复：身份来自调用方快照时补上 admission 证据，
+      // 否则 guard 会因目录已无该角色而整体跳过，等于丢掉 deny/persona 边界。
       const persistedRecord = typeof agent?.id === "string" ? source().childModels?.[agent.id] : void 0;
       const identity = resolvedOrRecorded !== void 0
         && resolvedOrRecorded !== null
@@ -6225,7 +6181,6 @@ export default {
       observerPreferred: false,
       taskManagementEnabled: true,
       autoOpenSubagentSidebar: false,
-      customRoles: {},
       // 单价（票据 25）：旧配置/未配置 => 空数组（不估算成本）。
       modelPrices: [],
       // 上下文继承（票据 29）：旧配置/未配置 => 空映射（全部关闭）。
@@ -6315,10 +6270,6 @@ export default {
         // 自动打开属于全局 settings：必须随同一份快照进入 source()，否则冷恢复/服务重载
         // 之后 client 读到的值会悄悄退回默认关闭。
         autoOpenSubagentSidebar: settingsSnapshot.autoOpenSubagentSidebar,
-        // 自定义角色定义与读取诊断（票据 27）：与 settings 同源，供 RPC meta/get 投影；
-        // 运行期目录的重建读 settingsSource()，这里只保证读面一致。
-        customRoles: settingsSnapshot.customRoles,
-        customRoleDiagnostics: settingsSnapshot.customRoleDiagnostics,
         // 单价（票据 25）：与 settings 同源进入运行期读源，RPC meta/get 与客户端设置页
         // 读到同一份归一值；诊断只服务 meta，不进入设置响应。
         modelPrices: settingsSnapshot.modelPrices,
@@ -6407,24 +6358,19 @@ export default {
       observerPreferred: false,
       taskManagementEnabled: true,
       autoOpenSubagentSidebar: false,
-      // 旧配置没有自定义角色：默认空映射，读取面因此天然兼容。
-      customRoles: {},
       // 旧配置没有单价：默认空数组；读取面因此不会估算任何成本。
       modelPrices: [],
       // 旧配置没有上下文继承：默认空映射 = 全部关闭。
       inheritContext: {},
     }, {
       setSource(next) {
-        // 先按原始值重建运行期目录，再建立归一读源：activeRoles()/defaults 归一/自定义角色
-        // 过滤都必须基于**新的**候选集合，否则新角色第一次保存时会被当成未启用。
-        rebuildRoleCatalog(next()?.customRoles);
+        // 建立归一读源：activeRoles()/defaults 归一都基于最新快照。
         settingsSource = () => normalizeSnapshot(next(), activeRoles());
         source = readStorageSnapshot;
       },
       onChange() {
-        // 三个观察点收敛到同一入口（host/settings-source）：目录跟随最新设置，
-        // 并在工具面已装配后同步角色工具/fanout/提示词。
-        rebuildRoleCatalog(settingsSource()?.customRoles);
+        // 三个观察点收敛到同一入口（host/settings-source）：工具面已装配时保持
+        // 角色工具/fanout/提示词与设置一致（幂等）。
         syncRoleTools();
       },
     });
@@ -6444,9 +6390,7 @@ export default {
      *   entries: Array<{role: string, defaultPersona: string, override: (string|undefined), customized: boolean}>}}
      */
     function describeRolePrompts(snapshot) {
-      // 角色集合 = 运行期目录（内置 + 自定义）；设置页因此可以为自定义角色编辑提示词，
-      // 「恢复默认」使用与内置角色同一条 defaultExpertPersonaOf 解析（自定义缺失 persona
-      // 时回落到 description）。
+      // 角色集合 = 内置目录；「恢复默认」使用 defaultExpertPersonaOf 解析。
       const roles = roleCatalog().records();
       const overrides = snapshot?.[PROMPT_OVERRIDES_SETTINGS_KEY];
       const entries = roles.map((entry) => {
@@ -6487,11 +6431,11 @@ export default {
     }
 
     /**
-     * 解析 admission 时的 persona；角色已不在运行期目录时返回 undefined。
+     * 解析 admission 时的 persona；角色已不在内置目录时返回 undefined。
      *
-     * 只服务「自定义角色创建后被删除」的恢复路径：调用方必须先尝试 child 创建时持久化
-     * 的 persona 快照，只有快照缺失时才回落到当前目录；目录也没有该角色时由调用方
-     * fail-closed（绝不用通用人格启动专家）。
+     * 只服务历史 child 的恢复路径：调用方必须先尝试 child 创建时持久化的 persona 快照，
+     * 只有快照缺失时才回落到当前目录；目录也没有该角色时由调用方 fail-closed
+     * （绝不用通用人格启动专家）。
      *
      * @param {string} role - 专家角色 id。
      * @returns {string|undefined} 完整 persona；未知角色返回 undefined。
@@ -6504,10 +6448,6 @@ export default {
     /**
      * 角色可编辑默认 persona（不抛错；未知角色返回 undefined）。
      *
-     * 提示词覆盖的「与默认逐字相同 = 删除键」规则对自定义角色同样成立：它们的默认
-     * persona 是 persona ?? description，因此用户显式保存一份默认副本时仍会被折算成
-     * 「没有覆盖」，继续跟随未来的定义更新。
-     *
      * @param {string} role - 角色 id。
      * @returns {string|undefined} 默认 persona；未知角色返回 undefined。
      */
@@ -6517,29 +6457,10 @@ export default {
     }
 
     /**
-     * 用一份 customRoles 原始值重建运行期角色目录（内置 + 自定义）。
+     * 让工具面与提示词与当前角色目录保持一致（幂等）。
      *
-     * 失败语义：读取归一从不抛错（非法条目丢弃并诊断），因此这里总能得到一份可用目录；
-     * 唯一可能抛错的是 createRoleRegistry 对**内置记录**的校验（模块常量，不会在运行期变化）。
-     * 写入边界的严格拒绝在 commitSettingsCandidate 调用 assertCustomRoleDefinitions 时发生。
-     *
-     * @param {unknown} rawCustomRoles - settingsSource()/候选设置里的 customRoles。
-     * @returns {object} 新的运行期注册表。
-     */
-    function rebuildRoleCatalog(rawCustomRoles) {
-      const normalized = normalizeCustomRolesForRead(rawCustomRoles);
-      const next = createRoleRegistry([...ROLE_REGISTRY.records(), ...customRoleRecords(normalized.definitions)]);
-      runtimeCatalog.registry = next;
-      runtimeCatalog.diagnostics = normalized.diagnostics;
-      if (invalidateAllRoleSnapshots !== null) {
-        try { invalidateAllRoleSnapshots(); } catch { /* 失效只是缓存优化，绝不影响保存 */ }
-      }
-      return next;
-    }
-
-    /**
-     * 让工具面与提示词跟随运行期目录：新增角色挂载 role 工具，删除角色卸载，
-     * fanout 工具按新的 role 枚举重挂载，routing/orchestrator 提示词重建。
+     * 角色集合固定为内置六角色：这里只处理启用集合变化（例如 Config.enableObserver）
+     * 与定义签名变化，fanout 工具按当前 role 枚举重挂载，routing/orchestrator 提示词重建。
      *
      * 幂等：mountRole 按 toolDisposers 去重，unmountRole 对已卸载角色是 no-op，
      * fanout 只在已挂载时重挂载（provider 不可用时不制造空工具）。
@@ -6547,9 +6468,8 @@ export default {
     function syncRoleTools() {
       if (!roleToolsReady) return;
       const desired = new Set(activeRoles());
-      // 定义变更先卸载：工具描述/静态元数据只在注册时生成，已有角色改了
-      // label/description/persona/toolDeny 时 mountRole 的"已挂载"短路会让工具面陈旧。
-      // 角色集增删仍由下面的循环处理（desired 已包含新增角色）。
+      // 定义变更先卸载：工具描述/静态元数据只在注册时生成，定义签名变化时
+      // mountRole 的"已挂载"短路会让工具面陈旧。
       for (const role of desired) {
         if (!toolDisposers.has(role)) continue;
         const entry = roleCatalog().get(role);
@@ -6562,8 +6482,7 @@ export default {
         unmountRole(role);
       }
       for (const role of desired) mountRole(role);
-      // fanout 的 role 枚举与描述在注册时生成：角色集变化必须重挂载，否则新角色无法派发、
-      // 已删除角色仍会出现在枚举里。
+      // fanout 的 role 枚举与描述在注册时生成：重挂载保证枚举与当前启用集合同源。
       if (toolDisposers.has("fanout")) {
         unmountFanoutTool();
         mountFanoutTool();
@@ -7573,8 +7492,7 @@ export default {
           throw promptOverrideError(role + " 提示词超过 " + PROMPT_OVERRIDE_MAX_GRAPHEMES + " 字符上限", PROMPT_OVERRIDE_INVALID_CODE);
         }
         // 逐字相同 => 删除键（不保存冗余覆盖）；只要有一个字符不同就必须保留，
-        // 包括只差首尾空白这种用户有意保留的格式。自定义角色没有静态默认表，其默认
-        // persona 来自记录（persona ?? description），因此用同一个解析函数比较。
+        // 包括只差首尾空白这种用户有意保留的格式。
         if (text === defaultPersonaForRole(role)) continue;
         normalized[role] = text;
       }
@@ -7591,7 +7509,7 @@ export default {
      * 可校验的映射，保持兼容、不拒绝写入。
      *
      * @param {unknown} value - 解析后 settings 值里的 promptOverrides。
-     * @param {readonly string[]} [allowedRoles] - 候选设置自己的角色集合（含新增自定义角色）。
+     * @param {readonly string[]} [allowedRoles] - 候选设置自己的角色集合。
      */
     function assertPromptOverridesCandidate(value, allowedRoles = STATUS_ROLE_IDS) {
       if (value === void 0) return;
@@ -7783,7 +7701,7 @@ export default {
      *
      * 规则（保存时**只**做结构/范围校验，不调用模型目录、不解析模型）：
      * - 值必须是普通对象（数组/null 都拒绝）；
-     * - 角色键必须属于**候选设置自己的角色集**（内置 + 本次声明的自定义角色）：
+     * - 角色键必须属于内置角色集：
      *   否则一次保存就会写进一个永远不会被调度读到的键，用户看到配置却永不生效；
      * - 值必须是 1..64 的安全整数（与 roleConcurrencyLimit/任务级上限同界）。
      *
@@ -7930,22 +7848,9 @@ export default {
       if (hasAutoOpenSubagentSidebar && typeof candidate.autoOpenSubagentSidebar !== "boolean") {
         throw new ValidationError("设置 autoOpenSubagentSidebar 无效");
       }
-      // 自定义角色（票据 27）：缺字段 = 旧客户端/旧文档，不写 patch 且保持已有角色；
-      // 显式提供时按 role-registry 的 fail-closed 规则严格校验（缺 readOnly/toolDeny、
-      // 未知字段、非法 id、覆盖内置/保留名、超数量都拒绝），绝不为新角色默认放开权限。
-      const hasCustomRoles = candidate.customRoles !== void 0;
-      const customRoleDefinitionsCandidate = hasCustomRoles
-        ? assertCustomRolesCandidate(candidate.customRoles)
-        : void 0;
-      // **候选设置自己的角色集合**：新增角色必须在本次保存内就被视为已声明，否则校验会
-      // 读旧的 runs-time 目录并把新角色当作未启用而跳过模型/提示词校验（票据 27 的联动要求）。
-      const candidateRoleRegistry = hasCustomRoles
-        ? createRoleRegistry([...ROLE_REGISTRY.records(), ...customRoleRecords(customRoleDefinitionsCandidate)])
-        : roleCatalog();
-      const candidateRoleIds = Object.freeze([
-        ...STATUS_ROLE_IDS,
-        ...(hasCustomRoles ? Object.keys(customRoleDefinitionsCandidate) : roleCatalog().customIds()),
-      ]);
+      // 角色集合固定为内置六角色（自定义角色能力已删除）。
+      const candidateRoleRegistry = roleCatalog();
+      const candidateRoleIds = STATUS_ROLE_IDS;
       /**
        * 并发映射（票据 26）：缺字段 = 旧客户端/旧文档，不写 patch、保持已有映射；
        * 显式提供时只做结构/范围校验（不触碰模型目录），非法条目整次保存拒绝。
@@ -7957,7 +7862,7 @@ export default {
       const providerLimits = hasProviderLimits ? assertProviderLimitsCandidate(candidate.providerLimits) : void 0;
       /**
        * 上下文继承映射（票据 29）：缺字段 = 旧客户端/旧文档，不写 patch、保持已有映射；
-       * 显式提供时 fail-closed：Observer、未知/自定义角色与非布尔值整次保存拒绝。
+       * 显式提供时 fail-closed：Observer、未知角色与非布尔值整次保存拒绝。
        * 判定与限流映射一样在任何 await 之前完成。
        */
       const hasInheritContext = candidate.inheritContext !== void 0;
@@ -8001,8 +7906,7 @@ export default {
         ? await validateModelCandidatesCandidate(candidate.candidates, candidateRoles, savedSnapshot.candidates ?? {}, signal)
         : void 0;
       const defaults = {};
-      // 启用集合来自**候选设置自己的**目录（含本次新增/删除的自定义角色），
-      // 不读旧的运行期目录。
+      // 启用集合来自内置目录（observer 是否启用由 Config 决定）。
       const enabledRoles = new Set(candidateRoleRegistry.enabledIds({ enableObserver: config.enableObserver === true }));
       const resolvedRoles = [];
       for (const [role, selection] of Object.entries(candidate.defaults)) {
@@ -8029,9 +7933,6 @@ export default {
           ...(hasFallbackLimit ? { fallbackLimit } : {}),
           ...(hasNotificationEvents ? { notificationEvents } : {}),
           ...(hasPromptOverrides ? { [PROMPT_OVERRIDES_SETTINGS_KEY]: promptOverrides } : {}),
-          // 自定义角色按整份映射 replace（与 defaults/candidates 同语义）：空对象显式删除全部。
-          // 写入形状剥离派生 id：id 就是映射键，文档里再出现 id 会在下次读取时被判成未知字段。
-          ...(hasCustomRoles ? { customRoles: customRoleDefinitionsDocument(customRoleDefinitionsCandidate) } : {}),
           // 并发映射按整份映射 replace（票据 26）：空对象 = 显式清空全部覆盖，
           // 与「缺字段 = 保持原值」是两种不同语义。
           ...(hasRoleLimits ? { roleLimits } : {}),
@@ -8086,24 +7987,6 @@ export default {
      *   候选仍是完整值，patch 仍按顶层键整值写入。
      */
     /**
-     * 自定义角色候选的严格校验（票据 27）。
-     *
-     * 复用 role-registry 的 assertCustomRoleDefinitions 作为唯一规则来源，只把错误类型
-     * 换成 RPC 层能映射成 400 的 ValidationError；绝不在组合根复制第二套字段校验。
-     *
-     * @param {unknown} value - candidate.customRoles。
-     * @returns {Record<string, object>} 冻结的定义映射。
-     */
-    function assertCustomRolesCandidate(value) {
-      try {
-        return assertCustomRoleDefinitions(value);
-      } catch (error) {
-        if (error instanceof RoleRegistryError) throw new ValidationError(error.message);
-        throw error;
-      }
-    }
-
-    /**
      * 单价候选的严格校验（票据 25）。
      *
      * 复用 host/usage-ledger.js 的 assertModelPrices 作为唯一规则来源，只把错误类型
@@ -8121,84 +8004,6 @@ export default {
       }
     }
 
-    /**
-     * 候选设置的角色集合（内置 + 该候选声明的自定义角色）。
-     *
-     * 用于在任何 await 之前的同步校验（提示词覆盖/候选模型）：此时读取旧的运行期目录
-     * 会把新角色误判成未知或未启用，因此必须基于候选自身的声明。
-     *
-     * @param {object} candidate - 完整 settings 候选。
-     * @returns {readonly string[]} 角色 id 集合。
-     */
-    function customRoleIdsOfCandidate(candidate) {
-      const raw = candidate?.customRoles;
-      if (raw === void 0) return Object.freeze([...STATUS_ROLE_IDS, ...roleCatalog().customIds()]);
-      const definitions = assertCustomRolesCandidate(raw);
-      return Object.freeze([...STATUS_ROLE_IDS, ...Object.keys(definitions)]);
-    }
-
-    /**
-     * 删除自定义角色前的使用中检查（fail-closed，票据 27）。
-     *
-     * 只有能**证明**没有活动使用时才允许删除：
-     * 1. fan-out：manager 的 listTasks() 是唯一权威任务源；非终态任务的 role 或任一 shard
-     *    的 role 命中被删角色即拒绝。读不到 listTasks 时同样拒绝，绝不假设"没有任务"。
-     * 2. live agents：agents.list() 是唯一权威运行视图；任一 live Agent 的专家 marker
-     *    命中即拒绝；读不到列表（宿主未提供/不是数组）同样拒绝。
-     * 3. 本进程仍持有、且可续作的 recovery record：它代表一个会被恢复路径继续使用的 child，
-     *    同样算使用中。
-     * 历史任务不受影响：它们的 roleLabel 已随 child_models 持久化。
-     *
-     * @param {Set<string>} removedIds - 本次保存要删除的自定义角色 id。
-     */
-    function assertCustomRoleRemovalsUnused(removedIds) {
-      if (!(removedIds instanceof Set) || removedIds.size === 0) return;
-      const names = [...removedIds].join(", ");
-      const reject = (reason) => {
-        throw new ValidationError("自定义角色仍在使用中，已拒绝删除（" + reason + "）：" + names);
-      };
-      if (typeof fanoutHost?.listTasks !== "function") reject("无法确认没有活动 fan-out 任务");
-      let tasks;
-      try {
-        tasks = fanoutHost.listTasks();
-      } catch {
-        reject("fan-out 任务列表读取失败");
-      }
-      if (!Array.isArray(tasks)) reject("无法确认没有活动 fan-out 任务");
-      for (const task of tasks) {
-        if (fanoutTaskIsTerminal(task)) continue;
-        const roles = [task?.role, ...(Array.isArray(task?.shards) ? task.shards.map((shard) => shard?.role) : [])];
-        for (const role of roles) {
-          if (typeof role === "string" && removedIds.has(role)) reject("存在活动 fan-out 任务");
-        }
-      }
-      const liveAgents = typeof agents?.list === "function" ? agents.list() : void 0;
-      if (!Array.isArray(liveAgents)) reject("无法读取 live agents");
-      for (const agent of liveAgents) {
-        const role = agent?.options?.[ROLE_MARKER];
-        if (typeof role === "string" && removedIds.has(role)) reject("存在 live 专家 child");
-      }
-      for (const record of recoveryRecords.values()) {
-        if (record?.continuable !== true) continue;
-        if (typeof record.role === "string" && removedIds.has(record.role)) reject("存在可续作专家 child");
-      }
-    }
-
-    /**
-     * 计算本次保存要删除的自定义角色（已保存 − 候选），用于删除守卫。
-     *
-     * @param {Record<string, object>} nextDefinitions - 候选的完整自定义角色定义。
-     * @returns {Set<string>} 被删除的角色 id。
-     */
-    function removedCustomRoleIds(nextDefinitions) {
-      const saved = normalizeCustomRolesForRead(readSavedSettingsValue()?.customRoles).definitions;
-      const removed = new Set();
-      for (const id of Object.keys(saved)) {
-        if (!Object.prototype.hasOwnProperty.call(nextDefinitions, id)) removed.add(id);
-      }
-      return removed;
-    }
-
     function commitSettingsCandidate(candidate, expectedRevision, signal, changed) {
       // 旧客户端缺少任务管理字段时既不写 patch，也不在响应里新增字段（保持历史形状）。
       const hasTaskManagementEnabled = candidate?.taskManagementEnabled !== void 0;
@@ -8213,8 +8018,6 @@ export default {
       // 响应也维持历史形状（不新增字段）。
       const hasCandidates = candidate?.candidates !== void 0;
       const hasFallbackLimit = candidate?.fallbackLimit !== void 0;
-      // 自定义角色（票据 27）同样只写显式提供的字段：缺字段 = 保持已有角色，绝不删除。
-      const hasCustomRoles = candidate?.customRoles !== void 0;
       // 并发映射（票据 26）同一规则：缺字段 = 旧客户端，不写 patch、不在响应里新增字段；
       // 显式空对象则表示「清空全部逐角色/provider 覆盖」（与缺字段语义不同）。
       const hasRoleLimits = candidate?.roleLimits !== void 0;
@@ -8229,13 +8032,9 @@ export default {
         const generation = settingsRuntime.generation;
         // 写入前的第一道语义边界：与 validateSettingsCandidate 内部同一批规则，
         // 但这里先于任何 await 运行，保证非法覆盖不会在异步校验期间进入宿主写入路径。
-        // 角色集合取**候选自己的声明**（新增自定义角色的第一次保存必须被当作已启用）。
-        assertPromptOverridesCandidate(candidate?.[PROMPT_OVERRIDES_SETTINGS_KEY], customRoleIdsOfCandidate(candidate));
+        assertPromptOverridesCandidate(candidate?.[PROMPT_OVERRIDES_SETTINGS_KEY], STATUS_ROLE_IDS);
         const validated = await validateSettingsCandidate(candidate, signal, changed);
         const validatedSettings = validated.value;
-        // 删除守卫（fail-closed）：被活动 fan-out 任务、live agents 或可续作 recovery record
-        // 引用的自定义角色不允许删除。历史任务的 roleLabel 已随 child_models 持久化。
-        if (hasCustomRoles) assertCustomRoleRemovalsUnused(removedCustomRoleIds(validatedSettings.customRoles));
         // 目录代次栅栏只保护「这次真的要写模型字段」的提交（票据 20）：与模型无关的保存
         // 不依赖目录，用写入时刻的代次参与复核，因此不会被提交期间到达的目录事件误判成
         // 过期；确有模型变更时仍用提交起始代次，语义与票据 03 完全一致。
@@ -8244,7 +8043,11 @@ export default {
         if (!settingsRuntime.isCurrentGeneration(generationForWrite)) {
           throw new ValidationError("模型目录在保存期间发生变化，请刷新目录后重试");
         }
+        // 一次性配置迁移的持久化开关：读取面把旧的 10 解释为 20，首次保存把标记
+        // 与其它字段写进同一份 patch；之后 10 原样保留（用户可手动改回）。
+        const migrationMarked = configMigrationPending();
         const patch = {
+          ...(migrationMarked ? { configMigrationVersion: CONFIG_MIGRATION_VERSION } : {}),
           provider: validatedSettings.provider,
           defaults: validatedSettings.defaults,
           // 候选/降级上限只在显式提供时写入；候选按整份映射 replace（与 defaults 同语义）。
@@ -8265,8 +8068,6 @@ export default {
           ...(hasAutoOpenSubagentSidebar ? { autoOpenSubagentSidebar: validatedSettings.autoOpenSubagentSidebar } : {}),
           // 提示词覆盖按整份映射提交（不做键级合并）：空对象显式清空全部自定义提示词。
           ...(hasPromptOverrides ? { [PROMPT_OVERRIDES_SETTINGS_KEY]: validatedSettings[PROMPT_OVERRIDES_SETTINGS_KEY] } : {}),
-          // 自定义角色按整份映射 replace：空对象显式删除全部自定义角色。
-          ...(hasCustomRoles ? { customRoles: validatedSettings.customRoles } : {}),
           // 并发映射按整份映射 replace（票据 26）：空对象显式清空覆盖，回到默认值/不限制。
           ...(hasRoleLimits ? { roleLimits: validatedSettings.roleLimits } : {}),
           ...(hasProviderLimits ? { providerLimits: validatedSettings.providerLimits } : {}),
@@ -8276,12 +8077,6 @@ export default {
           ...(hasModelPrices ? { modelPrices: validatedSettings.modelPrices } : {}),
         };
         await updateSettingsAtGeneration({ ...patch }, expectedRevision, generationForWrite);
-        // 保存成功后立即同步运行期目录与工具面：新增角色在本次响应返回前就可派发，
-        // 删除角色即时卸载；onChange 观察点随后会做一次幂等重建。
-        if (hasCustomRoles) {
-          rebuildRoleCatalog(validatedSettings.customRoles);
-          syncRoleTools();
-        }
         const descriptor = settings.describe().find((entry) => entry.ns === SETTINGS_NAMESPACE);
         // 提交后基线改从 describe() 读取（旧 settings.get 已从宿主删除）；value 是
         // defaults resolved 结果，与读取面同一份权威值。
@@ -8296,7 +8091,6 @@ export default {
         if (!hasNotificationEvents) delete committedSettings.notificationEvents;
         if (!hasCandidates) delete committedSettings.candidates;
         if (!hasFallbackLimit) delete committedSettings.fallbackLimit;
-        if (!hasCustomRoles) delete committedSettings.customRoles;
         // 并发映射同上：旧客户端不传时响应保持历史形状（不新增字段）。
         if (!hasRoleLimits) delete committedSettings.roleLimits;
         if (!hasProviderLimits) delete committedSettings.providerLimits;
@@ -8304,14 +8098,18 @@ export default {
         if (!hasInheritContext) delete committedSettings.inheritContext;
         // 单价同理：旧客户端不传时响应保持历史形状（不新增字段）。
         if (!hasModelPrices) delete committedSettings.modelPrices;
-        // 读取诊断只服务 RPC meta 的有界投影，绝不进入设置响应（它不是配置）。
-        delete committedSettings.customRoleDiagnostics;
         // 并发映射的读取期丢弃诊断同理：它是诊断，不是可回写的配置。
         delete committedSettings.limitDiagnostics;
         // 上下文继承的读取期丢弃诊断同样只是诊断，不是可回写的配置。
         delete committedSettings.inheritContextDiagnostics;
         // 单价读取期丢弃诊断同样只是诊断，不是可回写的配置。
         delete committedSettings.modelPriceDiagnostics;
+        // 迁移标记必须随响应回传：客户端据此关闭读取别名，保存 10 之后读回仍是 10。
+        // 首次保存时标记刚随 patch 落盘；后续保存时文档里本来就有该标记。
+        const committedMigrationVersion = descriptor?.value?.configMigrationVersion;
+        if (Number.isSafeInteger(committedMigrationVersion) && committedMigrationVersion >= 1) {
+          committedSettings.configMigrationVersion = committedMigrationVersion;
+        }
         return {
           settings: committedSettings,
           // 保存成功后直接回传最新只读投影：客户端据此更新基线、dirty 与"已自定义"
@@ -8641,7 +8439,7 @@ export default {
           reasoningEffort: effort === void 0 ? void 0 : String(effort),
           ...(isExpertChild ? {
             role,
-            // 角色显示名快照（票据 27）：自定义角色删除后历史任务仍能显示标签。
+            // 角色显示名快照：历史任务在角色不再可用时仍能显示标签。
             ...(typeof roleLabelOfRole(role) === "string" ? { roleLabel: roleLabelOfRole(role) } : {}),
             parentId,
             ...(isContinuable ? { continuable: true } : {}),
@@ -9484,9 +9282,9 @@ export default {
       if (typeof source.provider !== "string" || typeof source.model !== "string") {
         throw new Error("cannot rebuild recovery child because its original model route is unavailable");
       }
-      // 角色元数据（票据 27）：自定义角色可能在 child 创建后被删除，此时必须使用 child
-      // 创建时持久化的 persona，而不是把角色变成未知或回落到通用人格；两者都没有时
-      // fail-closed（未注册角色连默认 persona 都没有，重建出来的 child 会失去全部约束）。
+      // 角色元数据：冷恢复必须使用 child 创建时持久化的 persona，而不是把角色变成未知
+      // 或回落到通用人格；两者都没有时 fail-closed（未注册角色连默认 persona 都没有，
+      // 重建出来的 child 会失去全部约束）。
       // 注意：本函数内的 `source` 是 recovery 上下文，child_models 读源必须显式走 storage 读源。
       const persistedChild = typeof record.childId === "string" ? readStorageSnapshot()?.childModels?.[record.childId] : void 0;
       const recordedPersona = validPersonaMarker(persistedChild?.[PERSONA_MARKER])
@@ -10606,7 +10404,7 @@ export default {
     /**
      * 角色是否开启了上下文继承（票据 29）。
      *
-     * 读取面已丢弃 Observer/未知/自定义角色键与非法值；这里再显式排除 Observer，
+     * 读取面已丢弃 Observer/未知角色键与非法值；这里再显式排除 Observer，
      * 即便设置被外部写成 true 也强制关闭（Observer 的安全边界不依赖设置校验）。
      *
      * @param {string} role - 角色 id。
@@ -10799,21 +10597,18 @@ export default {
     }
 
     /**
-     * 专家 admission 的完整 deny 边界（票据 27）。
+     * 专家 admission 的完整 deny 边界。
      *
-     * 与内置角色完全同源，只是把「角色自身 toolDeny + 运行期自定义角色工具名」并进候选：
-     * - 只读角色（含未知/已删除角色）：READONLY_DENY + toolDeny + 扩展，并并入全部动态
-     *   MCP 工具（includeDynamicMcp=true，fail-closed）；
-     * - 可写角色：EXPERT_DELEGATION_DENY + ROOT_ONLY_TOOL_DENY + toolDeny + 扩展。
-     * 合并成一份候选后只调用一次 effectiveDeny：可见性过滤按名称逐项执行，
-     * 因此与旧实现「两次过滤再拼接」等价，但不会漏掉新增的自定义 role 工具名。
+     * - 只读角色（含未知角色）：READONLY_DENY，并并入全部动态 MCP 工具
+     *   （includeDynamicMcp=true，fail-closed）；
+     * - 可写角色：EXPERT_DELEGATION_DENY + ROOT_ONLY_TOOL_DENY。
      *
      * @param {object} parent - 调用工具的子代理父代理（Agent 对象）。
-     * @param {object|undefined} roleEntry - 运行期目录里的角色记录（未知按只读）。
+     * @param {object|undefined} roleEntry - 角色目录里的记录（未知按只读）。
      * @returns {string[]} 可交给 tools.restrict() 的 deny 名单。
      */
     function expertDenyForAdmission(parent, roleEntry) {
-      const candidates = expertDenyCandidates(roleEntry, runtimeCustomRoleToolNames());
+      const candidates = expertDenyCandidates(roleEntry);
       const readOnlyRole = roleEntry === void 0 || roleEntry.readOnly === true;
       return effectiveDeny(parent, candidates, readOnlyRole);
     }
@@ -11677,10 +11472,8 @@ export default {
     fanoutHost = createFanoutRuntimeModule({
       createRuntime: (options) => createFanoutRuntime(options),
       runtimeOptions: {
-        // affectedPaths 冲突只对可写角色生效（内置 designer/fixer + 运行期目录里的可写
-        // 自定义角色）。组合根这里按**装配时刻**的运行期目录计算：之后新增的自定义
-        // 可写角色要到下一次进程启动才会进入该集合（fanout.js 不在本票据改动范围内，
-        // 其 writeRoles 在运行时构造期固定）。这是已知边界，已在票据 27 实施记录中标注。
+        // affectedPaths 冲突只对可写内置角色（designer/fixer）生效；组合根这里按
+        // 装配时刻的角色目录计算，角色集合固定为内置六角色。
         writeRoles: activeRoles().filter((role) => {
           const entry = roleCatalog().get(role);
           return entry !== void 0 && entry.readOnly !== true;
@@ -11697,7 +11490,7 @@ export default {
        *
        * 任务级显式 concurrencyLimit（fanout 工具入参）仍然优先，并且会在任务快照里固化，
        * 恢复后不变；这两层优先级必须与工具描述、RPC meta 和设置页文案保持一致。
-       * settingsSource() 已归一化（1~64 整数，非法/缺失回退 10），manager 侧还有一道
+       * settingsSource() 已归一化（1~64 整数，非法/缺失回退 20），manager 侧还有一道
        * 校验兜底，scheduler 不会拿到 NaN/负数/越界值。
        */
       concurrencyLimit: () => normalizeRoleConcurrencyLimit(settingsSource()?.roleConcurrencyLimit),
@@ -11705,7 +11498,7 @@ export default {
        * 逐角色并发映射（票据 26）：与上面的 roleConcurrencyLimit 是**两层**关系。
        *
        * roleConcurrencyLimit 是「没有逐角色覆盖时」的默认值；roleLimits 是逐角色覆盖
-       * （候选设置自己的角色集，含自定义角色）。两者都由 manager 在派发时实时解析：
+       * （内置角色集）。两者都由 manager 在派发时实时解析：
        * 设置页保存后，之后进入 running 的分片立即按新映射受限，无需重新装配。
        *
        * 这里传的是**已归一**快照里的字段（旧配置缺字段 = 空映射），因此 manager 拿到的
@@ -11761,8 +11554,8 @@ export default {
         const subagentTarget = restoredRoute === null
           ? resolveSubagentProviderForRole(input.role, parent)
           : resolvePersistedSubagentTarget(input.role, parent, restoredRoute);
-        // deny 边界来自运行期目录（内置 + 自定义同源）：只读自定义角色沿用 READONLY_DENY
-        // 并叠加自身 toolDeny；可写自定义角色同样叠加委派与 root-only 拒绝。
+        // deny 边界来自内置角色目录：只读角色沿用 READONLY_DENY，
+        // 可写角色叠加委派与 root-only 拒绝。
         const deny = expertDenyForAdmission(parent, roleCatalog().require(input.role));
         // 分片任务名称是展示层短标签：有名称时子代理的 dispatch label 与任务正文都
         // 显示"分片代号 + 任务名称"，让专家自己知道这一片在整体目标里叫什么；没有名称
@@ -11922,7 +11715,7 @@ export default {
               : {}),
             ...(persistedFanoutChild?.structured === undefined ? {} : { structured: persistedFanoutChild.structured }),
             ...(typeof role === "string" ? { role } : {}),
-            // 角色显示名快照（票据 27）：自定义角色删除后历史分片仍能显示标签。
+            // 角色显示名快照：历史分片在角色不再可用时仍能显示标签。
             ...(typeof role === "string" && typeof roleLabelOfRole(role) === "string" ? { roleLabel: roleLabelOfRole(role) } : {}),
             ...(typeof parentId === "string" ? { parentId } : {}),
             continuable: true,
@@ -12033,18 +11826,14 @@ export default {
       recoveryRecords,
       source,
       sessionQuery: () => expertGroupSessionQuery,
-      // 角色显示名（票据 27）：每次构建现读运行期目录，因此新增/删除自定义角色后
-      // 侧栏标签立即跟随；历史节点在角色仍存在时也使用当前目录标签，角色删除后才回退
-    // child_models 里的持久化 roleLabel。
+      // 角色显示名：每次构建现读内置角色目录；历史节点在角色仍存在时使用当前目录标签，
+    // 角色不可用时回退 child_models 里的持久化 roleLabel。
       roleLabels: () => roleLabelsProjection(),
       // 用量（票据 25）：live 账本优先于持久化记录，去抖窗口内的最新值也能进入快照；
       // runtime 只读该投影，不参与计量与刷盘。
       usageFor: (childId) => usageLedger.usageFor(childId),
       logger: ctx.logger,
     });
-    // 角色目录变化后的快照失效入口：装配完成后再挂上，避免 apply 早期重建目录时误用。
-    invalidateAllRoleSnapshots = () => expertGroupRuntime.invalidateSnapshots({ all: true });
-    ctx.effect(() => () => { invalidateAllRoleSnapshots = null; }, "dsh-expert-group: role catalog snapshot invalidation");
     /**
      * 快照缓存失效接线（幂等、O(1)）。
      *
@@ -12083,7 +11872,7 @@ export default {
       // 对齐 dsh-tool-subagent：provider 缺失或能力不足时不注册工具，等 provider-added 再挂载。
       if (toolDisposers.has(role)) return;
       if (!spawnProviderReady()) return;
-      // 未注册角色不挂载工具（运行期目录是唯一角色来源，含自定义角色）；
+      // 未注册角色不挂载工具（内置角色目录是唯一角色来源）；
       // persona 在 admission 边界解析，因此这里不再缓存角色人格快照。
       if (!roleCatalog().has(role)) return;
 
@@ -13156,8 +12945,7 @@ export default {
           // 写/命令限制。deny 列表必须按“当前组合里实际可见的工具”动态计算：
           // 平台门控的 bash/pwsh 与 preset 域内的 workflow 可能不存在，
           // 静态全量列入会在子代理创建窗口触发 tools.restrict 的未知工具错误。
-          // 保留历史再委派 deny 的调用边界（只读再叠加写/命令限制），并叠加角色自身
-          // toolDeny 与运行期自定义角色工具名：自定义角色与内置角色同一组合规则。
+          // 保留历史再委派 deny 的调用边界（只读再叠加写/命令限制）。
           const deny = expertDenyForAdmission(parent, roleCatalog().require(role));
           // send_message 是 scope-local 工具，不能依赖 effectiveDeny 的全局可见性判断；
           // 显式加入 child filter 后，DSH 不会再向专家追加英文通信指令。
@@ -13424,8 +13212,7 @@ export default {
           + "回收不保留任务墓碑，针对已回收 parentTaskId 的查询返回 task_not_found；"
           + "回收后同一 requestId 再提交视为新任务（旧幂等记录随任务删除），不会命中旧任务句柄。",
         parameters: {
-          // 枚举与运行时校验同源（运行期目录）：角色集变化时本工具会重挂载，
-          // 因此新增/删除自定义角色不需要重启，也不会出现"枚举里有但校验拒绝"。
+          // 枚举与运行时校验同源（内置角色目录），不会出现"枚举里有但校验拒绝"。
           role: { type: "string", enum: activeRoles(), required: true, description: "One enabled expert role shared by all shards. 复用时必须与原任务的 role 一致。" },
           basePrompt: { type: "string", required: true, description: "Shared public goal delivered to every shard child. 复用时它是**本轮**的共享目标。" },
           shards: {
@@ -13470,7 +13257,7 @@ export default {
           allowOverlap: { type: "boolean", default: false, description: "Explicitly allow write-role affectedPaths overlap." },
           concurrencyLimit: {
             type: "integer",
-            description: "Optional per-task running-child limit from 1 to 64, counted against this task's own running shards only. Dispatch requires BOTH this task-level limit AND the per-role shared pool (settings roleConcurrencyLimit, current value, plugin default 10) to allow the shard; the two caps are enforced independently. The per-role pool is a shared cap for the whole role and follows the current setting, so it may grow or shrink for later dispatches; a task-level value is frozen into the task snapshot and survives restore.",
+            description: "Optional per-task running-child limit from 1 to 64, counted against this task's own running shards only. Dispatch requires BOTH this task-level limit AND the per-role shared pool (settings roleConcurrencyLimit, current value, plugin default 20) to allow the shard; the two caps are enforced independently. The per-role pool is a shared cap for the whole role and follows the current setting, so it may grow or shrink for later dispatches; a task-level value is frozen into the task snapshot and survives restore.",
           },
           // 父任务默认超时（票据 06）：与分片级同一校验语义，可被分片覆盖。
           timeoutMs: {
@@ -14432,8 +14219,8 @@ export default {
       }
       const role = typeof raw.role === "string" ? raw.role.trim() : "";
       if (role.length === 0) return manualDispatchFailure(400, "invalid-role", "缺少 role", { field: "role" });
-      // 角色必须当前启用（内置 + 显式启用的可选角色 + 自定义角色）：手动派发不得
-      // 绕过运行期角色目录，也不能给已删除/未启用的角色创建 child。
+      // 角色必须当前启用（内置 + 显式启用的可选角色）：手动派发不得
+      // 绕过角色目录，也不能给未启用的角色创建 child。
       if (!isActiveRole(role)) {
         return manualDispatchFailure(400, "invalid-role", "未启用的角色: " + role, { field: "role" });
       }
@@ -15497,16 +15284,13 @@ export default {
             ok: true,
             roles,
             activeRoles: roles,
-            // 角色只读投影（票据 27）：含自定义角色。客户端据此渲染设置页角色表与侧栏标签；
+            // 角色只读投影：客户端据此渲染设置页角色表与侧栏标签；
             // roleLabels 是显示名（英文，与角色状态标签一致），roleDescriptions 是职责摘要（设置页提示）。
             roleLabels: roleLabelsProjection(),
             // 「会话模型」的全局默认读面：与 resolveRole 同源（snap.defaults），侧边栏据此显示
             // 「跟随全局默认」。这里只是只读投影，不改 get/session-override-* 的任何行为。
             roleDefaults: snap.defaults ?? {},
             roleDescriptions: roleDescriptionsOf(roleCatalog().records()),
-            // 设置页「自定义角色」编辑器的数据源：与保存/运行期目录同源的定义映射。
-            customRoles: snap.customRoles ?? {},
-            customRoleDiagnostics: projectCustomRoleDiagnostics(snap.customRoleDiagnostics),
             enableObserver: config.enableObserver === true,
             observerPreferred: snap.observerPreferred === true,
             roleConcurrencyLimit: snap.roleConcurrencyLimit,
@@ -16269,7 +16053,7 @@ export default {
           // 全局提示词覆盖与角色模型配置同源：都来自 settings，与会话无关，
           // 因此这里只返回已保存的有效覆盖（缺失键表示该角色跟随默认 persona）。
           const promptOverrides = {};
-          // 运行期目录（内置 + 自定义）：自定义角色的提示词覆盖与内置角色同源投影。
+          // 内置角色目录：只投影已保存的有效提示词覆盖。
           for (const entry of roleCatalog().records()) {
             const value = promptOverrideFor(snap[PROMPT_OVERRIDES_SETTINGS_KEY], entry.id);
             if (value !== void 0) promptOverrides[entry.id] = value;
@@ -16287,9 +16071,6 @@ export default {
             // 会话级覆盖代次（票据 21）：设置页打开/保存时以它做 CAS 栅栏；旧客户端
             // 忽略该未知字段，旧 Host 更不会出现它，客户端缺字段时按"不支持"降级。
             overrideRevision: sessionOverrideProjectionOf(snap, sessionId).revision,
-            // 自定义角色定义（票据 27）：设置页据此渲染编辑器；非法读取值已在
-            // normalizeSnapshot 内丢弃并诊断，不会以坏值形式出现在这里。
-            customRoles: snap.customRoles ?? {},
             roleLabels: roleLabelsProjection(),
             // 模型候选读取面（票据 24）：有序数组 + 自动降级上限；非法读取值已在
             // normalizeSnapshot 里回退为空/默认 2，客户端无需再容错。
@@ -17027,9 +16808,6 @@ export default {
         // 模型候选与启动前 fallback（票据 24）：本版本始终提供保存期预检与
         // primary -> candidates 的启动前降级；客户端据此显示候选编辑器。
         modelFallback: true,
-        // 自定义角色（票据 27）：本版本提供设置声明、运行期目录、工具面/ fan-out 枚举、
-        // RPC meta 投影与删除守卫；客户端据此显示自定义角色编辑器与侧栏标签。
-        customRoles: true,
         // 上下文继承（票据 29）：本版本提供服务端角色级开关、fork provider 选择、seed
         // 边界检查、Observer 隔离、持久化与恢复；设置页继承开关与 token 成本提示属
         // 后续客户端波次。
@@ -17417,7 +17195,7 @@ export default {
               : projectThrottleDiagnostics(fanoutState.throttle),
             // 解析来源（live / snapshot / fallback）与最近一次非法上限只保留固定
             // 枚举/类型；message 是插件内部固定文案（不含设置原文或原始返回值），
-            // 经长度与控制字符归一再透出，让用户能解释"设置页=3、实际并发=10"。
+            // 经长度与控制字符归一再透出，让用户能解释"设置页=3、实际并发=20"。
             source: diagnosticToken(concurrency?.source, "unknown"),
             invalidKind: concurrency?.invalid === undefined ? null : diagnosticToken(concurrency.invalid.kind),
             invalidValueType: concurrency?.invalid === undefined

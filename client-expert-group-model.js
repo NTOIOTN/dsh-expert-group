@@ -1118,7 +1118,8 @@
       // recovery 是 Host 新增的**可选**顶层块：缺失/非法时为 null（旧 Host 行为逐字不变，
       // 侧栏据此不渲染任何恢复错误横幅）。
       recovery: normalizeRecovery(raw.recovery),
-      // 票据 27：角色显示名映射（含自定义角色）。缺失/非法为 null，侧栏回退角色 id。
+      // 票据 27：角色显示名映射（含历史角色显示名，包括已删除角色的持久化标签）。
+      // 缺失/非法为 null，侧栏回退角色 id。
       roleLabels: normalizeRoleLabels(raw.roleLabels),
       root,
     };
@@ -1137,8 +1138,9 @@
   function formatExpertMetadata(node, options) {
     const source = isObject(node) ? node : {};
     const optionSource = isObject(options) ? options : {};
-    // 票据 27：显式显示名优先（节点 roleLabel → 调用方给出的 roleLabels 映射，含自定义角色）；
-    // 没有显示名时保持既有的 titleCase 角色 id 行为逐字不变（旧快照/旧 Host 兼容）。
+    // 票据 27：显式显示名优先（节点 roleLabel → 调用方给出的 roleLabels 映射；
+    // 映射含历史角色显示名，包括已删除角色的持久化标签）；没有显示名时
+    // 保持既有的 titleCase 角色 id 行为逐字不变（旧快照/旧 Host 兼容）。
     const explicitLabel = text(source.roleLabel) ?? roleLabelFrom(source.role, optionSource.roleLabels);
     const role = explicitLabel ?? titleCaseRole(source.role, source.kind === "root" ? "Orchestrator" : "Expert");
     const provider = text(source.provider) || "未知供应商";
@@ -1711,6 +1713,10 @@ const MESSAGE_CATALOG = Object.freeze({
   "settings.noProvider": { zh: "无", en: "None" },
   "settings.observerPreferred": { zh: "Observer优先", en: "Prefer Observer" },
   "settings.concurrencyLimit": { zh: "单个角色并发上限", en: "Per-role concurrency limit" },
+  "settings.concurrencyLimit.title": {
+    zh: "取值范围 1–64 的整数；默认 20；保存后生效",
+    en: "An integer from 1–64; defaults to 20; takes effect after saving",
+  },
   "settings.roleTimeout": { zh: "角色默认超时 (s)", en: "Default role timeout (s)" },
   "settings.roleTimeout.title": {
     zh: "默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
@@ -1721,25 +1727,6 @@ const MESSAGE_CATALOG = Object.freeze({
   "settings.discard": { zh: "放弃修改", en: "Discard changes" },
   "settings.saved": { zh: "已保存", en: "Saved" },
   "settings.unsaved": { zh: "有未保存的修改", en: "Unsaved changes" },
-  "settings.diagnostics.title": { zh: "诊断与通知状态", en: "Diagnostics and notification status" },
-  "settings.diagnostics.capabilities": { zh: "能力矩阵", en: "Capabilities" },
-  "settings.diagnostics.runtime": { zh: "运行时诊断", en: "Runtime diagnostics" },
-  "settings.diagnostics.budget": { zh: "预算用量与最近违规", en: "Budget usage and latest violation" },
-  "settings.diagnostics.persistence": { zh: "持久化与恢复", en: "Persistence and recovery" },
-  "settings.diagnostics.notifications": { zh: "通知投递", en: "Notification delivery" },
-  "settings.diagnostics.loading": { zh: "正在读取宿主诊断…", en: "Loading host diagnostics…" },
-  "settings.diagnostics.unavailable": {
-    zh: "宿主诊断不可用；以下只显示客户端能力。",
-    en: "Host diagnostics are unavailable; only client capabilities are shown below.",
-  },
-  "settings.diagnostics.absent": {
-    zh: "宿主未提供诊断数据；以下只显示客户端能力。",
-    en: "The host provided no diagnostics; only client capabilities are shown below.",
-  },
-  "settings.testNotification": { zh: "发送测试通知", en: "Send test notification" },
-  "settings.testNotification.sending": { zh: "发送中…", en: "Sending…" },
-  "settings.testNotification.sent": { zh: "已发送测试通知", en: "Test notification sent" },
-  "settings.testNotification.disabled": { zh: "通知已关闭，未发送测试通知", en: "Notifications are off; test notification not sent" },
   "announce.start": { zh: "任务开始：{name}", en: "Task started: {name}" },
   "announce.finish": { zh: "任务完成：{name}", en: "Task finished: {name}" },
   "announce.fail": { zh: "任务失败：{name}", en: "Task failed: {name}" },

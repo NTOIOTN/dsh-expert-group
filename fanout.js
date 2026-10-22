@@ -105,8 +105,13 @@ import {
   describeSubagentCapacityFailure,
 } from "./shared.js";
 
-/** per-role 并发上限的默认值。 */
-export const DEFAULT_CONCURRENCY_LIMIT = 10;
+/**
+ * per-role 并发上限的默认值。
+ *
+ * 与插件 settings 的 DEFAULT_ROLE_CONCURRENCY_LIMIT（index.js）、客户端归一/设置页
+ * title 文案保持一致；这里同时是解析函数抛错或返回非法值时的安全回退值。
+ */
+export const DEFAULT_CONCURRENCY_LIMIT = 20;
 /** per-role 并发上限的下界。 */
 export const MIN_CONCURRENCY_LIMIT = 1;
 /** per-role 并发上限的上界。 */
@@ -1964,7 +1969,7 @@ export function createFanoutManager(options = {}) {
    * - live：注入的解析函数给出了合法值（当前设置权威）；
    * - snapshot：没有 live resolver，使用冻结值（快照或构造期静态值）；
    * - fallback：解析函数抛错或返回非法值，本次已回退安全默认值。诊断必须如实暴露
-   *   fallback，否则用户看到设置页=3、实际并发=10 却无从解释。
+   *   fallback，否则用户看到设置页=3、实际并发=20 却无从解释。
    *
    * @returns {{value:number, source:"live"|"snapshot"|"fallback"}}
    */

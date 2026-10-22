@@ -393,9 +393,9 @@
    * 宿主 meta 的只读归一（票据 25/26/27）。
    *
    * 只保留侧栏真正消费的字段，且**缺什么就是什么**：
-   * - roles：activeRoles（优先）或 roles，去重、限条数；不按静态内置角色表过滤，
-   *   自定义角色因此与内置角色完全同源；
-   * - roleLabels：角色 id → 显示名；
+   * - roles：activeRoles（优先）或 roles，去重、限条数；只按宿主运行期列表收集，
+   *   不按客户端静态内置角色表过滤：保留历史显示名，不因角色表收缩而丢标签；
+   * - roleLabels：角色 id → 显示名（含历史角色显示名，包括已删除角色的持久化标签）；
    * - modelPrices：原样数组（每一项的合法性由 findModelPrice/estimateUsageCost 再校验）；
    * - throttle：diagnostics.fanout.concurrency.throttle（role/provider 的 limit/running/queued/etaMs）；
    * - usage：全局用量聚合（totals/byRole/...），只用于诊断区展示。
@@ -9151,9 +9151,11 @@
       };
       /**
        * 角色显示名（票据 27）：节点 roleLabel → snapshot.roleLabels → meta.roleLabels → 角色 id。
+       * 后两个来源含历史角色显示名（包括已删除角色的持久化标签）。
        *
        * snapshot 与 meta 的合并只在这里发生一次（snapshot 优先），因此筛选下拉、元数据行与
-       * 派发表单看到的是同一份显示名，且**绝不按静态内置角色表过滤**（自定义角色同源）。
+       * 派发表单看到的是同一份显示名；这里只合并宿主/快照给出的显示名，**不按静态内置
+       * 角色表过滤**：保留历史显示名，不因角色表收缩而丢标签。
        */
       const mergedRoleLabels = (() => {
         const sources = [
@@ -10214,8 +10216,9 @@
         // fan-out 标题（票据 18）：可聚焦 + Enter/Space 跳转会话，与任务名同一套键盘契约。
         // 只有真的能导航（宿主提供 uiWorkspace.openSession 且任务有 sessionId）时才挂 role/tabIndex，
         // 绝不留下一个「可聚焦但按了没反应」的标题；它是 div，不是嵌套 button。
-        // 票据 27：fan-out 标题的角色段优先使用显示名（含自定义角色），没有显示名时
-        // 保持既有的「角色 id 首字母大写」文案逐字不变。
+        // 票据 27：fan-out 标题的角色段优先使用显示名（含历史角色显示名，
+        // 包括已删除角色的持久化标签），没有显示名时保持既有的
+        // 「角色 id 首字母大写」文案逐字不变。
         const fanoutRole = roleLabelFor(task.role, task.roleLabel) ?? "Expert";
         const fanoutTitle = fanoutRole.charAt(0).toUpperCase() + fanoutRole.slice(1)
           + " · " + shards.length + " shards · " + RUNTIME_STATUS_LABELS[runtimeStatusOf(task, null)];
@@ -10717,8 +10720,9 @@
             onChange: (event) => { updateFilter({ role: event?.target?.value ?? "" }); },
           }, [
             react.createElement("option", { key: "__all_roles", value: "" }, t("sidebar.filter.allRoles")),
-            // 票据 27：value 仍是角色 id（过滤按 id 匹配），显示名优先用 roleLabel，
-            // 自定义角色因此不会被静态内置角色表过滤掉。
+            // 票据 27：value 仍是角色 id（过滤按 id 匹配），显示名优先用 roleLabel；
+            // 选项来自运行期角色列表，不按静态内置角色表过滤，因此保留历史显示名，
+            // 不因角色表收缩而丢标签。
             ...roles.map((role) => react.createElement("option", { key: role, value: role }, roleLabelFor(role, null) ?? role)),
           ]),
           react.createElement("select", {

@@ -450,7 +450,7 @@ function createdAtOf(...values) {
  * root 冷读、普通 expert 阶段、fan-out 的 task/shard/attempt 证明全部计入同一个上限；
  * 普通 expert 阶段的 forEachWithConcurrency 也用这个值作为 worker 数，两者叠加仍不超过 4。
  * 取值 4：足以把一个根下若干普通专家的等待时间从「逐个求和」压回「取最大值」，又明显低于
- * fan-out 的 per-role 默认并发（10）。live/cached 会话不进入这个并发池。
+ * fan-out 的 per-role 默认并发（20）。live/cached 会话不进入这个并发池。
  */
 const COLD_READ_CONCURRENCY = 4;
 
@@ -610,8 +610,10 @@ const SNAPSHOT_INFLIGHT_LIMIT = 2 * SNAPSHOT_CACHE_LIMIT;
  * @param {object} [dependencies.logger] - 可选：`{warn}`。后台完整构建失败不再向请求方抛出，
  *   因此需要一条宿主日志出口；缺失时静默（只保留 lastError，供 awaitFullBuild 观察）。
  * @param {Function} [dependencies.roleLabels] - 可选：`() => Record<string,string>`，运行期
- *   角色目录的「id → 显示名」投影（含自定义角色，票据 27）。专家/分片/attempt 的 roleLabel
- *   优先使用记录里持久化的值（角色被删除后仍可读），缺失时才回落到这份映射。
+ *   角色目录的「id → 显示名」投影（含历史角色显示名，包括已删除角色的持久化标签；
+ *   票据 27）。自定义角色能力已删除后，这份映射仍服务历史记录的可读标签。
+ *   专家/分片/attempt 的 roleLabel 优先使用记录里持久化的值（角色被删除后仍可读），
+ *   缺失时才回落到这份映射。
  * @returns {{snapshotForSession(sessionId:string): Promise<object>,
  *   invalidateSnapshots(sessionId?:string): number,
  *   awaitFullBuild(sessionId:string): Promise<object|null>}}
@@ -685,7 +687,11 @@ export function createExpertGroupRuntime({
     return record?.outputSchemaRequested === true;
   }
 
-  /** 运行期角色显示名映射（含自定义角色）；不可用时返回空对象，绝不猜显示名。 */
+  /**
+   * 运行期角色显示名映射（含历史角色显示名，包括已删除角色的持久化标签）。
+   * 自定义角色能力已删除，它只服务历史任务/旧快照的可读标签；
+   * 不可用时返回空对象，绝不猜显示名。
+   */
   function currentRoleLabels() {
     if (typeof roleLabels !== "function") return {};
     const value = safeCall(() => roleLabels(), null);
@@ -1438,7 +1444,8 @@ export function createExpertGroupRuntime({
       },
       experts,
       fanoutTasks,
-      // 角色显示名（票据 27）：含自定义角色；只有至少一个条目时才出现在快照顶层。
+      // 角色显示名（票据 27）：含历史角色显示名（包括已删除角色的持久化标签）；
+      // 只有至少一个条目时才出现在快照顶层。
       roleLabels: currentRoleLabels(),
       // partial 是本次新增的快照级标记：true = 轻量快照（跳过了全部冷读，状态可能不完整），
       // false = 完整权威快照。客户端据此在轻量快照期间保持状态圆点/活动文案中性。
