@@ -94,6 +94,26 @@ import {
  */
 const budgetPolicy = FANOUT_BUDGET;
 
+/**
+ * 已结算（终态）父任务的状态集合：只有这些任务会被自动裁剪。
+ *
+ * 边界：pending（含 stop_pending 未确认停止的形态）是唯一的非终态，永不入列——裁剪
+ * 一个仍可能产生状态变化的任务会把它从 role 索引、影响范围索引与快照里摘掉，执行体
+ * 之后再写就跟内存表脱节了。
+ *
+ * 词表现状（fanout/errors.js 的 FANOUT_TASK_STATUSES）只有 completed /
+ * completed_with_errors / cancelled 三个终态；failed / timed_out / interrupted 一并列出，
+ * 是为将来扩展任务级状态时不必再改裁剪判定（当前状态下它们永不出现，不改变行为）。
+ */
+const SETTLED_TASK_STATUSES = new Set([
+  "completed",
+  "completed_with_errors",
+  "cancelled",
+  "failed",
+  "timed_out",
+  "interrupted",
+]);
+
 function rejectSettlement(s, deps, task, shard, attempt, requestedStatus, reason) {
   const event = deps.events.emit({
     type: "shard_settlement_rejected",
@@ -235,6 +255,23 @@ function settleShard(s, deps, task, shard, attempt, status, {
   if ((status === "timed_out" || status === "cancelled") && !isStopObserved(attempt)) {
     deps.scheduler.markStopRequested(task, shard, attempt, { watch: watchStop && !deps.gate.closed });
   }
+  /**
+   * 释放 admission 句柄（内存去重）：句柄持有 child 的 completion promise 与 child 对象，
+   * 而 completion 结果同时存在 attempt.result 与已 settle 的 promise 值里，长期持有等于
+   * 每个终态 attempt 都多留一份结果。
+   *
+   * 边界的核对结论（写入前实测全仓库读写点）：
+   * - completion 订阅已在 admission 落地时用局部变量注册（scheduler.consumeLaunchResult），
+   *   结算路径不再读 handle.completion；
+   * - canceller 只在仍在执行的那一侧读取 handle（超时/取消请求发生在写终态之前），
+   *   Host 的 canceller 也是从自己的归属记录取 handle，不读这里；
+   * - 只有下面两个已执行过的分支读过 attempt.handle：notStarted 证据判定（本函数上方）
+   *   与 markStopRequested（紧随其前的停止证据收敛），因此置空点必须放在它们之后。
+   *
+   * 结算后仍需保留的标量（childId / messageId / attemptId / executionGeneration /
+   * stopEvidence）原样保留，迟到回调与停止证据归属仍按既有语义识别。
+   */
+  attempt.handle = undefined;
   // 多轮复用安全边界：同一 shard 可以有多个 attempt（手工 retry / continuation），
   // shard 的**当前状态**只能由最新 attempt 决定。非最新 attempt 的迟到结算仍然写入它
   // 自己的 attempt 历史（审计可见）并发布 attempt 级事件，但绝不改写 shard.status，
@@ -415,6 +452,238 @@ function failShard(s, deps, task, shard, attempt, error) {
   });
 }
 
+/**
+ * 读取一个已结算任务的裁剪排序时刻。
+ *
+ * 只用于「谁最旧」的比较，不参与任何对外投影：settledAt 是权威结算时刻；老快照/恢复
+ * 出来的任务可能缺这个字段，因此按 updatedAt -> createdAt 逐级兜底；三者都不是有限数字
+ * 时返回 +Infinity，让插入序成为最终判据（绝不因为时间戳缺失就把任务误判成最旧）。
+ */
+function settledRetentionStamp(task) {
+  for (const value of [task?.settledAt, task?.updatedAt, task?.createdAt]) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+/**
+ * 移除一个已结算父任务，并复用显式回收 commit 的清理语义（fanout/reclaim.js）。
+ *
+ * 逐项对应 reclaim commit 的删除顺序，保证自动裁剪与用户主动回收留下的内存状态完全一致：
+ * 1. dropTask：任务本体出表；
+ * 2. dropRequestOwner：仅当 requestId 索引仍指向该任务（否则会误删别人的幂等键）；
+ * 3. dropContinuationOwner：续作 requestId 索引按 owner 反查清理；
+ * 4. removeTaskIndex：role 轮转索引 + 影响范围索引 + 任务级 running 计数一并收敛；
+ * 5. task.reclaimed 墓碑 + rememberReclaimedTask：迟到回调持有的就是这个对象引用，
+ *    据此按「任务已回收」的结构化 no-op 处理（不复活、不改统计、不发事件）。
+ *
+ * 不发布 tasks_reclaimed 事件：那是「用户主动回收」的语义，自动裁剪只是内存收敛，
+ * 由调用方照常 notifyPersistence() 让磁盘快照跟着收敛即可。
+ */
+function dropSettledTask(s, deps, task) {
+  const parentTaskId = task.parentTaskId;
+  deps.store.dropTask(parentTaskId);
+  if (task.requestId !== undefined && deps.store.requestOwner(task.requestId) === parentTaskId) {
+    deps.store.dropRequestOwner(task.requestId);
+  }
+  for (const [requestId, ownerId] of [...deps.store.continuationOwnerEntries()]) {
+    if (ownerId === parentTaskId) deps.store.dropContinuationOwner(requestId);
+  }
+  deps.store.removeTaskIndex(task);
+  task.reclaimed = true;
+  deps.store.rememberReclaimedTask(parentTaskId);
+}
+
+/**
+ * 计算本次「已结算任务保留」的淘汰计划（纯函数，无副作用）。
+ *
+ * 为什么单独抽取：淘汰必须同时满足条数预算与字节预算，输入非法时还要 fail-safe；
+ * 纯函数可以直接验证这些边界，不必每次都构造 1 MiB 的真实任务（集成路径另有用例）。
+ *
+ * 语义边界：
+ * - 只统计 SETTLED_TASK_STATUSES 里的任务，活跃任务（pending）永不参与淘汰；
+ * - 按 settledRetentionStamp 升序淘汰最旧的，时间戳相同则按任务表插入序（Map 迭代序）
+ *   兜底，保证同毫秒结算的一批任务淘汰顺序可复现；
+ * - protectedTask 是「刚刚结算、正要发布 task_settled」的当前任务：即使所有时间戳相同，
+ *   也绝不把它自己裁掉（否则事件会指向一个已不存在的任务句柄）。它仍计入条数与字节
+ *   合计——它同样是快照负担，只是不可淘汰；
+ * - 每次淘汰当前最旧的一条，直到「条数 ≤ maxSettledTasks 且 字节合计 ≤ 字节预算」同时
+ *   成立；任一预算超限都继续淘汰。字节预算是调用方算出的**有效预算**（默认静态 1 MiB，
+ *   结算路径会按当前事件历史/活动任务收小）；**0 是合法的零预算**，仍必须继续淘汰；
+ * - 字节口径 = measureJsonBytes(task)；null（不可序列化）按「不可测量 = 保守超限」
+ *   处理：只有把它淘汰之后才可能回到预算内，绝不当成 0 字节放过；
+ * - fail-safe：字节预算非法（undefined / 负数 / 小数）时不启用字节裁剪，只做既有条数
+ *   裁剪；maxSettledTasks 非法时返回空计划（与既有 trim 语义一致，不抛错）。
+ *
+ * @param {Iterable<object>} tasks - deps.store.allTasks()（插入序）。
+ * @param {{maxSettledTasks?:number, maxSettledTaskBytes?:number, protectedTask?:object}} [policy]
+ * @returns {object[]} 需要淘汰的任务对象（最旧优先）；调用方负责真正删除。
+ */
+export function planSettledTaskEvictions(tasks, policy = {}) {
+  const countLimit = policy.maxSettledTasks;
+  // 条数常量非法时 fail-safe：宁可不裁剪，也不做无界淘汰（配置是编译期冻结的常量，
+  // 走到这里只可能是打包/替换出错）。
+  if (!Number.isSafeInteger(countLimit) || countLimit < 0) return [];
+  // 字节预算只有「非负安全整数」才启用：0 表示动态余额已耗尽（仍要淘汰），
+  // undefined/负数/小数表示无法判定（关闭字节裁剪，条数裁剪继续）。
+  const hasByteBudget = Number.isSafeInteger(policy.maxSettledTaskBytes) && policy.maxSettledTaskBytes >= 0;
+  const byteLimit = hasByteBudget ? policy.maxSettledTaskBytes : 0;
+  const protectedTask = policy.protectedTask;
+  const candidates = [];
+  let order = 0;
+  let protectedCount = 0;
+  let measuredBytes = 0;
+  let unmeasurableCount = 0;
+  for (const task of tasks) {
+    const insertionOrder = order;
+    order += 1;
+    if (task === null || typeof task !== "object") continue;
+    if (!SETTLED_TASK_STATUSES.has(task.status)) continue;
+    // 字节统计是每次结算 O(已结算任务数 × 序列化)：条数上限 32 量级可接受。这里刻意
+    // 不做缓存——retry/续作会改写 shards，缓存失效比多算一遍更难发现。
+    const bytes = measureJsonBytes(task);
+    if (bytes === null) unmeasurableCount += 1;
+    else measuredBytes += bytes;
+    if (task === protectedTask) {
+      protectedCount += 1;
+      continue;
+    }
+    candidates.push({ task, bytes, insertionOrder });
+  }
+  const bytesExceeded = () => hasByteBudget && (unmeasurableCount > 0 || measuredBytes > byteLimit);
+  if (candidates.length + protectedCount <= countLimit && !bytesExceeded()) return [];
+  candidates.sort((left, right) => {
+    const leftStamp = settledRetentionStamp(left.task);
+    const rightStamp = settledRetentionStamp(right.task);
+    if (leftStamp !== rightStamp) return leftStamp - rightStamp;
+    return left.insertionOrder - right.insertionOrder;
+  });
+  const plan = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    // 剩余候选数 = 尚未淘汰的条数；protected 永不计入可淘汰集合，但计入合计。
+    const remaining = candidates.length - index;
+    if (remaining + protectedCount <= countLimit && !bytesExceeded()) break;
+    const entry = candidates[index];
+    plan.push(entry.task);
+    if (entry.bytes === null) unmeasurableCount -= 1;
+    else measuredBytes -= entry.bytes;
+  }
+  return plan;
+}
+
+/**
+ * 快照封装、元数据与降级诊断事件的保留字节（约 260 KiB）：快照还含 envelope/version、
+ * childModels 等元数据与降级诊断事件，它们不参与裁剪却占用 maxSnapshotBytes，算
+ * 「已结算任务可用字节」时必须先扣掉，否则动态预算把余量算大、又会写满磁盘。
+ */
+const SNAPSHOT_RESERVE_BYTES = 260 * 1024;
+
+/**
+ * 读取当前事件历史的字节数（纯只读；不触发裁剪，也不发事件）。
+ * - 读面存在且返回非负安全整数 → 直接采用；
+ * - 读面缺失（旧装配 / 测试替身）→ 用 maxEventHistoryBytes 保守估计「可能已占满」；
+ * - 读面抛错或返回非法值 → null，由调用方回落静态 maxSettledTaskBytes（不做过度淘汰）。
+ *
+ * @param {object} deps - 任务命令依赖（只用 events 只读面）。
+ * @returns {number|null} 字节数；null 表示不可信。
+ */
+function readEventHistoryBytes(deps) {
+  const readHistoryBytes = deps.events?.historyBytes;
+  if (typeof readHistoryBytes !== "function") {
+    const fallback = budgetPolicy.maxEventHistoryBytes;
+    return Number.isSafeInteger(fallback) && fallback >= 0 ? fallback : null;
+  }
+  let value;
+  try {
+    value = readHistoryBytes();
+  } catch {
+    return null;
+  }
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * 活动（非终态）任务的 JSON 字节合计：它们不参与淘汰却出现在快照里，因此要先从快照
+ * 预算扣除，剩下的才是已结算任务可用空间。任一任务不可序列化时整体返回 null
+ * （无法证明体积时宁可回落静态上限）。
+ *
+ * @param {Iterable<object>} tasks - 与淘汰计划同源的任务快照（插入序）。
+ * @returns {number|null} 字节合计；null 表示不可测量。
+ */
+function measuredActiveTaskBytes(tasks) {
+  let total = 0;
+  try {
+    for (const task of tasks) {
+      if (task === null || typeof task !== "object") continue;
+      if (SETTLED_TASK_STATUSES.has(task.status)) continue;
+      const bytes = measureJsonBytes(task);
+      if (bytes === null) return null;
+      total += bytes;
+    }
+  } catch {
+    return null;
+  }
+  return total;
+}
+
+/**
+ * 计算本次「已结算任务字节」的动态有效预算：
+ *   effective = min(maxSettledTaskBytes,
+ *                   maxSnapshotBytes − 事件历史 − 活动任务 − SNAPSHOT_RESERVE_BYTES)
+ *
+ * 为什么动态：静态 1 MiB 是按「事件历史 ≤ 2 MiB」推导的；事件历史若已占掉大半预算，
+ * 静态值仍会挤爆快照。动态值把当前真实占用算进去，保证任务 + 事件 + 活动任务 +
+ * 预留能装进 maxSnapshotBytes。
+ * 边界：结果 < 0 按 0（已结算历史清到只剩 protectedTask，活动任务永不淘汰）；静态
+ * 常量为 0/非法 → undefined，交给 plan 关闭字节裁剪；快照上限非法、事件历史读数非法、
+ * 活动任务不可测量 → 回落静态 maxSettledTaskBytes（宁可少淘汰，不按错误动态值过度淘汰）。
+ * 不做缓存：结算频率低，O(已结算 + 活动) 次序列化可接受。
+ *
+ * @param {Iterable<object>} tasks - 与淘汰计划同源的任务快照。
+ * @param {object} deps - 任务命令依赖。
+ * @returns {number|undefined} 有效字节预算；undefined 表示关闭字节裁剪。
+ */
+function effectiveSettledTaskBudget(tasks, deps) {
+  const staticLimit = budgetPolicy.maxSettledTaskBytes;
+  if (!Number.isSafeInteger(staticLimit) || staticLimit <= 0) return void 0;
+  const snapshotLimit = budgetPolicy.maxSnapshotBytes;
+  if (!Number.isSafeInteger(snapshotLimit) || snapshotLimit <= 0) return staticLimit;
+  const eventHistoryBytes = readEventHistoryBytes(deps);
+  if (eventHistoryBytes === null) return staticLimit;
+  const activeTaskBytes = measuredActiveTaskBytes(tasks);
+  if (activeTaskBytes === null) return staticLimit;
+  const remaining = snapshotLimit - eventHistoryBytes - activeTaskBytes - SNAPSHOT_RESERVE_BYTES;
+  return Math.max(0, Math.min(staticLimit, remaining));
+}
+
+/**
+ * 已结算任务的保留修剪（结算路径的内存收敛点）。
+ *
+ * 决策全部交给 planSettledTaskEvictions；条数预算固定为 maxSettledTasks，字节预算由
+ * effectiveSettledTaskBudget 按当前快照占用动态收小（静态 maxSettledTaskBytes 只是上限）。
+ * 本函数只负责执行删除并触发一次落盘通知。
+ * 性能边界：只在确实淘汰了任务时才调用 notifyPersistence，避免每次结算都额外落盘。
+ *
+ * @returns {string[]} 本次被裁掉的 parentTaskId（供诊断/测试观察，不进入事件）。
+ */
+function trimSettledTasks(s, deps, protectedTask) {
+  // 单次收集：活动任务字节与淘汰计划使用同一份任务快照，避免两次遍历之间状态漂移。
+  const tasks = [...deps.store.allTasks()];
+  const plan = planSettledTaskEvictions(tasks, {
+    maxSettledTasks: budgetPolicy.maxSettledTasks,
+    maxSettledTaskBytes: effectiveSettledTaskBudget(tasks, deps),
+    protectedTask,
+  });
+  const dropped = [];
+  for (const task of plan) {
+    dropped.push(task.parentTaskId);
+    dropSettledTask(s, deps, task);
+  }
+  // 裁剪改变了快照内容：按既有契约照常落盘（批内合并，批外立即落盘）。
+  if (dropped.length > 0) deps.persistence.notifyPersistence();
+  return dropped;
+}
+
 function aggregateTask(s, deps, task) {
   const counts = deps.store.computeCounts(task);
   const allTerminal = counts.pending === 0 && counts.stop_pending === 0;
@@ -439,6 +708,15 @@ function aggregateTask(s, deps, task) {
     return;
   }
   task.settledAt = task.updatedAt;
+  /**
+   * 自动裁剪已结算任务（本函数是唯一的结算收敛点）：
+   * - 位置在「写入 settledAt 之后、发布 task_settled 之前」：此刻本任务已是最新结算，
+   *   被淘汰的只可能是更旧的历史任务，事件仍然指向真实存在的任务；
+   * - restoringSnapshot 期间不裁剪：恢复必须原样装下快照内容，是否超限由
+   *   checkRestoreBudget 判定；在恢复途中顺手删任务会让内存与磁盘分叉；
+   * - 本任务作为 protectedTask 传入，即使整批任务时间戳相同也不会裁掉自己。
+   */
+  if (deps.gate.restoringSnapshot !== true) trimSettledTasks(s, deps, task);
   // 重复 cancel/aggregate 只刷新快照，不重复发布 task_settled；只有从 pending 进入
   // 终态，或终态因显式 retry / continuation 后再次结算，才产生新的聚合结算事件。
   if (deps.gate.restoringSnapshot || (wasSettled && previousStatus === status)) return;

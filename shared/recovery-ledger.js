@@ -43,6 +43,27 @@ export const TASK_BINDING_LIMIT = 64;
 export const CLAIMED_LIMIT = 512;
 
 /**
+ * durable recovery record 的可淘汰容量软上限：保留最近 256 个**已可淘汰**的 child 恢复记录。
+ *
+ * 为什么需要它：record 跨 Activation 存活，只有 root 销毁、插件卸载或 owner/session
+ * 变化才整批丢弃；若父 root 长期不销毁（长会话），每个已完成 child 的 record 都会
+ * 一直留下。超过上限后按 Map 插入序淘汰**最旧且可淘汰**的记录，淘汰资格由
+ * host/index-recovery.js 的 recoveryRecordIsEvictable / pruneRecoveryRecords 逐条核对：
+ * - 已无进行中恢复（pendingRecoveries.size === 0）的记录不再需要为自动恢复保留；
+ * - 以下记录**永不被淘汰**（否则会吞掉尚未结算的信息）：
+ *   1) 仍有 live Activation（agents.get(childId) 仍返回 Agent 对象）——record.agent /
+ *      record.session 是迟到 settlement 做 exact 身份门控的依据；
+ *   2) 仍有进行中恢复 op，或 gatedRecoveryFeedbacks / recoveryFeedbackDeliveries 非空；
+ *   3) handoff 域仍持有该 record 的未结算 child turn/end。
+ * - **256 是可淘汰历史记录的软上限，不是硬上限**：上述保护成立时记录数可以暂时超过
+ *   256，这是「正确性优先于容量」的有意取舍；判定过程中状态缺失或形状异常一律按
+ *   「受保护」处理（fail-closed）；
+ * - 容量以「record 条数」计数而不是字节数：本常量只是资源上界，不是安全边界。
+ * 256 足以覆盖单次会话里并行 + 近期的专家委派，长期内存仍由上限收敛。
+ */
+export const RECOVERY_RECORD_LIMIT = 256;
+
+/**
  * record.processedFeedbackMessageIds 上限：父 inbox settlement 的 message.id 去重账本。
  *
  * 与 CLAIMED_LIMIT 的关键差别：这里**不做插入序淘汰**。淘汰会让一条迟到副本重新变成

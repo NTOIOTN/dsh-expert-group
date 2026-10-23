@@ -49,6 +49,7 @@ import { OUTPUT_SCHEMA_ERROR_CODES } from "../shared/structured.js";
 import { sameDurableSessionId } from "../shared/structured-path.js";
 import {
   FEEDBACK_DELIVERY_LIMIT,
+  RECOVERY_RECORD_LIMIT,
   createFeedbackIdentityLedger,
 } from "../shared/recovery-ledger.js";
 import {
@@ -94,6 +95,144 @@ class RecoveryRecordStore extends Map {
 }
 
 /**
+ * 容量淘汰的「live Activation」判定：agents.get(childId) 仍返回对象即视为 live。
+ *
+ * 为什么不能只看 childId 或 record.agent：record 跨 Activation 存活，而迟到 settlement
+ * 的 exact 身份门控依赖 record.agent / record.session。只要宿主仍持有该 child 的 Agent
+ * 对象，就必须保留 record，否则结算信息会随记录一起丢失并留下 detached 活动范围。
+ * 读面缺失（注入不完整）或 agents.get 抛错时无法证明已停止 → fail-closed 视为 live。
+ *
+ * @param {object} agents - agents registry（只读查询）。
+ * @param {string} childId - exact child session id。
+ * @returns {boolean} 仍有 live Agent（或无法证明没有）返回 true。
+ */
+function recordHasLiveChildAgent(agents, childId) {
+  if (agents === null || typeof agents !== "object" || typeof agents.get !== "function") return true;
+  try {
+    const agent = agents.get(childId);
+    return agent !== null && typeof agent === "object";
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * pendingRecoveries 判定：必须存在且 size === 0 才允许淘汰。
+ * 缺失或形状异常（旧记录 / 测试替身）时无法证明恢复链已结算 → fail-closed 视为仍有恢复。
+ */
+function recordHasPendingRecoveries(record) {
+  const pending = record.pendingRecoveries;
+  if (pending === null || typeof pending !== "object" || typeof pending.size !== "number") return true;
+  return pending.size > 0;
+}
+
+/**
+ * gated feedback 判定：非空 gatedRecoveryFeedbacks 或非空 recoveryFeedbackDeliveries 都保护记录。
+ * 前者是仍待按 exact generation 重投递的撤回消息，后者是本代已投递 id 的去重账本；
+ * 淘汰它们会让门控失效或让迟到副本被当成新 settlement。字段缺失（旧形状/测试替身）
+ * 同样按「受保护」处理（fail-closed）。
+ */
+function recordHasGatedFeedback(record) {
+  const gated = record.gatedRecoveryFeedbacks;
+  if (!Array.isArray(gated) || gated.length > 0) return true;
+  const deliveries = record.recoveryFeedbackDeliveries;
+  if (!(deliveries instanceof Set)) return true;
+  return deliveries.size > 0;
+}
+
+/**
+ * 未结算 child turn/end 判定：委托 handoff 域的只读查询（不写状态、不发事件）。
+ * 查询面缺失、抛错或没有明确返回 false 时一律按「仍有挂起」fail-closed 处理：
+ * 淘汰这类记录会丢失尚未完成的 handoff 结算信息。
+ */
+function recordHasPendingChildTurnEnds(handoff, record) {
+  if (handoff === null || typeof handoff !== "object"
+    || typeof handoff.hasPendingChildTurnEndsForRecord !== "function") return true;
+  try {
+    return handoff.hasPendingChildTurnEndsForRecord(record) !== false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * 容量淘汰资格（可核对规则）：以下条件**全部**成立才允许淘汰。
+ * 1. 没有 live Activation（agents.get(childId) 不是对象）；
+ * 2. pendingRecoveries 存在且 size === 0；
+ * 3. 没有非空 gatedRecoveryFeedbacks / recoveryFeedbackDeliveries；
+ * 4. handoff 域没有该 record 的未结算 child turn/end。
+ * fail-closed：任何一步状态缺失或形状异常都返回 false（仍受保护）。因此
+ * RECOVERY_RECORD_LIMIT 只是可淘汰历史记录的软上限，记录数允许暂时超过它。
+ *
+ * @param {string} childId - exact child session id（store 的键）。
+ * @param {object} record - durable recovery record。
+ * @param {{agents?:object, handoff?:object}} evictionDeps - 只读依赖面。
+ * @returns {boolean} 可淘汰返回 true。
+ */
+function recoveryRecordIsEvictable(childId, record, evictionDeps) {
+  if (record === null || typeof record !== "object") return false;
+  if (recordHasLiveChildAgent(evictionDeps?.agents, childId)) return false;
+  if (recordHasPendingRecoveries(record)) return false;
+  if (recordHasGatedFeedback(record)) return false;
+  return !recordHasPendingChildTurnEnds(evictionDeps?.handoff, record);
+}
+
+/**
+ * 找出「最旧且通过淘汰资格判定」的 record id（Map 插入序 = LRU 顺序）。
+ *
+ * 跳过条件：
+ * - protectedRecord：刚创建的那条必须留下，创建者手里还拿着它；
+ * - recoveryRecordIsEvictable 返回 false：live / 有挂起恢复 / 有 gated feedback /
+ *   有挂起 child turn-end 的记录一律顺延到下一条（见该函数的四重判据）。
+ *
+ * @param {Map} store - recovery record 存储（只读遍历）。
+ * @param {object} protectedRecord - 不得淘汰的刚创建 record。
+ * @param {{agents?:object, handoff?:object}} evictionDeps - 只读依赖面。
+ * @returns {string|undefined} 可淘汰的 childId；没有可淘汰项时返回 undefined。
+ */
+function oldestEvictableRecordId(store, protectedRecord, evictionDeps) {
+  for (const [childId, record] of store.entries()) {
+    if (record === protectedRecord) continue;
+    if (recoveryRecordIsEvictable(childId, record, evictionDeps)) return childId;
+  }
+  return void 0;
+}
+
+/**
+ * 把 record 存储修剪到 RECOVERY_RECORD_LIMIT 以内（可淘汰历史记录的软上限）。
+ *
+ * 只在新建 record 之后调用，因此容量增长点唯一。淘汰走既有的 dropRecoveryRecord：
+ * releaseScope 保持 false（容量淘汰不等于该 child 已权威停止，活动范围保护要保留），
+ * 同时由 expectedRecord 精确锁定同一条 record，避免淘汰并发替换后的新记录。
+ *
+ * 容量语义（正确性优先于容量）：256 只是「可淘汰历史记录」的软上限，不是硬上限。
+ * live Activation / 非空 pendingRecoveries / 非空 gated feedback / 有挂起 child
+ * turn-end 的记录永不淘汰，因此 store.size 可以暂时超过 256；淘汰这些记录会丢失
+ * 恢复链与交接结算信息，比内存暂时超限严重得多。资格判定 fail-closed：状态缺失或
+ * 形状异常一律按「受保护」处理。
+ *
+ * 防御边界：
+ * - 单次循环必须有真实减量，否则立即退出：dropRecoveryRecord 因 exact 身份不匹配
+ *   而拒绝删除时不会无限重试；
+ * - 本函数不 catch 异常，调用点用 try/catch 包住，保证创建流程不被修剪失败打断。
+ *
+ * @param {Map} store - recovery record 存储。
+ * @param {object} protectedRecord - 刚创建、不得被淘汰的 record。
+ * @param {function} dropRecord - 域内 dropRecoveryRecord（childId, message, expectedRecord, options）。
+ * @param {{agents?:object, handoff?:object}} evictionDeps - 只读依赖面：agents registry 与
+ *   handoff 域能力面（只调用只读查询，不写状态、不发事件）。
+ */
+function pruneRecoveryRecords(store, protectedRecord, dropRecord, evictionDeps) {
+  while (store.size > RECOVERY_RECORD_LIMIT) {
+    const victimId = oldestEvictableRecordId(store, protectedRecord, evictionDeps);
+    if (victimId === void 0) return;
+    const sizeBefore = store.size;
+    dropRecord(victimId, "recovery record capacity exceeded", store.get(victimId), { releaseScope: false });
+    if (store.size >= sizeBefore) return;
+  }
+}
+
+/**
  * 创建恢复登记表 / 模型降级域能力面。
  *
  * @param {object} deps - 窄能力面（**禁止**传整个 ctx）。
@@ -132,7 +271,7 @@ export function createIndexRecoveryDomain(deps) {
  * @returns {object} 记录注册表能力面。
  */
 function installRecoveryRecords(deps, api, store) {
-  const { host, delegation, handoff, identity } = deps;
+  const { host, agents, delegation, handoff, identity } = deps;
   const {
     clearPendingChildTurnEnds,
     releaseHandoffAdmission,
@@ -340,6 +479,13 @@ function installRecoveryRecords(deps, api, store) {
         tasks: new Map(),
       };
       recordSet(childId, record);
+      // 容量修剪：新建记录位于插入序末尾，只会淘汰更旧且通过四重资格判定（无 live
+      // Agent / 无待结算恢复 op / 无 gated feedback / 无挂起 child turn-end）的记录；
+      // 保护成立时 store 允许暂时超过软上限。用 try/catch 兜底：容量修剪是资源治理，
+      // 绝不能让它的异常打断 record 创建（record 已写入容器，创建者仍应拿到可用对象）。
+      try {
+        pruneRecoveryRecords(store, record, dropRecoveryRecord, { agents, handoff });
+      } catch { /* 修剪失败只意味着暂时超出上限。 */ }
     }
     return record;
   }

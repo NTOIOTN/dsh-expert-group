@@ -2247,7 +2247,13 @@ test("finalize 只传 admissionEpoch 时同样登记同一张等待账本（toke
   host.setAgentStatus(children[0].child, "idle");
   await flushAsyncWork(20);
   assert.equal(settled, true, "专家静止后同一张账本一次性收口");
-  assert.equal(host.agentSteerMessages(root).length, 1);
+  const conclusions = host.agentSteerMessages(root);
+  assert.equal(conclusions.length, 1);
+  // 收口结论必须是「继续调用工具」的输入：纯文本回复会结束 root turn，因此结论正文
+  // 必须显式要求模型继续推进，而不是只交回一段状态说明。
+  const conclusionText = conclusions[0].content.map((block) => block.text).join("");
+  assert.match(conclusionText, /Continue the task from here now by calling the next tool/);
+  assert.match(conclusionText, /a reply without a tool call ends the turn/);
   assertNoGoalCalls(probe);
 });
 

@@ -212,6 +212,43 @@ export function sessionTitle(session, sessionId, events = sessionEvents(session)
 }
 
 /**
+ * 从父会话事件里取「childId → 派发 label」（纯函数，**只用于展示兜底**）。
+ *
+ * 为什么需要它：DSH 的父会话 catalog 是 **durable** 的（见 dsh-subagent 的
+ * `lib/types/catalog.js`）：每个 continuable 子代理都会以 `subagent/catalog` 事件把
+ * `{ version, childId, childCreatedAt, mode, label }` 落进父会话日志。label 是派发时由用户/
+ * 调用方给出的任务名，语义等同 DEG 的 `lastDispatch.description`。因此即使 DEG 自有
+ * child_models 的 lastDispatch 被历史写回抹掉（真实故障），父会话事件流里仍留着这份名字——
+ * 不做任何 IO 就能救回历史行，不必回退到 DSH session title（那是 prompt 首句，不是任务名）。
+ *
+ * 只收 `type === "subagent/catalog"` 且 data.childId / data.label 都非空的记录；同一 child
+ * 出现多次时**以后到者为准**（事件流是追加式日志，后出现的那行才是最新 label：续作/steer 会
+ * 追加新的 catalog 行）。形状异常（非数组、null、非对象 data、非字符串字段）一律跳过，
+ * 绝不抛错：投影侧的兜底数据永远不能让整棵快照构建失败。
+ *
+ * 本函数**不参与**归属判定、状态推导或导航键，只给任务名降级链提供一级候选。
+ *
+ * @param {Array} events - 父会话事件数组（`sessionEvents(root.session)`）。
+ * @returns {Map<string, string>} trim 后的 childId → trim 后的非空 label。
+ */
+export function catalogLabelsOf(events) {
+  const labels = new Map();
+  if (!Array.isArray(events)) return labels;
+  for (const event of events) {
+    if (event === null || typeof event !== "object") continue;
+    if (event.type !== "subagent/catalog") continue;
+    const data = event.data;
+    if (data === null || typeof data !== "object") continue;
+    const childId = nonEmpty(data.childId);
+    const label = nonEmpty(data.label);
+    if (childId === null || label === null) continue;
+    // 后到者覆盖：同一 child 的最新 catalog 行才代表当前 label。
+    labels.set(childId, label);
+  }
+  return labels;
+}
+
+/**
  * 取系统通知第二行使用的 root 任务名称。
  *
  * 通知只能使用 DSH 已发布的 session/title；缺失时返回 null，不能用 session id、prompt
@@ -825,6 +862,7 @@ export const expertProjection = Object.freeze({
   safeCall,
   sessionEvents,
   sessionTitle,
+  catalogLabelsOf,
   dispatchedPrompt,
   expertStatus,
   runSummary,

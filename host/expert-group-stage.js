@@ -135,6 +135,12 @@ export async function collectExperts(root, deps) {
   const {
     project, recoveryRecords, agents, persisted, coordinator, recovery, now,
     usageFor, roleLabelOf, projectionTitleOf, fast,
+    // 父会话 durable catalog 的 label 映射（Map<childId, 任务名>，可能为空）：历史 child_models
+    // 的 lastDispatch 被写回抹掉时，用它与 lastDispatch 同语义地兜底任务名。
+    catalogLabels,
+    // 任务名兜底映射（Map<childId, 展示名> | undefined）：只由运行时在 **fast 构建**时传入，
+    // 内容取自同一 root 上一份完整快照。这里只读它，绝不修改（deps 已 Object.freeze）。
+    previousExpertTaskNames,
   } = deps;
   const {
     safeCall, firstText, sessionEvents, sessionTitle, dispatchedPrompt, expertStatus,
@@ -226,13 +232,26 @@ export async function collectExperts(root, deps) {
       // 当前/最近一轮的墙钟用时（与 DSH 状态行同源）；没有 turn 事件时省略。
       ...(turnDurationMs === null ? {} : { turnDurationMs }),
       // context.label 是最新 accepted dispatch 的短描述；冷恢复再读持久 child model。
-      // 降级顺序与完整构建完全一致（描述优先于会话标题），轻量路径只是把读不到的冷会话标题
-      // 换成同样语义的可选零 I/O 读面（projectionTitleOf），避免 full 替换 fast 时任务名跳动。
+      // 降级顺序：context.label → lastDispatch.description → catalogLabels → projectionTitleOf
+      //           → sessionTitle → 上一份 full 的展示名。
+      //
+      // 为什么 catalogLabels 插在 lastDispatch 之后、sessionTitle 之前：它是父会话 durable
+      // `subagent/catalog` 事件里的**派发 label**，语义与 lastDispatch.description 完全相同
+      // （都是「这个任务叫什么」）。历史 child_models 的 lastDispatch 被旧实现整条写回抹掉后，
+      // 这正是唯一还活着的名字；若把它排在 sessionTitle 之后，历史行仍会显示 prompt 首句，
+      // 修复就失去意义。
+      // 前四级（label → description → catalog → projectionTitleOf）在快照层是**只读展示**：
+      // 不参与归属判定、状态推导或导航键；projectionTitleOf 仍是零 IO 的会话标题读面。
+      // 最后一级 previousExpertTaskNames 只在 fast 构建时有值（同一 root 上一份 full 的
+      // childId → taskName）：fast 不冷读会话，这是它唯一能拿到的、与 full 一致的展示名。
+      // 它优先级最低——绝不覆盖真实标题、派发描述或 catalog label。
       taskName: firstText(
         context?.label,
         childSnapshot?.lastDispatch?.description,
+        catalogLabels?.get?.(childId),
         projectionTitleOf(childId),
         sessionTitle(session, childId, events),
+        previousExpertTaskNames?.get?.(childId),
       ),
       content: firstText(context?.promptText, childSnapshot?.lastDispatch?.prompt, sessionPrompt),
       contentSource: context?.promptText ? "dispatch-prompt" : sessionPrompt ? "session-log" : "unavailable",

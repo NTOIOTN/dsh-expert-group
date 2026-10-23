@@ -27,6 +27,7 @@
  */
 import { buildExpertGroupSnapshot } from "./expert-group-snapshot.js";
 import {
+  catalogLabelsOf,
   createExpertProjectionContext,
   createProjectionTitleReader,
   createRoleLabelReader,
@@ -162,8 +163,18 @@ export function createExpertGroupRuntime(dependencies = {}) {
    *   残留冷读，同一 root 的立即重试不会与旧批次重叠；
    * - 双失败时按**优化前的阶段顺序**（fan-out 优先）选错：`firstRejection([fanoutOutcome,
    *   expertOutcome])`，与谁先失败/谁先完成无关（否则错误会随负载抖动）。
+   *
+   * 参数 `previousExpertTaskNames`（可选，`Map<childId, 展示名>`）：只由 cache owner 在**轻量
+   * 构建**时传入，内容取自同一 root 最近一份完整快照。fast 路径不冷读会话，拿不到 DSH 的
+   * session/title，这是它唯一能得到的、与 full 一致的展示名来源；它随 stageDeps 只读传到
+   * collectExperts，作为 taskName 降级链的**最后一级**（绝不覆盖真实标题/派发描述）。
+   * 补名因此发生在投影内部，revision 摘要天然覆盖它；full 构建不传该参数（它的名字以冷读
+   * 到的会话标题为准，不引入跨代展示名）。
    */
-  async function buildSnapshotForSession(sessionId, { fast = false, sortAnchorFor = null } = {}) {
+  async function buildSnapshotForSession(
+    sessionId,
+    { fast = false, sortAnchorFor = null, previousExpertTaskNames = undefined } = {},
+  ) {
     const id = nonEmpty(sessionId);
     if (id === null) throw new TypeError("expert-group-snapshot 需要 sessionId");
     // 本次构建独有的冷读协调器：root 冷读、普通 expert 阶段与 fan-out 阶段共用同一份读取
@@ -212,6 +223,11 @@ export function createExpertGroupRuntime(dependencies = {}) {
 
     const session = root.session;
     const rootEvents = sessionEvents(session);
+    // 父会话 durable catalog（`subagent/catalog` 事件）：childId → 派发 label。
+    // rootEvents 已在手，因此这是**零额外 IO** 的读面；它用于救回历史记录里被写回抹掉的
+    // 任务名（真实故障：child_models 只剩 persistChildModel 的字段集合）。
+    // fast 路径若用占位 root，rootEvents 天然为空数组 ⇒ 空 Map，不影响轻量语义。
+    const catalogLabels = catalogLabelsOf(rootEvents);
     const goal = safeCall(() => goals?.get?.(root), undefined) ?? safeCall(() => goals?.get?.(id), undefined);
     const userRequest = recentUserRequest(session, rootEvents);
     const content = firstText(goal?.objective, userRequest);
@@ -242,6 +258,12 @@ export function createExpertGroupRuntime(dependencies = {}) {
       usageFor,
       roleLabelOf,
       projectionTitleOf,
+      // 父会话 catalog 的 label 映射（childId → 任务名）：只读传给学生产投影，作为任务名
+      // 降级链中「派发描述」之后、会话标题之前的一级（详见 stage 的注释）。
+      catalogLabels,
+      // 任务名兜底映射（仅 fast 构建有值）：Map 只读传递，stage 侧只调用 get(childId)，
+      // 不修改它、也不把它带出阶段（stageDeps 本身已 Object.freeze）。
+      previousExpertTaskNames,
       project: expertProjection,
     });
     // 普通 expert 阶段先启动：它决定首屏的专家列表，理应优先占用冷读队列；fan-out 阶段紧随其后

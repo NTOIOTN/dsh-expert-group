@@ -697,7 +697,6 @@
     const { autoActionStillValid, autoTakeoverStateOf } = deps;
     const { autoContext, key } = action;
       if (autoContext === null) return "proceed";
-      if (autoContext === null) return "proceed";
       if (autoActionStillValid(autoContext) !== true) return "abort";
       /**
        * 这里刻意**不**再加一道「持久 manual ⇒ abort」的闸门（持久抑制的判据只落在候选选择处，

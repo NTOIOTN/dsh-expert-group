@@ -570,10 +570,9 @@
       if (verify === null || verify.key === null || verify.key === undefined) {
         // 没有可验证的 key（批量入口）：请求完成了但**什么都没被证明** ⇒ failed，等待者自己复核。
         lease.release("failed");
-        return { status: "request-resolved-unverified", closed: false };
+      } else {
+        beginSidebarCloseVerification(lease, tabId, verify);
       }
-
-      beginSidebarCloseVerification(lease, tabId, verify);
       return { status: "request-resolved-unverified", closed: false };
     }
     return Object.freeze({
@@ -612,38 +611,49 @@
       for (const [key, entry] of origin) {
         // 只处理当前 surface 的记账：别的 session/root 的键在当前快照里无法判定，绝不越权操作。
         if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
-        if (running.has(entry.address) === true) {
+        const runningNow = running.has(entry.address);
+        let scopedRecord = records.get(key);
+        if (scopedRecord === undefined
+          || scopedRecord.sessionId !== sidebarSessionId || scopedRecord.rootSessionId !== rootSessionId) scopedRecord = undefined;
+        if (scopedRecord === undefined) {
+          // 这个 key 的打开/动作仍在途：运行中交给下面的运行态清理（预算/冷却复位），空闲时等它
+          // 落地、本轮不撤销归属。
+          if (openings.has(key) || sidebarTabPendingRef.current.has(key)) {
+            if (!runningNow) continue;
+          } else {
+            /**
+             * 本实例没有记录不等于宿主里没有这个 tab（records 实例级、origin realm 级）：DOM
+             * 渲染抖动、Panel 重挂载、收养只成功一部分都会走到这里。恢复前必须**权威读**持久层
+             * （缓存里的 auto 不能掩盖另一 realm 写入的 manual）；并且只有宿主 inventory 仍以
+             * **同一个 tabId + 同一 contentId** 承载这个地址时才重建记录；读不到时 fail-closed
+             * 保留归属，明确已不是那个 tab 才撤销。
+             */
+            const persisted = readSidebarAutoOwnershipEntry(sidebarSessionId, rootSessionId, entry.address, { quiet: true, authoritative: true });
+            const boundTabId = sidebarAutoOriginTabIdOf(entry);
+            const presence = persisted === undefined ? "unreadable" : sidebarTabPresenceInInventory(boundTabId, entry.address);
+            if (persisted?.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
+              || (presence !== "unreadable" && presence !== "present" && !runningNow)) {
+              origin.delete(key);
+              clearAutoCloseBudget(key);
+              continue;
+            }
+            if (presence === "present" && sidebarResourceTabStateOf(entry.address).tabId === boundTabId) {
+              records.set(key, scopedRecord = { sessionId: sidebarSessionId, rootSessionId, tabId: boundTabId, title: null, misses: 0, origin: SIDEBAR_TAB_ORIGIN_AUTO });
+            } else if (!runningNow) {
+              continue;
+            }
+          }
+        }
+        if (runningNow === true) {
           // 资源重新变成运行中：它已经开着就保持开着，重试预算、owner 身份与失败冷却一并清零。
           // **绝不**丢弃仍在验证中的关闭：那条链属于「已经发出的一次关闭」，它的收口（删记录、
           // 撤销来源 / 登记抑制）与重试预算无关；丢掉它会让 record 与箭头永久停在 <<。
-          /**
-           * 归属标记同源清理：只有在「这个 key 上确实有过一次关闭在途/预算消耗」时才清——那才是
-           * 「资源又跑起来了，旧归属已经过期」的形状；普通的运行中 Auto tab（刚打开、没有任何关闭
-           * 记账）绝不能被顺手清掉，否则一次刷新就会把它降级成 manual，正是本插件要修的漏收。
-           * 清掉之后，下一次自动打开会重新打点（见 recordSidebarTab 的 auto-open 写入）。
-           */
-          if (attempts.has(key) === true
-            || sidebarAutoCloseCooldownsRef.current.has(key) === true
-            || sidebarAutoCloseVerificationsRef.current.has(key) === true) {
+          if (attempts.has(key)
+            || sidebarAutoCloseCooldownsRef.current.has(key)
+            || sidebarAutoCloseVerificationsRef.current.has(key)) {
             deleteSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, "resource-running");
           }
           clearAutoCloseBudget(key);
-          continue;
-
-        }
-        const record = records.get(key);
-        const scopedRecord = record !== undefined
-          && record.sessionId === sidebarSessionId && record.rootSessionId === rootSessionId
-          ? record
-          : undefined;
-        if (scopedRecord === undefined) {
-          // 没有已确认的 tabId 时绝不猜一个 id 去关：这次打开仍在途就继续等它落地，
-          // 否则只撤销来源标记（元素已经不在这个 surface 上了）。
-          const opening = openings.get(key);
-          if (opening !== undefined && opening.sessionId === sidebarSessionId && opening.rootSessionId === rootSessionId) continue;
-          if (sidebarTabPendingRef.current.has(key) === true) continue;
-          origin.delete(key);
-          clearAutoCloseAttempt(key);
           continue;
         }
         if (scopedRecord.origin !== SIDEBAR_TAB_ORIGIN_AUTO) {

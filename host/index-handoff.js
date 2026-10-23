@@ -79,6 +79,12 @@ export function createHandoffDomain(deps) {
     return pendingChildTurnEnds.has(parent);
   }
 
+  /** 只读：某 record 是否仍有未结算 child turn/end；键恒为 record.parentAgent，形状异常 fail-closed 返回 true。 */
+  function hasPendingChildTurnEndsForRecord(record) {
+    const entries = pendingChildTurnEnds.get(record?.parentAgent);
+    return entries === void 0 ? false : !Array.isArray(entries) || entries.some((entry) => entry?.record === record);
+  }
+
   /** 卸载时清空全部未消费 child turn/end（不保留 root 强引用）。 */
   function clearAllParentTurnEnds() {
     pendingChildTurnEnds.clear();
@@ -131,19 +137,13 @@ export function createHandoffDomain(deps) {
 
   return {
     ...api,
-    nextSessionEventReceipt,
-    forgetParentTurnEnds,
-    hasParentTurnEnds,
-    clearAllParentTurnEnds,
-    forgetFailedHandoffParent,
-    hasFailedHandoffParent,
-    clearChildHandoffFailure,
-    clearAllHandoffFailures,
-    markHandoffAdmissionPaused,
-    retargetHandoffAdmissionActivation,
-    releaseHandoffAdmission,
-    listHandoffAdmissionRoots,
-    clearHandoffAdmissionRoot,
+    nextSessionEventReceipt, forgetParentTurnEnds,
+    hasParentTurnEnds, hasPendingChildTurnEndsForRecord,
+    clearAllParentTurnEnds, forgetFailedHandoffParent,
+    hasFailedHandoffParent, clearChildHandoffFailure,
+    clearAllHandoffFailures, markHandoffAdmissionPaused,
+    retargetHandoffAdmissionActivation, releaseHandoffAdmission,
+    listHandoffAdmissionRoots, clearHandoffAdmissionRoot,
   };
 }
 /**

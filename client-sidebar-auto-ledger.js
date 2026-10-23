@@ -392,7 +392,9 @@
    *   {kind:"ownership",event:"delete",reason:"stale-memory"} 诊断；
    * - 持久层有 ⇒ 按持久层的 origin / tabId 返回，并把内存条目修正到同源（下一轮不再复核）；
    * - 持久层不可读 / 解析失败 ⇒ fail-closed 继续按内存判定。
-   * 读 auto 不走复核，避免每轮同步对每个候选都做一次全表解析。
+   * 读 auto 默认不走复核，避免每轮同步对每个候选都做一次全表解析；await 之外的恢复路径需要
+   * 「另一 realm 是否已写 manual」的权威结论时传 options.authoritative === true：强制按 key
+   * 对账一次，且持久层不可读时返回 undefined（调用方 fail-closed，不恢复、不撤销）。
    *
    * 读取本身绝不修改除「自愈那一条」以外的任何状态，失败一律当作「没有标记」（调用方按 manual 兜底）。
    * options.quiet === true 时连「命中」诊断也不写：调用点可能是每轮同步都会跑的判据（自动打开候选、
@@ -408,7 +410,8 @@
        * 只有「已成功落盘的 manual」才允许被持久层对账：本 realm 落盘失败的 manual 一定不在表里，
        * 若照常对账就会被合法空表判成 stale 删掉（Auto 随即重开用户刚关掉的 tab，违背 P1-B）。
        */
-      if (entry !== undefined && entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
+      const authoritative = options?.authoritative === true;
+      if (entry !== undefined && (authoritative === true || entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL)
         && sidebarOwnershipMemory()?.unpersisted?.has(key) !== true) {
         // null = 持久层不可读（fail-closed 沿用内存判定）；Map 里没有这个 key = 持久层权威的「没有」。
         const persisted = loadSidebarOwnershipEntries();
@@ -418,6 +421,10 @@
           // 自愈删除是真实状态变更：即使 quiet 也要留证据（quiet 只静音命中判据）。
           if (entry === undefined) recordSidebarAutoDiag({ kind: "ownership", event: "delete", reason: "stale-memory", key: sidebarAutoKeyDigest(key) });
           else entries.set(key, entry);
+        } else if (authoritative === true && sidebarLocalStorage() !== null) {
+          // 权威读失败：绝不把缓存里的 auto 当成「另一 realm 的 manual 不存在」。
+          // 没有 localStorage 的宿主不存在跨 realm 持久层，内存条目本身就是权威证据。
+          return void 0;
         }
       }
       // 条目的 origin 在写入 / 载入时已经归一为 AUTO 或 MANUAL，这里直接取用（无需二次归一）。

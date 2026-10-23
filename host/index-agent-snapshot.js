@@ -7,16 +7,17 @@
  *    （仅当 role/parentId/continuable 三项都成立才接受，与迁移前同一判定）。
  * 2. `persistChildModel(...)`：把 child 的实际 provider/model/effort、角色显示名、
  *    admission deny/persona、实际路由元数据、subagent provider 与继承开关、结构化交付
- *    标记与 shadow 生效性快照写入 child_models（同一份 storage 串行链）。
+ *    标记与 shadow 生效性快照**合并**写入 child_models（同一份 storage 串行链）。
  *
  * ## 铁律（票据 19）
  * 不接收 ctx、不注册事件、不持容器：`ctx.on("agent/created")` 与 guard 安装仍由
  * `index.js` 的原注册点/装配 adapter 完成；本模块只返回纯读写命令。
  *
  * ## 行为等价
- * 写入字段集合、条件展开顺序、malformed 值过滤（validPersonaMarker）、cold-resume
- * 保留原值的优先级、以及 `writeChildModel().then(flushPendingStructuredPatch)` 的
- * 异步形态与迁移前逐行一致。
+ * 写入字段集合、条件展开顺序、malformed 值过滤（validPersonaMarker）与 cold-resume
+ * 保留原值的优先级与迁移前一致；只有**写入语义**从「整条替换」改为「浅合并」
+ * （`writeChildModelPatch`，见 persistChildModel 内的说明）——这是修复「冷恢复抹掉历史
+ * 任务名/用量」的必要改动；`.then(flushPendingStructuredPatch)` 的异步形态不变。
  *
  * @module dsh-expert-group/host/index-agent-snapshot
  */
@@ -45,7 +46,7 @@ import { shadowMarkerFields } from "./send-message-shadow.js";
  *
  * @param {object} deps - 窄能力面（5 组）。
  * @param {object} deps.storage - settings/storage 域：`readSnapshot()`（完整快照读面）与
- *   `writeChildModel(childId, record)`（同一条串行写链）。
+ *   `writeChildModelPatch(childId, patch)`（同一条串行写链上的**浅合并**写命令）。
  * @param {object} deps.roles - 角色目录投影：`roleLabelOfRole(role)`。
  * @param {object} deps.core - 专家核心域：`validSubagentProviderName`、
  *   `flushPendingStructuredPatch(childId)`。
@@ -109,6 +110,16 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
     // child_models 记录在真实 storage-domain 写入边界被拒绝（连带丢掉 provider/model）。
     const personaMarkerSnapshot = validPersonaMarker(agent.options?.[PERSONA_MARKER])
       ?? validPersonaMarker(recordedExpert?.[PERSONA_MARKER]);
+    // 浅合并不会自动丢掉「本函数没写」的键，因此必须显式处理**必须清除**的字段：历史记录里
+    // 可能存在 malformed persona（非空但没通过 validPersonaMarker），本次也没有可写的好值时，
+    // 必须显式删除该键——否则真实 storage-domain 会因 persona 的类型/长度约束整条拒绝这条
+    // 记录，连本次的 provider/model 一起写不进去（旧整条写恰好"顺手"丢掉了它）。
+    const storedPersona = recordedExpert?.[PERSONA_MARKER];
+    const personaRemoveKeys = isExpertChild === true
+      && personaMarkerSnapshot === undefined
+      && storedPersona !== undefined
+      ? [PERSONA_MARKER]
+      : [];
     // 实际路由快照（票据 24）：优先当前 agentOptions marker；cold-resume 的 Host 不还原
     // agentOptions，因此回落到 DEG 自有 child_models 记录里的扁平字段，避免恢复写回擦除。
     const recordedRouteFields = modelRouteFieldsFromRecord(recordedExpert);
@@ -129,7 +140,23 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
       guards.installExpertReportGuard(agent, { role, parentId, source: recordedExpert === void 0 ? "marker" : "snapshot" });
     }
     if (typeof agent?.options?.provider === "string" && typeof agent?.options?.model === "string" && (isExpertChild || effort !== void 0)) {
-      void storage.writeChildModel(agent.id, {
+      /**
+       * 写入语义选择：**浅合并**（`storage.writeChildModelPatch`），而不是整条替换。
+       *
+       * 本函数只负责「本次 created 观测到的」模型 / 身份 / 路由 / 结构化 / shadow 字段，
+       * 它**不负责** child_models 里的 lastDispatch、usage、createdAt 与 fanout* 来源身份。
+       * 旧实现用 `writeChildModel` 整条覆盖，于是每次 agent/created（含**冷恢复**重放）
+       * 都会把这些字段一并抹掉：真实数据里 22 条非 fanout 记录只剩本函数的字段集合，
+       * 历史专家行的任务名因此回退到 DSH session title（prompt 首句）。
+       *
+       * 改用 patch 后，本函数只覆盖自己真正知道的键，其余字段（含将来新增的持久字段）
+       * 原样保留，且写入仍在同一条串行写临界区内（与用量账本、lastDispatch 写入互不覆盖）。
+       * 必须显式清除的字段只有一类：历史记录里 malformed 的 persona（见 personaRemoveKeys）——
+       * 它不是「写入即清除」，而是「非法值不得留在 durable schema 里」。其余字段都不清除；
+       * effort 缺失时 reasoningEffort 写 undefined，浅合并后该键仍为 undefined，序列化时被
+       * 丢弃，与旧整条写的行为一致（两种情况都留不下该键）。
+       */
+      void storage.writeChildModelPatch(agent.id, {
         provider: agent.options.provider,
         model: agent.options.model,
         reasoningEffort: effort === void 0 ? void 0 : String(effort),
@@ -167,7 +194,8 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
           // 因此这里能写出 verified/absent 等实际结果（foreign 会让本监听器不会被执行）。
           ...shadowMarkerFields(agent.id),
         } : {}),
-      }).then(() => core.flushPendingStructuredPatch(agent.id));
+      }, personaRemoveKeys.length === 0 ? undefined : { remove: personaRemoveKeys })
+        .then(() => core.flushPendingStructuredPatch(agent.id));
     }
   }
 

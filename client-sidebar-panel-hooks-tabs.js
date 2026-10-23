@@ -845,14 +845,6 @@
      */
     const autoSidebarOwnershipHasCapacity = (key, address) => autoController().autoSidebarOwnershipHasCapacity(key, address);
     /**
-     * 唯一实现在 client-sidebar-auto-controller.js 的 sidebarTabCloseKeyOf()：本层只注入本帧作用面，不含任何判据。
-     */
-    const sidebarTabCloseKeyOf = (tabId) => autoController().sidebarTabCloseKeyOf(tabId);
-    /**
-     * 唯一实现在 client-sidebar-auto-controller.js 的 sidebarTabCloseLeaseOf()：本层只注入本帧作用面，不含任何判据。
-     */
-    const sidebarTabCloseLeaseOf = (tabId) => autoController().sidebarTabCloseLeaseOf(tabId);
-    /**
      * 唯一实现在 client-sidebar-auto-controller.js 的 sidebarTabCloseInFlight()：本层只注入本帧作用面，不含任何判据。
      */
     const sidebarTabCloseInFlight = (tabId) => autoController().sidebarTabCloseInFlight(tabId);
@@ -893,7 +885,7 @@
     Object.assign(frame, {
       acquireSidebarTabClose, autoCloseCandidate, autoController, autoOpenCandidate, autoSidebarOwnershipHasCapacity, beginSidebarCloseVerification,
       finishVerifiedSidebarClose, requestSidebarTabClose, sidebarActions, sidebarActionsCache, sidebarAutoCloseKeyIsActive, sidebarAutoControllerCache,
-      sidebarAutoFrame, sidebarAutoFrameCache, sidebarAutoOpenCapable, sidebarTabCloseInFlight, sidebarTabCloseKeyOf, sidebarTabCloseLeaseOf,
+      sidebarAutoFrame, sidebarAutoFrameCache, sidebarAutoOpenCapable, sidebarTabCloseInFlight,
       sidebarTabPresenceInInventory, verifyPendingSidebarCloses, waitForSidebarCloseLease,
     });
   }

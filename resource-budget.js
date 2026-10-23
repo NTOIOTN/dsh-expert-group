@@ -41,6 +41,37 @@ export const FANOUT_BUDGET = Object.freeze({
   maxEventHistory: 1000,
   /** 单个 manager 内并发登记的父任务数上限。 */
   maxTasks: 64,
+  /**
+   * 已结算父任务的保留上限。
+   *
+   * 结算后的父任务仍完整保留 basePrompt 与全部 shard attempt 结果，若永不淘汰，历史任务
+   * 会永久占用内存并吃掉 maxTasks 的 64 个槽位（到顶后 submit 直接 BUDGET_EXCEEDED）。
+   * 因此结算路径按 settledAt 保留最近 maxSettledTasks 个已结算任务，超出部分淘汰最旧的
+   * 已结算任务；活跃任务（pending 等非终态）永不参与淘汰。
+   *
+   * 取值小于 maxTasks：即使已结算任务占满该额度，仍留有提交新任务的槽位。
+   */
+  maxSettledTasks: 32,
+  /**
+   * 已结算任务合计字节上限（1 MiB，静态软上限）。
+   *
+   * 为什么需要它：maxSettledTasks 只按条数收敛，32 条「大任务」仍可能把快照推过
+   * maxSnapshotBytes（4 MiB）——超预算时 persistence 静默 skipped，重启后
+   * checkRestoreBudget 直接失败，磁盘再也写不进，只能人工改文件。
+   *
+   * 取值推导（4 MiB 快照上限内必须同时装下事件历史与封装）：
+   *   4 MiB − 最多 2 MiB 事件历史（maxEventHistoryBytes）
+   *         − 约 256 KiB 快照封装与元数据
+   *         − 约 4 KiB 降级诊断事件
+   *         ≈ 1.7 MiB 可用任务字节；这里取 1 MiB 作为保守的静态值。
+   * 结算路径还会按「当前事件历史 + 活动任务 + 预留」算出更小的动态有效预算
+   * （见 fanout/task-commands.js 的 effectiveSettledTaskBudget）；本常量是**软上限，
+   * 不是总快照的硬保证**，restore 仍以 maxSnapshotBytes 复核。
+   *
+   * 非法值（非正安全整数，例如旧包缺字段 / 打包损坏）时关闭字节裁剪，只保留既有
+   * 条数裁剪——资源治理失败不能变成结算路径抛错。
+   */
+  maxSettledTaskBytes: 1 * 1024 * 1024,
   /** 单个父任务的 shard 数上限。 */
   maxShardsPerTask: 64,
   /** 单 shard 的 attempt 数上限；retry 超限返回结构化失败且不新建 attempt。 */

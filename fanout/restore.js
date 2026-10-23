@@ -520,10 +520,12 @@ function commitRestoreConfig(deps, plan, resolvedBoundaries) {
   deps.setRestoreDispatchSuppressed(!resume);
   deps.boundScheduler.dispatchState.clearPendingWork();
   // 代次种子：恢复后新建 attempt 的代次必须严格大于全部历史值（见 restoredMaxGeneration）。
+  // 代次种子必须是数值：函数引用参与 Math.max 会被转成 NaN，导致恢复后每个新建
+  // attempt 的 executionGeneration 都变成 NaN，停止证据校验永远失败、任务永久不可回收。
   deps.store.setNextExecutionGeneration(Math.max(
     Number.isSafeInteger(snapshot.nextExecutionGeneration) ? snapshot.nextExecutionGeneration : 0,
     restoredMaxGeneration,
-    deps.store.nextExecutionGenerationValue,
+    deps.store.nextExecutionGenerationValue(),
   ));
   // 记录本次恢复使用的停止证据边界（只读诊断；不写入快照——边界属于恢复进程的决定）。
   // 多任务混合边界（延迟恢复的旧任务 + 本进程任务）显式投影为 "mixed"。

@@ -110,7 +110,9 @@ export function assembleAgentHandlers(state) {
     delegation: { bindActiveTask: (activityId, childId) => delegationTracker.bindActiveTask(activityId, childId) },
   });
   const agentSnapshot = createAgentSnapshotDomain({
-    storage: { readSnapshot: state.readSnapshot, writeChildModel: state.writeChildModel },
+    // child 模型快照写面：只交出只读快照与**浅合并**写命令（persistChildModel 不得整条替换，
+    // 否则冷恢复重放会抹掉 lastDispatch/usage 等它不负责的持久字段）。
+    storage: { readSnapshot: state.readSnapshot, writeChildModelPatch: state.writeChildModelPatch },
     roles: { roleLabelOfRole: state.roleLabelOfRole },
     // expertCore 是 apply 后段才装配的晚绑定值：只交出调用期解析的窄命令。
     core: {

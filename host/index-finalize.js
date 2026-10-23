@@ -559,6 +559,10 @@ function reengagePendingCloseWorks(parent, pendingClose) {
  * 只表达「收口已完成 + admissionEpoch + acceptedCount」这三项**插件自己拥有**的事实：
  * 专家的具体结果由 DSH 的结算通知各自提供，插件消息不复制、不改写任何专家收尾文本，
  * 也刻意不与 Host 自动完成通知的固定前缀同形（避免被当作 child settlement）。
+ *
+ * 除此之外，本段还额外携带一条执行纪律：纯文本回复会结束 root turn，模型必须继续调用
+ * 工具推进任务。这不是插件事实，而是模型可见契约的一部分——收口结论是「继续」的输入，
+ * 不是「可以收尾」的许可。
  */
 function rootFinalizationConclusionText(admissionEpoch, acceptedCount) {
   return "Expert group finalization: the expert batch you finalized is finalized"
@@ -567,8 +571,9 @@ function rootFinalizationConclusionText(admissionEpoch, acceptedCount) {
     + " Every expert task accepted in that batch has actually finished;"
     + " each expert's own closing output arrived separately as a subagent settlement message,"
     + " which this notice deliberately does not repeat."
-    + " Do not call dsh_expert_group_finalize again for this batch and do not poll for status;"
-    + " continue the task from here.";
+    + " Do not call dsh_expert_group_finalize again for this batch and do not poll for status."
+    + " Continue the task from here now by calling the next tool: a reply without a tool call"
+    + " ends the turn, so do not answer with a plan or summary while work remains.";
 }
 
 /**
@@ -750,7 +755,12 @@ const finalizeTool = defineTool({
         return [{ type: "text", text: base
           + " — waiting registered for " + value.acceptedCount + " accepted expert task(s) in admissionEpoch "
           + value.admissionEpoch + summary
-          + "; do not call finalize again and do not poll for status" }];
+          + "; do not call finalize again for this batch and do not poll for status"
+          // 模型可见硬约束：纯文本回复会直接结束 turn。waiting 回执必须显式说明这一点，
+          // 否则模型会把「等待已登记」当成可以收尾的信号，只回一段计划文本就关闭 turn。
+          + " — the plugin now holds this turn at the lifecycle boundary; keep working with other"
+          + " tool calls if any independent work remains, and never end the turn with a plan or"
+          + " status note (a reply without a tool call closes it)" }];
       }
       return [{ type: "text", text: base }];
     },

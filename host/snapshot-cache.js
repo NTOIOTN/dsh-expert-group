@@ -15,8 +15,11 @@
  * - 策略判定（新鲜度 / 宽限 / 可启动构建 / 失败退避 / 锚点）全部是**同文件 module-scope 无状态
  *   helper**，factory 本体因此守住 ≤400（plan R2.3）。
  *
- * 对外冻结面：`{ snapshotForSession, invalidateSnapshots, awaitFullBuild }`，与拆分前
- * `createExpertGroupRuntime` 返回的 surface 完全一致（不改 RPC、snapshot 字段或错误语义）。
+ * 对外冻结面：`createSnapshotCache` 返回 `{ snapshotForSession, invalidateSnapshots, awaitFullBuild }`，
+ * 与拆分前 `createExpertGroupRuntime` 返回的 surface 完全一致（不改 RPC、snapshot 字段或错误语义）。
+ * 另导出一个**纯函数** `expertTaskNamesOf`（从 full 快照取「专家 childId → 展示名」，供
+ * fast 构建补齐任务名；单测直接锁「只收 expert / 拒绝空白」规则）。补名发生在**投影内部**，
+ * 因此 revision 摘要天然覆盖补后名字；该导出不进入 runtime surface，也不改变任何协议字段。
  *
  * @module dsh-expert-group/host/snapshot-cache
  */
@@ -166,6 +169,17 @@ function displayableFull(entry, timestamp) {
 }
 
 /**
+ * 构建 fast 时随构建请求传给 builder 的「上一份完整快照的专家任务名」（childId → 名字）。
+ *
+ * 名字只用于展示，因此这里刻意**不**判断代次 / 宽限（权威性判定由 displayableFull 负责，两者
+ * 正交）：只要曾经成功构建过 full，就把同一 childId 的最好名字交给 fast 投影去兜底。
+ * full 不存在时返回 undefined —— builder 的行为与改造前完全一致。
+ */
+function previousExpertTaskNamesFor(entry) {
+  return entry.full === null ? undefined : expertTaskNamesOf(entry.full.snapshot);
+}
+
+/**
  * 是否允许启动一次**新的**后台完整构建（两条独立的闸门）。
  *
  * 1. 失效去抖：上一次构建「成功但期间发生过失效」后，冷却 STALE_REBUILD_MIN_INTERVAL_MS；
@@ -248,6 +262,56 @@ function firstTextOf(...values) {
   return null;
 }
 
+// ── 任务名补全：从上一份完整快照取「专家 childId → 展示名」 ────────────────────
+
+/**
+ * 从一份**完整快照**里取「专家 childId → 非空展示名」，供后续 fast 构建补齐任务名（纯函数）。
+ *
+ * 为什么需要它：fast 帧不冷读会话，而 taskName 降级链里唯一的零 I/O 兜底 `projectionTitleOf`
+ * 在组合根**故意未接线**（host/index-assembly-tools.js:195-200，恒 null）。于是同一 root 的缓存
+ * 交替返回 full / fast 时，fast 帧 taskName 为空 → 客户端（client-sidebar-dom.js:477）显示
+ * 「未命名任务」，full 帧显示 session/title 的 prompt 首句，任务名在数秒内来回切换。
+ *
+ * **只认 `kind === "expert"` 且 id 为字符串的节点**：fan-out 父任务与 shard 也带 taskName，但
+ * 它们的身份不是 childId——shardId 只在父任务内唯一，不同父任务下会重名；按「节点上第一个非空
+ * 身份字段」跨 kind 取名字，就会把分片名补给恰好同名的空名专家行。只有专家 id（DSH 的 child
+ * agent id 即会话 id）在整个 DEG 内全局唯一，因此补名映射只允许由它构成。
+ *
+ * 重复 id 的处理：按 root.children 的先序，**第一个非空名字胜出**，后续同名节点不覆盖。投影层
+ * 本应让同一个 child 只出现一次（projectChildren 会剔除已在 fan-out attempt 里出现的专家），
+ * 真出现重复说明上游数据异常，此时沿用先出现者、不做猜测。
+ *
+ * 空白名字（非字符串 / trim 后为空）不入表：它们本来就是「没有名字」，不能当兜底。
+ * 形状异常（非对象、root 缺失、children 非数组）一律返回空 Map，绝不抛错。
+ *
+ * 键用节点 id 的**原字符串**（不做 trim）：它必须与 stage 里的 childId 原值逐字符一致才能命中。
+ * 名字只用于展示，不参与归属或状态判定；因此这里不判断代次 / 宽限，调用方传哪一份 full 就用哪份。
+ *
+ * 导出是给单测直接锁「只收 expert / 拒绝空白 / 同 id 先到者胜」这几条规则的纯 helper，
+ * 不进入 runtime 对外 surface。
+ *
+ * @param {object|null} snapshot - 完整快照。
+ * @returns {Map<string, string>} childId → 已 trim 的非空展示名。
+ */
+export function expertTaskNamesOf(snapshot) {
+  const names = new Map();
+  const root = snapshot === null || typeof snapshot !== "object" ? null : snapshot.root;
+  const children = root === null || typeof root !== "object" ? null : root.children;
+  if (!Array.isArray(children)) return names;
+  for (const node of children) {
+    if (node === null || typeof node !== "object") continue;
+    // 只允许专家节点提供名字：shard / fan-out 父任务的身份不是全局唯一的 childId。
+    if (node.kind !== "expert") continue;
+    const id = node.id;
+    if (typeof id !== "string" || id.trim().length === 0) continue;
+    const name = node.taskName;
+    if (typeof name !== "string" || name.trim().length === 0) continue;
+    if (names.has(id)) continue;
+    names.set(id, name.trim());
+  }
+  return names;
+}
+
 /**
  * 按 root 的两级快照缓存（轻量 / 完整）。
  *
@@ -279,7 +343,9 @@ function firstTextOf(...values) {
  *
  * @param {object} dependencies
  * @param {Function} dependencies.buildSnapshotForSession - 注入能力：
- *   `(sessionId, { fast, sortAnchorFor }) => Promise<object|null>`。
+ *   `(sessionId, { fast, sortAnchorFor, previousExpertTaskNames }) => Promise<object|null>`。
+ *   `previousExpertTaskNames` 是 fast 构建专用的可选 Map（childId → 上一份 full 的专家展示名），
+ *   full 构建不传（它的任务名一律来自冷读到的 session/title）。
  * @param {Function} dependencies.now - 单调时钟读数（毫秒）。
  * @param {object} [dependencies.logger] - 可选：`{warn}` 宿主日志出口。
  * @param {Map} dependencies.recoveryRecords - recovery 记录（失效判定用，只读）。
@@ -563,12 +629,23 @@ export function createSnapshotCache({
       // 修复 A：把该 root 的排序锚点（只读查询）传给轻量构建，用它给缺失的 createdAt 兜底
       // （按 root 隔离；Map 不离开本模块）。
       fastGeneration = entry.generation;
-      fast = await buildSnapshotForSession(id, { fast: true, sortAnchorFor: createSortAnchorQuery(entry) });
+      fast = await buildSnapshotForSession(id, {
+        fast: true,
+        sortAnchorFor: createSortAnchorQuery(entry),
+        // 任务名补全（见 expertTaskNamesOf）：fast 不冷读会话，这是它唯一能拿到的、与上一份
+        // full 一致的展示名。它随构建请求进入**投影内部**，因此 revision 摘要天然覆盖补后名字
+        // （客户端按 revision 短路，摘要不含名字就会吞掉标题变化）。
+        previousExpertTaskNames: previousExpertTaskNamesFor(entry),
+      });
       if (fast !== null && fastGeneration !== entry.generation) {
         // R5：构建期间发生过失效，这份结果不是当前权威——丢弃它，按**当前**代次重算一次
         // （仍是零 I/O 的同步轻量投影，不引入阻塞、不触发冷读）。只重算一次，避免自旋。
         fastGeneration = entry.generation;
-        fast = await buildSnapshotForSession(id, { fast: true, sortAnchorFor: createSortAnchorQuery(entry) });
+        fast = await buildSnapshotForSession(id, {
+          fast: true,
+          sortAnchorFor: createSortAnchorQuery(entry),
+          previousExpertTaskNames: previousExpertTaskNamesFor(entry),
+        });
       }
       // 只有真正重建成功时才写入新的时间戳与代次；命中路径保持原有 at 不变。
       if (fast !== null) {
