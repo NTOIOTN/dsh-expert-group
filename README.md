@@ -357,4 +357,4 @@ Expert Group 是 DEG 注册在右侧栏的任务视图：它把**当前会话所
 - **`dsh_expert_group_release_scope` 已收紧为只读诊断**：它不再删除保护，只返回 `scope-release-refused` 与当前活动项摘要。保护应在专家真正停止后由正常生命周期自动释放。
 - **显式回收**：root 可通过 RPC `fanout-reclaim`（`sessionId` + `parentTaskIds`）回收**已结算、无活动 attempt、未被等待账本引用**的父任务。回收先落盘成功再从内存与侧栏移除；持久化失败时状态不变。回收不保留墓碑：之后同一 `requestId` 视为新任务，旧 id 的查询返回 `task_not_found`。容量拒绝会返回 `current`、`reclaimable` 与可执行 `hint`，且 requestId 幂等判定先于容量判定。
 - **人工逃生**：`dsh_expert_group_abandon_wait`（root-only，参数 `reason`）仅在权威后代查询明确「没有运行中的后代」时关闭当前等待批次；它不会取消 child、不会释放影响范围、也不会改变 fan-out 状态。查询失败、降级或状态未知时一律拒绝并返回稳定原因码。root turn 等待本身没有自动超时释放。
-- **可观测性**：`meta.diagnostics.rootTurnWait` 暴露未结算数、最早等待时长、后代查询能力等级、最近一次收口投递结果与人工关闭次数。等待超过 30 分钟、后代查询降级或收口投递失败会产生一次性系统通知（仍受通知开关约束）。
+- **可观测性**：`meta.diagnostics.rootTurnWait` 暴露未结算数、最早等待时长、后代查询能力等级、最近一次收口投递结果与人工关闭次数。只有收口投递失败会产生一次性系统通知（仍受通知开关约束）；长等待与后代查询降级只作为诊断（`capabilityLevel` / `reminderCount`）保留，不再弹系统通知。

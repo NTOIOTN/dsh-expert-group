@@ -45,16 +45,21 @@ export function buildTestNotificationText(locale) {
   };
 }
 
-/** 长等待/查询降级/投递失败提示：固定类别 → 消息表键（body 里含人工逃生入口说明）。 */
+/**
+ * 等待账本提示文案：固定类别 → 消息表键。
+ *
+ * 产品收敛后只有「收口结论投递失败」还会提示用户：
+ * - `deliveryFailed` → `notify.waitDeliveryFailed.body`（body 里含重试说明）；
+ * - `long`（等待 ≥ 30 分钟）与 `queryDegraded`（后代查询降级/失败）的文案已随系统通知
+ *   一并删除，两者返回 null。账本侧的定时器、issue 产生与 reminderCount /
+ *   capabilityLevel 诊断**不受影响**，只是不再变成用户可见提示。
+ * - 其他未知类别同样返回 null（绝不猜测文案）。
+ */
 export function buildRootWaitNotificationText(locale, kind) {
-  const key = kind === "long"
-    ? "notify.waitLong.body"
-    : kind === "queryDegraded"
-      ? "notify.waitQueryDegraded.body"
-      : kind === "deliveryFailed"
-        ? "notify.waitDeliveryFailed.body"
-        : null;
-  if (key === null) return null;
-  return { title: translateMessage(locale, "notify.test.title"), body: translateMessage(locale, key) };
+  if (kind !== "deliveryFailed") return null;
+  return {
+    title: translateMessage(locale, "notify.test.title"),
+    body: translateMessage(locale, "notify.waitDeliveryFailed.body"),
+  };
 }
 

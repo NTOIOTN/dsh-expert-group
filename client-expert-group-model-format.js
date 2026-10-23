@@ -265,14 +265,8 @@ const MESSAGE_CATALOG = Object.freeze({
     zh: "测试通知：系统通知通道可用。",
     en: "Test notification: the system notification channel is available.",
   },
-  "notify.waitLong.body": {
-    zh: "专家任务已等待超过 30 分钟仍未结算。若权威查询确认没有运行中的后代，可用 dsh_expert_group_abandon_wait 手动关闭等待账本；它不会终止专家，也不会释放影响范围保护。",
-    en: "The expert task has been waiting more than 30 minutes without settling. If an authoritative query confirms no running descendants, use dsh_expert_group_abandon_wait to close the wait ledger manually; it neither stops experts nor releases impact-scope protection.",
-  },
-  "notify.waitQueryDegraded.body": {
-    zh: "无法确认专家后代的运行状态（后代查询降级或失败），root turn 会继续等待；未知状态不等于专家已完成。",
-    en: "The running state of expert descendants cannot be confirmed (descendant query degraded or failed); the root turn keeps waiting. Unknown is not the same as completed.",
-  },
+  // 说明：客户端表必须与 shared.MESSAGE_CATALOG 逐键同值，因此长等待与后代查询降级
+  // 两条文案同步移除（插件已不再把这两类事件变成系统通知）。
   "notify.waitDeliveryFailed.body": {
     zh: "专家批次已静止，但收口结论投递失败；批次保持待收口，插件会在后续 root turn 重试。",
     en: "The expert batch is quiescent but delivering the finalization result failed; the batch remains pending and the plugin retries on later root turns.",

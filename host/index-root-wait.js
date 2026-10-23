@@ -16,7 +16,8 @@
  * ## 语义边界（不得改变）
  * - 静止判定只认权威 listing 的干净完整回答；waterfall 只提供正向证据；
  * - 任何空数组（含 sentinel 透传、第三方 fresh `[]`）一律 `known:false`（fail-closed）；
- * - 提示（长等待 / 查询降级 / 投递失败）只影响投递，绝不改变等待与收口语义。
+ * - 提示（仅收口结论投递失败）只影响投递，绝不改变等待与收口语义；长等待与后代查询降级
+ *   只作为账本侧的可观测性（diagnostic），插件不再把它们投递成系统通知。
  *
  * @module dsh-expert-group/host/index-root-wait
  */
@@ -91,21 +92,30 @@ export function createRootWaitDomain(deps) {
   const core = installRootWaitCore({ ...flat, getRootTurnWaits: () => rootTurnWaits });
   const queries = installDescendantQueries({ ...flat, logTurnWaitError: core.logTurnWaitError });
 
-  /** 等待账本的用户可见提示开关（票据 11）：只影响提示，不影响等待/收口语义。 */
+  /**
+   * 等待账本的用户可见提示开关（票据 11）：只影响提示，不影响等待/收口语义。
+   *
+   * 现在只剩「收口结论投递失败」一类提示；长等待（onLongWait）与后代查询降级
+   * （descendant-query-degraded issue）按产品要求不再弹系统通知。
+   */
   const ledgerNotificationsEnabled = flat.config?.waitLedgerNotifications !== false;
-  const rootWaitLongToast = () => buildRootWaitNotificationText(flat.notificationLocale, "long");
-  const rootWaitQueryDegradedToast = () => buildRootWaitNotificationText(flat.notificationLocale, "queryDegraded");
   const rootWaitDeliveryFailedToast = () => buildRootWaitNotificationText(flat.notificationLocale, "deliveryFailed");
 
   /**
    * 唯一的 root turn 等待登记表：finalize 与 agent/turn-stopping 兜底共用。
    *
    * 释放条件见 host/turn-wait.js 的模块文档；本处只负责把宿主事实接进来。
-   * onLongWait/onIssue 只做用户可见提示（票据 11）：提示失败绝不改变等待语义，
-   * 去重与限流也全部由账本负责（记录级一次性 + 30 分钟时间桶）。
+   *
+   * 通知面（票据 11，2026-10 产品收敛）：
+   * - 账本仍会在等待超过 30 分钟时触发 onLongWait 注入点、仍会为降级查询产出
+   *   descendant-query-degraded issue，并继续维护 reminderCount / lastReminderAt /
+   *   capabilityLevel 诊断字段——这些**语义与可观测性一律保留**；
+   * - 但插件只把 finalization-delivery-failed 变成系统通知，长等待与后代查询降级
+   *   仅作为诊断存在，不再打扰用户；
+   * - 提示失败绝不改变等待语义，去重与限流全部由账本负责（记录级一次性 + 30 分钟时间桶）。
    */
   // 账本工厂的注入面同样按能力组组织（票据 32）：clock 与 notifications 是命名空间，
-  // 提示开关关闭时整组缺省（与收窄前"不传 onLongWait/onIssue"语义一致）。
+  // 提示开关关闭时整组缺省（与收窄前"不传 onIssue"语义一致）。
   rootTurnWaits = createRootTurnWaitRegistry({
     isLiveRoot: (agent) => core.isLiveRootAgent(agent),
     snapshotDescendants: (rootId) => queries.snapshotRootTurnDescendants(rootId),
@@ -114,11 +124,12 @@ export function createRootWaitDomain(deps) {
     onError: (error) => core.logTurnWaitError("check", error),
     ...(ledgerNotificationsEnabled ? {
       notifications: {
-        onLongWait: () => { flat.sendSystemToast(rootWaitLongToast()); },
+        // 刻意不注入 onLongWait：账本侧 30 分钟定时器、reminderCount/lastReminderAt 诊断
+        // 照旧运行（缺省回调是 no-op），但长等待不再产生系统通知。
         onIssue: (issue) => {
           // kind 由账本固定枚举；未知 kind 静默忽略（绝不猜测文案）。
-          if (issue?.kind === "descendant-query-degraded") flat.sendSystemToast(rootWaitQueryDegradedToast());
-          else if (issue?.kind === "finalization-delivery-failed") flat.sendSystemToast(rootWaitDeliveryFailedToast());
+          // descendant-query-degraded 同样静默：它只保留为记录上的可观测性事实。
+          if (issue?.kind === "finalization-delivery-failed") flat.sendSystemToast(rootWaitDeliveryFailedToast());
         },
       },
     } : {}),
