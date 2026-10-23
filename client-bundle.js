@@ -1537,6 +1537,7 @@ const SIDEBAR_SHARED_AUTO_LEDGER_KEY=Symbol.for("dsh-expert-group/sidebar#shared
 const SIDEBAR_SHARED_AUTO_LEDGER_VERSION=1;
 const SIDEBAR_AUTO_OWNERSHIP_KEY="dsh-expert-group:auto-ownership:v1";
 const SIDEBAR_AUTO_OWNERSHIP_LIMIT=128;
+const SIDEBAR_AUTO_OWNERSHIP_GLOBAL_LIMIT=4*SIDEBAR_AUTO_OWNERSHIP_LIMIT;
 const SIDEBAR_AUTO_OWNERSHIP_TTL_MS=7*24*60*60*1000;
 const SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO="auto";
 const SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL="manual";
@@ -1689,10 +1690,10 @@ const host=sidebarRealmHost();
 if(host===null)return null;
 try{
 const existing=host[SIDEBAR_AUTO_OWNERSHIP_MEMORY_KEY];
-if(existing!==null&&typeof existing==="object"&&existing.entries instanceof Map)return existing;
+if(existing?.entries instanceof Map)return existing;
 }catch{return null;}
 try{
-const created={entries:new Map(),loaded:false};
+const created={entries:new Map(),loaded:false,unpersisted:new Set()};
 Object.defineProperty(host,SIDEBAR_AUTO_OWNERSHIP_MEMORY_KEY,{value:created,configurable:true,writable:true});
 return created;
 }catch{
@@ -1704,15 +1705,14 @@ const entries=new Map();
 if(Array.isArray(raw)!==true)return entries;
 for(const item of raw){
 if(item===null||typeof item!=="object")continue;
-const key=typeof item.key==="string"?item.key:null;
-if(key===null)continue;
+if(typeof item.key!=="string")continue;
+const key=item.key;
 const updatedAt=Number(item.updatedAt);
-if(Number.isFinite(updatedAt)!==true||now-updatedAt>SIDEBAR_AUTO_OWNERSHIP_TTL_MS)continue;
+if(!Number.isFinite(updatedAt)||now-updatedAt>SIDEBAR_AUTO_OWNERSHIP_TTL_MS)continue;
 const origin=item.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
 ?SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
 :SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO;
-const previous=entries.get(key);
-if(previous!==undefined&&previous.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL)continue;
+if(entries.get(key)?.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL)continue;
 entries.delete(key);
 entries.set(key,{
 key,
@@ -1724,57 +1724,58 @@ tabId:sidebarBoundedText(item.tabId),
 }
 return entries;
 };
+const loadSidebarOwnershipEntries=()=>{
+const storage=sidebarLocalStorage();
+if(storage===null)return null;
+try{
+const raw=storage.getItem(SIDEBAR_AUTO_OWNERSHIP_KEY);
+if(!raw)return new Map();
+const parsed=JSON.parse(raw);
+return Array.isArray(parsed)===true?normalizeSidebarOwnershipEntries(parsed,Date.now()):null;
+}catch{
+return null;
+}
+};
 const sidebarOwnershipEntries=()=>{
 const memory=sidebarOwnershipMemory();
-if(memory===null){
-const storage=sidebarLocalStorage();
-if(storage===null)return new Map();
-try{
-const raw=storage.getItem(SIDEBAR_AUTO_OWNERSHIP_KEY);
-return normalizeSidebarOwnershipEntries(raw===null||raw.length===0?[]:JSON.parse(raw),Date.now());
-}catch{
-return new Map();
-}
-}
+if(memory===null)return loadSidebarOwnershipEntries();
 if(memory.loaded!==true){
 memory.loaded=true;
-const storage=sidebarLocalStorage();
-if(storage!==null){
-try{
-const raw=storage.getItem(SIDEBAR_AUTO_OWNERSHIP_KEY);
-memory.entries=normalizeSidebarOwnershipEntries(raw===null||raw.length===0?[]:JSON.parse(raw),Date.now());
-}catch{
-memory.entries=new Map();
-}
-}
+memory.entries=loadSidebarOwnershipEntries()??new Map();
 }
 return memory.entries;
 };
 const persistSidebarOwnership=(entries)=>{
-const storage=sidebarLocalStorage();
-if(storage===null)return false;
 try{
+const storage=sidebarLocalStorage();
+if(storage===null)throw new Error("storage-unavailable");
 const list=[];
-for(const entry of entries.values()){
-const item={key:entry.key,origin:entry.origin,updatedAt:entry.updatedAt};
-if(entry.reason!==undefined)item.reason=entry.reason;
-if(entry.tabId!==undefined)item.tabId=entry.tabId;
-list.push(item);
-}
+for(const entry of entries.values())list.push({...entry});
 storage.setItem(SIDEBAR_AUTO_OWNERSHIP_KEY,JSON.stringify(list));
+sidebarOwnershipMemory()?.unpersisted?.clear();
 return true;
 }catch{
+recordSidebarAutoDiag({kind:"ownership",event:"persist-failed",reason:"write-rejected"});
 return false;
 }
 };
 const readSidebarAutoOwnershipEntry=(sessionId,rootId,address,options)=>{
 try{
 const key=sidebarAutoScopedKey(sessionId,rootId,address);
-const entry=sidebarOwnershipEntries().get(key);
-const origin=entry===undefined
-?null
-:(entry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL?SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL:SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO);
-if(options===null||options===undefined||options.quiet!==true){
+const entries=sidebarOwnershipEntries();
+let entry=entries.get(key);
+if(entry!==undefined&&entry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
+&&sidebarOwnershipMemory()?.unpersisted?.has(key)!==true){
+const persisted=loadSidebarOwnershipEntries();
+if(persisted!==null){
+entry=persisted.get(key);
+entries.delete(key);
+if(entry===undefined)recordSidebarAutoDiag({kind:"ownership",event:"delete",reason:"stale-memory",key:sidebarAutoKeyDigest(key)});
+else entries.set(key,entry);
+}
+}
+const origin=entry===undefined?null:entry.origin;
+if(options?.quiet!==true){
 recordSidebarAutoDiag({kind:"ownership",event:"hit",origin,key:sidebarAutoKeyDigest(key)});
 }
 if(entry===undefined)return null;
@@ -1786,21 +1787,27 @@ tabId:typeof entry.tabId==="string"&&entry.tabId.length>0?entry.tabId:null,
 return null;
 }
 };
-const sidebarOwnershipAutoCount=(entries)=>{
-let count=0;
-for(const entry of entries.values()){
-if(entry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO)count+=1;
+const planSidebarOwnershipAutoWrite=(entries,prefix,key)=>{
+let scopeAuto=0;
+let totalAuto=0;
+const others=[];
+for(const[entryKey,entry]of entries){
+if(entry.origin!==SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO)continue;
+totalAuto+=1;
+if(entryKey.startsWith(prefix))scopeAuto+=1;
+else others.push([entryKey,entry.updatedAt]);
 }
-return count;
+const existingIsAuto=entries.get(key)?.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO?1:0;
+if(scopeAuto-existingIsAuto+1>SIDEBAR_AUTO_OWNERSHIP_LIMIT)return null;
+const overflow=totalAuto-existingIsAuto+1-SIDEBAR_AUTO_OWNERSHIP_GLOBAL_LIMIT;
+if(overflow<=0)return[];
+if(overflow>64)return null;
+others.sort((left,right)=>left[1]-right[1]);
+return others.length<overflow?null:others.slice(0,overflow).map(([entryKey])=>entryKey);
 };
 const sidebarOwnershipAcceptsNewAuto=(sessionId,rootId,address)=>{
 try{
-const entries=sidebarOwnershipEntries();
-const key=sidebarAutoScopedKey(sessionId,rootId,address);
-const existing=entries.get(key);
-const existingIsAuto=existing!==undefined&&existing.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO;
-const nextAutoCount=sidebarOwnershipAutoCount(entries)-(existingIsAuto?1:0)+1;
-return nextAutoCount<=SIDEBAR_AUTO_OWNERSHIP_LIMIT;
+return planSidebarOwnershipAutoWrite(sidebarOwnershipEntries(),sidebarAutoScopedKey(sessionId,rootId,""),sidebarAutoScopedKey(sessionId,rootId,address))!==null;
 }catch{
 return true;
 }
@@ -1812,11 +1819,14 @@ const normalizedOrigin=origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
 :SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO;
 const entries=sidebarOwnershipEntries();
 const key=sidebarAutoScopedKey(sessionId,rootId,address);
-if(normalizedOrigin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
-&&sidebarOwnershipAcceptsNewAuto(sessionId,rootId,address)!==true){
+const plan=normalizedOrigin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
+?planSidebarOwnershipAutoWrite(entries,sidebarAutoScopedKey(sessionId,rootId,""),key)
+:[];
+if(plan===null){
 recordSidebarAutoDiag({kind:"ownership",event:"reject",origin:normalizedOrigin,reason:"capacity",key:sidebarAutoKeyDigest(key)});
 return false;
 }
+for(const evictedKey of plan)entries.delete(evictedKey);
 entries.delete(key);
 entries.set(key,{
 key,
@@ -1825,8 +1835,11 @@ updatedAt:Date.now(),
 reason:sidebarBoundedText(reason),
 tabId:sidebarBoundedText(tabId),
 });
-persistSidebarOwnership(entries);
-recordSidebarAutoDiag({kind:"ownership",event:"write",origin:normalizedOrigin,reason,key:sidebarAutoKeyDigest(key)});
+if(persistSidebarOwnership(entries)!==true&&normalizedOrigin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL){
+const memory=sidebarOwnershipMemory();
+if(memory!==null)(memory.unpersisted??=new Set()).add(key);
+}
+recordSidebarAutoDiag({kind:"ownership",event:"write",origin:normalizedOrigin,reason,key:sidebarAutoKeyDigest(key),degraded:plan.length>0});
 return true;
 }catch{
 return false;
@@ -1841,31 +1854,49 @@ if(entry===undefined){
 recordSidebarAutoDiag({kind:"ownership",event:"delete-miss",reason,key:sidebarAutoKeyDigest(key)});
 return false;
 }
-if(entry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
-&&(options===null||options===undefined||options.manual!==true)){
+if(entry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL&&options?.manual!==true){
 recordSidebarAutoDiag({kind:"ownership",event:"keep",origin:SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,reason,key:sidebarAutoKeyDigest(key)});
 return false;
 }
 entries.delete(key);
 persistSidebarOwnership(entries);
+sidebarOwnershipMemory()?.unpersisted?.delete(key);
 recordSidebarAutoDiag({kind:"ownership",event:"delete",reason,key:sidebarAutoKeyDigest(key)});
 return true;
 }catch{
 return false;
 }
 };
+const clearSidebarAutoManualSuppressions=(sessionId,rootId)=>{
+try{
+const entries=sidebarOwnershipEntries();
+const prefix=sidebarAutoScopedKey(sessionId,rootId,"");
+const keys=[...entries]
+.filter(([key,entry])=>entry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL&&key.startsWith(prefix))
+.map(([key])=>key);
+for(const key of keys){
+entries.delete(key);
+sidebarOwnershipMemory()?.unpersisted?.delete(key);
+}
+if(keys.length>0)persistSidebarOwnership(entries);
+return keys.length;
+}catch{
+return 0;
+}
+};
 const recordSidebarAutoDecision=(event,candidate,verdict,reason)=>{
 recordSidebarAutoDiag({
 kind:"decision",
 event,
-action:candidate===null||candidate===undefined?undefined:candidate.kind,
+action:candidate?.kind,
 verdict,
 reason,
-key:candidate===null||candidate===undefined?undefined:sidebarAutoKeyDigest(candidate.key),
+key:candidate==null?undefined:sidebarAutoKeyDigest(candidate.key),
 });
 };
 global[SYMBOL]=Object.freeze({
-SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,deleteSidebarAutoOwnership,readSidebarAutoOwnershipEntry,
+SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,clearSidebarAutoManualSuppressions,
+deleteSidebarAutoOwnership,readSidebarAutoOwnershipEntry,
 recordSidebarAutoDecision,recordSidebarAutoDiag,resolveSidebarSharedAutoLedger,sidebarAutoKeyDigest,
 sidebarAutoOriginEntry,sidebarAutoOriginTabIdOf,sidebarAutoOriginWrittenAtOf,sidebarBoundedText,
 sidebarLocalStorage,sidebarOwnershipAcceptsNewAuto,sidebarSharedAutoLedgerSizes,sidebarSharedAutoLedgerTotal,
@@ -5838,7 +5869,13 @@ return record!==undefined
 }
 function autoSidebarOwnershipHasCapacity(key,address){
 const origin=sidebarAutoOriginRef.current;
-if(origin.has(key)!==true&&origin.size>=SIDEBAR_AUTO_KEY_LIMIT)return false;
+let scopedCount=0;
+for(const[entryKey,entry]of origin){
+if(entryKey===key)continue;
+if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId)continue;
+scopedCount+=1;
+}
+if(scopedCount>=SIDEBAR_AUTO_KEY_LIMIT)return false;
 return sidebarOwnershipAcceptsNewAuto(sidebarSessionId,rootSessionId,address);
 }
 function cleanupAutoSidebarKeys(known,actingKey){
@@ -8608,7 +8645,8 @@ derivedSurfaceToken,sidebarSurfaceStillCurrent,surfaceToken,surfaceTokenRef,surf
 }
 function useSidebarPanelHostServices(frame){
 const{
-config,contextRef,sessionId,setAutoOpenDraft,sidebarRight,sidebarSessionId,
+clearSidebarAutoManualSuppressions,config,contextRef,rootSessionId,sessionId,
+setAutoOpenDraft,sidebarRight,sidebarSessionId,
 }=frame;
 const navigation=getOpenSession(config,contextRef.current);
 const readAutoOpenSetting=typeof config.getAutoOpenSubagentSidebar==="function"
@@ -8628,7 +8666,18 @@ setAutoOpenDraft(value);
 void Promise.resolve()
 .then(()=>writeAutoOpenSetting(value))
 .then(
-(accepted)=>{if(accepted!==true)setAutoOpenDraft(null);},
+(accepted)=>{
+if(accepted!==true){
+setAutoOpenDraft(null);
+return;
+}
+if(value===true){
+if(typeof clearSidebarAutoManualSuppressions==="function"){
+try{clearSidebarAutoManualSuppressions(sidebarSessionId,rootSessionId);}catch{}
+}
+frame.late.clearSidebarAutoSuppressionsOfScope?.();
+}
+},
 ()=>{setAutoOpenDraft(null);},
 );
 };
@@ -9475,6 +9524,15 @@ const AUTO_CONTROLLER_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-co
 const AUTO_CONTROLLER=global[AUTO_CONTROLLER_SYMBOL]||{};
 const SIDEBAR_ACTIONS_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-actions");
 const SIDEBAR_ACTIONS=global[SIDEBAR_ACTIONS_SYMBOL]||{};
+function clearAutoSuppressionsOfScope(suppressed,sessionId,rootSessionId){
+let removed=0;
+for(const[key,entry]of suppressed){
+if(entry.sessionId!==sessionId||entry.rootSessionId!==rootSessionId)continue;
+suppressed.delete(key);
+removed+=1;
+}
+return removed;
+}
 function useSidebarPanelAutoRefs(frame){
 const{
 react,sessionId,sharedSidebarAutoCloseAttemptOwners,sharedSidebarAutoCloseAttempts,sharedSidebarAutoCloseCooldowns,sharedSidebarAutoCloseVerifications,
@@ -9934,6 +9992,7 @@ const waitForSidebarCloseLease=(leaseToken,timeoutMs)=>autoController().waitForS
 const beginSidebarCloseVerification=(lease,tabId,verify)=>autoController().beginSidebarCloseVerification(lease,tabId,verify);
 const finishVerifiedSidebarClose=(key,entry,reason)=>autoController().finishVerifiedSidebarClose(key,entry,reason);
 const verifyPendingSidebarCloses=()=>autoController().verifyPendingSidebarCloses();
+frame.late.clearSidebarAutoSuppressionsOfScope=()=>clearAutoSuppressionsOfScope(sidebarAutoSuppressedRef.current,sidebarSessionId,rootSessionId);
 frame.late.sidebarAutoCloseKeyIsActive=sidebarAutoCloseKeyIsActive;
 Object.assign(frame,{
 acquireSidebarTabClose,autoCloseCandidate,autoController,autoOpenCandidate,autoSidebarOwnershipHasCapacity,beginSidebarCloseVerification,
@@ -10810,7 +10869,8 @@ formatPanelUpdatedTime,readPanelTabActivity,
 const AUTO_LEDGER_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
 const AUTO_LEDGER=global[AUTO_LEDGER_SYMBOL]||{};
 const{
-recordSidebarAutoDiag,resolveSidebarSharedAutoLedger,sidebarSharedAutoLedgerSizes,sidebarSharedAutoLedgerTotal,
+clearSidebarAutoManualSuppressions,recordSidebarAutoDiag,resolveSidebarSharedAutoLedger,
+sidebarSharedAutoLedgerSizes,sidebarSharedAutoLedgerTotal,
 }=AUTO_LEDGER;
 const PANEL_CACHE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-cache");
 const PANEL_CACHE=global[PANEL_CACHE_SYMBOL]||{};
@@ -10940,6 +11000,7 @@ const cancelSidebarSplit=typeof config.cancelSidebarSplit==="function"?config.ca
 const openSidebarResource=methodOf(sidebarRight,"openResource");
 Object.assign(frame,{
 ctx,tabInfo,tabParams,sessionsSnapshot,catalogEntryOf,fallbackCurrent,scopedId,scope,
+clearSidebarAutoManualSuppressions,
 sessionId,resolvedRoot,rootSessionId,sidebarSessionId,tabActivity,tabActivityKey,
 model,panelLocale,t,errorLabelOf,
 serviceCandidates,sessionsService,sidebarRight,requestRightbarDragSync,releaseRightbarDragLock,

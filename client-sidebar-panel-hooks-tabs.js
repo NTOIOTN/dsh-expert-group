@@ -26,6 +26,26 @@
   const SIDEBAR_ACTIONS_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-actions");
   const SIDEBAR_ACTIONS = global[SIDEBAR_ACTIONS_SYMBOL] || {};
 
+  /**
+   * 清除某个 scope 的**内存**手动关闭抑制（标题栏 Auto 由关→开 = 重新授权）。
+   *
+   * 抑制表是 realm 级 Map：键与 sidebarTabKey 同构，条目形如 { sessionId, rootSessionId, address }。
+   * 只删 (sessionId, rootSessionId) **逐字相等**的条目——别的会话 / root 的抑制是那边用户的意图，
+   * 绝不能被另一处的开关顺手清掉；返回删除条数（0 表示本来就没有抑制）。
+   *
+   * 独立成模块级纯函数：承载它的 Hook 已贴着 200 行上限，本逻辑也不依赖 React 状态，放在闭包里
+   * 只会给 Hook 增行、给「闭包内函数数」加数，收益为零。
+   */
+  function clearAutoSuppressionsOfScope(suppressed, sessionId, rootSessionId) {
+    let removed = 0;
+    for (const [key, entry] of suppressed) {
+      if (entry.sessionId !== sessionId || entry.rootSessionId !== rootSessionId) continue;
+      suppressed.delete(key);
+      removed += 1;
+    }
+    return removed;
+  }
+
   /** tab 记账 / Auto 预算 / 关闭租约所需的实例级 ref 容器。 */
   function useSidebarPanelAutoRefs(frame) {
     const {
@@ -867,6 +887,8 @@
     const verifyPendingSidebarCloses = () => autoController().verifyPendingSidebarCloses();
 
     // 登记给更早 Hook 的晚绑定包装（声明已完成，此后的调用都拿到本帧的实例）。
+    // 内存抑制清除也走晚绑定：归属账本清的是持久层，这张表是同一页面生命周期内的第二层抑制。
+    frame.late.clearSidebarAutoSuppressionsOfScope = () => clearAutoSuppressionsOfScope(sidebarAutoSuppressedRef.current, sidebarSessionId, rootSessionId);
     frame.late.sidebarAutoCloseKeyIsActive = sidebarAutoCloseKeyIsActive;
     Object.assign(frame, {
       acquireSidebarTabClose, autoCloseCandidate, autoController, autoOpenCandidate, autoSidebarOwnershipHasCapacity, beginSidebarCloseVerification,

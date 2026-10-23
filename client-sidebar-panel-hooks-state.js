@@ -702,7 +702,8 @@
   /** 宿主服务解析、Auto 开关、split 事务入口与无标签同步读面。 */
   function useSidebarPanelHostServices(frame) {
     const {
-      config, contextRef, sessionId, setAutoOpenDraft, sidebarRight, sidebarSessionId,
+      clearSidebarAutoManualSuppressions, config, contextRef, rootSessionId, sessionId,
+      setAutoOpenDraft, sidebarRight, sidebarSessionId,
     } = frame;
 
     const navigation = getOpenSession(config, contextRef.current);
@@ -737,7 +738,33 @@
       void Promise.resolve()
         .then(() => writeAutoOpenSetting(value))
         .then(
-          (accepted) => { if (accepted !== true) setAutoOpenDraft(null); },
+          (accepted) => {
+            if (accepted !== true) {
+              setAutoOpenDraft(null);
+              return;
+            }
+            /**
+             * 由关→开 = 重新授权自动打开：解除本 scope 的手动关闭抑制，且**两层都要解除**——
+             * 持久 manual 归属（跨刷新，账本负责）与本页 realm 内存抑制表（同一页面生命周期，
+             * 见 hooks-tabs 的 clearSidebarAutoSuppressionsOfScope 晚绑定）。只清一层时，同一页面里
+             * 手动关过的仍在运行资源仍会被 autoOpenCandidate 跳过，直到它回到 ready 才恢复。
+             *
+             * 只有**写面确认接受**且 value === true 时才清：写失败 / 只读文档时开关并没有真的打开，
+             * 顺手清抑制等于替用户撤销了他从未表达过的意图。关闭（false）时什么也不做——抑制正是
+             * 「关闭」需要保留的记忆。
+             *
+             * scope 用 sidebarSessionId + rootSessionId：归属账本与内存抑制表的所有写入点都以这
+             * 两个值为键，清理必须落在同一个 scope 上。缺依赖（旧宿主 / 直接 createExpertGroupPanel）
+             * 时静默跳过：Auto 开关本身照常持久化，行为退回没有这条恢复路径。
+             */
+            // 清理失败不影响「Auto 已打开」这个事实：下一轮同步仍会按持久层判定。
+            if (value === true) {
+              if (typeof clearSidebarAutoManualSuppressions === "function") {
+                try { clearSidebarAutoManualSuppressions(sidebarSessionId, rootSessionId); } catch {}
+              }
+              frame.late.clearSidebarAutoSuppressionsOfScope?.();
+            }
+          },
           () => { setAutoOpenDraft(null); },
         );
     };

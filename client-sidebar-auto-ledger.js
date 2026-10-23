@@ -21,7 +21,27 @@
   const SIDEBAR_SHARED_AUTO_LEDGER_VERSION = 1;
   /** 持久归属标记的版本化键（与 dsh-expert-group:rightbar-presented:v1 同命名风格）。 */
   const SIDEBAR_AUTO_OWNERSHIP_KEY = "dsh-expert-group:auto-ownership:v1";
+  /**
+   * **单 scope** 的 auto 归属上限（容量按 scope 分账）。
+   *
+   * 归属表里一条记录只对「写下它的那个 (sidebar session, root session)」有效，因此容量也只能按
+   * scope 计账：旧实现按全表 auto 总数判定，16 个历史会话留下的 128 条 auto 条目会把任何**新**
+   * 会话永久挡在门外（用户实测：Auto 开关是开的、候选也选出来了、每个候选都因容量/陈旧 manual
+   * 被跳过）——这是一条跨会话死锁。
+   */
   const SIDEBAR_AUTO_OWNERSHIP_LIMIT = 128;
+  /**
+   * 持久归属表的**全局**硬上限（4 × 单 scope 上限 = 512），只约束存储体积。
+   *
+   * 它不参与「能不能自动打开」的语义判定（那是上面按 scope 的那道判据）；只有当一次 auto 写入会让
+   * 全表 auto 条目数超过本上限时，才先按 updatedAt 从旧到新淘汰**别的 scope** 的 auto 条目来腾位。
+   * manual 条目是用户意图，**永不被淘汰**；当前 scope 的条目同样一条都不许淘汰。
+   */
+  const SIDEBAR_AUTO_OWNERSHIP_GLOBAL_LIMIT = 4 * SIDEBAR_AUTO_OWNERSHIP_LIMIT;
+  /**
+   * 单次写入最多淘汰 64 条别的 scope 的旧 auto 条目（有界工作量：一次写入绝不为了腾位扫完整张表）。
+   * 上限直接写在 planSidebarOwnershipAutoWrite 里，避免再多一份只被引用一次的常量。
+   */
   const SIDEBAR_AUTO_OWNERSHIP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   const SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO = "auto";
   const SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL = "manual";
@@ -239,16 +259,20 @@
   /**
    * 归属标记的内存索引（懒加载 + write-through）：命中 realm 槽位即复用，否则新建并写回。
    * 槽位不可用时返回 null——此时所有读写直接走 localStorage（仍然正确，只是每次都要解析）。
+   *
+   * `unpersisted` 是同层的「本 realm 已写入内存、但**落盘失败**的 manual 复合键」集合：
+   * 对账时这些 key 一律不采信持久层（fail-closed）。它比另开一个 Symbol 槽位少一次槽位解析，
+   * 生命周期也与索引完全一致（同一个 realm 槽位，一起创建、一起被测试重置）。
    */
   const sidebarOwnershipMemory = () => {
     const host = sidebarRealmHost();
     if (host === null) return null;
     try {
       const existing = host[SIDEBAR_AUTO_OWNERSHIP_MEMORY_KEY];
-      if (existing !== null && typeof existing === "object" && existing.entries instanceof Map) return existing;
+      if (existing?.entries instanceof Map) return existing;
     } catch { return null; }
     try {
-      const created = { entries: new Map(), loaded: false };
+      const created = { entries: new Map(), loaded: false, unpersisted: new Set() };
       Object.defineProperty(host, SIDEBAR_AUTO_OWNERSHIP_MEMORY_KEY, { value: created, configurable: true, writable: true });
       return created;
     } catch {
@@ -271,15 +295,14 @@
     if (Array.isArray(raw) !== true) return entries;
     for (const item of raw) {
       if (item === null || typeof item !== "object") continue;
-      const key = typeof item.key === "string" ? item.key : null;
-      if (key === null) continue;
+      if (typeof item.key !== "string") continue;
+      const key = item.key;
       const updatedAt = Number(item.updatedAt);
-      if (Number.isFinite(updatedAt) !== true || now - updatedAt > SIDEBAR_AUTO_OWNERSHIP_TTL_MS) continue;
+      if (!Number.isFinite(updatedAt) || now - updatedAt > SIDEBAR_AUTO_OWNERSHIP_TTL_MS) continue;
       const origin = item.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
         ? SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
         : SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO;
-      const previous = entries.get(key);
-      if (previous !== undefined && previous.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL) continue;
+      if (entries.get(key)?.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL) continue;
       /**
        * tabId 是「写下这条归属的那一刻，宿主 inventory 里这个地址的 tab id」（缺省表示这次写入没有
        * 可证明的 tab）。只有 **auto** 条目在收养时会按它比对（见 recordSidebarTab 的 tabId 绑定闸门）：
@@ -298,50 +321,58 @@
     return entries;
   };
 
+  /**
+   * 从持久表构建一份归属索引。
+   *
+   * 三态契约（载入与对账共用这一份解析，避免第二套 JSON 口径）：null = 持久层不可读 / 解析失败
+   * （调用方 fail-closed 或退回空索引）；空 Map = 持久层确实没有条目；否则是规范化后的条目索引。
+   */
+  const loadSidebarOwnershipEntries = () => {
+    const storage = sidebarLocalStorage();
+    if (storage === null) return null;
+    try {
+      const raw = storage.getItem(SIDEBAR_AUTO_OWNERSHIP_KEY);
+      if (!raw) return new Map();
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) === true ? normalizeSidebarOwnershipEntries(parsed, Date.now()) : null;
+    } catch {
+      return null;
+    }
+  };
+
   /** 读取（必要时从 localStorage 懒加载）归属索引；两处都不可用时返回空的临时索引。 */
   const sidebarOwnershipEntries = () => {
     const memory = sidebarOwnershipMemory();
-    if (memory === null) {
-      const storage = sidebarLocalStorage();
-      if (storage === null) return new Map();
-      try {
-        const raw = storage.getItem(SIDEBAR_AUTO_OWNERSHIP_KEY);
-        return normalizeSidebarOwnershipEntries(raw === null || raw.length === 0 ? [] : JSON.parse(raw), Date.now());
-      } catch {
-        return new Map();
-      }
-    }
+    if (memory === null) return loadSidebarOwnershipEntries();
     if (memory.loaded !== true) {
       memory.loaded = true;
-      const storage = sidebarLocalStorage();
-      if (storage !== null) {
-        try {
-          const raw = storage.getItem(SIDEBAR_AUTO_OWNERSHIP_KEY);
-          memory.entries = normalizeSidebarOwnershipEntries(raw === null || raw.length === 0 ? [] : JSON.parse(raw), Date.now());
-        } catch {
-          memory.entries = new Map();
-        }
-      }
+      memory.entries = loadSidebarOwnershipEntries() ?? new Map();
     }
     return memory.entries;
   };
 
-  /** 把索引写回 localStorage（失败 / 不可用一律静默：内存仍然一致，只是不持久）。 */
+  /**
+   * 把索引写回 localStorage（失败 / 不可用一律不抛错：内存仍然一致，只是不持久）。
+   *
+   * 失败必须留一条**有界**诊断（{kind:"ownership",event:"persist-failed"}）：归属写不进去时，
+   * 刷新之后这条 owner 就消失了（tab 会永久漏收）。诊断环本身有界（60 条、单条 ≤360 字符），
+   * 且绝不记录条目原文 / 地址 —— 只记「写失败了」这一个结论。
+   */
   const persistSidebarOwnership = (entries) => {
-    const storage = sidebarLocalStorage();
-    if (storage === null) return false;
     try {
+      const storage = sidebarLocalStorage();
+      if (storage === null) throw new Error("storage-unavailable");
+      // 展开条目即可：reason / tabId 为 undefined 时 JSON.stringify 会省略该键，落盘形状与逐字段拷贝一致
+      // （tabId 必须随条目一起持久化：整页刷新之后它是唯一能证明「这条 auto 归属描述的是哪个 tab」的证据）。
       const list = [];
-      for (const entry of entries.values()) {
-        const item = { key: entry.key, origin: entry.origin, updatedAt: entry.updatedAt };
-        if (entry.reason !== undefined) item.reason = entry.reason;
-        // tabId 必须随条目一起持久化：整页刷新之后它是唯一能证明「这条 auto 归属描述的是哪个 tab」的证据。
-        if (entry.tabId !== undefined) item.tabId = entry.tabId;
-        list.push(item);
-      }
+      for (const entry of entries.values()) list.push({ ...entry });
       storage.setItem(SIDEBAR_AUTO_OWNERSHIP_KEY, JSON.stringify(list));
+      // 全表已写出：此前任何「落盘失败」的 manual 都已被这次写入覆盖，标记随之清空。
+      sidebarOwnershipMemory()?.unpersisted?.clear();
       return true;
     } catch {
+      // 固定短码（不记异常原文 / 条目原文）：event 已足以区分「落盘失败」，reason 只说明写面被拒。
+      recordSidebarAutoDiag({ kind: "ownership", event: "persist-failed", reason: "write-rejected" });
       return false;
     }
   };
@@ -353,18 +384,45 @@
    * - tabId 是写入那一刻宿主 inventory 里这个地址的 tab id（没有可证明的 tab 时为 null）；
    *   只有 auto 条目会被调用方按它比对，manual 条目只按 origin 判定。
    *
-   * 读取本身绝不修改任何状态，失败一律当作「没有标记」（调用方按 manual 兜底）。
-   * options.quiet === true 时连诊断也不写：调用点可能是每轮同步都会跑的判据（自动打开候选、
-   * 空闲资源的抑制清除扫描），它们的结论由各自的决策 / 删除诊断承担，不该把有界诊断环挤满。
+   * **内存 / 持久层对账（自愈 stale 内存）**：内存归属索引是 realm 级缓存（跨 HMR 复用），而持久
+   * 表可能已被另一个 realm（旧 bundle 实例 / 别的标签页）改写。两者分叉时，内存里那条 manual 会把
+   * 自动打开永久挡住——用户实测形状正是：持久表 128 条全是 auto、没有任何 manual，Auto 却对每个
+   * 候选都记 persisted-manual 跳过。因此**只有内存命中 manual 时**才复核一次持久层：
+   * - 持久层确实没有这条 key ⇒ 内存是 stale 的：删掉内存条目并按「没有标记」返回，同时留一条
+   *   {kind:"ownership",event:"delete",reason:"stale-memory"} 诊断；
+   * - 持久层有 ⇒ 按持久层的 origin / tabId 返回，并把内存条目修正到同源（下一轮不再复核）；
+   * - 持久层不可读 / 解析失败 ⇒ fail-closed 继续按内存判定。
+   * 读 auto 不走复核，避免每轮同步对每个候选都做一次全表解析。
+   *
+   * 读取本身绝不修改除「自愈那一条」以外的任何状态，失败一律当作「没有标记」（调用方按 manual 兜底）。
+   * options.quiet === true 时连「命中」诊断也不写：调用点可能是每轮同步都会跑的判据（自动打开候选、
+   * 空闲资源的抑制清除扫描），它们的结论由各自的决策 / 删除诊断承担。**但自愈删除是一次真实的
+   * 状态变更**，不受 quiet 影响——判据的诊断会被判据本身替代，状态变更不会。
    */
   const readSidebarAutoOwnershipEntry = (sessionId, rootId, address, options) => {
     try {
       const key = sidebarAutoScopedKey(sessionId, rootId, address);
-      const entry = sidebarOwnershipEntries().get(key);
-      const origin = entry === undefined
-        ? null
-        : (entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL ? SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL : SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO);
-      if (options === null || options === undefined || options.quiet !== true) {
+      const entries = sidebarOwnershipEntries();
+      let entry = entries.get(key);
+      /**
+       * 只有「已成功落盘的 manual」才允许被持久层对账：本 realm 落盘失败的 manual 一定不在表里，
+       * 若照常对账就会被合法空表判成 stale 删掉（Auto 随即重开用户刚关掉的 tab，违背 P1-B）。
+       */
+      if (entry !== undefined && entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
+        && sidebarOwnershipMemory()?.unpersisted?.has(key) !== true) {
+        // null = 持久层不可读（fail-closed 沿用内存判定）；Map 里没有这个 key = 持久层权威的「没有」。
+        const persisted = loadSidebarOwnershipEntries();
+        if (persisted !== null) {
+          entry = persisted.get(key);
+          entries.delete(key);
+          // 自愈删除是真实状态变更：即使 quiet 也要留证据（quiet 只静音命中判据）。
+          if (entry === undefined) recordSidebarAutoDiag({ kind: "ownership", event: "delete", reason: "stale-memory", key: sidebarAutoKeyDigest(key) });
+          else entries.set(key, entry);
+        }
+      }
+      // 条目的 origin 在写入 / 载入时已经归一为 AUTO 或 MANUAL，这里直接取用（无需二次归一）。
+      const origin = entry === undefined ? null : entry.origin;
+      if (options?.quiet !== true) {
         recordSidebarAutoDiag({ kind: "ownership", event: "hit", origin, key: sidebarAutoKeyDigest(key) });
       }
       if (entry === undefined) return null;
@@ -377,37 +435,60 @@
     }
   };
 
-  /** 持久表里的 auto 条目数（容量只对 auto 计账：manual 是用户意图，恒优先、从不被容量拒绝）。 */
-  const sidebarOwnershipAutoCount = (entries) => {
-    let count = 0;
-    for (const entry of entries.values()) {
-      if (entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO) count += 1;
+  /**
+   * 一次 auto 写入的容量计划：**判定 + 回收清单的唯一实现**（写路径与判据共用，杜绝两处分叉）。
+   *
+   * scope 前缀直接复用 sidebarAutoScopedKey(sessionId, rootId, "")，不另写拼接：容量分账与归属
+   * 读写的键口径必须逐字同源，否则「按 scope 计账」会悄悄变成第二套键格式。
+   *
+   * 两道容量，缺一不可：
+   * 1. **按 scope 记账**（本次修复）：只统计当前 scope（key 前缀 sessionId|rootId|）的 auto 条目，
+   *    达到 SIDEBAR_AUTO_OWNERSHIP_LIMIT 才拒绝。旧实现按全表 auto 总数判定，于是 16 个旧会话留下的
+   *    128 条 auto 条目会把任何新会话永久挡在门外（用户实测：Auto 开着、候选选出来了、每个候选都
+   *    被跳过）——跨会话死锁。别的 scope 的条目**不再阻塞**当前 scope。
+   * 2. **全局硬上限**（存储体积）：写入之后全表 auto 条目数不得超过
+   *    SIDEBAR_AUTO_OWNERSHIP_GLOBAL_LIMIT。超出时可以先按 updatedAt 从旧到新淘汰**别的 scope** 的
+   *    auto 条目（单次最多 64 条）；淘汰之后仍然放不下才拒绝。
+   *
+   * 两条边界不可放宽：
+   * - **当前 scope 的条目一条都不许淘汰**：它描述的是这个会话现在仍然有效的 owner，淘汰就是永久
+   *   漏收（既有容量用例锁定：同 scope 满额必须 fail-closed 拒绝，绝不为了腾位丢 owner）；
+   * - **manual 条目永不淘汰**：它表达用户意图，容量压力不该改写用户的选择。
+   *
+   * 返回值：null = 这次写入放不下（调用方 fail-closed 拒绝）；数组 = 需要先淘汰的键（空数组 = 不用
+   * 淘汰）。manual 写入从不走本函数（手动恒优先、从不被容量拒绝）。
+   */
+  const planSidebarOwnershipAutoWrite = (entries, prefix, key) => {
+    let scopeAuto = 0;
+    let totalAuto = 0;
+    const others = [];
+    for (const [entryKey, entry] of entries) {
+      if (entry.origin !== SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO) continue;
+      totalAuto += 1;
+      if (entryKey.startsWith(prefix)) scopeAuto += 1;
+      else others.push([entryKey, entry.updatedAt]);
     }
-    return count;
+    const existingIsAuto = entries.get(key)?.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO ? 1 : 0;
+    if (scopeAuto - existingIsAuto + 1 > SIDEBAR_AUTO_OWNERSHIP_LIMIT) return null;
+    const overflow = totalAuto - existingIsAuto + 1 - SIDEBAR_AUTO_OWNERSHIP_GLOBAL_LIMIT;
+    if (overflow <= 0) return [];
+    if (overflow > 64) return null;
+    others.sort((left, right) => left[1] - right[1]);
+    return others.length < overflow ? null : others.slice(0, overflow).map(([entryKey]) => entryKey);
   };
 
   /**
-   * 持久表是否还容得下这个地址的一条 **auto** 归属（fail-closed 容量判据，缺陷 2）。
+   * 持久表是否还容得下这个地址的一条 **auto** 归属（fail-closed 容量判据）。
    *
-   * 判据只有一条：写入之后 auto 条目数不得超过 SIDEBAR_AUTO_OWNERSHIP_LIMIT。**绝不为了腾位而
-   * 淘汰任何已有条目**——持久表里的 auto 条目描述的 owner 在本帧完全可能仍然有效（宿主里那个 tab
-   * 还开着），LRU（或任何「看起来更旧」的排序）淘汰它同样会让那个 tab 永久失去 Auto 归属，刷新
-   * 也不能恢复。
-   *
-   * manual 条目不参与这里的容量判定：它表达用户意图，写入 / 改写一律照常（手动恒优先）。因此本
-   * 函数回答的是「新增/改写一条 auto 条目能不能被保留」，而不是「表里总共有多少条」。
+   * 判据本体与回收清单都在 planSidebarOwnershipAutoWrite（唯一实现）；这里只回答「计划是否成立」。
+   * 刻意不在这里执行淘汰：判据必须是只读的（调用点每轮同步都会跑）。
    *
    * 读取失败（localStorage 不可用 / 抛错）按「容得下」处理：内存账本仍然守着同一份容量，持久层
    * 只是「刷新之后的记忆」，读不到它不该让自动打开整体失效（与既有的静默降级一致）。
    */
   const sidebarOwnershipAcceptsNewAuto = (sessionId, rootId, address) => {
     try {
-      const entries = sidebarOwnershipEntries();
-      const key = sidebarAutoScopedKey(sessionId, rootId, address);
-      const existing = entries.get(key);
-      const existingIsAuto = existing !== undefined && existing.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO;
-      const nextAutoCount = sidebarOwnershipAutoCount(entries) - (existingIsAuto ? 1 : 0) + 1;
-      return nextAutoCount <= SIDEBAR_AUTO_OWNERSHIP_LIMIT;
+      return planSidebarOwnershipAutoWrite(sidebarOwnershipEntries(), sidebarAutoScopedKey(sessionId, rootId, ""), sidebarAutoScopedKey(sessionId, rootId, address)) !== null;
     } catch {
       return true;
     }
@@ -421,8 +502,10 @@
    * tab」（见 recordSidebarTab 的 tabId 绑定闸门）。manual 条目不需要它，传 undefined 即可。
    *
    * 容量 fail-closed（缺陷 2）：会挤掉仍有效 owner 的新增 / 改写（即写入之后 auto 条目数超过上限）
-   * **一律拒绝**，并留下一条 reject/capacity 诊断。manual 写入从不被容量拒绝——但同样绝不为了腾位
-   * 去淘汰任何已有条目，因此持久表最多是「上限条 auto + 用户自己产生的 manual 条目」。
+   * **一律拒绝**，并留下一条 reject/capacity 诊断。manual 写入从不被容量拒绝，也绝不会为了腾位去
+   * 淘汰任何已有条目。auto 写入只在**全局硬上限**被突破时才回收别的 scope 的旧 auto 条目（回收
+   * 清单与判据同源，见 planSidebarOwnershipAutoWrite）；当前 scope 的条目与 manual 条目一条都不淘汰，
+   * 因此持久表最多是「每个 scope 上限条 auto + 用户自己产生的 manual 条目」。
    * 到达上限是可用性代价而不是错误：那个资源不自动打开，用户仍然可以手动打开（手动打开照常写
    * manual 归属，见 handleSidebarAction 的入口写入）。
    */
@@ -433,11 +516,18 @@
         : SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO;
       const entries = sidebarOwnershipEntries();
       const key = sidebarAutoScopedKey(sessionId, rootId, address);
-      if (normalizedOrigin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
-        && sidebarOwnershipAcceptsNewAuto(sessionId, rootId, address) !== true) {
+      /**
+       * 只有 auto 写入要过容量闸门：manual 是用户意图，恒优先、从不被容量拒绝（也绝不为了腾位淘汰
+       * 任何条目）。capacity 计划同时给出「放不放得下」与「要回收哪些别的 scope 的旧 auto 条目」。
+       */
+      const plan = normalizedOrigin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
+        ? planSidebarOwnershipAutoWrite(entries, sidebarAutoScopedKey(sessionId, rootId, ""), key)
+        : [];
+      if (plan === null) {
         recordSidebarAutoDiag({ kind: "ownership", event: "reject", origin: normalizedOrigin, reason: "capacity", key: sidebarAutoKeyDigest(key) });
         return false;
       }
+      for (const evictedKey of plan) entries.delete(evictedKey);
       entries.delete(key);
       entries.set(key, {
         key,
@@ -446,8 +536,17 @@
         reason: sidebarBoundedText(reason),
         tabId: sidebarBoundedText(tabId),
       });
-      persistSidebarOwnership(entries);
-      recordSidebarAutoDiag({ kind: "ownership", event: "write", origin: normalizedOrigin, reason, key: sidebarAutoKeyDigest(key) });
+      if (persistSidebarOwnership(entries) !== true && normalizedOrigin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL) {
+        // 懒建集合：HMR 从旧 bundle 复用过来的 realm 索引槽位可能还没有 unpersisted 字段。
+        const memory = sidebarOwnershipMemory();
+        if (memory !== null) (memory.unpersisted ??= new Set()).add(key);
+      }
+      /**
+       * 淘汰证据**聚合**在这条既有写入诊断上（degraded=true = 为了放下这条 auto 回收过别的 scope 的
+       * 旧 auto 条目）：逐条淘汰各写一条会一次刷满 60 条的有界诊断环，收益远低于代价。字段只用
+       * recordSidebarAutoDiag 的既有白名单（degraded 是布尔标记，计数不进协议）。
+       */
+      recordSidebarAutoDiag({ kind: "ownership", event: "write", origin: normalizedOrigin, reason, key: sidebarAutoKeyDigest(key), degraded: plan.length > 0 });
       return true;
     } catch {
       /* 归属标记只影响「刷新之后还认不认」，任何失败都静默。 */
@@ -476,17 +575,49 @@
         recordSidebarAutoDiag({ kind: "ownership", event: "delete-miss", reason, key: sidebarAutoKeyDigest(key) });
         return false;
       }
-      if (entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
-        && (options === null || options === undefined || options.manual !== true)) {
+      if (entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL && options?.manual !== true) {
         recordSidebarAutoDiag({ kind: "ownership", event: "keep", origin: SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, reason, key: sidebarAutoKeyDigest(key) });
         return false;
       }
       entries.delete(key);
       persistSidebarOwnership(entries);
+      sidebarOwnershipMemory()?.unpersisted?.delete(key);
       recordSidebarAutoDiag({ kind: "ownership", event: "delete", reason, key: sidebarAutoKeyDigest(key) });
       return true;
     } catch {
       return false;
+    }
+  };
+
+  /**
+   * 清除某个 scope 的全部 manual 归属（标题栏 Auto 由关→开 = 重新授权自动打开）。
+   *
+   * 语义边界（逐条固定，不可放宽）：
+   * - 只删**当前 scope**（key 前缀 sessionId|rootId|）里 origin=manual 的条目；别的 scope 的 manual
+   *   条目一条都不动（那是别的会话的用户意图）；
+   * - 当前 scope 的 auto 条目一条都不动（那是仍然有效的 owner，删掉就是永久漏收）；
+   * - 返回删除条数；0 条时不落盘（没有变化就不制造写放大）。
+   *
+   * 为什么需要这条确定性路径：manual 归属是跨刷新的用户意图，既有实现里只有「资源明确空闲」那一条
+   * 清点路径会清它。用户手动关闭过某个子代理之后，那个抑制会一直带到下一次运行，于是即使重新打开
+   * Auto 也不会恢复自动打开（用户实测形状）。标题栏 Auto 由关→开是一次明确的重新授权，必须能直接
+   * 解除本 scope 的抑制，而不是等资源恰好回到 ready。
+   */
+  const clearSidebarAutoManualSuppressions = (sessionId, rootId) => {
+    try {
+      const entries = sidebarOwnershipEntries();
+      const prefix = sidebarAutoScopedKey(sessionId, rootId, "");
+      const keys = [...entries]
+        .filter(([key, entry]) => entry.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL && key.startsWith(prefix))
+        .map(([key]) => key);
+      for (const key of keys) {
+        entries.delete(key);
+        sidebarOwnershipMemory()?.unpersisted?.delete(key);
+      }
+      if (keys.length > 0) persistSidebarOwnership(entries);
+      return keys.length;
+    } catch {
+      return 0;
     }
   };
 
@@ -495,17 +626,18 @@
     recordSidebarAutoDiag({
       kind: "decision",
       event,
-      action: candidate === null || candidate === undefined ? undefined : candidate.kind,
+      action: candidate?.kind,
       verdict,
       reason,
-      key: candidate === null || candidate === undefined ? undefined : sidebarAutoKeyDigest(candidate.key),
+      key: candidate == null ? undefined : sidebarAutoKeyDigest(candidate.key),
     });
   };
 
 
   // 只暴露兄弟模块与主 IIFE 实际消费的符号（无全量外挂）。
   global[SYMBOL] = Object.freeze({
-    SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, deleteSidebarAutoOwnership, readSidebarAutoOwnershipEntry,
+    SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, clearSidebarAutoManualSuppressions,
+    deleteSidebarAutoOwnership, readSidebarAutoOwnershipEntry,
     recordSidebarAutoDecision, recordSidebarAutoDiag, resolveSidebarSharedAutoLedger, sidebarAutoKeyDigest,
     sidebarAutoOriginEntry, sidebarAutoOriginTabIdOf, sidebarAutoOriginWrittenAtOf, sidebarBoundedText,
     sidebarLocalStorage, sidebarOwnershipAcceptsNewAuto, sidebarSharedAutoLedgerSizes, sidebarSharedAutoLedgerTotal,

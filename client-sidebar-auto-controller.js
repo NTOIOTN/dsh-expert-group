@@ -237,7 +237,21 @@
     }
     function autoSidebarOwnershipHasCapacity(key, address) {
       const origin = sidebarAutoOriginRef.current;
-      if (origin.has(key) !== true && origin.size >= SIDEBAR_AUTO_KEY_LIMIT) return false;
+      /**
+       * 容量按 **scope** 计账，不再用 origin.size（跨 scope 合计）。
+       *
+       * origin 是 realm 级共享 Map（多个面板实例 / 多个会话共用），旧实现拿合计值判定：别的会话
+       * 占满 128 条时，当前会话会被永久拒绝——与持久层已经修掉的跨会话死锁是同一类缺陷。
+       * 这里只数 (sessionId, rootSessionId) 逐字相等的条目，并排除 key 自己那一格（覆盖写不占
+       * 新增额度）。绝不为了腾位淘汰任何 origin 条目：仍有效的 owner 被删掉就是永久漏收。
+       */
+      let scopedCount = 0;
+      for (const [entryKey, entry] of origin) {
+        if (entryKey === key) continue;
+        if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
+        scopedCount += 1;
+      }
+      if (scopedCount >= SIDEBAR_AUTO_KEY_LIMIT) return false;
       return sidebarOwnershipAcceptsNewAuto(sidebarSessionId, rootSessionId, address);
     }
     function cleanupAutoSidebarKeys(known, actingKey) {

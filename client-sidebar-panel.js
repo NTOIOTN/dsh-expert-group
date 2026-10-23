@@ -37,7 +37,8 @@
   const AUTO_LEDGER_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
   const AUTO_LEDGER = global[AUTO_LEDGER_SYMBOL] || {};
   const {
-    recordSidebarAutoDiag, resolveSidebarSharedAutoLedger, sidebarSharedAutoLedgerSizes, sidebarSharedAutoLedgerTotal,
+    clearSidebarAutoManualSuppressions, recordSidebarAutoDiag, resolveSidebarSharedAutoLedger,
+    sidebarSharedAutoLedgerSizes, sidebarSharedAutoLedgerTotal,
   } = AUTO_LEDGER;
   const PANEL_CACHE_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-panel-cache");
   const PANEL_CACHE = global[PANEL_CACHE_SYMBOL] || {};
@@ -343,6 +344,16 @@
     const openSidebarResource = methodOf(sidebarRight, "openResource");
     Object.assign(frame, {
       ctx, tabInfo, tabParams, sessionsSnapshot, catalogEntryOf, fallbackCurrent, scopedId, scope,
+      /**
+       * 归属账本的「清除本 scope manual 抑制」写面：标题栏 Auto 由关→开时由 Panel 的 Host 服务 Hook
+       * 调用（见 client-sidebar-panel-hooks-state.js 的 toggleAutoOpen）。
+       *
+       * 为什么在这里注入而不是让 Hook 模块自己读检查点：本文件**已经是** auto-ledger 的声明读取方
+       * （createSidebarPanelShared 用它建共享账本），而 Hook 模块与账本之间没有依赖边。经由 frame
+       * 转交可以保持 manifest.iifeDependencies 与依赖图门禁逐项不变，也不会给 Hook 增加一条只在
+       * 一个点击路径上才用得到的装配依赖。
+       */
+      clearSidebarAutoManualSuppressions,
       sessionId, resolvedRoot, rootSessionId, sidebarSessionId, tabActivity, tabActivityKey,
       model, panelLocale, t, errorLabelOf,
       serviceCandidates, sessionsService, sidebarRight, requestRightbarDragSync, releaseRightbarDragLock,
