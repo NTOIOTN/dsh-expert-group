@@ -557,47 +557,67 @@ function normalizeReasonToken(value, fallback) {
 /**
  * 创建 Windows 系统 Toast 适配器。
  *
+ * ## 注入形态（票据 33 · C3 收窄：14 项 → 3 组）
+ * 参数按**能力组**组织、每组单一关注点；收窄只改注入形态，下面的默认值/归一逻辑逐字不变。
+ *
+ * 1. `hostPorts`：**宿主提供的端口面**——子进程工厂 `spawn`、目录读取 `readdir`、
+ *    存在性探测 `fileExists`、快捷方式读取 `listShortcuts`、提示音路径 `audioPath`、
+ *    时钟 `now`、日志出口 `logger`。七者都是「本模块向宿主要能力」的同一关注点：全部是
+ *    可注入的副作用 seam（默认实现读进程/文件系统，测试注入替身），彼此不可合并是因为
+ *    替换其一不影响其他，但**归属同一组**是因为它们共同构成本模块的宿主侧边界；
+ * 2. `hostEnvironment`：**宿主环境事实**——`platform`（进程平台）、`env`（环境变量）、
+ *    `execPath`（可执行文件路径）。三者是"我在什么环境里"的只读事实，不是可替换能力，
+ *    因此与 1 分开：拿掉一个端口只是降级，拿掉这些事实则无法判定平台与 AUMID 匹配；
+ * 3. `limits`：**投递预算配置**——`timeoutMs`（单次超时）、`maxConcurrent`（并发上限）、
+ *    `maxQueue`（队列上限）、`aumidCooldownMs`（AUMID 重试冷却）。四者是同一份策略配置，
+ *    只影响排队/重试节奏，不影响投递语义。
+ *
  * @param {object} [options]
- * @param {string} [options.platform] - 依赖平台，默认 process.platform（非 win32 => unsupported）。
- * @param {object} [options.env] - 环境变量（APPDATA/SystemRoot），默认 process.env。
- * @param {string} [options.execPath] - 需要匹配的可执行文件，默认 process.execPath。
- * @param {Function} [options.spawn] - 子进程工厂 seam（契约同 node:child_process.spawn）。
- * @param {Function} [options.readdir] - 目录读取 seam（契约同 collectShortcutPaths）。
- * @param {Function} [options.fileExists] - PowerShell 绝对路径存在性探测 seam（默认 node:fs）。
- * @param {Function} [options.listShortcuts] - 快捷方式读取 seam：
+ * @param {object} [options.hostPorts] 宿主端口面（见上；缺省时全部使用默认实现）。
+ * @param {Function} [options.hostPorts.spawn] - 子进程工厂 seam（契约同 node:child_process.spawn）。
+ * @param {Function} [options.hostPorts.readdir] - 目录读取 seam（契约同 collectShortcutPaths）。
+ * @param {Function} [options.hostPorts.fileExists] - PowerShell 绝对路径存在性探测 seam（默认 node:fs）。
+ * @param {Function} [options.hostPorts.listShortcuts] - 快捷方式读取 seam：
  *   () => Promise<{entries: Array<{targetPath, aumid}>, reason: string|null}>；默认实现
  *   递归扫描开始菜单并调用固定 probe 脚本。
- * @param {string} [options.audioPath] - 自定义提示音文件路径（测试 seam）。默认解析包内
+ * @param {string} [options.hostPorts.audioPath] - 自定义提示音文件路径（测试 seam）。默认解析包内
  *   assets/notification-whoosh.wav；传空串表示不放音效。该路径只进 stdin JSON。
- * @param {number} [options.timeoutMs] - 单次子进程超时。
- * @param {number} [options.maxConcurrent] - 并发上限。
- * @param {number} [options.maxQueue] - 队列上限（超限按 queue-full 丢弃）。
- * @param {number} [options.aumidCooldownMs] - AUMID 解析失败后的重试冷却。
- * @param {() => number} [options.now] - 可注入时钟（冷却判定）。
- * @param {{warn?: Function}} [options.logger] - 只接收固定 token 的 warn 出口。
+ * @param {() => number} [options.hostPorts.now] - 可注入时钟（冷却判定）。
+ * @param {{warn?: Function}} [options.hostPorts.logger] - 只接收固定 token 的 warn 出口。
+ * @param {string} [options.hostEnvironment.platform] - 依赖平台，默认 process.platform（非 win32 => unsupported）。
+ * @param {object} [options.hostEnvironment.env] - 环境变量（APPDATA/SystemRoot），默认 process.env。
+ * @param {string} [options.hostEnvironment.execPath] - 需要匹配的可执行文件，默认 process.execPath。
+ * @param {number} [options.limits.timeoutMs] - 单次子进程超时。
+ * @param {number} [options.limits.maxConcurrent] - 并发上限。
+ * @param {number} [options.limits.maxQueue] - 队列上限（超限按 queue-full 丢弃）。
+ * @param {number} [options.limits.aumidCooldownMs] - AUMID 解析失败后的重试冷却。
  */
 export function createSystemToastModule(options = {}) {
-  const platform = typeof options.platform === "string" ? options.platform : process.platform;
-  const env = options.env !== undefined && options.env !== null ? options.env : process.env;
-  const execPath = typeof options.execPath === "string" ? options.execPath : process.execPath;
-  const spawnProcess = typeof options.spawn === "function" ? options.spawn : spawnChildProcess;
-  const readdir = typeof options.readdir === "function" ? options.readdir : defaultReadDirectory;
-  const fileExists = typeof options.fileExists === "function" ? options.fileExists : existsSync;
-  const timeoutMs = Number.isSafeInteger(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : DEFAULT_SYSTEM_TOAST_TIMEOUT_MS;
-  const maxConcurrent = Number.isSafeInteger(options.maxConcurrent) && options.maxConcurrent > 0
-    ? options.maxConcurrent
+  // 命名空间允许整体缺省：hostPorts/hostEnvironment/limits 各自回落到默认实现。
+  const hostPorts = options.hostPorts ?? {};
+  const hostEnvironment = options.hostEnvironment ?? {};
+  const limits = options.limits ?? {};
+  const platform = typeof hostEnvironment.platform === "string" ? hostEnvironment.platform : process.platform;
+  const env = hostEnvironment.env !== undefined && hostEnvironment.env !== null ? hostEnvironment.env : process.env;
+  const execPath = typeof hostEnvironment.execPath === "string" ? hostEnvironment.execPath : process.execPath;
+  const spawnProcess = typeof hostPorts.spawn === "function" ? hostPorts.spawn : spawnChildProcess;
+  const readdir = typeof hostPorts.readdir === "function" ? hostPorts.readdir : defaultReadDirectory;
+  const fileExists = typeof hostPorts.fileExists === "function" ? hostPorts.fileExists : existsSync;
+  const timeoutMs = Number.isSafeInteger(limits.timeoutMs) && limits.timeoutMs > 0 ? limits.timeoutMs : DEFAULT_SYSTEM_TOAST_TIMEOUT_MS;
+  const maxConcurrent = Number.isSafeInteger(limits.maxConcurrent) && limits.maxConcurrent > 0
+    ? limits.maxConcurrent
     : DEFAULT_SYSTEM_TOAST_MAX_CONCURRENT;
-  const maxQueue = Number.isSafeInteger(options.maxQueue) && options.maxQueue >= 0
-    ? options.maxQueue
+  const maxQueue = Number.isSafeInteger(limits.maxQueue) && limits.maxQueue >= 0
+    ? limits.maxQueue
     : DEFAULT_SYSTEM_TOAST_MAX_QUEUE;
-  const aumidCooldownMs = Number.isSafeInteger(options.aumidCooldownMs) && options.aumidCooldownMs >= 0
-    ? options.aumidCooldownMs
+  const aumidCooldownMs = Number.isSafeInteger(limits.aumidCooldownMs) && limits.aumidCooldownMs >= 0
+    ? limits.aumidCooldownMs
     : DEFAULT_AUMID_RETRY_COOLDOWN_MS;
-  const now = typeof options.now === "function" ? options.now : () => Date.now();
-  const logger = options.logger ?? null;
-  const listShortcuts = typeof options.listShortcuts === "function" ? options.listShortcuts : defaultListShortcuts;
+  const now = typeof hostPorts.now === "function" ? hostPorts.now : () => Date.now();
+  const logger = hostPorts.logger ?? null;
+  const listShortcuts = typeof hostPorts.listShortcuts === "function" ? hostPorts.listShortcuts : defaultListShortcuts;
   // 音频路径同样只在这里解析一次：它绝不参与命令行拼装，只作为 stdin 载荷字段下发。
-  const audioPath = typeof options.audioPath === "string" ? options.audioPath.trim() : defaultNotificationAudioPath();
+  const audioPath = typeof hostPorts.audioPath === "string" ? hostPorts.audioPath.trim() : defaultNotificationAudioPath();
 
   const stats = { sent: 0, failed: 0, dropped: 0, lastReason: null };
   const aumidState = { aumid: null, reason: null, attemptAt: null };

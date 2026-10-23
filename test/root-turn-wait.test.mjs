@@ -2346,9 +2346,9 @@ function createFactoryRig(snapshot, clock = {}) {
       return () => { set.delete(invalidate); };
     },
     onError: () => {},
-    ...(typeof clock.now === "function" ? { now: clock.now } : {}),
-    ...(typeof clock.setTimeout === "function" ? { setTimeout: clock.setTimeout } : {}),
-    ...(typeof clock.clearTimeout === "function" ? { clearTimeout: clock.clearTimeout } : {}),
+    // 票据 32：时钟三方法收拢为一个 clock 能力组（仍是同一协作方，语义不变）。
+    ...(typeof clock.now === "function" || typeof clock.setTimeout === "function"
+      || typeof clock.clearTimeout === "function" ? { clock } : {}),
   });
   return {
     registry,

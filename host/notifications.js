@@ -15,7 +15,7 @@
  *
  * @module dsh-expert-group/host/notifications
  */
-import { snapshotRunningRootDescendants } from "../shared.js";
+import { snapshotRunningRootDescendants } from "../shared/root-descendants.js";
 
 /**
  * DSH turn/end 的已知终止原因。TurnEndReason 是 merge-extensible 联合类型，

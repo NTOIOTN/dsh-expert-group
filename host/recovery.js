@@ -19,7 +19,9 @@
  *
  * @module dsh-expert-group/host/recovery
  */
-import { appendRecoveryRetryCount, lastTurnErrorMessage, shouldAutoRecover } from "../shared.js";
+import { appendRecoveryRetryCount } from "../shared/recovery-ledger.js";
+import { lastTurnErrorMessage } from "../shared/retry-policy.js";
+import { shouldAutoRecover } from "../shared/turn-settlement.js";
 
 function isRecord(value) {
   return value !== null && typeof value === "object";

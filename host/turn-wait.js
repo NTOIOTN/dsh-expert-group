@@ -49,6 +49,26 @@
  * Agent 强引用清空；旧代际的迟到事件不会释放新 waiter（记录已不存在，事件只会命中
  * 新对象的新记录）。
  *
+ * ## 拆分结构（补票 R2.5-A：同文件内降行数，文件与导出面不变）
+ * 单个工厂硬上限 400 行，而本登记表在拆分前是一个 728 行的巨型闭包。保留**同一文件**
+ * （状态 owner 与全部读写点都在这里，不新增模块），按关注点拆成 4 个单元工厂：
+ *
+ * 1. `createTurnWaitState`：**唯一的**状态容器 owner——`records`（exact root Agent ->
+ *    record）、`deliveryIssueNotified`（跨记录投递失败去重）、`disposed` 标志与
+ *    协作方/时钟/定时器引用。容器只在**本文件内**被持有，从不经由任何返回值外泄；
+ *    每个记录内部的 `works` / `waiters` / `issueNotified` 同样只在本文件内读写。
+ * 2. `createTurnWaitObservability`：`report` / `notifyIssue` / `noteSnapshot` /
+ *    `notifyDeliveryIssue` / `noteDelivery` 与只读投影 `describe` / `describeAll`。
+ * 3. `createTurnWaitLifecycle`：定时器（退避复查 / 长等待提醒）、唯一销毁路径
+ *    `destroyRecord`、静止判定 `scheduleCheck` 与查询落地 `handleQuerySettled`。
+ * 4. `createTurnWaitCommands`：对外命令面（track / settle / wait / abandon / retire …）
+ *    与记录创建 `ensureRecord`。
+ *
+ * `createRootTurnWaitRegistry` 只做装配与命令转发（不再承载任何逻辑），因此行数远低于
+ * 阈值。纯判定/投影（工作键编码、记录构造、摘要投影、快照原因码）被提为模块级无状态
+ * 函数。单元之间只传 `state`（同一对象引用）与兄弟单元返回的**命令**，对外 API 只暴露
+ * 命令与只读投影，不交出 Map/Set。
+ *
  * @module dsh-expert-group/host/turn-wait
  */
 
@@ -93,70 +113,227 @@ function createDeferred() {
   return { promise, resolve };
 }
 
-/** 长等待提醒的默认间隔：30 分钟。可由 options.longWaitMs 覆盖（测试用假时钟/短间隔）。 */
+/** 长等待提醒的默认间隔：30 分钟。可由 options.config.longWaitMs 覆盖（测试用假时钟/短间隔）。 */
 const DEFAULT_LONG_WAIT_MS = 30 * 60 * 1000;
 /** describeAll 的返回上限：诊断面绝不随 root 数量增长。 */
 const DESCRIBE_ALL_LIMIT = 16;
 /** 投递失败提示的去重上限（按 rootId+reason）；只保留固定条数，避免无界增长。 */
 const DELIVERY_ISSUE_LIMIT = 64;
+/** 退避复查的初始间隔与上限：查询未知/仍有 running 后代时无期限异步复查。 */
+const RETRY_INITIAL_DELAY = 10;
+const RETRY_MAX_DELAY = 1000;
 
 /**
- * 创建 root turn 等待登记表。
+ * 归一化工厂参数（纯函数，无状态）。
  *
- * @param {object} options
- * @param {(agent:object)=>boolean} options.isLiveRoot - exact root Agent 是否仍是当前
- *   live root（对象身份 + generation 双重校验由调用方提供）。
- * @param {(rootId:string)=>Promise<{known:boolean,running?:unknown[],runningIds?:Set<string>,reason?:string}>} options.snapshotDescendants
- *   root-scoped 后代查询。**必须**是「明确回答」语义：查询失败/结构非法返回
- *   `known:false`，绝不能返回「空的 running 列表」来冒充已知。
- * @param {(agent:object, snapshot:object)=>void} [options.onKnownSnapshot]
- *   拿到**明确**快照后的可选回调（`known === true` 时）。调用方用它做「完成通知缺失」
- *   的回退结算：只有在明确知道「某个 admission 的 exact child 已不在 running 列表里」
- *   时才允许结算，因此绝不会凭未知状态放行。回调只能**减少**未结算工作；它在
- *   version 复查之后、同一同步临界区内被调用，因此不会与新的登记交错。
- * @param {(agent:object, invalidate:()=>void)=>()=>void} options.subscribe
- *   安装本 root 的活动监听（child 创建 / 状态转 running / dispose），返回移除函数。
- *   调用方必须在**首次状态查询之前**同步安装（本模块保证 subscribe 在第一次
- *   `scheduleCheck` 之前完成）。记录销毁后本模块必定调用返回的移除函数，因此监听
- *   不会跨记录泄漏。
- * @param {(error:unknown)=>void} [options.onError] - 异常记录回调；不得抛出。
- * @returns {object} 登记表 API。
+ * ## 注入形态（票据 32 · C3 收窄）
+ * 参数袋按**能力组**组织，当前恰好 8 组（规格书 §能力组（C3）的硬上限）：
+ *
+ * 1. `isLiveRoot`——root 活性判定协作方；
+ * 2. `snapshotDescendants`——root-scoped 后代查询协作方；
+ * 3. `subscribe`——活动订阅协作方；
+ * 4. `onKnownSnapshot`——明确快照的回退结算回调协作方；
+ * 5. `onError`——诊断异常记录协作方；
+ * 6. `clock`——**时钟与定时器**（`now` / `setTimeout` / `clearTimeout`）：三者必须同源，
+ *    否则 `waitedMs` 与提醒边界会读两套时间，假时钟测试也会失去确定性；
+ * 7. `notifications`——**用户可见提示投递**（`onLongWait` / `onIssue`）：同一投递通道的两个
+ *    通知类别，二者只影响提示、绝不改变等待语义，因此属于同一关注点；
+ * 8. `config`——**只读时序配置**（`longWaitMs`）：提醒间隔是策略值，不是协作方能力，
+ *    与 `clock`（时间事实来源）关注点不同，故独立成组。
+ *
+ * 为什么不是"一个参数一组"：`now`/`setTimeout`/`clearTimeout` 是同一个时钟协作方的
+ * 三方法能力面（规格书：同一协作方即使有 10 个方法仍算 1 组），拆成三个参数会虚增组数。
+ *
+ * 全部字段都是**可选**注入：缺省值必须与收窄前逐字一致，否则等待语义（fail-closed、
+ * 时钟可注入、提示可关闭）会悄悄改变。默认实现延迟读取全局对象，因此测试即使在创建
+ * 登记表之后安装假时钟也仍然生效。
+ *
+ * @param {object} options 原始参数袋（与公开工厂签名一致）。
+ * @returns {object} 已补全默认值的协作方 / 时钟 / 配置。
  */
-export function createRootTurnWaitRegistry(options = {}) {
-  const isLiveRoot = typeof options.isLiveRoot === "function" ? options.isLiveRoot : () => false;
-  const snapshotDescendants = typeof options.snapshotDescendants === "function"
-    ? options.snapshotDescendants
-    : async () => ({ known: false, running: [], reason: "descendant-query-unavailable" });
-  const subscribe = typeof options.subscribe === "function" ? options.subscribe : () => () => {};
-  const onKnownSnapshot = typeof options.onKnownSnapshot === "function" ? options.onKnownSnapshot : () => {};
-  const onError = typeof options.onError === "function" ? options.onError : () => {};
-  // 时钟与定时器全部可注入：长等待提醒与 waitedMs 断言必须能在假时钟下确定性地覆盖，
-  // 默认实现延迟读取全局对象，因此测试即使在创建登记表之后安装假时钟也仍然生效。
-  const now = typeof options.now === "function" ? options.now : () => Date.now();
-  const setTimer = typeof options.setTimeout === "function"
-    ? options.setTimeout
-    : (callback, delay) => globalThis.setTimeout(callback, delay);
-  const clearTimer = typeof options.clearTimeout === "function"
-    ? options.clearTimeout
-    : (timer) => globalThis.clearTimeout(timer);
-  const onLongWait = typeof options.onLongWait === "function" ? options.onLongWait : () => {};
-  const onIssue = typeof options.onIssue === "function" ? options.onIssue : () => {};
-  const longWaitMs = Number.isSafeInteger(options.longWaitMs) && options.longWaitMs > 0
-    ? options.longWaitMs
-    : DEFAULT_LONG_WAIT_MS;
+function normalizeTurnWaitOptions(options) {
+  // 命名空间允许整体缺省（旧调用方/单测只关心其中一组时不必构造空对象）。
+  const clock = options.clock ?? {};
+  const notifications = options.notifications ?? {};
+  const config = options.config ?? {};
+  return {
+    isLiveRoot: typeof options.isLiveRoot === "function" ? options.isLiveRoot : () => false,
+    snapshotDescendants: typeof options.snapshotDescendants === "function"
+      ? options.snapshotDescendants
+      : async () => ({ known: false, running: [], reason: "descendant-query-unavailable" }),
+    subscribe: typeof options.subscribe === "function" ? options.subscribe : () => () => {},
+    onKnownSnapshot: typeof options.onKnownSnapshot === "function" ? options.onKnownSnapshot : () => {},
+    onError: typeof options.onError === "function" ? options.onError : () => {},
+    // 时钟与定时器全部可注入：长等待提醒与 waitedMs 断言必须能在假时钟下确定性地覆盖。
+    now: typeof clock.now === "function" ? clock.now : () => Date.now(),
+    setTimer: typeof clock.setTimeout === "function"
+      ? clock.setTimeout
+      : (callback, delay) => globalThis.setTimeout(callback, delay),
+    clearTimer: typeof clock.clearTimeout === "function"
+      ? clock.clearTimeout
+      : (timer) => globalThis.clearTimeout(timer),
+    onLongWait: typeof notifications.onLongWait === "function" ? notifications.onLongWait : () => {},
+    onIssue: typeof notifications.onIssue === "function" ? notifications.onIssue : () => {},
+    longWaitMs: Number.isSafeInteger(config.longWaitMs) && config.longWaitMs > 0
+      ? config.longWaitMs
+      : DEFAULT_LONG_WAIT_MS,
+  };
+}
 
-  /** exact root Agent -> record。Map 会强引用 root，因此 destroy 必须显式删除。 */
-  const records = new Map();
-  let disposed = false;
-  /**
-   * 已通知过的投递失败（key = rootId + ":" + reason）。
-   *
-   * 为什么去重不能只放在记录上：投递发生在静止收口之后，此时等待记录已被销毁；若只看
-   * 记录，下一次 turn-stopping 重建记录后会把同一个失败再次提示给用户。这里只保存
-   * rootId 字符串与固定原因码，不持有 Agent 引用，且有固定上限。
-   */
-  const deliveryIssueNotified = new Set();
+/**
+ * 构造一条等待记录（纯构造器：不读时钟、不订阅、不写登记表）。
+ *
+ * `startedAt` 由调用方取时钟后传入，保证「构造记录」与「读取开始时间」仍是同一次
+ * `now()` 调用（拆分前记录字面量里的 `startedAt: now()` 语义不变）。
+ *
+ * @param {object} agent exact root Agent。
+ * @param {number} startedAt 记录创建时刻。
+ * @returns {object} 全新记录（`works` / `waiters` / `issueNotified` 容器随之创建）。
+ */
+function createTurnWaitRecord(agent, startedAt) {
+  return {
+    owner: agent,
+    agent,
+    rootId: typeof agent.id === "string" ? agent.id : void 0,
+    works: new Map(),
+    waiters: new Set(),
+    version: 0,
+    querySequence: 0,
+    activeQueryId: 0,
+    checking: false,
+    recheck: false,
+    inSnapshot: false,
+    released: false,
+    cancelled: false,
+    destroyed: false,
+    releaseReason: void 0,
+    retryTimer: void 0,
+    retryDelay: RETRY_INITIAL_DELAY,
+    unlisten: void 0,
+    /**
+     * 可观测性与人工逃生状态（票据 11）。
+     *
+     * 全部只保存固定枚举/时间戳/计数：不保存 prompt、任务正文或任何 agent 引用。
+     * longWaitTimer 只是内存句柄，绝不进入任何快照。
+     */
+    startedAt,
+    lastSnapshot: void 0,
+    lastDelivery: void 0,
+    capabilityLevel: "unavailable",
+    lastReminderAt: void 0,
+    reminderCount: 0,
+    lastReminderBucket: 0,
+    issueNotified: new Set(),
+    longWaitTimer: void 0,
+    abandoned: false,
+    abandonReason: void 0,
+  };
+}
 
+/**
+ * 记录 -> 只读摘要（纯投影；`at` 由调用方取时钟，一次摘要只读一次时钟）。
+ *
+ * 只含计数、固定枚举与时间戳；不包含 Agent 引用、root/session id、work 键或任何正文。
+ * lastSnapshot/lastDelivery 都是浅拷贝，调用方无法通过返回值改写内部观测状态。
+ *
+ * @param {object} record 目标记录。
+ * @param {number} at 投影时刻（用于 `waitedMs`）。
+ * @returns {object} 有界只读摘要。
+ */
+function summarizeTurnWaitRecord(record, at) {
+  return {
+    outstanding: record.works.size,
+    waiters: record.waiters.size,
+    version: record.version,
+    released: record.released === true,
+    cancelled: record.cancelled === true,
+    reason: record.releaseReason ?? null,
+    startedAt: record.startedAt,
+    waitedMs: Math.max(0, at - record.startedAt),
+    lastSnapshot: record.lastSnapshot === void 0 ? null : { ...record.lastSnapshot },
+    capabilityLevel: record.capabilityLevel,
+    lastDelivery: record.lastDelivery === void 0 ? null : { ...record.lastDelivery },
+    reminderCount: record.reminderCount,
+    lastReminderAt: record.lastReminderAt ?? null,
+    abandoned: record.abandoned === true,
+  };
+}
+
+/**
+ * 落一条 lastSnapshot 时使用的稳定原因码（纯判定）。
+ *
+ * 调用方给的 reason 优先且**原样保留**；缺省时按「是否明确 / 是否有 running 后代」
+ * 给出固定枚举。顺序与拆分前逐字一致。
+ *
+ * @param {object|undefined} result 后代查询结果。
+ * @param {boolean} known 是否明确回答。
+ * @param {unknown[]} running 明确回答里的 running 后代。
+ * @returns {string} 稳定原因码。
+ */
+function resolveSnapshotReason(result, known, running) {
+  return typeof result?.reason === "string" && result.reason.length > 0
+    ? result.reason
+    : (known ? (running.length > 0 ? "running-descendants" : "no-running-descendants") : "descendant-query-unknown");
+}
+
+/**
+ * 登记表的**状态容器单元**：本文件唯一的状态 owner。
+ *
+ * 契约（补票 R2.5-A）：
+ * - `records` / `deliveryIssueNotified` / `disposed` 在这里一次性创建，**只**交给同文件
+ *   的兄弟单元（`createTurnWaitObservability` / `createTurnWaitLifecycle` /
+ *   `createTurnWaitCommands`），从不经过 `createRootTurnWaitRegistry` 的返回值外泄；
+ *   记录内部的 `works` / `waiters` / `issueNotified` 同理只在本文件内读写。
+ * - `disposed` 是唯一会被单元修改的标量标志，因此所有单元都直接读 `state.disposed`
+ *   （不能解构到局部变量，否则会冻结创建时的初值）。
+ *
+ * @param {object} options 工厂参数袋（未归一化）。
+ * @returns {object} 状态容器（模块私有）。
+ */
+function createTurnWaitState(options) {
+  const config = normalizeTurnWaitOptions(options);
+  return {
+    // ── 协作方 / 时钟 / 配置（只读引用；创建后不再改写） ────────────────────
+    isLiveRoot: config.isLiveRoot,
+    snapshotDescendants: config.snapshotDescendants,
+    subscribe: config.subscribe,
+    onKnownSnapshot: config.onKnownSnapshot,
+    onError: config.onError,
+    now: config.now,
+    setTimer: config.setTimer,
+    clearTimer: config.clearTimer,
+    onLongWait: config.onLongWait,
+    onIssue: config.onIssue,
+    longWaitMs: config.longWaitMs,
+    // ── 可变状态（本文件唯一 owner） ────────────────────────────────────────
+    /** exact root Agent -> record。Map 会强引用 root，因此 destroy 必须显式删除。 */
+    records: new Map(),
+    /**
+     * 已通知过的投递失败（key = rootId + ":" + reason）。
+     *
+     * 为什么去重不能只放在记录上：投递发生在静止收口之后，此时等待记录已被销毁；若只看
+     * 记录，下一次 turn-stopping 重建记录后会把同一个失败再次提示给用户。这里只保存
+     * rootId 字符串与固定原因码，不持有 Agent 引用，且有固定上限。
+     */
+    deliveryIssueNotified: new Set(),
+    /** 插件是否已卸载；卸载后所有单元一律早退。 */
+    disposed: false,
+  };
+}
+
+/**
+ * 可观测性单元：一次性提示、快照/投递事实写入、只读诊断投影。
+ *
+ * 与等待语义的边界：这里的每个回调异常都被就地隔离（`report`），提示失败绝不改变
+ * 等待/收口结论；`noteSnapshot` 只写观测字段，不触碰 `works` / `waiters`。
+ *
+ * @param {object} state `createTurnWaitState` 的返回值。
+ * @returns {object} 日志/提示命令 + 只读投影（不含任何容器）。
+ */
+function createTurnWaitObservability(state) {
+  const { records, deliveryIssueNotified, now, onError, onIssue } = state;
+
+  /** 异常记录回调；不得抛出。 */
   function report(error) {
     try { onError(error); } catch { /* 记录回调自身异常不得改变等待语义 */ }
   }
@@ -181,7 +358,7 @@ export function createRootTurnWaitRegistry(options = {}) {
   /**
    * 收口结论投递失败的一次性通知（跨记录去重）。
    *
-   * 与 notifyIssue 分开的原因见 deliveryIssueNotified 的注释：投递失败通常发生在记录
+   * 与 notifyIssue 分开的原因见 `deliveryIssueNotified` 的注释：投递失败通常发生在记录
    * 销毁之后，必须用稳定的 rootId+reason 做跨记录限流。
    */
   function notifyDeliveryIssue(agent, reason) {
@@ -220,6 +397,90 @@ export function createRootTurnWaitRegistry(options = {}) {
     }
   }
 
+  /**
+   * 记录一次收口结论投递结果（票据 11）。
+   *
+   * 只在记录仍存活时写入 lastDelivery；失败还会触发**跨记录**一次性提示（投递通常发生在
+   * 静止收口、记录销毁之后，仅靠记录去重挡不住下一个 turn 的重复提示）。
+   * 本方法绝不抛错：诊断写入失败不得影响收口或等待语义。
+   *
+   * @param {object} agent - exact root Agent。
+   * @param {{ok:boolean, reason?:string}} delivery - 投递结论（reason 是固定原因码）。
+   * @returns {boolean} 是否成功记录（输入非法/记录已销毁也算已处理，仅回调异常返回 false）。
+   */
+  function noteDelivery(agent, delivery) {
+    try {
+      const ok = delivery?.ok === true;
+      const reason = typeof delivery?.reason === "string" && delivery.reason.length > 0
+        ? delivery.reason
+        : (ok ? "delivered" : "delivery-failed");
+      const at = now();
+      const record = records.get(agent);
+      if (record !== void 0 && record.destroyed !== true) {
+        record.lastDelivery = { ok, reason, at };
+      }
+      if (!ok) notifyDeliveryIssue(agent, reason);
+      return true;
+    } catch (error) {
+      report(error);
+      return false;
+    }
+  }
+
+  /**
+   * 记录的只读摘要（单条）。
+   *
+   * 只含计数、固定枚举与时间戳；不包含 Agent 引用、root/session id、work 键或任何正文。
+   */
+  function describe(agent) {
+    const record = records.get(agent);
+    if (record === void 0 || record.destroyed === true) return void 0;
+    return summarizeTurnWaitRecord(record, now());
+  }
+
+  /**
+   * 全部存活记录的有界只读摘要（最多 `DESCRIBE_ALL_LIMIT` 条）。
+   *
+   * 供诊断使用：条目只含 waitedMs/outstanding/capability 等计数与固定枚举，不含 Agent
+   * 引用、root/session id、work 键或会话正文，因此不可能把任务数据带进 RPC 投影。
+   */
+  function describeAll() {
+    const summaries = [];
+    for (const record of records.values()) {
+      if (record.destroyed === true) continue;
+      if (summaries.length >= DESCRIBE_ALL_LIMIT) break;
+      summaries.push(summarizeTurnWaitRecord(record, now()));
+    }
+    return summaries;
+  }
+
+  return { report, notifyIssue, notifyDeliveryIssue, noteSnapshot, noteDelivery, describe, describeAll };
+}
+
+/**
+ * 生命周期单元：定时器（退避复查 / 长等待提醒）、唯一销毁路径与静止判定。
+ *
+ * 为什么这些放在同一个单元：`scheduleCheck` 与 `scheduleRetry` 互相引用（查询落地后
+ * 要么立即复查、要么退避复查），拆成两个闭包只能靠迟到绑定，反而更难证明「同一同步
+ * 临界区」的语义。
+ *
+ * @param {object} state `createTurnWaitState` 的返回值。
+ * @param {object} observability `createTurnWaitObservability` 的命令面。
+ * @returns {object} 定时器清理、销毁与静止判定命令（不含任何容器）。
+ */
+function createTurnWaitLifecycle(state, observability) {
+  const {
+    records,
+    now,
+    setTimer,
+    clearTimer,
+    longWaitMs,
+    isLiveRoot,
+    snapshotDescendants,
+    onKnownSnapshot,
+  } = state;
+  const { report, notifyIssue, noteSnapshot } = observability;
+
   /** 释放一条记录的监听器；幂等。 */
   function releaseListeners(record) {
     if (typeof record.unlisten !== "function") return;
@@ -242,8 +503,6 @@ export function createRootTurnWaitRegistry(options = {}) {
 
   // 查询结果未知或仍发现运行中的后代时，使用无期限的退避复查。timer 只服务于
   // 当前仍有 waiter 的活动记录；记录退休或最后一个 waiter 取消时必须清除它。
-  const RETRY_INITIAL_DELAY = 10;
-  const RETRY_MAX_DELAY = 1000;
   function clearRetryTimer(record) {
     if (record.retryTimer === void 0) return;
     const timer = record.retryTimer;
@@ -252,13 +511,13 @@ export function createRootTurnWaitRegistry(options = {}) {
   }
 
   function scheduleRetry(record) {
-    if (disposed || record.destroyed === true || record.released === true
+    if (state.disposed || record.destroyed === true || record.released === true
       || record.waiters.size === 0 || record.retryTimer !== void 0) return;
     const delay = record.retryDelay;
     const timer = setTimer(() => {
       if (record.retryTimer !== timer) return;
       record.retryTimer = void 0;
-      if (disposed || record.destroyed === true || record.released === true
+      if (state.disposed || record.destroyed === true || record.released === true
         || record.waiters.size === 0) return;
       scheduleCheck(record);
     }, delay);
@@ -284,7 +543,7 @@ export function createRootTurnWaitRegistry(options = {}) {
    * - timer 必须 unref：等待本身永不超时，提醒绝不能把宿主进程钉住。
    */
   function armLongWaitTimer(record) {
-    if (disposed || record.destroyed === true || record.longWaitTimer !== void 0) return;
+    if (state.disposed || record.destroyed === true || record.longWaitTimer !== void 0) return;
     if (record.works.size === 0 && record.waiters.size === 0) return;
     const elapsed = Math.max(0, now() - record.startedAt);
     const bucket = Math.floor(elapsed / longWaitMs);
@@ -310,7 +569,7 @@ export function createRootTurnWaitRegistry(options = {}) {
    * 提醒绝不释放等待、绝不改动 works（票据 11 的硬边界）。
    */
   function handleLongWaitTick(record) {
-    if (disposed || record.destroyed === true) return;
+    if (state.disposed || record.destroyed === true) return;
     if (record.works.size === 0 && record.waiters.size === 0) return;
     const waitedMs = Math.max(0, now() - record.startedAt);
     const bucket = Math.floor(waitedMs / longWaitMs);
@@ -319,7 +578,7 @@ export function createRootTurnWaitRegistry(options = {}) {
       record.lastReminderAt = now();
       record.reminderCount += 1;
       try {
-        onLongWait({
+        state.onLongWait({
           rootId: record.rootId,
           outstanding: record.works.size,
           waitedMs,
@@ -375,7 +634,7 @@ export function createRootTurnWaitRegistry(options = {}) {
    * @param {object} record - 目标记录。
    */
   function scheduleCheck(record) {
-    if (disposed || record.destroyed === true || record.released === true) return;
+    if (state.disposed || record.destroyed === true || record.released === true) return;
     // 显式活动事件或新 waiter 优先于退避 timer，避免同一记录并发发起重复查询。
     clearRetryTimer(record);
     // 正在 onKnownSnapshot 的同步回调里：本次结算由外层判定统一收口，不再嵌套发起查询。
@@ -419,7 +678,7 @@ export function createRootTurnWaitRegistry(options = {}) {
     if (record.activeQueryId !== queryId) return;
     record.activeQueryId = 0;
     record.checking = false;
-    if (disposed || record.destroyed === true) return;
+    if (state.disposed || record.destroyed === true) return;
 
     if (error !== void 0) {
       report(error);
@@ -448,14 +707,7 @@ export function createRootTurnWaitRegistry(options = {}) {
     const running = known && Array.isArray(result.running) ? result.running : [];
     // 只有真正被本次判定采用的查询结果才落 lastSnapshot：version 已变化的陈旧结论会在
     // 上面直接重跑，不能覆盖更新的观测事实。
-    noteSnapshot(
-      record,
-      known,
-      typeof result?.reason === "string" && result.reason.length > 0
-        ? result.reason
-        : (known ? (running.length > 0 ? "running-descendants" : "no-running-descendants") : "descendant-query-unknown"),
-      false,
-    );
+    noteSnapshot(record, known, resolveSnapshotReason(result, known, running), false);
     if (!known) {
       // 未知（结构非法 / 状态无法确定）：继续等待，**绝不**当成无人运行。
       if (record.recheck === true) {
@@ -497,6 +749,40 @@ export function createRootTurnWaitRegistry(options = {}) {
     destroyRecord(record, true, "quiescent");
   }
 
+  // 命令面只交出「能改动等待状态」的入口与定时器清理；查询落地/退避调度是内部实现。
+  return {
+    settleWaiters,
+    clearRetryTimer,
+    clearLongWaitTimer,
+    armLongWaitTimer,
+    scheduleCheck,
+    destroyRecord,
+  };
+}
+
+/**
+ * 命令面单元：记录创建（ensureRecord）与对外命令（登记/结算/等待/人工逃生/卸载）。
+ *
+ * 只通过 state 与兄弟单元的命令读写状态：本单元拿不到任何 Map/Set 之外的东西，
+ * 也**不**把这些容器放进返回值。
+ *
+ * @param {object} state `createTurnWaitState` 的返回值。
+ * @param {object} lifecycle `createTurnWaitLifecycle` 的命令面。
+ * @param {object} observability `createTurnWaitObservability` 的命令面。
+ * @returns {object} 对外命令面（无容器）。
+ */
+function createTurnWaitCommands(state, lifecycle, observability) {
+  const { records, now, subscribe } = state;
+  const { report } = observability;
+  const {
+    settleWaiters,
+    clearRetryTimer,
+    clearLongWaitTimer,
+    armLongWaitTimer,
+    scheduleCheck,
+    destroyRecord,
+  } = lifecycle;
+
   /**
    * 取得（必要时创建）一个 root 的记录；首次创建时**先**安装监听器，再返回，
    * 因此调用方的第一次状态查询一定发生在监听安装之后。
@@ -505,47 +791,11 @@ export function createRootTurnWaitRegistry(options = {}) {
    * （问题 2 的第二轮等待就靠这一点）。
    */
   function ensureRecord(agent) {
-    if (disposed) return void 0;
+    if (state.disposed) return void 0;
     if (agent === null || (typeof agent !== "object" && typeof agent !== "function")) return void 0;
     const existing = records.get(agent);
     if (existing !== void 0) return existing;
-    const record = {
-      owner: agent,
-      agent,
-      rootId: typeof agent.id === "string" ? agent.id : void 0,
-      works: new Map(),
-      waiters: new Set(),
-      version: 0,
-      querySequence: 0,
-      activeQueryId: 0,
-      checking: false,
-      recheck: false,
-      inSnapshot: false,
-      released: false,
-      cancelled: false,
-      destroyed: false,
-      releaseReason: void 0,
-      retryTimer: void 0,
-      retryDelay: RETRY_INITIAL_DELAY,
-      unlisten: void 0,
-      /**
-       * 可观测性与人工逃生状态（票据 11）。
-       *
-       * 全部只保存固定枚举/时间戳/计数：不保存 prompt、任务正文或任何 agent 引用。
-       * longWaitTimer 只是内存句柄，绝不进入任何快照。
-       */
-      startedAt: now(),
-      lastSnapshot: void 0,
-      lastDelivery: void 0,
-      capabilityLevel: "unavailable",
-      lastReminderAt: void 0,
-      reminderCount: 0,
-      lastReminderBucket: 0,
-      issueNotified: new Set(),
-      longWaitTimer: void 0,
-      abandoned: false,
-      abandonReason: void 0,
-    };
+    const record = createTurnWaitRecord(agent, now());
     if (typeof record.rootId !== "string" || record.rootId.length === 0) return void 0;
     records.set(agent, record);
     // 监听必须先于任何状态查询/快照安装。
@@ -712,84 +962,6 @@ export function createRootTurnWaitRegistry(options = {}) {
   }
 
   /**
-   * 记录的只读摘要。
-   *
-   * 只含计数、固定枚举与时间戳；不包含 Agent 引用、root/session id、work 键或任何正文。
-   * lastSnapshot/lastDelivery 都是浅拷贝，调用方无法通过返回值改写内部观测状态。
-   */
-  function summarize(record) {
-    return {
-      outstanding: record.works.size,
-      waiters: record.waiters.size,
-      version: record.version,
-      released: record.released === true,
-      cancelled: record.cancelled === true,
-      reason: record.releaseReason ?? null,
-      startedAt: record.startedAt,
-      waitedMs: Math.max(0, now() - record.startedAt),
-      lastSnapshot: record.lastSnapshot === void 0 ? null : { ...record.lastSnapshot },
-      capabilityLevel: record.capabilityLevel,
-      lastDelivery: record.lastDelivery === void 0 ? null : { ...record.lastDelivery },
-      reminderCount: record.reminderCount,
-      lastReminderAt: record.lastReminderAt ?? null,
-      abandoned: record.abandoned === true,
-    };
-  }
-
-  /** 只读诊断投影（不含任何工作负载，也不暴露 Agent 引用）。 */
-  function describe(agent) {
-    const record = records.get(agent);
-    if (record === void 0 || record.destroyed === true) return void 0;
-    return summarize(record);
-  }
-
-  /**
-   * 全部存活记录的有界只读摘要（最多 `DESCRIBE_ALL_LIMIT` 条）。
-   *
-   * 供诊断使用：条目只含 waitedMs/outstanding/capability 等计数与固定枚举，不含 Agent
-   * 引用、root/session id、work 键或会话正文，因此不可能把任务数据带进 RPC 投影。
-   */
-  function describeAll() {
-    const summaries = [];
-    for (const record of records.values()) {
-      if (record.destroyed === true) continue;
-      if (summaries.length >= DESCRIBE_ALL_LIMIT) break;
-      summaries.push(summarize(record));
-    }
-    return summaries;
-  }
-
-  /**
-   * 记录一次收口结论投递结果（票据 11）。
-   *
-   * 只在记录仍存活时写入 lastDelivery；失败还会触发**跨记录**一次性提示（投递通常发生在
-   * 静止收口、记录销毁之后，仅靠记录去重挡不住下一个 turn 的重复提示）。
-   * 本方法绝不抛错：诊断写入失败不得影响收口或等待语义。
-   *
-   * @param {object} agent - exact root Agent。
-   * @param {{ok:boolean, reason?:string}} delivery - 投递结论（reason 是固定原因码）。
-   * @returns {boolean} 是否成功记录（输入非法/记录已销毁也算已处理，仅回调异常返回 false）。
-   */
-  function noteDelivery(agent, delivery) {
-    try {
-      const ok = delivery?.ok === true;
-      const reason = typeof delivery?.reason === "string" && delivery.reason.length > 0
-        ? delivery.reason
-        : (ok ? "delivered" : "delivery-failed");
-      const at = now();
-      const record = records.get(agent);
-      if (record !== void 0 && record.destroyed !== true) {
-        record.lastDelivery = { ok, reason, at };
-      }
-      if (!ok) notifyDeliveryIssue(agent, reason);
-      return true;
-    } catch (error) {
-      report(error);
-      return false;
-    }
-  }
-
-  /**
    * 人工关闭该 root 的等待账本（票据 11 的唯一逃生写入面）。
    *
    * 语义边界（必须由调用方先用权威后代查询确认「没有运行中的后代」）：
@@ -826,12 +998,12 @@ export function createRootTurnWaitRegistry(options = {}) {
 
   /** 插件卸载：所有 root 一起收口，绝不留下悬空等待或监听。 */
   function dispose() {
-    disposed = true;
+    state.disposed = true;
     for (const record of [...records.values()]) destroyRecord(record, false, "plugin-unloaded");
     records.clear();
   }
 
-  return Object.freeze({
+  return {
     track,
     settle,
     invalidate,
@@ -841,12 +1013,56 @@ export function createRootTurnWaitRegistry(options = {}) {
     wait,
     hasOutstanding,
     outstandingCount,
-    describe,
-    describeAll,
-    noteDelivery,
     abandon,
     retire,
     dispose,
-    get size() { return records.size; },
+  };
+}
+
+/**
+ * 创建 root turn 等待登记表。
+ *
+ * 参数按**能力组**注入（口径见规格书 C3，本票 32 收窄为 8 组，逐组理由见
+ * `normalizeTurnWaitOptions` 的注释）：
+ * - `isLiveRoot`：exact root Agent 是否仍是当前 live root（对象身份 + generation 双重校验
+ *   由调用方提供）；
+ * - `snapshotDescendants`：root-scoped 后代查询，**必须**是「明确回答」语义；
+ * - `subscribe`：安装本 root 的活动监听并返回移除函数；
+ * - `onKnownSnapshot`：拿到**明确**快照后的可选回退结算回调（只能减少未结算工作）；
+ * - `onError`：异常记录回调；
+ * - `clock: { now, setTimeout, clearTimeout }`：时钟与定时器能力面（可注入假时钟）；
+ * - `notifications: { onLongWait, onIssue }`：长等待提醒与降级/投递失败提示（同一投递通道）；
+ * - `config: { longWaitMs }`：长等待提醒间隔（默认 30 分钟）。
+ *
+ * 收窄只改注入形态：默认值、判定顺序与全部命令语义与收窄前逐字一致。
+ *
+ * 工厂本体只做**装配与命令转发**：状态容器在 `createTurnWaitState`，可观测性/生命周期/
+ * 命令面在三个兄弟单元工厂里（补票 R2.5-A）。因此这里既没有状态，也没有定时器。
+ *
+ * @param {object} options 见上（全部可选）。
+ * @returns {object} 登记表 API（命令 + 只读投影；不含任何 Map/Set）。
+ */
+export function createRootTurnWaitRegistry(options = {}) {
+  const state = createTurnWaitState(options);
+  const observability = createTurnWaitObservability(state);
+  const lifecycle = createTurnWaitLifecycle(state, observability);
+  const commands = createTurnWaitCommands(state, lifecycle, observability);
+  return Object.freeze({
+    track: commands.track,
+    settle: commands.settle,
+    invalidate: commands.invalidate,
+    cancelWaiters: commands.cancelWaiters,
+    engage: commands.engage,
+    isEngaged: commands.isEngaged,
+    wait: commands.wait,
+    hasOutstanding: commands.hasOutstanding,
+    outstandingCount: commands.outstandingCount,
+    describe: observability.describe,
+    describeAll: observability.describeAll,
+    noteDelivery: observability.noteDelivery,
+    abandon: commands.abandon,
+    retire: commands.retire,
+    dispose: commands.dispose,
+    get size() { return state.records.size; },
   });
 }

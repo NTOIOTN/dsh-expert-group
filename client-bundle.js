@@ -1,9 +1,9 @@
 /* 此文件由 scripts/assemble-client.mjs 生成，请勿手工编辑。 */
-/* source: client-expert-group-model.js */
-(function installExpertGroupModel(global){
+/* source: client-expert-group-model-normalize.js */
+(function installExpertGroupModelNormalize(global){
 "use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-expert-group-model-normalize");
 const SCHEMA_VERSION=1;
-const SYMBOL=Symbol.for("dsh-expert-group/client-expert-group-model");
 const STATUSES=new Set([
 "queued","waiting","running","succeeded","failed","cancelled",
 "timed_out","interrupted","idle","ready","unknown",
@@ -22,23 +22,25 @@ const COUNT_FIELDS=Object.freeze([
 ]);
 const FAILURE_CODE_MAX_LENGTH=64;
 const FAILURE_MESSAGE_MAX_LENGTH=160;
-const FAILURE_MESSAGE_DISPLAY_MAX_LENGTH=120;
-const RETRY_WARNING_THRESHOLD=3;
-const ATTEMPT_TIMELINE_LIMIT=5;
-const FAILURE_STATUSES=Object.freeze(["failed","timed_out","interrupted"]);
-const STATUS_FILTER_GROUPS=Object.freeze({
-running:Object.freeze(["queued","waiting","running"]),
-failed:Object.freeze(["failed","timed_out","interrupted"]),
-succeeded:Object.freeze(["succeeded"]),
-cancelled:Object.freeze(["cancelled"]),
-idle:Object.freeze(["idle","ready","unknown"]),
-});
 const MAX_NESTED_EXPERT_DEPTH=16;
 const ACTIVE_STATUS_SET=new Set(["queued","waiting","running"]);
 const RECOVERY_CODE_PATTERN=/^[A-Z][A-Z0-9_]{0,63}$/;
 const RECOVERY_MESSAGE_MAX_LENGTH=200;
 const RUNTIME_STATUSES=Object.freeze(["running","ready"]);
-const DEFAULT_COLLAPSED_STATUSES=new Set(["idle","ready","succeeded","cancelled"]);
+const UNKNOWN_RUNTIME_STATUS="unknown";
+const USAGE_TOKEN_FIELDS=Object.freeze([
+"inputTokens","outputTokens","cacheReadTokens","cacheWriteTokens","reasoningTokens",
+]);
+const USAGE_COUNT_FIELDS=Object.freeze(["requests","retries","fallbacks"]);
+const USAGE_TEXT_MAX_LENGTH=128;
+const STRUCTURED_FALLBACK_REASONS=Object.freeze({
+missing_structured:"未收到结构化结果，已回退文本总结",
+result_unavailable:"结构化结果不可用，已回退文本总结",
+result_too_large:"结构化结果超过 64 KiB 上限，已回退文本总结",
+schema_not_restored:"冷恢复未恢复输出声明，本轮无法校验结构化结果",
+});
+const STRUCTURED_FALLBACK_REASON_SET=new Set(Object.keys(STRUCTURED_FALLBACK_REASONS));
+const ROLE_LABEL_MAX_ENTRIES=64;
 function isObject(value){
 return value!==null&&typeof value==="object"&&!Array.isArray(value);
 }
@@ -57,44 +59,9 @@ return null;
 function numberOrNull(value){
 return typeof value==="number"&&Number.isFinite(value)?value:null;
 }
-function pad2(value){
-return value<10?"0"+value:String(value);
-}
 function durationBetween(startedAt,finishedAt){
 if(startedAt===null||finishedAt===null)return null;
 return Math.max(0,finishedAt-startedAt);
-}
-function formatDuration(value){
-const ms=numberOrNull(value);
-if(ms===null)return null;
-const clamped=Math.max(0,ms);
-if(clamped<1000)return"<1s";
-if(clamped<60000){
-const seconds=(clamped/1000).toFixed(1);
-return(seconds.endsWith(".0")?seconds.slice(0,-2):seconds)+"s";
-}
-if(clamped<3600000){
-const minutes=Math.floor(clamped/60000);
-const seconds=Math.floor((clamped%60000)/1000);
-return minutes+"m "+seconds+"s";
-}
-const hours=Math.floor(clamped/3600000);
-const minutes=Math.floor((clamped%3600000)/60000);
-return minutes===0?hours+"h":hours+"h "+minutes+"m";
-}
-function formatClockTime(value){
-const timestamp=numberOrNull(value);
-if(timestamp===null)return null;
-const date=new Date(timestamp);
-if(Number.isNaN(date.getTime()))return null;
-return pad2(date.getHours())+":"+pad2(date.getMinutes())+":"+pad2(date.getSeconds());
-}
-function formatIsoTime(value){
-const timestamp=numberOrNull(value);
-if(timestamp===null)return null;
-const date=new Date(timestamp);
-if(Number.isNaN(date.getTime()))return null;
-return date.toISOString();
 }
 const QUOTED_WINDOWS_PATH_PATTERN=/(["'])[A-Za-z]:[\\/][^"'\r\n]*\1/g;
 const QUOTED_POSIX_PATH_PATTERN=/(["'])\/[^"'\r\n]*\1/g;
@@ -130,17 +97,6 @@ const rawCode=text(value.code);
 const cleanedCode=rawCode===null?"":rawCode.replace(/[\u0000-\u001f\u007f-\u009f]+/g,"").trim();
 const code=cleanedCode.length===0?"error":cleanedCode.slice(0,FAILURE_CODE_MAX_LENGTH);
 return{code,message:collapseFailureMessage(value.message)};
-}
-function formatFailureSummary(value){
-const failure=normalizeFailure(value);
-if(failure===null)return null;
-const message=failure.message===null||failure.message.length<=FAILURE_MESSAGE_DISPLAY_MAX_LENGTH
-?failure.message
-:failure.message.slice(0,FAILURE_MESSAGE_DISPLAY_MAX_LENGTH-1)+"…";
-return{code:failure.code,message};
-}
-function isFailureStatus(value){
-return FAILURE_STATUSES.indexOf(normalizeStatus(value))!==-1;
 }
 function normalizeStatus(value){
 const source=text(value);
@@ -180,7 +136,6 @@ if(protocolStatus==="running")return"running";
 if(protocolStatus!=="unknown")return"inactive";
 return null;
 }
-const UNKNOWN_RUNTIME_STATUS="unknown";
 function runtimeStatusOf(node,entry,options){
 const signal=activitySignalOf(node,entry);
 if(signal==="running")return"running";
@@ -213,20 +168,6 @@ retryable:status==="failed"&&value.retryable===true,
 persistenceBlocked:value.persistenceBlocked===true,
 };
 }
-const USAGE_TOKEN_FIELDS=Object.freeze([
-"inputTokens","outputTokens","cacheReadTokens","cacheWriteTokens","reasoningTokens",
-]);
-const USAGE_COUNT_FIELDS=Object.freeze(["requests","retries","fallbacks"]);
-const USAGE_TEXT_MAX_LENGTH=128;
-const STRUCTURED_PREVIEW_MAX_CHARS=400;
-const STRUCTURED_FALLBACK_REASONS=Object.freeze({
-missing_structured:"未收到结构化结果，已回退文本总结",
-result_unavailable:"结构化结果不可用，已回退文本总结",
-result_too_large:"结构化结果超过 64 KiB 上限，已回退文本总结",
-schema_not_restored:"冷恢复未恢复输出声明，本轮无法校验结构化结果",
-});
-const STRUCTURED_FALLBACK_REASON_SET=new Set(Object.keys(STRUCTURED_FALLBACK_REASONS));
-const ROLE_LABEL_MAX_ENTRIES=64;
 function countOrNull(value){
 return typeof value==="number"&&Number.isSafeInteger(value)&&value>=0?value:null;
 }
@@ -308,36 +249,6 @@ return{
 ...(requested===null?{}:{outputSchemaRequested:requested}),
 };
 }
-function structuredFallbackText(reason){
-return STRUCTURED_FALLBACK_REASON_SET.has(reason)
-?STRUCTURED_FALLBACK_REASONS[reason]
-:STRUCTURED_FALLBACK_REASONS.result_unavailable;
-}
-function structuredPreviewOf(value,options){
-const structured=normalizeStructured(value);
-if(structured===null)return null;
-const optionSource=isObject(options)?options:{};
-const rawLimit=numberOrNull(optionSource.maxChars);
-const limit=rawLimit!==null&&rawLimit>0?Math.floor(rawLimit):STRUCTURED_PREVIEW_MAX_CHARS;
-if(structured.value!==undefined){
-let serialized="";
-try{serialized=JSON.stringify(structured.value);}catch{serialized="";}
-if(serialized.length===0){
-return{text:null,truncated:false,fallback:true,reason:structured.reason??"result_unavailable"};
-}
-const truncated=serialized.length>limit;
-return{
-text:truncated?serialized.slice(0,limit):serialized,
-truncated,
-fallback:structured.fallback===true,
-reason:structured.reason??null,
-};
-}
-if(structured.fallback===true||typeof structured.reason==="string"){
-return{text:null,truncated:false,fallback:true,reason:structured.reason??"missing_structured"};
-}
-return null;
-}
 function normalizeRoleLabels(value){
 if(!isObject(value))return null;
 const labels={};
@@ -392,103 +303,6 @@ inputCost,
 outputCost,
 totalCost:inputCost+outputCost,
 });
-}
-function formatTokenCount(value){
-const count=countOrNull(value);
-if(count===null)return null;
-if(count<1000)return String(count);
-if(count<1000000){
-const thousands=count/1000;
-return(thousands<10?thousands.toFixed(1):String(Math.round(thousands)))+"k";
-}
-const millions=count/1000000;
-return(millions<10?millions.toFixed(1):String(Math.round(millions)))+"M";
-}
-function formatDurationCompact(value){
-const ms=numberOrNull(value);
-if(ms===null)return null;
-const clamped=Math.max(0,ms);
-if(clamped<1000)return"<1s";
-if(clamped<60000){
-const seconds=(clamped/1000).toFixed(1);
-return(seconds.endsWith(".0")?seconds.slice(0,-2):seconds)+"s";
-}
-if(clamped<3600000){
-const minutes=Math.floor(clamped/60000);
-const seconds=Math.floor((clamped%60000)/1000);
-return seconds===0?minutes+"m":minutes+"m"+seconds+"s";
-}
-const hours=Math.floor(clamped/3600000);
-const minutes=Math.floor((clamped%3600000)/60000);
-return minutes===0?hours+"h":hours+"h"+minutes+"m";
-}
-function formatThroughputText(value){
-const rounded=value>=10?String(Math.round(value)):value.toFixed(1);
-return(rounded.endsWith(".0")?rounded.slice(0,-2):rounded)+"tok/s";
-}
-function summarizeUsageMetrics(usage,options){
-const source=isObject(usage)?usage:{};
-const settings=isObject(options)?options:{};
-const durationMs=countOrNull(settings.durationMs);
-const durationText=formatDurationCompact(durationMs);
-const outputTokens=countOrNull(source.outputTokens);
-const billedInput=countOrNull(source.billedInputTokens);
-let totalTokens=countOrNull(source.totalTokens);
-if(totalTokens===null&&billedInput!==null&&outputTokens!==null){
-totalTokens=billedInput+outputTokens;
-}
-const totalTokensText=totalTokens===null?null:(formatTokenCount(totalTokens)??null)+" tok";
-let tokensPerSecond=null;
-let throughputText=null;
-const measured=numberOrNull(settings.measuredTokensPerSecond);
-if(measured!==null&&measured>=0.1){
-tokensPerSecond=measured;
-throughputText=formatThroughputText(measured);
-}else if(durationMs!==null&&durationMs>=1000&&outputTokens!==null&&outputTokens>0){
-const value=outputTokens/(durationMs/1000);
-if(Number.isFinite(value)&&value>=0.1){
-tokensPerSecond=value;
-throughputText=formatThroughputText(value);
-}
-}
-const cacheRead=countOrNull(source.cacheReadTokens);
-let cacheHitPercent=null;
-if(cacheRead!==null&&billedInput!==null&&billedInput>0){
-cacheHitPercent=Math.min(100,Math.round((cacheRead/billedInput)*100));
-}
-const cacheHitText=cacheHitPercent===null?null:"命中"+cacheHitPercent+"%";
-const pressure=isObject(settings.contextPressure)?settings.contextPressure:{};
-const contextUsedTokens=countOrNull(pressure.projectedTokens)??countOrNull(pressure.pressureTokens);
-const contextWindow=countOrNull(pressure.contextWindow);
-let contextPercent=null;
-if(contextUsedTokens!==null&&contextWindow!==null&&contextWindow>0){
-contextPercent=Math.min(100,Math.round((contextUsedTokens/contextWindow)*100));
-}
-const contextText=contextPercent===null?null:"context "+contextPercent+"%";
-return{
-durationMs,
-durationText,
-tokensPerSecond,
-throughputText,
-totalTokens,
-totalTokensText,
-cacheHitPercent,
-cacheHitText,
-contextPercent,
-contextText,
-contextUsedTokens,
-contextWindow,
-};
-}
-function redactDisplayText(value,maxLength){
-const raw=typeof value==="string"?value:(value instanceof Error?value.message:"");
-const collapsed=raw
-.replace(/[\u0000-\u001f\u007f-\u009f]+/g," ")
-.replace(/\s+/g," ")
-.trim();
-if(collapsed.length===0)return"";
-const limit=numberOrNull(maxLength)!==null&&maxLength>0?Math.floor(maxLength):160;
-return redactFailurePaths(collapsed).slice(0,limit);
 }
 function normalizeCapabilityEntry(value){
 if(!isObject(value)||typeof value.allowed!=="boolean")return null;
@@ -736,6 +550,419 @@ recovery:normalizeRecovery(raw.recovery),
 roleLabels:normalizeRoleLabels(raw.roleLabels),
 root,
 };
+}
+global[SYMBOL]=Object.freeze({
+SCHEMA_VERSION,
+RUNTIME_STATUSES,
+UNKNOWN_RUNTIME_STATUS,
+STRUCTURED_FALLBACK_REASONS,
+STRUCTURED_FALLBACK_REASON_SET,
+MAX_NESTED_EXPERT_DEPTH,
+normalizeExpertGroupSnapshot,
+normalizeCapabilities,
+normalizeStatus,
+normalizeFailure,
+normalizeUsage,
+normalizeStructured,
+normalizeRoleLabels,
+roleLabelFrom,
+roleLabelOf,
+findModelPrice,
+estimateUsageCost,
+runtimeStatusOf,
+isObject,
+text,
+firstText,
+numberOrNull,
+countOrNull,
+redactFailurePaths,
+normalizeAttempt,
+});
+})(globalThis);
+/* source: client-expert-group-model-format.js */
+(function installExpertGroupModelFormat(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-expert-group-model-format");
+const{
+SCHEMA_VERSION,
+MAX_NESTED_EXPERT_DEPTH,
+STRUCTURED_FALLBACK_REASONS,
+STRUCTURED_FALLBACK_REASON_SET,
+isObject,
+text,
+firstText,
+numberOrNull,
+countOrNull,
+redactFailurePaths,
+normalizeStatus,
+normalizeFailure,
+normalizeUsage,
+normalizeStructured,
+normalizeAttempt,
+roleLabelFrom,
+}=global[Symbol.for("dsh-expert-group/client-expert-group-model-normalize")];
+const FAILURE_MESSAGE_DISPLAY_MAX_LENGTH=120;
+const RETRY_WARNING_THRESHOLD=3;
+const ATTEMPT_TIMELINE_LIMIT=5;
+const FAILURE_STATUSES=Object.freeze(["failed","timed_out","interrupted"]);
+const STATUS_FILTER_GROUPS=Object.freeze({
+running:Object.freeze(["queued","waiting","running"]),
+failed:Object.freeze(["failed","timed_out","interrupted"]),
+succeeded:Object.freeze(["succeeded"]),
+cancelled:Object.freeze(["cancelled"]),
+idle:Object.freeze(["idle","ready","unknown"]),
+});
+const DEFAULT_COLLAPSED_STATUSES=new Set(["idle","ready","succeeded","cancelled"]);
+const STRUCTURED_PREVIEW_MAX_CHARS=400;
+const SUPPORTED_LOCALES=Object.freeze(["zh","en"]);
+const DEFAULT_LOCALE="zh";
+const MISSING_MESSAGE_TEXT="—";
+const MESSAGE_CATALOG=Object.freeze({
+"sidebar.title":{zh:"Expert Group",en:"Expert Group"},
+"sidebar.empty":{zh:"暂无 Expert Group 任务",en:"No Expert Group tasks yet"},
+"sidebar.error.snapshot":{zh:"快照读取失败",en:"Snapshot read failed"},
+"sidebar.error.action":{zh:"操作失败",en:"Action failed"},
+"sidebar.error.rpc":{zh:"请求失败",en:"Request failed"},
+"sidebar.refresh":{zh:"刷新",en:"Refresh"},
+"sidebar.retry":{zh:"重试",en:"Retry"},
+"sidebar.partial":{zh:"数据不完整",en:"Incomplete data"},
+"sidebar.partial.title":{
+zh:"数据不完整：轻量快照已先上屏，状态与任务名可能尚未读取完整",
+en:"Incomplete data: a lightweight snapshot is shown first; statuses and task names may not be fully loaded yet",
+},
+"sidebar.updated":{zh:"更新于 {time}",en:"Updated {time}"},
+"sidebar.updated.title":{
+zh:"最后更新时间（本次数据上屏的时刻）",
+en:"Last update time (when this data was rendered)",
+},
+"sidebar.idleGroup":{zh:"空闲子代理（{count}）",en:"Idle subagents ({count})"},
+"sidebar.idleGroup.name":{zh:"空闲子代理",en:"Idle subagents"},
+"sidebar.search.label":{zh:"任务过滤",en:"Filter tasks"},
+"sidebar.search.aria":{zh:"搜索任务",en:"Search tasks"},
+"sidebar.search.placeholder":{zh:"搜索任务名 / 角色 / 模型",en:"Search task name / role / model"},
+"sidebar.filter.role":{zh:"按角色筛选",en:"Filter by role"},
+"sidebar.filter.status":{zh:"按状态筛选",en:"Filter by status"},
+"sidebar.filter.allRoles":{zh:"全部角色",en:"All roles"},
+"sidebar.filter.allStatuses":{zh:"全部状态",en:"All statuses"},
+"sidebar.filter.empty":{zh:"没有匹配的任务",en:"No matching tasks"},
+"sidebar.collapse":{zh:"收起",en:"Collapse"},
+"sidebar.expand":{zh:"展开",en:"Expand"},
+"sidebar.timeline.showAll":{zh:"查看全部",en:"Show all"},
+"sidebar.recovery.retry":{zh:"重试恢复",en:"Retry recovery"},
+"sidebar.recovery.retrying":{zh:"重试中…",en:"Retrying…"},
+"sidebar.recovery.failed":{zh:"任务恢复失败（{code}）",en:"Task recovery failed ({code})"},
+"sidebar.recovery.retryFailed":{zh:"重试未恢复（{code}）",en:"Retry did not recover ({code})"},
+"sidebar.sessionModel.open":{zh:"会话模型",en:"Session models"},
+"sidebar.sessionModel.title":{zh:"会话模型",en:"Session models"},
+"sidebar.sessionModel.hint":{
+zh:"只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
+en:"Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the global default again.",
+},
+"sidebar.sessionModel.openTitle":{
+zh:"按会话修改专家模型，不影响全局默认",
+en:"Change expert models for this session; global defaults are unchanged",
+},
+"sidebar.sessionModel.close":{zh:"关闭会话模型",en:"Close session models"},
+"sidebar.sessionModel.noSession":{
+zh:"未打开会话：打开一个会话后可在此临时覆盖角色模型。",
+en:"No open session: open a session to temporarily override role models here.",
+},
+"sidebar.sessionModel.child":{
+zh:"当前是子代理会话，会话级模型覆盖只读。",
+en:"This is a subagent session; session model overrides are read-only.",
+},
+"sidebar.sessionModel.loading":{zh:"正在读取本会话覆盖…",en:"Loading session overrides…"},
+"sidebar.sessionModel.unavailable":{
+zh:"本会话覆盖读取失败，请稍后重试。",
+en:"Failed to read session overrides; please retry later.",
+},
+"sidebar.sessionModel.unsupported":{
+zh:"当前宿主版本不支持会话级模型覆盖。",
+en:"This host version does not support session model overrides.",
+},
+"sidebar.sessionModel.offline":{
+zh:"会话未运行：会话级覆盖只读。",
+en:"The session is not running; session overrides are read-only.",
+},
+"sidebar.sessionModel.followGlobal":{zh:"跟随全局默认",en:"Follow global default"},
+"sidebar.sessionModel.override":{zh:"本会话覆盖",en:"Session override"},
+"sidebar.sessionModel.revision":{zh:"代次 {revision}",en:"Revision {revision}"},
+"sidebar.sessionModel.provider":{zh:"供应商",en:"Provider"},
+"sidebar.sessionModel.model":{zh:"模型",en:"Model"},
+"sidebar.sessionModel.effort":{zh:"思考深度",en:"Reasoning effort"},
+"sidebar.sessionModel.effortDefault":{zh:"模型默认",en:"Model default"},
+"sidebar.sessionModel.save":{zh:"保存覆盖",en:"Save override"},
+"sidebar.sessionModel.clear":{zh:"清除",en:"Clear"},
+"sidebar.sessionModel.saving":{zh:"保存中…",en:"Saving…"},
+"sidebar.sessionModel.saved":{zh:"已保存本会话覆盖",en:"Session override saved"},
+"sidebar.sessionModel.cleared":{zh:"已清除，恢复全局默认",en:"Cleared; global default restored"},
+"sidebar.sessionModel.conflict":{
+zh:"其他页面已修改本会话覆盖（当前代次 {revision}）；你的输入已保留，请确认后重试。",
+en:"Another page changed this session's overrides (current revision {revision}); your input was kept, please review and retry.",
+},
+"sidebar.sessionModel.failed":{zh:"保存失败：{message}",en:"Save failed: {message}"},
+"sidebar.sessionModel.retry":{zh:"重新读取",en:"Reload"},
+"sidebar.sessionModel.globalSummary":{zh:"全局：{provider} / {model}",en:"Global: {provider} / {model}"},
+"sidebar.sessionModel.emptyGlobal":{zh:"未配置全局默认",en:"No global default configured"},
+"sidebar.sessionModel.emptyRoles":{zh:"没有可配置的专家角色。",en:"No configurable expert roles."},
+"sidebar.sessionModel.columnRole":{zh:"专家",en:"Expert"},
+"sidebar.sessionModel.columnModel":{zh:"模型选择",en:"Model"},
+"sidebar.sessionModel.tableLabel":{zh:"会话模型覆盖",en:"Session model overrides"},
+"sidebar.sessionModel.saveChanges":{zh:"保存",en:"Save"},
+"sidebar.sessionModel.invalidDraft":{
+zh:"请为已修改的角色选择供应商和模型。",
+en:"Choose a provider and model for every edited role.",
+},
+"sidebar.sessionModel.clearRole":{
+zh:"清除{role}的本会话覆盖",
+en:"Clear the session override for {role}",
+},
+"settings.title":{zh:"dsh-expert-group",en:"dsh-expert-group"},
+"settings.hint":{
+zh:"专家模型使用 DSH 当前已配置的 provider 和模型目录。",
+en:"Expert models use the providers and model catalog configured in DSH.",
+},
+"settings.taskManagement":{zh:"任务管理",en:"Task management"},
+"settings.auto":{zh:"Auto",en:"Auto"},
+"settings.autoTitle":{
+zh:"自动打开运行中的子代理侧栏会话",
+en:"Automatically open running subagent sidebar sessions",
+},
+"settings.notifications":{zh:"通知弹窗",en:"Notifications"},
+"settings.notificationVolume":{zh:"通知音量",en:"Notification volume"},
+"settings.notificationEvents":{zh:"通知事件",en:"Notification events"},
+"settings.notificationVolume.range":{zh:"通知音量滑块",en:"Notification volume slider"},
+"settings.notificationVolume.number":{zh:"通知音量数值",en:"Notification volume value"},
+"settings.notificationEvent.completed":{zh:"任务完成",en:"Task completed"},
+"settings.roleTimeout.aria":{zh:"角色默认超时",en:"Default role timeout"},
+"settings.notificationEvent.completed.aria":{zh:"通知任务完成",en:"Notify on task completed"},
+"settings.notificationEvent.waiting.aria":{zh:"通知等待用户",en:"Notify on waiting for user"},
+"settings.notificationEvent.failed.aria":{zh:"通知任务失败",en:"Notify on task failed"},
+"settings.notificationEvent.waiting":{zh:"等待用户",en:"Waiting for user"},
+"settings.notificationEvent.failed":{zh:"任务失败",en:"Task failed"},
+"settings.unifiedProvider":{zh:"统一供应商",en:"Unified provider"},
+"settings.noProvider":{zh:"无",en:"None"},
+"settings.observerPreferred":{zh:"Observer优先",en:"Prefer Observer"},
+"settings.concurrencyLimit":{zh:"单个角色并发上限",en:"Per-role concurrency limit"},
+"settings.concurrencyLimit.title":{
+zh:"取值范围 1–64 的整数；默认 20；保存后生效",
+en:"An integer from 1–64; defaults to 20; takes effect after saving",
+},
+"settings.roleTimeout":{zh:"角色默认超时 (s)",en:"Default role timeout (s)"},
+"settings.roleTimeout.title":{
+zh:"默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
+en:"Defaults to 10 hours (36000 s); 0 disables it; enabled values are 1–86400 s (integer, 1 s precision). Applies only to attempts created after saving; running shards are unchanged.",
+},
+"settings.save":{zh:"保存",en:"Save"},
+"settings.saving":{zh:"保存中…",en:"Saving…"},
+"settings.discard":{zh:"放弃修改",en:"Discard changes"},
+"settings.saved":{zh:"已保存",en:"Saved"},
+"settings.unsaved":{zh:"有未保存的修改",en:"Unsaved changes"},
+"announce.start":{zh:"任务开始：{name}",en:"Task started: {name}"},
+"announce.finish":{zh:"任务完成：{name}",en:"Task finished: {name}"},
+"announce.fail":{zh:"任务失败：{name}",en:"Task failed: {name}"},
+"announce.cancel":{zh:"任务取消：{name}",en:"Task cancelled: {name}"},
+"announce.more":{zh:"等 {count} 项",en:"and {count} more"},
+"notify.termination.title":{zh:"Expert Group",en:"Expert Group"},
+"notify.termination.completed":{zh:"任务已完成。",en:"Task completed."},
+"notify.termination.blocked":{zh:"任务被阻塞，需要你处理。",en:"Task blocked; your input is needed."},
+"notify.termination.error":{zh:"任务因错误终止。",en:"Task terminated with an error."},
+"notify.termination.aborted":{zh:"任务已中止。",en:"Task aborted."},
+"notify.termination.interrupted":{zh:"任务被中断。",en:"Task interrupted."},
+"notify.termination.max-tokens":{zh:"任务达到 token 上限。",en:"Task reached the token limit."},
+"notify.termination.unknown":{zh:"任务已终止。",en:"Task terminated."},
+"notify.test.title":{zh:"Expert Group",en:"Expert Group"},
+"notify.wait.title":{zh:"Expert Group",en:"Expert Group"},
+"notify.wait.body":{zh:"需要你操作",en:"Your action is required"},
+"notify.test.body":{
+zh:"测试通知：系统通知通道可用。",
+en:"Test notification: the system notification channel is available.",
+},
+"notify.waitLong.body":{
+zh:"专家任务已等待超过 30 分钟仍未结算。若权威查询确认没有运行中的后代，可用 dsh_expert_group_abandon_wait 手动关闭等待账本；它不会终止专家，也不会释放影响范围保护。",
+en:"The expert task has been waiting more than 30 minutes without settling. If an authoritative query confirms no running descendants, use dsh_expert_group_abandon_wait to close the wait ledger manually; it neither stops experts nor releases impact-scope protection.",
+},
+"notify.waitQueryDegraded.body":{
+zh:"无法确认专家后代的运行状态（后代查询降级或失败），root turn 会继续等待；未知状态不等于专家已完成。",
+en:"The running state of expert descendants cannot be confirmed (descendant query degraded or failed); the root turn keeps waiting. Unknown is not the same as completed.",
+},
+"notify.waitDeliveryFailed.body":{
+zh:"专家批次已静止，但收口结论投递失败；批次保持待收口，插件会在后续 root turn 重试。",
+en:"The expert batch is quiescent but delivering the finalization result failed; the batch remains pending and the plugin retries on later root turns.",
+},
+});
+function pad2(value){
+return value<10?"0"+value:String(value);
+}
+function formatDuration(value){
+const ms=numberOrNull(value);
+if(ms===null)return null;
+const clamped=Math.max(0,ms);
+if(clamped<1000)return"<1s";
+if(clamped<60000){
+const seconds=(clamped/1000).toFixed(1);
+return(seconds.endsWith(".0")?seconds.slice(0,-2):seconds)+"s";
+}
+if(clamped<3600000){
+const minutes=Math.floor(clamped/60000);
+const seconds=Math.floor((clamped%60000)/1000);
+return minutes+"m "+seconds+"s";
+}
+const hours=Math.floor(clamped/3600000);
+const minutes=Math.floor((clamped%3600000)/60000);
+return minutes===0?hours+"h":hours+"h "+minutes+"m";
+}
+function formatClockTime(value){
+const timestamp=numberOrNull(value);
+if(timestamp===null)return null;
+const date=new Date(timestamp);
+if(Number.isNaN(date.getTime()))return null;
+return pad2(date.getHours())+":"+pad2(date.getMinutes())+":"+pad2(date.getSeconds());
+}
+function formatIsoTime(value){
+const timestamp=numberOrNull(value);
+if(timestamp===null)return null;
+const date=new Date(timestamp);
+if(Number.isNaN(date.getTime()))return null;
+return date.toISOString();
+}
+function formatFailureSummary(value){
+const failure=normalizeFailure(value);
+if(failure===null)return null;
+const message=failure.message===null||failure.message.length<=FAILURE_MESSAGE_DISPLAY_MAX_LENGTH
+?failure.message
+:failure.message.slice(0,FAILURE_MESSAGE_DISPLAY_MAX_LENGTH-1)+"…";
+return{code:failure.code,message};
+}
+function isFailureStatus(value){
+return FAILURE_STATUSES.indexOf(normalizeStatus(value))!==-1;
+}
+function structuredFallbackText(reason){
+return STRUCTURED_FALLBACK_REASON_SET.has(reason)
+?STRUCTURED_FALLBACK_REASONS[reason]
+:STRUCTURED_FALLBACK_REASONS.result_unavailable;
+}
+function structuredPreviewOf(value,options){
+const structured=normalizeStructured(value);
+if(structured===null)return null;
+const optionSource=isObject(options)?options:{};
+const rawLimit=numberOrNull(optionSource.maxChars);
+const limit=rawLimit!==null&&rawLimit>0?Math.floor(rawLimit):STRUCTURED_PREVIEW_MAX_CHARS;
+if(structured.value!==undefined){
+let serialized="";
+try{serialized=JSON.stringify(structured.value);}catch{serialized="";}
+if(serialized.length===0){
+return{text:null,truncated:false,fallback:true,reason:structured.reason??"result_unavailable"};
+}
+const truncated=serialized.length>limit;
+return{
+text:truncated?serialized.slice(0,limit):serialized,
+truncated,
+fallback:structured.fallback===true,
+reason:structured.reason??null,
+};
+}
+if(structured.fallback===true||typeof structured.reason==="string"){
+return{text:null,truncated:false,fallback:true,reason:structured.reason??"missing_structured"};
+}
+return null;
+}
+function formatTokenCount(value){
+const count=countOrNull(value);
+if(count===null)return null;
+if(count<1000)return String(count);
+if(count<1000000){
+const thousands=count/1000;
+return(thousands<10?thousands.toFixed(1):String(Math.round(thousands)))+"k";
+}
+const millions=count/1000000;
+return(millions<10?millions.toFixed(1):String(Math.round(millions)))+"M";
+}
+function formatDurationCompact(value){
+const ms=numberOrNull(value);
+if(ms===null)return null;
+const clamped=Math.max(0,ms);
+if(clamped<1000)return"<1s";
+if(clamped<60000){
+const seconds=(clamped/1000).toFixed(1);
+return(seconds.endsWith(".0")?seconds.slice(0,-2):seconds)+"s";
+}
+if(clamped<3600000){
+const minutes=Math.floor(clamped/60000);
+const seconds=Math.floor((clamped%60000)/1000);
+return seconds===0?minutes+"m":minutes+"m"+seconds+"s";
+}
+const hours=Math.floor(clamped/3600000);
+const minutes=Math.floor((clamped%3600000)/60000);
+return minutes===0?hours+"h":hours+"h"+minutes+"m";
+}
+function formatThroughputText(value){
+const rounded=value>=10?String(Math.round(value)):value.toFixed(1);
+return(rounded.endsWith(".0")?rounded.slice(0,-2):rounded)+"tok/s";
+}
+function summarizeUsageMetrics(usage,options){
+const source=isObject(usage)?usage:{};
+const settings=isObject(options)?options:{};
+const durationMs=countOrNull(settings.durationMs);
+const durationText=formatDurationCompact(durationMs);
+const outputTokens=countOrNull(source.outputTokens);
+const billedInput=countOrNull(source.billedInputTokens);
+let totalTokens=countOrNull(source.totalTokens);
+if(totalTokens===null&&billedInput!==null&&outputTokens!==null){
+totalTokens=billedInput+outputTokens;
+}
+const totalTokensText=totalTokens===null?null:(formatTokenCount(totalTokens)??null)+" tok";
+let tokensPerSecond=null;
+let throughputText=null;
+const measured=numberOrNull(settings.measuredTokensPerSecond);
+if(measured!==null&&measured>=0.1){
+tokensPerSecond=measured;
+throughputText=formatThroughputText(measured);
+}else if(durationMs!==null&&durationMs>=1000&&outputTokens!==null&&outputTokens>0){
+const value=outputTokens/(durationMs/1000);
+if(Number.isFinite(value)&&value>=0.1){
+tokensPerSecond=value;
+throughputText=formatThroughputText(value);
+}
+}
+const cacheRead=countOrNull(source.cacheReadTokens);
+let cacheHitPercent=null;
+if(cacheRead!==null&&billedInput!==null&&billedInput>0){
+cacheHitPercent=Math.min(100,Math.round((cacheRead/billedInput)*100));
+}
+const cacheHitText=cacheHitPercent===null?null:"命中"+cacheHitPercent+"%";
+const pressure=isObject(settings.contextPressure)?settings.contextPressure:{};
+const contextUsedTokens=countOrNull(pressure.projectedTokens)??countOrNull(pressure.pressureTokens);
+const contextWindow=countOrNull(pressure.contextWindow);
+let contextPercent=null;
+if(contextUsedTokens!==null&&contextWindow!==null&&contextWindow>0){
+contextPercent=Math.min(100,Math.round((contextUsedTokens/contextWindow)*100));
+}
+const contextText=contextPercent===null?null:"context "+contextPercent+"%";
+return{
+durationMs,
+durationText,
+tokensPerSecond,
+throughputText,
+totalTokens,
+totalTokensText,
+cacheHitPercent,
+cacheHitText,
+contextPercent,
+contextText,
+contextUsedTokens,
+contextWindow,
+};
+}
+function redactDisplayText(value,maxLength){
+const raw=typeof value==="string"?value:(value instanceof Error?value.message:"");
+const collapsed=raw
+.replace(/[\u0000-\u001f\u007f-\u009f]+/g," ")
+.replace(/\s+/g," ")
+.trim();
+if(collapsed.length===0)return"";
+const limit=numberOrNull(maxLength)!==null&&maxLength>0?Math.floor(maxLength):160;
+return redactFailurePaths(collapsed).slice(0,limit);
 }
 function titleCaseRole(value,fallback){
 const source=text(value);
@@ -1111,183 +1338,6 @@ rootSessionId,keyFor,isExpanded,get:isExpanded,
 setExpanded,set:setExpanded,toggle,clear,
 });
 }
-const SUPPORTED_LOCALES=Object.freeze(["zh","en"]);
-const DEFAULT_LOCALE="zh";
-const MISSING_MESSAGE_TEXT="—";
-const MESSAGE_CATALOG=Object.freeze({
-"sidebar.title":{zh:"Expert Group",en:"Expert Group"},
-"sidebar.empty":{zh:"暂无 Expert Group 任务",en:"No Expert Group tasks yet"},
-"sidebar.error.snapshot":{zh:"快照读取失败",en:"Snapshot read failed"},
-"sidebar.error.action":{zh:"操作失败",en:"Action failed"},
-"sidebar.error.rpc":{zh:"请求失败",en:"Request failed"},
-"sidebar.refresh":{zh:"刷新",en:"Refresh"},
-"sidebar.retry":{zh:"重试",en:"Retry"},
-"sidebar.partial":{zh:"数据不完整",en:"Incomplete data"},
-"sidebar.partial.title":{
-zh:"数据不完整：轻量快照已先上屏，状态与任务名可能尚未读取完整",
-en:"Incomplete data: a lightweight snapshot is shown first; statuses and task names may not be fully loaded yet",
-},
-"sidebar.updated":{zh:"更新于 {time}",en:"Updated {time}"},
-"sidebar.updated.title":{
-zh:"最后更新时间（本次数据上屏的时刻）",
-en:"Last update time (when this data was rendered)",
-},
-"sidebar.idleGroup":{zh:"空闲子代理（{count}）",en:"Idle subagents ({count})"},
-"sidebar.idleGroup.name":{zh:"空闲子代理",en:"Idle subagents"},
-"sidebar.search.label":{zh:"任务过滤",en:"Filter tasks"},
-"sidebar.search.aria":{zh:"搜索任务",en:"Search tasks"},
-"sidebar.search.placeholder":{zh:"搜索任务名 / 角色 / 模型",en:"Search task name / role / model"},
-"sidebar.filter.role":{zh:"按角色筛选",en:"Filter by role"},
-"sidebar.filter.status":{zh:"按状态筛选",en:"Filter by status"},
-"sidebar.filter.allRoles":{zh:"全部角色",en:"All roles"},
-"sidebar.filter.allStatuses":{zh:"全部状态",en:"All statuses"},
-"sidebar.filter.empty":{zh:"没有匹配的任务",en:"No matching tasks"},
-"sidebar.collapse":{zh:"收起",en:"Collapse"},
-"sidebar.expand":{zh:"展开",en:"Expand"},
-"sidebar.timeline.showAll":{zh:"查看全部",en:"Show all"},
-"sidebar.recovery.retry":{zh:"重试恢复",en:"Retry recovery"},
-"sidebar.recovery.retrying":{zh:"重试中…",en:"Retrying…"},
-"sidebar.recovery.failed":{zh:"任务恢复失败（{code}）",en:"Task recovery failed ({code})"},
-"sidebar.recovery.retryFailed":{zh:"重试未恢复（{code}）",en:"Retry did not recover ({code})"},
-"sidebar.sessionModel.open":{zh:"会话模型",en:"Session models"},
-"sidebar.sessionModel.title":{zh:"会话模型",en:"Session models"},
-"sidebar.sessionModel.hint":{
-zh:"只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
-en:"Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the global default again.",
-},
-"sidebar.sessionModel.openTitle":{
-zh:"按会话修改专家模型，不影响全局默认",
-en:"Change expert models for this session; global defaults are unchanged",
-},
-"sidebar.sessionModel.close":{zh:"关闭会话模型",en:"Close session models"},
-"sidebar.sessionModel.noSession":{
-zh:"未打开会话：打开一个会话后可在此临时覆盖角色模型。",
-en:"No open session: open a session to temporarily override role models here.",
-},
-"sidebar.sessionModel.child":{
-zh:"当前是子代理会话，会话级模型覆盖只读。",
-en:"This is a subagent session; session model overrides are read-only.",
-},
-"sidebar.sessionModel.loading":{zh:"正在读取本会话覆盖…",en:"Loading session overrides…"},
-"sidebar.sessionModel.unavailable":{
-zh:"本会话覆盖读取失败，请稍后重试。",
-en:"Failed to read session overrides; please retry later.",
-},
-"sidebar.sessionModel.unsupported":{
-zh:"当前宿主版本不支持会话级模型覆盖。",
-en:"This host version does not support session model overrides.",
-},
-"sidebar.sessionModel.offline":{
-zh:"会话未运行：会话级覆盖只读。",
-en:"The session is not running; session overrides are read-only.",
-},
-"sidebar.sessionModel.followGlobal":{zh:"跟随全局默认",en:"Follow global default"},
-"sidebar.sessionModel.override":{zh:"本会话覆盖",en:"Session override"},
-"sidebar.sessionModel.revision":{zh:"代次 {revision}",en:"Revision {revision}"},
-"sidebar.sessionModel.provider":{zh:"供应商",en:"Provider"},
-"sidebar.sessionModel.model":{zh:"模型",en:"Model"},
-"sidebar.sessionModel.effort":{zh:"思考深度",en:"Reasoning effort"},
-"sidebar.sessionModel.effortDefault":{zh:"模型默认",en:"Model default"},
-"sidebar.sessionModel.save":{zh:"保存覆盖",en:"Save override"},
-"sidebar.sessionModel.clear":{zh:"清除",en:"Clear"},
-"sidebar.sessionModel.saving":{zh:"保存中…",en:"Saving…"},
-"sidebar.sessionModel.saved":{zh:"已保存本会话覆盖",en:"Session override saved"},
-"sidebar.sessionModel.cleared":{zh:"已清除，恢复全局默认",en:"Cleared; global default restored"},
-"sidebar.sessionModel.conflict":{
-zh:"其他页面已修改本会话覆盖（当前代次 {revision}）；你的输入已保留，请确认后重试。",
-en:"Another page changed this session's overrides (current revision {revision}); your input was kept, please review and retry.",
-},
-"sidebar.sessionModel.failed":{zh:"保存失败：{message}",en:"Save failed: {message}"},
-"sidebar.sessionModel.retry":{zh:"重新读取",en:"Reload"},
-"sidebar.sessionModel.globalSummary":{zh:"全局：{provider} / {model}",en:"Global: {provider} / {model}"},
-"sidebar.sessionModel.emptyGlobal":{zh:"未配置全局默认",en:"No global default configured"},
-"sidebar.sessionModel.emptyRoles":{zh:"没有可配置的专家角色。",en:"No configurable expert roles."},
-"sidebar.sessionModel.columnRole":{zh:"专家",en:"Expert"},
-"sidebar.sessionModel.columnModel":{zh:"模型选择",en:"Model"},
-"sidebar.sessionModel.tableLabel":{zh:"会话模型覆盖",en:"Session model overrides"},
-"sidebar.sessionModel.saveChanges":{zh:"保存",en:"Save"},
-"sidebar.sessionModel.invalidDraft":{
-zh:"请为已修改的角色选择供应商和模型。",
-en:"Choose a provider and model for every edited role.",
-},
-"sidebar.sessionModel.clearRole":{
-zh:"清除{role}的本会话覆盖",
-en:"Clear the session override for {role}",
-},
-"settings.title":{zh:"dsh-expert-group",en:"dsh-expert-group"},
-"settings.hint":{
-zh:"专家模型使用 DSH 当前已配置的 provider 和模型目录。",
-en:"Expert models use the providers and model catalog configured in DSH.",
-},
-"settings.taskManagement":{zh:"任务管理",en:"Task management"},
-"settings.auto":{zh:"Auto",en:"Auto"},
-"settings.autoTitle":{
-zh:"自动打开运行中的子代理侧栏会话",
-en:"Automatically open running subagent sidebar sessions",
-},
-"settings.notifications":{zh:"通知弹窗",en:"Notifications"},
-"settings.notificationVolume":{zh:"通知音量",en:"Notification volume"},
-"settings.notificationEvents":{zh:"通知事件",en:"Notification events"},
-"settings.notificationVolume.range":{zh:"通知音量滑块",en:"Notification volume slider"},
-"settings.notificationVolume.number":{zh:"通知音量数值",en:"Notification volume value"},
-"settings.notificationEvent.completed":{zh:"任务完成",en:"Task completed"},
-"settings.roleTimeout.aria":{zh:"角色默认超时",en:"Default role timeout"},
-"settings.notificationEvent.completed.aria":{zh:"通知任务完成",en:"Notify on task completed"},
-"settings.notificationEvent.waiting.aria":{zh:"通知等待用户",en:"Notify on waiting for user"},
-"settings.notificationEvent.failed.aria":{zh:"通知任务失败",en:"Notify on task failed"},
-"settings.notificationEvent.waiting":{zh:"等待用户",en:"Waiting for user"},
-"settings.notificationEvent.failed":{zh:"任务失败",en:"Task failed"},
-"settings.unifiedProvider":{zh:"统一供应商",en:"Unified provider"},
-"settings.noProvider":{zh:"无",en:"None"},
-"settings.observerPreferred":{zh:"Observer优先",en:"Prefer Observer"},
-"settings.concurrencyLimit":{zh:"单个角色并发上限",en:"Per-role concurrency limit"},
-"settings.concurrencyLimit.title":{
-zh:"取值范围 1–64 的整数；默认 20；保存后生效",
-en:"An integer from 1–64; defaults to 20; takes effect after saving",
-},
-"settings.roleTimeout":{zh:"角色默认超时 (s)",en:"Default role timeout (s)"},
-"settings.roleTimeout.title":{
-zh:"默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
-en:"Defaults to 10 hours (36000 s); 0 disables it; enabled values are 1–86400 s (integer, 1 s precision). Applies only to attempts created after saving; running shards are unchanged.",
-},
-"settings.save":{zh:"保存",en:"Save"},
-"settings.saving":{zh:"保存中…",en:"Saving…"},
-"settings.discard":{zh:"放弃修改",en:"Discard changes"},
-"settings.saved":{zh:"已保存",en:"Saved"},
-"settings.unsaved":{zh:"有未保存的修改",en:"Unsaved changes"},
-"announce.start":{zh:"任务开始：{name}",en:"Task started: {name}"},
-"announce.finish":{zh:"任务完成：{name}",en:"Task finished: {name}"},
-"announce.fail":{zh:"任务失败：{name}",en:"Task failed: {name}"},
-"announce.cancel":{zh:"任务取消：{name}",en:"Task cancelled: {name}"},
-"announce.more":{zh:"等 {count} 项",en:"and {count} more"},
-"notify.termination.title":{zh:"Expert Group",en:"Expert Group"},
-"notify.termination.completed":{zh:"任务已完成。",en:"Task completed."},
-"notify.termination.blocked":{zh:"任务被阻塞，需要你处理。",en:"Task blocked; your input is needed."},
-"notify.termination.error":{zh:"任务因错误终止。",en:"Task terminated with an error."},
-"notify.termination.aborted":{zh:"任务已中止。",en:"Task aborted."},
-"notify.termination.interrupted":{zh:"任务被中断。",en:"Task interrupted."},
-"notify.termination.max-tokens":{zh:"任务达到 token 上限。",en:"Task reached the token limit."},
-"notify.termination.unknown":{zh:"任务已终止。",en:"Task terminated."},
-"notify.test.title":{zh:"Expert Group",en:"Expert Group"},
-"notify.wait.title":{zh:"Expert Group",en:"Expert Group"},
-"notify.wait.body":{zh:"需要你操作",en:"Your action is required"},
-"notify.test.body":{
-zh:"测试通知：系统通知通道可用。",
-en:"Test notification: the system notification channel is available.",
-},
-"notify.waitLong.body":{
-zh:"专家任务已等待超过 30 分钟仍未结算。若权威查询确认没有运行中的后代，可用 dsh_expert_group_abandon_wait 手动关闭等待账本；它不会终止专家，也不会释放影响范围保护。",
-en:"The expert task has been waiting more than 30 minutes without settling. If an authoritative query confirms no running descendants, use dsh_expert_group_abandon_wait to close the wait ledger manually; it neither stops experts nor releases impact-scope protection.",
-},
-"notify.waitQueryDegraded.body":{
-zh:"无法确认专家后代的运行状态（后代查询降级或失败），root turn 会继续等待；未知状态不等于专家已完成。",
-en:"The running state of expert descendants cannot be confirmed (descendant query degraded or failed); the root turn keeps waiting. Unknown is not the same as completed.",
-},
-"notify.waitDeliveryFailed.body":{
-zh:"专家批次已静止，但收口结论投递失败；批次保持待收口，插件会在后续 root turn 重试。",
-en:"The expert batch is quiescent but delivering the finalization result failed; the batch remains pending and the plugin retries on later root turns.",
-},
-});
 function normalizeLocale(value){
 if(typeof value!=="string")return null;
 const primary=value.trim().toLowerCase().split(/[-_]/)[0];
@@ -1330,6 +1380,104 @@ const value=values[name];
 return value===undefined||value===null?match:String(value);
 });
 }
+global[SYMBOL]=Object.freeze({
+FAILURE_MESSAGE_DISPLAY_MAX_LENGTH,
+RETRY_WARNING_THRESHOLD,
+ATTEMPT_TIMELINE_LIMIT,
+FAILURE_STATUSES,
+STATUS_FILTER_GROUPS,
+STRUCTURED_PREVIEW_MAX_CHARS,
+formatFailureSummary,
+isFailureStatus,
+formatDuration,
+formatClockTime,
+formatIsoTime,
+attemptTimelineOf,
+structuredFallbackText,
+structuredPreviewOf,
+formatTokenCount,
+redactDisplayText,
+createTaskFilter,
+filterSnapshot,
+serializeSnapshot,
+formatDurationCompact,
+summarizeUsageMetrics,
+formatExpertMetadata,
+defaultExpanded,
+createExpansionStore,
+SUPPORTED_LOCALES,
+DEFAULT_LOCALE,
+MISSING_MESSAGE_TEXT,
+MESSAGE_CATALOG,
+normalizeLocale,
+resolveLocale,
+resolveClientLocale,
+translateMessage,
+});
+})(globalThis);
+/* source: client-expert-group-model.js */
+(function installExpertGroupModel(global){
+"use strict";
+const normalizeSymbol=Symbol.for("dsh-expert-group/client-expert-group-model-normalize");
+const formatSymbol=Symbol.for("dsh-expert-group/client-expert-group-model-format");
+const normalize=global[normalizeSymbol];
+const format=global[formatSymbol];
+if(!normalize||!format){
+throw new Error("专家组客户端模型子模块未装载：normalize / format 检查点缺失（装配顺序见 client-source-manifest.mjs）");
+}
+const{
+SCHEMA_VERSION,
+RUNTIME_STATUSES,
+UNKNOWN_RUNTIME_STATUS,
+STRUCTURED_FALLBACK_REASONS,
+normalizeExpertGroupSnapshot,
+normalizeCapabilities,
+normalizeStatus,
+normalizeFailure,
+normalizeUsage,
+normalizeStructured,
+normalizeRoleLabels,
+roleLabelFrom,
+roleLabelOf,
+findModelPrice,
+estimateUsageCost,
+runtimeStatusOf,
+}=normalize;
+const{
+FAILURE_MESSAGE_DISPLAY_MAX_LENGTH,
+RETRY_WARNING_THRESHOLD,
+ATTEMPT_TIMELINE_LIMIT,
+FAILURE_STATUSES,
+STATUS_FILTER_GROUPS,
+STRUCTURED_PREVIEW_MAX_CHARS,
+formatFailureSummary,
+isFailureStatus,
+formatDuration,
+formatClockTime,
+formatIsoTime,
+attemptTimelineOf,
+structuredFallbackText,
+structuredPreviewOf,
+formatTokenCount,
+redactDisplayText,
+createTaskFilter,
+filterSnapshot,
+serializeSnapshot,
+formatDurationCompact,
+summarizeUsageMetrics,
+formatExpertMetadata,
+defaultExpanded,
+createExpansionStore,
+SUPPORTED_LOCALES,
+DEFAULT_LOCALE,
+MISSING_MESSAGE_TEXT,
+MESSAGE_CATALOG,
+normalizeLocale,
+resolveLocale,
+resolveClientLocale,
+translateMessage,
+}=format;
+const SYMBOL=Symbol.for("dsh-expert-group/client-expert-group-model");
 global[SYMBOL]=Object.freeze({
 SCHEMA_VERSION,
 RUNTIME_STATUSES,
@@ -1381,1609 +1529,10 @@ resolveClientLocale,
 translateMessage,
 });
 })(globalThis);
-/* source: client-expert-group-sidebar.js */
-(function installExpertGroupSidebar(global){
+/* source: client-sidebar-auto-ledger.js */
+(function installClientSidebarAutoLedger(global){
 "use strict";
-const SYMBOL=Symbol.for("dsh-expert-group/client-expert-group-sidebar");
-const MODEL_SYMBOL=Symbol.for("dsh-expert-group/client-expert-group-model");
-const MODEL=global[MODEL_SYMBOL]||{};
-const modelApi=()=>global[MODEL_SYMBOL]||MODEL;
-const RUNTIME_STATUS_LABELS=Object.freeze({running:"running",ready:"ready",unknown:"unknown"});
-const RUNTIME_STATE_DOT=Object.freeze({running:"ongoing",ready:"done",unknown:"idle"});
-const TIMELINE_EXPANDED_KEY_LIMIT=256;
-const ATTEMPT_STATUS_LABELS=Object.freeze({
-queued:"排队",waiting:"等待",running:"运行中",succeeded:"成功",failed:"失败",
-cancelled:"已取消",timed_out:"超时",interrupted:"已中断",idle:"空闲",ready:"就绪",unknown:"未知",
-});
-const STATUS_FILTER_OPTIONS=Object.freeze([
-Object.freeze({value:"running",label:"运行中"}),
-Object.freeze({value:"failed",label:"失败"}),
-Object.freeze({value:"succeeded",label:"已完成"}),
-Object.freeze({value:"cancelled",label:"已取消"}),
-Object.freeze({value:"idle",label:"空闲"}),
-]);
-const ACTIVE_STATUSES=new Set(["queued","waiting","running"]);
-const RETRY_STATUSES=new Set(["failed","timed_out","interrupted"]);
-const FANOUT_SETTLED_STATUSES=new Set(["succeeded","failed","cancelled"]);
-const STYLE_ID="dsh-expert-group/expert-group-sidebar";
-const RIGHTBAR_WIDTH_RATIO=0.2;
-const OTHER_RIGHTBAR_WIDTH_RATIO=0.5;
-const RIGHTBAR_WIDTH_RATIO_MIN=0.15;
-const RIGHTBAR_WIDTH_RATIO_MAX=0.5;
-const RIGHTBAR_WIDTH_PREFERENCE_KEY="dsh-expert-group/rightbar-width-ratio:v1";
-function clampRightbarWidthRatio(value){
-const numeric=typeof value==="number"?value:Number(value);
-if(Number.isFinite(numeric)!==true)return null;
-if(numeric<RIGHTBAR_WIDTH_RATIO_MIN)return RIGHTBAR_WIDTH_RATIO_MIN;
-if(numeric>RIGHTBAR_WIDTH_RATIO_MAX)return RIGHTBAR_WIDTH_RATIO_MAX;
-return numeric;
-}
-function readStoredRightbarWidthRatio(){
-const storage=sidebarLocalStorage();
-if(storage===null)return RIGHTBAR_WIDTH_RATIO;
-let raw=null;
-try{raw=storage.getItem(RIGHTBAR_WIDTH_PREFERENCE_KEY);}catch{raw=null;}
-if(typeof raw!=="string"||raw.trim()==="")return RIGHTBAR_WIDTH_RATIO;
-const clamped=clampRightbarWidthRatio(Number(raw.trim()));
-return clamped===null?RIGHTBAR_WIDTH_RATIO:clamped;
-}
-function storeRightbarWidthRatio(value){
-const clamped=clampRightbarWidthRatio(value);
-if(clamped===null)return null;
-const storage=sidebarLocalStorage();
-if(storage===null)return clamped;
-try{storage.setItem(RIGHTBAR_WIDTH_PREFERENCE_KEY,String(clamped));}catch{/* 见上：本次仍生效。 */}
-return clamped;
-}
-const resolveExpertRightbarWidthRatio=()=>readStoredRightbarWidthRatio();
-const RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX=1;
-const RIGHTBAR_WIDTH_RECOVERY_MAX_ATTEMPTS=2;
-const BRAND_ICON_PATHS=Object.freeze([
-"M6 8.25C7.51878 8.25 8.75 7.01878 8.75 5.5C8.75 3.98122 7.51878 2.75 6 2.75C4.48122 2.75 3.25 3.98122 3.25 5.5C3.25 7.01878 4.48122 8.25 6 8.25Z",
-"M1 14.5C1 11.5 3.5 10.25 6 10.25C8.5 10.25 11 11.5 11 14.5",
-"M10.5 2.9C11.65 3.35 12.45 4.35 12.45 5.5C12.45 6.65 11.65 7.65 10.5 8.1",
-"M12.4 10.6C13.9 11.3 15 12.6 15 14.5",
-]);
-const RIGHTBAR_PANEL_SELECTOR="[data-sidebar-right-panel]";
-const RIGHTBAR_PANEL_SESSION_ATTRIBUTE="data-sidebar-right-session";
-const RIGHTBAR_TAB_SELECTOR="[data-dockkit-tab]";
-const RIGHTBAR_TAB_ID_ATTRIBUTE="data-dockkit-tab";
-const RIGHTBAR_PANE_SELECTOR="[data-dockkit-pane]";
-const RIGHTBAR_PANE_ID_ATTRIBUTE="data-dockkit-pane";
-const RIGHTBAR_PANE_COLUMN_ATTRIBUTE="data-dockkit-column";
-const RIGHTBAR_SPLIT_SELECTOR="[data-dockkit-split]";
-const RIGHTBAR_SPLIT_ATTRIBUTE="data-dockkit-split";
-const RIGHTBAR_DOCK_HOST_ATTRIBUTE="data-dockkit-host";
-const RIGHTBAR_DOCK_HOST_VALUE="dock";
-const RIGHTBAR_STRIP_TABS_SELECTOR="[data-dockkit-strip-tabs]";
-const RIGHTBAR_STRIP_TABS_ATTRIBUTE="data-dockkit-strip-tabs";
-const SIDEBAR_SPLIT_EXPERT_TRACK="0.4";
-const SIDEBAR_SPLIT_OTHER_TRACK="0.6";
-const SIDEBAR_SPLIT_GAP_TRACK="0px";
-const SIDEBAR_SPLIT_TRACK_PROPERTY="grid-template-columns";
-const EXPERT_GROUP_TAB_IDS=new Set(["dsh-expert-group","expert-group"]);
-function isGeneratedExpertGroupTabId(value){
-return typeof value==="string"&&/^(?:dsh-)?expert-group\d+$/.test(value);
-}
-const RIGHTBAR_FLOAT_SELECTOR="[data-dockkit-float]";
-const RIGHTBAR_FLOAT_TITLE_SELECTOR="[data-dockkit-float-title]";
-const SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS=2;
-const SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS=15000;
-const SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS=SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS;
-const SIDEBAR_AUTO_OPEN_PLACEHOLDER_FOREIGN_TTL_MS=4*SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS;
-const SIDEBAR_SPLIT_TRANSACTION_TIMEOUT_MS=15000;
-const SIDEBAR_SPLIT_LAYOUT_WAIT_FALLBACK_MS=250;
-const SIDEBAR_SPLIT_PENDING_RETRY_DELAY_MS=400;
-const SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS=4;
-const SIDEBAR_TAB_KEY_SEPARATOR="\u0000";
-const SIDEBAR_TAB_ORIGIN_AUTO="auto";
-const SIDEBAR_TAB_ORIGIN_MANUAL="manual";
-const SIDEBAR_AUTO_CLOSE_MAX_ATTEMPTS=3;
-const SIDEBAR_AUTO_KEY_LIMIT=128;
-const SIDEBAR_TAB_CLOSE_WATCHDOG_MS=10000;
-const SIDEBAR_TAB_CLOSE_VERIFY_TIMEOUT_MS=10000;
-const SIDEBAR_TAB_CLOSE_LATE_QUARANTINE_MS=3000;
-const SIDEBAR_AUTO_CLOSE_COOLDOWN_BASE_MS=60000;
-const SIDEBAR_AUTO_CLOSE_COOLDOWN_MAX_MS=900000;
-const SIDEBAR_TAB_CLOSE_SETTLE_REASONS=new Set(["closed","recycled","failed","timeout"]);
-function closeSettleReason(outcome){
-if(SIDEBAR_TAB_CLOSE_SETTLE_REASONS.has(outcome)===true)return outcome;
-return outcome===true?"closed":"failed";
-}
-function object(value){
-return value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
-}
-function text(value,fallback){
-if(typeof value!=="string"||value.trim()==="")return fallback;
-return value.trim();
-}
-const HOST_META_ROLE_LIMIT=32;
-function normalizeHostMeta(value){
-const source=object(value);
-const roles=[];
-const rawRoles=Array.isArray(source.activeRoles)?source.activeRoles:(Array.isArray(source.roles)?source.roles:[]);
-for(const entry of rawRoles){
-if(roles.length>=HOST_META_ROLE_LIMIT)break;
-const role=text(entry,null);
-if(role!==null&&roles.indexOf(role)===-1)roles.push(role);
-}
-const diagnostics=object(source.diagnostics);
-const fanout=object(diagnostics.fanout);
-const concurrency=object(fanout.concurrency);
-return{
-roles,
-roleLabels:object(source.roleLabels),
-roleDefaults:object(source.roleDefaults),
-modelPrices:Array.isArray(source.modelPrices)?source.modelPrices:[],
-usage:object(source.usage),
-throttle:Object.keys(concurrency.throttle===undefined?{}:object(concurrency.throttle)).length===0
-?null
-:object(concurrency.throttle),
-capabilities:object(source.capabilities),
-};
-}
-const SESSION_MODEL_ROLE_FALLBACK=Object.freeze(["explorer","librarian","oracle","designer","fixer","observer"]);
-function normalizeSessionModelSelection(selection){
-if(selection===null||typeof selection!=="object"||Array.isArray(selection))return null;
-if(typeof selection.provider!=="string"||selection.provider.length===0)return null;
-if(typeof selection.model!=="string"||selection.model.length===0)return null;
-const effort=typeof selection.reasoningEffort==="string"?selection.reasoningEffort:"";
-return{
-provider:selection.provider,
-model:selection.model,
-...(effort.length>0?{reasoningEffort:effort}:{}),
-};
-}
-function normalizeSessionModelOverrides(raw,roles){
-const overrides={};
-const source=raw!==null&&typeof raw==="object"&&Array.isArray(raw)!==true?raw:{};
-for(const role of Array.isArray(roles)?roles:[]){
-const selection=normalizeSessionModelSelection(source[role]);
-if(selection!==null)overrides[role]=selection;
-}
-return overrides;
-}
-function normalizeSessionModelView(body,roles){
-const source=object(body);
-if(source.ok!==true)return null;
-if(Number.isSafeInteger(source.revision)!==true||source.revision<0)return null;
-return{
-overrides:normalizeSessionModelOverrides(source.overrides,roles),
-revision:source.revision,
-live:source.live===true,
-};
-}
-function sessionModelSelectionOfDraft(draft){
-const provider=typeof draft?.provider==="string"?draft.provider:"";
-const model=typeof draft?.model==="string"?draft.model:"";
-const effort=typeof draft?.reasoningEffort==="string"?draft.reasoningEffort:"";
-return{provider,model,...(effort.length>0?{reasoningEffort:effort}:{})};
-}
-function sessionModelSelectionEquals(left,right){
-return(left?.provider??"")===(right?.provider??"")
-&&(left?.model??"")===(right?.model??"")
-&&(left?.reasoningEffort??"")===(right?.reasoningEffort??"");
-}
-function sessionModelModelOptions(provider,groups){
-const source=Array.isArray(groups)?groups:[];
-const group=source.find((entry)=>text(object(entry).id,null)===provider);
-const models=[];
-const pool=group===undefined
-?source.flatMap((entry)=>(Array.isArray(object(entry).models)?object(entry).models:[]))
-:(Array.isArray(object(group).models)?object(group).models:[]);
-for(const entry of pool){
-const item=object(entry);
-const id=text(item.id,null);
-if(id===null||models.some((existing)=>existing.id===id))continue;
-models.push(item);
-}
-return models;
-}
-function sessionModelRolesOf(metaValue){
-const source=metaValue===null||metaValue===undefined?{}:object(metaValue);
-const roles=[];
-for(const entry of Array.isArray(source.roles)?source.roles:[]){
-const role=text(entry,null);
-if(role!==null&&roles.indexOf(role)===-1)roles.push(role);
-}
-return roles.length===0?SESSION_MODEL_ROLE_FALLBACK.slice():roles;
-}
-function snapshotHasUsageFact(value,depth=0){
-if(depth>8||value===null||typeof value!=="object")return false;
-const source=object(value);
-const usage=object(source.usage);
-for(const field of["inputTokens","outputTokens","totalTokens","billedInputTokens","requests"]){
-if(typeof usage[field]==="number"&&Number.isFinite(usage[field]))return true;
-}
-if(snapshotHasUsageFact(source.root,depth+1))return true;
-for(const child of Array.isArray(source.children)?source.children:[]){
-if(snapshotHasUsageFact(child,depth+1))return true;
-}
-for(const shard of Array.isArray(source.shards)?source.shards:[]){
-if(snapshotHasUsageFact(shard,depth+1))return true;
-for(const attempt of Array.isArray(object(shard).attempts)?object(shard).attempts:[]){
-if(snapshotHasUsageFact(attempt,depth+1))return true;
-}
-}
-return false;
-}
-function latestShardChildIdOf(shard){
-const source=object(shard);
-const attempts=Array.isArray(source.attempts)?source.attempts:[];
-const latest=attempts.length===0?null:object(attempts[attempts.length-1]);
-return text(latest?.childId,text(source.childId,null));
-}
-function collectSnapshotSessionIds(snapshot){
-const ids=[];
-const seen=new Set();
-let visited=0;
-const push=(value)=>{
-const id=text(value,null);
-if(id===null||seen.has(id))return;
-seen.add(id);
-ids.push(id);
-};
-const visit=(node,depth)=>{
-if(depth>12||visited>=4096)return;
-const source=object(node);
-if(Object.keys(source).length===0)return;
-visited+=1;
-push(source.sessionId);
-for(const shard of Array.isArray(source.shards)?source.shards:[])push(latestShardChildIdOf(shard));
-for(const child of Array.isArray(source.children)?source.children:[])visit(child,depth+1);
-};
-visit(object(snapshot).root,0);
-return ids;
-}
-function viewportWidthOf(){
-let value=null;
-try{value=globalThis.window?.innerWidth??globalThis.innerWidth;}catch{value=null;}
-const width=Number(value);
-return Number.isFinite(width)&&width>0?width:null;
-}
-const ELEMENT_QUERY_MISSING="missing";
-const ELEMENT_QUERY_UNIQUE="unique";
-const ELEMENT_QUERY_AMBIGUOUS="ambiguous";
-function elementQueryOf(doc,selector){
-let nodes=null;
-try{
-if(doc===null||doc===undefined||typeof doc.querySelectorAll!=="function"){
-return{status:ELEMENT_QUERY_AMBIGUOUS,element:null};
-}
-nodes=Array.from(doc.querySelectorAll(selector));
-}catch{
-return{status:ELEMENT_QUERY_AMBIGUOUS,element:null};
-}
-if(nodes.length===0)return{status:ELEMENT_QUERY_MISSING,element:null};
-if(nodes.length>1)return{status:ELEMENT_QUERY_AMBIGUOUS,element:null};
-return{status:ELEMENT_QUERY_UNIQUE,element:nodes[0]};
-}
-function appFrameElementOf(doc){
-const candidates=[];
-const push=(element)=>{
-if(element===null||element===undefined||element.nodeType!==1)return;
-if(candidates.includes(element)===false)candidates.push(element);
-};
-const overlay=elementQueryOf(doc,"[data-shell-overlay]");
-if(overlay.status===ELEMENT_QUERY_AMBIGUOUS)return null;
-if(overlay.status===ELEMENT_QUERY_UNIQUE){
-let parent=null;
-try{parent=overlay.element.parentElement??null;}catch{parent=null;}
-push(parent);
-}
-for(const selector of["[data-rightbar-collapsed]","[data-rightbar-instant]"]){
-const state=elementQueryOf(doc,selector);
-if(state.status===ELEMENT_QUERY_AMBIGUOUS)return null;
-if(state.status===ELEMENT_QUERY_UNIQUE)push(state.element);
-}
-return candidates.length===1?candidates[0]:null;
-}
-function hostAppFrameWidthOf(){
-try{
-const doc=globalThis.document;
-const frame=appFrameElementOf(doc);
-if(frame===null)return null;
-if(frame===doc?.body||frame===doc?.documentElement)return null;
-const rect=typeof frame.getBoundingClientRect==="function"?frame.getBoundingClientRect():null;
-if(rect===null||typeof rect!=="object")return null;
-const width=Number(rect.width);
-return Number.isFinite(width)&&width>0?width:null;
-}catch{return null;}
-}
-function methodOf(target,name){
-if(target===null||target===undefined)return null;
-try{
-const candidate=target[name];
-return typeof candidate==="function"?candidate:null;
-}catch{return null;}
-}
-function resolveClientService(candidates,name){
-for(const candidate of candidates){
-if(candidate===null||candidate===undefined)continue;
-try{
-if(typeof candidate.get==="function"){
-const value=candidate.get(name);
-if(value!==null&&value!==undefined)return value;
-}
-}catch{/* 未声明服务读取即抛错：按「该候选没有它」处理。 */}
-try{
-const value=candidate[name];
-if(value!==null&&value!==undefined)return value;
-}catch{/* 同上。 */}
-}
-return null;
-}
-const SUBAGENT_CHAT_ADDRESS_PREFIX="dsh-resource://subagentchat/session/";
-const SUBAGENT_CHAT_KIND="subagentchat";
-const SUBAGENT_MODES=new Set(["one-shot","continuable","unknown"]);
-function normalizeSubagentAddress(value){
-const source=object(value);
-const parentSessionId=text(source.parentSessionId,text(source.parentId,null));
-const childSessionId=text(source.childSessionId,text(source.id,text(source.sessionId,null)));
-const mode=text(source.mode,null);
-if(parentSessionId===null||childSessionId===null||mode===null)return null;
-if(SUBAGENT_MODES.has(mode)!==true)return null;
-return{parentSessionId,childSessionId,mode};
-}
-function subagentChatAddress(value){
-const address=normalizeSubagentAddress(value);
-if(address===null)return null;
-const query=typeof global.URLSearchParams==="function"
-?new global.URLSearchParams({parent:address.parentSessionId,mode:address.mode}).toString()
-:"parent="+encodeAddressPart(address.parentSessionId)+"&mode="+encodeAddressPart(address.mode);
-return SUBAGENT_CHAT_ADDRESS_PREFIX
-+encodeAddressPart(address.childSessionId)
-+"?"+query;
-}
-function encodeAddressPart(value){
-const raw=String(value);
-return typeof encodeURIComponent==="function"?encodeURIComponent(raw):raw;
-}
-function sidebarTabKey(sessionId,rootSessionId,resourceAddress){
-return String(sessionId)+SIDEBAR_TAB_KEY_SEPARATOR
-+String(rootSessionId)+SIDEBAR_TAB_KEY_SEPARATOR+String(resourceAddress);
-}
-function sidebarTabCloseKey(sessionId,rootSessionId,tabId){
-return String(sessionId)+SIDEBAR_TAB_KEY_SEPARATOR
-+String(rootSessionId)+SIDEBAR_TAB_KEY_SEPARATOR+String(tabId);
-}
-function sessionEntries(value){
-if(value==null)return[];
-if(Array.isArray(value)){
-if(value.every((entry)=>Array.isArray(entry)&&entry.length>=2))return value;
-return value.map((entry,index)=>[String(index),entry]);
-}
-if(typeof value.entries==="function"){
-try{return Array.from(value.entries());}catch{return[];}
-}
-if(typeof value==="object")return Object.entries(value);
-return[];
-}
-function sessionIdOf(value,fallback){
-const source=object(value);
-return text(source.sessionId,text(source.id,text(fallback,null)));
-}
-function currentSessionIdOf(snapshot){
-const source=object(snapshot);
-const explicit=text(source.current,null);
-if(explicit!==null)return explicit;
-const currentObject=sessionIdOf(source.current,null);
-if(currentObject!==null)return currentObject;
-if(source.current===null)return null;
-const named=text(source.currentSessionId,text(source.activeSessionId,null));
-if(named!==null)return named;
-for(const[fallback,value]of sessionEntries(source.byId??source.sessions)){
-const summary=object(value);
-const retainedBy=object(summary.retainedBy);
-const mainView=retainedBy.mainView;
-if((typeof mainView==="number"&&mainView>0)||mainView===true){
-return sessionIdOf(summary,fallback);
-}
-}
-return null;
-}
-function parentIdOf(value){
-const source=object(value);
-const origin=object(source.origin);
-return text(source.parentId,text(source.parentSessionId,text(origin.parentId,text(origin.parentSessionId,null))));
-}
-function listSnapshot(deps,ctx){
-const sessions=deps.sessions||ctx?.sessions;
-const list=sessions?.list;
-if(typeof list?.getSnapshot==="function"){
-try{return list.getSnapshot()||{};}catch{return{};}
-}
-if(typeof sessions?.getSnapshot==="function"){
-try{return sessions.getSnapshot()||{};}catch{return{};}
-}
-return sessions?.snapshot||{};
-}
-function rootIdsOf(deps,ctx){
-const snapshot=listSnapshot(deps,ctx);
-const entries=sessionEntries(snapshot.byId??snapshot.sessions??snapshot);
-const sessions=new Map();
-for(const[fallback,value]of entries){
-const id=sessionIdOf(value,fallback);
-if(id!==null)sessions.set(id,value);
-}
-const roots=new Set();
-for(const[id,value]of sessions){
-let rootId;
-if(typeof deps.resolveRootSessionId==="function"){
-try{rootId=deps.resolveRootSessionId(id,value,snapshot);}catch{rootId=undefined;}
-}
-rootId=text(rootId,null);
-if(rootId===null){
-let current=id;
-const visited=new Set();
-while(!visited.has(current)){
-visited.add(current);
-const parent=parentIdOf(sessions.get(current));
-if(parent===null||parent===current||!sessions.has(parent))break;
-current=parent;
-}
-rootId=current;
-}
-if(rootId!==null)roots.add(rootId);
-}
-if(roots.size===0){
-const current=currentSessionIdOf(snapshot);
-if(current!==null){
-let rootId=current;
-if(typeof deps.resolveRootSessionId==="function"){
-try{rootId=text(deps.resolveRootSessionId(current,undefined,snapshot),current);}catch{/* 使用 current。 */}
-}
-roots.add(rootId);
-}
-}
-return[...roots];
-}
-function openTargetIdsOf(deps,ctx){
-const targets=new Set(rootIdsOf(deps,ctx));
-const current=currentSessionIdOf(listSnapshot(deps,ctx));
-if(current!==null)targets.add(current);
-return[...targets];
-}
-function subscribeSessions(deps,ctx,listener){
-const sessions=deps.sessions||ctx?.sessions;
-const list=sessions?.list;
-if(typeof list?.subscribe==="function"){
-try{return list.subscribe(listener);}catch{return()=>{};}
-}
-if(typeof sessions?.subscribe==="function"){
-try{return sessions.subscribe(listener);}catch{return()=>{};}
-}
-return()=>{};
-}
-function getOpenSession(deps,ctx){
-const workspace=resolveClientService([deps,ctx,deps?.ctx],"uiWorkspace");
-const openWorkspaceSession=methodOf(workspace,"openSession");
-if(openWorkspaceSession!==null){
-return{
-open:(target)=>openWorkspaceSession.call(workspace,target),
-acceptsAddress:true,
-available:true,
-};
-}
-return{open:()=>{},acceptsAddress:false,available:false};
-}
-function statusOf(node){
-const value=text(object(node).status,"unknown");
-return value||"unknown";
-}
-function capabilityAllowed(node,action){
-const capabilities=object(object(node).capabilities);
-const entry=object(capabilities[action]);
-return typeof entry.allowed==="boolean"?entry.allowed:null;
-}
-function runtimeStatusOf(node,entry,options){
-const model=modelApi();
-if(typeof model.runtimeStatusOf==="function")return model.runtimeStatusOf(node,entry,options);
-if(options?.partial===true&&object(node).running!==true)return"unknown";
-return object(node).running===true?"running":"ready";
-}
-function createCatalogLookup(snapshot){
-const tables=new Map();
-const tableFor=(parentId)=>{
-const cached=tables.get(parentId);
-if(cached!==undefined)return cached;
-const table=new Map();
-const projection=object(object(object(snapshot).projectionsBySession)[parentId]);
-const values=object(projection.values);
-const entries=Array.isArray(values.subagentCatalog)?values.subagentCatalog:[];
-for(const entry of entries){
-const source=object(entry);
-if(source.kind==="diagnostic")continue;
-const id=text(source.id,text(source.sessionId,null));
-if(id!==null&&!table.has(id))table.set(id,withSessionActivity(source,snapshot,id));
-}
-tables.set(parentId,table);
-return table;
-};
-return(parentId,childId)=>{
-if(parentId===null||childId===null)return null;
-const table=tableFor(parentId);
-return table.has(childId)?table.get(childId):null;
-};
-}
-const CATALOG_ACTIVITIES=new Set(["running","inactive"]);
-function withSessionActivity(entry,snapshot,sessionId){
-if(CATALOG_ACTIVITIES.has(text(entry.activity,null))===true)return entry;
-const running=sessionRunningOf(snapshot,sessionId);
-if(running===null)return entry;
-return{...entry,activity:running?"running":"inactive"};
-}
-function sessionRunningOf(snapshot,sessionId){
-if(sessionId===null)return null;
-const summary=object(object(object(snapshot).byId)[sessionId]);
-return typeof summary.running==="boolean"?summary.running:null;
-}
-function metadataOf(node,roleLabels){
-const model=modelApi();
-if(typeof model.formatExpertMetadata==="function")return model.formatExpertMetadata(node,{roleLabels});
-const source=object(node);
-return[text(source.role,source.kind==="root"?"Orchestrator":"Expert"),text(source.provider,"未知供应商"),text(source.model,"未知模型"),text(source.effort,"默认")].join(" · ");
-}
-function titleOf(node){
-const source=object(node);
-if(source.kind==="fanout"){
-const role=text(source.role,"Expert");
-const count=Array.isArray(source.shards)?source.shards.length:0;
-return role.charAt(0).toUpperCase()+role.slice(1)+" · "+count+" shards · "+RUNTIME_STATUS_LABELS[runtimeStatusOf(source,null)];
-}
-if(source.kind==="root")return"主代理";
-return text(source.taskName,"未命名任务");
-}
-function makeIcon(primitives,name,props){
-const Icon=primitives?.[name]||primitives?.IconWarningOutlineRegular;
-return typeof Icon==="function"?Icon(props||{size:14}):null;
-}
-function createBrandIcon(react,primitives){
-if(typeof primitives?.IconUsersOutlineRegular==="function")return primitives.IconUsersOutlineRegular;
-if(typeof react?.createElement!=="function")return null;
-return function DegBrandIcon(props){
-const size=props?.size??16;
-return react.createElement("svg",{
-width:size,
-height:size,
-viewBox:"0 0 16 16",
-fill:"none",
-className:props?.className,
-"aria-hidden":"true",
-strokeWidth:1,
-xmlns:"http://www.w3.org/2000/svg",
-},...BRAND_ICON_PATHS.map((d)=>react.createElement("path",{
-key:d,
-d,
-stroke:"currentColor",
-fill:"none",
-})));
-};
-}
-function stateDotOf(react,primitives,status){
-const StateDot=primitives?.StateDot;
-if(typeof StateDot==="function"){
-return react.createElement(StateDot,{state:RUNTIME_STATE_DOT[status]||RUNTIME_STATE_DOT.ready});
-}
-return react.createElement("span",{
-className:"deg_expert_group_state_dot",
-"data-state":status,
-"aria-hidden":"true",
-});
-}
-function statusIcon(react,primitives,status){
-const label=RUNTIME_STATUS_LABELS[status]||RUNTIME_STATUS_LABELS.ready;
-return react.createElement("span",{
-className:"deg_expert_group_status_icon",
-role:"img",
-"aria-label":label,
-title:label,
-"data-status":status,
-},stateDotOf(react,primitives,status));
-}
-const ANNOUNCEMENT_ACTIVE_STATUSES=new Set(["queued","waiting","running"]);
-const ANNOUNCEMENT_FINISHED_STATUSES=new Set(["succeeded","success","completed","complete","done","ready"]);
-const ANNOUNCEMENT_FAILED_STATUSES=new Set(["failed","error","timed_out","timeout","interrupted"]);
-const ANNOUNCEMENT_CANCELLED_STATUSES=new Set(["cancelled","canceled"]);
-const ANNOUNCEMENT_MAX_ITEMS=5;
-function collectAnnouncementTasks(snapshot){
-const result=new Map();
-const root=object(object(snapshot).root);
-if(Object.keys(root).length===0)return result;
-const visit=(node,fallbackName)=>{
-const source=object(node);
-const id=text(source.id,text(source.sessionId,text(source.parentTaskId,null)));
-if(id===null)return;
-const isRoot=source.kind==="root";
-const name=isRoot
-?"主代理"
-:text(source.taskName,text(source.sessionId,fallbackName));
-result.set(id,{name:text(name,id),status:statusOf(source)});
-for(const child of Array.isArray(source.children)?source.children:[])visit(child,id);
-for(const shard of Array.isArray(source.shards)?source.shards:[]){
-const shardId=text(shard.shardId,null);
-if(shardId===null)continue;
-const shardName=text(shard.taskName,shardId);
-result.set(id+":"+shardId,{name:shardName,status:statusOf(shard)});
-}
-};
-visit(root,"主代理");
-return result;
-}
-function announcementKindOf(previousStatus,nextStatus){
-if(previousStatus===nextStatus)return null;
-if(previousStatus==="unknown"||nextStatus==="unknown")return null;
-if(ANNOUNCEMENT_CANCELLED_STATUSES.has(nextStatus))return"cancel";
-if(ANNOUNCEMENT_FAILED_STATUSES.has(nextStatus))return"fail";
-if(ANNOUNCEMENT_FINISHED_STATUSES.has(nextStatus)){
-return ANNOUNCEMENT_ACTIVE_STATUSES.has(previousStatus)||previousStatus==="idle"?"finish":null;
-}
-if(ANNOUNCEMENT_ACTIVE_STATUSES.has(nextStatus)&&ANNOUNCEMENT_ACTIVE_STATUSES.has(previousStatus)!==true)return"start";
-return null;
-}
-function announcementEventsOf(previousTasks,nextTasks){
-const events=[];
-for(const[id,next]of nextTasks){
-const previous=previousTasks.get(id);
-const kind=previous===undefined
-?(ANNOUNCEMENT_ACTIVE_STATUSES.has(next.status)?"start":null)
-:announcementKindOf(previous.status,next.status);
-if(kind===null)continue;
-events.push({kind,name:next.name});
-}
-return events;
-}
-function safeNormalize(raw){
-const model=modelApi();
-if(typeof model.normalizeExpertGroupSnapshot!=="function")return null;
-try{return model.normalizeExpertGroupSnapshot(raw);}catch{return null;}
-}
-function snapshotContentEquals(left,right){
-if(Object.is(left,right))return true;
-if(left===null||right===null||typeof left!=="object"||typeof right!=="object")return false;
-if(Array.isArray(left)||Array.isArray(right)){
-if(Array.isArray(left)!==Array.isArray(right)||left.length!==right.length)return false;
-for(let index=0;index<left.length;index+=1){
-if(snapshotContentEquals(left[index],right[index])!==true)return false;
-}
-return true;
-}
-const leftKeys=Object.keys(left);
-const rightKeys=Object.keys(right);
-if(leftKeys.length!==rightKeys.length)return false;
-for(const key of leftKeys){
-if(Object.prototype.hasOwnProperty.call(right,key)!==true)return false;
-if(snapshotContentEquals(left[key],right[key])!==true)return false;
-}
-return true;
-}
-function samePanelSnapshot(left,right){
-if(left===right)return true;
-if(left===null||left===undefined||right===null||right===undefined)return false;
-return left.schemaVersion===right.schemaVersion
-&&left.sessionId===right.sessionId
-&&left.rootSessionId===right.rootSessionId
-&&(left.partial===true)===(right.partial===true)
-&&snapshotContentEquals(left.recovery??null,right.recovery??null)
-&&snapshotContentEquals(left.root,right.root);
-}
-const PANEL_POLL_TIMINGS=Object.freeze({
-activeMs:2500,
-idleStepsMs:Object.freeze([2500,5000,10000,20000,30000]),
-failureBaseMs:1000,
-failureMaxMs:30000,
-});
-function panelFailureDelayMs(failureCount){
-const count=Number.isSafeInteger(failureCount)&&failureCount>0?failureCount:0;
-if(count===0)return 0;
-const exponential=PANEL_POLL_TIMINGS.failureBaseMs*Math.pow(2,Math.min(count-1,16));
-return Math.min(exponential,PANEL_POLL_TIMINGS.failureMaxMs);
-}
-function panelIdleDelayMs(idleLevel){
-const steps=PANEL_POLL_TIMINGS.idleStepsMs;
-const level=Number.isSafeInteger(idleLevel)&&idleLevel>0?idleLevel:0;
-return steps[Math.min(level,steps.length-1)];
-}
-function panelNextPollDelayMs(state){
-const source=object(state);
-const failureDelay=panelFailureDelayMs(source.failureCount);
-if(failureDelay>0)return failureDelay;
-if(source.running!==false)return PANEL_POLL_TIMINGS.activeMs;
-return panelIdleDelayMs(source.idleLevel);
-}
-function readFanoutEventBatch(raw){
-const source=object(raw);
-const events=Array.isArray(source.events)?source.events:null;
-const cursor=Number.isSafeInteger(source.cursor)&&source.cursor>=0?source.cursor:null;
-const earliestSequence=Number.isSafeInteger(source.earliestSequence)&&source.earliestSequence>0
-?source.earliestSequence
-:null;
-return{
-events,
-cursor,
-earliestSequence,
-gap:source.gap===true,
-dropped:Number.isSafeInteger(source.dropped)&&source.dropped>0?source.dropped:0,
-conclusive:events!==null,
-};
-}
-function fanoutBatchIsStale(batch,cursor){
-if(batch===null||batch===undefined)return false;
-if(batch.gap===true)return true;
-if(batch.earliestSequence===null||batch.earliestSequence===undefined)return false;
-const after=Number.isSafeInteger(cursor)&&cursor>=0?cursor:0;
-return batch.earliestSequence>1&&after<batch.earliestSequence;
-}
-function snapshotHasRunningWork(snapshot){
-if(snapshot===null||typeof snapshot!=="object")return false;
-if(snapshot.partial===true)return true;
-const model=modelApi();
-const runtimeStatusOf=typeof model.runtimeStatusOf==="function"?model.runtimeStatusOf:null;
-if(runtimeStatusOf===null)return false;
-const pending=[snapshot.root];
-let visited=0;
-while(pending.length>0&&visited<4096){
-const node=pending.pop();
-visited+=1;
-if(node===null||typeof node!=="object")continue;
-let status;
-try{status=runtimeStatusOf(node,undefined,{});}catch{status="unknown";}
-if(status==="running")return true;
-if(Array.isArray(node.children))for(const child of node.children)pending.push(child);
-if(Array.isArray(node.shards))for(const shard of node.shards)pending.push(shard);
-}
-return false;
-}
-function readPanelTabActivity(deps,props,tabInfo){
-const injected=deps?.isTabActive;
-if(typeof injected==="function"){
-try{
-const value=injected();
-if(value===true||value===false)return value;
-}catch{/* 注入读面抛错：按未知处理，退回文档可见性。 */}
-}
-for(const candidate of[tabInfo,tabInfo?.tab]){
-const source=object(candidate);
-if(source.active===true||source.active===false)return source.active;
-if(source.isActive===true||source.isActive===false)return source.isActive;
-}
-return null;
-}
-function applyPanelPollCycle(scheduler,cycle,latestSnapshot){
-if(scheduler===null||scheduler===undefined)return;
-if(cycle===null||cycle===undefined||typeof cycle!=="object")return;
-const id=Number.isSafeInteger(cycle.id)?cycle.id:null;
-if(id!==null){
-if(id<=scheduler.lastCycleId)return;
-scheduler.lastCycleId=id;
-}
-if(cycle.cancelled===true)return;
-if(cycle.ok===true){
-scheduler.failureCount=0;
-const effective=cycle.snapshot===null||cycle.snapshot===undefined?latestSnapshot:cycle.snapshot;
-if(snapshotHasRunningWork(effective)){
-scheduler.running=true;
-scheduler.idleLevel=0;
-}else{
-scheduler.running=false;
-scheduler.idleLevel=Math.min(
-scheduler.idleLevel+1,
-PANEL_POLL_TIMINGS.idleStepsMs.length-1,
-);
-}
-}else{
-scheduler.failureCount=Math.min(scheduler.failureCount+1,16);
-}
-scheduler.delay=panelNextPollDelayMs(scheduler);
-}
-const PANEL_ERROR_SOURCES=Object.freeze({
-snapshot:"snapshot",
-action:"action",
-rpc:"rpc",
-});
-const RPC_FAILURE_KIND=Symbol.for("dsh-expert-group/rpc-failure-kind");
-const RPC_FAILURE_TRANSPORT="rpc";
-function markRpcTransportFailure(error){
-const failure=error!==null&&typeof error==="object"
-?error
-:new Error(error===undefined||error===null?"RPC 请求失败":String(error));
-try{
-Object.defineProperty(failure,RPC_FAILURE_KIND,{
-value:RPC_FAILURE_TRANSPORT,
-configurable:true,
-enumerable:false,
-writable:false,
-});
-}catch{/* 冻结对象：保留原错误，分类按 action 处理。 */}
-return failure;
-}
-function rpcFailureKindOf(error){
-if(error===null||typeof error!=="object")return null;
-try{
-return error[RPC_FAILURE_KIND]===RPC_FAILURE_TRANSPORT?RPC_FAILURE_TRANSPORT:null;
-}catch{return null;}
-}
-function rpcBusinessError(errorBlock){
-const block=object(errorBlock);
-const error=new Error(text(block.message,"RPC 请求失败"));
-try{
-Object.defineProperty(error,"code",{
-value:text(block.code,null),
-configurable:true,
-enumerable:false,
-writable:false,
-});
-Object.defineProperty(error,"details",{
-value:block.details,
-configurable:true,
-enumerable:false,
-writable:false,
-});
-}catch{/* 冻结/不可扩展错误对象：保留 message 即可。 */}
-return error;
-}
-function formatPanelUpdatedTime(value){
-const at=Number(value);
-if(Number.isFinite(at)!==true||at<=0)return null;
-const date=new Date(at);
-if(Number.isNaN(date.getTime())===true)return null;
-const pad=(part)=>(part<10?"0"+part:String(part));
-return pad(date.getHours())+":"+pad(date.getMinutes())+":"+pad(date.getSeconds());
-}
-const RPC_ADAPTER_PROTOCOL_FIELD="rpcAdapterProtocol";
-const RPC_ADAPTER_PROTOCOLS=Object.freeze({
-object:"object",
-"connection-first":"connection-first",
-"request-first":"request-first",
-});
-function rpcAdapterProtocolOf(deps){
-const declared=deps?.[RPC_ADAPTER_PROTOCOL_FIELD];
-if(declared===undefined||declared===null||declared==="")return RPC_ADAPTER_PROTOCOLS["connection-first"];
-if(typeof declared!=="string")throw new TypeError("RPC adapter 协议标识必须是字符串");
-const protocol=declared.trim();
-if(protocol==="")return RPC_ADAPTER_PROTOCOLS["connection-first"];
-if(protocol===RPC_ADAPTER_PROTOCOLS.object
-||protocol===RPC_ADAPTER_PROTOCOLS["connection-first"]
-||protocol===RPC_ADAPTER_PROTOCOLS["request-first"])return protocol;
-throw new Error("未知的 RPC adapter 协议："+protocol);
-}
-function rpcAdapterArguments(protocol,ctx,request,init){
-const connection=ctx?.connection;
-if(protocol===RPC_ADAPTER_PROTOCOLS.object)return[{connection,request,init}];
-if(protocol===RPC_ADAPTER_PROTOCOLS["request-first"])return[request,connection,init];
-return[connection,request,init];
-}
-async function callRpc(deps,ctx,request,init={},select){
-const fn=deps.requestPluginRpc;
-if(typeof fn!=="function")throw markRpcTransportFailure(new Error("当前 DSH 未提供插件 RPC"));
-let protocol;
-try{
-protocol=rpcAdapterProtocolOf(deps);
-}catch(error){
-throw markRpcTransportFailure(error);
-}
-let response;
-try{
-response=await fn(...rpcAdapterArguments(protocol,ctx,request,init));
-}catch(error){
-throw markRpcTransportFailure(error);
-}
-if(response?.ok===false)throw rpcBusinessError(response.error);
-if(typeof response?.json==="function"){
-let payload;
-try{
-payload=await response.json();
-}catch(error){
-throw markRpcTransportFailure(error);
-}
-if(payload?.ok===false)throw rpcBusinessError(payload.error);
-const body=payload?.value??payload;
-return typeof select==="function"?select(body):(body?.snapshot??body);
-}
-if(response?.value!==undefined){
-if(typeof select==="function")return select(response.value);
-return response.value?.snapshot??response.value;
-}
-return typeof select==="function"?select(response):(response?.snapshot??response);
-}
-function styleTag(){
-if(typeof document==="undefined"||typeof document.createElement!=="function")return;
-if(document.querySelector?.("style[data-plugin-css=\""+STYLE_ID+"\"]")!==null)return;
-const tag=document.createElement("style");
-tag.dataset.plugin="dsh-expert-group";
-tag.dataset.pluginCss=STYLE_ID;
-tag.textContent=[
-".deg_expert_group{position:relative;display:flex;flex-direction:column;min-width:0;height:100%;overflow:auto;padding:8px 10px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1,transparent);font-size:12px;line-height:16px}",
-".deg_expert_group_header{display:flex;flex-wrap:wrap;align-items:center;min-height:28px;gap:6px;border-bottom:1px solid var(--dsw-alias-border-l2);font-weight:600}",
-".deg_expert_group_header_title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-".deg_expert_group_partial{flex:0 0 auto;box-sizing:border-box;padding:0 4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);border-radius:4px;color:var(--dsw-alias-state-warning-primary,#f59e0b);font-size:11px;font-weight:600;line-height:14px;white-space:nowrap}",
-".deg_expert_group_updated{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px;font-weight:400;font-variant-numeric:tabular-nums}",
-".deg_expert_group_header_action,.deg_expert_group_chevron,.deg_expert_group_action,.deg_expert_group_sidebar_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}",
-".deg_expert_group_header_action{width:24px;height:24px;margin-left:auto}",
-".deg_expert_group_header_auto{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;margin-left:8px;font-weight:400;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
-".deg_expert_group_header_auto_input{margin:0;cursor:pointer}",
-".deg_expert_group_header_auto_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_header_auto_label{font-size:12px;line-height:16px}",
-".deg_expert_group_recovery{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin:6px 0 0;padding:6px 8px;border:1px solid var(--dsw-alias-state-error-primary,var(--dsw-alias-state-warning-primary,#f59e0b));border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-primary));font-weight:600}",
-".deg_expert_group_recovery_text{flex:1 1 140px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-".deg_expert_group_recovery_retry_error{flex:1 1 100%;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-weight:400}",
-".deg_expert_group_recovery_retry{flex:0 0 auto;box-sizing:border-box;height:24px;padding:0 8px;border:0;border-radius:5px;background:transparent;color:inherit;font-weight:600;cursor:pointer}",
-".deg_expert_group_recovery_retry:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}",
-".deg_expert_group_recovery_retry:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_recovery_retry:disabled{cursor:default;opacity:.7}",
-".deg_expert_group_header_action:hover,.deg_expert_group_chevron:hover,.deg_expert_group_action:hover:not(:disabled),.deg_expert_group_sidebar_action:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
-".deg_expert_group_header_action:focus-visible,.deg_expert_group_chevron:focus-visible,.deg_expert_group_action:focus-visible,.deg_expert_group_sidebar_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_tree{min-width:0;padding-top:5px}",
-".deg_expert_group_tree_items{min-width:0}",
-".deg_expert_group_announcer{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}",
-".deg_expert_group_task:focus-visible,.deg_expert_group_fanout_title>.deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
-".deg_expert_group_resizer{position:absolute;top:0;left:0;bottom:0;width:6px;cursor:col-resize;touch-action:none;background:transparent;z-index:2}",
-".deg_expert_group_resizer:hover,.deg_expert_group_resizer[data-dragging=true]{background:var(--dsw-alias-interactive-bg-hover)}",
-".deg_expert_group_resizer:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:-2px}",
-".deg_expert_group_node{position:relative;min-width:0;padding-left:16px}",
-".deg_expert_group_node_root{padding-left:0}",
-".deg_expert_group_row{box-sizing:border-box;display:grid;grid-template-columns:20px 20px minmax(0,1fr);min-width:0;min-height:44px;padding:4px 0}",
-".deg_expert_group_row_main{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto 16px;min-width:0}",
-".deg_expert_group_task_line{grid-area:1 / 1;display:flex;align-items:center;min-width:0;gap:2px}",
-".deg_expert_group_meta{grid-area:2 / 1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:11px}",
-".deg_expert_group_sidebar_action{flex:0 0 30px;width:30px;height:20px;margin:-2px 0;padding:0;color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
-".deg_expert_group_sidebar_action:hover{color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
-".deg_expert_group_sidebar_action[data-open=true]{color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
-".deg_expert_group_sidebar_action[data-open=true]:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
-".deg_expert_group_double_arrow{display:inline-flex;align-items:center;justify-content:center;width:30px;height:20px;line-height:0}",
-".deg_expert_group_double_arrow>*+*{margin-left:-10px}",
-".deg_expert_group_double_arrow_icon path{stroke:currentColor;stroke-width:1.5;stroke-linejoin:round}",
-".deg_expert_group_line{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-".deg_expert_group_task{min-width:0;flex:0 1 auto;font-weight:600;cursor:pointer}",
-".deg_expert_group_shard_task{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere}",
-".deg_expert_group_task:hover{text-decoration:underline}",
-".deg_expert_group_chevron{width:20px;height:20px;padding:0;align-self:start}",
-".deg_expert_group_fanout_header>.deg_expert_group_chevron{align-self:center}",
-".deg_expert_group_chevron_placeholder{display:inline-block;width:20px;height:20px}",
-".deg_expert_group_status_icon{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;color:var(--dsw-alias-label-secondary)}",
-".deg_expert_group_state_dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor}",
-".deg_expert_group_state_dot[data-state=running]{color:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary))}",
-".deg_expert_group_state_dot[data-state=ready]{color:var(--dsw-alias-state-success-primary)}",
-".deg_expert_group_state_dot[data-state=unknown]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
-".deg_expert_group_trailing{display:flex;flex:0 0 30px;align-items:center;justify-content:center;width:30px;height:20px;min-width:30px}",
-".deg_expert_group_task_line_trailing{justify-content:flex-start}",
-".deg_expert_group_idle_title_line{display:flex;align-items:center;min-width:0;gap:2px}",
-".deg_expert_group_idle_title_line>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
-".deg_expert_group_sidebar_batch_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;flex:0 0 30px;width:30px;height:20px;margin:0;padding:0;border:0;border-radius:5px;background:transparent;cursor:pointer;color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
-".deg_expert_group_sidebar_batch_action:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
-".deg_expert_group_sidebar_batch_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_sidebar_batch_action:disabled{opacity:.45;cursor:wait}",
-".deg_expert_group_sidebar_batch_zero{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary,#22d3ee))}",
-".deg_expert_group_children{position:relative;min-width:0;margin:0;padding:0;--deg-parent-row-height:44px}",
-".deg_expert_group_children>.deg_expert_group_node,.deg_expert_group_children>.deg_expert_group_fanout,.deg_expert_group_children>.deg_expert_group_idle_group{--deg-tree-anchor:14px;position:relative}",
-".deg_expert_group_children>.deg_expert_group_fanout{--deg-tree-anchor:14px}",
-".deg_expert_group_children>:first-child:before{position:absolute;top:calc(var(--deg-tree-anchor) - var(--deg-parent-row-height));bottom:calc(100% - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-".deg_expert_group_children>:not(:last-child):after{position:absolute;top:var(--deg-tree-anchor);bottom:calc(0px - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-".deg_expert_group_node>.deg_expert_group_row,.deg_expert_group_fanout_header,.deg_expert_group_idle_group>.deg_expert_group_row{position:relative}",
-".deg_expert_group_node:not(.deg_expert_group_node_root)>.deg_expert_group_row:before,.deg_expert_group_fanout_header:before,.deg_expert_group_idle_group>.deg_expert_group_row:before{position:absolute;top:var(--deg-tree-anchor,14px);left:-6px;width:16px;border-top:1px solid var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-".deg_expert_group_row>*,.deg_expert_group_fanout_header>*{position:relative;z-index:1}",
-".deg_expert_group_idle_group{position:relative;min-width:0;padding-left:16px;--deg-tree-anchor:14px}",
-".deg_expert_group_idle_group>.deg_expert_group_children{margin:0;padding:0;--deg-parent-row-height:28px}",
-".deg_expert_group_idle_group>.deg_expert_group_row.deg_expert_group_idle_header{display:grid;grid-template-columns:20px 20px minmax(0,1fr);align-items:center;height:28px;min-height:28px;padding:4px 0}",
-".deg_expert_group_idle_group>.deg_expert_group_row{margin:0}",
-".deg_expert_group_fanout{position:relative;margin-top:0;padding-left:16px}",
-".deg_expert_group_fanout_header{display:grid;grid-template-columns:20px 20px minmax(0,1fr) auto;align-items:center;min-width:0;min-height:28px;gap:4px}",
-".deg_expert_group_fanout_shards{position:relative;min-width:0;--deg-parent-row-height:28px}",
-".deg_expert_group_fanout_shards>.deg_expert_group_shard{--deg-tree-anchor:13px;position:relative}",
-".deg_expert_group_fanout_shards>.deg_expert_group_shard:first-child:before{position:absolute;top:calc(var(--deg-tree-anchor) - var(--deg-parent-row-height));bottom:calc(100% - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-".deg_expert_group_fanout_shards>.deg_expert_group_shard:not(:last-child):after{position:absolute;top:var(--deg-tree-anchor);bottom:calc(0px - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-".deg_expert_group_shard{display:grid;grid-template-columns:20px 20px minmax(0,1fr) auto;min-width:0;min-height:48px;padding:3px 0;gap:0 3px}",
-".deg_expert_group_shard[data-expanded=false]{min-height:24px}",
-".deg_expert_group_actions{display:flex;align-items:flex-start;gap:2px}",
-".deg_expert_group_action{width:24px;height:24px;padding:0}",
-".deg_expert_group_action:disabled{opacity:.45;cursor:wait}",
-".deg_expert_group_empty{padding:16px 2px;color:var(--dsw-alias-label-secondary)}",
-".deg_expert_group_error_empty{display:flex;flex-direction:column;gap:2px;padding:16px 2px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}",
-".deg_expert_group_error_empty_title{font-weight:600}",
-".deg_expert_group_error_empty_detail{min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-size:11px}",
-".deg_expert_group_skeleton{height:52px;margin:4px 0;border-radius:5px;background:var(--dsw-alias-bg-layer-2,var(--dsw-alias-interactive-bg-hover));opacity:.65}",
-".deg_expert_group_error{display:flex;align-items:center;gap:4px;padding:6px 0;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));font-size:11px}",
-".deg_expert_group_count{margin-left:auto;color:var(--dsw-alias-label-secondary);font-size:11px;font-weight:400}",
-".deg_expert_group_cell{display:flex;flex-direction:column;min-width:0}",
-".deg_expert_group_metrics{display:flex;flex-wrap:wrap;align-items:center;gap:2px 0;min-width:0;padding:2px 0 0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
-".deg_expert_group_metrics_part{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
-".deg_expert_group_metrics_separator{flex:0 0 auto;white-space:pre;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
-".deg_expert_group_metrics_part+.deg_expert_group_retry_warning{margin-left:6px}",
-".deg_expert_group_retry_warning{flex:0 0 auto;box-sizing:border-box;padding:0 4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);border-radius:4px;color:var(--dsw-alias-state-warning-primary,#f59e0b);font-weight:600;line-height:14px}",
-".deg_expert_group_failure{flex:1 1 100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
-".deg_expert_group_attempts{display:flex;flex-direction:column;gap:0;min-width:0;margin:2px 0;padding:0 0 0 6px;border-inline-start:1px solid var(--dsw-alias-border-l2)}",
-".deg_expert_group_attempt{display:flex;flex-direction:column;align-items:stretch;gap:0;min-width:0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
-".deg_expert_group_attempt_row{display:flex;align-items:center;gap:6px;min-width:0}",
-".deg_expert_group_attempt_usage{display:flex;flex-wrap:wrap;gap:0 6px;min-width:0;padding-left:2px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px}",
-".deg_expert_group_attempt_usage_tokens{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
-".deg_expert_group_attempt_cost{min-width:0;overflow-wrap:anywhere}",
-".deg_expert_group_attempt_cost[data-cost-configured=false]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
-".deg_expert_group_structured{min-width:0;margin:2px 0 0;padding:2px 4px;border-inline-start:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:15px;overflow-wrap:anywhere;max-height:84px;overflow:auto}",
-".deg_expert_group_structured[data-fallback=true]{border-inline-start-color:var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
-".deg_expert_group_shard_extra{display:flex;flex-direction:column;min-width:0}",
-".deg_expert_group_session_model_dialog{position:fixed;inset:0;margin:auto;box-sizing:border-box;width:min(920px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100vh - 48px);padding:0;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;box-shadow:0 18px 48px rgba(0,0,0,.28);overflow:hidden}",
-".deg_expert_group_session_model_dialog[open]{display:flex;flex-direction:column}",
-".deg_expert_group_session_model_dialog::backdrop{background:rgba(0,0,0,.42)}",
-".deg_expert_group_session_model_header{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:0 0 auto;padding:12px 14px 6px;font-weight:600}",
-".deg_expert_group_session_model_title{flex:1 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;font-weight:600}",
-".deg_expert_group_session_model_body{flex:1 1 auto;min-height:0;overflow:auto;padding:0 14px 8px}",
-".deg_expert_group_session_model_hint{margin:0 0 8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}",
-".deg_expert_group_session_model_notice{margin:0 0 8px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
-".deg_expert_group_session_model_notice_error{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}",
-".deg_expert_group_session_model_scroll{overflow-x:auto}",
-".deg_expert_group_session_model_table{display:grid;grid-template-columns:minmax(84px,.6fr) minmax(132px,.82fr) minmax(210px,1.5fr) minmax(96px,.62fr);min-width:540px;align-items:center}",
-".deg_expert_group_session_model_row{display:contents}",
-".deg_expert_group_session_model_head_cell{min-width:0;padding:8px 6px 6px;border-bottom:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;font-weight:600}",
-".deg_expert_group_session_model_cell{display:flex;align-items:center;min-width:0;padding:8px 6px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
-".deg_expert_group_session_model_cell select{width:100%;min-width:0;box-sizing:border-box;padding:5px 6px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2,transparent);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}",
-".deg_expert_group_session_model_cell select:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_session_model_cell select:disabled{opacity:.5;cursor:not-allowed}",
-".deg_expert_group_session_model_pill{display:flex;align-items:center;justify-content:space-between;gap:4px;flex:0 0 74px;width:74px;height:28px;min-height:28px;padding:2px 4px 2px 6px;box-sizing:border-box;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}",
-".deg_expert_group_session_model_pill_label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-".deg_expert_group_session_model_clear{display:inline-flex;align-items:center;justify-content:center;flex:0 0 16px;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:16px;cursor:pointer}",
-".deg_expert_group_session_model_clear:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
-".deg_expert_group_session_model_clear:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_session_model_clear:disabled{opacity:.4;cursor:not-allowed}",
-".deg_expert_group_session_model_footer{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:0 0 auto;padding:10px 14px;border-top:1px solid var(--dsw-alias-border-l2)}",
-".deg_expert_group_session_model_revision{flex:0 1 auto;min-width:0;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums;font-size:12px}",
-".deg_expert_group_session_model_invalid{flex:1 1 160px;min-width:0;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));font-size:12px;line-height:18px;overflow-wrap:anywhere}",
-".deg_expert_group_session_model_spacer{flex:1 1 auto}",
-".deg_expert_group_session_model_primary{box-sizing:border-box;height:28px;padding:0 12px;border:1px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-radius:6px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));color:var(--dsw-alias-bg-layer-1,#fff);font:inherit;font-size:12px;font-weight:600;cursor:pointer}",
-".deg_expert_group_session_model_primary:disabled{opacity:.45;cursor:not-allowed}",
-".deg_expert_group_attempt_index{flex:0 0 auto;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums}",
-".deg_expert_group_attempt_status{flex:0 0 auto;font-weight:600}",
-".deg_expert_group_attempt[data-status=failed] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=timed_out] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=interrupted] .deg_expert_group_attempt_status{color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
-".deg_expert_group_attempt_duration{flex:0 0 auto;font-variant-numeric:tabular-nums}",
-".deg_expert_group_attempt_time{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
-".deg_expert_group_attempts_toggle{flex:0 0 auto;align-self:flex-start;box-sizing:border-box;height:20px;margin:1px 0 0;padding:0 4px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
-".deg_expert_group_attempts_toggle:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
-".deg_expert_group_attempts_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_fanout_title{display:flex;flex-direction:column;min-width:0}",
-".deg_expert_group_fanout_title>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
-".deg_expert_group_toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:5px 0 2px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
-".deg_expert_group_search{flex:1 1 120px;min-width:0;box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px}",
-".deg_expert_group_filter{flex:0 1 auto;min-width:0;box-sizing:border-box;height:24px;padding:0 2px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px;color-scheme:light}",
-"body[data-ds-dark-theme] .deg_expert_group_filter{color-scheme:dark}",
-".deg_expert_group_filter option{background-color:var(--dsw-alias-bg-layer-2,Canvas);color:var(--dsw-alias-label-primary,CanvasText)}",
-".deg_expert_group_search:focus-visible,.deg_expert_group_filter:focus-visible,.deg_expert_group_export_button:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_export_button{box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
-".deg_expert_group_export_button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
-".deg_expert_group_filter_empty{padding:8px 2px;color:var(--dsw-alias-label-secondary);font-size:11px}",
-].join("");
-document.head?.appendChild(tag);
-}
-const RIGHTBAR_DRAG_HANDLE_SELECTOR="[data-side=rightbar]";
-function attributeOf(node,name){
-try{
-if(node===null||node===undefined||typeof node.getAttribute!=="function")return null;
-const raw=node.getAttribute(name);
-return typeof raw==="string"?raw:null;
-}catch{return null;}
-}
-function withinSameDockScope(node,root,boundaries){
-let parent=null;
-try{parent=node?.parentNode??null;}catch{return null;}
-let guard=0;
-while(parent!==null&&parent!==undefined&&parent!==root){
-guard+=1;
-if(guard>512)return null;
-if(typeof parent.getAttribute!=="function")return null;
-for(const name of boundaries){
-if(attributeOf(parent,name)!==null)return false;
-}
-try{parent=parent.parentNode??null;}catch{return null;}
-}
-return parent===root;
-}
-function hostHiddenStateOf(host){
-try{
-const value=host?.hidden;
-return typeof value==="boolean"?value:null;
-}catch{return null;}
-}
-function cellStripNodesOf(column){
-const hosts=column?.hosts??null;
-if(!Array.isArray(hosts)||hosts.length===0)return null;
-let activeStrip=null;
-let activeCount=0;
-for(const host of hosts){
-if(host===null||host===undefined||typeof host.querySelectorAll!=="function")return null;
-const hidden=hostHiddenStateOf(host);
-if(hidden===null)return null;
-let nodes=null;
-try{nodes=Array.from(host.querySelectorAll(RIGHTBAR_STRIP_TABS_SELECTOR));}catch{return null;}
-const owned=[];
-for(const node of nodes){
-const scoped=withinSameDockScope(node,host,[RIGHTBAR_DOCK_HOST_ATTRIBUTE,RIGHTBAR_SPLIT_ATTRIBUTE]);
-if(scoped===null)return null;
-if(scoped===true)owned.push(node);
-}
-if(hidden===true){
-if(owned.length!==0)return null;
-continue;
-}
-if(owned.length!==1)return null;
-activeCount+=1;
-if(activeCount>1)return null;
-activeStrip=owned[0];
-}
-if(activeCount!==1||activeStrip===null)return null;
-return[activeStrip];
-}
-function cellTabIdsOf(column){
-const ids=new Set();
-const strips=cellStripNodesOf(column);
-if(strips===null||strips.length!==1)return{ids,readable:false};
-const strip=strips[0];
-if(typeof strip.querySelectorAll!=="function")return{ids,readable:false};
-let tabNodes=null;
-try{tabNodes=Array.from(strip.querySelectorAll(RIGHTBAR_TAB_SELECTOR));}catch{return{ids,readable:false};}
-for(const node of tabNodes){
-const scoped=withinSameDockScope(node,strip,[RIGHTBAR_STRIP_TABS_ATTRIBUTE]);
-if(scoped===null)return{ids,readable:false};
-if(scoped!==true)continue;
-const tabId=text(attributeOf(node,RIGHTBAR_TAB_ID_ATTRIBUTE),null);
-if(tabId===null)return{ids,readable:false};
-if(ids.has(tabId))return{ids,readable:false};
-ids.add(tabId);
-}
-if(ids.size===0)return{ids,readable:false};
-return{ids,readable:true};
-}
-function expertGroupTabIdsOf(inventory,sessionId){
-const expertTabIds=new Set(EXPERT_GROUP_TAB_IDS);
-if(!Array.isArray(inventory)||typeof sessionId!=="string"||sessionId==="")return expertTabIds;
-for(const entry of inventory){
-try{
-const candidate=object(entry);
-if(text(candidate.sessionId,null)!==sessionId)continue;
-if(!EXPERT_GROUP_TAB_IDS.has(text(candidate.kind,null)))continue;
-const tabId=text(candidate.tabId,null);
-if(tabId!==null)expertTabIds.add(tabId);
-}catch{
-}
-}
-return expertTabIds;
-}
-function paneNodesOf(panel){
-if(panel===null||panel===undefined||typeof panel.querySelectorAll!=="function")return null;
-try{return Array.from(panel.querySelectorAll(RIGHTBAR_PANE_SELECTOR));}catch{return null;}
-}
-function tabKindsForSession(inventory,sessionId){
-if(!Array.isArray(inventory)||typeof sessionId!=="string"||sessionId==="")return null;
-const tabKinds=new Map();
-for(const entry of inventory){
-try{
-const candidate=object(entry);
-if(text(candidate.sessionId,null)!==sessionId)continue;
-const tabId=text(candidate.tabId,null);
-const kind=text(candidate.kind,text(candidate.type,null));
-if(tabId===null||kind===null)continue;
-const previous=tabKinds.get(tabId);
-if(previous!==undefined&&previous!==kind)return null;
-tabKinds.set(tabId,kind);
-}catch{
-}
-}
-return tabKinds;
-}
-function sidebarTabSetsForSession(inventory,sessionId){
-const tabKinds=tabKindsForSession(inventory,sessionId);
-if(tabKinds===null)return null;
-const expert=new Set(EXPERT_GROUP_TAB_IDS);
-const known=new Set(EXPERT_GROUP_TAB_IDS);
-for(const[tabId,kind]of tabKinds){
-known.add(tabId);
-if(EXPERT_GROUP_TAB_IDS.has(kind))expert.add(tabId);
-}
-return{expert,known};
-}
-function rightbarPanelForSession(doc,sessionId){
-if(doc===null||doc===undefined||typeof doc.querySelectorAll!=="function")return null;
-if(typeof sessionId!=="string"||sessionId==="")return null;
-let nodes=null;
-try{nodes=Array.from(doc.querySelectorAll(RIGHTBAR_PANEL_SELECTOR));}catch{return null;}
-let matched=null;
-for(const node of nodes){
-if(attributeOf(node,RIGHTBAR_PANEL_SESSION_ATTRIBUTE)!==sessionId)continue;
-if(matched!==null)return null;
-matched=node;
-}
-return matched;
-}
-function rightbarPanelForSessionCompat(doc,sessionId){
-const panel=rightbarPanelForSession(doc,sessionId);
-if(panel!==null)return panel;
-if(doc===null||doc===undefined||typeof doc.querySelectorAll!=="function")return null;
-let nodes=null;
-try{nodes=Array.from(doc.querySelectorAll(RIGHTBAR_PANEL_SELECTOR));}catch{return null;}
-if(nodes.length>1)return null;
-for(const node of nodes){
-if(attributeOf(node,RIGHTBAR_PANEL_SESSION_ATTRIBUTE)!==null)return null;
-}
-if(nodes.length===1)return nodes[0];
-if(typeof doc.querySelector!=="function")return null;
-let single=null;
-try{single=doc.querySelector(RIGHTBAR_PANEL_SELECTOR)??null;}catch{return null;}
-if(single===null||single===undefined)return null;
-if(attributeOf(single,RIGHTBAR_PANEL_SESSION_ATTRIBUTE)!==null)return null;
-return single;
-}
-function dockCellsOf(split){
-const cells=[];
-let children=null;
-try{children=split?.children??null;}catch{children=null;}
-if(children===null||children===undefined)return{cells,readable:false};
-const byColumn=new Map();
-for(const child of Array.from(children)){
-if(child===null||typeof child.getAttribute!=="function")return{cells,readable:false};
-if(attributeOf(child,RIGHTBAR_DOCK_HOST_ATTRIBUTE)!==RIGHTBAR_DOCK_HOST_VALUE)continue;
-const column=text(attributeOf(child,RIGHTBAR_PANE_COLUMN_ATTRIBUTE),null);
-if(column===null)return{cells,readable:false};
-const merged=byColumn.get(column);
-if(merged===undefined)byColumn.set(column,{column,hosts:[child]});
-else merged.hosts.push(child);
-}
-for(const entry of byColumn.values())cells.push(entry);
-return{cells,readable:true};
-}
-function splitOwnsExpertPair(split,tabSets){
-if(tabSets===null||tabSets===undefined||typeof tabSets!=="object")return false;
-const breakdown=dockCellsOf(split);
-if(breakdown.readable!==true||breakdown.cells.length!==2)return false;
-const byColumn=new Map(breakdown.cells.map((entry)=>[entry.column,entry]));
-if(!byColumn.has("0")||!byColumn.has("1"))return false;
-const expertTabs=cellTabIdsOf(byColumn.get("0"));
-const otherTabs=cellTabIdsOf(byColumn.get("1"));
-if(expertTabs.readable!==true||otherTabs.readable!==true)return false;
-let expertCount=0;
-for(const tabId of expertTabs.ids){
-if(otherTabs.ids.has(tabId))return false;
-if(tabSets.known.has(tabId)!==true)return false;
-if(tabSets.expert.has(tabId)!==true)return false;
-expertCount+=1;
-}
-if(expertCount===0)return false;
-for(const tabId of otherTabs.ids){
-if(tabSets.known.has(tabId)!==true)return false;
-if(tabSets.expert.has(tabId)===true)return false;
-}
-return true;
-}
-function cellPendingStateOf(column){
-const hosts=column?.hosts??null;
-if(!Array.isArray(hosts)||hosts.length===0)return"foreign";
-let activeStrip=null;
-let activeCount=0;
-for(const host of hosts){
-if(host===null||host===undefined||typeof host.querySelectorAll!=="function")return"foreign";
-const hidden=hostHiddenStateOf(host);
-if(hidden===null)return"foreign";
-let nodes=null;
-try{nodes=Array.from(host.querySelectorAll(RIGHTBAR_STRIP_TABS_SELECTOR));}catch{return"foreign";}
-const owned=[];
-for(const node of nodes){
-const scoped=withinSameDockScope(node,host,[RIGHTBAR_DOCK_HOST_ATTRIBUTE,RIGHTBAR_SPLIT_ATTRIBUTE]);
-if(scoped===null)return"foreign";
-if(scoped===true)owned.push(node);
-}
-if(hidden===true){
-if(owned.length!==0)return"foreign";
-continue;
-}
-if(owned.length!==1)return"foreign";
-activeCount+=1;
-if(activeCount>1)return"foreign";
-activeStrip=owned[0];
-}
-if(activeCount!==1||activeStrip===null)return"unavailable";
-return cellTabIdsOf(column).readable===true?"readable":"foreign";
-}
-function splitPairPendingOf(split,tabSets){
-if(tabSets===null||tabSets===undefined||typeof tabSets!=="object")return"foreign";
-const breakdown=dockCellsOf(split);
-if(breakdown.readable!==true||breakdown.cells.length!==2)return"foreign";
-const byColumn=new Map(breakdown.cells.map((entry)=>[entry.column,entry]));
-if(!byColumn.has("0")||!byColumn.has("1"))return"foreign";
-const expertTabs=cellTabIdsOf(byColumn.get("0"));
-if(expertTabs.readable!==true||expertTabs.ids.size===0)return"foreign";
-for(const tabId of expertTabs.ids){
-if(tabSets.known.has(tabId)!==true)return"foreign";
-if(tabSets.expert.has(tabId)!==true)return"foreign";
-}
-return cellPendingStateOf(byColumn.get("1"))==="unavailable"?"unavailable":"foreign";
-}
-function uniqueSplitBy(panel,matches){
-if(panel===null||panel===undefined||typeof panel.querySelectorAll!=="function")return[];
-let nodes=null;
-try{nodes=Array.from(panel.querySelectorAll(RIGHTBAR_SPLIT_SELECTOR));}catch{return[];}
-const resolved=[];
-for(const node of nodes){
-if(matches(node)!==true)continue;
-resolved.push(node);
-if(resolved.length>1)break;
-}
-return resolved;
-}
-function resolveSplitContainer(panel,tabSets){
-const resolved=uniqueSplitBy(panel,(node)=>splitOwnsExpertPair(node,tabSets)===true);
-return resolved.length===1?resolved[0]:null;
-}
-function splitPairPendingContainers(panel,tabSets){
-return uniqueSplitBy(panel,(node)=>splitPairPendingOf(node,tabSets)==="unavailable");
-}
-function parseSplitTracks(raw){
-const value=typeof raw==="string"?raw.trim():"";
-if(value==="")return null;
-const tracks=[];
-let depth=0;
-let current="";
-for(const character of value){
-if(character==="(")depth+=1;
-else if(character===")")depth-=1;
-if(depth<0)return null;
-if(depth===0&&/\s/.test(character)){
-if(current!==""){tracks.push(current);current="";}
-continue;
-}
-current+=character;
-}
-if(depth!==0||current==="")return null;
-tracks.push(current);
-if(tracks.length!==3)return null;
-const first=splitEndTrackFr(tracks[0]);
-const last=splitEndTrackFr(tracks[2]);
-if(first===null||last===null)return null;
-return{first,last,middle:tracks[1]};
-}
-function splitEndTrackFr(track){
-const match=/^minmax\(\s*0(?:px)?\s*,\s*(\d+(?:\.\d+)?)fr\s*\)$/.exec(track);
-if(match===null)return null;
-const value=Number(match[1]);
-return Number.isFinite(value)?value:null;
-}
-function createRightbarDragLock(){
-const HANDLE_STYLE_WRITES=Object.freeze([
-{name:"pointer-events",value:"none"},
-{name:"cursor",value:"default"},
-]);
-let locked=false;
-let element=null;
-let previous=null;
-const readHandle=()=>{
-try{
-const doc=globalThis.document;
-if(!doc||typeof doc.querySelector!=="function")return null;
-return doc.querySelector(RIGHTBAR_DRAG_HANDLE_SELECTOR)??null;
-}catch{return null;}
-};
-const readStyle=(style,name)=>{
-try{return typeof style.getPropertyValue==="function"?style.getPropertyValue(name):"";}catch{return"";}
-};
-const readPriority=(style,name)=>{
-try{return typeof style.getPropertyPriority==="function"?style.getPropertyPriority(name):"";}catch{return"";}
-};
-const restore=()=>{
-const target=element;
-const saved=previous;
-element=null;
-previous=null;
-if(target===null||saved===null)return;
-let style=null;
-try{style=target.style||null;}catch{style=null;}
-if(style===null)return;
-for(const entry of saved){
-try{
-if(readStyle(style,entry.name)!==entry.written)continue;
-if(readPriority(style,entry.name)!==entry.writtenPriority)continue;
-if(entry.value===""||entry.value===null||entry.value===undefined)style.removeProperty?.(entry.name);
-else style.setProperty(entry.name,entry.value,entry.priority||"");
-}catch{/* 单条属性还原失败不能阻断其它属性，最坏情况是宿主多留一条内联样式。 */}
-}
-};
-const apply=()=>{
-if(locked!==true)return false;
-const candidate=readHandle();
-if(candidate===null)return false;
-if(candidate!==element){
-element=candidate;
-previous=null;
-}
-let style=null;
-try{style=candidate.style||null;}catch{style=null;}
-if(style===null||typeof style.setProperty!=="function")return false;
-if(previous===null){
-previous=HANDLE_STYLE_WRITES.map(({name})=>({
-name,
-value:readStyle(style,name),
-priority:readPriority(style,name),
-written:null,
-writtenPriority:null,
-}));
-}
-HANDLE_STYLE_WRITES.forEach(({name,value},index)=>{
-if(readStyle(style,name)===value)return;
-try{
-style.setProperty(name,value,"important");
-previous[index].written=readStyle(style,name);
-previous[index].writtenPriority=readPriority(style,name);
-}catch{/* 写入失败：保留已经写上的那几条，绝不影响页面其它行为。 */}
-});
-return true;
-};
-return{
-setLocked(next){
-const target=next===true;
-if(target===locked){
-if(target)apply();
-return locked;
-}
-locked=target;
-if(target)apply();
-else restore();
-return locked;
-},
-isLocked:()=>locked,
-dispose(){
-locked=false;
-restore();
-},
-};
-}
-function createSplitTrackRatio(){
-let applied=null;
-let hostCapture=null;
-let disposed=false;
-let pending=null;
-let pendingRetryTimer=null;
-let lastReader=null;
-const readInline=(style,name,readerName)=>{
-try{
-if(style===null||style===undefined)return null;
-const reader=style[readerName];
-if(typeof reader!=="function")return null;
-const value=reader.call(style,name);
-return value===null||value===undefined?"":String(value);
-}catch{return null;}
-};
-const readValue=(style,name)=>readInline(style,name,"getPropertyValue");
-const readPriority=(style,name)=>readInline(style,name,"getPropertyPriority");
-const styleOf=(container)=>{
-try{
-const style=container?.style??null;
-if(style===null||typeof style.setProperty!=="function")return null;
-return style;
-}catch{return null;}
-};
-const composeDesired=(parsed)=>
-"minmax(0,"+SIDEBAR_SPLIT_EXPERT_TRACK+"fr) "
-+(parsed===null?SIDEBAR_SPLIT_GAP_TRACK:parsed.middle)
-+" minmax(0,"+SIDEBAR_SPLIT_OTHER_TRACK+"fr)";
-const captureHostStyle=(container)=>{
-if(hostCapture!==null&&hostCapture.container===container)return true;
-const style=styleOf(container);
-if(style===null)return false;
-const value=readValue(style,SIDEBAR_SPLIT_TRACK_PROPERTY);
-const priority=readPriority(style,SIDEBAR_SPLIT_TRACK_PROPERTY);
-if(value===null||priority===null)return false;
-hostCapture={container,value,priority};
-return true;
-};
-const shouldApply=(container,parsed,current)=>{
-if(hostCapture===null||hostCapture.container!==container)return true;
-if(current==="")return true;
-if(hostCapture.value===current)return true;
-return parsed!==null&&parsed.first===parsed.last;
-};
-const applyRatio=(container)=>{
-const style=styleOf(container);
-if(style===null)return false;
-const current=readValue(style,SIDEBAR_SPLIT_TRACK_PROPERTY);
-const currentPriority=readPriority(style,SIDEBAR_SPLIT_TRACK_PROPERTY);
-if(current===null||currentPriority===null)return false;
-const parsed=parseSplitTracks(current);
-if(current!==""&&parsed===null)return false;
-const desired=composeDesired(parsed);
-if(current===desired)return true;
-if(applied!==null&&applied.container===container
-&&current===applied.written&&currentPriority===applied.writtenPriority)return true;
-if(shouldApply(container,parsed,current)!==true)return false;
-if(captureHostStyle(container)!==true)return false;
-try{style.setProperty(SIDEBAR_SPLIT_TRACK_PROPERTY,desired,currentPriority);}catch{return false;}
-applied={
-container,
-written:readValue(style,SIDEBAR_SPLIT_TRACK_PROPERTY),
-writtenPriority:readPriority(style,SIDEBAR_SPLIT_TRACK_PROPERTY),
-};
-return true;
-};
-const restore=()=>{
-const entry=applied;
-applied=null;
-if(entry===null)return;
-const style=styleOf(entry.container);
-if(style===null)return;
-if(readValue(style,SIDEBAR_SPLIT_TRACK_PROPERTY)!==entry.written)return;
-if(readPriority(style,SIDEBAR_SPLIT_TRACK_PROPERTY)!==entry.writtenPriority)return;
-if(hostCapture===null||hostCapture.container!==entry.container)return;
-try{
-if(hostCapture.value==="")style.removeProperty(SIDEBAR_SPLIT_TRACK_PROPERTY);
-else style.setProperty(SIDEBAR_SPLIT_TRACK_PROPERTY,hostCapture.value,hostCapture.priority);
-}catch{/* 还原失败只影响外观，后续同步仍按同一规则重试。 */}
-};
-const cancelPendingRetry=()=>{
-if(pendingRetryTimer===null)return;
-const timer=pendingRetryTimer;
-pendingRetryTimer=null;
-try{
-globalThis.clearTimeout?.(timer);
-}catch{/* 取消失败不能阻止其它所有权释放。 */}
-};
-const clearPending=()=>{
-pending=null;
-cancelPendingRetry();
-};
-const schedulePendingRetry=(container)=>{
-if(disposed||pendingRetryTimer!==null)return;
-try{
-pendingRetryTimer=globalThis.setTimeout(()=>{
-pendingRetryTimer=null;
-if(disposed)return;
-if(pending===null||pending.container!==container)return;
-const entry=pending;
-if(typeof lastReader!=="function")return;
-pending={container,attempts:entry.attempts+1};
-sync(lastReader);
-if(pending!==null&&pending.container===container
-&&pendingRetryTimer===null
-&&pending.attempts<SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS){
-schedulePendingRetry(container);
-}
-},SIDEBAR_SPLIT_PENDING_RETRY_DELAY_MS);
-}catch{
-pendingRetryTimer=null;
-}
-};
-const sync=(readTarget)=>{
-if(disposed)return false;
-if(typeof readTarget==="function")lastReader=readTarget;
-let doc=null;
-try{doc=globalThis.document??null;}catch{doc=null;}
-if(doc===null||typeof doc.querySelector!=="function")return applied!==null;
-let target=null;
-try{target=typeof readTarget==="function"?readTarget(doc):null;}catch{target=null;}
-if(target===null||target.container===null||target.container===undefined){
-clearPending();
-restore();
-return false;
-}
-if(pending!==null&&pending.container!==target.container)clearPending();
-if(applied!==null&&applied.container!==target.container)restore();
-if(target.status==="pending"&&applied!==null&&applied.container===target.container){
-const attempts=pending!==null&&pending.container===target.container?pending.attempts:0;
-if(attempts<SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS){
-applyRatio(target.container);
-if(pending===null)pending={container:target.container,attempts:0};
-schedulePendingRetry(target.container);
-return true;
-}
-clearPending();
-restore();
-return false;
-}
-clearPending();
-if(target.status==="pending")return false;
-return applyRatio(target.container);
-};
-return{
-sync,
-dispose(){
-disposed=true;
-clearPending();
-restore();
-},
-};
-}
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
 const SIDEBAR_SHARED_AUTO_LEDGER_KEY=Symbol.for("dsh-expert-group/sidebar#shared-auto-ledger");
 const SIDEBAR_SHARED_AUTO_LEDGER_VERSION=1;
 const SIDEBAR_AUTO_OWNERSHIP_KEY="dsh-expert-group:auto-ownership:v1";
@@ -3315,32 +1864,1739 @@ reason,
 key:candidate===null||candidate===undefined?undefined:sidebarAutoKeyDigest(candidate.key),
 });
 };
-function createExpertGroupPanel(deps){
-const config=object(deps);
-const react=config.react;
-const primitives=config.primitives||{};
-if(!react||typeof react.createElement!=="function"){
-return function MissingReactPanel(){return null;};
+global[SYMBOL]=Object.freeze({
+SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,deleteSidebarAutoOwnership,readSidebarAutoOwnershipEntry,
+recordSidebarAutoDecision,recordSidebarAutoDiag,resolveSidebarSharedAutoLedger,sidebarAutoKeyDigest,
+sidebarAutoOriginEntry,sidebarAutoOriginTabIdOf,sidebarAutoOriginWrittenAtOf,sidebarBoundedText,
+sidebarLocalStorage,sidebarOwnershipAcceptsNewAuto,sidebarSharedAutoLedgerSizes,sidebarSharedAutoLedgerTotal,
+writeSidebarAutoOwnership,
+});
+})(globalThis);
+/* source: client-sidebar-pure.js */
+(function installClientSidebarPure(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const AUTO_LEDGER_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
+const AUTO_LEDGER=global[AUTO_LEDGER_SYMBOL]||{};
+const{
+sidebarLocalStorage,
+}=AUTO_LEDGER;
+const MODEL_SYMBOL=Symbol.for("dsh-expert-group/client-expert-group-model");
+const MODEL=global[MODEL_SYMBOL]||{};
+const modelApi=()=>global[MODEL_SYMBOL]||MODEL;
+const RUNTIME_STATUS_LABELS=Object.freeze({running:"running",ready:"ready",unknown:"unknown"});
+const RUNTIME_STATE_DOT=Object.freeze({running:"ongoing",ready:"done",unknown:"idle"});
+const TIMELINE_EXPANDED_KEY_LIMIT=256;
+const ATTEMPT_STATUS_LABELS=Object.freeze({
+queued:"排队",waiting:"等待",running:"运行中",succeeded:"成功",failed:"失败",
+cancelled:"已取消",timed_out:"超时",interrupted:"已中断",idle:"空闲",ready:"就绪",unknown:"未知",
+});
+const STATUS_FILTER_OPTIONS=Object.freeze([
+Object.freeze({value:"running",label:"运行中"}),
+Object.freeze({value:"failed",label:"失败"}),
+Object.freeze({value:"succeeded",label:"已完成"}),
+Object.freeze({value:"cancelled",label:"已取消"}),
+Object.freeze({value:"idle",label:"空闲"}),
+]);
+const ACTIVE_STATUSES=new Set(["queued","waiting","running"]);
+const RETRY_STATUSES=new Set(["failed","timed_out","interrupted"]);
+const FANOUT_SETTLED_STATUSES=new Set(["succeeded","failed","cancelled"]);
+const STYLE_ID="dsh-expert-group/expert-group-sidebar";
+const RIGHTBAR_WIDTH_RATIO=0.2;
+const OTHER_RIGHTBAR_WIDTH_RATIO=0.5;
+const RIGHTBAR_WIDTH_RATIO_MIN=0.15;
+const RIGHTBAR_WIDTH_RATIO_MAX=0.5;
+const RIGHTBAR_WIDTH_PREFERENCE_KEY="dsh-expert-group/rightbar-width-ratio:v1";
+function clampRightbarWidthRatio(value){
+const numeric=typeof value==="number"?value:Number(value);
+if(Number.isFinite(numeric)!==true)return null;
+if(numeric<RIGHTBAR_WIDTH_RATIO_MIN)return RIGHTBAR_WIDTH_RATIO_MIN;
+if(numeric>RIGHTBAR_WIDTH_RATIO_MAX)return RIGHTBAR_WIDTH_RATIO_MAX;
+return numeric;
 }
-styleTag();
+function readStoredRightbarWidthRatio(){
+const storage=sidebarLocalStorage();
+if(storage===null)return RIGHTBAR_WIDTH_RATIO;
+let raw=null;
+try{raw=storage.getItem(RIGHTBAR_WIDTH_PREFERENCE_KEY);}catch{raw=null;}
+if(typeof raw!=="string"||raw.trim()==="")return RIGHTBAR_WIDTH_RATIO;
+const clamped=clampRightbarWidthRatio(Number(raw.trim()));
+return clamped===null?RIGHTBAR_WIDTH_RATIO:clamped;
+}
+function storeRightbarWidthRatio(value){
+const clamped=clampRightbarWidthRatio(value);
+if(clamped===null)return null;
+const storage=sidebarLocalStorage();
+if(storage===null)return clamped;
+try{storage.setItem(RIGHTBAR_WIDTH_PREFERENCE_KEY,String(clamped));}catch{/* 见上：本次仍生效。 */}
+return clamped;
+}
+const resolveExpertRightbarWidthRatio=()=>readStoredRightbarWidthRatio();
+const RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX=1;
+const RIGHTBAR_WIDTH_RECOVERY_MAX_ATTEMPTS=2;
+const BRAND_ICON_PATHS=Object.freeze([
+"M6 8.25C7.51878 8.25 8.75 7.01878 8.75 5.5C8.75 3.98122 7.51878 2.75 6 2.75C4.48122 2.75 3.25 3.98122 3.25 5.5C3.25 7.01878 4.48122 8.25 6 8.25Z",
+"M1 14.5C1 11.5 3.5 10.25 6 10.25C8.5 10.25 11 11.5 11 14.5",
+"M10.5 2.9C11.65 3.35 12.45 4.35 12.45 5.5C12.45 6.65 11.65 7.65 10.5 8.1",
+"M12.4 10.6C13.9 11.3 15 12.6 15 14.5",
+]);
+const RIGHTBAR_PANEL_SELECTOR="[data-sidebar-right-panel]";
+const RIGHTBAR_PANEL_SESSION_ATTRIBUTE="data-sidebar-right-session";
+const RIGHTBAR_TAB_SELECTOR="[data-dockkit-tab]";
+const RIGHTBAR_TAB_ID_ATTRIBUTE="data-dockkit-tab";
+const RIGHTBAR_PANE_SELECTOR="[data-dockkit-pane]";
+const RIGHTBAR_PANE_ID_ATTRIBUTE="data-dockkit-pane";
+const RIGHTBAR_PANE_COLUMN_ATTRIBUTE="data-dockkit-column";
+const RIGHTBAR_SPLIT_SELECTOR="[data-dockkit-split]";
+const RIGHTBAR_SPLIT_ATTRIBUTE="data-dockkit-split";
+const RIGHTBAR_DOCK_HOST_ATTRIBUTE="data-dockkit-host";
+const RIGHTBAR_DOCK_HOST_VALUE="dock";
+const RIGHTBAR_STRIP_TABS_SELECTOR="[data-dockkit-strip-tabs]";
+const RIGHTBAR_STRIP_TABS_ATTRIBUTE="data-dockkit-strip-tabs";
+const SIDEBAR_SPLIT_EXPERT_TRACK="0.4";
+const SIDEBAR_SPLIT_OTHER_TRACK="0.6";
+const SIDEBAR_SPLIT_GAP_TRACK="0px";
+const SIDEBAR_SPLIT_TRACK_PROPERTY="grid-template-columns";
+const EXPERT_GROUP_TAB_IDS=new Set(["dsh-expert-group","expert-group"]);
+function isGeneratedExpertGroupTabId(value){
+return typeof value==="string"&&/^(?:dsh-)?expert-group\d+$/.test(value);
+}
+const RIGHTBAR_FLOAT_SELECTOR="[data-dockkit-float]";
+const RIGHTBAR_FLOAT_TITLE_SELECTOR="[data-dockkit-float-title]";
+const SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS=2;
+const SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS=15000;
+const SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS=SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS;
+const SIDEBAR_AUTO_OPEN_PLACEHOLDER_FOREIGN_TTL_MS=4*SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS;
+const SIDEBAR_SPLIT_TRANSACTION_TIMEOUT_MS=15000;
+const SIDEBAR_SPLIT_LAYOUT_WAIT_FALLBACK_MS=250;
+const SIDEBAR_SPLIT_PENDING_RETRY_DELAY_MS=400;
+const SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS=4;
+const SIDEBAR_TAB_KEY_SEPARATOR="\u0000";
+const SIDEBAR_TAB_ORIGIN_AUTO="auto";
+const SIDEBAR_TAB_ORIGIN_MANUAL="manual";
+const SIDEBAR_AUTO_CLOSE_MAX_ATTEMPTS=3;
+const SIDEBAR_AUTO_KEY_LIMIT=128;
+const SIDEBAR_TAB_CLOSE_WATCHDOG_MS=10000;
+const SIDEBAR_TAB_CLOSE_VERIFY_TIMEOUT_MS=10000;
+const SIDEBAR_TAB_CLOSE_LATE_QUARANTINE_MS=3000;
+const SIDEBAR_AUTO_CLOSE_COOLDOWN_BASE_MS=60000;
+const SIDEBAR_AUTO_CLOSE_COOLDOWN_MAX_MS=900000;
+const SIDEBAR_TAB_CLOSE_SETTLE_REASONS=new Set(["closed","recycled","failed","timeout"]);
+function closeSettleReason(outcome){
+if(SIDEBAR_TAB_CLOSE_SETTLE_REASONS.has(outcome)===true)return outcome;
+return outcome===true?"closed":"failed";
+}
+function object(value){
+return value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
+}
+function text(value,fallback){
+if(typeof value!=="string"||value.trim()==="")return fallback;
+return value.trim();
+}
+const HOST_META_ROLE_LIMIT=32;
+function normalizeHostMeta(value){
+const source=object(value);
+const roles=[];
+const rawRoles=Array.isArray(source.activeRoles)?source.activeRoles:(Array.isArray(source.roles)?source.roles:[]);
+for(const entry of rawRoles){
+if(roles.length>=HOST_META_ROLE_LIMIT)break;
+const role=text(entry,null);
+if(role!==null&&roles.indexOf(role)===-1)roles.push(role);
+}
+const diagnostics=object(source.diagnostics);
+const fanout=object(diagnostics.fanout);
+const concurrency=object(fanout.concurrency);
+return{
+roles,
+roleLabels:object(source.roleLabels),
+roleDefaults:object(source.roleDefaults),
+modelPrices:Array.isArray(source.modelPrices)?source.modelPrices:[],
+usage:object(source.usage),
+throttle:Object.keys(concurrency.throttle===undefined?{}:object(concurrency.throttle)).length===0
+?null
+:object(concurrency.throttle),
+capabilities:object(source.capabilities),
+};
+}
+const SESSION_MODEL_ROLE_FALLBACK=Object.freeze(["explorer","librarian","oracle","designer","fixer","observer"]);
+function normalizeSessionModelSelection(selection){
+if(selection===null||typeof selection!=="object"||Array.isArray(selection))return null;
+if(typeof selection.provider!=="string"||selection.provider.length===0)return null;
+if(typeof selection.model!=="string"||selection.model.length===0)return null;
+const effort=typeof selection.reasoningEffort==="string"?selection.reasoningEffort:"";
+return{
+provider:selection.provider,
+model:selection.model,
+...(effort.length>0?{reasoningEffort:effort}:{}),
+};
+}
+function normalizeSessionModelOverrides(raw,roles){
+const overrides={};
+const source=raw!==null&&typeof raw==="object"&&Array.isArray(raw)!==true?raw:{};
+for(const role of Array.isArray(roles)?roles:[]){
+const selection=normalizeSessionModelSelection(source[role]);
+if(selection!==null)overrides[role]=selection;
+}
+return overrides;
+}
+function normalizeSessionModelView(body,roles){
+const source=object(body);
+if(source.ok!==true)return null;
+if(Number.isSafeInteger(source.revision)!==true||source.revision<0)return null;
+return{
+overrides:normalizeSessionModelOverrides(source.overrides,roles),
+revision:source.revision,
+live:source.live===true,
+};
+}
+function sessionModelSelectionOfDraft(draft){
+const provider=typeof draft?.provider==="string"?draft.provider:"";
+const model=typeof draft?.model==="string"?draft.model:"";
+const effort=typeof draft?.reasoningEffort==="string"?draft.reasoningEffort:"";
+return{provider,model,...(effort.length>0?{reasoningEffort:effort}:{})};
+}
+function sessionModelSelectionEquals(left,right){
+return(left?.provider??"")===(right?.provider??"")
+&&(left?.model??"")===(right?.model??"")
+&&(left?.reasoningEffort??"")===(right?.reasoningEffort??"");
+}
+function sessionModelModelOptions(provider,groups){
+const source=Array.isArray(groups)?groups:[];
+const group=source.find((entry)=>text(object(entry).id,null)===provider);
+const models=[];
+const pool=group===undefined
+?source.flatMap((entry)=>(Array.isArray(object(entry).models)?object(entry).models:[]))
+:(Array.isArray(object(group).models)?object(group).models:[]);
+for(const entry of pool){
+const item=object(entry);
+const id=text(item.id,null);
+if(id===null||models.some((existing)=>existing.id===id))continue;
+models.push(item);
+}
+return models;
+}
+function sessionModelRolesOf(metaValue){
+const source=metaValue===null||metaValue===undefined?{}:object(metaValue);
+const roles=[];
+for(const entry of Array.isArray(source.roles)?source.roles:[]){
+const role=text(entry,null);
+if(role!==null&&roles.indexOf(role)===-1)roles.push(role);
+}
+return roles.length===0?SESSION_MODEL_ROLE_FALLBACK.slice():roles;
+}
+function snapshotHasUsageFact(value,depth=0){
+if(depth>8||value===null||typeof value!=="object")return false;
+const source=object(value);
+const usage=object(source.usage);
+for(const field of["inputTokens","outputTokens","totalTokens","billedInputTokens","requests"]){
+if(typeof usage[field]==="number"&&Number.isFinite(usage[field]))return true;
+}
+if(snapshotHasUsageFact(source.root,depth+1))return true;
+for(const child of Array.isArray(source.children)?source.children:[]){
+if(snapshotHasUsageFact(child,depth+1))return true;
+}
+for(const shard of Array.isArray(source.shards)?source.shards:[]){
+if(snapshotHasUsageFact(shard,depth+1))return true;
+for(const attempt of Array.isArray(object(shard).attempts)?object(shard).attempts:[]){
+if(snapshotHasUsageFact(attempt,depth+1))return true;
+}
+}
+return false;
+}
+function latestShardChildIdOf(shard){
+const source=object(shard);
+const attempts=Array.isArray(source.attempts)?source.attempts:[];
+const latest=attempts.length===0?null:object(attempts[attempts.length-1]);
+return text(latest?.childId,text(source.childId,null));
+}
+function collectSnapshotSessionIds(snapshot){
+const ids=[];
+const seen=new Set();
+let visited=0;
+const push=(value)=>{
+const id=text(value,null);
+if(id===null||seen.has(id))return;
+seen.add(id);
+ids.push(id);
+};
+const visit=(node,depth)=>{
+if(depth>12||visited>=4096)return;
+const source=object(node);
+if(Object.keys(source).length===0)return;
+visited+=1;
+push(source.sessionId);
+for(const shard of Array.isArray(source.shards)?source.shards:[])push(latestShardChildIdOf(shard));
+for(const child of Array.isArray(source.children)?source.children:[])visit(child,depth+1);
+};
+visit(object(snapshot).root,0);
+return ids;
+}
+function statusOf(node){
+const value=text(object(node).status,"unknown");
+return value||"unknown";
+}
+const ANNOUNCEMENT_ACTIVE_STATUSES=new Set(["queued","waiting","running"]);
+const ANNOUNCEMENT_FINISHED_STATUSES=new Set(["succeeded","success","completed","complete","done","ready"]);
+const ANNOUNCEMENT_FAILED_STATUSES=new Set(["failed","error","timed_out","timeout","interrupted"]);
+const ANNOUNCEMENT_CANCELLED_STATUSES=new Set(["cancelled","canceled"]);
+const ANNOUNCEMENT_MAX_ITEMS=5;
+function collectAnnouncementTasks(snapshot){
+const result=new Map();
+const root=object(object(snapshot).root);
+if(Object.keys(root).length===0)return result;
+const visit=(node,fallbackName)=>{
+const source=object(node);
+const id=text(source.id,text(source.sessionId,text(source.parentTaskId,null)));
+if(id===null)return;
+const isRoot=source.kind==="root";
+const name=isRoot
+?"主代理"
+:text(source.taskName,text(source.sessionId,fallbackName));
+result.set(id,{name:text(name,id),status:statusOf(source)});
+for(const child of Array.isArray(source.children)?source.children:[])visit(child,id);
+for(const shard of Array.isArray(source.shards)?source.shards:[]){
+const shardId=text(shard.shardId,null);
+if(shardId===null)continue;
+const shardName=text(shard.taskName,shardId);
+result.set(id+":"+shardId,{name:shardName,status:statusOf(shard)});
+}
+};
+visit(root,"主代理");
+return result;
+}
+function announcementKindOf(previousStatus,nextStatus){
+if(previousStatus===nextStatus)return null;
+if(previousStatus==="unknown"||nextStatus==="unknown")return null;
+if(ANNOUNCEMENT_CANCELLED_STATUSES.has(nextStatus))return"cancel";
+if(ANNOUNCEMENT_FAILED_STATUSES.has(nextStatus))return"fail";
+if(ANNOUNCEMENT_FINISHED_STATUSES.has(nextStatus)){
+return ANNOUNCEMENT_ACTIVE_STATUSES.has(previousStatus)||previousStatus==="idle"?"finish":null;
+}
+if(ANNOUNCEMENT_ACTIVE_STATUSES.has(nextStatus)&&ANNOUNCEMENT_ACTIVE_STATUSES.has(previousStatus)!==true)return"start";
+return null;
+}
+function announcementEventsOf(previousTasks,nextTasks){
+const events=[];
+for(const[id,next]of nextTasks){
+const previous=previousTasks.get(id);
+const kind=previous===undefined
+?(ANNOUNCEMENT_ACTIVE_STATUSES.has(next.status)?"start":null)
+:announcementKindOf(previous.status,next.status);
+if(kind===null)continue;
+events.push({kind,name:next.name});
+}
+return events;
+}
+function safeNormalize(raw){
+const model=modelApi();
+if(typeof model.normalizeExpertGroupSnapshot!=="function")return null;
+try{return model.normalizeExpertGroupSnapshot(raw);}catch{return null;}
+}
+const modelFunction=(name)=>{
+const api=modelApi();
+return api!==null&&api!==undefined&&typeof api[name]==="function"?api[name]:null;
+};
+const finiteNumber=(value)=>(typeof value==="number"&&Number.isFinite(value)?value:null);
+const formatDurationText=(value)=>{
+const fn=modelFunction("formatDuration");
+return fn===null?null:fn(value);
+};
+const formatCompactDuration=(value)=>{
+const fn=modelFunction("formatDurationCompact");
+return fn===null?null:fn(value);
+};
+const formatClockText=(value)=>{
+const fn=modelFunction("formatClockTime");
+return fn===null?null:fn(value);
+};
+const formatIsoText=(value)=>{
+const fn=modelFunction("formatIsoTime");
+return fn===null?null:fn(value);
+};
+const failureSummaryText=(value)=>{
+const fn=modelFunction("formatFailureSummary");
+return fn===null?null:fn(value);
+};
+const isFailureStatusOf=(status)=>{
+const fn=modelFunction("isFailureStatus");
+return fn===null?["failed","timed_out","interrupted"].includes(status):fn(status)===true;
+};
+const retryWarningThreshold=()=>{
+const value=modelApi()?.RETRY_WARNING_THRESHOLD;
+return typeof value==="number"&&Number.isFinite(value)&&value>0?value:3;
+};
+const mergedRoleLabelsOf=(snapshot,meta)=>{
+const sources=[
+snapshot===null||snapshot===undefined?null:object(snapshot.roleLabels),
+meta===null?null:object(meta.roleLabels),
+];
+const merged={};
+let any=false;
+for(const source of sources){
+if(source===null)continue;
+for(const key of Object.keys(source)){
+if(merged[key]!==undefined)continue;
+const label=text(source[key],null);
+if(label===null)continue;
+merged[key]=label;
+any=true;
+}
+}
+return any?merged:null;
+};
+const roleLabelFromMap=(role,labels)=>{
+const api=modelApi();
+return typeof api?.roleLabelFrom==="function"?api.roleLabelFrom(role,labels):null;
+};
+const roleLabelFor=(role,nodeLabel,labels)=>text(nodeLabel,null)
+??roleLabelFromMap(role,labels)
+??text(role,null);
+global[SYMBOL]=Object.freeze({
+ACTIVE_STATUSES,ANNOUNCEMENT_MAX_ITEMS,ATTEMPT_STATUS_LABELS,BRAND_ICON_PATHS,
+EXPERT_GROUP_TAB_IDS,FANOUT_SETTLED_STATUSES,OTHER_RIGHTBAR_WIDTH_RATIO,RETRY_STATUSES,
+RIGHTBAR_DOCK_HOST_ATTRIBUTE,RIGHTBAR_DOCK_HOST_VALUE,RIGHTBAR_FLOAT_SELECTOR,RIGHTBAR_FLOAT_TITLE_SELECTOR,
+RIGHTBAR_PANEL_SELECTOR,RIGHTBAR_PANEL_SESSION_ATTRIBUTE,RIGHTBAR_PANE_COLUMN_ATTRIBUTE,RIGHTBAR_PANE_ID_ATTRIBUTE,
+RIGHTBAR_PANE_SELECTOR,RIGHTBAR_SPLIT_ATTRIBUTE,RIGHTBAR_SPLIT_SELECTOR,RIGHTBAR_STRIP_TABS_ATTRIBUTE,
+RIGHTBAR_STRIP_TABS_SELECTOR,RIGHTBAR_TAB_ID_ATTRIBUTE,RIGHTBAR_TAB_SELECTOR,RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX,
+RIGHTBAR_WIDTH_RATIO,RIGHTBAR_WIDTH_RATIO_MAX,RIGHTBAR_WIDTH_RATIO_MIN,RIGHTBAR_WIDTH_RECOVERY_MAX_ATTEMPTS,
+RUNTIME_STATE_DOT,RUNTIME_STATUS_LABELS,SIDEBAR_AUTO_CLOSE_COOLDOWN_BASE_MS,SIDEBAR_AUTO_CLOSE_COOLDOWN_MAX_MS,
+SIDEBAR_AUTO_CLOSE_MAX_ATTEMPTS,SIDEBAR_AUTO_KEY_LIMIT,SIDEBAR_AUTO_OPEN_PLACEHOLDER_FOREIGN_TTL_MS,SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS,
+SIDEBAR_SPLIT_EXPERT_TRACK,SIDEBAR_SPLIT_GAP_TRACK,SIDEBAR_SPLIT_LAYOUT_WAIT_FALLBACK_MS,SIDEBAR_SPLIT_OTHER_TRACK,
+SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS,SIDEBAR_SPLIT_PENDING_RETRY_DELAY_MS,SIDEBAR_SPLIT_TRACK_PROPERTY,SIDEBAR_SPLIT_TRANSACTION_TIMEOUT_MS,
+SIDEBAR_TAB_CLOSE_LATE_QUARANTINE_MS,SIDEBAR_TAB_CLOSE_VERIFY_TIMEOUT_MS,SIDEBAR_TAB_CLOSE_WATCHDOG_MS,SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS,
+SIDEBAR_TAB_KEY_SEPARATOR,SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS,SIDEBAR_TAB_ORIGIN_AUTO,SIDEBAR_TAB_ORIGIN_MANUAL,
+STATUS_FILTER_OPTIONS,STYLE_ID,TIMELINE_EXPANDED_KEY_LIMIT,announcementEventsOf,
+clampRightbarWidthRatio,closeSettleReason,collectAnnouncementTasks,collectSnapshotSessionIds,
+failureSummaryText,finiteNumber,formatClockText,formatCompactDuration,
+formatDurationText,formatIsoText,isFailureStatusOf,isGeneratedExpertGroupTabId,
+latestShardChildIdOf,mergedRoleLabelsOf,modelApi,modelFunction,
+normalizeHostMeta,normalizeSessionModelOverrides,normalizeSessionModelSelection,normalizeSessionModelView,
+object,resolveExpertRightbarWidthRatio,retryWarningThreshold,roleLabelFor,
+safeNormalize,sessionModelModelOptions,sessionModelRolesOf,sessionModelSelectionEquals,
+sessionModelSelectionOfDraft,snapshotHasUsageFact,statusOf,storeRightbarWidthRatio,
+text,
+});
+})(globalThis);
+/* source: client-sidebar-dom.js */
+(function installClientSidebarDom(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+BRAND_ICON_PATHS,EXPERT_GROUP_TAB_IDS,RIGHTBAR_DOCK_HOST_ATTRIBUTE,RIGHTBAR_DOCK_HOST_VALUE,RIGHTBAR_PANEL_SELECTOR,RIGHTBAR_PANEL_SESSION_ATTRIBUTE,RIGHTBAR_PANE_COLUMN_ATTRIBUTE,RIGHTBAR_PANE_SELECTOR,RIGHTBAR_SPLIT_ATTRIBUTE,RIGHTBAR_SPLIT_SELECTOR,RIGHTBAR_STRIP_TABS_ATTRIBUTE,RIGHTBAR_STRIP_TABS_SELECTOR,RIGHTBAR_TAB_ID_ATTRIBUTE,RIGHTBAR_TAB_SELECTOR,RUNTIME_STATE_DOT,RUNTIME_STATUS_LABELS,SIDEBAR_TAB_KEY_SEPARATOR,STYLE_ID,modelApi,object,text,
+}=PURE;
+function viewportWidthOf(){
+let value=null;
+try{value=globalThis.window?.innerWidth??globalThis.innerWidth;}catch{value=null;}
+const width=Number(value);
+return Number.isFinite(width)&&width>0?width:null;
+}
+const ELEMENT_QUERY_MISSING="missing";
+const ELEMENT_QUERY_UNIQUE="unique";
+const ELEMENT_QUERY_AMBIGUOUS="ambiguous";
+function elementQueryOf(doc,selector){
+let nodes=null;
+try{
+if(doc===null||doc===undefined||typeof doc.querySelectorAll!=="function"){
+return{status:ELEMENT_QUERY_AMBIGUOUS,element:null};
+}
+nodes=Array.from(doc.querySelectorAll(selector));
+}catch{
+return{status:ELEMENT_QUERY_AMBIGUOUS,element:null};
+}
+if(nodes.length===0)return{status:ELEMENT_QUERY_MISSING,element:null};
+if(nodes.length>1)return{status:ELEMENT_QUERY_AMBIGUOUS,element:null};
+return{status:ELEMENT_QUERY_UNIQUE,element:nodes[0]};
+}
+function appFrameElementOf(doc){
+const candidates=[];
+const push=(element)=>{
+if(element===null||element===undefined||element.nodeType!==1)return;
+if(candidates.includes(element)===false)candidates.push(element);
+};
+const overlay=elementQueryOf(doc,"[data-shell-overlay]");
+if(overlay.status===ELEMENT_QUERY_AMBIGUOUS)return null;
+if(overlay.status===ELEMENT_QUERY_UNIQUE){
+let parent=null;
+try{parent=overlay.element.parentElement??null;}catch{parent=null;}
+push(parent);
+}
+for(const selector of["[data-rightbar-collapsed]","[data-rightbar-instant]"]){
+const state=elementQueryOf(doc,selector);
+if(state.status===ELEMENT_QUERY_AMBIGUOUS)return null;
+if(state.status===ELEMENT_QUERY_UNIQUE)push(state.element);
+}
+return candidates.length===1?candidates[0]:null;
+}
+function hostAppFrameWidthOf(){
+try{
+const doc=globalThis.document;
+const frame=appFrameElementOf(doc);
+if(frame===null)return null;
+if(frame===doc?.body||frame===doc?.documentElement)return null;
+const rect=typeof frame.getBoundingClientRect==="function"?frame.getBoundingClientRect():null;
+if(rect===null||typeof rect!=="object")return null;
+const width=Number(rect.width);
+return Number.isFinite(width)&&width>0?width:null;
+}catch{return null;}
+}
+function methodOf(target,name){
+if(target===null||target===undefined)return null;
+try{
+const candidate=target[name];
+return typeof candidate==="function"?candidate:null;
+}catch{return null;}
+}
+function resolveClientService(candidates,name){
+for(const candidate of candidates){
+if(candidate===null||candidate===undefined)continue;
+try{
+if(typeof candidate.get==="function"){
+const value=candidate.get(name);
+if(value!==null&&value!==undefined)return value;
+}
+}catch{/* 未声明服务读取即抛错：按「该候选没有它」处理。 */}
+try{
+const value=candidate[name];
+if(value!==null&&value!==undefined)return value;
+}catch{/* 同上。 */}
+}
+return null;
+}
+const SUBAGENT_CHAT_ADDRESS_PREFIX="dsh-resource://subagentchat/session/";
+const SUBAGENT_CHAT_KIND="subagentchat";
+const SUBAGENT_MODES=new Set(["one-shot","continuable","unknown"]);
+function normalizeSubagentAddress(value){
+const source=object(value);
+const parentSessionId=text(source.parentSessionId,text(source.parentId,null));
+const childSessionId=text(source.childSessionId,text(source.id,text(source.sessionId,null)));
+const mode=text(source.mode,null);
+if(parentSessionId===null||childSessionId===null||mode===null)return null;
+if(SUBAGENT_MODES.has(mode)!==true)return null;
+return{parentSessionId,childSessionId,mode};
+}
+function subagentChatAddress(value){
+const address=normalizeSubagentAddress(value);
+if(address===null)return null;
+const query=typeof global.URLSearchParams==="function"
+?new global.URLSearchParams({parent:address.parentSessionId,mode:address.mode}).toString()
+:"parent="+encodeAddressPart(address.parentSessionId)+"&mode="+encodeAddressPart(address.mode);
+return SUBAGENT_CHAT_ADDRESS_PREFIX
++encodeAddressPart(address.childSessionId)
++"?"+query;
+}
+function encodeAddressPart(value){
+const raw=String(value);
+return typeof encodeURIComponent==="function"?encodeURIComponent(raw):raw;
+}
+function sidebarTabKey(sessionId,rootSessionId,resourceAddress){
+return String(sessionId)+SIDEBAR_TAB_KEY_SEPARATOR
++String(rootSessionId)+SIDEBAR_TAB_KEY_SEPARATOR+String(resourceAddress);
+}
+function sidebarTabCloseKey(sessionId,rootSessionId,tabId){
+return String(sessionId)+SIDEBAR_TAB_KEY_SEPARATOR
++String(rootSessionId)+SIDEBAR_TAB_KEY_SEPARATOR+String(tabId);
+}
+function sessionEntries(value){
+if(value==null)return[];
+if(Array.isArray(value)){
+if(value.every((entry)=>Array.isArray(entry)&&entry.length>=2))return value;
+return value.map((entry,index)=>[String(index),entry]);
+}
+if(typeof value.entries==="function"){
+try{return Array.from(value.entries());}catch{return[];}
+}
+if(typeof value==="object")return Object.entries(value);
+return[];
+}
+function sessionIdOf(value,fallback){
+const source=object(value);
+return text(source.sessionId,text(source.id,text(fallback,null)));
+}
+function currentSessionIdOf(snapshot){
+const source=object(snapshot);
+const explicit=text(source.current,null);
+if(explicit!==null)return explicit;
+const currentObject=sessionIdOf(source.current,null);
+if(currentObject!==null)return currentObject;
+if(source.current===null)return null;
+const named=text(source.currentSessionId,text(source.activeSessionId,null));
+if(named!==null)return named;
+for(const[fallback,value]of sessionEntries(source.byId??source.sessions)){
+const summary=object(value);
+const retainedBy=object(summary.retainedBy);
+const mainView=retainedBy.mainView;
+if((typeof mainView==="number"&&mainView>0)||mainView===true){
+return sessionIdOf(summary,fallback);
+}
+}
+return null;
+}
+function listSnapshot(deps,ctx){
+const sessions=deps.sessions||ctx?.sessions;
+const list=sessions?.list;
+if(typeof list?.getSnapshot==="function"){
+try{return list.getSnapshot()||{};}catch{return{};}
+}
+if(typeof sessions?.getSnapshot==="function"){
+try{return sessions.getSnapshot()||{};}catch{return{};}
+}
+return sessions?.snapshot||{};
+}
+function subscribeSessions(deps,ctx,listener){
+const sessions=deps.sessions||ctx?.sessions;
+const list=sessions?.list;
+if(typeof list?.subscribe==="function"){
+try{return list.subscribe(listener);}catch{return()=>{};}
+}
+if(typeof sessions?.subscribe==="function"){
+try{return sessions.subscribe(listener);}catch{return()=>{};}
+}
+return()=>{};
+}
+function getOpenSession(deps,ctx){
+const workspace=resolveClientService([deps,ctx,deps?.ctx],"uiWorkspace");
+const openWorkspaceSession=methodOf(workspace,"openSession");
+if(openWorkspaceSession!==null){
+return{
+open:(target)=>openWorkspaceSession.call(workspace,target),
+acceptsAddress:true,
+available:true,
+};
+}
+return{open:()=>{},acceptsAddress:false,available:false};
+}
+function capabilityAllowed(node,action){
+const capabilities=object(object(node).capabilities);
+const entry=object(capabilities[action]);
+return typeof entry.allowed==="boolean"?entry.allowed:null;
+}
+function runtimeStatusOf(node,entry,options){
+const model=modelApi();
+if(typeof model.runtimeStatusOf==="function")return model.runtimeStatusOf(node,entry,options);
+if(options?.partial===true&&object(node).running!==true)return"unknown";
+return object(node).running===true?"running":"ready";
+}
+function createCatalogLookup(snapshot){
+const tables=new Map();
+const tableFor=(parentId)=>{
+const cached=tables.get(parentId);
+if(cached!==undefined)return cached;
+const table=new Map();
+const projection=object(object(object(snapshot).projectionsBySession)[parentId]);
+const values=object(projection.values);
+const entries=Array.isArray(values.subagentCatalog)?values.subagentCatalog:[];
+for(const entry of entries){
+const source=object(entry);
+if(source.kind==="diagnostic")continue;
+const id=text(source.id,text(source.sessionId,null));
+if(id!==null&&!table.has(id))table.set(id,withSessionActivity(source,snapshot,id));
+}
+tables.set(parentId,table);
+return table;
+};
+return(parentId,childId)=>{
+if(parentId===null||childId===null)return null;
+const table=tableFor(parentId);
+return table.has(childId)?table.get(childId):null;
+};
+}
+const CATALOG_ACTIVITIES=new Set(["running","inactive"]);
+function withSessionActivity(entry,snapshot,sessionId){
+if(CATALOG_ACTIVITIES.has(text(entry.activity,null))===true)return entry;
+const running=sessionRunningOf(snapshot,sessionId);
+if(running===null)return entry;
+return{...entry,activity:running?"running":"inactive"};
+}
+function sessionRunningOf(snapshot,sessionId){
+if(sessionId===null)return null;
+const summary=object(object(object(snapshot).byId)[sessionId]);
+return typeof summary.running==="boolean"?summary.running:null;
+}
+function metadataOf(node,roleLabels){
+const model=modelApi();
+if(typeof model.formatExpertMetadata==="function")return model.formatExpertMetadata(node,{roleLabels});
+const source=object(node);
+return[text(source.role,source.kind==="root"?"Orchestrator":"Expert"),text(source.provider,"未知供应商"),text(source.model,"未知模型"),text(source.effort,"默认")].join(" · ");
+}
+function titleOf(node){
+const source=object(node);
+if(source.kind==="fanout"){
+const role=text(source.role,"Expert");
+const count=Array.isArray(source.shards)?source.shards.length:0;
+return role.charAt(0).toUpperCase()+role.slice(1)+" · "+count+" shards · "+RUNTIME_STATUS_LABELS[runtimeStatusOf(source,null)];
+}
+if(source.kind==="root")return"主代理";
+return text(source.taskName,"未命名任务");
+}
+function makeIcon(primitives,name,props){
+const Icon=primitives?.[name]||primitives?.IconWarningOutlineRegular;
+return typeof Icon==="function"?Icon(props||{size:14}):null;
+}
+function createBrandIcon(react,primitives){
+if(typeof primitives?.IconUsersOutlineRegular==="function")return primitives.IconUsersOutlineRegular;
+if(typeof react?.createElement!=="function")return null;
+return function DegBrandIcon(props){
+const size=props?.size??16;
+return react.createElement("svg",{
+width:size,
+height:size,
+viewBox:"0 0 16 16",
+fill:"none",
+className:props?.className,
+"aria-hidden":"true",
+strokeWidth:1,
+xmlns:"http://www.w3.org/2000/svg",
+},...BRAND_ICON_PATHS.map((d)=>react.createElement("path",{
+key:d,
+d,
+stroke:"currentColor",
+fill:"none",
+})));
+};
+}
+function stateDotOf(react,primitives,status){
+const StateDot=primitives?.StateDot;
+if(typeof StateDot==="function"){
+return react.createElement(StateDot,{state:RUNTIME_STATE_DOT[status]||RUNTIME_STATE_DOT.ready});
+}
+return react.createElement("span",{
+className:"deg_expert_group_state_dot",
+"data-state":status,
+"aria-hidden":"true",
+});
+}
+function statusIcon(react,primitives,status){
+const label=RUNTIME_STATUS_LABELS[status]||RUNTIME_STATUS_LABELS.ready;
+return react.createElement("span",{
+className:"deg_expert_group_status_icon",
+role:"img",
+"aria-label":label,
+title:label,
+"data-status":status,
+},stateDotOf(react,primitives,status));
+}
+const PANEL_CSS_SHELL=[
+".deg_expert_group{position:relative;display:flex;flex-direction:column;min-width:0;height:100%;overflow:auto;padding:8px 10px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1,transparent);font-size:12px;line-height:16px}",
+".deg_expert_group_header{display:flex;flex-wrap:wrap;align-items:center;min-height:28px;gap:6px;border-bottom:1px solid var(--dsw-alias-border-l2);font-weight:600}",
+".deg_expert_group_header_title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+".deg_expert_group_partial{flex:0 0 auto;box-sizing:border-box;padding:0 4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);border-radius:4px;color:var(--dsw-alias-state-warning-primary,#f59e0b);font-size:11px;font-weight:600;line-height:14px;white-space:nowrap}",
+".deg_expert_group_updated{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px;font-weight:400;font-variant-numeric:tabular-nums}",
+".deg_expert_group_header_action,.deg_expert_group_chevron,.deg_expert_group_action,.deg_expert_group_sidebar_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}",
+".deg_expert_group_header_action{width:24px;height:24px;margin-left:auto}",
+".deg_expert_group_header_auto{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;margin-left:8px;font-weight:400;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
+".deg_expert_group_header_auto_input{margin:0;cursor:pointer}",
+".deg_expert_group_header_auto_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+".deg_expert_group_header_auto_label{font-size:12px;line-height:16px}",
+".deg_expert_group_recovery{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin:6px 0 0;padding:6px 8px;border:1px solid var(--dsw-alias-state-error-primary,var(--dsw-alias-state-warning-primary,#f59e0b));border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-primary));font-weight:600}",
+".deg_expert_group_recovery_text{flex:1 1 140px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+".deg_expert_group_recovery_retry_error{flex:1 1 100%;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-weight:400}",
+".deg_expert_group_recovery_retry{flex:0 0 auto;box-sizing:border-box;height:24px;padding:0 8px;border:0;border-radius:5px;background:transparent;color:inherit;font-weight:600;cursor:pointer}",
+".deg_expert_group_recovery_retry:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}",
+".deg_expert_group_recovery_retry:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+".deg_expert_group_recovery_retry:disabled{cursor:default;opacity:.7}",
+".deg_expert_group_header_action:hover,.deg_expert_group_chevron:hover,.deg_expert_group_action:hover:not(:disabled),.deg_expert_group_sidebar_action:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+".deg_expert_group_header_action:focus-visible,.deg_expert_group_chevron:focus-visible,.deg_expert_group_action:focus-visible,.deg_expert_group_sidebar_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+".deg_expert_group_tree{min-width:0;padding-top:5px}",
+".deg_expert_group_tree_items{min-width:0}",
+".deg_expert_group_announcer{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}",
+".deg_expert_group_task:focus-visible,.deg_expert_group_fanout_title>.deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
+".deg_expert_group_resizer{position:absolute;top:0;left:0;bottom:0;width:6px;cursor:col-resize;touch-action:none;background:transparent;z-index:2}",
+".deg_expert_group_resizer:hover,.deg_expert_group_resizer[data-dragging=true]{background:var(--dsw-alias-interactive-bg-hover)}",
+".deg_expert_group_resizer:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:-2px}",
+".deg_expert_group_node{position:relative;min-width:0;padding-left:16px}",
+".deg_expert_group_node_root{padding-left:0}",
+".deg_expert_group_row{box-sizing:border-box;display:grid;grid-template-columns:20px 20px minmax(0,1fr);min-width:0;min-height:44px;padding:4px 0}",
+".deg_expert_group_row_main{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto 16px;min-width:0}",
+".deg_expert_group_task_line{grid-area:1 / 1;display:flex;align-items:center;min-width:0;gap:2px}",
+".deg_expert_group_meta{grid-area:2 / 1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:11px}",
+".deg_expert_group_sidebar_action{flex:0 0 30px;width:30px;height:20px;margin:-2px 0;padding:0;color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
+".deg_expert_group_sidebar_action:hover{color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
+".deg_expert_group_sidebar_action[data-open=true]{color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
+".deg_expert_group_sidebar_action[data-open=true]:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
+".deg_expert_group_double_arrow{display:inline-flex;align-items:center;justify-content:center;width:30px;height:20px;line-height:0}",
+".deg_expert_group_double_arrow>*+*{margin-left:-10px}",
+".deg_expert_group_double_arrow_icon path{stroke:currentColor;stroke-width:1.5;stroke-linejoin:round}",
+".deg_expert_group_line{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+".deg_expert_group_task{min-width:0;flex:0 1 auto;font-weight:600;cursor:pointer}",
+".deg_expert_group_shard_task{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere}",
+".deg_expert_group_task:hover{text-decoration:underline}",
+".deg_expert_group_chevron{width:20px;height:20px;padding:0;align-self:start}",
+".deg_expert_group_fanout_header>.deg_expert_group_chevron{align-self:center}",
+".deg_expert_group_chevron_placeholder{display:inline-block;width:20px;height:20px}",
+".deg_expert_group_status_icon{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;color:var(--dsw-alias-label-secondary)}",
+".deg_expert_group_state_dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor}",
+".deg_expert_group_state_dot[data-state=running]{color:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary))}",
+".deg_expert_group_state_dot[data-state=ready]{color:var(--dsw-alias-state-success-primary)}",
+".deg_expert_group_state_dot[data-state=unknown]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
+".deg_expert_group_trailing{display:flex;flex:0 0 30px;align-items:center;justify-content:center;width:30px;height:20px;min-width:30px}",
+".deg_expert_group_task_line_trailing{justify-content:flex-start}",
+".deg_expert_group_idle_title_line{display:flex;align-items:center;min-width:0;gap:2px}",
+".deg_expert_group_idle_title_line>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
+".deg_expert_group_sidebar_batch_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;flex:0 0 30px;width:30px;height:20px;margin:0;padding:0;border:0;border-radius:5px;background:transparent;cursor:pointer;color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
+".deg_expert_group_sidebar_batch_action:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
+".deg_expert_group_sidebar_batch_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+".deg_expert_group_sidebar_batch_action:disabled{opacity:.45;cursor:wait}",
+".deg_expert_group_sidebar_batch_zero{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary,#22d3ee))}",
+".deg_expert_group_children{position:relative;min-width:0;margin:0;padding:0;--deg-parent-row-height:44px}",
+".deg_expert_group_children>.deg_expert_group_node,.deg_expert_group_children>.deg_expert_group_fanout,.deg_expert_group_children>.deg_expert_group_idle_group{--deg-tree-anchor:14px;position:relative}",
+".deg_expert_group_children>.deg_expert_group_fanout{--deg-tree-anchor:14px}",
+".deg_expert_group_children>:first-child:before{position:absolute;top:calc(var(--deg-tree-anchor) - var(--deg-parent-row-height));bottom:calc(100% - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
+".deg_expert_group_children>:not(:last-child):after{position:absolute;top:var(--deg-tree-anchor);bottom:calc(0px - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
+".deg_expert_group_node>.deg_expert_group_row,.deg_expert_group_fanout_header,.deg_expert_group_idle_group>.deg_expert_group_row{position:relative}",
+".deg_expert_group_node:not(.deg_expert_group_node_root)>.deg_expert_group_row:before,.deg_expert_group_fanout_header:before,.deg_expert_group_idle_group>.deg_expert_group_row:before{position:absolute;top:var(--deg-tree-anchor,14px);left:-6px;width:16px;border-top:1px solid var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
+".deg_expert_group_row>*,.deg_expert_group_fanout_header>*{position:relative;z-index:1}",
+".deg_expert_group_idle_group{position:relative;min-width:0;padding-left:16px;--deg-tree-anchor:14px}",
+".deg_expert_group_idle_group>.deg_expert_group_children{margin:0;padding:0;--deg-parent-row-height:28px}",
+".deg_expert_group_idle_group>.deg_expert_group_row.deg_expert_group_idle_header{display:grid;grid-template-columns:20px 20px minmax(0,1fr);align-items:center;height:28px;min-height:28px;padding:4px 0}",
+".deg_expert_group_idle_group>.deg_expert_group_row{margin:0}",
+".deg_expert_group_fanout{position:relative;margin-top:0;padding-left:16px}",
+".deg_expert_group_fanout_header{display:grid;grid-template-columns:20px 20px minmax(0,1fr) auto;align-items:center;min-width:0;min-height:28px;gap:4px}",
+".deg_expert_group_fanout_shards{position:relative;min-width:0;--deg-parent-row-height:28px}",
+".deg_expert_group_fanout_shards>.deg_expert_group_shard{--deg-tree-anchor:13px;position:relative}",
+".deg_expert_group_fanout_shards>.deg_expert_group_shard:first-child:before{position:absolute;top:calc(var(--deg-tree-anchor) - var(--deg-parent-row-height));bottom:calc(100% - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
+".deg_expert_group_fanout_shards>.deg_expert_group_shard:not(:last-child):after{position:absolute;top:var(--deg-tree-anchor);bottom:calc(0px - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
+".deg_expert_group_shard{display:grid;grid-template-columns:20px 20px minmax(0,1fr) auto;min-width:0;min-height:48px;padding:3px 0;gap:0 3px}",
+".deg_expert_group_shard[data-expanded=false]{min-height:24px}",
+".deg_expert_group_actions{display:flex;align-items:flex-start;gap:2px}",
+".deg_expert_group_action{width:24px;height:24px;padding:0}",
+".deg_expert_group_action:disabled{opacity:.45;cursor:wait}",
+".deg_expert_group_empty{padding:16px 2px;color:var(--dsw-alias-label-secondary)}",
+".deg_expert_group_error_empty{display:flex;flex-direction:column;gap:2px;padding:16px 2px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}",
+".deg_expert_group_error_empty_title{font-weight:600}",
+".deg_expert_group_error_empty_detail{min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-size:11px}",
+".deg_expert_group_skeleton{height:52px;margin:4px 0;border-radius:5px;background:var(--dsw-alias-bg-layer-2,var(--dsw-alias-interactive-bg-hover));opacity:.65}",
+".deg_expert_group_error{display:flex;align-items:center;gap:4px;padding:6px 0;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));font-size:11px}",
+".deg_expert_group_count{margin-left:auto;color:var(--dsw-alias-label-secondary);font-size:11px;font-weight:400}",
+".deg_expert_group_cell{display:flex;flex-direction:column;min-width:0}",
+".deg_expert_group_metrics{display:flex;flex-wrap:wrap;align-items:center;gap:2px 0;min-width:0;padding:2px 0 0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
+".deg_expert_group_metrics_part{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
+".deg_expert_group_metrics_separator{flex:0 0 auto;white-space:pre;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
+".deg_expert_group_metrics_part+.deg_expert_group_retry_warning{margin-left:6px}",
+".deg_expert_group_retry_warning{flex:0 0 auto;box-sizing:border-box;padding:0 4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);border-radius:4px;color:var(--dsw-alias-state-warning-primary,#f59e0b);font-weight:600;line-height:14px}",
+".deg_expert_group_failure{flex:1 1 100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
+".deg_expert_group_attempts{display:flex;flex-direction:column;gap:0;min-width:0;margin:2px 0;padding:0 0 0 6px;border-inline-start:1px solid var(--dsw-alias-border-l2)}",
+".deg_expert_group_attempt{display:flex;flex-direction:column;align-items:stretch;gap:0;min-width:0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}",
+".deg_expert_group_attempt_row{display:flex;align-items:center;gap:6px;min-width:0}",
+".deg_expert_group_attempt_usage{display:flex;flex-wrap:wrap;gap:0 6px;min-width:0;padding-left:2px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px}",
+".deg_expert_group_attempt_usage_tokens{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
+".deg_expert_group_attempt_cost{min-width:0;overflow-wrap:anywhere}",
+".deg_expert_group_attempt_cost[data-cost-configured=false]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
+".deg_expert_group_structured{min-width:0;margin:2px 0 0;padding:2px 4px;border-inline-start:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:15px;overflow-wrap:anywhere;max-height:84px;overflow:auto}",
+".deg_expert_group_structured[data-fallback=true]{border-inline-start-color:var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
+".deg_expert_group_shard_extra{display:flex;flex-direction:column;min-width:0}",
+].join("");
+const PANEL_CSS_SESSION_MODEL=[
+".deg_expert_group_session_model_dialog{position:fixed;inset:0;margin:auto;box-sizing:border-box;width:min(920px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100vh - 48px);padding:0;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;box-shadow:0 18px 48px rgba(0,0,0,.28);overflow:hidden}",
+".deg_expert_group_session_model_dialog[open]{display:flex;flex-direction:column}",
+".deg_expert_group_session_model_dialog::backdrop{background:rgba(0,0,0,.42)}",
+".deg_expert_group_session_model_header{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:0 0 auto;padding:12px 14px 6px;font-weight:600}",
+".deg_expert_group_session_model_title{flex:1 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;font-weight:600}",
+".deg_expert_group_session_model_body{flex:1 1 auto;min-height:0;overflow:auto;padding:0 14px 8px}",
+".deg_expert_group_session_model_hint{margin:0 0 8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}",
+".deg_expert_group_session_model_notice{margin:0 0 8px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
+".deg_expert_group_session_model_notice_error{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}",
+".deg_expert_group_session_model_scroll{overflow-x:auto}",
+".deg_expert_group_session_model_table{display:grid;grid-template-columns:minmax(84px,.6fr) minmax(132px,.82fr) minmax(210px,1.5fr) minmax(96px,.62fr);min-width:540px;align-items:center}",
+".deg_expert_group_session_model_row{display:contents}",
+".deg_expert_group_session_model_head_cell{min-width:0;padding:8px 6px 6px;border-bottom:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;font-weight:600}",
+".deg_expert_group_session_model_cell{display:flex;align-items:center;min-width:0;padding:8px 6px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
+".deg_expert_group_session_model_cell select{width:100%;min-width:0;box-sizing:border-box;padding:5px 6px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2,transparent);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}",
+".deg_expert_group_session_model_cell select:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}",
+".deg_expert_group_session_model_cell select:disabled{opacity:.5;cursor:not-allowed}",
+".deg_expert_group_session_model_pill{display:flex;align-items:center;justify-content:space-between;gap:4px;flex:0 0 74px;width:74px;height:28px;min-height:28px;padding:2px 4px 2px 6px;box-sizing:border-box;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}",
+".deg_expert_group_session_model_pill_label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+".deg_expert_group_session_model_clear{display:inline-flex;align-items:center;justify-content:center;flex:0 0 16px;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:16px;cursor:pointer}",
+".deg_expert_group_session_model_clear:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+".deg_expert_group_session_model_clear:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}",
+".deg_expert_group_session_model_clear:disabled{opacity:.4;cursor:not-allowed}",
+".deg_expert_group_session_model_footer{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:0 0 auto;padding:10px 14px;border-top:1px solid var(--dsw-alias-border-l2)}",
+".deg_expert_group_session_model_revision{flex:0 1 auto;min-width:0;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums;font-size:12px}",
+".deg_expert_group_session_model_invalid{flex:1 1 160px;min-width:0;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));font-size:12px;line-height:18px;overflow-wrap:anywhere}",
+".deg_expert_group_session_model_spacer{flex:1 1 auto}",
+".deg_expert_group_session_model_primary{box-sizing:border-box;height:28px;padding:0 12px;border:1px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-radius:6px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));color:var(--dsw-alias-bg-layer-1,#fff);font:inherit;font-size:12px;font-weight:600;cursor:pointer}",
+".deg_expert_group_session_model_primary:disabled{opacity:.45;cursor:not-allowed}",
+].join("");
+const PANEL_CSS_TIMELINE=[
+".deg_expert_group_attempt_index{flex:0 0 auto;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums}",
+".deg_expert_group_attempt_status{flex:0 0 auto;font-weight:600}",
+".deg_expert_group_attempt[data-status=failed] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=timed_out] .deg_expert_group_attempt_status,.deg_expert_group_attempt[data-status=interrupted] .deg_expert_group_attempt_status{color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-error,#f87171))}",
+".deg_expert_group_attempt_duration{flex:0 0 auto;font-variant-numeric:tabular-nums}",
+".deg_expert_group_attempt_time{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}",
+".deg_expert_group_attempts_toggle{flex:0 0 auto;align-self:flex-start;box-sizing:border-box;height:20px;margin:1px 0 0;padding:0 4px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
+".deg_expert_group_attempts_toggle:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+".deg_expert_group_attempts_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+".deg_expert_group_fanout_title{display:flex;flex-direction:column;min-width:0}",
+".deg_expert_group_fanout_title>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
+".deg_expert_group_toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:5px 0 2px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
+".deg_expert_group_search{flex:1 1 120px;min-width:0;box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px}",
+".deg_expert_group_filter{flex:0 1 auto;min-width:0;box-sizing:border-box;height:24px;padding:0 2px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px;color-scheme:light}",
+"body[data-ds-dark-theme] .deg_expert_group_filter{color-scheme:dark}",
+".deg_expert_group_filter option{background-color:var(--dsw-alias-bg-layer-2,Canvas);color:var(--dsw-alias-label-primary,CanvasText)}",
+".deg_expert_group_search:focus-visible,.deg_expert_group_filter:focus-visible,.deg_expert_group_export_button:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
+".deg_expert_group_export_button{box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
+".deg_expert_group_export_button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+".deg_expert_group_filter_empty{padding:8px 2px;color:var(--dsw-alias-label-secondary);font-size:11px}",
+].join("");
+const PANEL_CSS_TEXT=PANEL_CSS_SHELL+PANEL_CSS_SESSION_MODEL+PANEL_CSS_TIMELINE;
+function styleTag(){
+if(typeof document==="undefined"||typeof document.createElement!=="function")return;
+if(document.querySelector?.("style[data-plugin-css=\""+STYLE_ID+"\"]")!==null)return;
+const tag=document.createElement("style");
+tag.dataset.plugin="dsh-expert-group";
+tag.dataset.pluginCss=STYLE_ID;
+tag.textContent=PANEL_CSS_TEXT;
+document.head?.appendChild(tag);
+}
+const RIGHTBAR_DRAG_HANDLE_SELECTOR="[data-side=rightbar]";
+function attributeOf(node,name){
+try{
+if(node===null||node===undefined||typeof node.getAttribute!=="function")return null;
+const raw=node.getAttribute(name);
+return typeof raw==="string"?raw:null;
+}catch{return null;}
+}
+function withinSameDockScope(node,root,boundaries){
+let parent=null;
+try{parent=node?.parentNode??null;}catch{return null;}
+let guard=0;
+while(parent!==null&&parent!==undefined&&parent!==root){
+guard+=1;
+if(guard>512)return null;
+if(typeof parent.getAttribute!=="function")return null;
+for(const name of boundaries){
+if(attributeOf(parent,name)!==null)return false;
+}
+try{parent=parent.parentNode??null;}catch{return null;}
+}
+return parent===root;
+}
+function hostHiddenStateOf(host){
+try{
+const value=host?.hidden;
+return typeof value==="boolean"?value:null;
+}catch{return null;}
+}
+function cellStripNodesOf(column){
+const hosts=column?.hosts??null;
+if(!Array.isArray(hosts)||hosts.length===0)return null;
+let activeStrip=null;
+let activeCount=0;
+for(const host of hosts){
+if(host===null||host===undefined||typeof host.querySelectorAll!=="function")return null;
+const hidden=hostHiddenStateOf(host);
+if(hidden===null)return null;
+let nodes=null;
+try{nodes=Array.from(host.querySelectorAll(RIGHTBAR_STRIP_TABS_SELECTOR));}catch{return null;}
+const owned=[];
+for(const node of nodes){
+const scoped=withinSameDockScope(node,host,[RIGHTBAR_DOCK_HOST_ATTRIBUTE,RIGHTBAR_SPLIT_ATTRIBUTE]);
+if(scoped===null)return null;
+if(scoped===true)owned.push(node);
+}
+if(hidden===true){
+if(owned.length!==0)return null;
+continue;
+}
+if(owned.length!==1)return null;
+activeCount+=1;
+if(activeCount>1)return null;
+activeStrip=owned[0];
+}
+if(activeCount!==1||activeStrip===null)return null;
+return[activeStrip];
+}
+function cellTabIdsOf(column){
+const ids=new Set();
+const strips=cellStripNodesOf(column);
+if(strips===null||strips.length!==1)return{ids,readable:false};
+const strip=strips[0];
+if(typeof strip.querySelectorAll!=="function")return{ids,readable:false};
+let tabNodes=null;
+try{tabNodes=Array.from(strip.querySelectorAll(RIGHTBAR_TAB_SELECTOR));}catch{return{ids,readable:false};}
+for(const node of tabNodes){
+const scoped=withinSameDockScope(node,strip,[RIGHTBAR_STRIP_TABS_ATTRIBUTE]);
+if(scoped===null)return{ids,readable:false};
+if(scoped!==true)continue;
+const tabId=text(attributeOf(node,RIGHTBAR_TAB_ID_ATTRIBUTE),null);
+if(tabId===null)return{ids,readable:false};
+if(ids.has(tabId))return{ids,readable:false};
+ids.add(tabId);
+}
+if(ids.size===0)return{ids,readable:false};
+return{ids,readable:true};
+}
+function expertGroupTabIdsOf(inventory,sessionId){
+const expertTabIds=new Set(EXPERT_GROUP_TAB_IDS);
+if(!Array.isArray(inventory)||typeof sessionId!=="string"||sessionId==="")return expertTabIds;
+for(const entry of inventory){
+try{
+const candidate=object(entry);
+if(text(candidate.sessionId,null)!==sessionId)continue;
+if(!EXPERT_GROUP_TAB_IDS.has(text(candidate.kind,null)))continue;
+const tabId=text(candidate.tabId,null);
+if(tabId!==null)expertTabIds.add(tabId);
+}catch{
+}
+}
+return expertTabIds;
+}
+function paneNodesOf(panel){
+if(panel===null||panel===undefined||typeof panel.querySelectorAll!=="function")return null;
+try{return Array.from(panel.querySelectorAll(RIGHTBAR_PANE_SELECTOR));}catch{return null;}
+}
+function tabKindsForSession(inventory,sessionId){
+if(!Array.isArray(inventory)||typeof sessionId!=="string"||sessionId==="")return null;
+const tabKinds=new Map();
+for(const entry of inventory){
+try{
+const candidate=object(entry);
+if(text(candidate.sessionId,null)!==sessionId)continue;
+const tabId=text(candidate.tabId,null);
+const kind=text(candidate.kind,text(candidate.type,null));
+if(tabId===null||kind===null)continue;
+const previous=tabKinds.get(tabId);
+if(previous!==undefined&&previous!==kind)return null;
+tabKinds.set(tabId,kind);
+}catch{
+}
+}
+return tabKinds;
+}
+function sidebarTabSetsForSession(inventory,sessionId){
+const tabKinds=tabKindsForSession(inventory,sessionId);
+if(tabKinds===null)return null;
+const expert=new Set(EXPERT_GROUP_TAB_IDS);
+const known=new Set(EXPERT_GROUP_TAB_IDS);
+for(const[tabId,kind]of tabKinds){
+known.add(tabId);
+if(EXPERT_GROUP_TAB_IDS.has(kind))expert.add(tabId);
+}
+return{expert,known};
+}
+function rightbarPanelForSession(doc,sessionId){
+if(doc===null||doc===undefined||typeof doc.querySelectorAll!=="function")return null;
+if(typeof sessionId!=="string"||sessionId==="")return null;
+let nodes=null;
+try{nodes=Array.from(doc.querySelectorAll(RIGHTBAR_PANEL_SELECTOR));}catch{return null;}
+let matched=null;
+for(const node of nodes){
+if(attributeOf(node,RIGHTBAR_PANEL_SESSION_ATTRIBUTE)!==sessionId)continue;
+if(matched!==null)return null;
+matched=node;
+}
+return matched;
+}
+function rightbarPanelForSessionCompat(doc,sessionId){
+const panel=rightbarPanelForSession(doc,sessionId);
+if(panel!==null)return panel;
+if(doc===null||doc===undefined||typeof doc.querySelectorAll!=="function")return null;
+let nodes=null;
+try{nodes=Array.from(doc.querySelectorAll(RIGHTBAR_PANEL_SELECTOR));}catch{return null;}
+if(nodes.length>1)return null;
+for(const node of nodes){
+if(attributeOf(node,RIGHTBAR_PANEL_SESSION_ATTRIBUTE)!==null)return null;
+}
+if(nodes.length===1)return nodes[0];
+if(typeof doc.querySelector!=="function")return null;
+let single=null;
+try{single=doc.querySelector(RIGHTBAR_PANEL_SELECTOR)??null;}catch{return null;}
+if(single===null||single===undefined)return null;
+if(attributeOf(single,RIGHTBAR_PANEL_SESSION_ATTRIBUTE)!==null)return null;
+return single;
+}
+function dockCellsOf(split){
+const cells=[];
+let children=null;
+try{children=split?.children??null;}catch{children=null;}
+if(children===null||children===undefined)return{cells,readable:false};
+const byColumn=new Map();
+for(const child of Array.from(children)){
+if(child===null||typeof child.getAttribute!=="function")return{cells,readable:false};
+if(attributeOf(child,RIGHTBAR_DOCK_HOST_ATTRIBUTE)!==RIGHTBAR_DOCK_HOST_VALUE)continue;
+const column=text(attributeOf(child,RIGHTBAR_PANE_COLUMN_ATTRIBUTE),null);
+if(column===null)return{cells,readable:false};
+const merged=byColumn.get(column);
+if(merged===undefined)byColumn.set(column,{column,hosts:[child]});
+else merged.hosts.push(child);
+}
+for(const entry of byColumn.values())cells.push(entry);
+return{cells,readable:true};
+}
+function splitOwnsExpertPair(split,tabSets){
+if(tabSets===null||tabSets===undefined||typeof tabSets!=="object")return false;
+const breakdown=dockCellsOf(split);
+if(breakdown.readable!==true||breakdown.cells.length!==2)return false;
+const byColumn=new Map(breakdown.cells.map((entry)=>[entry.column,entry]));
+if(!byColumn.has("0")||!byColumn.has("1"))return false;
+const expertTabs=cellTabIdsOf(byColumn.get("0"));
+const otherTabs=cellTabIdsOf(byColumn.get("1"));
+if(expertTabs.readable!==true||otherTabs.readable!==true)return false;
+let expertCount=0;
+for(const tabId of expertTabs.ids){
+if(otherTabs.ids.has(tabId))return false;
+if(tabSets.known.has(tabId)!==true)return false;
+if(tabSets.expert.has(tabId)!==true)return false;
+expertCount+=1;
+}
+if(expertCount===0)return false;
+for(const tabId of otherTabs.ids){
+if(tabSets.known.has(tabId)!==true)return false;
+if(tabSets.expert.has(tabId)===true)return false;
+}
+return true;
+}
+function cellPendingStateOf(column){
+const hosts=column?.hosts??null;
+if(!Array.isArray(hosts)||hosts.length===0)return"foreign";
+let activeStrip=null;
+let activeCount=0;
+for(const host of hosts){
+if(host===null||host===undefined||typeof host.querySelectorAll!=="function")return"foreign";
+const hidden=hostHiddenStateOf(host);
+if(hidden===null)return"foreign";
+let nodes=null;
+try{nodes=Array.from(host.querySelectorAll(RIGHTBAR_STRIP_TABS_SELECTOR));}catch{return"foreign";}
+const owned=[];
+for(const node of nodes){
+const scoped=withinSameDockScope(node,host,[RIGHTBAR_DOCK_HOST_ATTRIBUTE,RIGHTBAR_SPLIT_ATTRIBUTE]);
+if(scoped===null)return"foreign";
+if(scoped===true)owned.push(node);
+}
+if(hidden===true){
+if(owned.length!==0)return"foreign";
+continue;
+}
+if(owned.length!==1)return"foreign";
+activeCount+=1;
+if(activeCount>1)return"foreign";
+activeStrip=owned[0];
+}
+if(activeCount!==1||activeStrip===null)return"unavailable";
+return cellTabIdsOf(column).readable===true?"readable":"foreign";
+}
+function splitPairPendingOf(split,tabSets){
+if(tabSets===null||tabSets===undefined||typeof tabSets!=="object")return"foreign";
+const breakdown=dockCellsOf(split);
+if(breakdown.readable!==true||breakdown.cells.length!==2)return"foreign";
+const byColumn=new Map(breakdown.cells.map((entry)=>[entry.column,entry]));
+if(!byColumn.has("0")||!byColumn.has("1"))return"foreign";
+const expertTabs=cellTabIdsOf(byColumn.get("0"));
+if(expertTabs.readable!==true||expertTabs.ids.size===0)return"foreign";
+for(const tabId of expertTabs.ids){
+if(tabSets.known.has(tabId)!==true)return"foreign";
+if(tabSets.expert.has(tabId)!==true)return"foreign";
+}
+return cellPendingStateOf(byColumn.get("1"))==="unavailable"?"unavailable":"foreign";
+}
+function uniqueSplitBy(panel,matches){
+if(panel===null||panel===undefined||typeof panel.querySelectorAll!=="function")return[];
+let nodes=null;
+try{nodes=Array.from(panel.querySelectorAll(RIGHTBAR_SPLIT_SELECTOR));}catch{return[];}
+const resolved=[];
+for(const node of nodes){
+if(matches(node)!==true)continue;
+resolved.push(node);
+if(resolved.length>1)break;
+}
+return resolved;
+}
+function resolveSplitContainer(panel,tabSets){
+const resolved=uniqueSplitBy(panel,(node)=>splitOwnsExpertPair(node,tabSets)===true);
+return resolved.length===1?resolved[0]:null;
+}
+function splitPairPendingContainers(panel,tabSets){
+return uniqueSplitBy(panel,(node)=>splitPairPendingOf(node,tabSets)==="unavailable");
+}
+function parseSplitTracks(raw){
+const value=typeof raw==="string"?raw.trim():"";
+if(value==="")return null;
+const tracks=[];
+let depth=0;
+let current="";
+for(const character of value){
+if(character==="(")depth+=1;
+else if(character===")")depth-=1;
+if(depth<0)return null;
+if(depth===0&&/\s/.test(character)){
+if(current!==""){tracks.push(current);current="";}
+continue;
+}
+current+=character;
+}
+if(depth!==0||current==="")return null;
+tracks.push(current);
+if(tracks.length!==3)return null;
+const first=splitEndTrackFr(tracks[0]);
+const last=splitEndTrackFr(tracks[2]);
+if(first===null||last===null)return null;
+return{first,last,middle:tracks[1]};
+}
+function splitEndTrackFr(track){
+const match=/^minmax\(\s*0(?:px)?\s*,\s*(\d+(?:\.\d+)?)fr\s*\)$/.exec(track);
+if(match===null)return null;
+const value=Number(match[1]);
+return Number.isFinite(value)?value:null;
+}
+global[SYMBOL]=Object.freeze({
+RIGHTBAR_DRAG_HANDLE_SELECTOR,SUBAGENT_CHAT_KIND,capabilityAllowed,createBrandIcon,
+createCatalogLookup,currentSessionIdOf,expertGroupTabIdsOf,getOpenSession,
+hostAppFrameWidthOf,listSnapshot,makeIcon,metadataOf,
+methodOf,normalizeSubagentAddress,paneNodesOf,parseSplitTracks,
+resolveClientService,resolveSplitContainer,rightbarPanelForSession,rightbarPanelForSessionCompat,
+runtimeStatusOf,sidebarTabCloseKey,sidebarTabKey,sidebarTabSetsForSession,
+splitPairPendingContainers,statusIcon,styleTag,subagentChatAddress,
+subscribeSessions,titleOf,viewportWidthOf,
+});
+})(globalThis);
+/* source: client-sidebar-poll.js */
+(function installClientSidebarPoll(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-poll");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+modelApi,object,text,
+}=PURE;
+function snapshotContentEquals(left,right){
+if(Object.is(left,right))return true;
+if(left===null||right===null||typeof left!=="object"||typeof right!=="object")return false;
+if(Array.isArray(left)||Array.isArray(right)){
+if(Array.isArray(left)!==Array.isArray(right)||left.length!==right.length)return false;
+for(let index=0;index<left.length;index+=1){
+if(snapshotContentEquals(left[index],right[index])!==true)return false;
+}
+return true;
+}
+const leftKeys=Object.keys(left);
+const rightKeys=Object.keys(right);
+if(leftKeys.length!==rightKeys.length)return false;
+for(const key of leftKeys){
+if(Object.prototype.hasOwnProperty.call(right,key)!==true)return false;
+if(snapshotContentEquals(left[key],right[key])!==true)return false;
+}
+return true;
+}
+function samePanelSnapshot(left,right){
+if(left===right)return true;
+if(left===null||left===undefined||right===null||right===undefined)return false;
+return left.schemaVersion===right.schemaVersion
+&&left.sessionId===right.sessionId
+&&left.rootSessionId===right.rootSessionId
+&&(left.partial===true)===(right.partial===true)
+&&snapshotContentEquals(left.recovery??null,right.recovery??null)
+&&snapshotContentEquals(left.root,right.root);
+}
+const PANEL_POLL_TIMINGS=Object.freeze({
+activeMs:2500,
+idleStepsMs:Object.freeze([2500,5000,10000,20000,30000]),
+failureBaseMs:1000,
+failureMaxMs:30000,
+});
+function panelFailureDelayMs(failureCount){
+const count=Number.isSafeInteger(failureCount)&&failureCount>0?failureCount:0;
+if(count===0)return 0;
+const exponential=PANEL_POLL_TIMINGS.failureBaseMs*Math.pow(2,Math.min(count-1,16));
+return Math.min(exponential,PANEL_POLL_TIMINGS.failureMaxMs);
+}
+function panelIdleDelayMs(idleLevel){
+const steps=PANEL_POLL_TIMINGS.idleStepsMs;
+const level=Number.isSafeInteger(idleLevel)&&idleLevel>0?idleLevel:0;
+return steps[Math.min(level,steps.length-1)];
+}
+function panelNextPollDelayMs(state){
+const source=object(state);
+const failureDelay=panelFailureDelayMs(source.failureCount);
+if(failureDelay>0)return failureDelay;
+if(source.running!==false)return PANEL_POLL_TIMINGS.activeMs;
+return panelIdleDelayMs(source.idleLevel);
+}
+function readFanoutEventBatch(raw){
+const source=object(raw);
+const events=Array.isArray(source.events)?source.events:null;
+const cursor=Number.isSafeInteger(source.cursor)&&source.cursor>=0?source.cursor:null;
+const earliestSequence=Number.isSafeInteger(source.earliestSequence)&&source.earliestSequence>0
+?source.earliestSequence
+:null;
+return{
+events,
+cursor,
+earliestSequence,
+gap:source.gap===true,
+dropped:Number.isSafeInteger(source.dropped)&&source.dropped>0?source.dropped:0,
+conclusive:events!==null,
+};
+}
+function fanoutBatchIsStale(batch,cursor){
+if(batch===null||batch===undefined)return false;
+if(batch.gap===true)return true;
+if(batch.earliestSequence===null||batch.earliestSequence===undefined)return false;
+const after=Number.isSafeInteger(cursor)&&cursor>=0?cursor:0;
+return batch.earliestSequence>1&&after<batch.earliestSequence;
+}
+function snapshotHasRunningWork(snapshot){
+if(snapshot===null||typeof snapshot!=="object")return false;
+if(snapshot.partial===true)return true;
+const model=modelApi();
+const runtimeStatusOf=typeof model.runtimeStatusOf==="function"?model.runtimeStatusOf:null;
+if(runtimeStatusOf===null)return false;
+const pending=[snapshot.root];
+let visited=0;
+while(pending.length>0&&visited<4096){
+const node=pending.pop();
+visited+=1;
+if(node===null||typeof node!=="object")continue;
+let status;
+try{status=runtimeStatusOf(node,undefined,{});}catch{status="unknown";}
+if(status==="running")return true;
+if(Array.isArray(node.children))for(const child of node.children)pending.push(child);
+if(Array.isArray(node.shards))for(const shard of node.shards)pending.push(shard);
+}
+return false;
+}
+function readPanelTabActivity(deps,props,tabInfo){
+const injected=deps?.isTabActive;
+if(typeof injected==="function"){
+try{
+const value=injected();
+if(value===true||value===false)return value;
+}catch{/* 注入读面抛错：按未知处理，退回文档可见性。 */}
+}
+for(const candidate of[tabInfo,tabInfo?.tab]){
+const source=object(candidate);
+if(source.active===true||source.active===false)return source.active;
+if(source.isActive===true||source.isActive===false)return source.isActive;
+}
+return null;
+}
+function applyPanelPollCycle(scheduler,cycle,latestSnapshot){
+if(scheduler===null||scheduler===undefined)return;
+if(cycle===null||cycle===undefined||typeof cycle!=="object")return;
+const id=Number.isSafeInteger(cycle.id)?cycle.id:null;
+if(id!==null){
+if(id<=scheduler.lastCycleId)return;
+scheduler.lastCycleId=id;
+}
+if(cycle.cancelled===true)return;
+if(cycle.ok===true){
+scheduler.failureCount=0;
+const effective=cycle.snapshot===null||cycle.snapshot===undefined?latestSnapshot:cycle.snapshot;
+if(snapshotHasRunningWork(effective)){
+scheduler.running=true;
+scheduler.idleLevel=0;
+}else{
+scheduler.running=false;
+scheduler.idleLevel=Math.min(
+scheduler.idleLevel+1,
+PANEL_POLL_TIMINGS.idleStepsMs.length-1,
+);
+}
+}else{
+scheduler.failureCount=Math.min(scheduler.failureCount+1,16);
+}
+scheduler.delay=panelNextPollDelayMs(scheduler);
+}
+const PANEL_ERROR_SOURCES=Object.freeze({
+snapshot:"snapshot",
+action:"action",
+rpc:"rpc",
+});
+const RPC_FAILURE_KIND=Symbol.for("dsh-expert-group/rpc-failure-kind");
+const RPC_FAILURE_TRANSPORT="rpc";
+function markRpcTransportFailure(error){
+const failure=error!==null&&typeof error==="object"
+?error
+:new Error(error===undefined||error===null?"RPC 请求失败":String(error));
+try{
+Object.defineProperty(failure,RPC_FAILURE_KIND,{
+value:RPC_FAILURE_TRANSPORT,
+configurable:true,
+enumerable:false,
+writable:false,
+});
+}catch{/* 冻结对象：保留原错误，分类按 action 处理。 */}
+return failure;
+}
+function rpcFailureKindOf(error){
+if(error===null||typeof error!=="object")return null;
+try{
+return error[RPC_FAILURE_KIND]===RPC_FAILURE_TRANSPORT?RPC_FAILURE_TRANSPORT:null;
+}catch{return null;}
+}
+function rpcBusinessError(errorBlock){
+const block=object(errorBlock);
+const error=new Error(text(block.message,"RPC 请求失败"));
+try{
+Object.defineProperty(error,"code",{
+value:text(block.code,null),
+configurable:true,
+enumerable:false,
+writable:false,
+});
+Object.defineProperty(error,"details",{
+value:block.details,
+configurable:true,
+enumerable:false,
+writable:false,
+});
+}catch{/* 冻结/不可扩展错误对象：保留 message 即可。 */}
+return error;
+}
+function formatPanelUpdatedTime(value){
+const at=Number(value);
+if(Number.isFinite(at)!==true||at<=0)return null;
+const date=new Date(at);
+if(Number.isNaN(date.getTime())===true)return null;
+const pad=(part)=>(part<10?"0"+part:String(part));
+return pad(date.getHours())+":"+pad(date.getMinutes())+":"+pad(date.getSeconds());
+}
+const RPC_ADAPTER_PROTOCOL_FIELD="rpcAdapterProtocol";
+const RPC_ADAPTER_PROTOCOLS=Object.freeze({
+object:"object",
+"connection-first":"connection-first",
+"request-first":"request-first",
+});
+function rpcAdapterProtocolOf(deps){
+const declared=deps?.[RPC_ADAPTER_PROTOCOL_FIELD];
+if(declared===undefined||declared===null||declared==="")return RPC_ADAPTER_PROTOCOLS["connection-first"];
+if(typeof declared!=="string")throw new TypeError("RPC adapter 协议标识必须是字符串");
+const protocol=declared.trim();
+if(protocol==="")return RPC_ADAPTER_PROTOCOLS["connection-first"];
+if(protocol===RPC_ADAPTER_PROTOCOLS.object
+||protocol===RPC_ADAPTER_PROTOCOLS["connection-first"]
+||protocol===RPC_ADAPTER_PROTOCOLS["request-first"])return protocol;
+throw new Error("未知的 RPC adapter 协议："+protocol);
+}
+function rpcAdapterArguments(protocol,ctx,request,init){
+const connection=ctx?.connection;
+if(protocol===RPC_ADAPTER_PROTOCOLS.object)return[{connection,request,init}];
+if(protocol===RPC_ADAPTER_PROTOCOLS["request-first"])return[request,connection,init];
+return[connection,request,init];
+}
+async function callRpc(deps,ctx,request,init={},select){
+const fn=deps.requestPluginRpc;
+if(typeof fn!=="function")throw markRpcTransportFailure(new Error("当前 DSH 未提供插件 RPC"));
+let protocol;
+try{
+protocol=rpcAdapterProtocolOf(deps);
+}catch(error){
+throw markRpcTransportFailure(error);
+}
+let response;
+try{
+response=await fn(...rpcAdapterArguments(protocol,ctx,request,init));
+}catch(error){
+throw markRpcTransportFailure(error);
+}
+if(response?.ok===false)throw rpcBusinessError(response.error);
+if(typeof response?.json==="function"){
+let payload;
+try{
+payload=await response.json();
+}catch(error){
+throw markRpcTransportFailure(error);
+}
+if(payload?.ok===false)throw rpcBusinessError(payload.error);
+const body=payload?.value??payload;
+return typeof select==="function"?select(body):(body?.snapshot??body);
+}
+if(response?.value!==undefined){
+if(typeof select==="function")return select(response.value);
+return response.value?.snapshot??response.value;
+}
+return typeof select==="function"?select(response):(response?.snapshot??response);
+}
+global[SYMBOL]=Object.freeze({
+PANEL_ERROR_SOURCES,PANEL_POLL_TIMINGS,RPC_FAILURE_TRANSPORT,applyPanelPollCycle,
+callRpc,fanoutBatchIsStale,formatPanelUpdatedTime,panelNextPollDelayMs,
+readFanoutEventBatch,readPanelTabActivity,rpcFailureKindOf,samePanelSnapshot,
+});
+})(globalThis);
+/* source: client-sidebar-layout.js */
+(function installClientSidebarLayout(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-layout");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+SIDEBAR_SPLIT_EXPERT_TRACK,SIDEBAR_SPLIT_GAP_TRACK,SIDEBAR_SPLIT_OTHER_TRACK,SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS,SIDEBAR_SPLIT_PENDING_RETRY_DELAY_MS,SIDEBAR_SPLIT_TRACK_PROPERTY,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+RIGHTBAR_DRAG_HANDLE_SELECTOR,parseSplitTracks,
+}=DOM;
+function createRightbarDragLock(){
+const HANDLE_STYLE_WRITES=Object.freeze([
+{name:"pointer-events",value:"none"},
+{name:"cursor",value:"default"},
+]);
+let locked=false;
+let element=null;
+let previous=null;
+const readHandle=()=>{
+try{
+const doc=globalThis.document;
+if(!doc||typeof doc.querySelector!=="function")return null;
+return doc.querySelector(RIGHTBAR_DRAG_HANDLE_SELECTOR)??null;
+}catch{return null;}
+};
+const readStyle=(style,name)=>{
+try{return typeof style.getPropertyValue==="function"?style.getPropertyValue(name):"";}catch{return"";}
+};
+const readPriority=(style,name)=>{
+try{return typeof style.getPropertyPriority==="function"?style.getPropertyPriority(name):"";}catch{return"";}
+};
+const restore=()=>{
+const target=element;
+const saved=previous;
+element=null;
+previous=null;
+if(target===null||saved===null)return;
+let style=null;
+try{style=target.style||null;}catch{style=null;}
+if(style===null)return;
+for(const entry of saved){
+try{
+if(readStyle(style,entry.name)!==entry.written)continue;
+if(readPriority(style,entry.name)!==entry.writtenPriority)continue;
+if(entry.value===""||entry.value===null||entry.value===undefined)style.removeProperty?.(entry.name);
+else style.setProperty(entry.name,entry.value,entry.priority||"");
+}catch{/* 单条属性还原失败不能阻断其它属性，最坏情况是宿主多留一条内联样式。 */}
+}
+};
+const apply=()=>{
+if(locked!==true)return false;
+const candidate=readHandle();
+if(candidate===null)return false;
+if(candidate!==element){
+element=candidate;
+previous=null;
+}
+let style=null;
+try{style=candidate.style||null;}catch{style=null;}
+if(style===null||typeof style.setProperty!=="function")return false;
+if(previous===null){
+previous=HANDLE_STYLE_WRITES.map(({name})=>({
+name,
+value:readStyle(style,name),
+priority:readPriority(style,name),
+written:null,
+writtenPriority:null,
+}));
+}
+HANDLE_STYLE_WRITES.forEach(({name,value},index)=>{
+if(readStyle(style,name)===value)return;
+try{
+style.setProperty(name,value,"important");
+previous[index].written=readStyle(style,name);
+previous[index].writtenPriority=readPriority(style,name);
+}catch{/* 写入失败：保留已经写上的那几条，绝不影响页面其它行为。 */}
+});
+return true;
+};
+return{
+setLocked(next){
+const target=next===true;
+if(target===locked){
+if(target)apply();
+return locked;
+}
+locked=target;
+if(target)apply();
+else restore();
+return locked;
+},
+isLocked:()=>locked,
+dispose(){
+locked=false;
+restore();
+},
+};
+}
+function createSplitTrackRatio(){
+let applied=null;
+let hostCapture=null;
+let disposed=false;
+let pending=null;
+let pendingRetryTimer=null;
+let lastReader=null;
+const readInline=(style,name,readerName)=>{
+try{
+if(style===null||style===undefined)return null;
+const reader=style[readerName];
+if(typeof reader!=="function")return null;
+const value=reader.call(style,name);
+return value===null||value===undefined?"":String(value);
+}catch{return null;}
+};
+const readValue=(style,name)=>readInline(style,name,"getPropertyValue");
+const readPriority=(style,name)=>readInline(style,name,"getPropertyPriority");
+const styleOf=(container)=>{
+try{
+const style=container?.style??null;
+if(style===null||typeof style.setProperty!=="function")return null;
+return style;
+}catch{return null;}
+};
+const composeDesired=(parsed)=>
+"minmax(0,"+SIDEBAR_SPLIT_EXPERT_TRACK+"fr) "
++(parsed===null?SIDEBAR_SPLIT_GAP_TRACK:parsed.middle)
++" minmax(0,"+SIDEBAR_SPLIT_OTHER_TRACK+"fr)";
+const captureHostStyle=(container)=>{
+if(hostCapture!==null&&hostCapture.container===container)return true;
+const style=styleOf(container);
+if(style===null)return false;
+const value=readValue(style,SIDEBAR_SPLIT_TRACK_PROPERTY);
+const priority=readPriority(style,SIDEBAR_SPLIT_TRACK_PROPERTY);
+if(value===null||priority===null)return false;
+hostCapture={container,value,priority};
+return true;
+};
+const shouldApply=(container,parsed,current)=>{
+if(hostCapture===null||hostCapture.container!==container)return true;
+if(current==="")return true;
+if(hostCapture.value===current)return true;
+return parsed!==null&&parsed.first===parsed.last;
+};
+const applyRatio=(container)=>{
+const style=styleOf(container);
+if(style===null)return false;
+const current=readValue(style,SIDEBAR_SPLIT_TRACK_PROPERTY);
+const currentPriority=readPriority(style,SIDEBAR_SPLIT_TRACK_PROPERTY);
+if(current===null||currentPriority===null)return false;
+const parsed=parseSplitTracks(current);
+if(current!==""&&parsed===null)return false;
+const desired=composeDesired(parsed);
+if(current===desired)return true;
+if(applied!==null&&applied.container===container
+&&current===applied.written&&currentPriority===applied.writtenPriority)return true;
+if(shouldApply(container,parsed,current)!==true)return false;
+if(captureHostStyle(container)!==true)return false;
+try{style.setProperty(SIDEBAR_SPLIT_TRACK_PROPERTY,desired,currentPriority);}catch{return false;}
+applied={
+container,
+written:readValue(style,SIDEBAR_SPLIT_TRACK_PROPERTY),
+writtenPriority:readPriority(style,SIDEBAR_SPLIT_TRACK_PROPERTY),
+};
+return true;
+};
+const restore=()=>{
+const entry=applied;
+applied=null;
+if(entry===null)return;
+const style=styleOf(entry.container);
+if(style===null)return;
+if(readValue(style,SIDEBAR_SPLIT_TRACK_PROPERTY)!==entry.written)return;
+if(readPriority(style,SIDEBAR_SPLIT_TRACK_PROPERTY)!==entry.writtenPriority)return;
+if(hostCapture===null||hostCapture.container!==entry.container)return;
+try{
+if(hostCapture.value==="")style.removeProperty(SIDEBAR_SPLIT_TRACK_PROPERTY);
+else style.setProperty(SIDEBAR_SPLIT_TRACK_PROPERTY,hostCapture.value,hostCapture.priority);
+}catch{/* 还原失败只影响外观，后续同步仍按同一规则重试。 */}
+};
+const cancelPendingRetry=()=>{
+if(pendingRetryTimer===null)return;
+const timer=pendingRetryTimer;
+pendingRetryTimer=null;
+try{
+globalThis.clearTimeout?.(timer);
+}catch{/* 取消失败不能阻止其它所有权释放。 */}
+};
+const clearPending=()=>{
+pending=null;
+cancelPendingRetry();
+};
+const schedulePendingRetry=(container)=>{
+if(disposed||pendingRetryTimer!==null)return;
+try{
+pendingRetryTimer=globalThis.setTimeout(()=>{
+pendingRetryTimer=null;
+if(disposed)return;
+if(pending===null||pending.container!==container)return;
+const entry=pending;
+if(typeof lastReader!=="function")return;
+pending={container,attempts:entry.attempts+1};
+sync(lastReader);
+if(pending!==null&&pending.container===container
+&&pendingRetryTimer===null
+&&pending.attempts<SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS){
+schedulePendingRetry(container);
+}
+},SIDEBAR_SPLIT_PENDING_RETRY_DELAY_MS);
+}catch{
+pendingRetryTimer=null;
+}
+};
+const sync=(readTarget)=>{
+if(disposed)return false;
+if(typeof readTarget==="function")lastReader=readTarget;
+let doc=null;
+try{doc=globalThis.document??null;}catch{doc=null;}
+if(doc===null||typeof doc.querySelector!=="function")return applied!==null;
+let target=null;
+try{target=typeof readTarget==="function"?readTarget(doc):null;}catch{target=null;}
+if(target===null||target.container===null||target.container===undefined){
+clearPending();
+restore();
+return false;
+}
+if(pending!==null&&pending.container!==target.container)clearPending();
+if(applied!==null&&applied.container!==target.container)restore();
+if(target.status==="pending"&&applied!==null&&applied.container===target.container){
+const attempts=pending!==null&&pending.container===target.container?pending.attempts:0;
+if(attempts<SIDEBAR_SPLIT_PENDING_MAX_ATTEMPTS){
+applyRatio(target.container);
+if(pending===null)pending={container:target.container,attempts:0};
+schedulePendingRetry(target.container);
+return true;
+}
+clearPending();
+restore();
+return false;
+}
+clearPending();
+if(target.status==="pending")return false;
+return applyRatio(target.container);
+};
+return{
+sync,
+dispose(){
+disposed=true;
+clearPending();
+restore();
+},
+};
+}
+global[SYMBOL]=Object.freeze({
+createRightbarDragLock,createSplitTrackRatio,
+});
+})(globalThis);
+/* source: client-sidebar-panel-cache.js */
+(function installClientSidebarPanelCache(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-cache");
 const SNAPSHOT_CACHE_LIMIT=32;
+function createPanelSnapshotCache(options){
+const limit=Number.isSafeInteger(options?.limit)&&options.limit>0?options.limit:SNAPSHOT_CACHE_LIMIT;
 const snapshotCache=new Map();
-const peekCachedSnapshot=(rootSessionId)=>{
+const peek=(rootSessionId)=>{
 if(rootSessionId===""||snapshotCache.has(rootSessionId)!==true)return null;
 return snapshotCache.get(rootSessionId)??null;
 };
-const writeCachedSnapshot=(rootSessionId,next,updatedAt)=>{
+const write=(rootSessionId,next,updatedAt)=>{
 if(rootSessionId===""||next===null||next===undefined)return;
 snapshotCache.delete(rootSessionId);
 snapshotCache.set(rootSessionId,{snapshot:next,updatedAt:Number.isFinite(updatedAt)?updatedAt:Date.now()});
-while(snapshotCache.size>SNAPSHOT_CACHE_LIMIT){
+while(snapshotCache.size>limit){
 const oldest=snapshotCache.keys().next();
 if(oldest.done===true)break;
 snapshotCache.delete(oldest.value);
 }
 };
 const initialStateFor=(rootSessionId)=>{
-const cached=peekCachedSnapshot(rootSessionId);
+const cached=peek(rootSessionId);
 return{
 rootSessionId,
 snapshot:cached===null?null:cached.snapshot,
@@ -3349,1225 +3605,28 @@ loading:cached===null,
 error:null,
 };
 };
-const sharedAutoLedgerState=resolveSidebarSharedAutoLedger();
-const sharedAutoLedger=sharedAutoLedgerState.ledger;
-recordSidebarAutoDiag({
-kind:"install",
-reused:sharedAutoLedgerState.reused,
-degraded:sharedAutoLedgerState.degraded,
-sizes:sidebarSharedAutoLedgerSizes(sharedAutoLedger),
-});
-if(sharedAutoLedgerState.reused===true&&sharedAutoLedgerState.degraded!==true
-&&sidebarSharedAutoLedgerTotal(sharedAutoLedger)>0){
-try{
-console.info("[dsh-expert-group] 本 realm 已有共享 Auto 账本：本次装载复用既有的归属 / 预算 / 确认计数（bundle 重新执行或 HMR）");
-}catch{/* 控制台不可用不影响功能。 */}
+const size=()=>snapshotCache.size;
+return Object.freeze({limit,peek,write,initialStateFor,size});
 }
-const sharedSidebarAutoOrigin=sharedAutoLedger.origin;
-const sharedSidebarAutoSuppressed=sharedAutoLedger.suppressed;
-const sharedSidebarAutoCloseAttempts=sharedAutoLedger.closeAttempts;
-const sharedSidebarAutoCloseAttemptOwners=sharedAutoLedger.closeAttemptOwners;
-const sharedSidebarAutoCloseVerifications=sharedAutoLedger.closeVerifications;
-const sharedSidebarAutoCloseCooldowns=sharedAutoLedger.closeCooldowns;
-const sharedSidebarAutoTabMisses=sharedAutoLedger.tabMisses;
-const trimSharedSidebarAutoTabMisses=()=>{
-while(sharedSidebarAutoTabMisses.size>SIDEBAR_AUTO_KEY_LIMIT){
-const oldest=sharedSidebarAutoTabMisses.keys().next();
-if(oldest.done===true)break;
-sharedSidebarAutoTabMisses.delete(oldest.value);
-}
-};
-const sharedSidebarTabCloseInFlight=sharedAutoLedger.tabCloseInFlight;
-function Panel(props){
-const ctx=props?.ctx||config.ctx;
-let tabInfo=null;
-if(typeof props?.useTabInfo==="function"){
-try{tabInfo=props.useTabInfo();}catch{tabInfo=null;}
-}
-const tabParams=object(tabInfo?.tab?.navigation?.params);
-const sessionsSnapshot=listSnapshot(config,ctx);
-const catalogEntryOf=createCatalogLookup(sessionsSnapshot);
-const fallbackCurrent=currentSessionIdOf(sessionsSnapshot);
-const scopedId=typeof config.sessions?.scopeOf==="function"?config.sessions.scopeOf(ctx):undefined;
-const scope=props?.scope||props?.tab?.scope||tabInfo?.scope||{};
-const sessionId=text(scope.sessionId,text(props?.sessionId,text(props?.rootSessionId,text(tabParams.rootSessionId,text(scopedId,fallbackCurrent)))));
-let resolvedRoot=sessionId;
-if(typeof config.resolveRootSessionId==="function"&&sessionId!==null){
-try{resolvedRoot=text(config.resolveRootSessionId(sessionId,undefined,listSnapshot(config,ctx)),sessionId);}catch{resolvedRoot=sessionId;}
-}
-const rootSessionId=resolvedRoot||"";
-const sidebarSessionId=sessionId||rootSessionId;
-const tabActivity=readPanelTabActivity(config,props,tabInfo);
-const tabActivityKey=tabActivity===true?"active":(tabActivity===false?"inactive":"unknown");
-const statePair=typeof react.useState==="function"
-?react.useState(()=>initialStateFor(rootSessionId))
-:[initialStateFor(rootSessionId),()=>{}];
-const state=statePair[0];
-const setState=statePair[1];
-const viewState=state.rootSessionId===rootSessionId?state:initialStateFor(rootSessionId);
-const versionPair=typeof react.useState==="function"?react.useState(0):[0,()=>{}];
-const version=versionPair[0];
-const bump=versionPair[1];
-const autoOpenDraftPair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
-const autoOpenDraft=autoOpenDraftPair[0];
-const setAutoOpenDraft=autoOpenDraftPair[1];
-const emptyFilter=Object.freeze({rootSessionId:null,query:"",role:"",status:""});
-const filterPair=typeof react.useState==="function"
-?react.useState(emptyFilter)
-:[emptyFilter,()=>{}];
-const filterState=filterPair[0]!==null&&typeof filterPair[0]==="object"?filterPair[0]:emptyFilter;
-const setFilterState=filterPair[1];
-const timelineExpandedRef=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
-const metaPair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
-const meta=metaPair[0];
-const setMeta=metaPair[1];
-const metaStateRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-metaStateRef.current=meta;
-const sessionModelOpenPair=typeof react.useState==="function"?react.useState(false):[false,()=>{}];
-const sessionModelOpen=sessionModelOpenPair[0];
-const setSessionModelOpen=sessionModelOpenPair[1];
-const sessionModelStatePair=typeof react.useState==="function"
-?react.useState({status:"idle",overrides:{},revision:0,live:false})
-:[{status:"idle",overrides:{},revision:0,live:false},()=>{}];
-const sessionModelState=sessionModelStatePair[0];
-const setSessionModelState=sessionModelStatePair[1];
-const sessionModelDraftsPair=typeof react.useState==="function"?react.useState({}):[{},()=>{}];
-const sessionModelDrafts=sessionModelDraftsPair[0];
-const setSessionModelDrafts=sessionModelDraftsPair[1];
-const sessionModelSavingPair=typeof react.useState==="function"?react.useState(false):[false,()=>{}];
-const sessionModelSaving=sessionModelSavingPair[0];
-const setSessionModelSaving=sessionModelSavingPair[1];
-const sessionModelNoticePair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
-const sessionModelNotice=sessionModelNoticePair[0];
-const setSessionModelNotice=sessionModelNoticePair[1];
-const sessionModelReloadPair=typeof react.useState==="function"?react.useState(0):[0,()=>{}];
-const sessionModelReloadToken=sessionModelReloadPair[0];
-const setSessionModelReloadToken=sessionModelReloadPair[1];
-const sessionModelRequestSerialRef=typeof react.useRef==="function"?react.useRef(0):{current:0};
-const sessionModelLoadedRootRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const sessionModelCatalogPair=typeof react.useState==="function"
-?react.useState({groups:[],status:"idle"})
-:[{groups:[],status:"idle"},()=>{}];
-const sessionModelCatalog=sessionModelCatalogPair[0];
-const setSessionModelCatalog=sessionModelCatalogPair[1];
-const sessionModelEntryRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const sessionModelWasOpenRef=typeof react.useRef==="function"?react.useRef(false):{current:false};
-const sessionModelDialogRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const sessionModelSurfaceRef=typeof react.useRef==="function"
-?react.useRef({rootSessionId:null,sidebarSessionId:null})
-:{current:{rootSessionId:null,sidebarSessionId:null}};
-const announcerRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const announcementPair=typeof react.useState==="function"?react.useState(""):["",()=>{}];
-const announcement=announcementPair[0];
-const setAnnouncement=announcementPair[1];
-if(typeof react.useEffect==="function"){
-react.useEffect(()=>{
-if(state.snapshot===null)return;
-const tasks=collectAnnouncementTasks(state.snapshot);
-const previous=announcerRef.current;
-announcerRef.current={rootSessionId,tasks};
-if(previous===null||previous.rootSessionId!==rootSessionId)return;
-const events=announcementEventsOf(previous.tasks,tasks);
-if(events.length===0)return;
-const visible=events.slice(0,ANNOUNCEMENT_MAX_ITEMS)
-.map((event)=>t("announce."+event.kind,{name:event.name}));
-if(events.length>ANNOUNCEMENT_MAX_ITEMS)visible.push(t("announce.more",{count:events.length}));
-setAnnouncement(visible.join(panelLocale==="en"?"; ":"；"));
-},[state.snapshot,rootSessionId]);
-}
-const readWidthRatio=typeof config.readRightbarWidthRatio==="function"?config.readRightbarWidthRatio:null;
-const applyWidthRatio=typeof config.applyRightbarWidthRatio==="function"?config.applyRightbarWidthRatio:null;
-const widthRatioPair=typeof react.useState==="function"
-?react.useState(()=>{
-const stored=readWidthRatio===null?null:clampRightbarWidthRatio(readWidthRatio());
-return stored===null?RIGHTBAR_WIDTH_RATIO:stored;
-})
-:[RIGHTBAR_WIDTH_RATIO,()=>{}];
-const widthRatio=widthRatioPair[0];
-const setWidthRatio=widthRatioPair[1];
-const widthDragRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const commitWidthRatio=(value,options={})=>{
-const clamped=clampRightbarWidthRatio(value);
-if(clamped===null)return null;
-setWidthRatio(clamped);
-if(applyWidthRatio!==null){
-try{applyWidthRatio(clamped,{persist:options.persist===true});}catch{/* 见上。 */}
-}
-return clamped;
-};
-const widthDragHost=()=>{
-try{return globalThis.window??globalThis;}catch{return null;}
-};
-const detachWidthDrag=(drag)=>{
-const host=widthDragHost();
-if(host===null||drag===null)return;
-try{
-host.removeEventListener?.("pointermove",drag.onMove);
-host.removeEventListener?.("pointerup",drag.onEnd);
-host.removeEventListener?.("pointercancel",drag.onEnd);
-host.removeEventListener?.("mousemove",drag.onMove);
-host.removeEventListener?.("mouseup",drag.onEnd);
-}catch{/* 移除失败不阻断松手收口。 */}
-};
-const endWidthDrag=()=>{
-const drag=widthDragRef.current;
-if(drag===null)return;
-widthDragRef.current=null;
-detachWidthDrag(drag);
-commitWidthRatio(drag.lastRatio,{persist:true});
-};
-const onWidthDragMove=(event)=>{
-const drag=widthDragRef.current;
-if(drag===null)return;
-const viewport=viewportWidthOf();
-const clientX=Number(event?.clientX);
-if(viewport===null||Number.isFinite(clientX)!==true)return;
-event?.preventDefault?.();
-const next=clampRightbarWidthRatio(drag.startRatio+(drag.startX-clientX)/viewport);
-if(next===null)return;
-drag.lastRatio=next;
-commitWidthRatio(next,{persist:false});
-};
-const onWidthDragStart=(event)=>{
-if(applyWidthRatio===null)return;
-event?.preventDefault?.();
-event?.stopPropagation?.();
-const clientX=Number(event?.clientX);
-if(Number.isFinite(clientX)!==true)return;
-endWidthDrag();
-const startRatio=clampRightbarWidthRatio(widthRatio)??RIGHTBAR_WIDTH_RATIO;
-const drag={
-startX:clientX,
-startRatio,
-lastRatio:startRatio,
-onMove:null,
-onEnd:null,
-};
-drag.onMove=(moveEvent)=>onWidthDragMove(moveEvent);
-drag.onEnd=()=>endWidthDrag();
-const host=widthDragHost();
-try{
-host?.addEventListener?.("pointermove",drag.onMove);
-host?.addEventListener?.("pointerup",drag.onEnd);
-host?.addEventListener?.("pointercancel",drag.onEnd);
-host?.addEventListener?.("mousemove",drag.onMove);
-host?.addEventListener?.("mouseup",drag.onEnd);
-}catch{/* 监听装不上时手柄仍可用键盘调整。 */}
-widthDragRef.current=drag;
-};
-const onWidthResizerKeyDown=(event)=>{
-const key=event?.key;
-if(key!=="ArrowLeft"&&key!=="ArrowRight"&&key!=="Home"&&key!=="End")return;
-event?.preventDefault?.();
-event?.stopPropagation?.();
-const step=0.02;
-const current=clampRightbarWidthRatio(widthRatio)??RIGHTBAR_WIDTH_RATIO;
-const next=key==="Home"?RIGHTBAR_WIDTH_RATIO_MIN
-:key==="End"?RIGHTBAR_WIDTH_RATIO_MAX
-:key==="ArrowLeft"?current-step:current+step;
-commitWidthRatio(next,{persist:true});
-};
-const widthResizer=applyWidthRatio===null
-?null
-:react.createElement("div",{
-className:"deg_expert_group_resizer",
-role:"separator",
-"aria-orientation":"vertical",
-"aria-label":"调整右栏宽度",
-"aria-valuemin":Math.round(RIGHTBAR_WIDTH_RATIO_MIN*100),
-"aria-valuemax":Math.round(RIGHTBAR_WIDTH_RATIO_MAX*100),
-"aria-valuenow":Math.round(widthRatio*100),
-"data-dragging":widthDragRef.current!==null?"true":undefined,
-tabIndex:0,
-onPointerDown:onWidthDragStart,
-onMouseDown:onWidthDragStart,
-onKeyDown:onWidthResizerKeyDown,
-});
-const model=modelApi();
-const panelLocale=(()=>{
-const sources={
-ctxLocale:(()=>{try{return ctx?.locale;}catch{return undefined;}})(),
-i18nLocale:(()=>{try{return ctx?.i18n?.locale;}catch{return undefined;}})(),
-tabInfo,
-documentLang:(()=>{
-try{return globalThis.document?.documentElement?.lang;}catch{return undefined;}
-})(),
-navigatorLanguage:(()=>{
-try{return globalThis.navigator?.language;}catch{return undefined;}
-})(),
-};
-if(typeof model.resolveClientLocale==="function")return model.resolveClientLocale(sources);
-const candidates=[sources.ctxLocale,sources.i18nLocale,sources.tabInfo?.locale,sources.documentLang,sources.navigatorLanguage];
-return candidates.some((value)=>typeof value==="string"&&value.trim().toLowerCase().startsWith("en"))?"en":"zh";
-})();
-const t=(key,vars)=>{
-if(typeof model.translateMessage==="function")return model.translateMessage(panelLocale,key,vars);
-return"—";
-};
-const errorLabelOf=(source)=>t("sidebar.error."+(source==="snapshot"||source==="rpc"?source:"action"));
-const createStore=()=>typeof model.createExpansionStore==="function"
-?model.createExpansionStore({storage:config.storage,rootSessionId})
-:null;
-const store=typeof react.useMemo==="function"
-?react.useMemo(createStore,[config.storage,rootSessionId])
-:createStore();
-const mountedRef=typeof react.useRef==="function"?react.useRef(true):{current:true};
-const requestSequenceRef=typeof react.useRef==="function"?react.useRef(0):{current:0};
-const contextRef=typeof react.useRef==="function"?react.useRef(ctx):{current:ctx};
-contextRef.current=ctx;
-const currentRootRef=typeof react.useRef==="function"?react.useRef(rootSessionId):{current:rootSessionId};
-currentRootRef.current=rootSessionId;
-const currentSidebarSessionRef=typeof react.useRef==="function"?react.useRef(sidebarSessionId):{current:sidebarSessionId};
-currentSidebarSessionRef.current=sidebarSessionId;
-const metaRequestRef=typeof react.useRef==="function"?react.useRef({inFlight:false,promise:null}):{current:{inFlight:false,promise:null}};
-const metaAutoAttemptRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const metaRefreshRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const loadMeta=async()=>{
-if(mountedRef.current!==true)return null;
-const request=metaRequestRef.current;
-if(request.inFlight===true){
-return typeof request.promise?.then==="function"?request.promise:null;
-}
-request.inFlight=true;
-const pending=(async()=>{
-try{
-const body=await callRpc(config,contextRef.current,{action:"meta"},{},(value)=>object(value));
-if(mountedRef.current!==true)return null;
-const normalized=normalizeHostMeta(body);
-setMeta(normalized);
-return normalized;
-}catch{
-return null;
-}finally{
-request.inFlight=false;
-request.promise=null;
-}
-})();
-request.promise=pending;
-return pending;
-};
-metaRefreshRef.current=loadMeta;
-if(typeof react.useEffect==="function"){
-react.useEffect(()=>{
-if(sessionModelOpen!==true)return()=>{};
-const targetSessionId=rootSessionId;
-const previousSurface=sessionModelSurfaceRef.current;
-const surfaceChanged=previousSurface.rootSessionId!==rootSessionId
-||previousSurface.sidebarSessionId!==sidebarSessionId;
-sessionModelSurfaceRef.current={rootSessionId,sidebarSessionId};
-if(surfaceChanged===true)setSessionModelSaving(false);
-if(sessionModelLoadedRootRef.current!==targetSessionId)setSessionModelNotice(null);
-if(targetSessionId===""||sidebarSessionId!==targetSessionId){
-sessionModelRequestSerialRef.current+=1;
-sessionModelLoadedRootRef.current=null;
-setSessionModelDrafts({});
-setSessionModelNotice(null);
-setSessionModelSaving(false);
-setSessionModelState({
-status:targetSessionId===""?"no-session":"child",
-overrides:{},
-revision:0,
-live:false,
-});
-return()=>{};
-}
-let cancelled=false;
-sessionModelRequestSerialRef.current+=1;
-const serial=sessionModelRequestSerialRef.current;
-setSessionModelState((previous)=>(previous.status==="ready"
-?{...previous,status:"loading"}
-:{status:"loading",overrides:{},revision:0,live:false}));
-void(async()=>{
-try{
-const pending=config.modelCatalog?.load?.();
-if(pending!==null&&pending!==undefined&&typeof pending.catch==="function")pending.catch(()=>{});
-}catch{/* 目录加载失败不阻塞覆盖读取：输入框仍可手填。 */}
-const loaded=await loadMeta();
-if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
-const effectiveMeta=loaded!==null?loaded:metaStateRef.current;
-if(effectiveMeta!==null&&effectiveMeta.capabilities.sessionOverride!==true){
-setSessionModelState({status:"unsupported",overrides:{},revision:0,live:false});
-return;
-}
-let body;
-try{
-body=await callRpc(
-config,
-contextRef.current,
-{action:"session-override-get",sessionId:targetSessionId},
-{},
-(value)=>object(value),
-);
-}catch(error){
-if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
-const code=text(object(error).code,null);
-setSessionModelState({
-status:code==="bad-request"&&effectiveMeta===null?"unsupported":"error",
-overrides:{},
-revision:0,
-live:false,
-});
-return;
-}
-if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
-const roles=sessionModelRolesOf(effectiveMeta);
-const view=normalizeSessionModelView(body,roles);
-if(view===null){
-setSessionModelState({status:"error",overrides:{},revision:0,live:false});
-return;
-}
-if(sessionModelLoadedRootRef.current!==targetSessionId)setSessionModelDrafts({});
-sessionModelLoadedRootRef.current=targetSessionId;
-setSessionModelState({status:"ready",overrides:view.overrides,revision:view.revision,live:view.live});
-})();
-return()=>{cancelled=true;};
-},[sessionModelOpen,rootSessionId,sidebarSessionId,sessionModelReloadToken,config]);
-}
-if(typeof react.useEffect==="function"){
-react.useEffect(()=>{
-if(sessionModelOpen!==true)return()=>{};
-const catalog=config.modelCatalog;
-if(catalog===null||catalog===undefined||typeof catalog!=="object")return()=>{};
-const read=()=>{
-if(mountedRef.current!==true)return;
-try{
-const snapshot=typeof catalog.getSnapshot==="function"?catalog.getSnapshot():null;
-const source=object(snapshot);
-setSessionModelCatalog({
-groups:Array.isArray(source.groups)?source.groups:[],
-status:text(source.status,"idle"),
-});
-}catch{
-setSessionModelCatalog({groups:[],status:"error"});
-}
-};
-read();
-let unsubscribe=null;
-try{
-if(typeof catalog.subscribe==="function")unsubscribe=catalog.subscribe(read);
-}catch{unsubscribe=null;}
-return()=>{if(typeof unsubscribe==="function")unsubscribe();};
-},[sessionModelOpen,config]);
-}
-if(typeof react.useEffect==="function"){
-react.useEffect(()=>{
-if(sessionModelOpen!==true)return;
-const node=sessionModelDialogRef.current;
-if(node===null||node===undefined)return;
-if(node.open===true)return;
-try{
-if(typeof node.showModal==="function")node.showModal();
-}catch{/* 宿主拒绝 showModal（已打开/非活动文档）时保持当前可见性。 */}
-},[sessionModelOpen]);
-}
-if(typeof react.useEffect==="function"){
-react.useEffect(()=>{
-const wasOpen=sessionModelWasOpenRef.current===true;
-sessionModelWasOpenRef.current=sessionModelOpen===true;
-if(wasOpen!==true||sessionModelOpen===true)return;
-const entry=sessionModelEntryRef.current;
-try{
-if(entry!==null&&entry!==undefined&&typeof entry.focus==="function")entry.focus();
-}catch{/* 宿主拒绝聚焦时忽略：关闭已经生效，焦点位置不是阻断条件。 */}
-},[sessionModelOpen]);
-}
-const updateSessionModelDraft=(role,field,value)=>{
-setSessionModelDrafts((previous)=>{
-const base=Object.prototype.hasOwnProperty.call(previous,role)
-?previous[role]
-:(()=>{
-const effective=sessionModelState.overrides[role]
-??normalizeSessionModelSelection(metaStateRef.current?.roleDefaults?.[role]);
-return{
-provider:effective?.provider??"",
-model:effective?.model??"",
-reasoningEffort:effective?.reasoningEffort??"",
-};
-})();
-const next={...base,[field]:value};
-const groups=sessionModelCatalog.groups;
-if(field==="provider"){
-const models=value===""?[]:sessionModelModelOptions(value,groups);
-const stillAvailable=next.model!==""
-&&models.some((candidate)=>text(object(candidate).id,null)===next.model);
-if(stillAvailable!==true){
-next.model="";
-next.reasoningEffort="";
-}
-}else if(field==="model"){
-const entry=sessionModelModelOptions(next.provider,groups)
-.find((candidate)=>text(object(candidate).id,null)===value);
-const defaultEffort=text(object(entry?.reasoning).defaultEffort,null);
-next.reasoningEffort=defaultEffort===null?"":defaultEffort;
-const efforts=Array.isArray(entry?.reasoning?.efforts)?entry.reasoning.efforts:[];
-if(next.reasoningEffort!==""
-&&efforts.every((effort)=>text(object(effort).id,null)!==next.reasoningEffort)){
-next.reasoningEffort="";
-}
-}
-return{...previous,[role]:next};
-});
-setSessionModelNotice(null);
-};
-const sessionModelBaselineOf=(role)=>sessionModelState.overrides[role]
-??normalizeSessionModelSelection(object(metaStateRef.current?.roleDefaults)[role]);
-const sessionModelPendingChanges=()=>{
-const changes=[];
-for(const role of sessionModelRolesOf(metaStateRef.current)){
-if(Object.prototype.hasOwnProperty.call(sessionModelDrafts,role)!==true)continue;
-const selection=sessionModelSelectionOfDraft(sessionModelDrafts[role]);
-if(selection.provider.length===0||selection.model.length===0)continue;
-if(sessionModelSelectionEquals(selection,sessionModelBaselineOf(role)))continue;
-changes.push({role,selection});
-}
-return changes;
-};
-const sessionModelHasInvalidDraft=()=>{
-for(const role of sessionModelRolesOf(metaStateRef.current)){
-if(Object.prototype.hasOwnProperty.call(sessionModelDrafts,role)!==true)continue;
-const selection=sessionModelSelectionOfDraft(sessionModelDrafts[role]);
-if(selection.provider.length===0||selection.model.length===0)return true;
-}
-return false;
-};
-const applySessionModelView=(view,role)=>{
-setSessionModelState({status:"ready",overrides:view.overrides,revision:view.revision,live:view.live});
-setSessionModelDrafts((previous)=>{
-if(Object.prototype.hasOwnProperty.call(previous,role)!==true)return previous;
-const next={...previous};
-delete next[role];
-return next;
-});
-};
-const settleSessionModelFailure=(error,role)=>{
-const roles=sessionModelRolesOf(metaStateRef.current);
-const code=text(object(error).code,null);
-const details=object(object(error).details);
-if(code==="session-override-conflict"){
-const currentRevision=Number.isSafeInteger(details.currentRevision)&&details.currentRevision>=0
-?details.currentRevision
-:null;
-const overrides=details.overrides===undefined
-?null
-:normalizeSessionModelOverrides(details.overrides,roles);
-setSessionModelState((previous)=>({
-...previous,
-status:"ready",
-revision:currentRevision===null?previous.revision:currentRevision,
-overrides:overrides===null?previous.overrides:overrides,
-}));
-setSessionModelNotice({
-kind:"conflict",
-role,
-text:t("sidebar.sessionModel.conflict",{
-revision:currentRevision===null?"?":currentRevision,
-}),
-});
-return;
-}
-const message=text(object(error).message,null);
-setSessionModelNotice({
-kind:"error",
-role,
-text:message===null
-?t("sidebar.sessionModel.unavailable")
-:t("sidebar.sessionModel.failed",{message}),
-});
-};
-const sessionModelWriteReady=()=>mountedRef.current===true
-&&sessionModelState.status==="ready"
-&&sessionModelState.live===true
-&&sessionModelSaving!==true
-&&rootSessionId!==""
-&&sidebarSessionId===rootSessionId;
-const commitSessionModelChanges=async()=>{
-if(sessionModelWriteReady()!==true)return;
-if(sessionModelHasInvalidDraft())return;
-const changes=sessionModelPendingChanges();
-if(changes.length===0)return;
-const targetSessionId=rootSessionId;
-const roles=sessionModelRolesOf(metaStateRef.current);
-setSessionModelSaving(true);
-setSessionModelNotice(null);
-let revision=sessionModelState.revision;
-try{
-for(const change of changes){
-const body=await callRpc(
-config,
-contextRef.current,
-{
-action:"session-override-set",
-sessionId:targetSessionId,
-role:change.role,
-expectedRevision:revision,
-selection:change.selection,
-},
-{},
-(value)=>object(value),
-);
-if(sidebarSurfaceStillCurrent()!==true)return;
-const view=normalizeSessionModelView(body,roles);
-if(view===null){
-setSessionModelNotice({kind:"error",role:change.role,text:t("sidebar.sessionModel.unavailable")});
-return;
-}
-revision=view.revision;
-applySessionModelView(view,change.role);
-}
-if(sidebarSurfaceStillCurrent()!==true)return;
-setSessionModelNotice({kind:"saved",revision});
-}catch(error){
-if(sidebarSurfaceStillCurrent()!==true)return;
-settleSessionModelFailure(error,changes[changes.length-1]?.role??null);
-}finally{
-if(sidebarSurfaceStillCurrent()===true)setSessionModelSaving(false);
-}
-};
-const clearSessionModelRole=async(role)=>{
-if(sessionModelWriteReady()!==true)return;
-if(sessionModelState.overrides[role]===undefined)return;
-const targetSessionId=rootSessionId;
-const roles=sessionModelRolesOf(metaStateRef.current);
-setSessionModelSaving(true);
-setSessionModelNotice(null);
-try{
-const body=await callRpc(
-config,
-contextRef.current,
-{
-action:"session-override-clear",
-sessionId:targetSessionId,
-role,
-expectedRevision:sessionModelState.revision,
-},
-{},
-(value)=>object(value),
-);
-if(sidebarSurfaceStillCurrent()!==true)return;
-const view=normalizeSessionModelView(body,roles);
-if(view===null){
-setSessionModelNotice({kind:"error",role,text:t("sidebar.sessionModel.unavailable")});
-return;
-}
-applySessionModelView(view,role);
-setSessionModelNotice({kind:"cleared",role,revision:view.revision});
-}catch(error){
-if(sidebarSurfaceStillCurrent()!==true)return;
-settleSessionModelFailure(error,role);
-}finally{
-if(sidebarSurfaceStillCurrent()===true)setSessionModelSaving(false);
-}
-};
-const surfaceTokenScopeRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const surfaceTokenRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const surfaceTokenScope=surfaceTokenScopeRef.current;
-if(surfaceTokenScope===null
-||surfaceTokenScope.rootSessionId!==rootSessionId
-||surfaceTokenScope.sidebarSessionId!==sidebarSessionId){
-surfaceTokenScopeRef.current={rootSessionId,sidebarSessionId};
-surfaceTokenRef.current={rootSessionId,sidebarSessionId};
-}
-const surfaceToken=surfaceTokenRef.current;
-const sidebarSurfaceStillCurrent=()=>mountedRef.current===true
-&&currentRootRef.current===rootSessionId
-&&currentSidebarSessionRef.current===sidebarSessionId
-&&surfaceTokenRef.current===surfaceToken;
-const refreshStateRef=typeof react.useRef==="function"
-?react.useRef({rootSessionId:null,inFlight:null,pending:false})
-:{current:{rootSessionId:null,inFlight:null,pending:false}};
-const fanoutCursorRef=typeof react.useRef==="function"
-?react.useRef({rootSessionId,cursor:0})
-:{current:{rootSessionId,cursor:0}};
-if(fanoutCursorRef.current.rootSessionId!==rootSessionId){
-fanoutCursorRef.current={rootSessionId,cursor:0};
-}
-const latestSnapshotRef=typeof react.useRef==="function"
-?react.useRef(state.snapshot)
-:{current:state.snapshot};
-latestSnapshotRef.current=state.snapshot;
-const latestPanelErrorRef=typeof react.useRef==="function"
-?react.useRef(state.error)
-:{current:state.error};
-latestPanelErrorRef.current=state.error;
-const pollSyncStateRef=typeof react.useRef==="function"
-?react.useRef({rootSessionId:null,inFlight:null,pending:false})
-:{current:{rootSessionId:null,inFlight:null,pending:false}};
-const pollCycleSequenceRef=typeof react.useRef==="function"?react.useRef(0):{current:0};
-const adoptFanoutCursorFromSnapshot=(requestRoot,envelope)=>{
-const cursor=Number.isSafeInteger(envelope?.cursor)&&envelope.cursor>=0?envelope.cursor:null;
-if(cursor===null)return false;
-if(fanoutCursorRef.current.rootSessionId!==requestRoot)return false;
-fanoutCursorRef.current={rootSessionId:requestRoot,cursor:Math.max(fanoutCursorRef.current.cursor,cursor)};
-return true;
-};
-const advanceFanoutCursor=(nextCursor)=>{
-if(!Number.isSafeInteger(nextCursor)||nextCursor<0)return false;
-if(fanoutCursorRef.current.rootSessionId!==rootSessionId)return false;
-if(nextCursor<=fanoutCursorRef.current.cursor)return false;
-fanoutCursorRef.current={rootSessionId,cursor:nextCursor};
-return true;
-};
-const refresh=(refreshOptions)=>{
-const commitManualTimestamp=refreshOptions?.manual===true;
-const refreshState=refreshStateRef.current;
-if(refreshState.rootSessionId!==rootSessionId){
-refreshState.inFlight?.controller?.abort?.();
-refreshState.inFlight=null;
-refreshState.pending=false;
-refreshState.rootSessionId=rootSessionId;
-}
-if(refreshState.inFlight!==null){
-refreshState.pending=true;
-return refreshState.inFlight.promise.then((outcome)=>(typeof outcome==="object"&&outcome!==null
-?{...outcome,merged:true}
-:{ok:false,snapshot:null,merged:true}));
-}
-const requestSequence=++requestSequenceRef.current;
-if(rootSessionId===""){
-setState({rootSessionId,snapshot:null,updatedAt:null,loading:false,error:null});
-return Promise.resolve({ok:true,snapshot:null,skipped:true});
-}
-const controller=typeof globalThis.AbortController==="function"?new globalThis.AbortController():null;
-const request={rootSessionId,requestSequence,controller,promise:null};
-refreshState.inFlight=request;
-const cachedBaseline=peekCachedSnapshot(rootSessionId);
-setState((previous)=>{
-if(previous.rootSessionId===rootSessionId){
-const nextLoading=previous.snapshot===null;
-const keptError=previous.error!==null&&previous.error.source===PANEL_ERROR_SOURCES.action
-?previous.error
-:null;
-if(previous.error===keptError&&previous.loading===nextLoading)return previous;
-return{
-rootSessionId,
-snapshot:previous.snapshot,
-updatedAt:previous.updatedAt,
-loading:nextLoading,
-error:keptError,
-};
-}
-return{
-rootSessionId,
-snapshot:cachedBaseline===null?null:cachedBaseline.snapshot,
-updatedAt:cachedBaseline===null?null:cachedBaseline.updatedAt,
-loading:cachedBaseline===null,
-error:null,
-};
-});
-const promise=(async()=>{
-let outcome={ok:false,snapshot:null,reason:text(refreshOptions?.reason,"refresh")};
-try{
-const envelope=await callRpc(
-config,
-contextRef.current,
-{action:"expert-group-snapshot",sessionId:rootSessionId},
-controller===null?{}:{signal:controller.signal},
-(body)=>object(body),
-);
-const raw=envelope.snapshot===undefined||envelope.snapshot===null?envelope:envelope.snapshot;
-const next=safeNormalize(raw);
-if(next===null)throw new Error("快照格式无效");
-const current=mountedRef.current===true
-&&refreshState.inFlight===request
-&&requestSequence===requestSequenceRef.current
-&&rootSessionId===request.rootSessionId;
-outcome={ok:true,snapshot:next,stale:current!==true,reason:outcome.reason};
-if(current){
-const updatedAt=Date.now();
-writeCachedSnapshot(rootSessionId,next,updatedAt);
-adoptFanoutCursorFromSnapshot(rootSessionId,envelope);
-setState((previous)=>{
-const keptError=previous.error!==null&&previous.error.source===PANEL_ERROR_SOURCES.action
-?previous.error
-:null;
-const sameRevision=typeof previous.snapshot?.revision==="string"
-&&typeof next.revision==="string"
-&&previous.snapshot.revision.length>0
-&&previous.snapshot.revision===next.revision;
-if(previous.rootSessionId===rootSessionId
-&&previous.loading===false
-&&previous.error===keptError
-&&(sameRevision||samePanelSnapshot(previous.snapshot,next))
-&&(commitManualTimestamp!==true||previous.updatedAt===updatedAt))return previous;
-return{rootSessionId,snapshot:next,updatedAt,loading:false,error:keptError};
-});
-}
-}catch(error){
-const aborted=controller?.signal?.aborted===true||error?.name==="AbortError";
-const current=mountedRef.current===true
-&&refreshState.inFlight===request
-&&requestSequence===requestSequenceRef.current
-&&rootSessionId===request.rootSessionId;
-outcome={ok:false,snapshot:null,aborted,stale:current!==true,reason:outcome.reason};
-if(!aborted&&current){
-const failedAt=Date.now();
-setState((previous)=>{
-const sameRoot=previous.rootSessionId===rootSessionId;
-const baseline=sameRoot
-?previous.snapshot
-:(cachedBaseline===null?null:cachedBaseline.snapshot);
-const message=error instanceof Error?error.message:String(error);
-if(sameRoot
-&&previous.error!==null
-&&previous.error.source===PANEL_ERROR_SOURCES.snapshot
-&&previous.error.message===message
-&&previous.loading===false
-&&previous.snapshot===baseline)return previous;
-return{
-rootSessionId,
-snapshot:baseline,
-updatedAt:sameRoot?previous.updatedAt:(cachedBaseline===null?null:cachedBaseline.updatedAt),
-loading:false,
-error:{source:PANEL_ERROR_SOURCES.snapshot,message,at:failedAt},
-};
-});
-}
-}
-if(refreshState.inFlight===request){
-refreshState.inFlight=null;
-if(refreshState.pending&&mountedRef.current===true&&refreshState.rootSessionId===rootSessionId){
-refreshState.pending=false;
-void refresh();
-}else{
-refreshState.pending=false;
-}
-}
-return outcome;
-})();
-request.promise=promise;
-return promise;
-};
-const refreshRef=typeof react.useRef==="function"?react.useRef(refresh):{current:refresh};
-refreshRef.current=refresh;
-const panelSchedulerRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const pollSurfaceStillCurrent=()=>sidebarSurfaceStillCurrent();
-const pollOnce=async(request)=>{
-const nextId=()=>{
-pollCycleSequenceRef.current+=1;
-return pollCycleSequenceRef.current;
-};
-const cancelledCycle=(outcome)=>({id:nextId(),outcome,ok:false,cancelled:true,snapshot:null});
-const partialBaseline=latestSnapshotRef.current!==null&&latestSnapshotRef.current?.partial===true;
-const lastSnapshotError=latestPanelErrorRef.current;
-const retryAfterFailure=lastSnapshotError!==null
-&&lastSnapshotError!==undefined
-&&lastSnapshotError.source===PANEL_ERROR_SOURCES.snapshot;
-if(partialBaseline||retryAfterFailure){
-const full=(await refresh({reason:partialBaseline?"partial":"retry"}))??{};
-return{
-id:nextId(),
-outcome:partialBaseline?"partial":"retry",
-ok:full.ok===true,
-cancelled:full.aborted===true||full.stale===true,
-snapshot:full.snapshot??null,
-};
-}
-const cursorBefore=fanoutCursorRef.current.rootSessionId===rootSessionId?fanoutCursorRef.current.cursor:0;
-let batch=null;
-try{
-const response=await callRpc(
-config,
-contextRef.current,
-{action:"fanout-events",sessionId:rootSessionId,after:cursorBefore},
-request.controller===null?{}:{signal:request.controller.signal},
-);
-batch=readFanoutEventBatch(response);
-}catch(error){
-const aborted=request.controller?.signal?.aborted===true||error?.name==="AbortError";
-if(aborted)return cancelledCycle("cancelled");
-batch=null;
-}
-if(!pollSurfaceStillCurrent())return cancelledCycle("stale");
-if(batch!==null&&batch.conclusive){
-if(fanoutBatchIsStale(batch,cursorBefore)){
-const full=(await refresh({reason:"gap"}))??{};
-if(full.ok===true&&full.stale!==true&&full.merged!==true)advanceFanoutCursor(batch.cursor);
-return{
-id:nextId(),
-outcome:"gap",
-ok:full.ok===true,
-cancelled:full.aborted===true||full.stale===true,
-snapshot:full.snapshot??null,
-};
-}
-if(batch.events.length>0){
-const full=(await refresh({reason:"events"}))??{};
-if(full.ok===true&&full.stale!==true&&full.merged!==true)advanceFanoutCursor(batch.cursor);
-return{
-id:nextId(),
-outcome:"events",
-ok:full.ok===true,
-cancelled:full.aborted===true||full.stale===true,
-snapshot:full.snapshot??null,
-};
-}
-advanceFanoutCursor(batch.cursor);
-return{id:nextId(),outcome:"none",ok:true,cancelled:false,snapshot:null};
-}
-const fallback=(await refresh({reason:"events-unavailable"}))??{};
-return{
-id:nextId(),
-outcome:"fallback",
-ok:fallback.ok===true,
-cancelled:fallback.aborted===true||fallback.stale===true,
-snapshot:fallback.snapshot??null,
-};
-};
-const runPollCycle=()=>{
-const state=pollSyncStateRef.current;
-if(state.rootSessionId!==rootSessionId){
-state.inFlight?.controller?.abort?.();
-state.inFlight=null;
-state.pending=false;
-state.rootSessionId=rootSessionId;
-}
-if(state.inFlight!==null){
-state.pending=true;
-return state.inFlight.promise;
-}
-const request={
-rootSessionId,
-controller:typeof globalThis.AbortController==="function"?new globalThis.AbortController():null,
-promise:null,
-};
-state.inFlight=request;
-const promise=(async()=>{
-let cycle=null;
-try{
-cycle=await pollOnce(request);
-while(state.pending&&state.inFlight===request&&pollSurfaceStillCurrent()){
-state.pending=false;
-cycle=await pollOnce(request);
-}
-}catch{
-pollCycleSequenceRef.current+=1;
-cycle={id:pollCycleSequenceRef.current,outcome:"error",ok:false,cancelled:false,snapshot:null};
-}finally{
-if(state.inFlight===request)state.inFlight=null;
-state.pending=false;
-}
-return cycle;
-})();
-request.promise=promise;
-return promise;
-};
-const sidebarTabRecordsRef=typeof react.useRef==="function"?react.useRef(new Map()):{current:new Map()};
-const sidebarTabOpeningRef=typeof react.useRef==="function"?react.useRef(new Map()):{current:new Map()};
-const sidebarAutoOriginRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoOrigin):{current:sharedSidebarAutoOrigin};
-const sidebarAutoSuppressedRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoSuppressed):{current:sharedSidebarAutoSuppressed};
-const sidebarAutoCloseAttemptsRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoCloseAttempts):{current:sharedSidebarAutoCloseAttempts};
-const sidebarAutoCloseAttemptOwnersRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoCloseAttemptOwners):{current:sharedSidebarAutoCloseAttemptOwners};
-const sidebarAutoCloseVerificationsRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoCloseVerifications):{current:sharedSidebarAutoCloseVerifications};
-const sidebarAutoCloseCooldownsRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoCloseCooldowns):{current:sharedSidebarAutoCloseCooldowns};
-const sidebarAutoTabMissesRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoTabMisses):{current:sharedSidebarAutoTabMisses};
-const sidebarAutoReservationRef=typeof react.useRef==="function"?react.useRef(new Map()):{current:new Map()};
-const sidebarAutoCascadeRef=typeof react.useRef==="function"?react.useRef(false):{current:false};
-const sidebarAutoFailedKeysRef=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
-const sidebarAutoEpochRef=typeof react.useRef==="function"?react.useRef(0):{current:0};
-const sidebarManualIntentRef=typeof react.useRef==="function"?react.useRef(new Map()):{current:new Map()};
-const sidebarAutoBusyRef=typeof react.useRef==="function"?react.useRef(false):{current:false};
-const sidebarAutoSignatureRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const sidebarSplitIntentRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const sidebarTabPendingRef=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
-const sidebarBatchPendingRef=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
-const sidebarBatchScopeKey=(sessionId,rootId)=>String(sessionId)+SIDEBAR_TAB_KEY_SEPARATOR+String(rootId);
-const sidebarBatchSignatureRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-const sidebarTabSyncRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
-if(typeof react.useEffect==="function"){
-react.useEffect(()=>{
-mountedRef.current=true;
-const refreshState=refreshStateRef.current;
-refreshState.rootSessionId=rootSessionId;
-refreshState.pending=false;
-void refresh();
-const unsubscribe=subscribeSessions(config,contextRef.current,()=>{
-bump((value)=>value+1);
-void refresh();
-});
-const documentRef=globalThis.document;
-const scheduler={
-timer:null,
-delay:PANEL_POLL_TIMINGS.activeMs,
-paused:false,
-detached:false,
-failureCount:0,
-idleLevel:0,
-running:true,
-lastCycleId:0,
-activityKey:tabActivityKey,
-};
-const readDocumentHidden=()=>{
-try{return documentRef?.hidden===true;}catch{return false;}
-};
-const clearSchedulerTimer=()=>{
-if(scheduler.timer===null)return;
-if(typeof globalThis.clearInterval==="function"){
-try{globalThis.clearInterval(scheduler.timer);}catch{/* 清理失败不影响渲染。 */}
-}
-scheduler.timer=null;
-};
-const armScheduler=()=>{
-clearSchedulerTimer();
-if(scheduler.detached===true||scheduler.paused===true)return;
-if(typeof globalThis.setInterval!=="function")return;
-try{scheduler.timer=globalThis.setInterval(runScheduledPoll,scheduler.delay);}catch{scheduler.timer=null;}
-};
-const pauseScheduler=()=>{
-if(scheduler.paused===true){clearSchedulerTimer();return;}
-scheduler.paused=true;
-clearSchedulerTimer();
-};
-const resumeScheduler=(refreshImmediately)=>{
-if(scheduler.detached===true)return;
-scheduler.paused=false;
-scheduler.failureCount=0;
-scheduler.idleLevel=0;
-scheduler.delay=panelNextPollDelayMs(scheduler);
-if(readDocumentHidden()){clearSchedulerTimer();return;}
-armScheduler();
-if(refreshImmediately===true)void refresh();
-};
-scheduler.pause=pauseScheduler;
-scheduler.resume=resumeScheduler;
-const pollSurfaceBlocked=()=>{
-if(readDocumentHidden())return"hidden";
-if(scheduler.activityKey==="inactive")return"inactive";
-return null;
-};
-const runScheduledPoll=()=>{
-sidebarTabSyncRef.current?.();
-if(pollSurfaceBlocked()!==null){
-pauseScheduler();
-return;
-}
-void runPollCycle().then((cycle)=>{
-if(scheduler.detached===true||panelSchedulerRef.current!==scheduler)return;
-applyPanelPollCycle(scheduler,cycle,latestSnapshotRef.current);
-armScheduler();
-});
-};
-const onVisibilityChange=()=>{
-try{
-if(documentRef?.hidden!==true){
-resumeScheduler(true);
-sidebarTabSyncRef.current?.();
-}else{
-pauseScheduler();
-}
-}catch{/* 可见性通知只是加速恢复，读取失败不影响轮询。 */}
-};
-panelSchedulerRef.current=scheduler;
-if(pollSurfaceBlocked()!==null)pauseScheduler();
-else armScheduler();
-try{documentRef?.addEventListener?.("visibilitychange",onVisibilityChange);}catch{/* 可选 API。 */}
-sidebarTabSyncRef.current?.();
-let unsubscribeOpenTabs=null;
-try{
-const inventory=sidebarRight?.openTabs??null;
-const subscribe=methodOf(inventory,"subscribe");
-if(subscribe!==null){
-const cleanup=subscribe.call(inventory,()=>{sidebarTabSyncRef.current?.();});
-if(typeof cleanup==="function")unsubscribeOpenTabs=cleanup;
-}
-}catch{/* 旧宿主没有公开 inventory 或订阅失败时继续靠 observer/轮询。 */}
-let tabObserver=null;
-try{
-const doc=globalThis.document;
-const Observer=globalThis.MutationObserver??doc?.defaultView?.MutationObserver;
-const target=doc?.body??null;
-if(typeof Observer==="function"&&target!==null&&target!==undefined){
-tabObserver=new Observer(()=>{sidebarTabSyncRef.current?.();});
-tabObserver.observe(target,{childList:true,subtree:true});
-}
-}catch{
-try{tabObserver?.disconnect?.();}catch{/* 可选 API。 */}
-tabObserver=null;
-}
-return()=>{
-mountedRef.current=false;
-try{releaseRightbarDragLock?.();}catch{/* 同上。 */}
-const splitIntent=sidebarSplitIntentRef.current;
-sidebarSplitIntentRef.current=null;
-if(splitIntent!==null&&cancelSidebarSplit!==null){
-try{cancelSidebarSplit.call(config,splitIntent.token,{reason:"unmount"});}catch{/* 事务收口失败不能阻断卸载。 */}
-}
-requestSequenceRef.current+=1;
-scheduler.detached=true;
-clearSchedulerTimer();
-if(panelSchedulerRef.current===scheduler)panelSchedulerRef.current=null;
-const pollState=pollSyncStateRef.current;
-pollState.pending=false;
-pollState.inFlight?.controller?.abort?.();
-pollState.inFlight=null;
-refreshState.pending=false;
-refreshState.inFlight?.controller?.abort?.();
-refreshState.inFlight=null;
-if(typeof unsubscribe==="function")unsubscribe();
-if(typeof unsubscribeOpenTabs==="function")unsubscribeOpenTabs();
-try{documentRef?.removeEventListener?.("visibilitychange",onVisibilityChange);}catch{/* 可选 API。 */}
-try{tabObserver?.disconnect?.();}catch{/* 可选 API。 */}
-};
-},[rootSessionId,sidebarSessionId]);
-}
-if(typeof react.useEffect==="function"){
-react.useEffect(()=>{
-const scheduler=panelSchedulerRef.current;
-if(scheduler===null||scheduler.detached===true)return;
-if(scheduler.activityKey===tabActivityKey)return;
-scheduler.activityKey=tabActivityKey;
-if(tabActivityKey==="inactive"){
-scheduler.pause?.();
-return;
-}
-scheduler.resume?.(tabActivityKey==="active");
-},[tabActivityKey]);
-}const navigation=getOpenSession(config,contextRef.current);
-const serviceCandidates=[config,ctx,config.ctx];
-const sessionsService=resolveClientService(serviceCandidates,"sessions");
-const sidebarRight=resolveClientService(serviceCandidates,"sidebarRight");
-const requestRightbarDragSync=typeof config.syncRightbarDragLock==="function"?config.syncRightbarDragLock:null;
-const releaseRightbarDragLock=typeof config.releaseRightbarDragLock==="function"?config.releaseRightbarDragLock:null;
-const beginSidebarSplit=typeof config.beginSidebarSplit==="function"?config.beginSidebarSplit:null;
-const markSidebarSplitPane=typeof config.markSidebarSplitPane==="function"?config.markSidebarSplitPane:null;
-const markSidebarSplitOpen=typeof config.markSidebarSplitOpen==="function"?config.markSidebarSplitOpen:null;
-const commitSidebarSplit=typeof config.commitSidebarSplit==="function"?config.commitSidebarSplit:null;
-const cancelSidebarSplit=typeof config.cancelSidebarSplit==="function"?config.cancelSidebarSplit:null;
-const openSidebarResource=methodOf(sidebarRight,"openResource");
-const readAutoOpenSetting=typeof config.getAutoOpenSubagentSidebar==="function"
-?config.getAutoOpenSubagentSidebar
-:null;
-const writeAutoOpenSetting=typeof config.setAutoOpenSubagentSidebar==="function"
-?config.setAutoOpenSubagentSidebar
-:null;
-const autoOpenEnabled=()=>{
-if(readAutoOpenSetting===null)return false;
-try{return readAutoOpenSetting()===true;}catch{return false;}
-};
-const toggleAutoOpen=(next)=>{
-const value=next===true;
-if(writeAutoOpenSetting===null)return;
-setAutoOpenDraft(value);
-void Promise.resolve()
-.then(()=>writeAutoOpenSetting(value))
-.then(
-(accepted)=>{if(accepted!==true)setAutoOpenDraft(null);},
-()=>{setAutoOpenDraft(null);},
-);
-};
-const splitSidebarPane=methodOf(sidebarRight,"split");
-const closeSidebarResource=methodOf(sidebarRight,"close");
-const readActiveSidebarResource=methodOf(sidebarRight,"active");
-const readSidebarOpenTabs=()=>{
-let inventory=null;
-try{inventory=sidebarRight?.openTabs??null;}catch{return null;}
-const getSnapshot=methodOf(inventory,"getSnapshot");
-if(getSnapshot===null)return null;
-try{
-const snapshot=getSnapshot.call(inventory);
-return Array.isArray(snapshot)?snapshot:null;
-}catch{return null;}
-};
-const seededGuideTabId=(beforeTabs,sessionId)=>{
-const expectedSessionId=text(sessionId,null);
-if(expectedSessionId===null||!Array.isArray(beforeTabs))return null;
-const beforeIds=new Set();
-for(const tab of beforeTabs){
-try{
-const candidate=object(tab);
-if(text(candidate.sessionId,null)!==expectedSessionId)continue;
-const tabId=text(candidate.tabId,null);
-if(tabId!==null)beforeIds.add(tabId);
-}catch{/* 损坏的 inventory 记录不影响其它 tab。 */}
-}
-const afterTabs=readSidebarOpenTabs();
-if(!Array.isArray(afterTabs))return null;
-const newGuideTabIds=[];
-for(const tab of afterTabs){
-try{
-const candidate=object(tab);
-if(text(candidate.sessionId,null)!==expectedSessionId
-||text(candidate.kind,null)!=="guide")continue;
-const tabId=text(candidate.tabId,null);
-if(tabId!==null&&!beforeIds.has(tabId))newGuideTabIds.push(tabId);
-}catch{/* 损坏的 inventory 记录不影响其它 tab。 */}
-}
-return newGuideTabIds.length===1?newGuideTabIds[0]:null;
-};
-const sidebarOpenTabsAvailable=readSidebarOpenTabs()!==null;
-const snapshot=viewState.snapshot;
-const partialSnapshot=snapshot?.partial===true;
-const usageFactPresent=snapshot===null?false:snapshotHasUsageFact(snapshot);
-if(typeof react.useEffect==="function"){
-react.useEffect(()=>{
-if(usageFactPresent!==true)return;
-if(metaStateRef.current!==null)return;
-if(metaAutoAttemptRef.current===rootSessionId)return;
-metaAutoAttemptRef.current=rootSessionId;
-void loadMeta();
-},[usageFactPresent,rootSessionId]);
-}
-const neutralRuntimeStatus=typeof model.UNKNOWN_RUNTIME_STATUS==="string"&&model.UNKNOWN_RUNTIME_STATUS.length>0
-?model.UNKNOWN_RUNTIME_STATUS
-:"unknown";
-const sidebarSnapshotSyncRef=typeof react.useRef==="function"
-?react.useRef({rootSessionId,sidebarSessionId,snapshot})
-:{current:{rootSessionId,sidebarSessionId,snapshot}};
-if(typeof react.useEffect==="function"){
-react.useEffect(()=>{
-const previous=sidebarSnapshotSyncRef.current;
-sidebarSnapshotSyncRef.current={rootSessionId,sidebarSessionId,snapshot};
-if(previous.rootSessionId===rootSessionId
-&&previous.sidebarSessionId===sidebarSessionId
-&&previous.snapshot!==snapshot)sidebarTabSyncRef.current?.();
-},[rootSessionId,sidebarSessionId,snapshot]);
-}
-const retry=()=>{
-setState((previous)=>(previous.rootSessionId===rootSessionId&&previous.error!==null
-?{...previous,error:null}
-:previous));
-void refresh({manual:true});
-};
-const expand=(node)=>store?store.isExpanded(node):(node?.kind==="root"||(typeof model.defaultExpanded==="function"&&model.defaultExpanded(node)));
-const toggle=(node)=>{
-if(store)store.toggle(node);
-bump((value)=>value+1);
-};
-const handleOpen=(id,address)=>{
-if(navigation.available!==true)return;
-if(typeof id!=="string"||id.length===0)return;
-navigation.open(address===null||address===undefined||navigation.acceptsAddress!==true?id:address);
-};
-const subagentAddressOfChild=(childId,parentId,node)=>{
-const id=text(childId,null);
-if(id===null)return null;
-const lookup=methodOf(sessionsService,"subagentAddress");
-if(lookup!==null){
-let addressed;
-try{addressed=lookup.call(sessionsService,id);}catch{addressed=null;}
-const normalized=normalizeSubagentAddress(addressed);
-if(normalized!==null)return normalized;
-if(addressed!==undefined&&addressed!==null)return null;
-}
-const parent=text(parentId,null);
-const entry=catalogEntryOf(parent,id);
-const entrySource=object(entry);
-const entryHasMode=Object.prototype.hasOwnProperty.call(entrySource,"mode");
-const entryMode=text(entrySource.mode,null);
-const mode=entryHasMode
-?entryMode
-:(object(node).continuable===true?"continuable":null);
-return normalizeSubagentAddress({
-parentSessionId:parent,
-childSessionId:id,
-mode,
-});
-};
-const activeSidebarTabId=()=>{
-if(readActiveSidebarResource===null)return null;
-try{return text(object(readActiveSidebarResource.call(sidebarRight)).id,null);}catch{return null;}
-};
-const presentSidebarTabIds=()=>{
-const doc=globalThis.document;
+global[SYMBOL]=Object.freeze({createPanelSnapshotCache});
+})(globalThis);
+/* source: client-sidebar-split-sync.js */
+(function installClientSidebarSplitSync(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-split-sync");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+RIGHTBAR_TAB_SELECTOR,RIGHTBAR_PANE_COLUMN_ATTRIBUTE,RIGHTBAR_PANE_ID_ATTRIBUTE,
+SIDEBAR_SPLIT_LAYOUT_WAIT_FALLBACK_MS,
+isGeneratedExpertGroupTabId,object,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+SUBAGENT_CHAT_KIND,expertGroupTabIdsOf,paneNodesOf,rightbarPanelForSessionCompat,
+}=DOM;
+function presentSidebarTabIds(doc,sidebarSessionId){
 if(!doc||typeof doc.querySelector!=="function")return null;
 const panel=rightbarPanelForSessionCompat(doc,sidebarSessionId);
 if(panel===null||panel===undefined)return null;
@@ -4585,8 +3644,8 @@ const id=text(raw,null);
 if(id!==null)ids.add(id);
 }
 return ids;
-};
-const paneIdsContainingTabs=(panel,tabIds,extraMatcher=null)=>{
+}
+function paneIdsContainingTabs(panel,tabIds,extraMatcher=null){
 if(panel===null||panel===undefined||typeof panel.querySelectorAll!=="function")return new Set();
 let nodes;
 try{nodes=Array.from(panel.querySelectorAll(RIGHTBAR_TAB_SELECTOR));}catch{return new Set();}
@@ -4617,18 +3676,22 @@ try{parent=parent.parentElement??parent.parentNode??null;}catch{parent=null;}
 }
 }
 return paneIds;
-};
-const paneIdContainingTab=(tabId)=>{
-const doc=globalThis.document;
+}
+function paneIdContainingTab(doc,sidebarSessionId,tabId){
 if(doc===null||doc===undefined||typeof doc.querySelector!=="function")return null;
 const panel=rightbarPanelForSessionCompat(doc,sidebarSessionId);
 if(panel===null||panel===undefined)return null;
 const paneIds=paneIdsContainingTabs(panel,new Set([tabId]));
 return paneIds.size===1?[...paneIds][0]:null;
-};
-const sidebarSplitTargetEvidence=(resourceAddress,expectedPaneId=null)=>{
-const inventory=readSidebarOpenTabs();
-if(inventory===null)return null;
+}
+function sidebarSplitTargetEvidence(options){
+const inventory=options?.inventory??null;
+const sidebarSessionId=text(options?.sidebarSessionId,null);
+const resourceAddress=text(options?.resourceAddress,null);
+const expectedPaneId=options?.expectedPaneId===undefined||options?.expectedPaneId===null
+?null
+:text(options.expectedPaneId,null);
+if(!Array.isArray(inventory)||sidebarSessionId===null||resourceAddress===null)return null;
 for(const entry of inventory){
 try{
 const candidate=object(entry);
@@ -4637,7 +3700,7 @@ if(text(candidate.kind,null)!==SUBAGENT_CHAT_KIND)continue;
 if(text(candidate.contentId,null)!==resourceAddress)continue;
 const tabId=text(candidate.tabId,null);
 if(tabId===null)continue;
-const paneId=paneIdContainingTab(tabId);
+const paneId=paneIdContainingTab(options.doc??null,sidebarSessionId,tabId);
 if(paneId===null)continue;
 if(expectedPaneId!==null&&paneId!==expectedPaneId)continue;
 return{tabId,paneId};
@@ -4645,21 +3708,20 @@ return{tabId,paneId};
 }
 }
 return null;
-};
-const expertGroupPaneIds=(panel)=>{
+}
+function expertGroupPaneIds(panel,inventory,sidebarSessionId){
 if(panel===null||panel===undefined||typeof panel.querySelectorAll!=="function")return new Set();
 return paneIdsContainingTabs(
 panel,
-expertGroupTabIdsOf(readSidebarOpenTabs(),sidebarSessionId),
+expertGroupTabIdsOf(inventory,sidebarSessionId),
 isGeneratedExpertGroupTabId,
 );
-};
-const existingSubagentPaneId=()=>{
-const doc=globalThis.document;
+}
+function existingSubagentPaneId(doc,sidebarSessionId,inventory){
 if(!doc||typeof doc.querySelector!=="function")return null;
 const panel=rightbarPanelForSessionCompat(doc,sidebarSessionId);
 if(panel===null||panel===undefined||typeof panel.querySelectorAll!=="function")return null;
-const expertPaneIds=expertGroupPaneIds(panel);
+const expertPaneIds=expertGroupPaneIds(panel,inventory,sidebarSessionId);
 if(expertPaneIds.size===0)return null;
 const panes=paneNodesOf(panel);
 if(panes===null)return null;
@@ -4693,167 +3755,34 @@ if(left.column===null&&right.column!==null)return 1;
 return right.index-left.index;
 });
 return candidates[0]?.paneId??null;
-};
-const presentFloatingSubagentTitles=()=>{
-const doc=globalThis.document;
-if(!doc||typeof doc.querySelectorAll!=="function")return null;
-let floats=null;
-try{floats=Array.from(doc.querySelectorAll(RIGHTBAR_FLOAT_SELECTOR));}catch{return null;}
-const titles=new Set();
-for(const float of floats){
-if(typeof float?.querySelector!=="function")return null;
-let chat=null;
-let titleNode=null;
+}
+function seededGuideTabId(beforeTabs,sessionId,afterTabs){
+const expectedSessionId=text(sessionId,null);
+if(expectedSessionId===null||!Array.isArray(beforeTabs))return null;
+const beforeIds=new Set();
+for(const tab of beforeTabs){
 try{
-chat=float.querySelector("[data-sidebar-chat]");
-titleNode=float.querySelector(RIGHTBAR_FLOAT_TITLE_SELECTOR);
-}catch{return null;}
-if(chat===null||titleNode===null)continue;
-const title=text(titleNode.textContent,null);
-if(title!==null)titles.add(title);
-}
-return titles;
-};
-const knownSidebarResourceAddresses=()=>{
-const addresses=new Set();
-const add=(node,parentId)=>{
-const source=object(node);
-if(source.kind==="fanout"){
-const shards=Array.isArray(source.shards)?source.shards:[];
-for(const shard of shards){
-const shardSource=object(shard);
-const childId=text(shardSource.childId,null);
-if(childId===null)continue;
-const address=subagentChatAddress(subagentAddressOfChild(childId,parentId,{
-...shardSource,
-kind:"expert",
-}));
-if(address!==null)addresses.add(address);
-}
-}else{
-const childId=text(source.sessionId,text(source.childId,null));
-if(childId!==null){
-const address=subagentChatAddress(subagentAddressOfChild(childId,parentId,source));
-if(address!==null)addresses.add(address);
-}
-}
-if(Array.isArray(source.children)){
-for(const child of source.children)add(child,parentId);
-}
-};
-const children=Array.isArray(snapshot?.root?.children)?snapshot.root.children:[];
-for(const child of children)add(child,rootSessionId);
-return addresses;
-};
-const sidebarExpertResourceAddresses=(node,parentId,addresses)=>{
-const source=object(node);
-const kind=text(source.kind,null);
-if(kind==="fanout"){
-const shards=Array.isArray(source.shards)?source.shards:[];
-for(const shard of shards){
-const shardSource=object(shard);
-const childId=text(shardSource.childId,null);
-if(childId===null)continue;
-if(runtimeStatusOfNode(shardSource,parentId,childId)!=="running")continue;
-const address=subagentChatAddress(subagentAddressOfChild(childId,parentId,{
-...shardSource,
-kind:"expert",
-}));
-if(address!==null)addresses.add(address);
-}
-return;
-}
-if(kind!=="expert")return;
-const childId=text(source.sessionId,text(source.childId,null));
-if(childId!==null&&runtimeStatusOfNode(source,parentId,childId)==="running"){
-const address=subagentChatAddress(subagentAddressOfChild(childId,parentId,source));
-if(address!==null)addresses.add(address);
-}
-if(Array.isArray(source.children)){
-for(const child of source.children)sidebarExpertResourceAddresses(child,childId,addresses);
-}
-};
-const sidebarRootChildren=()=>(Array.isArray(snapshot?.root?.children)?snapshot.root.children:[]);
-const sidebarNodeIsIdleReady=(node,parentId,childId)=>
-runtimeStatusOfNode(node,parentId,childId,{partial:partialSnapshot})==="ready";
-const sidebarNodeIsIdleMembership=(node,parentId,childId)=>{
-const status=runtimeStatusOfNode(node,parentId,childId,{partial:partialSnapshot});
-if(status==="ready")return true;
-return partialSnapshot===true&&status===neutralRuntimeStatus;
-};
-const sidebarIdleChildren=()=>sidebarRootChildren()
-.filter((node)=>{
-if(node.kind==="fanout")return FANOUT_SETTLED_STATUSES.has(statusOf(node));
-return node.kind==="expert"
-&&sidebarNodeIsIdleMembership(node,rootSessionId,text(node.sessionId,null));
-});
-const runningSidebarResourceAddresses=()=>{
-const addresses=new Set();
-for(const child of sidebarRootChildren())sidebarExpertResourceAddresses(child,rootSessionId,addresses);
-return addresses;
-};
-const idleSidebarResourceAddresses=(nodes)=>{
-const addresses=new Set();
-for(const node of Array.isArray(nodes)?nodes:[]){
-const source=object(node);
-if(source.kind==="fanout"){
-for(const shard of Array.isArray(source.shards)?source.shards:[]){
-const shardSource=object(shard);
-const shardChildId=text(shardSource.childId,null);
-if(shardChildId===null||sidebarNodeIsIdleReady(shardSource,rootSessionId,shardChildId)!==true)continue;
-const shardAddress=subagentChatAddress(subagentAddressOfChild(shardChildId,rootSessionId,{
-...shardSource,
-kind:"expert",
-}));
-if(shardAddress!==null)addresses.add(shardAddress);
-}
-continue;
-}
-const childId=text(source.sessionId,text(source.childId,null));
-if(childId===null)continue;
-if(sidebarNodeIsIdleReady(source,rootSessionId,text(source.sessionId,null))!==true)continue;
-const address=subagentChatAddress(subagentAddressOfChild(childId,rootSessionId,source));
-if(address!==null)addresses.add(address);
-}
-return addresses;
-};
-const sidebarBatchCandidates=(addresses,inventory)=>{
-const seen=new Set();
-const candidates=[];
-for(const entry of inventory){
-let candidate=null;
-try{
-candidate=object(entry);
-if(text(candidate.sessionId,null)!==sidebarSessionId)continue;
-if(text(candidate.kind,null)!==SUBAGENT_CHAT_KIND)continue;
+const candidate=object(tab);
+if(text(candidate.sessionId,null)!==expectedSessionId)continue;
 const tabId=text(candidate.tabId,null);
-if(tabId===null)continue;
-const contentId=text(candidate.contentId,null);
-if(contentId===null||addresses.has(contentId)!==true)continue;
-if(seen.has(tabId)===true)continue;
-seen.add(tabId);
-candidates.push({tabId,address:contentId});
-}catch{continue;}
+if(tabId!==null)beforeIds.add(tabId);
+}catch{/* 损坏的 inventory 记录不影响其它 tab。 */}
 }
-return candidates;
-};
-const sidebarBatchStateFor=(addresses)=>{
-const inventory=readSidebarOpenTabs();
-if(inventory===null)return{kind:"none",candidates:[]};
-const candidates=sidebarBatchCandidates(addresses,inventory);
-if(candidates.length===0)return{kind:"zero",candidates:[]};
-if(closeSidebarResource===null)return{kind:"none",candidates:[]};
-return{kind:"close",candidates};
-};
-const sidebarBatchSignatureOf=(runningState,idleState)=>{
-const part=(state)=>(state.kind==="close"
-?"close:"+state.candidates
-.map((candidate)=>candidate.tabId+SIDEBAR_TAB_KEY_SEPARATOR+candidate.address)
-.join(",")
-:state.kind);
-return part(runningState)+"|"+part(idleState);
-};
-const waitForSidebarSplitLayoutCommit=()=>new Promise((resolve)=>{
+if(!Array.isArray(afterTabs))return null;
+const newGuideTabIds=[];
+for(const tab of afterTabs){
+try{
+const candidate=object(tab);
+if(text(candidate.sessionId,null)!==expectedSessionId
+||text(candidate.kind,null)!=="guide")continue;
+const tabId=text(candidate.tabId,null);
+if(tabId!==null&&!beforeIds.has(tabId))newGuideTabIds.push(tabId);
+}catch{/* 损坏的 inventory 记录不影响其它 tab。 */}
+}
+return newGuideTabIds.length===1?newGuideTabIds[0]:null;
+}
+function waitForSidebarSplitLayoutCommit(){
+return new Promise((resolve)=>{
 let settled=false;
 let fallbackTimer=null;
 const clearFallback=()=>{
@@ -4894,111 +3823,160 @@ return;
 }catch{/* 最后的同步收口保证 Promise 不会永久悬挂。 */}
 settle();
 });
-const cancelPendingSidebarSplit=(reason,expectedIntentToken)=>{
-const intent=sidebarSplitIntentRef.current;
-if(intent===null)return;
-if(expectedIntentToken!==undefined&&intent.token!==expectedIntentToken)return;
-sidebarSplitIntentRef.current=null;
-sidebarTabOpeningRef.current.delete(intent.key);
-if(cancelSidebarSplit===null)return;
-try{cancelSidebarSplit.call(config,intent.token,{reason});}catch{/* 收口失败不能阻断面板同步。 */}
-};
-const cancelPendingSidebarSplitOfClose=(key,splitIntentToken)=>{
-const intent=sidebarSplitIntentRef.current;
-if(intent===null||intent.key!==key)return;
-if(splitIntentToken===null||splitIntentToken===undefined)return;
-if(intent.token!==splitIntentToken)return;
-cancelPendingSidebarSplit("close",splitIntentToken);
-};
-const tryCommitSidebarSplit=()=>{
-const intent=sidebarSplitIntentRef.current;
-if(intent===null||intent.resourceIssued!==true||commitSidebarSplit===null)return;
-const evidence=sidebarSplitTargetEvidence(intent.resourceAddress,intent.paneId);
-if(evidence===null)return;
+}
+global[SYMBOL]=Object.freeze({
+existingSubagentPaneId,
+presentSidebarTabIds,
+seededGuideTabId,
+sidebarSplitTargetEvidence,
+waitForSidebarSplitLayoutCommit,
+});
+})(globalThis);
+/* source: client-sidebar-tab-state.js */
+(function installClientSidebarTabState(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-tab-state");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+FANOUT_SETTLED_STATUSES,RIGHTBAR_FLOAT_SELECTOR,RIGHTBAR_FLOAT_TITLE_SELECTOR,
+SIDEBAR_AUTO_CLOSE_COOLDOWN_BASE_MS,SIDEBAR_AUTO_CLOSE_COOLDOWN_MAX_MS,
+SIDEBAR_AUTO_KEY_LIMIT,SIDEBAR_TAB_KEY_SEPARATOR,
+object,statusOf,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{SUBAGENT_CHAT_KIND,subagentChatAddress}=DOM;
+function presentFloatingSubagentTitles(doc){
+if(!doc||typeof doc.querySelectorAll!=="function")return null;
+let floats=null;
+try{floats=Array.from(doc.querySelectorAll(RIGHTBAR_FLOAT_SELECTOR));}catch{return null;}
+const titles=new Set();
+for(const float of floats){
+if(typeof float?.querySelector!=="function")return null;
+let chat=null;
+let titleNode=null;
 try{
-if(commitSidebarSplit.call(config,intent.token,evidence)===true){
-sidebarSplitIntentRef.current=null;
+chat=float.querySelector("[data-sidebar-chat]");
+titleNode=float.querySelector(RIGHTBAR_FLOAT_TITLE_SELECTOR);
+}catch{return null;}
+if(chat===null||titleNode===null)continue;
+const title=text(titleNode.textContent,null);
+if(title!==null)titles.add(title);
 }
-}catch{
+return titles;
+}
+function knownSidebarResourceAddresses(snapshot,rootSessionId,addressOf){
+const addresses=new Set();
+const add=(node,parentId)=>{
+const source=object(node);
+if(source.kind==="fanout"){
+const shards=Array.isArray(source.shards)?source.shards:[];
+for(const shard of shards){
+const shardSource=object(shard);
+const childId=text(shardSource.childId,null);
+if(childId===null)continue;
+const address=subagentChatAddress(addressOf(childId,parentId,{
+...shardSource,
+kind:"expert",
+}));
+if(address!==null)addresses.add(address);
+}
+}else{
+const childId=text(source.sessionId,text(source.childId,null));
+if(childId!==null){
+const address=subagentChatAddress(addressOf(childId,parentId,source));
+if(address!==null)addresses.add(address);
+}
+}
+if(Array.isArray(source.children)){
+for(const child of source.children)add(child,parentId);
 }
 };
-const syncSidebarTabRecords=()=>{
-try{requestRightbarDragSync?.();}catch{/* 手柄锁只是体验优化，绝不影响面板。 */}
-const batchSignatureNow=sidebarBatchSignatureOf(
-sidebarBatchStateFor(runningSidebarResourceAddresses()),
-sidebarBatchStateFor(idleSidebarResourceAddresses(sidebarIdleChildren())),
-);
-if(sidebarBatchSignatureRef.current!==batchSignatureNow){
-sidebarBatchSignatureRef.current=batchSignatureNow;
-bump((value)=>value+1);
+const children=Array.isArray(snapshot?.root?.children)?snapshot.root.children:[];
+for(const child of children)add(child,rootSessionId);
+return addresses;
 }
-const records=sidebarTabRecordsRef.current;
-const openings=sidebarTabOpeningRef.current;
-const now=Date.now();
-const openingResolved=[];
-let scopedRecordExists=false;
-for(const record of records.values()){
-if(record.sessionId===sidebarSessionId&&record.rootSessionId===rootSessionId){
-scopedRecordExists=true;
-break;
+function sidebarExpertResourceAddresses(node,parentId,addresses,deps){
+const addressOf=deps.addressOf;
+const statusOfNode=deps.statusOf;
+const source=object(node);
+const kind=text(source.kind,null);
+if(kind==="fanout"){
+const shards=Array.isArray(source.shards)?source.shards:[];
+for(const shard of shards){
+const shardSource=object(shard);
+const childId=text(shardSource.childId,null);
+if(childId===null)continue;
+if(statusOfNode(shardSource,parentId,childId)!=="running")continue;
+const address=subagentChatAddress(addressOf(childId,parentId,{
+...shardSource,
+kind:"expert",
+}));
+if(address!==null)addresses.add(address);
+}
+return;
+}
+if(kind!=="expert")return;
+const childId=text(source.sessionId,text(source.childId,null));
+if(childId!==null&&statusOfNode(source,parentId,childId)==="running"){
+const address=subagentChatAddress(addressOf(childId,parentId,source));
+if(address!==null)addresses.add(address);
+}
+if(Array.isArray(source.children)){
+for(const child of source.children)sidebarExpertResourceAddresses(child,childId,addresses,deps);
 }
 }
-if(scopedRecordExists!==true){
-for(const resourceAddress of knownSidebarResourceAddresses()){
-if(sidebarAdoptionEvidenceAvailable(resourceAddress)!==true)continue;
-const key=sidebarTabKey(sidebarSessionId,rootSessionId,resourceAddress);
-if(recordSidebarTab(key,resourceAddress))openings.delete(key);
+function sidebarNodeIsIdleReady(node,parentId,childId,deps){
+return deps.statusOf(node,parentId,childId,{partial:deps.partial})==="ready";
 }
+function sidebarNodeIsIdleMembership(node,parentId,childId,deps){
+const status=deps.statusOf(node,parentId,childId,{partial:deps.partial});
+if(status==="ready")return true;
+return deps.partial===true&&status===deps.neutralStatus;
 }
-for(const[key,opening]of openings){
-if(now>=opening.expiresAt){
-if(sidebarSplitIntentRef.current?.key===key)cancelPendingSidebarSplit("timeout");
-openingResolved.push(key);
+function sidebarIdleChildren(children,rootSessionId,deps){
+return(Array.isArray(children)?children:[])
+.filter((node)=>{
+if(node.kind==="fanout")return FANOUT_SETTLED_STATUSES.has(statusOf(node));
+return node.kind==="expert"
+&&sidebarNodeIsIdleMembership(node,rootSessionId,text(node.sessionId,null),deps);
+});
+}
+function runningSidebarResourceAddresses(children,rootSessionId,deps){
+const addresses=new Set();
+for(const child of Array.isArray(children)?children:[]){
+sidebarExpertResourceAddresses(child,rootSessionId,addresses,deps);
+}
+return addresses;
+}
+function idleSidebarResourceAddresses(nodes,rootSessionId,deps){
+const addresses=new Set();
+for(const node of Array.isArray(nodes)?nodes:[]){
+const source=object(node);
+if(source.kind==="fanout"){
+for(const shard of Array.isArray(source.shards)?source.shards:[]){
+const shardSource=object(shard);
+const shardChildId=text(shardSource.childId,null);
+if(shardChildId===null||sidebarNodeIsIdleReady(shardSource,rootSessionId,shardChildId,deps)!==true)continue;
+const shardAddress=subagentChatAddress(deps.addressOf(shardChildId,rootSessionId,{
+...shardSource,
+kind:"expert",
+}));
+if(shardAddress!==null)addresses.add(shardAddress);
+}
 continue;
 }
-if(opening.sessionId!==sidebarSessionId||opening.rootSessionId!==rootSessionId)continue;
-if(recordSidebarTab(key,opening.resourceAddress))openingResolved.push(key);
+const childId=text(source.sessionId,text(source.childId,null));
+if(childId===null)continue;
+if(sidebarNodeIsIdleReady(source,rootSessionId,text(source.sessionId,null),deps)!==true)continue;
+const address=subagentChatAddress(deps.addressOf(childId,rootSessionId,source));
+if(address!==null)addresses.add(address);
 }
-for(const key of openingResolved){
-openings.delete(key);
+return addresses;
 }
-tryCommitSidebarSplit();
-for(const key of[...sidebarManualIntentRef.current.keys()]){
-const entry=sidebarManualIntentRef.current.get(key);
-if(entry===undefined)continue;
-if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId){
-sidebarManualIntentRef.current.delete(key);
-continue;
-}
-applyPendingManualIntent(key);
-}
-if(records.size===0)return;
-const present=presentSidebarTabIds();
-if(present===null)return;
-const floatingTitles=presentFloatingSubagentTitles();
-if(floatingTitles===null)return;
-const activeTabId=activeSidebarTabId();
-const stale=[];
-for(const[key,record]of records){
-if(record.sessionId!==sidebarSessionId||record.rootSessionId!==rootSessionId)continue;
-if(present.has(record.tabId)===true
-||record.tabId===activeTabId
-||(text(record.title,null)!==null&&floatingTitles.has(record.title))){
-record.misses=0;
-continue;
-}
-record.misses+=1;
-if(record.misses>=SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS)stale.push(key);
-}
-if(stale.length===0)return;
-for(const key of stale){
-records.delete(key);
-}
-bump((value)=>value+1);
-};
-const sidebarResourceTabStateOf=(resourceAddress)=>{
-const inventory=readSidebarOpenTabs();
-if(inventory===null)return{readable:false,tabId:null};
+function sidebarResourceTabStateOf(inventory,sidebarSessionId,resourceAddress){
+if(inventory===null||inventory===undefined)return{readable:false,tabId:null};
 for(const entry of inventory){
 try{
 const candidate=object(entry);
@@ -5009,30 +3987,2096 @@ return{readable:true,tabId:text(candidate.tabId,null)};
 }catch{continue;}
 }
 return{readable:true,tabId:null};
-};
-const sidebarAdoptionEvidenceAvailable=(resourceAddress)=>{
-const state=sidebarResourceTabStateOf(resourceAddress);
+}
+function sidebarAdoptionEvidenceAvailable(inventory,sidebarSessionId,resourceAddress){
+const state=sidebarResourceTabStateOf(inventory,sidebarSessionId,resourceAddress);
 if(state.readable!==true)return true;
 return state.tabId!==null;
-};
-const sidebarActiveResourceMatches=(resourceAddress)=>{
-if(readActiveSidebarResource===null)return false;
-let tab=null;
-try{tab=object(readActiveSidebarResource.call(sidebarRight));}catch{return false;}
+}
+function sidebarActiveResourceMatches(activeTab,resourceAddress){
+if(activeTab===null||activeTab===undefined)return false;
+const tab=object(activeTab);
 if(text(tab.kind,null)!==SUBAGENT_CHAT_KIND)return false;
 return text(tab.contentId,null)===resourceAddress;
-};
-const sidebarAutoOpenCapable=()=>openSidebarResource!==null
-&&closeSidebarResource!==null
-&&(readActiveSidebarResource!==null||sidebarOpenTabsAvailable===true)
-&&typeof primitives?.IconChevronLeftOutlineRegular==="function";
-const sidebarManualIntentOf=(key)=>{
-const entry=sidebarManualIntentRef.current.get(key);
+}
+function sidebarManualIntentOf(manualIntentMap,key,sidebarSessionId,rootSessionId){
+const entry=manualIntentMap.get(key);
 if(entry===undefined)return undefined;
 if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId)return undefined;
 return entry;
+}
+function sidebarBatchCandidates(addresses,inventory,sidebarSessionId){
+const seen=new Set();
+const candidates=[];
+for(const entry of Array.isArray(inventory)?inventory:[]){
+let candidate=null;
+try{
+candidate=object(entry);
+if(text(candidate.sessionId,null)!==sidebarSessionId)continue;
+if(text(candidate.kind,null)!==SUBAGENT_CHAT_KIND)continue;
+const tabId=text(candidate.tabId,null);
+if(tabId===null)continue;
+const contentId=text(candidate.contentId,null);
+if(contentId===null||addresses.has(contentId)!==true)continue;
+if(seen.has(tabId)===true)continue;
+seen.add(tabId);
+candidates.push({tabId,address:contentId});
+}catch{continue;}
+}
+return candidates;
+}
+function sidebarBatchStateFor(addresses,options){
+const inventory=options?.inventory??null;
+if(inventory===null||inventory===undefined)return{kind:"none",candidates:[]};
+const candidates=sidebarBatchCandidates(addresses,inventory,options?.sidebarSessionId??null);
+if(candidates.length===0)return{kind:"zero",candidates:[]};
+if(options?.closeAvailable!==true)return{kind:"none",candidates:[]};
+return{kind:"close",candidates};
+}
+function sidebarBatchSignatureOf(runningState,idleState){
+const part=(state)=>(state.kind==="close"
+?"close:"+state.candidates
+.map((candidate)=>candidate.tabId+SIDEBAR_TAB_KEY_SEPARATOR+candidate.address)
+.join(",")
+:state.kind);
+return part(runningState)+"|"+part(idleState);
+}
+function trimAutoKeyMap(map,options){
+const limit=Number.isSafeInteger(options?.limit)?options.limit:SIDEBAR_AUTO_KEY_LIMIT;
+const activeAware=options?.activeAware===true;
+const isActive=typeof options?.isActive==="function"?options.isActive:null;
+while(map.size>limit){
+let victim=null;
+for(const candidate of map.keys()){
+if(activeAware!==true||isActive===null||isActive(candidate)!==true){
+victim=candidate;
+break;
+}
+}
+if(victim===null)break;
+map.delete(victim);
+}
+}
+function clearAutoCloseAttempt(ledger,key){
+ledger.closeAttempts.delete(key);
+ledger.owners.delete(key);
+ledger.tabMisses.delete(key);
+}
+function clearAutoCloseBudget(ledger,key){
+clearAutoCloseAttempt(ledger,key);
+ledger.closeCooldowns.delete(key);
+}
+function enterAutoCloseCooldown(ledger,key,isActive){
+const cooldowns=ledger.closeCooldowns;
+const previous=cooldowns.get(key);
+const step=previous===undefined?0:Math.min(previous.step+1,4);
+const delay=Math.min(SIDEBAR_AUTO_CLOSE_COOLDOWN_BASE_MS*(2**step),SIDEBAR_AUTO_CLOSE_COOLDOWN_MAX_MS);
+cooldowns.set(key,{step,until:Date.now()+delay});
+trimAutoKeyMap(cooldowns,{limit:ledger.limit,activeAware:true,isActive});
+}
+function autoCloseCooldownActive(ledger,key){
+const entry=ledger.closeCooldowns.get(key);
+return entry!==undefined&&entry.until>Date.now();
+}
+function releaseExpiredAutoCloseCooldown(ledger,key){
+const cooldowns=ledger.closeCooldowns;
+const entry=cooldowns.get(key);
+if(entry===undefined||entry.until>Date.now())return;
+clearAutoCloseAttempt(ledger,key);
+}
+function autoTabMissesOf(ledger,key,tabId){
+const entry=ledger.tabMisses.get(key);
+if(entry===undefined||entry.tabId!==tabId)return 0;
+return Number.isFinite(entry.misses)?entry.misses:0;
+}
+function sampleAutoTabMisses(ledger,key,options){
+const map=ledger.tabMisses;
+const previousMisses=autoTabMissesOf(ledger,key,options?.tabId??null);
+map.delete(key);
+if(options?.missing!==true)return 0;
+const misses=previousMisses+1;
+map.set(key,{
+sessionId:options?.sidebarSessionId??null,
+rootSessionId:options?.rootSessionId??null,
+tabId:options?.tabId??null,
+misses,
+});
+const limit=Number.isSafeInteger(ledger.limit)?ledger.limit:SIDEBAR_AUTO_KEY_LIMIT;
+while(map.size>limit){
+const oldest=map.keys().next();
+if(oldest.done===true)break;
+map.delete(oldest.value);
+}
+return misses;
+}
+function settleAutoCloseAttempt(ledger,key,context){
+if(context!==null&&context!==undefined){
+const owners=ledger.owners;
+if(context.kind==="close"){
+if(owners.get(key)!==context.attemptToken)return;
+}else if(owners.has(key)===true){
+return;
+}
+}
+clearAutoCloseAttempt(ledger,key);
+}
+global[SYMBOL]=Object.freeze({
+autoCloseCooldownActive,
+autoTabMissesOf,
+clearAutoCloseAttempt,
+clearAutoCloseBudget,
+enterAutoCloseCooldown,
+idleSidebarResourceAddresses,
+knownSidebarResourceAddresses,
+presentFloatingSubagentTitles,
+releaseExpiredAutoCloseCooldown,
+runningSidebarResourceAddresses,
+sampleAutoTabMisses,
+settleAutoCloseAttempt,
+sidebarActiveResourceMatches,
+sidebarAdoptionEvidenceAvailable,
+sidebarBatchCandidates,
+sidebarBatchSignatureOf,
+sidebarBatchStateFor,
+sidebarExpertResourceAddresses,
+sidebarIdleChildren,
+sidebarManualIntentOf,
+sidebarNodeIsIdleMembership,
+sidebarNodeIsIdleReady,
+sidebarResourceTabStateOf,
+trimAutoKeyMap,
+});
+})(globalThis);
+/* source: client-sidebar-panel-state-a.js */
+(function installClientSidebarPanelStateA(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-state-a");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+ANNOUNCEMENT_MAX_ITEMS,RIGHTBAR_WIDTH_RATIO,RIGHTBAR_WIDTH_RATIO_MAX,RIGHTBAR_WIDTH_RATIO_MIN,
+announcementEventsOf,clampRightbarWidthRatio,modelFunction,
+}=PURE;
+const EMPTY_TASK_FILTER=Object.freeze({rootSessionId:null,query:"",role:"",status:""});
+const WIDTH_RATIO_KEY_STEP=0.02;
+function resolvePanelLocale(model,ctx,tabInfo){
+const sources={
+ctxLocale:(()=>{try{return ctx?.locale;}catch{return undefined;}})(),
+i18nLocale:(()=>{try{return ctx?.i18n?.locale;}catch{return undefined;}})(),
+tabInfo,
+documentLang:(()=>{
+try{return globalThis.document?.documentElement?.lang;}catch{return undefined;}
+})(),
+navigatorLanguage:(()=>{
+try{return globalThis.navigator?.language;}catch{return undefined;}
+})(),
 };
-const autoCloseCandidate=(running)=>{
+if(typeof model?.resolveClientLocale==="function")return model.resolveClientLocale(sources);
+const candidates=[sources.ctxLocale,sources.i18nLocale,sources.tabInfo?.locale,sources.documentLang,sources.navigatorLanguage];
+return candidates.some((value)=>typeof value==="string"&&value.trim().toLowerCase().startsWith("en"))?"en":"zh";
+}
+function createPanelTranslator(model,locale){
+return function translate(key,vars){
+if(typeof model?.translateMessage==="function")return model.translateMessage(locale,key,vars);
+return"—";
+};
+}
+function errorLabelOf(t,source){
+return t("sidebar.error."+(source==="snapshot"||source==="rpc"?source:"action"));
+}
+function selectTaskFilter(model,filterState,rootSessionId,emptyFilter=EMPTY_TASK_FILTER){
+const filterSource=filterState.rootSessionId===rootSessionId?filterState:emptyFilter;
+const filterFactory=modelFunction("createTaskFilter");
+let taskFilter=null;
+if(filterFactory!==null){
+try{taskFilter=filterFactory(filterSource);}catch{taskFilter=null;}
+}
+const filterActive=taskFilter!==null&&taskFilter.active===true;
+const passesFilter=(node)=>(filterActive!==true||taskFilter.isVisible(node)===true);
+return{filterSource,taskFilter,filterActive,passesFilter};
+}
+function nextFilterPatch(filterSource,patch,rootSessionId){
+return{...filterSource,...patch,rootSessionId};
+}
+function nextWidthRatioFromDrag(options){
+const startX=Number(options?.startX);
+const clientX=Number(options?.clientX);
+const viewport=Number(options?.viewport);
+const startRatio=Number(options?.startRatio);
+if(Number.isFinite(startX)!==true||Number.isFinite(clientX)!==true)return null;
+if(Number.isFinite(viewport)!==true||viewport<=0)return null;
+if(Number.isFinite(startRatio)!==true)return null;
+return clampRightbarWidthRatio(startRatio+(startX-clientX)/viewport);
+}
+function nextWidthRatioFromKey(key,current){
+const base=clampRightbarWidthRatio(current)??RIGHTBAR_WIDTH_RATIO;
+if(key==="Home")return RIGHTBAR_WIDTH_RATIO_MIN;
+if(key==="End")return RIGHTBAR_WIDTH_RATIO_MAX;
+if(key==="ArrowLeft")return base-WIDTH_RATIO_KEY_STEP;
+if(key==="ArrowRight")return base+WIDTH_RATIO_KEY_STEP;
+return null;
+}
+function normalizeFanoutCursor(cursor,rootSessionId){
+if(cursor!==null&&cursor!==undefined&&cursor.rootSessionId===rootSessionId)return cursor;
+return{rootSessionId,cursor:0};
+}
+function adoptFanoutCursor(cursor,requestRoot,envelope){
+const next=Number.isSafeInteger(envelope?.cursor)&&envelope.cursor>=0?envelope.cursor:null;
+if(next===null)return null;
+if(cursor.rootSessionId!==requestRoot)return null;
+return{rootSessionId:requestRoot,cursor:Math.max(cursor.cursor,next)};
+}
+function advanceFanoutCursor(cursor,rootSessionId,nextCursor){
+if(!Number.isSafeInteger(nextCursor)||nextCursor<0)return null;
+if(cursor.rootSessionId!==rootSessionId)return null;
+if(nextCursor<=cursor.cursor)return null;
+return{rootSessionId,cursor:nextCursor};
+}
+function deriveSurfaceToken(scope,token,rootSessionId,sidebarSessionId){
+if(scope===null||scope===undefined
+||scope.rootSessionId!==rootSessionId
+||scope.sidebarSessionId!==sidebarSessionId){
+return{
+scope:{rootSessionId,sidebarSessionId},
+token:{rootSessionId,sidebarSessionId},
+};
+}
+return{scope,token};
+}
+function nextAnnouncementBaseline(previous,rootSessionId,tasks){
+const baseline={rootSessionId,tasks};
+if(previous===null||previous===undefined||previous.rootSessionId!==rootSessionId){
+return{baseline,events:[]};
+}
+return{baseline,events:announcementEventsOf(previous.tasks,tasks)};
+}
+function announcementTextOf(options){
+const events=Array.isArray(options?.events)?options.events:[];
+const t=options?.t;
+const maxItems=Number.isSafeInteger(options?.maxItems)?options.maxItems:ANNOUNCEMENT_MAX_ITEMS;
+if(events.length===0||typeof t!=="function")return"";
+const visible=events.slice(0,maxItems).map((event)=>t("announce."+event.kind,{name:event.name}));
+if(events.length>maxItems)visible.push(t("announce.more",{count:events.length}));
+return visible.join(options?.locale==="en"?"; ":"；");
+}
+global[SYMBOL]=Object.freeze({
+EMPTY_TASK_FILTER,
+adoptFanoutCursor,
+advanceFanoutCursor,
+announcementTextOf,
+createPanelTranslator,
+deriveSurfaceToken,
+errorLabelOf,
+nextAnnouncementBaseline,
+nextFilterPatch,
+nextWidthRatioFromDrag,
+nextWidthRatioFromKey,
+normalizeFanoutCursor,
+resolvePanelLocale,
+selectTaskFilter,
+});
+})(globalThis);
+/* source: client-sidebar-panel-state-b.js */
+(function installClientSidebarPanelStateB(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-state-b");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+normalizeSessionModelOverrides,normalizeSessionModelSelection,object,
+sessionModelModelOptions,sessionModelRolesOf,sessionModelSelectionEquals,
+sessionModelSelectionOfDraft,text,
+}=PURE;
+function draftBaseOf(previous,role,overrides,roleDefaults){
+if(Object.prototype.hasOwnProperty.call(previous,role))return previous[role];
+const effective=overrides?.[role]??normalizeSessionModelSelection(roleDefaults?.[role]);
+return{
+provider:effective?.provider??"",
+model:effective?.model??"",
+reasoningEffort:effective?.reasoningEffort??"",
+};
+}
+function nextSessionModelDrafts(options){
+const previous=object(options?.previous);
+const role=options?.role;
+const field=options?.field;
+const value=options?.value;
+const groups=options?.groups;
+const base=draftBaseOf(previous,role,options?.overrides,options?.roleDefaults);
+const next={...base,[field]:value};
+if(field==="provider"){
+const models=value===""?[]:sessionModelModelOptions(value,groups);
+const stillAvailable=next.model!==""
+&&models.some((candidate)=>text(object(candidate).id,null)===next.model);
+if(stillAvailable!==true){
+next.model="";
+next.reasoningEffort="";
+}
+}else if(field==="model"){
+const entry=sessionModelModelOptions(next.provider,groups)
+.find((candidate)=>text(object(candidate).id,null)===value);
+const defaultEffort=text(object(entry?.reasoning).defaultEffort,null);
+next.reasoningEffort=defaultEffort===null?"":defaultEffort;
+const efforts=Array.isArray(entry?.reasoning?.efforts)?entry.reasoning.efforts:[];
+if(next.reasoningEffort!==""
+&&efforts.every((effort)=>text(object(effort).id,null)!==next.reasoningEffort)){
+next.reasoningEffort="";
+}
+}
+return{...previous,[role]:next};
+}
+function sessionModelBaselineOf(overrides,roleDefaults,role){
+return overrides?.[role]??normalizeSessionModelSelection(object(roleDefaults)[role]);
+}
+function sessionModelPendingChangesOf(options){
+const drafts=object(options?.drafts);
+const baselineOf=options?.baselineOf;
+const changes=[];
+for(const role of sessionModelRolesOf(options?.meta)){
+if(Object.prototype.hasOwnProperty.call(drafts,role)!==true)continue;
+const selection=sessionModelSelectionOfDraft(drafts[role]);
+if(selection.provider.length===0||selection.model.length===0)continue;
+if(sessionModelSelectionEquals(selection,baselineOf(role)))continue;
+changes.push({role,selection});
+}
+return changes;
+}
+function sessionModelHasInvalidDraftOf(options){
+const drafts=object(options?.drafts);
+for(const role of sessionModelRolesOf(options?.meta)){
+if(Object.prototype.hasOwnProperty.call(drafts,role)!==true)continue;
+const selection=sessionModelSelectionOfDraft(drafts[role]);
+if(selection.provider.length===0||selection.model.length===0)return true;
+}
+return false;
+}
+function withoutRoleDraft(drafts,role){
+const previous=object(drafts);
+if(Object.prototype.hasOwnProperty.call(previous,role)!==true)return previous;
+const next={...previous};
+delete next[role];
+return next;
+}
+function sessionModelWriteReadyOf(options){
+const state=object(options?.state);
+return options?.mounted===true
+&&state.status==="ready"
+&&state.live===true
+&&options?.saving!==true
+&&options?.rootSessionId!==""
+&&options?.sidebarSessionId===options?.rootSessionId;
+}
+function describeSessionModelFailure(options){
+const error=options?.error;
+const role=options?.role;
+const roles=Array.isArray(options?.roles)?options.roles:sessionModelRolesOf(options?.meta);
+const t=options?.t;
+const code=text(object(error).code,null);
+const details=object(object(error).details);
+if(code==="session-override-conflict"){
+const currentRevision=Number.isSafeInteger(details.currentRevision)&&details.currentRevision>=0
+?details.currentRevision
+:null;
+const overrides=details.overrides===undefined
+?null
+:normalizeSessionModelOverrides(details.overrides,roles);
+return{
+statePatch:{revision:currentRevision,overrides},
+notice:{
+kind:"conflict",
+role,
+text:t("sidebar.sessionModel.conflict",{
+revision:currentRevision===null?"?":currentRevision,
+}),
+},
+};
+}
+const message=text(object(error).message,null);
+return{
+statePatch:null,
+notice:{
+kind:"error",
+role,
+text:message===null
+?t("sidebar.sessionModel.unavailable")
+:t("sidebar.sessionModel.failed",{message}),
+},
+};
+}
+global[SYMBOL]=Object.freeze({
+describeSessionModelFailure,
+nextSessionModelDrafts,
+sessionModelBaselineOf,
+sessionModelHasInvalidDraftOf,
+sessionModelPendingChangesOf,
+sessionModelWriteReadyOf,
+withoutRoleDraft,
+});
+})(globalThis);
+/* source: client-sidebar-views-a.js */
+(function installClientSidebarViewsA(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-views-a");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+ATTEMPT_STATUS_LABELS,failureSummaryText,finiteNumber,formatClockText,formatDurationText,
+formatIsoText,mergedRoleLabelsOf,modelApi,modelFunction,object,roleLabelFor:roleLabelForBase,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+makeIcon,sidebarTabKey,subagentChatAddress,
+}=DOM;
+const finiteToken=(value)=>finiteNumber(value);
+const usageOf=(node)=>{
+const api=modelApi();
+if(typeof api?.normalizeUsage!=="function")return null;
+return api.normalizeUsage(object(node).usage);
+};
+const findPriceOf=(ctx,provider,modelId)=>{
+const{meta}=ctx;
+const api=modelApi();
+if(meta===null||typeof api?.findModelPrice!=="function")return null;
+return api.findModelPrice(meta.modelPrices,provider,modelId);
+};
+const estimateCostOf=(ctx,usage,provider,modelId)=>{
+const api=modelApi();
+if(typeof api?.estimateUsageCost!=="function")return null;
+return api.estimateUsageCost(usage,findPriceOf(ctx,provider,modelId));
+};
+const formatCost=(value)=>{
+const amount=finiteNumber(value);
+if(amount===null)return null;
+if(amount===0)return"0";
+if(amount<0.000001)return amount.toExponential(2);
+return amount>=0.01?amount.toFixed(4):amount.toFixed(6);
+};
+const usageTitleOf=(usage)=>{
+const source=usage;
+if(source===null)return"用量：—";
+const parts=[];
+const tokens=[["inputTokens","输入"],["outputTokens","输出"],["cacheReadTokens","缓存读"],["cacheWriteTokens","缓存写"],["reasoningTokens","推理"]];
+for(const[field,label]of tokens){
+const value=finiteToken(source[field]);
+if(value!==null)parts.push(label+" "+value);
+}
+for(const[field,label]of[["requests","请求"],["retries","重试"],["fallbacks","降级"]]){
+const value=finiteToken(source[field]);
+if(value!==null)parts.push(label+" "+value);
+}
+const duration=formatDurationText(source.runMs);
+if(duration!==null)parts.push("运行时长 "+duration);
+return parts.length===0?"用量：—":"用量："+parts.join(" · ");
+};
+const renderChevron=(ctx,node,open)=>{
+const{react,primitives,t,toggle}=ctx;
+const label=open?t("sidebar.collapse"):t("sidebar.expand");
+return react.createElement("button",{
+type:"button",className:"deg_expert_group_chevron",title:label,
+"aria-label":label,"aria-expanded":open,onClick:(event)=>{event?.stopPropagation?.();toggle(node);},
+},makeIcon(primitives,open?"IconChevronDownOutlineRegular":"IconChevronRightOutlineRegular",{size:14}));
+};
+const renderAction=(ctx,label,Icon,onClick,pending)=>{
+const{react,primitives}=ctx;
+return react.createElement("button",{
+type:"button",className:"deg_expert_group_action",title:pending?label+"（处理中）":label,
+"aria-label":pending?label+"（处理中）":label,"aria-busy":pending||undefined,disabled:pending,onClick,
+},makeIcon(primitives,Icon,{size:14}));
+};
+const renderSidebarBatchSlot=(ctx,addresses,label)=>{
+const{react,primitives,sidebarBatchStateFor,sidebarSessionId,rootSessionId,handleSidebarBatchClose,isBatchPending}=ctx;
+const state=sidebarBatchStateFor(addresses);
+if(state.kind==="none")return null;
+if(state.kind==="zero"){
+if(typeof primitives?.IconChevronLeftOutlineRegular!=="function")return null;
+return react.createElement("div",{className:"deg_expert_group_trailing"},
+react.createElement("span",{
+className:"deg_expert_group_sidebar_batch_zero",
+"data-zero":"true",
+"aria-hidden":"true",
+}));
+}
+if(typeof primitives?.IconChevronLeftOutlineRegular!=="function")return null;
+const count=state.candidates.length;
+const accessibleName="在侧边栏关闭 "+count+" 个"+label;
+const pending=isBatchPending()===true;
+return react.createElement("div",{className:"deg_expert_group_trailing"},
+react.createElement("button",{
+type:"button",
+className:"deg_expert_group_sidebar_batch_action",
+title:accessibleName,
+"aria-label":accessibleName,
+"aria-busy":pending||undefined,
+disabled:pending,
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+return handleSidebarBatchClose(state.candidates);
+},
+onKeyDown:(event)=>{event?.stopPropagation?.();},
+},react.createElement("span",{
+className:"deg_expert_group_double_arrow",
+"data-direction":"close",
+"aria-hidden":"true",
+},
+makeIcon(primitives,"IconChevronLeftOutlineRegular",{size:20,className:"deg_expert_group_double_arrow_icon","aria-hidden":true}),
+makeIcon(primitives,"IconChevronLeftOutlineRegular",{size:20,className:"deg_expert_group_double_arrow_icon","aria-hidden":true}))));
+};
+const renderSidebarOpenAction=(ctx,address,label)=>{
+const{react,primitives,sidebarSessionId,rootSessionId,openSidebarResource,closeSidebarResource,readActiveSidebarResource,sidebarOpenTabsAvailable,handleSidebarAction,isTabOpen}=ctx;
+if(openSidebarResource===null)return null;
+const resourceAddress=subagentChatAddress(address);
+if(resourceAddress===null)return null;
+if(typeof primitives?.IconChevronRightOutlineRegular!=="function")return null;
+const toggleCapable=closeSidebarResource!==null
+&&(readActiveSidebarResource!==null||sidebarOpenTabsAvailable===true)
+&&typeof primitives?.IconChevronLeftOutlineRegular==="function";
+const key=sidebarTabKey(sidebarSessionId,rootSessionId,resourceAddress);
+const isOpen=toggleCapable===true&&isTabOpen(key)===true;
+const accessibleName=(isOpen?"在侧边栏关闭 ":"在侧边栏打开 ")+label;
+const buttonProps={
+type:"button",
+className:"deg_expert_group_sidebar_action",
+title:accessibleName,
+"aria-label":accessibleName,
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+return handleSidebarAction(key,resourceAddress);
+},
+onKeyDown:(event)=>{event?.stopPropagation?.();},
+};
+if(toggleCapable===true){
+buttonProps["aria-pressed"]=isOpen;
+buttonProps["data-open"]=isOpen?"true":"false";
+}
+const arrowIcon=isOpen?"IconChevronLeftOutlineRegular":"IconChevronRightOutlineRegular";
+return react.createElement("button",buttonProps,react.createElement("span",{
+className:"deg_expert_group_double_arrow",
+"data-direction":isOpen?"close":"open",
+"aria-hidden":"true",
+},
+makeIcon(primitives,arrowIcon,{size:20,className:"deg_expert_group_double_arrow_icon","aria-hidden":true}),
+makeIcon(primitives,arrowIcon,{size:20,className:"deg_expert_group_double_arrow_icon","aria-hidden":true})));
+};
+const renderAttemptUsage=(ctx,entry,options)=>{
+const{react}=ctx;
+const source=object(entry);
+const usage=usageOf(source);
+const fallbackProvider=text(object(options).provider,null);
+const fallbackModel=text(object(options).model,null);
+const value=(field)=>(usage===null?null:finiteToken(usage[field]));
+const pairs=[
+["输入",value("inputTokens")],
+["输出",value("outputTokens")],
+["缓存读",value("cacheReadTokens")],
+["缓存写",value("cacheWriteTokens")],
+["推理",value("reasoningTokens")],
+].map(([label,raw])=>label+" "+(raw===null?"—":String(raw)));
+pairs.push("请求 "+(value("requests")===null?"—":String(value("requests"))));
+pairs.push("重试 "+(value("retries")===null?"—":String(value("retries"))));
+pairs.push("降级 "+(value("fallbacks")===null?"—":String(value("fallbacks"))));
+pairs.push("运行时长 "+(formatDurationText(value("runMs"))??"—"));
+const provider=(usage===null?null:text(usage.provider,null))??fallbackProvider;
+const modelId=(usage===null?null:text(usage.model,null))??fallbackModel;
+const price=findPriceOf(ctx,provider,modelId);
+let costText="估算成本：未配置单价，不估算";
+let currency=null;
+const cost=usage===null?null:estimateCostOf(ctx,usage,provider,modelId);
+if(price!==null&&cost!==null){
+currency=cost.currency;
+costText="估算成本 ≈ "+(formatCost(cost.totalCost)??"—")+" "+cost.currency+"（按每百万 token 单价估算）";
+}else if(price!==null){
+costText="估算成本：—（缺少计费 token）";
+}
+return react.createElement("div",{
+className:"deg_expert_group_attempt_usage",
+"data-cost-currency":currency===undefined?undefined:currency,
+title:(usage===null?"用量：—":usageTitleOf(usage))+" · "+costText,
+},
+react.createElement("span",{className:"deg_expert_group_attempt_usage_tokens"},pairs.join(" · ")),
+react.createElement("span",{className:"deg_expert_group_attempt_cost","data-cost-configured":price===null?"false":"true"},costText));
+};
+const renderStructuredBlock=(ctx,value,requested,options)=>{
+const{react}=ctx;
+const api=modelApi();
+const preview=typeof api?.structuredPreviewOf==="function"?api.structuredPreviewOf(value):null;
+const asked=requested===true;
+if(preview===null&&asked!==true)return null;
+const kind=text(object(options).kind,"expert");
+let textValue="结构化结果：尚未返回（已请求输出契约）";
+let fallback=false;
+let truncated=false;
+let reason=null;
+if(preview!==null){
+if(preview.text!==null){
+textValue="结构化结果："+preview.text+(preview.truncated===true?" …（预览已截断）":"");
+truncated=preview.truncated===true;
+}else{
+fallback=true;
+reason=text(preview.reason,"result_unavailable");
+const reasonText=typeof api?.structuredFallbackText==="function"
+?api.structuredFallbackText(reason)
+:"结构化结果不可用";
+textValue="结构化结果回退："+reasonText+"（"+reason+"）";
+}
+}
+return react.createElement("div",{
+className:"deg_expert_group_structured",
+"data-kind":kind,
+"data-fallback":fallback?"true":undefined,
+"data-reason":reason===null?undefined:reason,
+"data-truncated":truncated?"true":undefined,
+role:"status",
+title:textValue.length>400?textValue.slice(0,400)+"…":textValue,
+},textValue);
+};
+const renderFailureSummary=(ctx,failure)=>{
+const{react}=ctx;
+const summary=failureSummaryText(failure);
+if(summary===null)return null;
+const content=summary.message===null?summary.code:summary.code+" · "+summary.message;
+return react.createElement("span",{
+key:"failure",
+className:"deg_expert_group_failure",
+"data-failure-code":summary.code,
+role:"status",
+title:content,
+},content);
+};
+const renderAttemptTimeline=(ctx,node,options={})=>{
+const{react,isTimelineExpanded,toggleTimelineExpanded}=ctx;
+const timelineOf=modelFunction("attemptTimelineOf");
+if(timelineOf===null)return null;
+const key=text(options.key,null);
+if(key===null)return null;
+const expanded=isTimelineExpanded(key)===true;
+let timeline=null;
+try{timeline=timelineOf(node,{expanded});}catch{return null;}
+if(timeline===null||!Array.isArray(timeline.entries))return null;
+const timelineProvider=text(object(node).provider,null);
+const timelineModel=text(object(node).model,null);
+const rows=timeline.entries.map((entry,index)=>{
+const attemptStatus=text(entry.status,"unknown");
+const attemptNumber=finiteNumber(entry.attempt)??finiteNumber(entry.position)??index+1;
+const duration=formatDurationText(entry.durationMs);
+const timestamp=finiteNumber(entry.finishedAt)??finiteNumber(entry.startedAt);
+const clock=formatClockText(timestamp);
+const durationLabel=duration===null?(clock??"—"):duration;
+const cells=[
+react.createElement("span",{key:"index",className:"deg_expert_group_attempt_index"},"#"+attemptNumber),
+react.createElement("span",{
+key:"status",
+className:"deg_expert_group_attempt_status",
+"data-status":attemptStatus,
+},ATTEMPT_STATUS_LABELS[attemptStatus]??attemptStatus),
+react.createElement("span",{
+key:"duration",
+className:"deg_expert_group_attempt_duration",
+title:durationLabel,
+},durationLabel),
+];
+if(duration!==null&&clock!==null){
+cells.push(react.createElement("span",{
+key:"time",
+className:"deg_expert_group_attempt_time",
+title:formatIsoText(timestamp)??clock,
+},clock));
+}
+return react.createElement("div",{
+key:key+":"+attemptNumber+":"+index,
+className:"deg_expert_group_attempt",
+role:"listitem",
+"data-status":attemptStatus,
+"data-attempt":String(attemptNumber),
+},
+react.createElement("div",{className:"deg_expert_group_attempt_row"},...cells),
+renderAttemptUsage(ctx,entry,{
+provider:text(entry.provider,null)??timelineProvider,
+model:text(entry.model,null)??timelineModel,
+}),
+renderStructuredBlock(ctx,entry.structured,entry.outputSchemaRequested,{kind:"attempt"}));
+});
+const toggle=timeline.total>timeline.limit
+?react.createElement("button",{
+key:"toggle",
+type:"button",
+className:"deg_expert_group_attempts_toggle",
+"aria-expanded":expanded,
+"aria-label":expanded?"收起尝试时间线":"查看全部尝试时间线",
+title:expanded?"只显示最近 "+timeline.limit+" 条":"查看全部 "+timeline.total+" 条",
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+toggleTimelineExpanded(key);
+},
+},expanded?"收起":"查看全部")
+:null;
+return react.createElement("div",{
+className:"deg_expert_group_attempts",
+role:"list",
+"aria-label":"尝试时间线",
+"data-total":String(timeline.total),
+"data-expanded":expanded,
+},...rows,toggle);
+};
+function createSidebarViewsA(ctx){
+const deps=ctx;
+const mergedRoleLabels=mergedRoleLabelsOf(deps.snapshot,deps.meta);
+const roleLabelFor=(role,nodeLabel)=>roleLabelForBase(role,nodeLabel,mergedRoleLabels);
+return Object.freeze({
+mergedRoleLabels,
+roleLabelFor,
+finiteToken,
+usageOf,
+usageTitleOf,
+renderChevron:(node,open)=>renderChevron(deps,node,open),
+renderAction:(label,Icon,onClick,pending)=>renderAction(deps,label,Icon,onClick,pending),
+renderSidebarBatchSlot:(addresses,label)=>renderSidebarBatchSlot(deps,addresses,label),
+renderSidebarOpenAction:(address,label)=>renderSidebarOpenAction(deps,address,label),
+renderAttemptUsage:(entry,options)=>renderAttemptUsage(deps,entry,options),
+renderStructuredBlock:(value,requested,options)=>renderStructuredBlock(deps,value,requested,options),
+renderFailureSummary:(failure)=>renderFailureSummary(deps,failure),
+renderAttemptTimeline:(node,options)=>renderAttemptTimeline(deps,node,options),
+});
+}
+global[SYMBOL]=Object.freeze({createSidebarViewsA});
+})(globalThis);
+/* source: client-sidebar-views-b.js */
+(function installClientSidebarViewsB(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-views-b");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+finiteNumber,formatCompactDuration,isFailureStatusOf,latestShardChildIdOf,modelApi,
+object,retryWarningThreshold,statusOf,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{metadataOf,titleOf}=DOM;
+const sessionSummaryOf=(ctx,sessionId)=>{
+const{sessionsSnapshot}=ctx;
+if(sessionId===null)return null;
+const summary=object(object(sessionsSnapshot.byId)[sessionId]);
+return Object.keys(summary).length===0?null:summary;
+};
+const projectionValueOf=(ctx,sessionId,key)=>{
+const{sessionsSnapshot,config}=ctx;
+if(sessionId===null||key===null)return null;
+const summary=object(sessionSummaryOf(ctx,sessionId));
+const fromSummary=object(summary.projectionValues)[key];
+if(fromSummary!==undefined&&fromSummary!==null)return fromSummary;
+const projection=object(object(object(sessionsSnapshot.projectionsBySession)[sessionId]).values);
+const fromProjection=projection[key];
+if(fromProjection!==undefined&&fromProjection!==null)return fromProjection;
+const readProjection=config.sessions?.projectionValues;
+if(typeof readProjection!=="function")return null;
+try{
+const value=readProjection.call(config.sessions,sessionId);
+const container=object(value);
+if(container[key]!==undefined&&container[key]!==null)return container[key];
+return value===undefined?null:value;
+}catch{
+return null;
+}
+};
+const contextPressureOfValue=(value)=>{
+const source=object(value);
+for(const field of["projectedTokens","pressureTokens","contextWindow"]){
+if(finiteNumber(source[field])!==null)return source;
+}
+return null;
+};
+const contextPressureOf=(ctx,sessionId)=>contextPressureOfValue(projectionValueOf(ctx,sessionId,"contextPressure"));
+const projectionNumber=(value)=>(typeof value==="number"&&Number.isFinite(value)&&value>=0?value:null);
+const DSH_STATS_FIELDS=Object.freeze(["llmMs","toolMs","decodeMs","decodeTokens"]);
+const DSH_TOKEN_FIELDS=Object.freeze([
+"uncachedInputTokens","cacheReadTokens","cacheWriteTokens","outputTokens",
+]);
+const dshMetricsOf=(ctx,sessionIds)=>{
+const ids=Array.isArray(sessionIds)?sessionIds:[];
+const stats={};
+const tokens={};
+let contributors=0;
+for(const rawId of ids){
+const sessionId=text(rawId,null);
+if(sessionId===null)continue;
+const statsValue=object(projectionValueOf(ctx,sessionId,"sessionStats"));
+const tokensValue=object(projectionValueOf(ctx,sessionId,"tokenUsage"));
+let touched=false;
+for(const field of DSH_STATS_FIELDS){
+const value=projectionNumber(statsValue[field]);
+if(value===null)continue;
+stats[field]=(stats[field]??0)+value;
+touched=true;
+}
+for(const field of DSH_TOKEN_FIELDS){
+const value=projectionNumber(tokensValue[field]);
+if(value===null)continue;
+tokens[field]=(tokens[field]??0)+value;
+touched=true;
+}
+if(touched)contributors+=1;
+}
+if(contributors===0)return null;
+const valueOf=(bag,field)=>(bag[field]===undefined?null:bag[field]);
+return{
+sessionCount:contributors,
+llmMs:valueOf(stats,"llmMs"),
+toolMs:valueOf(stats,"toolMs"),
+decodeMs:valueOf(stats,"decodeMs"),
+decodeTokens:valueOf(stats,"decodeTokens"),
+uncachedInputTokens:valueOf(tokens,"uncachedInputTokens"),
+cacheReadTokens:valueOf(tokens,"cacheReadTokens"),
+cacheWriteTokens:valueOf(tokens,"cacheWriteTokens"),
+outputTokens:valueOf(tokens,"outputTokens"),
+};
+};
+const dshUsageOf=(metrics)=>{
+if(metrics===null)return null;
+const{uncachedInputTokens,cacheReadTokens,cacheWriteTokens,outputTokens}=metrics;
+if(uncachedInputTokens===null&&cacheReadTokens===null&&cacheWriteTokens===null&&outputTokens===null){
+return null;
+}
+const complete=uncachedInputTokens!==null&&cacheReadTokens!==null&&cacheWriteTokens!==null;
+const billedInputTokens=complete?uncachedInputTokens+cacheReadTokens+cacheWriteTokens:null;
+return{
+inputTokens:uncachedInputTokens,
+cacheReadTokens,
+cacheWriteTokens,
+outputTokens,
+billedInputTokens,
+totalTokens:billedInputTokens!==null&&outputTokens!==null?billedInputTokens+outputTokens:null,
+};
+};
+const dshThroughputOf=(metrics)=>{
+if(metrics===null||metrics.decodeMs===null||metrics.decodeTokens===null)return null;
+if(metrics.decodeMs<=0||metrics.decodeTokens<=0)return null;
+return metrics.decodeTokens/(metrics.decodeMs/1000);
+};
+const fanoutSessionIdsOf=(task)=>{
+const ids=[];
+const seen=new Set();
+const source=object(task);
+for(const shard of Array.isArray(source.shards)?source.shards:[]){
+const childId=latestShardChildIdOf(shard);
+if(childId===null||seen.has(childId))continue;
+seen.add(childId);
+ids.push(childId);
+}
+return ids;
+};
+const sessionStatsPresentOf=(ctx,sessionId)=>{
+const value=object(projectionValueOf(ctx,sessionId,"sessionStats"));
+for(const field of DSH_STATS_FIELDS){
+if(projectionNumber(value[field])!==null)return true;
+}
+return false;
+};
+const durationOfNode=(ctx,source,runtimeStatus,sessionId)=>{
+const{snapshot,sessionsSnapshot}=ctx;
+const direct=finiteNumber(source.durationMs);
+if(direct!==null)return direct;
+const usage=ctx.a.usageOf(source);
+const runMs=finiteNumber(usage===null?null:usage.runMs);
+if(runMs!==null)return runMs;
+const summary=object(sessionSummaryOf(ctx,sessionId));
+const startedAt=finiteNumber(source.startedAt)??finiteNumber(summary.createdAt);
+if(startedAt===null)return null;
+const endedAt=runtimeStatus==="running"
+?(finiteNumber(object(snapshot).generatedAt)??finiteNumber(sessionsSnapshot.generatedAt))
+:(finiteNumber(summary.updatedAt)??finiteNumber(source.lastActivityAt));
+if(endedAt===null)return null;
+const elapsed=endedAt-startedAt;
+return elapsed>0?elapsed:null;
+};
+const renderMetrics=(ctx,node,options={})=>{
+const{react}=ctx;
+const source=object(node);
+const status=statusOf(source);
+const kind=text(options.kind,text(source.kind,"expert"));
+const runtimeStatus=text(options.runtimeStatus,null);
+const sessionId=text(options.sessionId,null);
+const sessionIds=Array.isArray(options.sessionIds)
+?options.sessionIds
+:(sessionId===null?[]:[sessionId]);
+const api=modelApi();
+const dsh=dshMetricsOf(ctx,sessionIds);
+const dshUsage=dshUsageOf(dsh);
+const usage=dshUsage!==null?dshUsage:ctx.a.usageOf(source);
+const measuredTps=dshThroughputOf(dsh);
+const dshLlmMs=dsh===null?null:dsh.llmMs;
+const dshDuration=dshLlmMs!==null&&dshLlmMs>0?dshLlmMs:null;
+const turnDurationMs=finiteNumber(source.turnDurationMs);
+const durationMs=turnDurationMs!==null
+?turnDurationMs
+:(dshDuration!==null?dshDuration:durationOfNode(ctx,source,runtimeStatus,sessionId));
+const summary=typeof api?.summarizeUsageMetrics==="function"
+?api.summarizeUsageMetrics(usage,{
+durationMs,
+contextPressure:contextPressureOf(ctx,sessionId),
+measuredTokensPerSecond:measuredTps,
+})
+:null;
+const segments=[];
+const pushSegment=(key,textValue,titleValue)=>{
+if(typeof textValue!=="string"||textValue.length===0)return;
+if(segments.length>0){
+segments.push(react.createElement("span",{
+key:key+"-separator",
+className:"deg_expert_group_metrics_separator",
+"aria-hidden":"true",
+}," · "));
+}
+segments.push(react.createElement("span",{
+key,
+className:"deg_expert_group_metrics_part",
+title:typeof titleValue==="string"?titleValue:textValue,
+},textValue));
+};
+if(summary!==null){
+const toolDurationText=dsh===null||dsh.toolMs===null?null:formatCompactDuration(dsh.toolMs);
+const modelDurationText=dshDuration===null?null:formatCompactDuration(dshDuration);
+const durationTitle=summary.durationText===null?null
+:turnDurationMs!==null
+?"本轮用时 "+summary.durationText
++(modelDurationText===null?"":" · 模型用时 "+modelDurationText)
++(toolDurationText===null?"":" · 工具调用用时 "+toolDurationText)
+:dshDuration!==null
+?"模型用时 "+summary.durationText+(toolDurationText===null?"":" · 工具调用用时 "+toolDurationText)
+:"运行时间 "+summary.durationText;
+pushSegment("duration",summary.durationText===null?null:"用时"+summary.durationText,durationTitle);
+pushSegment("throughput",summary.throughputText,
+summary.throughputText===null?null:(measuredTps===null?"平均吞吐 ":"输出速度 ")+summary.throughputText);
+const usageTitle=usage===null?null:ctx.a.usageTitleOf(usage);
+pushSegment("tokens",summary.totalTokensText,
+usageTitle===null?summary.totalTokensText:usageTitle.slice(0,400));
+pushSegment("cache-hit",summary.cacheHitText,
+summary.cacheHitPercent===null?null:"缓存命中率 "+summary.cacheHitPercent+"%（缓存读 ÷ 计费输入）");
+pushSegment("context",summary.contextText,
+summary.contextPercent===null?null
+:"上下文占用 "+summary.contextPercent+"%（已用 "+summary.contextUsedTokens+" / 窗口 "+summary.contextWindow+"）");
+}
+const retryCount=finiteNumber(source.retryCount);
+const retryWarning=retryCount!==null&&retryCount>=retryWarningThreshold()
+?react.createElement("span",{
+key:"retry-warning",
+className:"deg_expert_group_retry_warning",
+"data-retry-warning":"true",
+role:"status",
+title:"已重试 "+retryCount+" 次",
+},"多次重试")
+:null;
+const failure=isFailureStatusOf(status)?ctx.a.renderFailureSummary(source.failure):null;
+if(segments.length===0&&retryWarning===null&&failure===null)return null;
+return react.createElement("div",{
+className:"deg_expert_group_metrics",
+"data-metrics-kind":kind,
+role:"group",
+"aria-label":"任务用量摘要",
+},...segments,retryWarning,failure);
+};
+const renderRowMain=(ctx,node,options={})=>{
+const{react,subagentAddressOfChild,handleOpen,navigation}=ctx;
+const source=object(node);
+const fullName=titleOf(source);
+const oneLine=options.oneLine!==false;
+const parentId=text(options.parentId,null);
+const clickableId=text(options.sessionId,text(source.sessionId,text(source.childId,null)));
+const address=subagentAddressOfChild(clickableId,parentId,source);
+const navigable=navigation.available===true&&clickableId!==null;
+const onNavigate=navigable?()=>handleOpen(clickableId,address):undefined;
+const onKeyDown=onNavigate===undefined?undefined:(event)=>{
+if(event?.key!=="Enter"&&event?.key!==" ")return;
+event.preventDefault?.();
+event.stopPropagation?.();
+onNavigate();
+};
+const taskLabel="打开任务会话："+fullName;
+const navigateProps=onNavigate===undefined?{}:{
+role:"button",
+tabIndex:0,
+"aria-label":taskLabel,
+onKeyDown,
+};
+const metadata=metadataOf(source,ctx.a.mergedRoleLabels);
+const taskClassName="deg_expert_group_line deg_expert_group_task"
++(oneLine?"":" deg_expert_group_shard_task");
+const trailing=options.trailing===undefined?null:options.trailing;
+const taskChildren=[
+react.createElement("div",{className:taskClassName,title:fullName,onClick:onNavigate,...navigateProps},fullName),
+ctx.a.renderSidebarOpenAction(address,fullName),
+];
+if(trailing!==null)taskChildren.push(trailing);
+const taskLine=react.createElement("div",{
+className:"deg_expert_group_task_line"+(trailing===null?"":" deg_expert_group_task_line_trailing"),
+},...taskChildren);
+const rowMain=react.createElement("div",{className:"deg_expert_group_row_main","data-kind":source.kind||"expert","data-expanded":true},
+taskLine,
+react.createElement("div",{className:"deg_expert_group_meta",title:metadata},metadata));
+const extras=[];
+if(options.metrics!==undefined&&options.metrics!==null)extras.push(options.metrics);
+if(options.footer!==undefined&&options.footer!==null)extras.push(options.footer);
+if(extras.length===0)return rowMain;
+return react.createElement("div",{className:"deg_expert_group_cell"},rowMain,...extras);
+};
+function createSidebarViewsB(ctx,viewsA){
+const deps={...ctx,a:viewsA};
+return Object.freeze({
+sessionStatsPresentOf:(sessionId)=>sessionStatsPresentOf(deps,sessionId),
+durationOfNode:(source,runtimeStatus,sessionId)=>durationOfNode(deps,source,runtimeStatus,sessionId),
+fanoutSessionIdsOf:(task)=>fanoutSessionIdsOf(task),
+renderMetrics:(node,options)=>renderMetrics(deps,node,options),
+renderRowMain:(node,options)=>renderRowMain(deps,node,options),
+});
+}
+global[SYMBOL]=Object.freeze({createSidebarViewsB});
+})(globalThis);
+/* source: client-sidebar-views-c.js */
+(function installClientSidebarViewsC(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-views-c");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+ACTIVE_STATUSES,RETRY_STATUSES,RUNTIME_STATUS_LABELS,STATUS_FILTER_OPTIONS,
+normalizeSessionModelSelection,object,sessionModelModelOptions,sessionModelRolesOf,statusOf,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{capabilityAllowed,runtimeStatusOf,statusIcon}=DOM;
+const renderExpert=(ctx,node,index,parentId,treeMeta)=>{
+const{react,primitives,passesFilter,partialSnapshot,expand}=ctx;
+if(passesFilter(node)!==true)return null;
+const runtimeStatus=ctx.runtimeStatusOfNode(node,parentId,undefined,{partial:partialSnapshot});
+const children=Array.isArray(node.children)?node.children:[];
+const hasChildren=children.length>0;
+const expertOpen=hasChildren?expand(node):true;
+const chevron=hasChildren
+?ctx.a.renderChevron(node,expertOpen)
+:react.createElement("span",{className:"deg_expert_group_chevron_placeholder","aria-hidden":"true"});
+const meta=treeMeta!==undefined&&treeMeta!==null
+?treeMeta
+:{level:2,posinset:index+1,setsize:index+1};
+const visibleChildNodes=children.filter((child)=>passesFilter(child)===true);
+return react.createElement("div",{key:node.id||node.sessionId||"expert-"+index,className:"deg_expert_group_node",role:"none"},
+react.createElement("div",{
+className:"deg_expert_group_row",
+role:"treeitem",
+"aria-level":meta.level,
+"aria-posinset":meta.posinset,
+"aria-setsize":meta.setsize,
+...(hasChildren?{"aria-expanded":expertOpen}:{}),
+"data-status":runtimeStatus,
+"data-expanded":expertOpen,
+},
+statusIcon(react,primitives,runtimeStatus),
+chevron,
+react.createElement("div",null,ctx.b.renderRowMain(node,{
+sessionId:node.sessionId,
+parentId,
+metrics:ctx.b.renderMetrics(node,{kind:node.kind||"expert",runtimeStatus,sessionId:node.sessionId,sessionIds:[node.sessionId]}),
+footer:ctx.a.renderStructuredBlock(node.structured,node.outputSchemaRequested,{kind:node.kind||"expert"}),
+}))),
+hasChildren&&expertOpen
+?react.createElement("div",{className:"deg_expert_group_children",role:"group"},visibleChildNodes.map((child,childIndex)=>renderExpert(ctx,child,childIndex,parentId,{
+level:meta.level+1,
+posinset:childIndex+1,
+setsize:visibleChildNodes.length,
+})))
+:null);
+};
+const renderIdleGroup=(ctx,nodes,trailing,treeMeta)=>{
+const{react,primitives,t,rootSessionId,expand,partialSnapshot,neutralRuntimeStatus}=ctx;
+const members=Array.isArray(nodes)?nodes:[];
+const group={kind:"idle-group",id:rootSessionId+"__idle__",taskName:t("sidebar.idleGroup.name"),status:"idle",children:members};
+const open=expand(group);
+const idleTitleChildren=[
+react.createElement("div",{className:"deg_expert_group_line deg_expert_group_task"},t("sidebar.idleGroup",{count:members.length})),
+];
+if(trailing!==undefined&&trailing!==null)idleTitleChildren.push(trailing);
+const idleGroupStatus=partialSnapshot===true?neutralRuntimeStatus:"ready";
+const meta=treeMeta!==undefined&&treeMeta!==null
+?treeMeta
+:{level:2,posinset:1,setsize:1};
+return react.createElement("div",{className:"deg_expert_group_idle_group","data-expanded":open,role:"none"},
+react.createElement("div",{
+className:"deg_expert_group_row deg_expert_group_idle_header",
+role:"treeitem",
+"aria-level":meta.level,
+"aria-posinset":meta.posinset,
+"aria-setsize":meta.setsize,
+"aria-expanded":open,
+"data-status":idleGroupStatus,
+"data-expanded":open,
+},
+statusIcon(react,primitives,idleGroupStatus),
+ctx.a.renderChevron(group,open),
+react.createElement("div",{className:"deg_expert_group_idle_title_line"},...idleTitleChildren)),
+open?react.createElement("div",{className:"deg_expert_group_children deg_expert_group_idle_children",role:"group"},members.map((node,index)=>node.kind==="fanout"?renderFanout(ctx,node,index,{level:meta.level+1,posinset:index+1,setsize:members.length}):renderExpert(ctx,node,index,rootSessionId,{level:meta.level+1,posinset:index+1,setsize:members.length}))):null);
+};
+const renderShard=(ctx,task,shard,index,treeMeta)=>{
+const{react,primitives,rootSessionId,expand,runAction,isActionPending}=ctx;
+const shardKey=text(shard.shardId,"shard-"+index);
+const latestChildId=text(shard.childId,null);
+const status=statusOf(shard);
+const shardTaskName=text(shard.taskName,null);
+const shardNode={
+...shard,
+id:task.parentTaskId+":"+shardKey,
+kind:"expert",
+taskName:shardTaskName===null||shardTaskName===shardKey?shardKey:shardKey+"  "+shardTaskName,
+content:text(shard.prompt,""),
+};
+const cancelKey="cancel:"+task.parentTaskId+":"+shardKey;
+const retryKey="retry:"+task.parentTaskId+":"+shardKey;
+const actions=[];
+const cancelCapability=capabilityAllowed(shard,"cancel");
+const retryCapability=capabilityAllowed(shard,"retry");
+const showCancel=cancelCapability===null?ACTIVE_STATUSES.has(status):cancelCapability===true;
+const showRetry=retryCapability===null?RETRY_STATUSES.has(status):retryCapability===true;
+if(showCancel)actions.push(ctx.a.renderAction("取消分片 "+shardKey,"IconStopFillRegular",()=>runAction({action:"fanout-cancel-shard",parentTaskId:task.parentTaskId,shardId:shardKey},cancelKey,true,"确认取消分片 "+shardKey+"？"),isActionPending(cancelKey)));
+if(showRetry)actions.push(ctx.a.renderAction("重试分片 "+shardKey,"IconRefreshOutlineRegular",()=>runAction({action:"fanout-retry-shard",parentTaskId:task.parentTaskId,shardId:shardKey},retryKey,false,""),isActionPending(retryKey)));
+const runtimeStatus=ctx.runtimeStatusOfNode(shardNode,rootSessionId,latestChildId);
+const shardOpen=expand(shardNode);
+const timelineKey="shard:"+rootSessionId+":"+task.parentTaskId+":"+shardKey;
+const shardStructured=ctx.a.renderStructuredBlock(shard.structured,shard.outputSchemaRequested,{kind:"shard"});
+const shardTimeline=shardOpen?ctx.a.renderAttemptTimeline(shard,{key:timelineKey}):null;
+const shardFooter=shardStructured===null&&shardTimeline===null
+?null
+:react.createElement("div",{className:"deg_expert_group_shard_extra"},shardStructured,shardTimeline);
+const meta=treeMeta!==undefined&&treeMeta!==null
+?treeMeta
+:{level:3,posinset:index+1,setsize:index+1};
+return react.createElement("div",{
+key:shardKey,
+className:"deg_expert_group_shard",
+role:"treeitem",
+"aria-level":meta.level,
+"aria-posinset":meta.posinset,
+"aria-setsize":meta.setsize,
+"data-shard-id":shardKey,
+"data-status":runtimeStatus,
+"data-expanded":shardOpen,
+},
+statusIcon(react,primitives,runtimeStatus),
+ctx.a.renderChevron(shardNode,shardOpen),
+ctx.b.renderRowMain(shardNode,{
+sessionId:latestChildId,
+parentId:rootSessionId,
+oneLine:false,
+metrics:ctx.b.renderMetrics(shard,{kind:"shard",runtimeStatus,sessionId:latestChildId,sessionIds:[latestChildId]}),
+footer:shardFooter,
+}),
+react.createElement("div",{className:"deg_expert_group_actions"},actions));
+};
+const renderFanout=(ctx,task,index,treeMeta)=>{
+const{react,primitives,expand,handleOpen,navigation,passesFilter,filterActive,taskFilter,runAction,isActionPending}=ctx;
+if(passesFilter(task)!==true)return null;
+const shards=Array.isArray(task.shards)?task.shards:[];
+const visibleShards=filterActive===true&&taskFilter!==null?taskFilter.shardsFor(task):shards;
+const open=expand(task);
+const incomplete=shards.filter((shard)=>ACTIVE_STATUSES.has(statusOf(shard))).length;
+const parentKey="cancel-parent:"+task.parentTaskId;
+const cancelCapability=capabilityAllowed(task,"cancel");
+const showCancel=cancelCapability===null
+?(ACTIVE_STATUSES.has(statusOf(task))||incomplete>0)
+:cancelCapability===true;
+const actions=showCancel
+?[ctx.a.renderAction("取消父任务（未完成 "+incomplete+" 个分片）","IconStopFillRegular",()=>runAction({action:"fanout-cancel-parent",parentTaskId:task.parentTaskId},parentKey,true,"确认取消父任务？未完成 "+incomplete+" 个分片。"),isActionPending(parentKey))]
+:[];
+const runtimeStatus=runtimeStatusOf(task,null);
+const meta=treeMeta!==undefined&&treeMeta!==null
+?treeMeta
+:{level:2,posinset:index+1,setsize:index+1};
+const fanoutRole=ctx.a.roleLabelFor(task.role,task.roleLabel)??"Expert";
+const fanoutTitle=fanoutRole.charAt(0).toUpperCase()+fanoutRole.slice(1)
++" · "+shards.length+" shards · "+RUNTIME_STATUS_LABELS[runtimeStatusOf(task,null)];
+const fanoutNavigationId=(()=>{
+const explicit=text(task.sessionId,null);
+if(explicit!==null)return explicit;
+let fallback=null;
+for(const shard of visibleShards){
+const childId=text(object(shard).childId,null);
+if(childId===null)continue;
+if(ACTIVE_STATUSES.has(statusOf(shard)))return childId;
+if(fallback===null)fallback=childId;
+}
+return fallback;
+})();
+const fanoutNavigable=navigation.available===true&&fanoutNavigationId!==null;
+const onFanoutKeyDown=fanoutNavigable
+?(event)=>{
+if(event?.key!=="Enter"&&event?.key!==" ")return;
+event.preventDefault?.();
+event.stopPropagation?.();
+handleOpen(fanoutNavigationId);
+}
+:undefined;
+return react.createElement("div",{key:task.parentTaskId||"fanout-"+index,className:"deg_expert_group_fanout",role:"none","data-status":runtimeStatus,"data-task-status":statusOf(task)},
+react.createElement("div",{
+className:"deg_expert_group_fanout_header",
+role:"treeitem",
+"aria-level":meta.level,
+"aria-posinset":meta.posinset,
+"aria-setsize":meta.setsize,
+"aria-expanded":open,
+},
+statusIcon(react,primitives,runtimeStatus),
+ctx.a.renderChevron(task,open),
+react.createElement("div",{className:"deg_expert_group_fanout_title"},
+react.createElement("div",{
+className:"deg_expert_group_line deg_expert_group_task",
+title:fanoutTitle,
+...(fanoutNavigable?{role:"button",tabIndex:0,"aria-label":"打开任务会话："+fanoutTitle,onKeyDown:onFanoutKeyDown}:{}),
+onClick:fanoutNavigable?()=>handleOpen(fanoutNavigationId):undefined,
+},fanoutTitle),
+ctx.b.renderMetrics(task,{kind:"fanout",runtimeStatus,sessionIds:ctx.b.fanoutSessionIdsOf(task)})),
+react.createElement("div",{className:"deg_expert_group_actions"},actions)),
+open?react.createElement("div",{className:"deg_expert_group_fanout_shards deg_expert_group_tree_children",role:"group"},visibleShards.map((shard,shardIndex)=>renderShard(ctx,task,shard,shardIndex,{
+level:meta.level+1,
+posinset:shardIndex+1,
+setsize:visibleShards.length,
+}))):null);
+};
+const sessionModelOptionOf=(ctx,value,label,disabled)=>{
+const{react}=ctx;
+return react.createElement("option",{
+key:"opt:"+(disabled===true?"disabled:":"")+value,
+value,
+...(disabled===true?{disabled:true}:{}),
+},label);
+};
+const sessionModelRowOf=(ctx,role,groups)=>{
+const{t,meta,sessionModelState,sessionModelDrafts}=ctx;
+const current=sessionModelState.overrides[role]??null;
+const globalDefault=normalizeSessionModelSelection(object(meta?.roleDefaults)[role]);
+const hasDraft=Object.prototype.hasOwnProperty.call(sessionModelDrafts,role);
+const baseline=current??globalDefault;
+const editable=hasDraft
+?sessionModelDrafts[role]
+:{
+provider:baseline?.provider??"",
+model:baseline?.model??"",
+reasoningEffort:baseline?.reasoningEffort??"",
+};
+const providerValue=typeof editable.provider==="string"?editable.provider:"";
+const modelValue=typeof editable.model==="string"?editable.model:"";
+const effortValue=typeof editable.reasoningEffort==="string"?editable.reasoningEffort:"";
+const roleLabel=ctx.a.roleLabelFor(role,null)??role;
+const providerGroup=groups.find((group)=>text(object(group).id,null)===providerValue);
+const models=sessionModelModelOptions(providerValue,groups);
+const modelEntry=models.find((candidate)=>text(object(candidate).id,null)===modelValue);
+const reasoningRaw=modelEntry?.reasoning;
+const reasoning=reasoningRaw!==null&&typeof reasoningRaw==="object"&&Array.isArray(reasoningRaw)!==true
+?reasoningRaw
+:null;
+const efforts=Array.isArray(reasoning?.efforts)?reasoning.efforts:[];
+const providerOptions=[sessionModelOptionOf(ctx,"","未选择供应商")];
+if(providerValue!==""&&providerGroup===undefined){
+providerOptions.push(sessionModelOptionOf(ctx,providerValue,providerValue+"（不可用）",true));
+}
+for(const group of groups){
+const id=text(object(group).id,null);
+if(id===null||id==="")continue;
+providerOptions.push(sessionModelOptionOf(ctx,id,text(object(group).name,null)??id));
+}
+const modelOptions=[];
+if(providerValue===""){
+modelOptions.push(sessionModelOptionOf(ctx,"","先选择供应商",true));
+}else{
+modelOptions.push(sessionModelOptionOf(ctx,"","未选择模型"));
+if(modelValue!==""&&modelEntry===undefined){
+modelOptions.push(sessionModelOptionOf(ctx,modelValue,modelValue+"（不可用）",true));
+}
+for(const candidate of models){
+const id=text(object(candidate).id,null);
+if(id===null||id==="")continue;
+modelOptions.push(sessionModelOptionOf(ctx,id,text(object(candidate).name,null)??id));
+}
+}
+const effortOptions=[];
+if(reasoning===null){
+effortOptions.push(sessionModelOptionOf(ctx,"",providerValue===""?"先选择模型":"模型无思考深度",true));
+}else{
+effortOptions.push(sessionModelOptionOf(ctx,"",t("sidebar.sessionModel.effortDefault")));
+for(const effort of efforts){
+const id=text(object(effort).id,null);
+if(id===null||id==="")continue;
+effortOptions.push(sessionModelOptionOf(ctx,id,text(object(effort).name,null)??id));
+}
+if(effortValue!==""
+&&efforts.every((effort)=>text(object(effort).id,null)!==effortValue)){
+effortOptions.push(sessionModelOptionOf(ctx,effortValue,effortValue+"（不可用）",true));
+}
+}
+return{
+current,roleLabel,providerValue,modelValue,effortValue,
+providerOptions,modelOptions,effortOptions,reasoning,providerGroup,
+};
+};
+const renderSessionModelRow=(ctx,role,options)=>{
+const{react,t,updateSessionModelDraft,clearSessionModelRole}=ctx;
+const writable=options.writable;
+const row=sessionModelRowOf(ctx,role,options.groups);
+const{
+current,roleLabel,providerValue,modelValue,effortValue,
+providerOptions,modelOptions,effortOptions,reasoning,providerGroup,
+}=row;
+const pillChildren=[
+react.createElement("span",{
+key:"label",
+className:"deg_expert_group_session_model_pill_label",
+title:roleLabel,
+},roleLabel),
+];
+if(current!==null){
+pillChildren.push(react.createElement("button",{
+key:"clear",
+type:"button",
+className:"deg_expert_group_session_model_clear",
+"data-deg-session-model-clear":role,
+"aria-label":t("sidebar.sessionModel.clearRole",{role:roleLabel}),
+title:t("sidebar.sessionModel.clearRole",{role:roleLabel}),
+disabled:writable!==true,
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+void clearSessionModelRole(role);
+},
+},"×"));
+}
+return(react.createElement("div",{
+key:role,
+className:"deg_expert_group_session_model_row",
+role:"row",
+"data-deg-session-model-role":role,
+"data-deg-session-model-state":current!==null?"override":"follow",
+},[
+react.createElement("div",{
+key:"role",
+role:"cell",
+className:"deg_expert_group_session_model_cell",
+},react.createElement("span",{className:"deg_expert_group_session_model_pill"},pillChildren)),
+react.createElement("div",{
+key:"provider",
+role:"cell",
+className:"deg_expert_group_session_model_cell",
+},react.createElement("select",{
+className:"deg_expert_group_session_model_select",
+"aria-label":roleLabel+" "+t("sidebar.sessionModel.provider"),
+"data-deg-session-model-field":"provider",
+value:providerValue,
+disabled:writable!==true,
+onChange:(event)=>updateSessionModelDraft(role,"provider",event?.target?.value??""),
+},providerOptions)),
+react.createElement("div",{
+key:"model",
+role:"cell",
+className:"deg_expert_group_session_model_cell",
+},react.createElement("select",{
+className:"deg_expert_group_session_model_select",
+"aria-label":roleLabel+" "+t("sidebar.sessionModel.columnModel"),
+"data-deg-session-model-field":"model",
+value:modelValue,
+disabled:writable!==true||providerValue===""||providerGroup===undefined,
+onChange:(event)=>updateSessionModelDraft(role,"model",event?.target?.value??""),
+},modelOptions)),
+react.createElement("div",{
+key:"effort",
+role:"cell",
+className:"deg_expert_group_session_model_cell",
+},react.createElement("select",{
+className:"deg_expert_group_session_model_select",
+"aria-label":roleLabel+" "+t("sidebar.sessionModel.effort"),
+"data-deg-session-model-field":"effort",
+value:effortValue,
+disabled:writable!==true||reasoning===null||modelValue==="",
+onChange:(event)=>updateSessionModelDraft(role,"reasoningEffort",event?.target?.value??""),
+},effortOptions)),
+]));
+};
+const renderSessionModelFooter=(ctx,options)=>{
+const{react,t,sessionModelState,commitSessionModelChanges}=ctx;
+const{canSave,invalidDraft,closeDialog}=options;
+const revision=sessionModelState.revision;
+const footer=react.createElement("footer",{
+key:"footer",
+className:"deg_expert_group_session_model_footer",
+},[
+react.createElement("span",{
+key:"revision",
+className:"deg_expert_group_session_model_revision",
+"data-deg-session-model-revision":sessionModelState.revision,
+},t("sidebar.sessionModel.revision",{revision:sessionModelState.revision})),
+invalidDraft===true
+?react.createElement("span",{
+key:"invalid",
+className:"deg_expert_group_session_model_invalid",
+role:"status",
+"data-deg-session-model-invalid":"true",
+},t("sidebar.sessionModel.invalidDraft"))
+:null,
+react.createElement("span",{key:"spacer",className:"deg_expert_group_session_model_spacer"}),
+react.createElement("button",{
+key:"close",
+type:"button",
+className:"deg_expert_group_export_button",
+"data-deg-session-model-close":"footer",
+onClick:closeDialog,
+},t("sidebar.sessionModel.close")),
+react.createElement("button",{
+key:"save",
+type:"button",
+className:"deg_expert_group_session_model_primary",
+"data-deg-session-model-save":"true",
+"aria-label":t("sidebar.sessionModel.saveChanges"),
+disabled:canSave!==true,
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+void commitSessionModelChanges();
+},
+},t("sidebar.sessionModel.saveChanges")),
+]);
+return footer;
+};
+const renderSessionModelDialog=(ctx)=>{
+const{
+react,t,meta,sessionModelOpen,sessionModelState,sessionModelCatalog,sessionModelSaving,
+sessionModelNotice,sessionModelHasInvalidDraft,sessionModelPendingChanges,
+closeSessionModelDialog,retrySessionModelLoad,sessionModelDialogRef,
+}=ctx;
+if(sessionModelOpen!==true)return null;
+const status=sessionModelState.status;
+const roles=sessionModelRolesOf(meta);
+const groups=Array.isArray(sessionModelCatalog.groups)?sessionModelCatalog.groups:[];
+const writable=status==="ready"&&sessionModelState.live===true&&sessionModelSaving!==true;
+const readOnlyReasons={
+"no-session":t("sidebar.sessionModel.noSession"),
+child:t("sidebar.sessionModel.child"),
+loading:t("sidebar.sessionModel.loading"),
+unsupported:t("sidebar.sessionModel.unsupported"),
+error:t("sidebar.sessionModel.unavailable"),
+unavailable:t("sidebar.sessionModel.unavailable"),
+};
+const readOnlyHint=status==="ready"
+?(sessionModelState.live===true?null:t("sidebar.sessionModel.offline"))
+:(readOnlyReasons[status]??null);
+const noticeText=sessionModelNotice===null
+?null
+:sessionModelNotice.kind==="saved"
+?t("sidebar.sessionModel.saved")
+:sessionModelNotice.kind==="cleared"
+?t("sidebar.sessionModel.cleared")
+:sessionModelNotice.text;
+const noticeError=sessionModelNotice?.kind==="error"||sessionModelNotice?.kind==="conflict";
+const changes=status==="ready"?sessionModelPendingChanges():[];
+const invalidDraft=status==="ready"&&sessionModelHasInvalidDraft();
+const canSave=writable===true&&changes.length>0&&invalidDraft!==true;
+const closeDialog=(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+closeSessionModelDialog();
+};
+const headRow=react.createElement("div",{
+key:"__head",
+className:"deg_expert_group_session_model_row",
+role:"row",
+"data-deg-session-model-head":"true",
+},[
+react.createElement("span",{
+key:"role",
+role:"columnheader",
+className:"deg_expert_group_session_model_head_cell",
+},t("sidebar.sessionModel.columnRole")),
+react.createElement("span",{
+key:"provider",
+role:"columnheader",
+className:"deg_expert_group_session_model_head_cell",
+},t("sidebar.sessionModel.provider")),
+react.createElement("span",{
+key:"model",
+role:"columnheader",
+className:"deg_expert_group_session_model_head_cell",
+},t("sidebar.sessionModel.columnModel")),
+react.createElement("span",{
+key:"effort",
+role:"columnheader",
+className:"deg_expert_group_session_model_head_cell",
+},t("sidebar.sessionModel.effort")),
+]);
+const rows=[];
+if(status==="ready"){
+for(const role of roles){
+rows.push(renderSessionModelRow(ctx,role,{writable,groups}));
+}
+}
+const bodyChildren=[
+react.createElement("p",{key:"hint",className:"deg_expert_group_session_model_hint"},
+t("sidebar.sessionModel.hint")),
+];
+if(readOnlyHint!==null){
+bodyChildren.push(react.createElement("div",{
+key:"readonly",
+className:"deg_expert_group_session_model_hint",
+"data-deg-session-model-readonly":status,
+},readOnlyHint));
+}
+if(status==="error"){
+bodyChildren.push(react.createElement("button",{
+key:"retry",
+type:"button",
+className:"deg_expert_group_export_button",
+"data-deg-session-model-retry":"true",
+"aria-label":t("sidebar.sessionModel.retry"),
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+retrySessionModelLoad();
+},
+},t("sidebar.sessionModel.retry")));
+}
+if(noticeText!==null){
+bodyChildren.push(react.createElement("div",{
+key:"notice",
+className:noticeError
+?"deg_expert_group_session_model_notice deg_expert_group_session_model_notice_error"
+:"deg_expert_group_session_model_notice",
+role:"status",
+"data-deg-session-model-notice":sessionModelNotice?.kind??"none",
+},noticeText));
+}
+if(roles.length===0){
+bodyChildren.push(react.createElement("div",{
+key:"empty",
+className:"deg_expert_group_session_model_hint",
+},t("sidebar.sessionModel.emptyRoles")));
+}
+if(status==="ready"){
+bodyChildren.push(react.createElement("div",{
+key:"table",
+className:"deg_expert_group_session_model_scroll",
+},react.createElement("div",{
+role:"table",
+"aria-label":t("sidebar.sessionModel.tableLabel"),
+className:"deg_expert_group_session_model_table",
+},[headRow,...rows])));
+}
+const footer=renderSessionModelFooter(ctx,{canSave,invalidDraft,closeDialog});
+return react.createElement("dialog",{
+id:"deg-session-model-dialog",
+className:"deg_expert_group_session_model_dialog",
+"aria-labelledby":"deg-session-model-title",
+"data-deg-session-model":"dialog",
+"data-deg-session-model-state":status,
+ref:sessionModelDialogRef,
+onCancel:closeDialog,
+onClose:()=>{closeSessionModelDialog();},
+onClick:(event)=>{
+if(sessionModelDialogRef.current!==null
+&&event?.target===sessionModelDialogRef.current){
+closeSessionModelDialog();
+}
+},
+},
+react.createElement("header",{className:"deg_expert_group_session_model_header"},
+react.createElement("h2",{
+id:"deg-session-model-title",
+className:"deg_expert_group_session_model_title",
+},t("sidebar.sessionModel.title")),
+react.createElement("button",{
+type:"button",
+className:"deg_expert_group_export_button",
+"data-deg-session-model-close":"true",
+"aria-label":t("sidebar.sessionModel.close"),
+onClick:closeDialog,
+},"×")),
+react.createElement("div",{
+className:"deg_expert_group_session_model_body",
+},bodyChildren),
+footer);
+};
+const renderToolbar=(ctx)=>{
+const{react,t,snapshot,root,filterSource,updateFilter,sessionModelOpen,sessionModelEntryRef,toggleSessionModelDialog}=ctx;
+if(snapshot===null)return null;
+const roles=[];
+const addRole=(value)=>{
+const role=text(value,null);
+if(role!==null&&roles.indexOf(role)===-1)roles.push(role);
+};
+const collectRoles=(nodes)=>{
+for(const node of Array.isArray(nodes)?nodes:[]){
+addRole(node.role);
+collectRoles(node.children);
+for(const shard of Array.isArray(node.shards)?node.shards:[])addRole(shard.role);
+}
+};
+collectRoles(root?.children);
+roles.sort();
+return react.createElement("div",{className:"deg_expert_group_toolbar",role:"search","aria-label":t("sidebar.search.label")},
+react.createElement("input",{
+type:"search",
+className:"deg_expert_group_search",
+"aria-label":t("sidebar.search.aria"),
+placeholder:t("sidebar.search.placeholder"),
+value:filterSource.query,
+onChange:(event)=>{updateFilter({query:event?.target?.value??""});},
+}),
+react.createElement("select",{
+className:"deg_expert_group_filter",
+"aria-label":t("sidebar.filter.role"),
+value:filterSource.role,
+onChange:(event)=>{updateFilter({role:event?.target?.value??""});},
+},[
+react.createElement("option",{key:"__all_roles",value:""},t("sidebar.filter.allRoles")),
+...roles.map((role)=>react.createElement("option",{key:role,value:role},ctx.a.roleLabelFor(role,null)??role)),
+]),
+react.createElement("select",{
+className:"deg_expert_group_filter",
+"aria-label":t("sidebar.filter.status"),
+value:filterSource.status,
+onChange:(event)=>{updateFilter({status:event?.target?.value??""});},
+},[
+react.createElement("option",{key:"__all_statuses",value:""},t("sidebar.filter.allStatuses")),
+...STATUS_FILTER_OPTIONS.map((option)=>react.createElement("option",{key:option.value,value:option.value},option.label)),
+]),
+react.createElement("button",{
+type:"button",
+className:"deg_expert_group_export_button",
+"aria-label":t("sidebar.sessionModel.open"),
+"aria-expanded":sessionModelOpen,
+"aria-haspopup":"dialog",
+"aria-controls":"deg-session-model-dialog",
+ref:sessionModelEntryRef,
+title:t("sidebar.sessionModel.openTitle"),
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+toggleSessionModelDialog();
+},
+},t("sidebar.sessionModel.open")));
+};
+function createSidebarViewsC(ctx,viewsA,viewsB){
+const deps={...ctx,a:viewsA,b:viewsB};
+return Object.freeze({
+renderExpert:(node,index,parentId,treeMeta)=>renderExpert(deps,node,index,parentId,treeMeta),
+renderIdleGroup:(nodes,trailing,treeMeta)=>renderIdleGroup(deps,nodes,trailing,treeMeta),
+renderShard:(task,shard,index,treeMeta)=>renderShard(deps,task,shard,index,treeMeta),
+renderFanout:(task,index,treeMeta)=>renderFanout(deps,task,index,treeMeta),
+renderToolbar:()=>renderToolbar(deps),
+renderSessionModelDialog:()=>renderSessionModelDialog(deps),
+});
+}
+global[SYMBOL]=Object.freeze({createSidebarViewsC});
+})(globalThis);
+/* source: client-sidebar-auto-controller.js */
+(function installSidebarAutoController(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-controller");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+SIDEBAR_AUTO_CLOSE_MAX_ATTEMPTS,SIDEBAR_AUTO_KEY_LIMIT,SIDEBAR_AUTO_OPEN_PLACEHOLDER_FOREIGN_TTL_MS,
+SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS,SIDEBAR_TAB_CLOSE_LATE_QUARANTINE_MS,SIDEBAR_TAB_CLOSE_VERIFY_TIMEOUT_MS,
+SIDEBAR_TAB_CLOSE_WATCHDOG_MS,SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS,SIDEBAR_TAB_ORIGIN_AUTO,
+closeSettleReason,object,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+SUBAGENT_CHAT_KIND,sidebarTabCloseKey,sidebarTabKey,
+}=DOM;
+const LEDGER_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
+const LEDGER=global[LEDGER_SYMBOL]||{};
+const{
+SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,deleteSidebarAutoOwnership,readSidebarAutoOwnershipEntry,
+recordSidebarAutoDecision,recordSidebarAutoDiag,sidebarAutoKeyDigest,
+sidebarAutoOriginTabIdOf,sidebarAutoOriginWrittenAtOf,sidebarOwnershipAcceptsNewAuto,
+writeSidebarAutoOwnership,
+}=LEDGER;
+function createSidebarTabClosePort(scope){
+const{
+closeSidebarResource,readSidebarOpenTabs,rootSessionId,
+sharedSidebarTabCloseInFlight,sidebarRight,sidebarSessionId,
+}=scope;
+function sidebarTabCloseKeyOf(tabId){
+return sidebarTabCloseKey(sidebarSessionId,rootSessionId,tabId);
+}
+function sidebarTabCloseLeaseOf(tabId){
+return sharedSidebarTabCloseInFlight.get(sidebarTabCloseKeyOf(tabId))??null;
+}
+function sidebarTabCloseInFlight(tabId){
+return sidebarTabCloseLeaseOf(tabId)!==null;
+}
+function acquireSidebarTabClose(tabId){
+const key=sidebarTabCloseKeyOf(tabId);
+if(sharedSidebarTabCloseInFlight.has(key)===true)return null;
+let settleWaiters=null;
+const settled=new Promise((resolve)=>{settleWaiters=resolve;});
+const token={
+key,
+result:null,
+ok:null,
+settled:false,
+state:"in-flight",
+holdUntil:0,
+wait:()=>settled,
+release:null,
+};
+sharedSidebarTabCloseInFlight.set(key,token);
+let released=false;
+const release=(outcome)=>{
+if(released===true)return;
+released=true;
+const reason=closeSettleReason(outcome);
+token.result=reason;
+token.ok=reason==="closed";
+token.settled=true;
+const resolve=settleWaiters;
+settleWaiters=null;
+if(resolve!==null)resolve(reason);
+if(sharedSidebarTabCloseInFlight.get(key)===token)sharedSidebarTabCloseInFlight.delete(key);
+};
+token.release=release;
+return{
+token,
+hold(state,holdUntil){
+if(released===true)return;
+token.state=state;
+token.holdUntil=holdUntil;
+},
+release,
+};
+}
+function sidebarTabPresenceInInventory(tabId,expectedAddress=null){
+const inventory=readSidebarOpenTabs();
+if(inventory===null)return"unreadable";
+const expected=text(expectedAddress,null);
+for(const entry of inventory){
+try{
+const candidate=object(entry);
+if(text(candidate.sessionId,null)!==sidebarSessionId)continue;
+if(text(candidate.kind,null)!==SUBAGENT_CHAT_KIND)continue;
+if(text(candidate.tabId,null)!==tabId)continue;
+if(expected===null)return"present";
+const contentId=text(candidate.contentId,null);
+if(contentId===null)return"present";
+return contentId===expected?"present":"recycled";
+}catch{continue;}
+}
+return"absent";
+}
+function requestSidebarTabClose(tabId){
+return new Promise((resolve)=>{
+let settled=false;
+let timer=null;
+const finish=(outcome)=>{
+if(settled===true)return;
+settled=true;
+if(timer!==null){
+try{globalThis.clearTimeout?.(timer);}catch{/* 清理失败不影响结果。 */}
+}
+resolve(outcome);
+};
+try{
+timer=typeof globalThis.setTimeout==="function"
+?globalThis.setTimeout(()=>finish("timeout"),SIDEBAR_TAB_CLOSE_WATCHDOG_MS)
+:null;
+}catch{timer=null;}
+let result=null;
+try{
+result=closeSidebarResource.call(sidebarRight,tabId);
+}catch{
+finish("rejected");
+return;
+}
+Promise.resolve(result).then(()=>finish("resolved"),()=>finish("rejected"));
+});
+}
+function waitForSidebarCloseLease(leaseToken,timeoutMs){
+return new Promise((resolve)=>{
+let done=false;
+let timer=null;
+const finish=(value)=>{
+if(done===true)return;
+done=true;
+if(timer!==null){
+try{globalThis.clearTimeout?.(timer);}catch{/* 同上。 */}
+}
+resolve(value);
+};
+try{
+timer=typeof globalThis.setTimeout==="function"?globalThis.setTimeout(()=>finish(false),timeoutMs):null;
+}catch{timer=null;}
+Promise.resolve(leaseToken.wait()).then(()=>finish(true),()=>finish(true));
+});
+}
+return Object.freeze({
+sidebarTabCloseKeyOf,sidebarTabCloseLeaseOf,sidebarTabCloseInFlight,acquireSidebarTabClose,sidebarTabPresenceInInventory,requestSidebarTabClose,waitForSidebarCloseLease,
+});
+}
+function createSidebarAutoBookkeeping(scope){
+const{
+clearAutoCloseBudget,rootSessionId,sidebarAutoCloseCooldownsRef,
+sidebarAutoCloseVerificationsRef,sidebarAutoOriginRef,sidebarAutoReservationRef,
+sidebarAutoSuppressedRef,sidebarResourceTabStateOf,sidebarSessionId,
+sidebarTabOpeningRef,sidebarTabPendingRef,sidebarTabRecordsRef,
+}=scope;
+function sidebarAutoCloseKeyIsActive(key){
+if(sidebarTabPendingRef.current.has(key)===true)return true;
+if(sidebarTabOpeningRef.current.has(key)===true)return true;
+if(sidebarAutoReservationRef.current.has(key)===true)return true;
+if(sidebarAutoCloseVerificationsRef.current.has(key)===true)return true;
+if(sidebarAutoCloseCooldownsRef.current.has(key)===true)return true;
+const record=sidebarTabRecordsRef.current.get(key);
+return record!==undefined
+&&record.sessionId===sidebarSessionId
+&&record.rootSessionId===rootSessionId;
+}
+function autoSidebarOwnershipHasCapacity(key,address){
+const origin=sidebarAutoOriginRef.current;
+if(origin.has(key)!==true&&origin.size>=SIDEBAR_AUTO_KEY_LIMIT)return false;
+return sidebarOwnershipAcceptsNewAuto(sidebarSessionId,rootSessionId,address);
+}
+function cleanupAutoSidebarKeys(known,actingKey){
+for(const map of[sidebarAutoOriginRef.current,sidebarAutoSuppressedRef.current]){
+for(const[key,entry]of map){
+if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId)continue;
+if(key===actingKey)continue;
+if(known.has(entry.address)===true)continue;
+if(sidebarAutoCloseKeyIsActive(key)===true)continue;
+map.delete(key);
+clearAutoCloseBudget(key);
+}
+}
+for(const[key,entry]of sidebarAutoReservationRef.current){
+if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId)continue;
+if(key===actingKey)continue;
+if(known.has(entry.address)===true)continue;
+if(sidebarTabPendingRef.current.has(key)===true)continue;
+sidebarAutoReservationRef.current.delete(key);
+}
+}
+function sweepAutoOpenPlaceholders(running){
+const originMap=sidebarAutoOriginRef.current;
+if(originMap.size===0)return;
+const now=Date.now();
+for(const[key,entry]of[...originMap]){
+if(sidebarAutoOriginTabIdOf(entry)!==null)continue;
+const age=now-sidebarAutoOriginWrittenAtOf(entry);
+const scoped=entry.sessionId===sidebarSessionId&&entry.rootSessionId===rootSessionId;
+if(scoped!==true){
+if(age<SIDEBAR_AUTO_OPEN_PLACEHOLDER_FOREIGN_TTL_MS)continue;
+originMap.delete(key);
+recordSidebarAutoDiag({kind:"ownership",event:"delete",reason:"placeholder-foreign-expired",key:sidebarAutoKeyDigest(key)});
+continue;
+}
+if(age<SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS)continue;
+if(sidebarTabPendingRef.current.has(key)===true)continue;
+if(sidebarTabOpeningRef.current.has(key)===true)continue;
+const state=sidebarResourceTabStateOf(entry.address);
+if(state.readable!==true){
+recordSidebarAutoDiag({kind:"ownership",event:"keep",reason:"placeholder-unreadable",key:sidebarAutoKeyDigest(key)});
+continue;
+}
+originMap.delete(key);
+recordSidebarAutoDiag({
+kind:"ownership",
+event:"delete",
+reason:state.tabId===null
+?(running!==null&&running!==undefined&&running.has(entry.address)===true
+?"placeholder-retry"
+:"placeholder-released")
+:"placeholder-superseded",
+key:sidebarAutoKeyDigest(key),
+});
+}
+}
+function clearManualSuppressionOfIdleResources(idle){
+if(idle===null||idle===undefined||idle.size===0)return;
+for(const address of idle){
+const key=sidebarTabKey(sidebarSessionId,rootSessionId,address);
+if(sidebarAutoSuppressedRef.current.has(key)===true)sidebarAutoSuppressedRef.current.delete(key);
+const persisted=readSidebarAutoOwnershipEntry(sidebarSessionId,rootSessionId,address,{quiet:true});
+if(persisted===null||persisted.origin!==SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL)continue;
+deleteSidebarAutoOwnership(sidebarSessionId,rootSessionId,address,"resource-idle",{manual:true});
+}
+}
+return Object.freeze({
+sidebarAutoCloseKeyIsActive,autoSidebarOwnershipHasCapacity,cleanupAutoSidebarKeys,sweepAutoOpenPlaceholders,clearManualSuppressionOfIdleResources,
+});
+}
+function createSidebarCloseVerification(scope,tabClosePort){
+const{
+bump,cancelPendingSidebarSplitOfClose,clearAutoCloseAttempt,
+closeSidebarResource,rootSessionId,settleAutoCloseAttempt,
+sharedSidebarTabCloseInFlight,sidebarAutoCloseCooldownsRef,sidebarAutoCloseVerificationsRef,
+sidebarAutoFailedKeysRef,sidebarAutoOriginRef,sidebarAutoSuppressedRef,
+sidebarSessionId,sidebarSurfaceStillCurrent,sidebarTabRecordsRef,
+trimAutoKeyMap,
+}=scope;
+const{acquireSidebarTabClose,requestSidebarTabClose,sidebarTabCloseLeaseOf,sidebarTabPresenceInInventory}=tabClosePort;
+const{waitForSidebarCloseLease}=tabClosePort;
+function beginSidebarCloseVerification(lease,tabId,verify){
+const entry={
+sessionId:sidebarSessionId,
+rootSessionId,
+tabId,
+address:verify?.address??null,
+attemptToken:verify?.attemptToken??null,
+manual:verify?.manual===true,
+splitIntentToken:verify?.splitIntentToken??null,
+misses:0,
+deadline:Date.now()+SIDEBAR_TAB_CLOSE_VERIFY_TIMEOUT_MS,
+lease,
+};
+sidebarAutoCloseVerificationsRef.current.set(verify.key,entry);
+trimAutoKeyMap(sidebarAutoCloseVerificationsRef.current,true);
+lease.hold("verifying",entry.deadline);
+return entry;
+}
+function finishVerifiedSidebarClose(key,entry,reason){
+const records=sidebarTabRecordsRef.current;
+const record=records.get(key);
+const scopedRecord=record!==undefined
+&&record.sessionId===sidebarSessionId
+&&record.rootSessionId===rootSessionId
+?record
+:undefined;
+const sameTab=scopedRecord!==undefined&&scopedRecord.tabId===entry.tabId;
+cancelPendingSidebarSplitOfClose(key,entry.splitIntentToken);
+if(sameTab===true){
+records.delete(key);
+if(entry.attemptToken===null||entry.attemptToken===undefined)clearAutoCloseAttempt(key);
+else settleAutoCloseAttempt(key,{kind:"close",attemptToken:entry.attemptToken});
+sidebarAutoCloseCooldownsRef.current.delete(key);
+sidebarAutoOriginRef.current.delete(key);
+if(entry.manual===true&&entry.address!==null&&entry.address!==undefined){
+sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:entry.address});
+trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,entry.address,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
+}else if(entry.address!==null&&entry.address!==undefined){
+deleteSidebarAutoOwnership(sidebarSessionId,rootSessionId,entry.address,"verified-closed");
+}
+}else if(entry.attemptToken!==null&&entry.attemptToken!==undefined){
+settleAutoCloseAttempt(key,{kind:"close",attemptToken:entry.attemptToken});
+}
+sidebarAutoCloseVerificationsRef.current.delete(key);
+entry.lease?.release?.(reason==="recycled"?"recycled":"closed");
+bump((value)=>value+1);
+}
+function verifyPendingSidebarCloses(){
+const now=Date.now();
+for(const[,token]of sharedSidebarTabCloseInFlight){
+if(token.state!=="quarantined")continue;
+if(token.holdUntil>now)continue;
+token.release?.("timeout");
+}
+const verifications=sidebarAutoCloseVerificationsRef.current;
+for(const[key,entry]of[...verifications]){
+if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId)continue;
+const presence=sidebarTabPresenceInInventory(entry.tabId,entry.address);
+if(presence==="present")entry.misses=0;
+else if(presence!=="unreadable")entry.misses+=1;
+if(presence!=="present"&&presence!=="unreadable"
+&&entry.misses>=SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS){
+finishVerifiedSidebarClose(key,entry,presence==="recycled"?"recycled":"closed");
+continue;
+}
+if(now>=entry.deadline){
+verifications.delete(key);
+entry.lease?.release?.("timeout");
+sidebarAutoFailedKeysRef.current.add(key);
+}
+}
+}
+async function closeSidebarTabWithLease(tabId,options){
+if(closeSidebarResource===null)return{status:"unavailable",closed:false};
+const waitForCompeting=options?.waitForCompeting===true;
+const verify=options?.verify??null;
+let lease=acquireSidebarTabClose(tabId);
+if(lease===null){
+if(waitForCompeting!==true)return{status:"contended",closed:false};
+const competing=sidebarTabCloseLeaseOf(tabId);
+if(competing===null)return{status:"contended",closed:false};
+const settledInTime=await waitForSidebarCloseLease(competing,SIDEBAR_TAB_CLOSE_WATCHDOG_MS);
+if(settledInTime!==true)return{status:"contended-timeout",closed:false};
+if(sidebarSurfaceStillCurrent()!==true)return{status:"stale",closed:false};
+const settledReason=competing.result;
+if(settledReason==="recycled"
+&&(verify?.address===null||verify?.address===undefined)){
+return{status:"recycled-unverifiable",closed:false};
+}
+const presence=sidebarTabPresenceInInventory(tabId,verify?.address??null);
+if(presence==="unreadable")return{status:"unreadable",closed:false};
+if(presence==="recycled")return{status:"verified-recycled",closed:false};
+if(presence!=="present")return{status:"verified-closed",closed:true};
+lease=acquireSidebarTabClose(tabId);
+if(lease===null)return{status:"contended",closed:false};
+}
+const preflight=sidebarTabPresenceInInventory(tabId,verify?.address??null);
+const manualWithoutEvidence=preflight==="unreadable"&&verify!==null&&verify.manual===true;
+if(preflight==="unreadable"&&manualWithoutEvidence!==true){
+lease.release("failed");
+return{status:"unreadable",closed:false};
+}
+if(preflight==="absent"){
+lease.release("closed");
+return{status:"verified-closed",closed:true};
+}
+if(preflight==="recycled"){
+lease.release("recycled");
+return{status:"verified-recycled",closed:false};
+}
+const outcome=await requestSidebarTabClose(tabId);
+if(outcome==="rejected"){
+lease.release("failed");
+return{status:"failed",closed:false};
+}
+if(outcome==="timeout"){
+lease.hold("quarantined",Date.now()+SIDEBAR_TAB_CLOSE_LATE_QUARANTINE_MS);
+return{status:"timeout",closed:false};
+}
+if(manualWithoutEvidence===true){
+lease.release("closed");
+return{status:"closed",closed:true};
+}
+if(verify===null||verify.key===null||verify.key===undefined){
+lease.release("failed");
+return{status:"request-resolved-unverified",closed:false};
+}
+beginSidebarCloseVerification(lease,tabId,verify);
+return{status:"request-resolved-unverified",closed:false};
+}
+return Object.freeze({
+beginSidebarCloseVerification,finishVerifiedSidebarClose,verifyPendingSidebarCloses,closeSidebarTabWithLease,
+});
+}
+function createSidebarAutoCandidates(scope,tabClosePort,bookkeeping){
+const{
+autoCloseCooldownActive,bump,clearAutoCloseAttempt,
+clearAutoCloseBudget,closeSidebarResource,enterAutoCloseCooldown,
+openSidebarResource,primitives,readActiveSidebarResource,
+releaseExpiredAutoCloseCooldown,rootSessionId,sampleAutoTabMisses,
+sidebarActiveResourceMatches,sidebarAutoCloseAttemptOwnersRef,sidebarAutoCloseAttemptsRef,
+sidebarAutoCloseCooldownsRef,sidebarAutoCloseVerificationsRef,sidebarAutoEpochRef,
+sidebarAutoFailedKeysRef,sidebarAutoOriginRef,sidebarAutoReservationRef,
+sidebarAutoSuppressedRef,sidebarManualIntentOf,sidebarOpenTabsAvailable,
+sidebarResourceTabStateOf,sidebarSessionId,sidebarTabOpeningRef,
+sidebarTabPendingRef,sidebarTabRecordsRef,trimAutoKeyMap,
+}=scope;
+const{sidebarTabCloseInFlight,sidebarTabPresenceInInventory}=tabClosePort;
+const{autoSidebarOwnershipHasCapacity}=bookkeeping;
+function sidebarAutoOpenCapable(){
+return openSidebarResource!==null
+&&closeSidebarResource!==null
+&&(readActiveSidebarResource!==null||sidebarOpenTabsAvailable===true)
+&&typeof primitives?.IconChevronLeftOutlineRegular==="function";
+}
+function autoCloseCandidate(running){
 const origin=sidebarAutoOriginRef.current;
 const records=sidebarTabRecordsRef.current;
 const openings=sidebarTabOpeningRef.current;
@@ -5120,8 +6164,8 @@ trimAutoKeyMap(sidebarAutoCloseAttemptOwnersRef.current,true);
 return{key,address:entry.address,kind:"close",attemptsBefore:used,attemptToken};
 }
 return null;
-};
-const autoOpenCandidate=(running)=>{
+}
+function autoOpenCandidate(running){
 if(sidebarAutoOpenCapable()!==true)return null;
 const origin=sidebarAutoOriginRef.current;
 const suppressed=sidebarAutoSuppressedRef.current;
@@ -5159,377 +6203,58 @@ trimAutoKeyMap(reservations);
 return{key,address,kind:"open",epoch};
 }
 return null;
-};
-const trimAutoKeyMap=(map,activeAware)=>{
-while(map.size>SIDEBAR_AUTO_KEY_LIMIT){
-let victim=null;
-for(const candidate of map.keys()){
-if(activeAware!==true||sidebarAutoCloseKeyIsActive(candidate)!==true){
-victim=candidate;
-break;
 }
-}
-if(victim===null)break;
-map.delete(victim);
-}
-};
-const sidebarAutoCloseKeyIsActive=(key)=>{
-if(sidebarTabPendingRef.current.has(key)===true)return true;
-if(sidebarTabOpeningRef.current.has(key)===true)return true;
-if(sidebarAutoReservationRef.current.has(key)===true)return true;
-if(sidebarAutoCloseVerificationsRef.current.has(key)===true)return true;
-if(sidebarAutoCloseCooldownsRef.current.has(key)===true)return true;
-const record=sidebarTabRecordsRef.current.get(key);
-return record!==undefined
-&&record.sessionId===sidebarSessionId
-&&record.rootSessionId===rootSessionId;
-};
-const clearAutoCloseBudget=(key)=>{
-clearAutoCloseAttempt(key);
-sidebarAutoCloseCooldownsRef.current.delete(key);
-};
-const enterAutoCloseCooldown=(key)=>{
-const cooldowns=sidebarAutoCloseCooldownsRef.current;
-const previous=cooldowns.get(key);
-const step=previous===undefined?0:Math.min(previous.step+1,4);
-const delay=Math.min(SIDEBAR_AUTO_CLOSE_COOLDOWN_BASE_MS*(2**step),SIDEBAR_AUTO_CLOSE_COOLDOWN_MAX_MS);
-cooldowns.set(key,{step,until:Date.now()+delay});
-trimAutoKeyMap(cooldowns,true);
-};
-const autoCloseCooldownActive=(key)=>{
-const entry=sidebarAutoCloseCooldownsRef.current.get(key);
-return entry!==undefined&&entry.until>Date.now();
-};
-const releaseExpiredAutoCloseCooldown=(key)=>{
-const cooldowns=sidebarAutoCloseCooldownsRef.current;
-const entry=cooldowns.get(key);
-if(entry===undefined||entry.until>Date.now())return;
-clearAutoCloseAttempt(key);
-};
-const autoSidebarOwnershipHasCapacity=(key,address)=>{
-const origin=sidebarAutoOriginRef.current;
-if(origin.has(key)!==true&&origin.size>=SIDEBAR_AUTO_KEY_LIMIT)return false;
-return sidebarOwnershipAcceptsNewAuto(sidebarSessionId,rootSessionId,address);
-};
-const clearAutoCloseAttempt=(key)=>{
-sidebarAutoCloseAttemptsRef.current.delete(key);
-sidebarAutoCloseAttemptOwnersRef.current.delete(key);
-sidebarAutoTabMissesRef.current.delete(key);
-};
-const autoTabMissesOf=(key,tabId)=>{
-const entry=sidebarAutoTabMissesRef.current.get(key);
-if(entry===undefined||entry.tabId!==tabId)return 0;
-return Number.isFinite(entry.misses)?entry.misses:0;
-};
-const sampleAutoTabMisses=(key,tabId,missing)=>{
-const map=sidebarAutoTabMissesRef.current;
-const previousMisses=autoTabMissesOf(key,tabId);
-map.delete(key);
-if(missing!==true)return 0;
-const misses=previousMisses+1;
-map.set(key,{sessionId:sidebarSessionId,rootSessionId,tabId,misses});
-trimSharedSidebarAutoTabMisses();
-return misses;
-};
-const settleAutoCloseAttempt=(key,context)=>{
-if(context!==null&&context!==undefined){
-const owners=sidebarAutoCloseAttemptOwnersRef.current;
-if(context.kind==="close"){
-if(owners.get(key)!==context.attemptToken)return;
-}else if(owners.has(key)===true){
-return;
-}
-}
-clearAutoCloseAttempt(key);
-};
-const sidebarTabCloseKeyOf=(tabId)=>sidebarTabCloseKey(sidebarSessionId,rootSessionId,tabId);
-const sidebarTabCloseLeaseOf=(tabId)=>sharedSidebarTabCloseInFlight.get(sidebarTabCloseKeyOf(tabId))??null;
-const sidebarTabCloseInFlight=(tabId)=>sidebarTabCloseLeaseOf(tabId)!==null;
-const acquireSidebarTabClose=(tabId)=>{
-const key=sidebarTabCloseKeyOf(tabId);
-if(sharedSidebarTabCloseInFlight.has(key)===true)return null;
-let settleWaiters=null;
-const settled=new Promise((resolve)=>{settleWaiters=resolve;});
-const token={
-key,
-result:null,
-ok:null,
-settled:false,
-state:"in-flight",
-holdUntil:0,
-wait:()=>settled,
-release:null,
-};
-sharedSidebarTabCloseInFlight.set(key,token);
-let released=false;
-const release=(outcome)=>{
-if(released===true)return;
-released=true;
-const reason=closeSettleReason(outcome);
-token.result=reason;
-token.ok=reason==="closed";
-token.settled=true;
-const resolve=settleWaiters;
-settleWaiters=null;
-if(resolve!==null)resolve(reason);
-if(sharedSidebarTabCloseInFlight.get(key)===token)sharedSidebarTabCloseInFlight.delete(key);
-};
-token.release=release;
-return{
-token,
-hold(state,holdUntil){
-if(released===true)return;
-token.state=state;
-token.holdUntil=holdUntil;
-},
-release,
-};
-};
-const sidebarTabPresenceInInventory=(tabId,expectedAddress=null)=>{
-const inventory=readSidebarOpenTabs();
-if(inventory===null)return"unreadable";
-const expected=text(expectedAddress,null);
-for(const entry of inventory){
-try{
-const candidate=object(entry);
-if(text(candidate.sessionId,null)!==sidebarSessionId)continue;
-if(text(candidate.kind,null)!==SUBAGENT_CHAT_KIND)continue;
-if(text(candidate.tabId,null)!==tabId)continue;
-if(expected===null)return"present";
-const contentId=text(candidate.contentId,null);
-if(contentId===null)return"present";
-return contentId===expected?"present":"recycled";
-}catch{continue;}
-}
-return"absent";
-};
-const requestSidebarTabClose=(tabId)=>new Promise((resolve)=>{
-let settled=false;
-let timer=null;
-const finish=(outcome)=>{
-if(settled===true)return;
-settled=true;
-if(timer!==null){
-try{globalThis.clearTimeout?.(timer);}catch{/* 清理失败不影响结果。 */}
-}
-resolve(outcome);
-};
-try{
-timer=typeof globalThis.setTimeout==="function"
-?globalThis.setTimeout(()=>finish("timeout"),SIDEBAR_TAB_CLOSE_WATCHDOG_MS)
-:null;
-}catch{timer=null;}
-let result=null;
-try{
-result=closeSidebarResource.call(sidebarRight,tabId);
-}catch{
-finish("rejected");
-return;
-}
-Promise.resolve(result).then(()=>finish("resolved"),()=>finish("rejected"));
-});
-const waitForSidebarCloseLease=(leaseToken,timeoutMs)=>new Promise((resolve)=>{
-let done=false;
-let timer=null;
-const finish=(value)=>{
-if(done===true)return;
-done=true;
-if(timer!==null){
-try{globalThis.clearTimeout?.(timer);}catch{/* 同上。 */}
-}
-resolve(value);
-};
-try{
-timer=typeof globalThis.setTimeout==="function"?globalThis.setTimeout(()=>finish(false),timeoutMs):null;
-}catch{timer=null;}
-Promise.resolve(leaseToken.wait()).then(()=>finish(true),()=>finish(true));
-});
-const beginSidebarCloseVerification=(lease,tabId,verify)=>{
-const entry={
-sessionId:sidebarSessionId,
-rootSessionId,
-tabId,
-address:verify?.address??null,
-attemptToken:verify?.attemptToken??null,
-manual:verify?.manual===true,
-splitIntentToken:verify?.splitIntentToken??null,
-misses:0,
-deadline:Date.now()+SIDEBAR_TAB_CLOSE_VERIFY_TIMEOUT_MS,
-lease,
-};
-sidebarAutoCloseVerificationsRef.current.set(verify.key,entry);
-trimAutoKeyMap(sidebarAutoCloseVerificationsRef.current,true);
-lease.hold("verifying",entry.deadline);
-return entry;
-};
-const finishVerifiedSidebarClose=(key,entry,reason)=>{
-const records=sidebarTabRecordsRef.current;
-const record=records.get(key);
-const scopedRecord=record!==undefined
-&&record.sessionId===sidebarSessionId
-&&record.rootSessionId===rootSessionId
-?record
-:undefined;
-const sameTab=scopedRecord!==undefined&&scopedRecord.tabId===entry.tabId;
-cancelPendingSidebarSplitOfClose(key,entry.splitIntentToken);
-if(sameTab===true){
-records.delete(key);
-if(entry.attemptToken===null||entry.attemptToken===undefined)clearAutoCloseAttempt(key);
-else settleAutoCloseAttempt(key,{kind:"close",attemptToken:entry.attemptToken});
-sidebarAutoCloseCooldownsRef.current.delete(key);
-sidebarAutoOriginRef.current.delete(key);
-if(entry.manual===true&&entry.address!==null&&entry.address!==undefined){
-sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:entry.address});
-trimAutoKeyMap(sidebarAutoSuppressedRef.current);
-writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,entry.address,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
-}else if(entry.address!==null&&entry.address!==undefined){
-deleteSidebarAutoOwnership(sidebarSessionId,rootSessionId,entry.address,"verified-closed");
-}
-}else if(entry.attemptToken!==null&&entry.attemptToken!==undefined){
-settleAutoCloseAttempt(key,{kind:"close",attemptToken:entry.attemptToken});
-}
-sidebarAutoCloseVerificationsRef.current.delete(key);
-entry.lease?.release?.(reason==="recycled"?"recycled":"closed");
-bump((value)=>value+1);
-};
-const verifyPendingSidebarCloses=()=>{
-const now=Date.now();
-for(const[,token]of sharedSidebarTabCloseInFlight){
-if(token.state!=="quarantined")continue;
-if(token.holdUntil>now)continue;
-token.release?.("timeout");
-}
-const verifications=sidebarAutoCloseVerificationsRef.current;
-for(const[key,entry]of[...verifications]){
-if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId)continue;
-const presence=sidebarTabPresenceInInventory(entry.tabId,entry.address);
-if(presence==="present")entry.misses=0;
-else if(presence!=="unreadable")entry.misses+=1;
-if(presence!=="present"&&presence!=="unreadable"
-&&entry.misses>=SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS){
-finishVerifiedSidebarClose(key,entry,presence==="recycled"?"recycled":"closed");
-continue;
-}
-if(now>=entry.deadline){
-verifications.delete(key);
-entry.lease?.release?.("timeout");
-sidebarAutoFailedKeysRef.current.add(key);
-}
-}
-};
-const closeSidebarTabWithLease=async(tabId,options)=>{
-if(closeSidebarResource===null)return{status:"unavailable",closed:false};
-const waitForCompeting=options?.waitForCompeting===true;
-const verify=options?.verify??null;
-let lease=acquireSidebarTabClose(tabId);
-if(lease===null){
-if(waitForCompeting!==true)return{status:"contended",closed:false};
-const competing=sidebarTabCloseLeaseOf(tabId);
-if(competing===null)return{status:"contended",closed:false};
-const settledInTime=await waitForSidebarCloseLease(competing,SIDEBAR_TAB_CLOSE_WATCHDOG_MS);
-if(settledInTime!==true)return{status:"contended-timeout",closed:false};
-if(sidebarSurfaceStillCurrent()!==true)return{status:"stale",closed:false};
-const settledReason=competing.result;
-if(settledReason==="recycled"
-&&(verify?.address===null||verify?.address===undefined)){
-return{status:"recycled-unverifiable",closed:false};
-}
-const presence=sidebarTabPresenceInInventory(tabId,verify?.address??null);
-if(presence==="unreadable")return{status:"unreadable",closed:false};
-if(presence==="recycled")return{status:"verified-recycled",closed:false};
-if(presence!=="present")return{status:"verified-closed",closed:true};
-lease=acquireSidebarTabClose(tabId);
-if(lease===null)return{status:"contended",closed:false};
-}
-const preflight=sidebarTabPresenceInInventory(tabId,verify?.address??null);
-const manualWithoutEvidence=preflight==="unreadable"&&verify!==null&&verify.manual===true;
-if(preflight==="unreadable"&&manualWithoutEvidence!==true){
-lease.release("failed");
-return{status:"unreadable",closed:false};
-}
-if(preflight==="absent"){
-lease.release("closed");
-return{status:"verified-closed",closed:true};
-}
-if(preflight==="recycled"){
-lease.release("recycled");
-return{status:"verified-recycled",closed:false};
-}
-const outcome=await requestSidebarTabClose(tabId);
-if(outcome==="rejected"){
-lease.release("failed");
-return{status:"failed",closed:false};
-}
-if(outcome==="timeout"){
-lease.hold("quarantined",Date.now()+SIDEBAR_TAB_CLOSE_LATE_QUARANTINE_MS);
-return{status:"timeout",closed:false};
-}
-if(manualWithoutEvidence===true){
-lease.release("closed");
-return{status:"closed",closed:true};
-}
-if(verify===null||verify.key===null||verify.key===undefined){
-lease.release("failed");
-return{status:"request-resolved-unverified",closed:false};
-}
-beginSidebarCloseVerification(lease,tabId,verify);
-return{status:"request-resolved-unverified",closed:false};
-};
-const cleanupAutoSidebarKeys=(known,actingKey)=>{
-for(const map of[sidebarAutoOriginRef.current,sidebarAutoSuppressedRef.current]){
-for(const[key,entry]of map){
-if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId)continue;
-if(key===actingKey)continue;
-if(known.has(entry.address)===true)continue;
-if(sidebarAutoCloseKeyIsActive(key)===true)continue;
-map.delete(key);
-clearAutoCloseBudget(key);
-}
-}
-for(const[key,entry]of sidebarAutoReservationRef.current){
-if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId)continue;
-if(key===actingKey)continue;
-if(known.has(entry.address)===true)continue;
-if(sidebarTabPendingRef.current.has(key)===true)continue;
-sidebarAutoReservationRef.current.delete(key);
-}
-};
-const sweepAutoOpenPlaceholders=(running)=>{
-const originMap=sidebarAutoOriginRef.current;
-if(originMap.size===0)return;
-const now=Date.now();
-for(const[key,entry]of[...originMap]){
-if(sidebarAutoOriginTabIdOf(entry)!==null)continue;
-const age=now-sidebarAutoOriginWrittenAtOf(entry);
-const scoped=entry.sessionId===sidebarSessionId&&entry.rootSessionId===rootSessionId;
-if(scoped!==true){
-if(age<SIDEBAR_AUTO_OPEN_PLACEHOLDER_FOREIGN_TTL_MS)continue;
-originMap.delete(key);
-recordSidebarAutoDiag({kind:"ownership",event:"delete",reason:"placeholder-foreign-expired",key:sidebarAutoKeyDigest(key)});
-continue;
-}
-if(age<SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS)continue;
-if(sidebarTabPendingRef.current.has(key)===true)continue;
-if(sidebarTabOpeningRef.current.has(key)===true)continue;
-const state=sidebarResourceTabStateOf(entry.address);
-if(state.readable!==true){
-recordSidebarAutoDiag({kind:"ownership",event:"keep",reason:"placeholder-unreadable",key:sidebarAutoKeyDigest(key)});
-continue;
-}
-originMap.delete(key);
-recordSidebarAutoDiag({
-kind:"ownership",
-event:"delete",
-reason:state.tabId===null
-?(running!==null&&running!==undefined&&running.has(entry.address)===true
-?"placeholder-retry"
-:"placeholder-released")
-:"placeholder-superseded",
-key:sidebarAutoKeyDigest(key),
+return Object.freeze({
+sidebarAutoOpenCapable,autoCloseCandidate,autoOpenCandidate,
 });
 }
-};
-const launchAutoSidebarAction=(candidate)=>{
+function createSidebarAutoController(scope){
+const tabClosePort=createSidebarTabClosePort(scope);
+const bookkeeping=createSidebarAutoBookkeeping(scope);
+const verification=createSidebarCloseVerification(scope,tabClosePort);
+const candidates=createSidebarAutoCandidates(scope,tabClosePort,bookkeeping);
+return Object.freeze({
+...candidates,
+...verification,
+...bookkeeping,
+...tabClosePort,
+});
+}
+global[SYMBOL]=Object.freeze({createSidebarAutoController});
+})(globalThis);
+/* source: client-sidebar-actions.js */
+(function installSidebarActions(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-actions");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+SIDEBAR_TAB_ORIGIN_AUTO,SIDEBAR_TAB_ORIGIN_MANUAL,text,
+}=PURE;
+const LEDGER_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
+const LEDGER=global[LEDGER_SYMBOL]||{};
+const{
+SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,recordSidebarAutoDecision,sidebarBoundedText,
+writeSidebarAutoOwnership,
+}=LEDGER;
+function createSidebarActions(scope){
+const{
+autoCloseCandidate,autoOpenCandidate,autoOpenEnabled,
+bump,cancelPendingSidebarSplit,cleanupAutoSidebarKeys,
+clearAutoCloseAttempt,clearManualSuppressionOfIdleResources,currentRootRef,
+currentSidebarSessionRef,handleSidebarAction,idleSidebarResourceAddresses,
+knownSidebarResourceAddresses,mountedRef,rootSessionId,
+runningSidebarResourceAddresses,setAutoOpenDraft,sidebarAutoBusyRef,
+sidebarAutoCascadeRef,sidebarAutoCloseAttemptOwnersRef,sidebarAutoCloseAttemptsRef,
+sidebarAutoEpochRef,sidebarAutoFailedKeysRef,sidebarAutoOriginRef,
+sidebarAutoReservationRef,sidebarAutoSignatureRef,sidebarAutoSuppressedRef,
+sidebarIdleChildren,sidebarManualIntentOf,sidebarManualIntentRef,
+sidebarSessionId,sidebarSplitIntentRef,sidebarSurfaceStillCurrent,
+sidebarTabOpeningRef,sidebarTabPendingRef,sidebarTabRecordsRef,
+sidebarTabSyncRef,snapshot,sweepAutoOpenPlaceholders,
+syncSidebarTabRecords,trimAutoKeyMap,verifyPendingSidebarCloses,
+}=scope;
+function launchAutoSidebarAction(candidate){
 sidebarAutoBusyRef.current=true;
 recordSidebarAutoDecision("launch",candidate,"candidate");
 void Promise.resolve()
@@ -5550,18 +6275,8 @@ sidebarTabSyncRef.current?.();
 sidebarAutoCascadeRef.current=false;
 }
 });
-};
-const clearManualSuppressionOfIdleResources=(idle)=>{
-if(idle===null||idle===undefined||idle.size===0)return;
-for(const address of idle){
-const key=sidebarTabKey(sidebarSessionId,rootSessionId,address);
-if(sidebarAutoSuppressedRef.current.has(key)===true)sidebarAutoSuppressedRef.current.delete(key);
-const persisted=readSidebarAutoOwnershipEntry(sidebarSessionId,rootSessionId,address,{quiet:true});
-if(persisted===null||persisted.origin!==SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL)continue;
-deleteSidebarAutoOwnership(sidebarSessionId,rootSessionId,address,"resource-idle",{manual:true});
 }
-};
-const syncAutoSidebarTabs=()=>{
+function syncAutoSidebarTabs(){
 const source=snapshot;
 if(source===null||source===undefined)return;
 if(text(source.rootSessionId,null)!==rootSessionId)return;
@@ -5577,22 +6292,22 @@ candidate=autoCloseCandidate(running)??autoOpenCandidate(running);
 cleanupAutoSidebarKeys(known,candidate===null?null:candidate.key);
 if(candidate===null)return;
 launchAutoSidebarAction(candidate);
-};
-const autoActionStillValid=(context)=>{
+}
+function autoActionStillValid(context){
 if(context===null||context===undefined)return false;
 if(autoOpenEnabled()!==true)return false;
 if(sidebarAutoEpochRef.current!==context.epoch)return false;
 return mountedRef.current===true
 &&currentRootRef.current===rootSessionId
 &&currentSidebarSessionRef.current===sidebarSessionId;
-};
-const abandonAutoSidebarAction=(key,context)=>{
+}
+function abandonAutoSidebarAction(key,context){
 if(sidebarSplitIntentRef.current?.key===key)cancelPendingSidebarSplit("auto-abandoned");
 sidebarTabOpeningRef.current.delete(key);
 sidebarAutoReservationRef.current.delete(key);
 releaseAutoCloseAttempt(key,context);
-};
-const releaseAutoCloseAttempt=(key,context)=>{
+}
+function releaseAutoCloseAttempt(key,context){
 if(context===null||context===undefined||context.kind!=="close")return;
 const owners=sidebarAutoCloseAttemptOwnersRef.current;
 const token=context.attemptToken;
@@ -5608,13 +6323,13 @@ attempts.set(key,context.attemptsBefore);
 trimAutoKeyMap(attempts);
 }
 owners.delete(key);
-};
-const autoTakeoverStateOf=(key)=>{
+}
+function autoTakeoverStateOf(key){
 const intent=sidebarManualIntentOf(key);
 if(intent===undefined)return null;
 return intent.intent==="close"?"close":"open";
-};
-const recordSidebarManualIntent=(key,resourceAddress)=>{
+}
+function recordSidebarManualIntent(key,resourceAddress){
 const record=sidebarTabRecordsRef.current.get(key);
 const scoped=record!==undefined
 &&record.sessionId===sidebarSessionId&&record.rootSessionId===rootSessionId;
@@ -5624,8 +6339,8 @@ rootSessionId,
 address:resourceAddress,
 intent:scoped?"close":"open",
 });
-};
-const applyPendingManualIntent=(key)=>{
+}
+function applyPendingManualIntent(key){
 const entry=sidebarManualIntentOf(key);
 if(entry===undefined)return;
 if(sidebarTabPendingRef.current.has(key)===true)return;
@@ -5672,8 +6387,8 @@ trimAutoKeyMap(sidebarAutoSuppressedRef.current);
 writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,entry.address,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
 sidebarAutoOriginRef.current.delete(key);
 clearAutoCloseAttempt(key);
-};
-const syncSidebarTabs=()=>{
+}
+function syncSidebarTabs(){
 if(sidebarAutoCascadeRef.current!==true)sidebarAutoFailedKeysRef.current.clear();
 syncSidebarTabRecords();
 verifyPendingSidebarCloses();
@@ -5685,1989 +6400,25 @@ setAutoOpenDraft(null);
 bump((value)=>value+1);
 }
 syncAutoSidebarTabs();
-};
-sidebarTabSyncRef.current=syncSidebarTabs;
-const recordSidebarTab=(key,resourceAddress,actionOrigin,actionProof)=>{
-if(closeSidebarResource===null)return false;
-if(readActiveSidebarResource===null&&readSidebarOpenTabs()===null)return false;
-if(typeof primitives?.IconChevronLeftOutlineRegular!=="function")return false;
-const declaredOrigin=actionOrigin===SIDEBAR_TAB_ORIGIN_AUTO||actionOrigin===SIDEBAR_TAB_ORIGIN_MANUAL
-?actionOrigin
-:null;
-const declaredAutoProven=actionProof!==null&&actionProof!==undefined
-&&actionProof.autoProven===true;
-let tab=null;
-const inventory=readSidebarOpenTabs();
-if(inventory!==null){
-for(const entry of inventory){
-const candidate=object(entry);
-if(text(candidate.sessionId,null)!==sidebarSessionId)continue;
-if(text(candidate.kind,null)!==SUBAGENT_CHAT_KIND)continue;
-if(text(candidate.contentId,null)!==resourceAddress)continue;
-const candidateId=text(candidate.tabId,null);
-if(candidateId!==null){
-tab={id:candidateId,kind:candidate.kind,contentId:candidate.contentId,title:null};
-break;
 }
-}
-}
-if(tab!==null&&readActiveSidebarResource!==null){
-try{
-const activeSource=object(readActiveSidebarResource.call(sidebarRight));
-if(text(activeSource.id,null)===tab.id)tab={...tab,title:text(activeSource.title,null)};
-}catch{/* inventory 已足够确认 tabId，标题读取失败不阻塞 toggle。 */}
-}
-if(tab===null){
-try{tab=readActiveSidebarResource.call(sidebarRight);}catch{return false;}
-}
-const source=object(tab);
-const tabId=text(source.id,null);
-const tabTitle=text(source.title,null);
-if(tabId===null)return false;
-if(text(source.kind,null)!==SUBAGENT_CHAT_KIND)return false;
-if(text(source.contentId,null)!==resourceAddress)return false;
-const previous=sidebarTabRecordsRef.current.get(key);
-const opening=sidebarTabOpeningRef.current.get(key);
-const previousScoped=previous!==undefined
-&&previous.sessionId===sidebarSessionId&&previous.rootSessionId===rootSessionId
-?previous
-:undefined;
-const openingScoped=opening!==undefined
-&&opening.sessionId===sidebarSessionId&&opening.rootSessionId===rootSessionId
-?opening
-:undefined;
-if(openingScoped!==undefined
-&&(openingScoped.causalIssuedAt===null||openingScoped.causalIssuedAt===undefined)){
-openingScoped.foreignWriter=true;
-}
-const manualTakeover=sidebarManualIntentOf(key);
-const sharedOrigin=sidebarAutoOriginRef.current.get(key);
-const sharedOriginScoped=sharedOrigin!==undefined
-&&sharedOrigin.sessionId===sidebarSessionId&&sharedOrigin.rootSessionId===rootSessionId
-?sharedOrigin
-:undefined;
-const sharedOriginTabId=sidebarAutoOriginTabIdOf(sharedOriginScoped);
-const sharedOriginBound=sharedOriginTabId!==null&&sharedOriginTabId===tabId;
-const sharedOriginStale=sharedOriginScoped!==undefined&&sharedOriginBound!==true;
-const persistedEntry=readSidebarAutoOwnershipEntry(sidebarSessionId,rootSessionId,resourceAddress);
-const persistedManual=persistedEntry!==null&&persistedEntry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL;
-const persistedAutoBound=persistedEntry!==null
-&&persistedEntry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
-&&persistedEntry.tabId!==null
-&&persistedEntry.tabId===tabId;
-const persistedStaleAuto=persistedEntry!==null
-&&persistedEntry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
-&&persistedAutoBound!==true;
-const previousUsableAuto=previousScoped!==undefined
-&&previousScoped.origin===SIDEBAR_TAB_ORIGIN_AUTO
-&&previousScoped.tabId===tabId;
-const openingUsableAuto=openingScoped!==undefined
-&&openingScoped.origin===SIDEBAR_TAB_ORIGIN_AUTO
-&&openingScoped.causalProof==="proven"
-&&openingScoped.causalIssuedAt!==null&&openingScoped.causalIssuedAt!==undefined
-&&openingScoped.foreignWriter!==true;
-const declaredUsable=declaredOrigin===SIDEBAR_TAB_ORIGIN_AUTO
-?(declaredAutoProven===true?SIDEBAR_TAB_ORIGIN_AUTO:SIDEBAR_TAB_ORIGIN_MANUAL)
-:declaredOrigin;
-const manualIntentOpen=manualTakeover!==undefined&&manualTakeover.intent==="open";
-const origin=manualIntentOpen||persistedManual
-?SIDEBAR_TAB_ORIGIN_MANUAL
-:(declaredUsable
-??(previousUsableAuto===true
-?SIDEBAR_TAB_ORIGIN_AUTO
-:(openingUsableAuto===true
-?SIDEBAR_TAB_ORIGIN_AUTO
-:(sharedOriginBound===true
-?SIDEBAR_TAB_ORIGIN_AUTO
-:(persistedAutoBound===true?SIDEBAR_TAB_ORIGIN_AUTO:SIDEBAR_TAB_ORIGIN_MANUAL)))));
-const recordOrigin=origin===SIDEBAR_TAB_ORIGIN_AUTO?SIDEBAR_TAB_ORIGIN_AUTO:SIDEBAR_TAB_ORIGIN_MANUAL;
-if(sharedOriginStale===true
-||(persistedManual===true&&sharedOriginScoped!==undefined)){
-sidebarAutoOriginRef.current.delete(key);
-}
-if(recordOrigin===SIDEBAR_TAB_ORIGIN_AUTO){
-sidebarAutoOriginRef.current.set(
-key,
-sidebarAutoOriginEntry(sidebarSessionId,rootSessionId,resourceAddress,tabId),
-);
-}
-writeSidebarAutoOwnership(
-sidebarSessionId,
-rootSessionId,
-resourceAddress,
-recordOrigin===SIDEBAR_TAB_ORIGIN_AUTO?SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO:SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,
-recordOrigin===SIDEBAR_TAB_ORIGIN_AUTO
-?(declaredOrigin===SIDEBAR_TAB_ORIGIN_AUTO?"auto-open":"auto-adopt")
-:(manualIntentOpen===true
-?"manual-open"
-:(persistedStaleAuto===true
-?"manual-stale-auto"
-:(sharedOriginStale===true
-?"manual-stale-origin"
-:(declaredOrigin===SIDEBAR_TAB_ORIGIN_AUTO&&declaredAutoProven!==true
-?"manual-unproven-open"
-:(openingScoped!==undefined&&openingScoped.origin===SIDEBAR_TAB_ORIGIN_AUTO
-&&openingUsableAuto!==true&&previousUsableAuto!==true
-?"manual-unproven-open"
-:"manual-takeover"))))),
-tabId,
-);
-if(previous!==undefined&&previous.sessionId===sidebarSessionId
-&&previous.rootSessionId===rootSessionId&&previous.tabId===tabId){
-previous.title=tabTitle??previous.title;
-previous.misses=0;
-previous.origin=recordOrigin;
-return true;
-}
-sidebarTabRecordsRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,tabId,title:tabTitle,misses:0,origin:recordOrigin});
-bump((value)=>value+1);
-return true;
-};
-const handleSidebarAction=async(key,resourceAddress,actionOrigin,autoAction)=>{
-const origin=actionOrigin===SIDEBAR_TAB_ORIGIN_AUTO?SIDEBAR_TAB_ORIGIN_AUTO:SIDEBAR_TAB_ORIGIN_MANUAL;
-if(origin===SIDEBAR_TAB_ORIGIN_MANUAL){
-const manualRecord=sidebarTabRecordsRef.current.get(key);
-writeSidebarAutoOwnership(
-sidebarSessionId,
-rootSessionId,
-resourceAddress,
-SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,
-manualRecord===undefined?"manual-open":"manual-close",
-);
-}
-const autoContext=origin===SIDEBAR_TAB_ORIGIN_AUTO&&autoAction!==null&&typeof autoAction==="object"
-?{
-kind:autoAction.kind==="close"?"close":"open",
-epoch:Number.isFinite(Number(autoAction.epoch))?Number(autoAction.epoch):sidebarAutoEpochRef.current,
-attemptsBefore:Number.isFinite(Number(autoAction.attemptsBefore))?Number(autoAction.attemptsBefore):0,
-attemptToken:autoAction.attemptToken!==null&&autoAction.attemptToken!==undefined
-&&typeof autoAction.attemptToken==="object"
-?autoAction.attemptToken
-:null,
-}
-:null;
-if(sidebarSurfaceStillCurrent()!==true){
-if(autoContext!==null){
-sidebarAutoReservationRef.current.delete(key);
-releaseAutoCloseAttempt(key,autoContext);
-}
-return;
-}
-const pending=sidebarTabPendingRef.current;
-if(pending.has(key)){
-if(origin===SIDEBAR_TAB_ORIGIN_MANUAL)recordSidebarManualIntent(key,resourceAddress);
-return;
-}
-pending.add(key);
-let openIssued=false;
-try{
-if(autoContext!==null&&autoActionStillValid(autoContext)!==true){
-abandonAutoSidebarAction(key,autoContext);
-return;
-}
-const record=sidebarTabRecordsRef.current.get(key);
-if(record===undefined&&sidebarTabOpeningRef.current.has(key)){
-if(origin===SIDEBAR_TAB_ORIGIN_MANUAL)recordSidebarManualIntent(key,resourceAddress);
-return;
-}
-if(record!==undefined&&closeSidebarResource!==null){
-const splitIntentAtClose=sidebarSplitIntentRef.current;
-const closeSplitIntentToken=splitIntentAtClose!==null&&splitIntentAtClose.key===key
-?splitIntentAtClose.token
-:null;
-const closeOutcome=await closeSidebarTabWithLease(record.tabId,{
-waitForCompeting:origin===SIDEBAR_TAB_ORIGIN_MANUAL,
-verify:{
-key,
-address:resourceAddress,
-attemptToken:autoContext===null?null:autoContext.attemptToken,
-manual:origin===SIDEBAR_TAB_ORIGIN_MANUAL,
-splitIntentToken:closeSplitIntentToken,
-},
-});
-if(sidebarSurfaceStillCurrent()!==true){
-return;
-}
-if(closeOutcome.status==="contended"||closeOutcome.status==="contended-timeout"){
-if(autoContext!==null){
-sidebarAutoReservationRef.current.delete(key);
-releaseAutoCloseAttempt(key,autoContext);
-sidebarAutoFailedKeysRef.current.add(key);
-}
-return;
-}
-if(closeOutcome.status==="unreadable"){
-if(autoContext!==null){
-sidebarAutoReservationRef.current.delete(key);
-releaseAutoCloseAttempt(key,autoContext);
-sidebarAutoFailedKeysRef.current.add(key);
-}
-return;
-}
-if(closeOutcome.status==="stale"){
-if(autoContext!==null){
-sidebarAutoReservationRef.current.delete(key);
-releaseAutoCloseAttempt(key,autoContext);
-}
-return;
-}
-if(closeOutcome.status==="failed"||closeOutcome.status==="timeout"){
-sidebarAutoFailedKeysRef.current.add(key);
-return;
-}
-if(closeOutcome.status==="request-resolved-unverified"){
-return;
-}
-if(closeOutcome.status==="verified-closed"||closeOutcome.status==="closed"
-||closeOutcome.status==="verified-recycled"){
-const currentRecord=sidebarTabRecordsRef.current.get(key);
-const recordStillSame=currentRecord!==undefined&&currentRecord.tabId===record.tabId;
-cancelPendingSidebarSplitOfClose(key,closeSplitIntentToken);
-if(recordStillSame===true){
-sidebarTabRecordsRef.current.delete(key);
-}
-settleAutoCloseAttempt(key,autoContext);
-if(recordStillSame===true&&closeOutcome.status==="verified-recycled"){
-sidebarAutoCloseCooldownsRef.current.delete(key);
-}
-if(recordStillSame===true){
-sidebarAutoOriginRef.current.delete(key);
-if(origin===SIDEBAR_TAB_ORIGIN_MANUAL){
-sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:resourceAddress});
-trimAutoKeyMap(sidebarAutoSuppressedRef.current);
-writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,resourceAddress,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
-}
-}
-bump((value)=>value+1);
-syncSidebarTabs();
-}
-return;
-}
-if(openSidebarResource===null)return;
-const reviewAutoSideEffect=()=>{
-if(autoContext===null)return"proceed";
-if(autoContext===null)return"proceed";
-if(autoActionStillValid(autoContext)!==true)return"abort";
-const takeover=autoTakeoverStateOf(key);
-if(takeover==="close")return"abort";
-if(takeover==="open")return"manual";
-return"proceed";
-};
-let effectiveOrigin=origin;
-const canTrackOpen=closeSidebarResource!==null
-&&(readActiveSidebarResource!==null||sidebarOpenTabsAvailable===true)
-&&typeof primitives?.IconChevronLeftOutlineRegular==="function";
-const canObserveOpenCommit=canTrackOpen
-&&globalThis.document!==null&&globalThis.document!==undefined;
-if(canObserveOpenCommit){
-sidebarTabOpeningRef.current.set(key,{
-sessionId:sidebarSessionId,
-rootSessionId,
-resourceAddress,
-expiresAt:Date.now()+SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS,
-origin,
-causalProof:"pending",
-causalIssuedAt:null,
-foreignWriter:false,
+return Object.freeze({
+abandonAutoSidebarAction,
+applyPendingManualIntent,
+autoActionStillValid,
+autoTakeoverStateOf,
+launchAutoSidebarAction,
+recordSidebarManualIntent,
+releaseAutoCloseAttempt,
+syncAutoSidebarTabs,
+syncSidebarTabs,
 });
 }
-if(origin===SIDEBAR_TAB_ORIGIN_MANUAL){
-sidebarAutoSuppressedRef.current.delete(key);
-sidebarAutoOriginRef.current.delete(key);
-clearAutoCloseAttempt(key);
-}
-const targetPaneId=existingSubagentPaneId();
-let openOptions=null;
-let splitToken=null;
-if(targetPaneId!==null){
-openOptions={kind:SUBAGENT_CHAT_KIND,paneId:targetPaneId,preferNewPane:false};
-}else if(splitSidebarPane!==null){
-const tabsBeforeSplit=readSidebarOpenTabs();
-if(beginSidebarSplit!==null){
-let preparation=null;
-try{
-preparation=beginSidebarSplit.call(config,{
-sessionId:sidebarSessionId,
-rootSessionId,
-key,
-resourceAddress,
-});
-}catch{
-preparation=null;
-}
-if(preparation?.busy===true){
-sidebarTabOpeningRef.current.delete(key);
-return;
-}
-if(preparation===null||typeof preparation!=="object"
-||preparation.token===null||preparation.token===undefined){
-sidebarTabOpeningRef.current.delete(key);
-return;
-}
-splitToken=preparation.token;
-if(splitToken!==null){
-sidebarSplitIntentRef.current={
-token:splitToken,
-key,
-resourceAddress,
-paneId:null,
-resourceIssued:false,
-};
-}
-await waitForSidebarSplitLayoutCommit();
-const splitStillCurrent=sidebarSurfaceStillCurrent()===true
-&&sidebarSplitIntentRef.current?.token===splitToken;
-if(!splitStillCurrent){
-if(sidebarSplitIntentRef.current?.token===splitToken)cancelPendingSidebarSplit("split-stale");
-sidebarTabOpeningRef.current.delete(key);
-return;
-}
-const afterLayoutReview=reviewAutoSideEffect();
-if(afterLayoutReview==="abort"){
-abandonAutoSidebarAction(key,autoContext);
-if(autoTakeoverStateOf(key)==="close"){
-sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:resourceAddress});
-trimAutoKeyMap(sidebarAutoSuppressedRef.current);
-writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,resourceAddress,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
-}
-return;
-}
-if(afterLayoutReview==="manual")effectiveOrigin=SIDEBAR_TAB_ORIGIN_MANUAL;
-}
-let paneId=null;
-try{paneId=splitSidebarPane.call(sidebarRight);}catch{paneId=null;}
-if(typeof paneId!=="string"||paneId.trim()===""){
-if(splitToken!==null)cancelPendingSidebarSplit("split-failed");
-sidebarTabOpeningRef.current.delete(key);
-return;
-}
-if(splitToken!==null){
-let accepted=true;
-if(markSidebarSplitPane!==null){
-try{accepted=markSidebarSplitPane.call(config,splitToken,paneId)!==false;}catch{accepted=false;}
-}
-if(!accepted){
-cancelPendingSidebarSplit("pane-rejected");
-sidebarTabOpeningRef.current.delete(key);
-return;
-}
-if(sidebarSplitIntentRef.current?.token===splitToken){
-sidebarSplitIntentRef.current.paneId=paneId;
-}
-}
-const guideTabId=seededGuideTabId(tabsBeforeSplit,sidebarSessionId);
-openOptions={kind:SUBAGENT_CHAT_KIND,paneId,preferNewPane:false};
-if(guideTabId!==null)openOptions.replaceTab=guideTabId;
-}else{
-openOptions={kind:SUBAGENT_CHAT_KIND,preferNewPane:true};
-}
-const beforeOpenReview=reviewAutoSideEffect();
-if(beforeOpenReview==="abort"){
-abandonAutoSidebarAction(key,autoContext);
-if(autoTakeoverStateOf(key)==="close"){
-sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:resourceAddress});
-trimAutoKeyMap(sidebarAutoSuppressedRef.current);
-writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,resourceAddress,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
-}
-return;
-}
-if(beforeOpenReview==="manual")effectiveOrigin=SIDEBAR_TAB_ORIGIN_MANUAL;
-let openProof=null;
-if(autoContext!==null){
-const openWitness=sidebarResourceTabStateOf(resourceAddress);
-const autoProven=openWitness.readable===true&&openWitness.tabId===null;
-openProof={autoProven};
-if(autoProven!==true){
-recordSidebarAutoDecision("open",{key,kind:"open"},"downgrade","causal-unproven");
-}
-const pendingOpening=sidebarTabOpeningRef.current.get(key);
-if(pendingOpening!==undefined
-&&pendingOpening.sessionId===sidebarSessionId&&pendingOpening.rootSessionId===rootSessionId){
-pendingOpening.causalProof=autoProven===true?"proven":"failed";
-}
-}
-const issuedOpening=autoContext===null?undefined:sidebarTabOpeningRef.current.get(key);
-const issuedOpeningScoped=issuedOpening!==undefined
-&&issuedOpening.sessionId===sidebarSessionId&&issuedOpening.rootSessionId===rootSessionId
-?issuedOpening
-:undefined;
-const issuedAtBefore=issuedOpeningScoped===undefined
-||issuedOpeningScoped.causalIssuedAt===null||issuedOpeningScoped.causalIssuedAt===undefined
-?null
-:issuedOpeningScoped.causalIssuedAt;
-if(issuedOpeningScoped!==undefined)issuedOpeningScoped.causalIssuedAt=Date.now();
-try{
-openSidebarResource.call(sidebarRight,resourceAddress,openOptions);
-}catch(error){
-if(issuedOpeningScoped!==undefined)issuedOpeningScoped.causalIssuedAt=issuedAtBefore;
-throw error;
-}
-openIssued=true;
-if(effectiveOrigin===SIDEBAR_TAB_ORIGIN_AUTO&&canTrackOpen===true
-&&openProof!==null&&openProof.autoProven===true){
-const landedOriginEntry=sidebarAutoOriginRef.current.get(key);
-if(sidebarAutoOriginTabIdOf(landedOriginEntry)===null){
-sidebarAutoOriginRef.current.set(
-key,
-sidebarAutoOriginEntry(sidebarSessionId,rootSessionId,resourceAddress,null),
-);
-}
-}
-if(splitToken!==null){
-let acknowledged=true;
-if(markSidebarSplitOpen!==null){
-try{acknowledged=markSidebarSplitOpen.call(config,splitToken)!==false;}catch{acknowledged=false;}
-}
-if(!acknowledged){
-cancelPendingSidebarSplit("resource-not-acknowledged");
-}else if(sidebarSplitIntentRef.current?.token===splitToken){
-sidebarSplitIntentRef.current.resourceIssued=true;
-}
-}
-const opened=recordSidebarTab(key,resourceAddress,effectiveOrigin,openProof);
-if(opened)sidebarTabOpeningRef.current.delete(key);
-if(sidebarSurfaceStillCurrent()===true)syncSidebarTabs();
-}catch{
-if(sidebarSplitIntentRef.current?.key===key)cancelPendingSidebarSplit("resource-failed");
-sidebarTabOpeningRef.current.delete(key);
-}
-finally{
-pending.delete(key);
-const surfaceCurrent=sidebarSurfaceStillCurrent()===true;
-if(autoContext!==null){
-sidebarAutoReservationRef.current.delete(key);
-if(surfaceCurrent===true&&autoContext.kind==="open"&&openIssued!==true){
-sidebarAutoOriginRef.current.delete(key);
-sidebarAutoFailedKeysRef.current.add(key);
-}
-if(surfaceCurrent===true&&openIssued===true)sidebarAutoFailedKeysRef.current.delete(key);
-}
-if(surfaceCurrent===true)applyPendingManualIntent(key);
-}
-};
-const handleSidebarBatchClose=async(candidates)=>{
-if(sidebarSurfaceStillCurrent()!==true)return;
-if(closeSidebarResource===null)return;
-if(Array.isArray(candidates)!==true||candidates.length===0)return;
-const scopeKey=sidebarBatchScopeKey(sidebarSessionId,rootSessionId);
-const pendingScopes=sidebarBatchPendingRef.current;
-if(pendingScopes.has(scopeKey)===true)return;
-pendingScopes.add(scopeKey);
-bump((value)=>value+1);
-try{
-for(const candidate of candidates){
-if(sidebarSurfaceStillCurrent()!==true)return;
-const tabId=text(object(candidate).tabId,null);
-const candidateAddress=text(object(candidate).address,null);
-if(tabId===null||candidateAddress===null)continue;
-if(sidebarTabPresenceInInventory(tabId,candidateAddress)!=="present")continue;
-writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,candidateAddress,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
-await closeSidebarTabWithLease(tabId,{
-waitForCompeting:true,
-verify:{key:null,address:candidateAddress,attemptToken:null,manual:true},
-});
-if(sidebarSurfaceStillCurrent()!==true)return;
-}
-}finally{
-pendingScopes.delete(scopeKey);
-if(sidebarSurfaceStillCurrent()===true){
-bump((value)=>value+1);
-syncSidebarTabs();
-}
-}
-};
-const renderSidebarBatchSlot=(addresses,label)=>{
-const state=sidebarBatchStateFor(addresses);
-if(state.kind==="none")return null;
-if(state.kind==="zero"){
-if(typeof primitives?.IconChevronLeftOutlineRegular!=="function")return null;
-return react.createElement("div",{className:"deg_expert_group_trailing"},
-react.createElement("span",{
-className:"deg_expert_group_sidebar_batch_zero",
-"data-zero":"true",
-"aria-hidden":"true",
-}));
-}
-if(typeof primitives?.IconChevronLeftOutlineRegular!=="function")return null;
-const count=state.candidates.length;
-const accessibleName="在侧边栏关闭 "+count+" 个"+label;
-const pending=sidebarBatchPendingRef.current.has(sidebarBatchScopeKey(sidebarSessionId,rootSessionId));
-return react.createElement("div",{className:"deg_expert_group_trailing"},
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_sidebar_batch_action",
-title:accessibleName,
-"aria-label":accessibleName,
-"aria-busy":pending||undefined,
-disabled:pending,
-onClick:(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-return handleSidebarBatchClose(state.candidates);
-},
-onKeyDown:(event)=>{event?.stopPropagation?.();},
-},react.createElement("span",{
-className:"deg_expert_group_double_arrow",
-"data-direction":"close",
-"aria-hidden":"true",
-},
-makeIcon(primitives,"IconChevronLeftOutlineRegular",{size:20,className:"deg_expert_group_double_arrow_icon","aria-hidden":true}),
-makeIcon(primitives,"IconChevronLeftOutlineRegular",{size:20,className:"deg_expert_group_double_arrow_icon","aria-hidden":true}))));
-};
-const renderSidebarOpenAction=(address,label)=>{
-if(openSidebarResource===null)return null;
-const resourceAddress=subagentChatAddress(address);
-if(resourceAddress===null)return null;
-if(typeof primitives?.IconChevronRightOutlineRegular!=="function")return null;
-const toggleCapable=closeSidebarResource!==null
-&&(readActiveSidebarResource!==null||sidebarOpenTabsAvailable===true)
-&&typeof primitives?.IconChevronLeftOutlineRegular==="function";
-const key=sidebarTabKey(sidebarSessionId,rootSessionId,resourceAddress);
-const openRecord=toggleCapable===true?sidebarTabRecordsRef.current.get(key):undefined;
-const isOpen=openRecord!==undefined;
-const accessibleName=(isOpen?"在侧边栏关闭 ":"在侧边栏打开 ")+label;
-const buttonProps={
-type:"button",
-className:"deg_expert_group_sidebar_action",
-title:accessibleName,
-"aria-label":accessibleName,
-onClick:(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-return handleSidebarAction(key,resourceAddress);
-},
-onKeyDown:(event)=>{event?.stopPropagation?.();},
-};
-if(toggleCapable===true){
-buttonProps["aria-pressed"]=isOpen;
-buttonProps["data-open"]=isOpen?"true":"false";
-}
-const arrowIcon=isOpen?"IconChevronLeftOutlineRegular":"IconChevronRightOutlineRegular";
-return react.createElement("button",buttonProps,react.createElement("span",{
-className:"deg_expert_group_double_arrow",
-"data-direction":isOpen?"close":"open",
-"aria-hidden":"true",
-},
-makeIcon(primitives,arrowIcon,{size:20,className:"deg_expert_group_double_arrow_icon","aria-hidden":true}),
-makeIcon(primitives,arrowIcon,{size:20,className:"deg_expert_group_double_arrow_icon","aria-hidden":true})));
-};
-const renderChevron=(node,open)=>{
-const label=open?t("sidebar.collapse"):t("sidebar.expand");
-return react.createElement("button",{
-type:"button",className:"deg_expert_group_chevron",title:label,
-"aria-label":label,"aria-expanded":open,onClick:(event)=>{event?.stopPropagation?.();toggle(node);},
-},makeIcon(primitives,open?"IconChevronDownOutlineRegular":"IconChevronRightOutlineRegular",{size:14}));
-};
-const modelFunction=(name)=>{
-const api=modelApi();
-return api!==null&&api!==undefined&&typeof api[name]==="function"?api[name]:null;
-};
-const finiteNumber=(value)=>(typeof value==="number"&&Number.isFinite(value)?value:null);
-const formatDurationText=(value)=>{
-const fn=modelFunction("formatDuration");
-return fn===null?null:fn(value);
-};
-const formatCompactDuration=(value)=>{
-const fn=modelFunction("formatDurationCompact");
-return fn===null?null:fn(value);
-};
-const formatClockText=(value)=>{
-const fn=modelFunction("formatClockTime");
-return fn===null?null:fn(value);
-};
-const formatIsoText=(value)=>{
-const fn=modelFunction("formatIsoTime");
-return fn===null?null:fn(value);
-};
-const failureSummaryText=(value)=>{
-const fn=modelFunction("formatFailureSummary");
-return fn===null?null:fn(value);
-};
-const isFailureStatusOf=(status)=>{
-const fn=modelFunction("isFailureStatus");
-return fn===null?["failed","timed_out","interrupted"].includes(status):fn(status)===true;
-};
-const retryWarningThreshold=()=>{
-const value=modelApi()?.RETRY_WARNING_THRESHOLD;
-return typeof value==="number"&&Number.isFinite(value)&&value>0?value:3;
-};
-const mergedRoleLabels=(()=>{
-const sources=[
-snapshot===null||snapshot===undefined?null:object(snapshot.roleLabels),
-meta===null?null:object(meta.roleLabels),
-];
-const merged={};
-let any=false;
-for(const source of sources){
-if(source===null)continue;
-for(const key of Object.keys(source)){
-if(merged[key]!==undefined)continue;
-const label=text(source[key],null);
-if(label===null)continue;
-merged[key]=label;
-any=true;
-}
-}
-return any?merged:null;
-})();
-const roleLabelFromMap=(role,labels)=>{
-const api=modelApi();
-return typeof api?.roleLabelFrom==="function"?api.roleLabelFrom(role,labels):null;
-};
-const roleLabelFor=(role,nodeLabel)=>text(nodeLabel,null)
-??roleLabelFromMap(role,mergedRoleLabels)
-??text(role,null);
-const finiteToken=(value)=>finiteNumber(value);
-const tokenText=(value)=>{
-const api=modelApi();
-return typeof api?.formatTokenCount==="function"?api.formatTokenCount(value):null;
-};
-const usageOf=(node)=>{
-const api=modelApi();
-if(typeof api?.normalizeUsage!=="function")return null;
-return api.normalizeUsage(object(node).usage);
-};
-const findPriceOf=(provider,modelId)=>{
-const api=modelApi();
-if(meta===null||typeof api?.findModelPrice!=="function")return null;
-return api.findModelPrice(meta.modelPrices,provider,modelId);
-};
-const estimateCostOf=(usage,provider,modelId)=>{
-const api=modelApi();
-if(typeof api?.estimateUsageCost!=="function")return null;
-return api.estimateUsageCost(usage,findPriceOf(provider,modelId));
-};
-const formatCost=(value)=>{
-const amount=finiteNumber(value);
-if(amount===null)return null;
-if(amount===0)return"0";
-if(amount<0.000001)return amount.toExponential(2);
-return amount>=0.01?amount.toFixed(4):amount.toFixed(6);
-};
-const usageTitleOf=(usage)=>{
-const source=usage;
-if(source===null)return"用量：—";
-const parts=[];
-const tokens=[["inputTokens","输入"],["outputTokens","输出"],["cacheReadTokens","缓存读"],["cacheWriteTokens","缓存写"],["reasoningTokens","推理"]];
-for(const[field,label]of tokens){
-const value=finiteToken(source[field]);
-if(value!==null)parts.push(label+" "+value);
-}
-for(const[field,label]of[["requests","请求"],["retries","重试"],["fallbacks","降级"]]){
-const value=finiteToken(source[field]);
-if(value!==null)parts.push(label+" "+value);
-}
-const duration=formatDurationText(source.runMs);
-if(duration!==null)parts.push("运行时长 "+duration);
-return parts.length===0?"用量：—":"用量："+parts.join(" · ");
-};
-const renderAttemptUsage=(entry,options)=>{
-const source=object(entry);
-const usage=usageOf(source);
-const fallbackProvider=text(object(options).provider,null);
-const fallbackModel=text(object(options).model,null);
-const value=(field)=>(usage===null?null:finiteToken(usage[field]));
-const pairs=[
-["输入",value("inputTokens")],
-["输出",value("outputTokens")],
-["缓存读",value("cacheReadTokens")],
-["缓存写",value("cacheWriteTokens")],
-["推理",value("reasoningTokens")],
-].map(([label,raw])=>label+" "+(raw===null?"—":String(raw)));
-pairs.push("请求 "+(value("requests")===null?"—":String(value("requests"))));
-pairs.push("重试 "+(value("retries")===null?"—":String(value("retries"))));
-pairs.push("降级 "+(value("fallbacks")===null?"—":String(value("fallbacks"))));
-pairs.push("运行时长 "+(formatDurationText(value("runMs"))??"—"));
-const provider=(usage===null?null:text(usage.provider,null))??fallbackProvider;
-const modelId=(usage===null?null:text(usage.model,null))??fallbackModel;
-const price=findPriceOf(provider,modelId);
-let costText="估算成本：未配置单价，不估算";
-let currency=null;
-const cost=usage===null?null:estimateCostOf(usage,provider,modelId);
-if(price!==null&&cost!==null){
-currency=cost.currency;
-costText="估算成本 ≈ "+(formatCost(cost.totalCost)??"—")+" "+cost.currency+"（按每百万 token 单价估算）";
-}else if(price!==null){
-costText="估算成本：—（缺少计费 token）";
-}
-return react.createElement("div",{
-className:"deg_expert_group_attempt_usage",
-"data-cost-currency":currency===undefined?undefined:currency,
-title:(usage===null?"用量：—":usageTitleOf(usage))+" · "+costText,
-},
-react.createElement("span",{className:"deg_expert_group_attempt_usage_tokens"},pairs.join(" · ")),
-react.createElement("span",{className:"deg_expert_group_attempt_cost","data-cost-configured":price===null?"false":"true"},costText));
-};
-const renderStructuredBlock=(value,requested,options)=>{
-const api=modelApi();
-const preview=typeof api?.structuredPreviewOf==="function"?api.structuredPreviewOf(value):null;
-const asked=requested===true;
-if(preview===null&&asked!==true)return null;
-const kind=text(object(options).kind,"expert");
-let textValue="结构化结果：尚未返回（已请求输出契约）";
-let fallback=false;
-let truncated=false;
-let reason=null;
-if(preview!==null){
-if(preview.text!==null){
-textValue="结构化结果："+preview.text+(preview.truncated===true?" …（预览已截断）":"");
-truncated=preview.truncated===true;
-}else{
-fallback=true;
-reason=text(preview.reason,"result_unavailable");
-const reasonText=typeof api?.structuredFallbackText==="function"
-?api.structuredFallbackText(reason)
-:"结构化结果不可用";
-textValue="结构化结果回退："+reasonText+"（"+reason+"）";
-}
-}
-return react.createElement("div",{
-className:"deg_expert_group_structured",
-"data-kind":kind,
-"data-fallback":fallback?"true":undefined,
-"data-reason":reason===null?undefined:reason,
-"data-truncated":truncated?"true":undefined,
-role:"status",
-title:textValue.length>400?textValue.slice(0,400)+"…":textValue,
-},textValue);
-};
-const renderFailureSummary=(failure)=>{
-const summary=failureSummaryText(failure);
-if(summary===null)return null;
-const content=summary.message===null?summary.code:summary.code+" · "+summary.message;
-return react.createElement("span",{
-key:"failure",
-className:"deg_expert_group_failure",
-"data-failure-code":summary.code,
-role:"status",
-title:content,
-},content);
-};
-const sessionSummaryOf=(sessionId)=>{
-if(sessionId===null)return null;
-const summary=object(object(sessionsSnapshot.byId)[sessionId]);
-return Object.keys(summary).length===0?null:summary;
-};
-const projectionValueOf=(sessionId,key)=>{
-if(sessionId===null||key===null)return null;
-const summary=object(sessionSummaryOf(sessionId));
-const fromSummary=object(summary.projectionValues)[key];
-if(fromSummary!==undefined&&fromSummary!==null)return fromSummary;
-const projection=object(object(object(sessionsSnapshot.projectionsBySession)[sessionId]).values);
-const fromProjection=projection[key];
-if(fromProjection!==undefined&&fromProjection!==null)return fromProjection;
-const readProjection=config.sessions?.projectionValues;
-if(typeof readProjection!=="function")return null;
-try{
-const value=readProjection.call(config.sessions,sessionId);
-const container=object(value);
-if(container[key]!==undefined&&container[key]!==null)return container[key];
-return value===undefined?null:value;
-}catch{
-return null;
-}
-};
-const contextPressureOfValue=(value)=>{
-const source=object(value);
-for(const field of["projectedTokens","pressureTokens","contextWindow"]){
-if(finiteNumber(source[field])!==null)return source;
-}
-return null;
-};
-const contextPressureOf=(sessionId)=>contextPressureOfValue(projectionValueOf(sessionId,"contextPressure"));
-const projectionNumber=(value)=>(typeof value==="number"&&Number.isFinite(value)&&value>=0?value:null);
-const DSH_STATS_FIELDS=Object.freeze(["llmMs","toolMs","decodeMs","decodeTokens"]);
-const DSH_TOKEN_FIELDS=Object.freeze([
-"uncachedInputTokens","cacheReadTokens","cacheWriteTokens","outputTokens",
-]);
-const dshMetricsOf=(sessionIds)=>{
-const ids=Array.isArray(sessionIds)?sessionIds:[];
-const stats={};
-const tokens={};
-let contributors=0;
-for(const rawId of ids){
-const sessionId=text(rawId,null);
-if(sessionId===null)continue;
-const statsValue=object(projectionValueOf(sessionId,"sessionStats"));
-const tokensValue=object(projectionValueOf(sessionId,"tokenUsage"));
-let touched=false;
-for(const field of DSH_STATS_FIELDS){
-const value=projectionNumber(statsValue[field]);
-if(value===null)continue;
-stats[field]=(stats[field]??0)+value;
-touched=true;
-}
-for(const field of DSH_TOKEN_FIELDS){
-const value=projectionNumber(tokensValue[field]);
-if(value===null)continue;
-tokens[field]=(tokens[field]??0)+value;
-touched=true;
-}
-if(touched)contributors+=1;
-}
-if(contributors===0)return null;
-const valueOf=(bag,field)=>(bag[field]===undefined?null:bag[field]);
-return{
-sessionCount:contributors,
-llmMs:valueOf(stats,"llmMs"),
-toolMs:valueOf(stats,"toolMs"),
-decodeMs:valueOf(stats,"decodeMs"),
-decodeTokens:valueOf(stats,"decodeTokens"),
-uncachedInputTokens:valueOf(tokens,"uncachedInputTokens"),
-cacheReadTokens:valueOf(tokens,"cacheReadTokens"),
-cacheWriteTokens:valueOf(tokens,"cacheWriteTokens"),
-outputTokens:valueOf(tokens,"outputTokens"),
-};
-};
-const dshUsageOf=(metrics)=>{
-if(metrics===null)return null;
-const{uncachedInputTokens,cacheReadTokens,cacheWriteTokens,outputTokens}=metrics;
-if(uncachedInputTokens===null&&cacheReadTokens===null&&cacheWriteTokens===null&&outputTokens===null){
-return null;
-}
-const complete=uncachedInputTokens!==null&&cacheReadTokens!==null&&cacheWriteTokens!==null;
-const billedInputTokens=complete?uncachedInputTokens+cacheReadTokens+cacheWriteTokens:null;
-return{
-inputTokens:uncachedInputTokens,
-cacheReadTokens,
-cacheWriteTokens,
-outputTokens,
-billedInputTokens,
-totalTokens:billedInputTokens!==null&&outputTokens!==null?billedInputTokens+outputTokens:null,
-};
-};
-const dshThroughputOf=(metrics)=>{
-if(metrics===null||metrics.decodeMs===null||metrics.decodeTokens===null)return null;
-if(metrics.decodeMs<=0||metrics.decodeTokens<=0)return null;
-return metrics.decodeTokens/(metrics.decodeMs/1000);
-};
-const fanoutSessionIdsOf=(task)=>{
-const ids=[];
-const seen=new Set();
-const source=object(task);
-for(const shard of Array.isArray(source.shards)?source.shards:[]){
-const childId=latestShardChildIdOf(shard);
-if(childId===null||seen.has(childId))continue;
-seen.add(childId);
-ids.push(childId);
-}
-return ids;
-};
-const sessionStatsPresentOf=(sessionId)=>{
-const value=object(projectionValueOf(sessionId,"sessionStats"));
-for(const field of DSH_STATS_FIELDS){
-if(projectionNumber(value[field])!==null)return true;
-}
-return false;
-};
-const projectionRefreshRequestedRef=typeof react.useRef==="function"
-?react.useRef(new Set())
-:{current:new Set()};
-if(typeof react.useEffect==="function"){
-react.useEffect(()=>{
-if(snapshot===null||snapshot===undefined)return;
-let service=null;
-let refreshProjections=null;
-try{
-service=config.sessions??ctx?.sessions??null;
-refreshProjections=service===null||service===undefined?null:service.refreshProjections;
-}catch{
-service=null;
-refreshProjections=null;
-}
-if(typeof refreshProjections!=="function")return;
-const requested=projectionRefreshRequestedRef.current;
-for(const sessionId of collectSnapshotSessionIds(snapshot)){
-if(requested.has(sessionId))continue;
-if(sessionStatsPresentOf(sessionId)===true)continue;
-requested.add(sessionId);
-try{
-const pending=refreshProjections.call(service,sessionId);
-if(pending!==null&&typeof pending==="object"&&typeof pending.catch==="function"){
-pending.catch(()=>{});
-}
-}catch{
-}
-}
-},[snapshot,rootSessionId]);
-}
-const durationOfNode=(source,runtimeStatus,sessionId)=>{
-const direct=finiteNumber(source.durationMs);
-if(direct!==null)return direct;
-const usage=usageOf(source);
-const runMs=finiteNumber(usage===null?null:usage.runMs);
-if(runMs!==null)return runMs;
-const summary=object(sessionSummaryOf(sessionId));
-const startedAt=finiteNumber(source.startedAt)??finiteNumber(summary.createdAt);
-if(startedAt===null)return null;
-const endedAt=runtimeStatus==="running"
-?(finiteNumber(object(snapshot).generatedAt)??finiteNumber(sessionsSnapshot.generatedAt))
-:(finiteNumber(summary.updatedAt)??finiteNumber(source.lastActivityAt));
-if(endedAt===null)return null;
-const elapsed=endedAt-startedAt;
-return elapsed>0?elapsed:null;
-};
-const renderMetrics=(node,options={})=>{
-const source=object(node);
-const status=statusOf(source);
-const kind=text(options.kind,text(source.kind,"expert"));
-const runtimeStatus=text(options.runtimeStatus,null);
-const sessionId=text(options.sessionId,null);
-const sessionIds=Array.isArray(options.sessionIds)
-?options.sessionIds
-:(sessionId===null?[]:[sessionId]);
-const api=modelApi();
-const dsh=dshMetricsOf(sessionIds);
-const dshUsage=dshUsageOf(dsh);
-const usage=dshUsage!==null?dshUsage:usageOf(source);
-const measuredTps=dshThroughputOf(dsh);
-const dshLlmMs=dsh===null?null:dsh.llmMs;
-const dshDuration=dshLlmMs!==null&&dshLlmMs>0?dshLlmMs:null;
-const turnDurationMs=finiteNumber(source.turnDurationMs);
-const durationMs=turnDurationMs!==null
-?turnDurationMs
-:(dshDuration!==null?dshDuration:durationOfNode(source,runtimeStatus,sessionId));
-const summary=typeof api?.summarizeUsageMetrics==="function"
-?api.summarizeUsageMetrics(usage,{
-durationMs,
-contextPressure:contextPressureOf(sessionId),
-measuredTokensPerSecond:measuredTps,
-})
-:null;
-const segments=[];
-const pushSegment=(key,textValue,titleValue)=>{
-if(typeof textValue!=="string"||textValue.length===0)return;
-if(segments.length>0){
-segments.push(react.createElement("span",{
-key:key+"-separator",
-className:"deg_expert_group_metrics_separator",
-"aria-hidden":"true",
-}," · "));
-}
-segments.push(react.createElement("span",{
-key,
-className:"deg_expert_group_metrics_part",
-title:typeof titleValue==="string"?titleValue:textValue,
-},textValue));
-};
-if(summary!==null){
-const toolDurationText=dsh===null||dsh.toolMs===null?null:formatCompactDuration(dsh.toolMs);
-const modelDurationText=dshDuration===null?null:formatCompactDuration(dshDuration);
-const durationTitle=summary.durationText===null?null
-:turnDurationMs!==null
-?"本轮用时 "+summary.durationText
-+(modelDurationText===null?"":" · 模型用时 "+modelDurationText)
-+(toolDurationText===null?"":" · 工具调用用时 "+toolDurationText)
-:dshDuration!==null
-?"模型用时 "+summary.durationText+(toolDurationText===null?"":" · 工具调用用时 "+toolDurationText)
-:"运行时间 "+summary.durationText;
-pushSegment("duration",summary.durationText===null?null:"用时"+summary.durationText,durationTitle);
-pushSegment("throughput",summary.throughputText,
-summary.throughputText===null?null:(measuredTps===null?"平均吞吐 ":"输出速度 ")+summary.throughputText);
-const usageTitle=usage===null?null:usageTitleOf(usage);
-pushSegment("tokens",summary.totalTokensText,
-usageTitle===null?summary.totalTokensText:usageTitle.slice(0,400));
-pushSegment("cache-hit",summary.cacheHitText,
-summary.cacheHitPercent===null?null:"缓存命中率 "+summary.cacheHitPercent+"%（缓存读 ÷ 计费输入）");
-pushSegment("context",summary.contextText,
-summary.contextPercent===null?null
-:"上下文占用 "+summary.contextPercent+"%（已用 "+summary.contextUsedTokens+" / 窗口 "+summary.contextWindow+"）");
-}
-const retryCount=finiteNumber(source.retryCount);
-const retryWarning=retryCount!==null&&retryCount>=retryWarningThreshold()
-?react.createElement("span",{
-key:"retry-warning",
-className:"deg_expert_group_retry_warning",
-"data-retry-warning":"true",
-role:"status",
-title:"已重试 "+retryCount+" 次",
-},"多次重试")
-:null;
-const failure=isFailureStatusOf(status)?renderFailureSummary(source.failure):null;
-if(segments.length===0&&retryWarning===null&&failure===null)return null;
-return react.createElement("div",{
-className:"deg_expert_group_metrics",
-"data-metrics-kind":kind,
-role:"group",
-"aria-label":"任务用量摘要",
-},...segments,retryWarning,failure);
-};
-const renderAttemptTimeline=(node,options={})=>{
-const timelineOf=modelFunction("attemptTimelineOf");
-if(timelineOf===null)return null;
-const key=text(options.key,null);
-if(key===null)return null;
-const expanded=timelineExpandedRef.current.has(key)===true;
-let timeline=null;
-try{timeline=timelineOf(node,{expanded});}catch{return null;}
-if(timeline===null||!Array.isArray(timeline.entries))return null;
-const timelineProvider=text(object(node).provider,null);
-const timelineModel=text(object(node).model,null);
-const rows=timeline.entries.map((entry,index)=>{
-const attemptStatus=text(entry.status,"unknown");
-const attemptNumber=finiteNumber(entry.attempt)??finiteNumber(entry.position)??index+1;
-const duration=formatDurationText(entry.durationMs);
-const timestamp=finiteNumber(entry.finishedAt)??finiteNumber(entry.startedAt);
-const clock=formatClockText(timestamp);
-const durationLabel=duration===null?(clock??"—"):duration;
-const cells=[
-react.createElement("span",{key:"index",className:"deg_expert_group_attempt_index"},"#"+attemptNumber),
-react.createElement("span",{
-key:"status",
-className:"deg_expert_group_attempt_status",
-"data-status":attemptStatus,
-},ATTEMPT_STATUS_LABELS[attemptStatus]??attemptStatus),
-react.createElement("span",{
-key:"duration",
-className:"deg_expert_group_attempt_duration",
-title:durationLabel,
-},durationLabel),
-];
-if(duration!==null&&clock!==null){
-cells.push(react.createElement("span",{
-key:"time",
-className:"deg_expert_group_attempt_time",
-title:formatIsoText(timestamp)??clock,
-},clock));
-}
-return react.createElement("div",{
-key:key+":"+attemptNumber+":"+index,
-className:"deg_expert_group_attempt",
-role:"listitem",
-"data-status":attemptStatus,
-"data-attempt":String(attemptNumber),
-},
-react.createElement("div",{className:"deg_expert_group_attempt_row"},...cells),
-renderAttemptUsage(entry,{
-provider:text(entry.provider,null)??timelineProvider,
-model:text(entry.model,null)??timelineModel,
-}),
-renderStructuredBlock(entry.structured,entry.outputSchemaRequested,{kind:"attempt"}));
-});
-const toggle=timeline.total>timeline.limit
-?react.createElement("button",{
-key:"toggle",
-type:"button",
-className:"deg_expert_group_attempts_toggle",
-"aria-expanded":expanded,
-"aria-label":expanded?"收起尝试时间线":"查看全部尝试时间线",
-title:expanded?"只显示最近 "+timeline.limit+" 条":"查看全部 "+timeline.total+" 条",
-onClick:(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-const expandedKeys=timelineExpandedRef.current;
-if(expandedKeys.has(key))expandedKeys.delete(key);
-else{
-expandedKeys.add(key);
-while(expandedKeys.size>TIMELINE_EXPANDED_KEY_LIMIT){
-const oldest=expandedKeys.values().next();
-if(oldest.done===true)break;
-expandedKeys.delete(oldest.value);
-}
-}
-bump((value)=>value+1);
-},
-},expanded?"收起":"查看全部")
-:null;
-return react.createElement("div",{
-className:"deg_expert_group_attempts",
-role:"list",
-"aria-label":"尝试时间线",
-"data-total":String(timeline.total),
-"data-expanded":expanded,
-},...rows,toggle);
-};
-const renderRowMain=(node,options={})=>{
-const source=object(node);
-const fullName=titleOf(source);
-const oneLine=options.oneLine!==false;
-const parentId=text(options.parentId,null);
-const clickableId=text(options.sessionId,text(source.sessionId,text(source.childId,null)));
-const address=subagentAddressOfChild(clickableId,parentId,source);
-const navigable=navigation.available===true&&clickableId!==null;
-const onNavigate=navigable?()=>handleOpen(clickableId,address):undefined;
-const onKeyDown=onNavigate===undefined?undefined:(event)=>{
-if(event?.key!=="Enter"&&event?.key!==" ")return;
-event.preventDefault?.();
-event.stopPropagation?.();
-onNavigate();
-};
-const taskLabel="打开任务会话："+fullName;
-const navigateProps=onNavigate===undefined?{}:{
-role:"button",
-tabIndex:0,
-"aria-label":taskLabel,
-onKeyDown,
-};
-const metadata=metadataOf(source,mergedRoleLabels);
-const taskClassName="deg_expert_group_line deg_expert_group_task"
-+(oneLine?"":" deg_expert_group_shard_task");
-const trailing=options.trailing===undefined?null:options.trailing;
-const taskChildren=[
-react.createElement("div",{className:taskClassName,title:fullName,onClick:onNavigate,...navigateProps},fullName),
-renderSidebarOpenAction(address,fullName),
-];
-if(trailing!==null)taskChildren.push(trailing);
-const taskLine=react.createElement("div",{
-className:"deg_expert_group_task_line"+(trailing===null?"":" deg_expert_group_task_line_trailing"),
-},...taskChildren);
-const rowMain=react.createElement("div",{className:"deg_expert_group_row_main","data-kind":source.kind||"expert","data-expanded":true},
-taskLine,
-react.createElement("div",{className:"deg_expert_group_meta",title:metadata},metadata));
-const extras=[];
-if(options.metrics!==undefined&&options.metrics!==null)extras.push(options.metrics);
-if(options.footer!==undefined&&options.footer!==null)extras.push(options.footer);
-if(extras.length===0)return rowMain;
-return react.createElement("div",{className:"deg_expert_group_cell"},rowMain,...extras);
-};
-const runtimeStatusOfNode=(node,parentId,childId,options)=>runtimeStatusOf(
-node,
-catalogEntryOf(parentId,childId??text(object(node).sessionId,null)),
-options,
-);
-const renderExpert=(node,index,parentId,treeMeta)=>{
-if(passesFilter(node)!==true)return null;
-const runtimeStatus=runtimeStatusOfNode(node,parentId,undefined,{partial:partialSnapshot});
-const children=Array.isArray(node.children)?node.children:[];
-const hasChildren=children.length>0;
-const expertOpen=hasChildren?expand(node):true;
-const chevron=hasChildren
-?renderChevron(node,expertOpen)
-:react.createElement("span",{className:"deg_expert_group_chevron_placeholder","aria-hidden":"true"});
-const meta=treeMeta!==undefined&&treeMeta!==null
-?treeMeta
-:{level:2,posinset:index+1,setsize:index+1};
-const visibleChildNodes=children.filter((child)=>passesFilter(child)===true);
-return react.createElement("div",{key:node.id||node.sessionId||"expert-"+index,className:"deg_expert_group_node",role:"none"},
-react.createElement("div",{
-className:"deg_expert_group_row",
-role:"treeitem",
-"aria-level":meta.level,
-"aria-posinset":meta.posinset,
-"aria-setsize":meta.setsize,
-...(hasChildren?{"aria-expanded":expertOpen}:{}),
-"data-status":runtimeStatus,
-"data-expanded":expertOpen,
-},
-statusIcon(react,primitives,runtimeStatus),
-chevron,
-react.createElement("div",null,renderRowMain(node,{
-sessionId:node.sessionId,
-parentId,
-metrics:renderMetrics(node,{kind:node.kind||"expert",runtimeStatus,sessionId:node.sessionId,sessionIds:[node.sessionId]}),
-footer:renderStructuredBlock(node.structured,node.outputSchemaRequested,{kind:node.kind||"expert"}),
-}))),
-hasChildren&&expertOpen
-?react.createElement("div",{className:"deg_expert_group_children",role:"group"},visibleChildNodes.map((child,childIndex)=>renderExpert(child,childIndex,parentId,{
-level:meta.level+1,
-posinset:childIndex+1,
-setsize:visibleChildNodes.length,
-})))
-:null);
-};
-const renderIdleGroup=(nodes,trailing,treeMeta)=>{
-const members=Array.isArray(nodes)?nodes:[];
-const group={kind:"idle-group",id:rootSessionId+"__idle__",taskName:t("sidebar.idleGroup.name"),status:"idle",children:members};
-const open=expand(group);
-const idleTitleChildren=[
-react.createElement("div",{className:"deg_expert_group_line deg_expert_group_task"},t("sidebar.idleGroup",{count:members.length})),
-];
-if(trailing!==undefined&&trailing!==null)idleTitleChildren.push(trailing);
-const idleGroupStatus=partialSnapshot===true?neutralRuntimeStatus:"ready";
-const meta=treeMeta!==undefined&&treeMeta!==null
-?treeMeta
-:{level:2,posinset:1,setsize:1};
-return react.createElement("div",{className:"deg_expert_group_idle_group","data-expanded":open,role:"none"},
-react.createElement("div",{
-className:"deg_expert_group_row deg_expert_group_idle_header",
-role:"treeitem",
-"aria-level":meta.level,
-"aria-posinset":meta.posinset,
-"aria-setsize":meta.setsize,
-"aria-expanded":open,
-"data-status":idleGroupStatus,
-"data-expanded":open,
-},
-statusIcon(react,primitives,idleGroupStatus),
-renderChevron(group,open),
-react.createElement("div",{className:"deg_expert_group_idle_title_line"},...idleTitleChildren)),
-open?react.createElement("div",{className:"deg_expert_group_children deg_expert_group_idle_children",role:"group"},members.map((node,index)=>node.kind==="fanout"?renderFanout(node,index,{level:meta.level+1,posinset:index+1,setsize:members.length}):renderExpert(node,index,rootSessionId,{level:meta.level+1,posinset:index+1,setsize:members.length}))):null);
-};
-const pendingSet=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
-const recoveryRetryRef=typeof react.useRef==="function"
-?react.useRef({rootSessionId:null,inFlight:false,error:null})
-:{current:{rootSessionId:null,inFlight:false,error:null}};
-const runAction=async(request,key,requiresConfirm,message,options)=>{
-const actionOptions=object(options);
-if(mountedRef.current!==true)return null;
-if(pendingSet.current.has(key))return null;
-pendingSet.current.add(key);
-bump((value)=>value+1);
-setState((previous)=>{
-const current=previous.error;
-if(current===null||(current.source!==PANEL_ERROR_SOURCES.action&&current.source!==PANEL_ERROR_SOURCES.rpc)){
-return previous;
-}
-return{...previous,error:null};
-});
-try{
-if(requiresConfirm){
-if(typeof config.confirm!=="function")return null;
-let accepted=false;
-try{accepted=await config.confirm(message);}catch{accepted=false;}
-if(accepted!==true)return null;
-if(mountedRef.current!==true)return null;
-}
-const targetSessionId=typeof currentRootRef.current==="string"?currentRootRef.current:"";
-if(targetSessionId==="")return null;
-const result=await callRpc(config,contextRef.current,{...request,sessionId:targetSessionId});
-if(mountedRef.current!==true)return null;
-await refreshRef.current();
-if(metaStateRef.current!==null&&actionOptions.refreshMeta!==false){
-const refreshMeta=metaRefreshRef.current;
-if(typeof refreshMeta==="function")void refreshMeta();
-}
-return result;
-}catch(error){
-if(mountedRef.current!==true)return null;
-let message=error instanceof Error?error.message:String(error);
-if(actionOptions.safeMessage===true){
-const redact=modelFunction("redactDisplayText");
-const clean=redact===null?message:redact(message,200);
-message=clean===""?message:clean;
-}
-const code=actionOptions.includeErrorCode===true?text(object(error).code,null):null;
-if(code!==null)message=code+" · "+message;
-const source=rpcFailureKindOf(error)===RPC_FAILURE_TRANSPORT
-?PANEL_ERROR_SOURCES.rpc
-:PANEL_ERROR_SOURCES.action;
-const at=Date.now();
-setState((previous)=>({...previous,error:{source,message,at}}));
-return null;
-}finally{
-pendingSet.current.delete(key);
-if(mountedRef.current===true)bump((value)=>value+1);
-}
-};
-const retryRecovery=async()=>{
-if(mountedRef.current!==true)return;
-const targetSessionId=typeof currentRootRef.current==="string"?currentRootRef.current:"";
-if(targetSessionId==="")return;
-const previous=recoveryRetryRef.current;
-if(previous.rootSessionId===targetSessionId&&previous.inFlight===true)return;
-recoveryRetryRef.current={rootSessionId:targetSessionId,inFlight:true,error:null};
-bump((value)=>value+1);
-let failure=null;
-try{
-const result=await callRpc(config,contextRef.current,{
-action:"fanout-restore-retry",
-sessionId:targetSessionId,
-});
-if(result?.restored!==true){
-const error=object(result?.error);
-const code=text(error.code,null);
-failure=code===null
-?{code:"NO_RESTORABLE_SNAPSHOT",message:"当前没有可恢复的持久化任务"}
-:{code,message:text(error.message,"")};
-}
-}catch(error){
-failure={
-code:"RETRY_FAILED",
-message:error instanceof Error?error.message:String(error),
-};
-}
-const stillCurrent=mountedRef.current===true&&currentRootRef.current===targetSessionId;
-recoveryRetryRef.current={rootSessionId:targetSessionId,inFlight:false,error:stillCurrent?failure:null};
-if(stillCurrent!==true)return;
-bump((value)=>value+1);
-await refreshRef.current();
-};
-const renderAction=(label,Icon,onClick,pending)=>react.createElement("button",{
-type:"button",className:"deg_expert_group_action",title:pending?label+"（处理中）":label,
-"aria-label":pending?label+"（处理中）":label,"aria-busy":pending||undefined,disabled:pending,onClick,
-},makeIcon(primitives,Icon,{size:14}));
-const renderShard=(task,shard,index,treeMeta)=>{
-const shardKey=text(shard.shardId,"shard-"+index);
-const latestChildId=text(shard.childId,null);
-const status=statusOf(shard);
-const shardTaskName=text(shard.taskName,null);
-const shardNode={
-...shard,
-id:task.parentTaskId+":"+shardKey,
-kind:"expert",
-taskName:shardTaskName===null||shardTaskName===shardKey?shardKey:shardKey+"  "+shardTaskName,
-content:text(shard.prompt,""),
-};
-const cancelKey="cancel:"+task.parentTaskId+":"+shardKey;
-const retryKey="retry:"+task.parentTaskId+":"+shardKey;
-const actions=[];
-const cancelCapability=capabilityAllowed(shard,"cancel");
-const retryCapability=capabilityAllowed(shard,"retry");
-const showCancel=cancelCapability===null?ACTIVE_STATUSES.has(status):cancelCapability===true;
-const showRetry=retryCapability===null?RETRY_STATUSES.has(status):retryCapability===true;
-if(showCancel)actions.push(renderAction("取消分片 "+shardKey,"IconStopFillRegular",()=>runAction({action:"fanout-cancel-shard",parentTaskId:task.parentTaskId,shardId:shardKey},cancelKey,true,"确认取消分片 "+shardKey+"？"),pendingSet.current.has(cancelKey)));
-if(showRetry)actions.push(renderAction("重试分片 "+shardKey,"IconRefreshOutlineRegular",()=>runAction({action:"fanout-retry-shard",parentTaskId:task.parentTaskId,shardId:shardKey},retryKey,false,""),pendingSet.current.has(retryKey)));
-const runtimeStatus=runtimeStatusOfNode(shardNode,rootSessionId,latestChildId);
-const shardOpen=expand(shardNode);
-const timelineKey="shard:"+rootSessionId+":"+task.parentTaskId+":"+shardKey;
-const shardStructured=renderStructuredBlock(shard.structured,shard.outputSchemaRequested,{kind:"shard"});
-const shardTimeline=shardOpen?renderAttemptTimeline(shard,{key:timelineKey}):null;
-const shardFooter=shardStructured===null&&shardTimeline===null
-?null
-:react.createElement("div",{className:"deg_expert_group_shard_extra"},shardStructured,shardTimeline);
-const meta=treeMeta!==undefined&&treeMeta!==null
-?treeMeta
-:{level:3,posinset:index+1,setsize:index+1};
-return react.createElement("div",{
-key:shardKey,
-className:"deg_expert_group_shard",
-role:"treeitem",
-"aria-level":meta.level,
-"aria-posinset":meta.posinset,
-"aria-setsize":meta.setsize,
-"data-shard-id":shardKey,
-"data-status":runtimeStatus,
-"data-expanded":shardOpen,
-},
-statusIcon(react,primitives,runtimeStatus),
-renderChevron(shardNode,shardOpen),
-renderRowMain(shardNode,{
-sessionId:latestChildId,
-parentId:rootSessionId,
-oneLine:false,
-metrics:renderMetrics(shard,{kind:"shard",runtimeStatus,sessionId:latestChildId,sessionIds:[latestChildId]}),
-footer:shardFooter,
-}),
-react.createElement("div",{className:"deg_expert_group_actions"},actions));
-};
-const renderFanout=(task,index,treeMeta)=>{
-if(passesFilter(task)!==true)return null;
-const shards=Array.isArray(task.shards)?task.shards:[];
-const visibleShards=filterActive===true&&taskFilter!==null?taskFilter.shardsFor(task):shards;
-const open=expand(task);
-const incomplete=shards.filter((shard)=>ACTIVE_STATUSES.has(statusOf(shard))).length;
-const parentKey="cancel-parent:"+task.parentTaskId;
-const cancelCapability=capabilityAllowed(task,"cancel");
-const showCancel=cancelCapability===null
-?(ACTIVE_STATUSES.has(statusOf(task))||incomplete>0)
-:cancelCapability===true;
-const actions=showCancel
-?[renderAction("取消父任务（未完成 "+incomplete+" 个分片）","IconStopFillRegular",()=>runAction({action:"fanout-cancel-parent",parentTaskId:task.parentTaskId},parentKey,true,"确认取消父任务？未完成 "+incomplete+" 个分片。"),pendingSet.current.has(parentKey))]
-:[];
-const runtimeStatus=runtimeStatusOf(task,null);
-const meta=treeMeta!==undefined&&treeMeta!==null
-?treeMeta
-:{level:2,posinset:index+1,setsize:index+1};
-const fanoutRole=roleLabelFor(task.role,task.roleLabel)??"Expert";
-const fanoutTitle=fanoutRole.charAt(0).toUpperCase()+fanoutRole.slice(1)
-+" · "+shards.length+" shards · "+RUNTIME_STATUS_LABELS[runtimeStatusOf(task,null)];
-const fanoutNavigationId=(()=>{
-const explicit=text(task.sessionId,null);
-if(explicit!==null)return explicit;
-let fallback=null;
-for(const shard of visibleShards){
-const childId=text(object(shard).childId,null);
-if(childId===null)continue;
-if(ACTIVE_STATUSES.has(statusOf(shard)))return childId;
-if(fallback===null)fallback=childId;
-}
-return fallback;
-})();
-const fanoutNavigable=navigation.available===true&&fanoutNavigationId!==null;
-const onFanoutKeyDown=fanoutNavigable
-?(event)=>{
-if(event?.key!=="Enter"&&event?.key!==" ")return;
-event.preventDefault?.();
-event.stopPropagation?.();
-handleOpen(fanoutNavigationId);
-}
-:undefined;
-return react.createElement("div",{key:task.parentTaskId||"fanout-"+index,className:"deg_expert_group_fanout",role:"none","data-status":runtimeStatus,"data-task-status":statusOf(task)},
-react.createElement("div",{
-className:"deg_expert_group_fanout_header",
-role:"treeitem",
-"aria-level":meta.level,
-"aria-posinset":meta.posinset,
-"aria-setsize":meta.setsize,
-"aria-expanded":open,
-},
-statusIcon(react,primitives,runtimeStatus),
-renderChevron(task,open),
-react.createElement("div",{className:"deg_expert_group_fanout_title"},
-react.createElement("div",{
-className:"deg_expert_group_line deg_expert_group_task",
-title:fanoutTitle,
-...(fanoutNavigable?{role:"button",tabIndex:0,"aria-label":"打开任务会话："+fanoutTitle,onKeyDown:onFanoutKeyDown}:{}),
-onClick:fanoutNavigable?()=>handleOpen(fanoutNavigationId):undefined,
-},fanoutTitle),
-renderMetrics(task,{kind:"fanout",runtimeStatus,sessionIds:fanoutSessionIdsOf(task)})),
-react.createElement("div",{className:"deg_expert_group_actions"},actions)),
-open?react.createElement("div",{className:"deg_expert_group_fanout_shards deg_expert_group_tree_children",role:"group"},visibleShards.map((shard,shardIndex)=>renderShard(task,shard,shardIndex,{
-level:meta.level+1,
-posinset:shardIndex+1,
-setsize:visibleShards.length,
-}))):null);
-};
-const children=Array.isArray(snapshot?.root?.children)?snapshot.root.children:[];
-const filterSource=filterState.rootSessionId===rootSessionId?filterState:emptyFilter;
-const filterFactory=modelFunction("createTaskFilter");
-let taskFilter=null;
-if(filterFactory!==null){
-try{taskFilter=filterFactory(filterSource);}catch{taskFilter=null;}
-}
-const filterActive=taskFilter!==null&&taskFilter.active===true;
-const passesFilter=(node)=>(filterActive!==true||taskFilter.isVisible(node)===true);
-const updateFilter=(patch)=>{
-setFilterState({...filterSource,...patch,rootSessionId});
-};
-const idleChildren=sidebarIdleChildren();
-const visibleChildren=children.filter((node)=>!idleChildren.includes(node)).filter((node)=>passesFilter(node));
-const visibleIdleChildren=filterActive===true?idleChildren.filter((node)=>passesFilter(node)):idleChildren;
-const rootBatchSlot=filterActive===true?null:renderSidebarBatchSlot(runningSidebarResourceAddresses(),"运行中的子代理");
-const idleBatchSlot=filterActive===true?null:renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren),t("sidebar.idleGroup.name"));
-const root=snapshot?.root;
-const renderSessionModelDialog=()=>{
-if(sessionModelOpen!==true)return null;
-const status=sessionModelState.status;
-const roles=sessionModelRolesOf(meta);
-const groups=Array.isArray(sessionModelCatalog.groups)?sessionModelCatalog.groups:[];
-const writable=status==="ready"&&sessionModelState.live===true&&sessionModelSaving!==true;
-const readOnlyReasons={
-"no-session":t("sidebar.sessionModel.noSession"),
-child:t("sidebar.sessionModel.child"),
-loading:t("sidebar.sessionModel.loading"),
-unsupported:t("sidebar.sessionModel.unsupported"),
-error:t("sidebar.sessionModel.unavailable"),
-unavailable:t("sidebar.sessionModel.unavailable"),
-};
-const readOnlyHint=status==="ready"
-?(sessionModelState.live===true?null:t("sidebar.sessionModel.offline"))
-:(readOnlyReasons[status]??null);
-const noticeText=sessionModelNotice===null
-?null
-:sessionModelNotice.kind==="saved"
-?t("sidebar.sessionModel.saved")
-:sessionModelNotice.kind==="cleared"
-?t("sidebar.sessionModel.cleared")
-:sessionModelNotice.text;
-const noticeError=sessionModelNotice?.kind==="error"||sessionModelNotice?.kind==="conflict";
-const changes=status==="ready"?sessionModelPendingChanges():[];
-const invalidDraft=status==="ready"&&sessionModelHasInvalidDraft();
-const canSave=writable===true&&changes.length>0&&invalidDraft!==true;
-const closeDialog=(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-setSessionModelOpen(false);
-};
-const optionOf=(value,label,disabled)=>react.createElement("option",{
-key:"opt:"+(disabled===true?"disabled:":"")+value,
-value,
-...(disabled===true?{disabled:true}:{}),
-},label);
-const headRow=react.createElement("div",{
-key:"__head",
-className:"deg_expert_group_session_model_row",
-role:"row",
-"data-deg-session-model-head":"true",
-},[
-react.createElement("span",{
-key:"role",
-role:"columnheader",
-className:"deg_expert_group_session_model_head_cell",
-},t("sidebar.sessionModel.columnRole")),
-react.createElement("span",{
-key:"provider",
-role:"columnheader",
-className:"deg_expert_group_session_model_head_cell",
-},t("sidebar.sessionModel.provider")),
-react.createElement("span",{
-key:"model",
-role:"columnheader",
-className:"deg_expert_group_session_model_head_cell",
-},t("sidebar.sessionModel.columnModel")),
-react.createElement("span",{
-key:"effort",
-role:"columnheader",
-className:"deg_expert_group_session_model_head_cell",
-},t("sidebar.sessionModel.effort")),
-]);
-const rows=[];
-if(status==="ready"){
-for(const role of roles){
-const current=sessionModelState.overrides[role]??null;
-const globalDefault=normalizeSessionModelSelection(object(meta?.roleDefaults)[role]);
-const hasDraft=Object.prototype.hasOwnProperty.call(sessionModelDrafts,role);
-const baseline=current??globalDefault;
-const editable=hasDraft
-?sessionModelDrafts[role]
-:{
-provider:baseline?.provider??"",
-model:baseline?.model??"",
-reasoningEffort:baseline?.reasoningEffort??"",
-};
-const providerValue=typeof editable.provider==="string"?editable.provider:"";
-const modelValue=typeof editable.model==="string"?editable.model:"";
-const effortValue=typeof editable.reasoningEffort==="string"?editable.reasoningEffort:"";
-const roleLabel=roleLabelFor(role,null)??role;
-const providerGroup=groups.find((group)=>text(object(group).id,null)===providerValue);
-const models=sessionModelModelOptions(providerValue,groups);
-const modelEntry=models.find((candidate)=>text(object(candidate).id,null)===modelValue);
-const reasoningRaw=modelEntry?.reasoning;
-const reasoning=reasoningRaw!==null&&typeof reasoningRaw==="object"&&Array.isArray(reasoningRaw)!==true
-?reasoningRaw
-:null;
-const efforts=Array.isArray(reasoning?.efforts)?reasoning.efforts:[];
-const providerOptions=[optionOf("","未选择供应商")];
-if(providerValue!==""&&providerGroup===undefined){
-providerOptions.push(optionOf(providerValue,providerValue+"（不可用）",true));
-}
-for(const group of groups){
-const id=text(object(group).id,null);
-if(id===null||id==="")continue;
-providerOptions.push(optionOf(id,text(object(group).name,null)??id));
-}
-const modelOptions=[];
-if(providerValue===""){
-modelOptions.push(optionOf("","先选择供应商",true));
-}else{
-modelOptions.push(optionOf("","未选择模型"));
-if(modelValue!==""&&modelEntry===undefined){
-modelOptions.push(optionOf(modelValue,modelValue+"（不可用）",true));
-}
-for(const candidate of models){
-const id=text(object(candidate).id,null);
-if(id===null||id==="")continue;
-modelOptions.push(optionOf(id,text(object(candidate).name,null)??id));
-}
-}
-const effortOptions=[];
-if(reasoning===null){
-effortOptions.push(optionOf("",providerValue===""?"先选择模型":"模型无思考深度",true));
-}else{
-effortOptions.push(optionOf("",t("sidebar.sessionModel.effortDefault")));
-for(const effort of efforts){
-const id=text(object(effort).id,null);
-if(id===null||id==="")continue;
-effortOptions.push(optionOf(id,text(object(effort).name,null)??id));
-}
-if(effortValue!==""
-&&efforts.every((effort)=>text(object(effort).id,null)!==effortValue)){
-effortOptions.push(optionOf(effortValue,effortValue+"（不可用）",true));
-}
-}
-const pillChildren=[
-react.createElement("span",{
-key:"label",
-className:"deg_expert_group_session_model_pill_label",
-title:roleLabel,
-},roleLabel),
-];
-if(current!==null){
-pillChildren.push(react.createElement("button",{
-key:"clear",
-type:"button",
-className:"deg_expert_group_session_model_clear",
-"data-deg-session-model-clear":role,
-"aria-label":t("sidebar.sessionModel.clearRole",{role:roleLabel}),
-title:t("sidebar.sessionModel.clearRole",{role:roleLabel}),
-disabled:writable!==true,
-onClick:(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-void clearSessionModelRole(role);
-},
-},"×"));
-}
-rows.push(react.createElement("div",{
-key:role,
-className:"deg_expert_group_session_model_row",
-role:"row",
-"data-deg-session-model-role":role,
-"data-deg-session-model-state":current!==null?"override":"follow",
-},[
-react.createElement("div",{
-key:"role",
-role:"cell",
-className:"deg_expert_group_session_model_cell",
-},react.createElement("span",{className:"deg_expert_group_session_model_pill"},pillChildren)),
-react.createElement("div",{
-key:"provider",
-role:"cell",
-className:"deg_expert_group_session_model_cell",
-},react.createElement("select",{
-className:"deg_expert_group_session_model_select",
-"aria-label":roleLabel+" "+t("sidebar.sessionModel.provider"),
-"data-deg-session-model-field":"provider",
-value:providerValue,
-disabled:writable!==true,
-onChange:(event)=>updateSessionModelDraft(role,"provider",event?.target?.value??""),
-},providerOptions)),
-react.createElement("div",{
-key:"model",
-role:"cell",
-className:"deg_expert_group_session_model_cell",
-},react.createElement("select",{
-className:"deg_expert_group_session_model_select",
-"aria-label":roleLabel+" "+t("sidebar.sessionModel.columnModel"),
-"data-deg-session-model-field":"model",
-value:modelValue,
-disabled:writable!==true||providerValue===""||providerGroup===undefined,
-onChange:(event)=>updateSessionModelDraft(role,"model",event?.target?.value??""),
-},modelOptions)),
-react.createElement("div",{
-key:"effort",
-role:"cell",
-className:"deg_expert_group_session_model_cell",
-},react.createElement("select",{
-className:"deg_expert_group_session_model_select",
-"aria-label":roleLabel+" "+t("sidebar.sessionModel.effort"),
-"data-deg-session-model-field":"effort",
-value:effortValue,
-disabled:writable!==true||reasoning===null||modelValue==="",
-onChange:(event)=>updateSessionModelDraft(role,"reasoningEffort",event?.target?.value??""),
-},effortOptions)),
-]));
-}
-}
-const bodyChildren=[
-react.createElement("p",{key:"hint",className:"deg_expert_group_session_model_hint"},
-t("sidebar.sessionModel.hint")),
-];
-if(readOnlyHint!==null){
-bodyChildren.push(react.createElement("div",{
-key:"readonly",
-className:"deg_expert_group_session_model_hint",
-"data-deg-session-model-readonly":status,
-},readOnlyHint));
-}
-if(status==="error"){
-bodyChildren.push(react.createElement("button",{
-key:"retry",
-type:"button",
-className:"deg_expert_group_export_button",
-"data-deg-session-model-retry":"true",
-"aria-label":t("sidebar.sessionModel.retry"),
-onClick:(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-setSessionModelReloadToken((value)=>value+1);
-},
-},t("sidebar.sessionModel.retry")));
-}
-if(noticeText!==null){
-bodyChildren.push(react.createElement("div",{
-key:"notice",
-className:noticeError
-?"deg_expert_group_session_model_notice deg_expert_group_session_model_notice_error"
-:"deg_expert_group_session_model_notice",
-role:"status",
-"data-deg-session-model-notice":sessionModelNotice?.kind??"none",
-},noticeText));
-}
-if(roles.length===0){
-bodyChildren.push(react.createElement("div",{
-key:"empty",
-className:"deg_expert_group_session_model_hint",
-},t("sidebar.sessionModel.emptyRoles")));
-}
-if(status==="ready"){
-bodyChildren.push(react.createElement("div",{
-key:"table",
-className:"deg_expert_group_session_model_scroll",
-},react.createElement("div",{
-role:"table",
-"aria-label":t("sidebar.sessionModel.tableLabel"),
-className:"deg_expert_group_session_model_table",
-},[headRow,...rows])));
-}
-const footer=react.createElement("footer",{
-key:"footer",
-className:"deg_expert_group_session_model_footer",
-},[
-react.createElement("span",{
-key:"revision",
-className:"deg_expert_group_session_model_revision",
-"data-deg-session-model-revision":sessionModelState.revision,
-},t("sidebar.sessionModel.revision",{revision:sessionModelState.revision})),
-invalidDraft===true
-?react.createElement("span",{
-key:"invalid",
-className:"deg_expert_group_session_model_invalid",
-role:"status",
-"data-deg-session-model-invalid":"true",
-},t("sidebar.sessionModel.invalidDraft"))
-:null,
-react.createElement("span",{key:"spacer",className:"deg_expert_group_session_model_spacer"}),
-react.createElement("button",{
-key:"close",
-type:"button",
-className:"deg_expert_group_export_button",
-"data-deg-session-model-close":"footer",
-onClick:closeDialog,
-},t("sidebar.sessionModel.close")),
-react.createElement("button",{
-key:"save",
-type:"button",
-className:"deg_expert_group_session_model_primary",
-"data-deg-session-model-save":"true",
-"aria-label":t("sidebar.sessionModel.saveChanges"),
-disabled:canSave!==true,
-onClick:(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-void commitSessionModelChanges();
-},
-},t("sidebar.sessionModel.saveChanges")),
-]);
-return react.createElement("dialog",{
-id:"deg-session-model-dialog",
-className:"deg_expert_group_session_model_dialog",
-"aria-labelledby":"deg-session-model-title",
-"data-deg-session-model":"dialog",
-"data-deg-session-model-state":status,
-ref:sessionModelDialogRef,
-onCancel:closeDialog,
-onClose:()=>{setSessionModelOpen(false);},
-onClick:(event)=>{
-if(sessionModelDialogRef.current!==null
-&&event?.target===sessionModelDialogRef.current){
-setSessionModelOpen(false);
-}
-},
-},
-react.createElement("header",{className:"deg_expert_group_session_model_header"},
-react.createElement("h2",{
-id:"deg-session-model-title",
-className:"deg_expert_group_session_model_title",
-},t("sidebar.sessionModel.title")),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"data-deg-session-model-close":"true",
-"aria-label":t("sidebar.sessionModel.close"),
-onClick:closeDialog,
-},"×")),
-react.createElement("div",{
-className:"deg_expert_group_session_model_body",
-},bodyChildren),
-footer);
-};
-const renderToolbar=()=>{
-if(snapshot===null)return null;
-const roles=[];
-const addRole=(value)=>{
-const role=text(value,null);
-if(role!==null&&roles.indexOf(role)===-1)roles.push(role);
-};
-const collectRoles=(nodes)=>{
-for(const node of Array.isArray(nodes)?nodes:[]){
-addRole(node.role);
-collectRoles(node.children);
-for(const shard of Array.isArray(node.shards)?node.shards:[])addRole(shard.role);
-}
-};
-collectRoles(root?.children);
-roles.sort();
-return react.createElement("div",{className:"deg_expert_group_toolbar",role:"search","aria-label":t("sidebar.search.label")},
-react.createElement("input",{
-type:"search",
-className:"deg_expert_group_search",
-"aria-label":t("sidebar.search.aria"),
-placeholder:t("sidebar.search.placeholder"),
-value:filterSource.query,
-onChange:(event)=>{updateFilter({query:event?.target?.value??""});},
-}),
-react.createElement("select",{
-className:"deg_expert_group_filter",
-"aria-label":t("sidebar.filter.role"),
-value:filterSource.role,
-onChange:(event)=>{updateFilter({role:event?.target?.value??""});},
-},[
-react.createElement("option",{key:"__all_roles",value:""},t("sidebar.filter.allRoles")),
-...roles.map((role)=>react.createElement("option",{key:role,value:role},roleLabelFor(role,null)??role)),
-]),
-react.createElement("select",{
-className:"deg_expert_group_filter",
-"aria-label":t("sidebar.filter.status"),
-value:filterSource.status,
-onChange:(event)=>{updateFilter({status:event?.target?.value??""});},
-},[
-react.createElement("option",{key:"__all_statuses",value:""},t("sidebar.filter.allStatuses")),
-...STATUS_FILTER_OPTIONS.map((option)=>react.createElement("option",{key:option.value,value:option.value},option.label)),
-]),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_export_button",
-"aria-label":t("sidebar.sessionModel.open"),
-"aria-expanded":sessionModelOpen,
-"aria-haspopup":"dialog",
-"aria-controls":"deg-session-model-dialog",
-ref:sessionModelEntryRef,
-title:t("sidebar.sessionModel.openTitle"),
-onClick:(event)=>{
-event?.preventDefault?.();
-event?.stopPropagation?.();
-setSessionModelOpen((previous)=>previous!==true);
-},
-},t("sidebar.sessionModel.open")));
-};
-const rootOpen=root===null?true:expand(root);
-const idleGroupVisible=!(filterActive===true&&visibleIdleChildren.length===0);
-const rootSiblingCount=visibleChildren.length+(idleGroupVisible?1:0);
-const rootStatus=runtimeStatusOf(root,null,{partial:partialSnapshot});
-const recovery=snapshot?.recovery??null;
-const recoveryFailed=recovery!==null&&recovery.status==="failed";
-const recoveryRetry=recoveryRetryRef.current;
-const recoveryRetryPending=recoveryRetry.inFlight===true&&recoveryRetry.rootSessionId===rootSessionId;
-const recoveryCode=recovery===null?null:text(recovery.code,"RESTORE_FAILED");
-const recoveryRetryError=recoveryFailed===true
-&&recoveryRetry.rootSessionId===rootSessionId
-&&recoveryRetry.error!==null
-&&(recoveryRetry.error.code===recoveryCode
-||recoveryRetry.error.code==="RETRY_FAILED"
-||recoveryRetry.error.code==="NO_RESTORABLE_SNAPSHOT")
-?recoveryRetry.error
-:null;
-const recoveryMessage=recovery===null?null:text(recovery.message,null);
-const recoveryBanner=recoveryFailed!==true
-?null
-:react.createElement("div",{
-className:"deg_expert_group_recovery",
-role:"alert",
-"data-recovery-status":"failed",
-"data-recovery-code":recoveryCode,
-title:recoveryMessage===null?"恢复失败（"+recoveryCode+"）":recoveryMessage,
-},
-react.createElement("span",{className:"deg_expert_group_recovery_text"},
-"任务恢复失败（"+recoveryCode+"）"+(recoveryMessage===null?"":"："+recoveryMessage)),
-recoveryRetryError===null
-?null
-:react.createElement("span",{className:"deg_expert_group_recovery_retry_error",role:"status"},
-"重试未恢复（"+text(recoveryRetryError.code,"RETRY_FAILED")+"）"
-+(text(recoveryRetryError.message,"")===""?"":"："+text(recoveryRetryError.message,""))),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_recovery_retry",
-title:recovery.retryable===false
-?"该原因通常需要修复持久化快照后才能恢复；点击会重新读取当前持久化快照"
-:"重新读取当前持久化快照并重跑恢复",
-"aria-label":t("sidebar.recovery.retry"),
-"aria-busy":recoveryRetryPending||undefined,
-disabled:recoveryRetryPending,
-onClick:retryRecovery,
-},recoveryRetryPending?t("sidebar.recovery.retrying"):t("sidebar.recovery.retry")));
-const errorEmptyState=(panelError)=>react.createElement("div",{
-className:"deg_expert_group_empty deg_expert_group_error_empty",
-role:"alert",
-"data-error-source":panelError.source,
-title:panelError.message,
-},
-react.createElement("div",{className:"deg_expert_group_error_empty_title"},
-errorLabelOf(panelError.source)),
-react.createElement("div",{className:"deg_expert_group_error_empty_detail"},panelError.message));
-const body=viewState.loading&&snapshot===null
-?react.createElement("div",{className:"deg_expert_group_tree","aria-busy":"true"},react.createElement("div",{className:"deg_expert_group_skeleton"}),react.createElement("div",{className:"deg_expert_group_skeleton"}))
-:snapshot===null&&viewState.error!==null
-?errorEmptyState(viewState.error)
-:snapshot===null
-?react.createElement("div",{className:"deg_expert_group_empty"},t("sidebar.empty"))
-:react.createElement("div",{className:"deg_expert_group_tree"},
-renderToolbar(),
-react.createElement("div",{className:"deg_expert_group_tree_items",role:"tree","aria-label":"专家任务树"},
-react.createElement("div",{className:"deg_expert_group_node deg_expert_group_node_root",role:"none","data-root":"true"},
-react.createElement("div",{
-className:"deg_expert_group_row",
-role:"treeitem",
-"aria-level":1,
-"aria-posinset":1,
-"aria-setsize":1,
-"aria-expanded":rootOpen,
-"data-status":rootStatus,
-"data-expanded":rootOpen,
-},statusIcon(react,primitives,rootStatus),renderChevron(root,rootOpen),react.createElement("div",null,renderRowMain(root,{
-sessionId:root.sessionId,
-parentId:null,
-expanded:true,
-trailing:rootBatchSlot,
-metrics:renderMetrics(root,{kind:"root",runtimeStatus:rootStatus,sessionId:root.sessionId,sessionIds:[root.sessionId]}),
-}))),
-rootOpen?react.createElement("div",{className:"deg_expert_group_children",role:"group"},[
-...visibleChildren.map((node,index)=>node.kind==="fanout"
-?renderFanout(node,index,{level:2,posinset:index+1,setsize:rootSiblingCount})
-:renderExpert(node,index,rootSessionId,{level:2,posinset:index+1,setsize:rootSiblingCount})),
-idleGroupVisible
-?renderIdleGroup(filterActive===true?visibleIdleChildren:idleChildren,idleBatchSlot,{level:2,posinset:visibleChildren.length+1,setsize:rootSiblingCount})
-:null,
-filterActive===true&&visibleChildren.length===0&&visibleIdleChildren.length===0
-&&taskFilter!==null&&taskFilter.matches(root)!==true
-?react.createElement("div",{className:"deg_expert_group_filter_empty",role:"status"},t("sidebar.filter.empty"))
-:null,
-].filter((node)=>node!==null&&node!==undefined)):null)));
-const autoOpenChecked=autoOpenDraft===null?autoOpenEnabled():autoOpenDraft===true;
-const autoOpenToggle=react.createElement("label",{
-className:"deg_expert_group_header_auto",
-title:"自动打开运行中的子代理侧栏会话",
-},
-react.createElement("input",{
-type:"checkbox",
-className:"deg_expert_group_header_auto_input",
-"aria-label":"Auto",
-checked:autoOpenChecked,
-disabled:writeAutoOpenSetting===null,
-onChange:(event)=>toggleAutoOpen(event?.target?.checked===true),
-}),
-react.createElement("span",{className:"deg_expert_group_header_auto_label"},"Auto"));
-const panelError=viewState.error;
-const panelErrorLabel=panelError===null
-?null
-:errorLabelOf(panelError.source);
-const updatedTime=snapshot===null?null:formatPanelUpdatedTime(viewState.updatedAt);
-const partialBadge=partialSnapshot===true
-?react.createElement("span",{
-className:"deg_expert_group_partial",
-role:"status",
-"data-partial":"true",
-title:t("sidebar.partial.title"),
-},t("sidebar.partial"))
-:null;
-const updatedBadge=updatedTime===null
-?null
-:react.createElement("span",{className:"deg_expert_group_updated",title:t("sidebar.updated.title")},t("sidebar.updated",{time:updatedTime}));
-const refreshLabel=panelError===null?t("sidebar.refresh"):t("sidebar.retry");
-const refreshButton=react.createElement("button",{
-type:"button",
-className:"deg_expert_group_header_action",
-title:refreshLabel,
-"aria-label":refreshLabel,
-onClick:retry,
-},makeIcon(primitives,"IconRefreshOutlineRegular",{size:14}));
-return react.createElement("section",{className:"deg_expert_group","data-version":version,"aria-label":"Expert Group"},
-widthResizer,
-react.createElement("div",{
-className:"deg_expert_group_announcer",
-role:"status",
-"aria-live":"polite",
-"aria-atomic":"true",
-"data-announcement":announcement===""?undefined:announcement,
-},announcement),
-react.createElement("header",{className:"deg_expert_group_header"},
-react.createElement("span",{className:"deg_expert_group_header_title"},t("sidebar.title")),
-partialBadge,
-updatedBadge,
-autoOpenToggle,
-panelError===null
-?null
-:react.createElement("span",{
-className:"deg_expert_group_error",
-"data-error-source":panelError.source,
-title:panelError.message,
-},panelErrorLabel),
-refreshButton),recoveryBanner,body,
-renderSessionModelDialog());
-}
-Panel.displayName="ExpertGroupPanel";
-return Panel;
-}
+global[SYMBOL]=Object.freeze({createSidebarActions});
+})(globalThis);
+/* source: client-sidebar-overlay.js */
+(function installClientSidebarOverlay(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-overlay");
 const RIGHTBAR_CONTINUITY_OVERLAY_ID="dsh-expert-group-rightbar-continuity-overlay";
 const RIGHTBAR_CONTINUITY_FALLBACK_MS=500;
 function createNativeRightbarContinuityOverlay(){
@@ -7811,145 +6562,21 @@ return release;
 };
 return Object.freeze({capture,release});
 }
-function installExpertGroupSidebar(ctx,deps){
-const config={...object(deps),ctx};
-if(config.taskManagementEnabled===false)return()=>{};
-const rightbarDragLock=createRightbarDragLock();
-const splitTrackRatio=createSplitTrackRatio();
-let splitTrackReader=null;
-const requestSplitTrackSync=()=>{
-if(splitTrackReader===null||disposed)return false;
-return splitTrackRatio.sync(splitTrackReader.readTarget);
-};
-let rightbarDragSyncImpl=null;
-const requestRightbarDragSync=()=>{
-if(rightbarDragSyncImpl===null||disposed)return;
-try{rightbarDragSyncImpl();}catch{/* 手柄锁只是体验优化，绝不影响面板渲染。 */}
-};
-const releaseRightbarDragLock=()=>{
-if(disposed)return;
-try{rightbarDragLock.setLocked(false);}catch{/* 同上。 */}
-try{requestSplitTrackSync();}catch{/* 配比只是布局微调，绝不影响卸载。 */}
-};
-const brandReact=typeof config.react?.createElement==="function"?config.react:null;
-const brandIcon=createBrandIcon(brandReact,object(config.primitives));
-const optionalService=(name)=>{
-try{
-const value=typeof ctx?.get==="function"?ctx.get(name):null;
-if(value)return value;
-}catch{/* 服务未安装。 */}
-try{return ctx?.[name]||null;}catch{return null;}
-};
-const better=config.betterSidebar||optionalService("betterSidebar");
-const sessions=config.sessions||optionalService("sessions");
-const tabs=config.sidebarRightTabs||optionalService("sidebarRightTabs");
-const nativeSidebar=config.sidebarRight||optionalService("sidebarRight");
-const slots=config.slots||optionalService("slots");
-const disposers=[];
-let disposed=false;
-const surfaceRecords=new Map();
-const MAX_SURFACE_OPEN_ATTEMPTS=3;
-const MAX_SURFACE_OPEN_RETRIES=1;
-const SURFACE_OPEN_DELAY_MS=0;
-const SURFACE_OPEN_RETRY_MS=250;
-const MAX_READINESS_RETRIES=3;
-const HOST_COMMIT_RETRY_MS=250;
-const surfaceRecordOf=(sessionId)=>{
-let record=surfaceRecords.get(sessionId);
-if(record===undefined){
-record={
-visitEpoch:0,
-openAttempts:0,
-openRetries:0,
-openFailures:0,
-openState:"idle",
-expandDone:false,
-readinessRetries:0,
-commitState:"unknown",
-transitionRestore:null,
-continuityRelease:null,
-};
-surfaceRecords.set(sessionId,record);
-}
-return record;
-};
-const releaseContinuityOverlayOf=(record)=>{
-if(record===undefined||record===null)return false;
-const release=record.continuityRelease??null;
-record.continuityRelease=null;
-if(typeof release!=="function")return false;
-try{release();}catch{/* 释放失败不能阻断其它收尾动作。 */}
-return true;
-};
-const releaseTransitionRestore=(record,options={})=>{
-if(record===undefined||record===null)return false;
-if(options.keepContinuity!==true)releaseContinuityOverlayOf(record);
-const restore=record.transitionRestore??null;
-record.transitionRestore=null;
-if(typeof restore!=="function")return false;
-try{restore();}catch{/* 恢复失败不能阻断其它收尾动作。 */}
-return true;
-};
-const beginVisitFor=(sessionId,epoch)=>{
-const record=surfaceRecordOf(sessionId);
-if(record.visitEpoch===epoch)return record;
-releaseTransitionRestore(record,{keepContinuity:true});
-record.visitEpoch=epoch;
-record.openAttempts=0;
-record.openRetries=0;
-record.openFailures=0;
-record.openState="idle";
-record.expandDone=false;
-record.readinessRetries=0;
-record.commitState="unknown";
-return record;
-};
-let currentVisitKey=null;
-let currentVisitEpoch=0;
-let currentVisitSessionId=null;
-let currentRemountSerial=0;
-const beginVisit=(current,hostSessionId)=>{
-const key=String(current)+"|"+String(hostSessionId)+"|"+String(currentRemountSerial);
-if(key===currentVisitKey)return currentVisitEpoch;
-currentVisitKey=key;
-currentVisitEpoch+=1;
-if(currentVisitSessionId!==null){
-cancelSurfaceOpenTimer(currentVisitSessionId);
-cancelRightbarExpand(currentVisitSessionId);
-releaseTransitionRestore(surfaceRecords.get(currentVisitSessionId),{
-keepContinuity:currentVisitSessionId===current&&hostSessionId!==null,
-});
-}
-currentVisitSessionId=current;
-return currentVisitEpoch;
-};
-const readHostActiveSurface=()=>{
-let readSnapshot;
-try{
-const candidate=better?.getSnapshot;
-if(typeof candidate!=="function")return{available:false,sessionId:null};
-readSnapshot=candidate;
-}catch{return{available:false,sessionId:null};}
-try{
-return{available:true,sessionId:text(object(readSnapshot.call(better)).sessionId,null)};
-}catch{return{available:false,sessionId:null};}
-};
-const RIGHTBAR_PRESENTED_KEY="dsh-expert-group:rightbar-presented:v1";
-const readPersistedRightbarPresented=()=>{
-try{
-const storage=globalThis.localStorage;
-if(!storage||typeof storage.getItem!=="function")return false;
-return storage.getItem(RIGHTBAR_PRESENTED_KEY)==="1";
-}catch{return false;}
-};
-const persistRightbarPresented=()=>{
-try{
-const storage=globalThis.localStorage;
-if(!storage||typeof storage.setItem!=="function")return false;
-storage.setItem(RIGHTBAR_PRESENTED_KEY,"1");
-return true;
-}catch{return false;}
-};
+global[SYMBOL]=Object.freeze({createNativeRightbarContinuityOverlay});
+})(globalThis);
+/* source: client-sidebar-install-layout.js */
+(function installSidebarInstallLayout(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-install-layout");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{object,text}=PURE;
+const LAYOUT_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-layout");
+const LAYOUT=global[LAYOUT_SYMBOL]||{};
+const{createRightbarDragLock,createSplitTrackRatio}=LAYOUT;
+const OVERLAY_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-overlay");
+const OVERLAY=global[OVERLAY_SYMBOL]||{};
+const{createNativeRightbarContinuityOverlay}=OVERLAY;
 const RIGHTBAR_TARGET_MARKERS=[
 "data-sidebar-right-panel",// 右栏面板本体
 "data-sidebar-right-open",// 面板展开状态（动画开始）
@@ -7958,6 +6585,8 @@ const RIGHTBAR_TARGET_MARKERS=[
 "data-rightbar-instant",// AppFrame 瞬时展开状态
 "data-dsh-better-sidebar",
 ];
+const RIGHTBAR_TRANSITION_VAR="--ds-transition-duration-slow";
+const RIGHTBAR_INSTANT_FALLBACK_MS=250;
 const rightbarTransitionTargets=()=>{
 const targets=[];
 const byElement=new Map();// element → targets 下标：同一元素只保留一次
@@ -7983,15 +6612,14 @@ push(doc.querySelector("[data-dsh-better-sidebar] > [class*='panel']:not([class*
 push(doc.querySelector("#root"),"frame");
 }catch{/* 探测失败：返回已收集到的部分，其余按「无法抑制」处理。 */}
 return targets;
-};
+}
 const frameRightbarCollapsed=()=>{
 try{
 const doc=globalThis.document;
 if(!doc||typeof doc.querySelector!=="function")return false;
 return doc.querySelector("[data-rightbar-collapsed]")!==null;
 }catch{return false;}
-};
-const RIGHTBAR_TRANSITION_VAR="--ds-transition-duration-slow";
+}
 const suppressRightbarTransition=()=>{
 const handled=new Set();
 const restores=[];
@@ -8083,8 +6711,8 @@ for(const restore of restores){
 try{restore();}catch{/* 单个目标还原失败不能阻断其它目标。 */}
 }
 };
-};
-const RIGHTBAR_INSTANT_FALLBACK_MS=250;
+}
+function createInstantRestoreScheduler(){
 let pendingInstantRestore=null;// { restore, cancel }
 const flushInstantRestore=()=>{
 const pending=pendingInstantRestore;
@@ -8129,14 +6757,189 @@ return;
 }
 pendingInstantRestore={restore,cancel};
 };
+return Object.freeze({flushInstantRestore,scheduleInstantRestore});
+}
+function createSidebarInstallLayout(frame){
+const config=frame.config;
+const rightbarDragLock=createRightbarDragLock();
+const splitTrackRatio=createSplitTrackRatio();
+let splitTrackReader=null;
+const requestSplitTrackSync=()=>{
+if(splitTrackReader===null||frame.disposed)return false;
+return splitTrackRatio.sync(splitTrackReader.readTarget);
+};
+let rightbarDragSyncImpl=null;
+const requestRightbarDragSync=()=>{
+if(rightbarDragSyncImpl===null||frame.disposed)return;
+try{rightbarDragSyncImpl();}catch{/* 手柄锁只是体验优化，绝不影响面板渲染。 */}
+};
+const releaseRightbarDragLock=()=>{
+if(frame.disposed)return;
+try{rightbarDragLock.setLocked(false);}catch{/* 同上。 */}
+try{requestSplitTrackSync();}catch{/* 配比只是布局微调，绝不影响卸载。 */}
+};
+const surfaceRecords=new Map();
+const MAX_SURFACE_OPEN_ATTEMPTS=3;
+const MAX_SURFACE_OPEN_RETRIES=1;
+const SURFACE_OPEN_DELAY_MS=0;
+const SURFACE_OPEN_RETRY_MS=250;
+const MAX_READINESS_RETRIES=3;
+const HOST_COMMIT_RETRY_MS=250;
+const surfaceRecordOf=(sessionId)=>{
+let record=surfaceRecords.get(sessionId);
+if(record===undefined){
+record={
+visitEpoch:0,
+openAttempts:0,
+openRetries:0,
+openFailures:0,
+openState:"idle",
+expandDone:false,
+readinessRetries:0,
+commitState:"unknown",
+transitionRestore:null,
+continuityRelease:null,
+};
+surfaceRecords.set(sessionId,record);
+}
+return record;
+};
+const releaseContinuityOverlayOf=(record)=>{
+if(record===undefined||record===null)return false;
+const release=record.continuityRelease??null;
+record.continuityRelease=null;
+if(typeof release!=="function")return false;
+try{release();}catch{/* 释放失败不能阻断其它收尾动作。 */}
+return true;
+};
+const releaseTransitionRestore=(record,options={})=>{
+if(record===undefined||record===null)return false;
+if(options.keepContinuity!==true)releaseContinuityOverlayOf(record);
+const restore=record.transitionRestore??null;
+record.transitionRestore=null;
+if(typeof restore!=="function")return false;
+try{restore();}catch{/* 恢复失败不能阻断其它收尾动作。 */}
+return true;
+};
+const beginVisitFor=(sessionId,epoch)=>{
+const record=surfaceRecordOf(sessionId);
+if(record.visitEpoch===epoch)return record;
+releaseTransitionRestore(record,{keepContinuity:true});
+record.visitEpoch=epoch;
+record.openAttempts=0;
+record.openRetries=0;
+record.openFailures=0;
+record.openState="idle";
+record.expandDone=false;
+record.readinessRetries=0;
+record.commitState="unknown";
+return record;
+};
+let currentVisitKey=null;
+let currentVisitEpoch=0;
+let currentVisitSessionId=null;
+const beginVisit=(current,hostSessionId)=>{
+const key=String(current)+"|"+String(hostSessionId)+"|"+String(frame.target.remountSerial());
+if(key===currentVisitKey)return currentVisitEpoch;
+currentVisitKey=key;
+currentVisitEpoch+=1;
+if(currentVisitSessionId!==null){
+frame.expand.cancelSurfaceOpenTimer(currentVisitSessionId);
+frame.expand.cancelRightbarExpand(currentVisitSessionId);
+releaseTransitionRestore(surfaceRecords.get(currentVisitSessionId),{
+keepContinuity:currentVisitSessionId===current&&hostSessionId!==null,
+});
+}
+currentVisitSessionId=current;
+return currentVisitEpoch;
+};
+const readHostActiveSurface=()=>{
+const better=frame.better;
+let readSnapshot;
+try{
+const candidate=better?.getSnapshot;
+if(typeof candidate!=="function")return{available:false,sessionId:null};
+readSnapshot=candidate;
+}catch{return{available:false,sessionId:null};}
+try{
+return{available:true,sessionId:text(object(readSnapshot.call(better)).sessionId,null)};
+}catch{return{available:false,sessionId:null};}
+};
+const instantRestore=createInstantRestoreScheduler();
 const continuityOverlay=createNativeRightbarContinuityOverlay();
 const rightbarWidths=new Map();
 const rightbarWidthViewports=new Map();
-let rightbarWidthSurfaceSessionId=null;
 const rightbarWidthModes=new Map();
 const rightbarWidthPreparedSessions=new Set();
 const rightbarWidthActiveSessions=new Set();
 const rightbarWidthRecoveries=new Map();
+const rightbarSplitTransactions=new Map();
+const widthState={
+widths:rightbarWidths,
+viewports:rightbarWidthViewports,
+modes:rightbarWidthModes,
+prepared:rightbarWidthPreparedSessions,
+active:rightbarWidthActiveSessions,
+recoveries:rightbarWidthRecoveries,
+splitTransactions:rightbarSplitTransactions,
+};
+const clearWidthState=()=>{
+rightbarWidths.clear();
+rightbarWidthViewports.clear();
+rightbarWidthModes.clear();
+rightbarWidthPreparedSessions.clear();
+rightbarWidthActiveSessions.clear();
+rightbarWidthRecoveries.clear();
+};
+return Object.freeze({
+beginVisit,
+beginVisitFor,
+clearWidthState,
+continuityOverlay,
+currentVisitEpoch:()=>currentVisitEpoch,
+flushInstantRestore:instantRestore.flushInstantRestore,
+readHostActiveSurface,
+releaseRightbarDragLock,
+releaseTransitionRestore,
+requestRightbarDragSync,
+requestSplitTrackSync,
+rightbarDragLock,
+scheduleInstantRestore:instantRestore.scheduleInstantRestore,
+setDragSyncImpl:(impl)=>{rightbarDragSyncImpl=impl;},
+setSplitTrackReader:(reader)=>{splitTrackReader=reader;},
+suppressRightbarTransition,
+splitTrackRatio,
+surfaceRecordOf,
+surfaceRecords,
+widthState,
+});
+}
+global[SYMBOL]=Object.freeze({createSidebarInstallLayout});
+})(globalThis);
+/* source: client-sidebar-install-width.js */
+(function installSidebarInstallWidth(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-install-width");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+OTHER_RIGHTBAR_WIDTH_RATIO,RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX,RIGHTBAR_WIDTH_RECOVERY_MAX_ATTEMPTS,
+clampRightbarWidthRatio,resolveExpertRightbarWidthRatio,storeRightbarWidthRatio,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+hostAppFrameWidthOf,methodOf,rightbarPanelForSession,viewportWidthOf,
+}=DOM;
+function createWidthBookkeeping(frame){
+const state=frame.layout.widthState;
+const rightbarWidths=state.widths;
+const rightbarWidthModes=state.modes;
+const rightbarWidthPreparedSessions=state.prepared;
+const rightbarWidthActiveSessions=state.active;
+const rightbarWidthRecoveries=state.recoveries;
+const rightbarSplitTransactions=state.splitTransactions;
+let rightbarWidthSurfaceSessionId=null;
 const clearRightbarWidthRecovery=(sessionId)=>{
 if(sessionId===null||sessionId===undefined)return;
 rightbarWidthRecoveries.delete(sessionId);
@@ -8170,16 +6973,16 @@ if(previous!==null&&previous!==next)clearRightbarWidthRecovery(sessionId);
 };
 const isWidthPrepared=(sessionId)=>sessionId!==null&&sessionId!==undefined
 &&rightbarWidthPreparedSessions.has(sessionId);
-const setWidthPrepared=(sessionId,prepared)=>{
+const setWidthPrepared=(sessionId,value)=>{
 if(sessionId===null||sessionId===undefined)return;
-if(prepared===true)rightbarWidthPreparedSessions.add(sessionId);
+if(value===true)rightbarWidthPreparedSessions.add(sessionId);
 else rightbarWidthPreparedSessions.delete(sessionId);
 };
 const isWidthActive=(sessionId)=>sessionId!==null&&sessionId!==undefined
 &&rightbarWidthActiveSessions.has(sessionId);
-const setWidthActive=(sessionId,active)=>{
+const setWidthActive=(sessionId,value)=>{
 if(sessionId===null||sessionId===undefined)return;
-if(active===true)rightbarWidthActiveSessions.add(sessionId);
+if(value===true)rightbarWidthActiveSessions.add(sessionId);
 else rightbarWidthActiveSessions.delete(sessionId);
 };
 const clearRightbarWidthMarks=(sessionId)=>{
@@ -8194,7 +6997,6 @@ const previous=rightbarWidthSurfaceSessionId;
 if(previous!==null&&previous!==sessionId)clearRightbarWidthMarks(previous);
 rightbarWidthSurfaceSessionId=sessionId;
 };
-const rightbarSplitTransactions=new Map();
 const transactionOf=(token)=>{
 if(token===null||token===undefined)return null;
 for(const transaction of rightbarSplitTransactions.values()){
@@ -8209,7 +7011,7 @@ rightbarSplitTransactions.delete(transaction.sessionId);
 };
 const cancelAllSidebarSplits=(reason)=>{
 for(const transaction of[...rightbarSplitTransactions.values()]){
-try{cancelSidebarSplit(transaction.token,{reason});}catch{/* 单条收口失败不能阻断其余事务与 disposer。 */}
+try{frame.target.cancelSidebarSplit(transaction.token,{reason});}catch{/* 单条收口失败不能阻断其余事务与 disposer。 */}
 }
 };
 const clearSidebarSplitDeadline=(transaction)=>{
@@ -8219,6 +7021,33 @@ transaction.deadlineTimer=null;
 if(timer===null||timer===undefined)return;
 try{globalThis.clearTimeout?.(timer);}catch{/* 收口路径必须继续执行。 */}
 };
+return Object.freeze({
+allowRightbarRecoveryWrite,
+cancelAllSidebarSplits,
+hasSplitTransaction:(sessionId)=>rightbarSplitTransactions.has(sessionId),
+hasWidthTarget:(sessionId)=>rightbarWidths.has(sessionId),
+splitTransactions:rightbarSplitTransactions,
+splitTransactionsList:()=>[...rightbarSplitTransactions],
+surfaceSessionId:()=>rightbarWidthSurfaceSessionId,
+claimRightbarWidthOwnership,
+clearRightbarWidthMarks,
+clearRightbarWidthRecovery,
+clearSidebarSplitDeadline,
+isWidthActive,
+isWidthPrepared,
+releaseSidebarSplitTransaction,
+setWidthActive,
+setWidthMode,
+setWidthPrepared,
+transactionOf,
+widthModeOf,
+});
+}
+function createRightbarWidthWriter(frame){
+const config=frame.config;
+const state=frame.layout.widthState;
+const rightbarWidths=state.widths;
+const rightbarWidthViewports=state.viewports;
 const applyRightbarWidth=(sessionId,ratio=resolveExpertRightbarWidthRatio(),force=false)=>{
 if(sessionId===null||sessionId===undefined)return false;
 const viewportWidth=viewportWidthOf();
@@ -8227,7 +7056,7 @@ const normalizedRatio=Number(ratio);
 if(!Number.isFinite(normalizedRatio)||normalizedRatio<=0)return false;
 const target=Math.round(viewportWidth*normalizedRatio);
 if(force!==true&&rightbarWidths.get(sessionId)===target)return false;
-const layout=config.layout||optionalService("layout");
+const layout=config.layout||frame.optionalService("layout");
 let panels=null;
 try{panels=layout?.panels??null;}catch{panels=null;}
 const setRightbar=methodOf(panels,"setRightbar");
@@ -8244,7 +7073,7 @@ return false;
 }
 rightbarWidths.set(sessionId,target);
 rightbarWidthViewports.set(sessionId,viewportWidth);
-claimRightbarWidthOwnership(sessionId);
+frame.width.claimRightbarWidthOwnership(sessionId);
 return true;
 };
 const rightbarWidthViewportChanged=(sessionId)=>{
@@ -8270,10 +7099,6 @@ try{width=Number(rect.width);}catch{return null;}
 if(Number.isFinite(width)!==true||width<=0)return null;
 return width;
 };
-const hostWidthMatchesPluginTarget=(sessionId)=>{
-const ownership=rightbarOwnershipOf(sessionId);
-return ownership!==null&&ownership.matches===true;
-};
 const rightbarOwnershipOf=(sessionId)=>{
 const target=rightbarWidths.get(sessionId);
 if(typeof target!=="number"||Number.isFinite(target)!==true)return null;
@@ -8287,8 +7112,12 @@ matches:delta<=RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX,
 differs:delta>RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX,
 };
 };
+const hostWidthMatchesPluginTarget=(sessionId)=>{
+const ownership=rightbarOwnershipOf(sessionId);
+return ownership!==null&&ownership.matches===true;
+};
 const settleRightbarRecovery=(sessionId,ownership)=>{
-if(ownership!==null&&ownership.matches===true)clearRightbarWidthRecovery(sessionId);
+if(ownership!==null&&ownership.matches===true)frame.width.clearRightbarWidthRecovery(sessionId);
 };
 const recoverRightbarWidth=(sessionId,ratio,ownership)=>{
 if(sessionId===null||sessionId===undefined)return false;
@@ -8299,7 +7128,7 @@ const expectedTarget=Math.round(viewportWidth*ratio);
 if(Math.abs(ownership.actualWidth-expectedTarget)<=RIGHTBAR_WIDTH_OWNERSHIP_TOLERANCE_PX){
 return applyRightbarWidth(sessionId,ratio,true)===true;
 }
-if(allowRightbarRecoveryWrite(sessionId,expectedTarget,ownership.actualWidth)!==true)return false;
+if(frame.width.allowRightbarRecoveryWrite(sessionId,expectedTarget,ownership.actualWidth)!==true)return false;
 return applyRightbarWidth(sessionId,ratio,true)===true;
 };
 const recomputeOwnedWidth=(sessionId)=>{
@@ -8309,7 +7138,7 @@ const ownership=rightbarOwnershipOf(sessionId);
 settleRightbarRecovery(sessionId,ownership);
 const hostReclaimed=ownership!==null&&ownership.differs===true;
 if(viewportChanged!==true&&hostReclaimed!==true)return false;
-const mode=widthModeOf(sessionId);
+const mode=frame.width.widthModeOf(sessionId);
 let ratio=null;
 if(mode==="expert"){
 ratio=resolveExpertRightbarWidthRatio();
@@ -8317,15 +7146,85 @@ ratio=resolveExpertRightbarWidthRatio();
 if(viewportChanged!==true)return false;
 if(ownership===null||ownership.matches!==true)return false;
 ratio=OTHER_RIGHTBAR_WIDTH_RATIO;
-}else if(mode===null&&(isWidthPrepared(sessionId)||isWidthActive(sessionId))){
+}else if(mode===null&&(frame.width.isWidthPrepared(sessionId)||frame.width.isWidthActive(sessionId))){
 ratio=resolveExpertRightbarWidthRatio();
 }
 if(ratio===null)return false;
 return recoverRightbarWidth(sessionId,ratio,ownership)===true;
 };
+const applyRightbarWidthRatio=(ratio,options={})=>{
+const clamped=clampRightbarWidthRatio(ratio);
+if(clamped===null)return null;
+if(options.persist===true)storeRightbarWidthRatio(clamped);
+const sessionId=frame.target.currentSurfaceSessionId();
+if(sessionId===null)return clamped;
+if(frame.width.hasSplitTransaction(sessionId))return clamped;
+if(applyRightbarWidth(sessionId,clamped,true)!==true)return clamped;
+setWidthPrepared(sessionId,false);
+setWidthActive(sessionId,true);
+setWidthMode(sessionId,"expert");
+return clamped;
+};
+return Object.freeze({
+applyRightbarWidth,
+applyRightbarWidthRatio,
+hostWidthMatchesPluginTarget,
+readRightbarPanelWidth,
+recomputeOwnedWidth,
+recoverRightbarWidth,
+rightbarOwnershipOf,
+rightbarWidthViewportChanged,
+settleRightbarRecovery,
+});
+}
+global[SYMBOL]=Object.freeze({createRightbarWidthWriter,createWidthBookkeeping});
+})(globalThis);
+/* source: client-sidebar-install-expand.js */
+(function installSidebarInstallExpand(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-install-expand");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+EXPERT_GROUP_TAB_IDS,RIGHTBAR_PANEL_SELECTOR,RIGHTBAR_TAB_SELECTOR,
+isGeneratedExpertGroupTabId,object,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{methodOf,rightbarPanelForSession}=DOM;
 const RIGHTBAR_EXPAND_DELAY_MS=0;// 至少一个宏任务：排到宿主本次提交（surface/seat）之后
 const RIGHTBAR_EXPAND_RETRY_MS=250;// 调用抛错后的短重试间隔
 const RIGHTBAR_EXPAND_MAX_ATTEMPTS=3;// 每个 surface 的调用尝试上限（含自动重试）
+const MAX_SURFACE_OPEN_ATTEMPTS=3;
+const MAX_SURFACE_OPEN_RETRIES=1;
+const SURFACE_OPEN_DELAY_MS=0;
+const SURFACE_OPEN_RETRY_MS=250;
+const MAX_READINESS_RETRIES=3;
+const HOST_COMMIT_RETRY_MS=250;
+const RIGHTBAR_PRESENTED_KEY="dsh-expert-group:rightbar-presented:v1";
+const readPersistedRightbarPresented=()=>{
+try{
+const storage=globalThis.localStorage;
+if(!storage||typeof storage.getItem!=="function")return false;
+return storage.getItem(RIGHTBAR_PRESENTED_KEY)==="1";
+}catch{return false;}
+}
+const persistRightbarPresented=()=>{
+try{
+const storage=globalThis.localStorage;
+if(!storage||typeof storage.setItem!=="function")return false;
+storage.setItem(RIGHTBAR_PRESENTED_KEY,"1");
+return true;
+}catch{return false;}
+}
+function createRightbarExpand(frame){
+const config=frame.config;
+const layout=frame.layout;
+const{
+readHostActiveSurface,releaseTransitionRestore,scheduleInstantRestore,suppressRightbarTransition,
+surfaceRecordOf,surfaceRecords,
+}=layout;
+const currentSurfaceSessionIdOf=()=>frame.target.currentSurfaceSessionId();
 const rightbarExpandTimers=new Map();
 const rightbarExpandFailures=new Map();
 let rightbarPresented=false;
@@ -8346,7 +7245,7 @@ const releasePrepared=()=>{
 if(typeof preparedRestore!=="function")return;
 try{preparedRestore();}catch{/* 恢复失败不能阻断其它收尾。 */}
 };
-const layout=config.layout||optionalService("layout");
+const layout=config.layout||frame.optionalService("layout");
 let openRightbar=null;
 try{
 const candidate=layout?.openRightbar;
@@ -8372,7 +7271,7 @@ if(restoreTransition!==null)scheduleInstantRestore(restoreTransition);
 return result;
 };
 const scheduleRightbarExpand=(sessionId,epoch,delay)=>{
-if(disposed||sessionId===null)return false;
+if(frame.disposed||sessionId===null)return false;
 if(rightbarPresented)return false;
 const record=surfaceRecordOf(sessionId);
 if(record.visitEpoch!==epoch)return false;
@@ -8391,7 +7290,7 @@ rightbarExpandTimers.set(sessionId,timer);
 return true;
 };
 const runRightbarExpand=(sessionId,epoch)=>{
-if(disposed)return;
+if(frame.disposed)return;
 const record=surfaceRecordOf(sessionId);
 if(rightbarPresented){
 releaseTransitionRestore(record);
@@ -8403,7 +7302,7 @@ if((rightbarExpandFailures.get(sessionId)||0)>=RIGHTBAR_EXPAND_MAX_ATTEMPTS){
 releaseTransitionRestore(record);
 return;
 }
-if(currentSurfaceSessionId()!==sessionId){
+if(currentSurfaceSessionIdOf()!==sessionId){
 releaseTransitionRestore(record);
 return;
 }
@@ -8436,7 +7335,7 @@ releaseTransitionRestore(record);
 }
 };
 const scheduleCurrentSurfaceExpand=()=>{
-const current=currentSurfaceSessionId();
+const current=currentSurfaceSessionIdOf();
 const record=current===null?undefined:surfaceRecords.get(current);
 if(rightbarPresented){
 const preparedRestore=typeof record?.transitionRestore==="function"?record.transitionRestore:null;
@@ -8447,16 +7346,41 @@ return;
 }
 if(current===null)return;
 if(record===undefined)return;
-if(record.visitEpoch!==currentVisitEpoch)return;
+if(record.visitEpoch!==frame.layout.currentVisitEpoch())return;
 if(record.openState!=="opened")return;
 if(record.expandDone)return;
 if(scheduleRightbarExpand(current,record.visitEpoch,RIGHTBAR_EXPAND_DELAY_MS)!==true){
 releaseTransitionRestore(record);
 }
 };
+const armSuppression=(record)=>{
+if(rightbarPresentedPersisted&&typeof record.transitionRestore!=="function"){
+record.transitionRestore=suppressRightbarTransition();
+}
+};
+return Object.freeze({
+armSuppression,
+cancelAllRightbarExpands,
+cancelRightbarExpand,
+isPersisted:()=>rightbarPresentedPersisted,
+isPresented:()=>rightbarPresented,
+endPresentation:(sessionId)=>{
+rightbarPresented=false;
+cancelRightbarExpand(sessionId);
+rightbarExpandFailures.clear();
+},
+scheduleCurrentSurfaceExpand,
+scheduleRightbarExpand,
+});
+}
+function createRightbarComposition(frame){
+const config=frame.config;
+const sessions=frame.sessions;
+const nativeSidebar=frame.nativeSidebar;
+const{readHostActiveSurface}=frame.layout;
 const nativeSidebarFor=(target)=>{
 if(typeof config.sidebarRightForSession==="function"){
-try{return config.sidebarRightForSession(target,ctx);}catch{return null;}
+try{return config.sidebarRightForSession(target,frame.ctx);}catch{return null;}
 }
 try{
 const scoped=typeof sessions?.scope==="function"?sessions.scope(target):null;
@@ -8597,6 +7521,27 @@ try{inventoryUnavailable=readSurfaceOpenTabs()===null;}catch{inventoryUnavailabl
 try{domUnavailable=readRightbarDomComposition()===null;}catch{domUnavailable=true;}
 return inventoryUnavailable&&domUnavailable;
 };
+return Object.freeze({
+activeTabEvidenceOf,
+compositionReadFacesUnavailable,
+hasExistingExpertGroupTab,
+hasOtherRightbarPage,
+nativeSidebarFor,
+readRightbarDomComposition,
+readSurfaceOpenTabs,
+rightbarCompositionEvidenceOf,
+});
+}
+function createSurfaceOpen(frame){
+const better=frame.better;
+const layout=frame.layout;
+const{readHostActiveSurface,releaseTransitionRestore,surfaceRecordOf}=layout;
+const activeTabEvidenceOf=(sessionId)=>frame.expand.activeTabEvidenceOf(sessionId);
+const armSuppression=(record)=>frame.expand.armSuppression(record);
+const hasExistingExpertGroupTab=(sessionId)=>frame.expand.hasExistingExpertGroupTab(sessionId);
+const scheduleCurrentSurfaceExpand=(...args)=>frame.expand.scheduleCurrentSurfaceExpand(...args);
+const openNativeTab=(target)=>frame.target.openNativeTab(target);
+const currentSurfaceSessionIdOf=()=>frame.target.currentSurfaceSessionId();
 const openSurfaceTab=(target)=>{
 if(better){
 if(typeof better.openTab!=="function")return false;
@@ -8622,11 +7567,11 @@ const cancelAllSurfaceOpens=()=>{
 for(const sessionId of[...surfaceOpenTimers.keys()])cancelSurfaceOpenTimer(sessionId);
 };
 const scheduleSurfaceOpen=(sessionId,epoch,delay)=>{
-if(disposed||sessionId===null)return false;
+if(frame.disposed||sessionId===null)return false;
 const record=surfaceRecordOf(sessionId);
 if(record.visitEpoch!==epoch)return false;
 if(record.openState==="opened")return false;
-if(record.openAttempts>=MAX_SURFACE_OPEN_ATTEMPTS)return false;
+if(record.openAttempts>=frame.layout.maxSurfaceOpenAttempts)return false;
 if(surfaceOpenTimers.has(sessionId))return false;
 let timer;
 try{
@@ -8641,11 +7586,12 @@ surfaceOpenTimers.set(sessionId,timer);
 return true;
 };
 const runSurfaceOpen=(sessionId,epoch)=>{
-if(disposed)return;
-const record=surfaceRecordOf(sessionId);
+if(frame.disposed)return;
+const layout=frame.layout;
+const record=layout.surfaceRecordOf(sessionId);
 if(record.visitEpoch!==epoch)return;
 if(record.openState==="opened")return;
-if(currentSurfaceSessionId()!==sessionId)return;
+if(currentSurfaceSessionIdOf()!==sessionId)return;
 const host=readHostActiveSurface();
 if(host.available&&host.sessionId!==sessionId){
 if(record.readinessRetries<MAX_READINESS_RETRIES
@@ -8668,9 +7614,7 @@ scheduleCurrentSurfaceExpand();
 return;
 }
 record.openAttempts+=1;
-if(rightbarPresentedPersisted&&typeof record.transitionRestore!=="function"){
-record.transitionRestore=suppressRightbarTransition();
-}
+armSuppression(record);
 const opened=openSurfaceTab(sessionId);
 const evidence=opened?activeTabEvidenceOf(sessionId):"unknown";
 if(opened&&(evidence==="confirmed"||evidence==="unknown")){
@@ -8692,8 +7636,59 @@ record.openRetries+=1;
 releaseTransitionRestore(record);
 }
 };
+return Object.freeze({
+cancelAllSurfaceOpens,
+cancelSurfaceOpenTimer,
+openSurfaceTab,
+surfaceOpenDelayMs:SURFACE_OPEN_DELAY_MS,
+scheduleSurfaceOpen,
+surfaceOpenTimers,
+});
+}
+global[SYMBOL]=Object.freeze({createRightbarComposition,createRightbarExpand,createSurfaceOpen});
+})(globalThis);
+/* source: client-sidebar-install-target.js */
+(function installSidebarInstallTarget(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-install-target");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+OTHER_RIGHTBAR_WIDTH_RATIO,SIDEBAR_SPLIT_TRANSACTION_TIMEOUT_MS,
+resolveExpertRightbarWidthRatio,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{currentSessionIdOf,listSnapshot}=DOM;
+function createSidebarInstallTarget(frame){
+const config=frame.config;
+const ctx=frame.ctx;
+const sessions=frame.sessions;
+const better=frame.better;
+const nativeSidebar=frame.nativeSidebar;
+const layout=frame.layout;
+const width=frame.width;
+const expand=frame.expand;
+const{
+beginVisit,beginVisitFor,continuityOverlay,flushInstantRestore,readHostActiveSurface,
+releaseTransitionRestore,requestRightbarDragSync,requestSplitTrackSync,rightbarDragLock,surfaceRecords,
+}=layout;
+const{
+activeTabEvidenceOf,compositionReadFacesUnavailable,hasExistingExpertGroupTab,hasOtherRightbarPage,
+nativeSidebarFor,rightbarCompositionEvidenceOf,scheduleCurrentSurfaceExpand,scheduleSurfaceOpen,
+}=expand;
+const{
+applyRightbarWidth,cancelAllSidebarSplits,claimRightbarWidthOwnership,clearRightbarWidthMarks,hostWidthMatchesPluginTarget,
+isWidthActive,isWidthPrepared,recomputeOwnedWidth,recoverRightbarWidth,rightbarOwnershipOf,
+rightbarWidthViewportChanged,setWidthActive,setWidthMode,setWidthPrepared,settleRightbarRecovery,
+widthModeOf,
+}=width;
+const rightbarSplitTransactions=width.splitTransactions;
+const SURFACE_OPEN_DELAY_MS=expand.surfaceOpenDelayMs;
+const widthSurfaceSessionId=()=>width.surfaceSessionId();
+let currentRemountSerial=0;
 const openTargets=()=>{
-if(disposed)return;
+if(frame.disposed)return;
 const current=currentSurfaceSessionId();
 const targets=current===null?[]:[current];
 if(targets.length===0){
@@ -8716,10 +7711,11 @@ const otherPagePresent=hasOtherRightbarPage(current);
 const splitPending=rightbarSplitTransactions.has(current);
 const expertPageCanOwnWidth=splitPending!==true
 &&widthModeOf(current)!=="other"&&otherPagePresent!==true;
+const rightbarWidthSurfaceSessionId=widthSurfaceSessionId();
 const widthSurfaceChanged=rightbarWidthSurfaceSessionId!==current;
 const shouldPrepareWidth=expertPageCanOwnWidth&&(widthSurfaceChanged
 ||isWidthActive(current)
-||!rightbarWidths.has(current));
+||!width.hasWidthTarget(current));
 if(shouldPrepareWidth&&applyRightbarWidth(current,resolveExpertRightbarWidthRatio(),widthSurfaceChanged)){
 setWidthPrepared(current,true);
 }
@@ -8731,15 +7727,13 @@ if(previousRecord!==undefined
 &&previousRecord.commitState==="confirmed"
 &&activeTabEvidenceOf(current)==="missing"){
 currentRemountSerial+=1;
-rightbarPresented=false;
-cancelRightbarExpand(current);
-rightbarExpandFailures.clear();
+expand.endPresentation(current);
 }
 }
 const epoch=beginVisit(current,observedActive);
 if(current!==null){
 const record=beginVisitFor(current,epoch);
-if(rightbarPresented===true&&rightbarPresentedPersisted===true
+if(expand.isPresented()===true&&expand.isPersisted()===true
 &&typeof record.continuityRelease!=="function"){
 record.continuityRelease=continuityOverlay.capture();
 }
@@ -8748,18 +7742,18 @@ scheduleSurfaceOpen(current,epoch,SURFACE_OPEN_DELAY_MS);
 scheduleCurrentSurfaceExpand();
 requestRightbarDragSync();
 };
-rightbarDragSyncImpl=()=>{
+const rightbarDragSyncImpl=()=>{
 try{requestSplitTrackSync();}catch{/* 配比只是布局微调，绝不影响宽度与手柄的判定。 */}
 const current=currentSurfaceSessionId();
 if(current===null){
 cancelAllSidebarSplits("session-missing");
-clearRightbarWidthMarks(rightbarWidthSurfaceSessionId);
+clearRightbarWidthMarks(widthSurfaceSessionId());
 rightbarDragLock.setLocked(false);
 return;
 }
-for(const[sessionId,transaction]of[...rightbarSplitTransactions]){
+for(const[sessionId,transaction]of width.splitTransactionsList()){
 if(sessionId===current)continue;
-try{cancelSidebarSplit(transaction.token,{reason:"session-switched"});}catch{/* 后续同步仍会重估。 */}
+try{frame.target.cancelSidebarSplit(transaction.token,{reason:"session-switched"});}catch{/* 后续同步仍会重估。 */}
 }
 if(rightbarSplitTransactions.has(current)){
 rightbarDragLock.setLocked(true);
@@ -8831,22 +7825,46 @@ return true;
 }
 return false;
 };
+layout.setDragSyncImpl(rightbarDragSyncImpl);
+return Object.freeze({
+currentSurfaceSessionId,
+openNativeTab,
+resetRemountSerial:()=>{currentRemountSerial=0;},
+remountSerial:()=>currentRemountSerial,
+openTargets,
+rightbarDragSyncImpl,
+});
+}
+function createSidebarSplitTransactions(frame){
+const layout=frame.layout;
+const width=frame.width;
+const expand=frame.expand;
+const{rightbarDragLock}=layout;
+const{
+applyRightbarWidth,claimRightbarWidthOwnership,clearRightbarWidthMarks,clearSidebarSplitDeadline,
+isWidthActive,releaseSidebarSplitTransaction,setWidthActive,setWidthMode,setWidthPrepared,
+transactionOf,widthModeOf,
+}=width;
+const{activeTabEvidenceOf,compositionReadFacesUnavailable,rightbarCompositionEvidenceOf}=expand;
+const rightbarSplitTransactions=width.splitTransactions;
+const currentSurfaceSessionIdOf=()=>frame.target.currentSurfaceSessionId();
 const isActiveOnlySplitCompatible=(sessionId,activeEvidence)=>{
 if(activeEvidence!=="confirmed")return false;
-try{if(currentSurfaceSessionId()!==sessionId)return false;}catch{return false;}
+try{if(currentSurfaceSessionIdOf()!==sessionId)return false;}catch{return false;}
 return compositionReadFacesUnavailable();
 };
 const beginSidebarSplit=(details)=>{
-if(disposed)return{busy:true};
+if(frame.disposed)return{busy:true};
 const input=details!==null&&typeof details==="object"?details:{};
 const sessionId=text(input.sessionId,null);
-if(sessionId===null||currentSurfaceSessionId()!==sessionId)return null;
+if(sessionId===null||currentSurfaceSessionIdOf()!==sessionId)return null;
 if(rightbarSplitTransactions.has(sessionId))return{busy:true};
 let activeEvidence="unknown";
 try{activeEvidence=activeTabEvidenceOf(sessionId);}catch{activeEvidence="unknown";}
 let composition="unknown";
 try{composition=rightbarCompositionEvidenceOf(sessionId,activeEvidence);}catch{composition="unknown";}
-if(composition!=="confirmed"&&isActiveOnlySplitCompatible(sessionId,activeEvidence)!==true)return null;
+if(composition!=="confirmed"
+&&frame.target.isActiveOnlySplitCompatible(sessionId,activeEvidence)!==true)return null;
 const prepared=applyRightbarWidth(sessionId,OTHER_RIGHTBAR_WIDTH_RATIO,true);
 if(prepared!==true)return null;
 const token={};
@@ -8869,11 +7887,11 @@ try{rightbarDragLock.setLocked(true);}catch{/* 锁定失败不阻断公开 split
 try{
 transaction.deadlineTimer=globalThis.setTimeout(()=>{
 if(transactionOf(token)!==null){
-try{cancelSidebarSplit(token,{reason:"deadline"});}catch{/* deadline 仍须保持有界。 */}
+try{frame.target.cancelSidebarSplit(token,{reason:"deadline"});}catch{/* deadline 仍须保持有界。 */}
 }
 },SIDEBAR_SPLIT_TRANSACTION_TIMEOUT_MS);
 }catch{
-cancelSidebarSplit(token,{reason:"deadline-unavailable"});
+frame.target.cancelSidebarSplit(token,{reason:"deadline-unavailable"});
 return null;
 }
 return{token};
@@ -8901,7 +7919,7 @@ if(transaction===null
 clearSidebarSplitDeadline(transaction);
 releaseSidebarSplitTransaction(transaction);
 let current=null;
-try{current=currentSurfaceSessionId();}catch{current=null;}
+try{current=currentSurfaceSessionIdOf();}catch{current=null;}
 if(current!==transaction.sessionId){
 clearRightbarWidthMarks(transaction.sessionId);
 return true;
@@ -8917,7 +7935,7 @@ const transaction=transactionOf(token);
 if(transaction===null)return false;
 clearSidebarSplitDeadline(transaction);
 releaseSidebarSplitTransaction(transaction);
-const current=currentSurfaceSessionId();
+const current=currentSurfaceSessionIdOf();
 if(current!==transaction.sessionId){
 if(current===null){
 const restored=applyRightbarWidth(transaction.sessionId,resolveExpertRightbarWidthRatio(),true);
@@ -8957,7 +7975,87 @@ try{rightbarDragLock.setLocked(false);}catch{/* 后续同步重估。 */}
 }
 return true;
 }
-const panel=createExpertGroupPanel({
+return Object.freeze({
+beginSidebarSplit,
+cancelSidebarSplit,
+isActiveOnlySplitCompatible,
+commitSidebarSplit,
+markSidebarSplitOpen,
+markSidebarSplitPane,
+});
+}
+global[SYMBOL]=Object.freeze({createSidebarInstallTarget,createSidebarSplitTransactions});
+})(globalThis);
+/* source: client-sidebar-install-resources.js */
+(function installSidebarInstallResources(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-install-resources");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{object,resolveExpertRightbarWidthRatio}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{createBrandIcon,viewportWidthOf}=DOM;
+const LAYOUT_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-install-layout");
+const INSTALL_LAYOUT=global[LAYOUT_SYMBOL]||{};
+const{createSidebarInstallLayout}=INSTALL_LAYOUT;
+const WIDTH_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-install-width");
+const INSTALL_WIDTH=global[WIDTH_SYMBOL]||{};
+const{createRightbarWidthWriter,createWidthBookkeeping}=INSTALL_WIDTH;
+const EXPAND_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-install-expand");
+const INSTALL_EXPAND=global[EXPAND_SYMBOL]||{};
+const{createRightbarComposition,createRightbarExpand,createSurfaceOpen}=INSTALL_EXPAND;
+const TARGET_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-install-target");
+const INSTALL_TARGET=global[TARGET_SYMBOL]||{};
+const{createSidebarInstallTarget,createSidebarSplitTransactions}=INSTALL_TARGET;
+function createSidebarInstallCoordinator(ctx,deps,host){
+const config={...object(deps),ctx};
+if(config.taskManagementEnabled===false)return()=>{};
+const optionalService=(name)=>{
+try{
+const value=typeof ctx?.get==="function"?ctx.get(name):null;
+if(value)return value;
+}catch{/* 服务未安装。 */}
+try{return ctx?.[name]||null;}catch{return null;}
+};
+const brandReact=typeof config.react?.createElement==="function"?config.react:null;
+const brandIcon=createBrandIcon(brandReact,object(config.primitives));
+const frame={
+better:config.betterSidebar||optionalService("betterSidebar"),
+brandIcon,
+brandReact,
+config,
+ctx,
+disposed:false,
+nativeSidebar:config.sidebarRight||optionalService("sidebarRight"),
+optionalService,
+sessions:config.sessions||optionalService("sessions"),
+slots:config.slots||optionalService("slots"),
+tabs:config.sidebarRightTabs||optionalService("sidebarRightTabs"),
+};
+const disposers=[];
+frame.layout=createSidebarInstallLayout(frame);
+frame.width={...createWidthBookkeeping(frame),...createRightbarWidthWriter(frame)};
+frame.expand={
+...createRightbarExpand(frame),
+...createRightbarComposition(frame),
+...createSurfaceOpen(frame),
+};
+frame.target={...createSidebarInstallTarget(frame),...createSidebarSplitTransactions(frame)};
+const{
+cancelAllRightbarExpands,cancelAllSurfaceOpens,
+}=frame.expand;
+const{
+cancelAllSidebarSplits,applyRightbarWidthRatio,
+}=frame.width;
+const{
+beginSidebarSplit,cancelSidebarSplit,commitSidebarSplit,markSidebarSplitOpen,markSidebarSplitPane,
+}=frame.target;
+const{
+continuityOverlay,flushInstantRestore,releaseRightbarDragLock,releaseTransitionRestore,
+requestRightbarDragSync,rightbarDragLock,splitTrackRatio,surfaceRecords,
+}=frame.layout;
+const panel=host.createExpertGroupPanel({
 ...config,
 syncRightbarDragLock:requestRightbarDragSync,
 releaseRightbarDragLock,
@@ -8967,25 +8065,15 @@ markSidebarSplitOpen,
 commitSidebarSplit,
 cancelSidebarSplit,
 readRightbarWidthRatio:resolveExpertRightbarWidthRatio,
-applyRightbarWidthRatio:(ratio,options={})=>{
-const clamped=clampRightbarWidthRatio(ratio);
-if(clamped===null)return null;
-if(options.persist===true)storeRightbarWidthRatio(clamped);
-const sessionId=currentSurfaceSessionId();
-if(sessionId===null)return clamped;
-if(rightbarSplitTransactions.has(sessionId))return clamped;
-if(applyRightbarWidth(sessionId,clamped,true)!==true)return clamped;
-setWidthPrepared(sessionId,false);
-setWidthActive(sessionId,true);
-setWidthMode(sessionId,"expert");
-return clamped;
-},
+applyRightbarWidthRatio,
 });
-const unsubscribe=subscribeSessions({...config,sessions},ctx,openTargets);
+const unsubscribe=frame.sessions===null||frame.sessions===undefined
+?null
+:DOM.subscribeSessions({...config,sessions:frame.sessions},ctx,frame.target.openTargets);
 disposers.push(typeof unsubscribe==="function"?unsubscribe:()=>{});
-if(better){
-if(typeof better.registerTab==="function"){
-const release=better.registerTab({
+if(frame.better){
+if(typeof frame.better.registerTab==="function"){
+const release=frame.better.registerTab({
 id:"expert-group",
 title:"expert group",
 single:true,
@@ -8994,16 +8082,16 @@ component:panel,
 });
 if(typeof release==="function")disposers.push(release);
 }
-if(typeof better.subscribeState==="function"){
+if(typeof frame.better.subscribeState==="function"){
 try{
-const unsubscribeState=better.subscribeState(openTargets);
+const unsubscribeState=frame.better.subscribeState(frame.target.openTargets);
 if(typeof unsubscribeState==="function")disposers.push(unsubscribeState);
 }catch{/* 旧版 Better Sidebar 没有设置订阅时仍可初次打开。 */}
 }
-openTargets();
+frame.target.openTargets();
 }else{
-if(typeof tabs?.register==="function"){
-const release=tabs.register({
+if(typeof frame.tabs?.register==="function"){
+const release=frame.tabs.register({
 id:"dsh-expert-group",
 kind:"expert-group",
 keepMounted:true,
@@ -9017,15 +8105,15 @@ description:()=>"查看当前会话的专家任务树",
 });
 if(typeof release==="function")disposers.push(release);
 }
-if(typeof slots?.register==="function"){
-const release=slots.register({name:"sidebar.right.pane.tab",key:"dsh-expert-group"},panel);
+if(typeof frame.slots?.register==="function"){
+const release=frame.slots.register({name:"sidebar.right.pane.tab",key:"dsh-expert-group"},panel);
 if(typeof release==="function")disposers.push(release);
 }
-openTargets();
+frame.target.openTargets();
 }
 let lastObservedViewportWidth=viewportWidthOf();
 const onViewportResize=()=>{
-if(disposed)return;
+if(frame.disposed)return;
 const viewportWidth=viewportWidthOf();
 if(viewportWidth===null)return;
 if(lastObservedViewportWidth===viewportWidth)return;
@@ -9042,26 +8130,26 @@ try{viewportTarget.removeEventListener("resize",onViewportResize);}catch{/* 注�
 });
 }
 }catch{/* 没有 window 或代理读取抛错：只靠既有 observer 与 2.5 秒轮询兜底。 */}
-splitTrackReader={
+frame.layout.setSplitTrackReader({
 readTarget(doc){
 let sessionId=null;
-try{sessionId=currentSurfaceSessionId();}catch{sessionId=null;}
+try{sessionId=frame.target.currentSurfaceSessionId();}catch{sessionId=null;}
 if(typeof sessionId!=="string"||sessionId==="")return null;
-const tabSets=sidebarTabSetsForSession(readSurfaceOpenTabs(),sessionId);
+const tabSets=DOM.sidebarTabSetsForSession(frame.expand.readSurfaceOpenTabs(),sessionId);
 if(tabSets===null)return null;
-const panel=rightbarPanelForSession(doc,sessionId);
+const panel=DOM.rightbarPanelForSession(doc,sessionId);
 if(panel===null)return null;
-const container=resolveSplitContainer(panel,tabSets);
+const container=DOM.resolveSplitContainer(panel,tabSets);
 if(container!==null)return{status:"target",container};
-const candidates=splitPairPendingContainers(panel,tabSets);
+const candidates=DOM.splitPairPendingContainers(panel,tabSets);
 if(candidates.length===1)return{status:"pending",container:candidates[0]};
 return null;
 },
-};
-try{requestSplitTrackSync();}catch{/* 配比只是布局微调，绝不影响 install。 */}
-return()=>{
-if(disposed)return;
-disposed=true;
+});
+try{frame.layout.requestSplitTrackSync();}catch{/* 配比只是布局微调，绝不影响 install。 */}
+const disposeAll=()=>{
+if(frame.disposed)return;
+frame.disposed=true;
 cancelAllSidebarSplits("dispose");
 cancelAllRightbarExpands();
 cancelAllSurfaceOpens();
@@ -9070,16 +8158,3154 @@ for(const record of surfaceRecords.values())releaseTransitionRestore(record);
 continuityOverlay.release();
 rightbarDragLock.dispose();
 splitTrackRatio.dispose();
-rightbarWidths.clear();
-rightbarWidthViewports.clear();
-rightbarWidthModes.clear();
-rightbarWidthPreparedSessions.clear();
-rightbarWidthActiveSessions.clear();
-rightbarWidthRecoveries.clear();
+frame.layout.clearWidthState();
 for(let index=disposers.length-1;index>=0;index-=1){
 try{disposers[index]();}catch{/* 一个 disposer 失败不能阻止其它所有权释放。 */}
 }
 };
+return disposeAll;
+}
+global[SYMBOL]=Object.freeze({createSidebarInstallCoordinator});
+})(globalThis);
+/* source: client-sidebar-panel-hooks-state.js */
+(function installSidebarPanelHooksState(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-state");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+RIGHTBAR_WIDTH_RATIO,RIGHTBAR_WIDTH_RATIO_MAX,RIGHTBAR_WIDTH_RATIO_MIN,clampRightbarWidthRatio,normalizeHostMeta,normalizeSessionModelView,
+object,sessionModelRolesOf,snapshotHasUsageFact,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+getOpenSession,methodOf,viewportWidthOf,
+}=DOM;
+const POLL_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-poll");
+const POLL=global[POLL_SYMBOL]||{};
+const{
+callRpc,
+}=POLL;
+const SPLIT_SYNC_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-split-sync");
+const SPLIT_SYNC=global[SPLIT_SYNC_SYMBOL]||{};
+const PANEL_STATE_A_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-state-a");
+const PANEL_STATE_A=global[PANEL_STATE_A_SYMBOL]||{};
+const PANEL_STATE_B_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-state-b");
+const PANEL_STATE_B=global[PANEL_STATE_B_SYMBOL]||{};
+function useSidebarPanelStateCore(frame){
+const{
+initialStateFor,react,rootSessionId,
+}=frame;
+const statePair=typeof react.useState==="function"
+?react.useState(()=>initialStateFor(rootSessionId))
+:[initialStateFor(rootSessionId),()=>{}];
+const state=statePair[0];
+const setState=statePair[1];
+const viewState=state.rootSessionId===rootSessionId?state:initialStateFor(rootSessionId);
+const versionPair=typeof react.useState==="function"?react.useState(0):[0,()=>{}];
+const version=versionPair[0];
+const bump=versionPair[1];
+const autoOpenDraftPair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
+const autoOpenDraft=autoOpenDraftPair[0];
+const setAutoOpenDraft=autoOpenDraftPair[1];
+const emptyFilter=PANEL_STATE_A.EMPTY_TASK_FILTER;
+const filterPair=typeof react.useState==="function"
+?react.useState(emptyFilter)
+:[emptyFilter,()=>{}];
+const filterState=filterPair[0]!==null&&typeof filterPair[0]==="object"?filterPair[0]:emptyFilter;
+const setFilterState=filterPair[1];
+const timelineExpandedRef=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
+const metaPair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
+const meta=metaPair[0];
+const setMeta=metaPair[1];
+const metaStateRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+metaStateRef.current=meta;
+const sessionModelOpenPair=typeof react.useState==="function"?react.useState(false):[false,()=>{}];
+const sessionModelOpen=sessionModelOpenPair[0];
+const setSessionModelOpen=sessionModelOpenPair[1];
+const sessionModelStatePair=typeof react.useState==="function"
+?react.useState({status:"idle",overrides:{},revision:0,live:false})
+:[{status:"idle",overrides:{},revision:0,live:false},()=>{}];
+const sessionModelState=sessionModelStatePair[0];
+const setSessionModelState=sessionModelStatePair[1];
+const sessionModelDraftsPair=typeof react.useState==="function"?react.useState({}):[{},()=>{}];
+const sessionModelDrafts=sessionModelDraftsPair[0];
+const setSessionModelDrafts=sessionModelDraftsPair[1];
+const sessionModelSavingPair=typeof react.useState==="function"?react.useState(false):[false,()=>{}];
+const sessionModelSaving=sessionModelSavingPair[0];
+const setSessionModelSaving=sessionModelSavingPair[1];
+const sessionModelNoticePair=typeof react.useState==="function"?react.useState(null):[null,()=>{}];
+const sessionModelNotice=sessionModelNoticePair[0];
+const setSessionModelNotice=sessionModelNoticePair[1];
+const sessionModelReloadPair=typeof react.useState==="function"?react.useState(0):[0,()=>{}];
+const sessionModelReloadToken=sessionModelReloadPair[0];
+const setSessionModelReloadToken=sessionModelReloadPair[1];
+const sessionModelRequestSerialRef=typeof react.useRef==="function"?react.useRef(0):{current:0};
+const sessionModelLoadedRootRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const sessionModelCatalogPair=typeof react.useState==="function"
+?react.useState({groups:[],status:"idle"})
+:[{groups:[],status:"idle"},()=>{}];
+const sessionModelCatalog=sessionModelCatalogPair[0];
+const setSessionModelCatalog=sessionModelCatalogPair[1];
+const sessionModelEntryRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const sessionModelWasOpenRef=typeof react.useRef==="function"?react.useRef(false):{current:false};
+const sessionModelDialogRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const sessionModelSurfaceRef=typeof react.useRef==="function"
+?react.useRef({rootSessionId:null,sidebarSessionId:null})
+:{current:{rootSessionId:null,sidebarSessionId:null}};
+const announcerRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const announcementPair=typeof react.useState==="function"?react.useState(""):["",()=>{}];
+const announcement=announcementPair[0];
+const setAnnouncement=announcementPair[1];
+Object.assign(frame,{
+announcement,announcementPair,announcerRef,autoOpenDraft,autoOpenDraftPair,bump,
+emptyFilter,filterPair,filterState,meta,metaPair,metaStateRef,
+sessionModelCatalog,sessionModelCatalogPair,sessionModelDialogRef,sessionModelDrafts,sessionModelDraftsPair,sessionModelEntryRef,
+sessionModelLoadedRootRef,sessionModelNotice,sessionModelNoticePair,sessionModelOpen,sessionModelOpenPair,sessionModelReloadPair,
+sessionModelReloadToken,sessionModelRequestSerialRef,sessionModelSaving,sessionModelSavingPair,sessionModelState,sessionModelStatePair,
+sessionModelSurfaceRef,sessionModelWasOpenRef,setAnnouncement,setAutoOpenDraft,setFilterState,setMeta,
+setSessionModelCatalog,setSessionModelDrafts,setSessionModelNotice,setSessionModelOpen,setSessionModelReloadToken,setSessionModelSaving,
+setSessionModelState,setState,state,statePair,timelineExpandedRef,version,
+versionPair,viewState,
+});
+}
+function useSidebarPanelWidth(frame){
+const{
+config,react,
+}=frame;
+const readWidthRatio=typeof config.readRightbarWidthRatio==="function"?config.readRightbarWidthRatio:null;
+const applyWidthRatio=typeof config.applyRightbarWidthRatio==="function"?config.applyRightbarWidthRatio:null;
+const widthRatioPair=typeof react.useState==="function"
+?react.useState(()=>{
+const stored=readWidthRatio===null?null:clampRightbarWidthRatio(readWidthRatio());
+return stored===null?RIGHTBAR_WIDTH_RATIO:stored;
+})
+:[RIGHTBAR_WIDTH_RATIO,()=>{}];
+const widthRatio=widthRatioPair[0];
+const setWidthRatio=widthRatioPair[1];
+const widthDragRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const commitWidthRatio=(value,options={})=>{
+const clamped=clampRightbarWidthRatio(value);
+if(clamped===null)return null;
+setWidthRatio(clamped);
+if(applyWidthRatio!==null){
+try{applyWidthRatio(clamped,{persist:options.persist===true});}catch{/* 见上。 */}
+}
+return clamped;
+};
+const widthDragHost=()=>{
+try{return globalThis.window??globalThis;}catch{return null;}
+};
+const detachWidthDrag=(drag)=>{
+const host=widthDragHost();
+if(host===null||drag===null)return;
+try{
+host.removeEventListener?.("pointermove",drag.onMove);
+host.removeEventListener?.("pointerup",drag.onEnd);
+host.removeEventListener?.("pointercancel",drag.onEnd);
+host.removeEventListener?.("mousemove",drag.onMove);
+host.removeEventListener?.("mouseup",drag.onEnd);
+}catch{/* 移除失败不阻断松手收口。 */}
+};
+const endWidthDrag=()=>{
+const drag=widthDragRef.current;
+if(drag===null)return;
+widthDragRef.current=null;
+detachWidthDrag(drag);
+commitWidthRatio(drag.lastRatio,{persist:true});
+};
+const onWidthDragMove=(event)=>{
+const drag=widthDragRef.current;
+if(drag===null)return;
+const clientX=Number(event?.clientX);
+if(Number.isFinite(clientX)!==true)return;
+event?.preventDefault?.();
+const next=PANEL_STATE_A.nextWidthRatioFromDrag({
+startX:drag.startX,
+startRatio:drag.startRatio,
+clientX,
+viewport:viewportWidthOf(),
+});
+if(next===null)return;
+drag.lastRatio=next;
+commitWidthRatio(next,{persist:false});
+};
+const onWidthDragStart=(event)=>{
+if(applyWidthRatio===null)return;
+event?.preventDefault?.();
+event?.stopPropagation?.();
+const clientX=Number(event?.clientX);
+if(Number.isFinite(clientX)!==true)return;
+endWidthDrag();
+const startRatio=clampRightbarWidthRatio(widthRatio)??RIGHTBAR_WIDTH_RATIO;
+const drag={
+startX:clientX,
+startRatio,
+lastRatio:startRatio,
+onMove:null,
+onEnd:null,
+};
+drag.onMove=(moveEvent)=>onWidthDragMove(moveEvent);
+drag.onEnd=()=>endWidthDrag();
+const host=widthDragHost();
+try{
+host?.addEventListener?.("pointermove",drag.onMove);
+host?.addEventListener?.("pointerup",drag.onEnd);
+host?.addEventListener?.("pointercancel",drag.onEnd);
+host?.addEventListener?.("mousemove",drag.onMove);
+host?.addEventListener?.("mouseup",drag.onEnd);
+}catch{/* 监听装不上时手柄仍可用键盘调整。 */}
+widthDragRef.current=drag;
+};
+const onWidthResizerKeyDown=(event)=>{
+const key=event?.key;
+if(key!=="ArrowLeft"&&key!=="ArrowRight"&&key!=="Home"&&key!=="End")return;
+event?.preventDefault?.();
+event?.stopPropagation?.();
+const next=PANEL_STATE_A.nextWidthRatioFromKey(key,widthRatio);
+if(next===null)return;
+commitWidthRatio(next,{persist:true});
+};
+const widthResizer=applyWidthRatio===null
+?null
+:react.createElement("div",{
+className:"deg_expert_group_resizer",
+role:"separator",
+"aria-orientation":"vertical",
+"aria-label":"调整右栏宽度",
+"aria-valuemin":Math.round(RIGHTBAR_WIDTH_RATIO_MIN*100),
+"aria-valuemax":Math.round(RIGHTBAR_WIDTH_RATIO_MAX*100),
+"aria-valuenow":Math.round(widthRatio*100),
+"data-dragging":widthDragRef.current!==null?"true":undefined,
+tabIndex:0,
+onPointerDown:onWidthDragStart,
+onMouseDown:onWidthDragStart,
+onKeyDown:onWidthResizerKeyDown,
+});
+Object.assign(frame,{
+applyWidthRatio,commitWidthRatio,detachWidthDrag,endWidthDrag,onWidthDragMove,onWidthDragStart,
+onWidthResizerKeyDown,readWidthRatio,setWidthRatio,widthDragHost,widthDragRef,widthRatio,
+widthRatioPair,widthResizer,
+});
+}
+function useSidebarPanelStoreAndMeta(frame){
+const{
+config,ctx,model,react,rootSessionId,setMeta,
+sidebarSessionId,
+}=frame;
+const createStore=()=>typeof model.createExpansionStore==="function"
+?model.createExpansionStore({storage:config.storage,rootSessionId})
+:null;
+const store=typeof react.useMemo==="function"
+?react.useMemo(createStore,[config.storage,rootSessionId])
+:createStore();
+const mountedRef=typeof react.useRef==="function"?react.useRef(true):{current:true};
+const requestSequenceRef=typeof react.useRef==="function"?react.useRef(0):{current:0};
+const contextRef=typeof react.useRef==="function"?react.useRef(ctx):{current:ctx};
+contextRef.current=ctx;
+const currentRootRef=typeof react.useRef==="function"?react.useRef(rootSessionId):{current:rootSessionId};
+currentRootRef.current=rootSessionId;
+const currentSidebarSessionRef=typeof react.useRef==="function"?react.useRef(sidebarSessionId):{current:sidebarSessionId};
+currentSidebarSessionRef.current=sidebarSessionId;
+const metaRequestRef=typeof react.useRef==="function"?react.useRef({inFlight:false,promise:null}):{current:{inFlight:false,promise:null}};
+const metaAutoAttemptRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const metaRefreshRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const loadMeta=async()=>{
+if(mountedRef.current!==true)return null;
+const request=metaRequestRef.current;
+if(request.inFlight===true){
+return typeof request.promise?.then==="function"?request.promise:null;
+}
+request.inFlight=true;
+const pending=(async()=>{
+try{
+const body=await callRpc(config,contextRef.current,{action:"meta"},{},(value)=>object(value));
+if(mountedRef.current!==true)return null;
+const normalized=normalizeHostMeta(body);
+setMeta(normalized);
+return normalized;
+}catch{
+return null;
+}finally{
+request.inFlight=false;
+request.promise=null;
+}
+})();
+request.promise=pending;
+return pending;
+};
+metaRefreshRef.current=loadMeta;
+Object.assign(frame,{
+contextRef,createStore,currentRootRef,currentSidebarSessionRef,loadMeta,metaAutoAttemptRef,
+metaRefreshRef,metaRequestRef,mountedRef,requestSequenceRef,store,
+});
+}
+function useSidebarPanelSessionModel(frame){
+const{
+config,contextRef,metaStateRef,mountedRef,rootSessionId,sessionModelCatalog,
+sessionModelDrafts,sessionModelSaving,sessionModelState,setSessionModelDrafts,setSessionModelNotice,setSessionModelSaving,
+setSessionModelState,sidebarSessionId,t,
+}=frame;
+const sidebarSurfaceStillCurrent=(...args)=>frame.late.sidebarSurfaceStillCurrent(...args);
+const updateSessionModelDraft=(role,field,value)=>{
+setSessionModelDrafts((previous)=>PANEL_STATE_B.nextSessionModelDrafts({
+previous,
+role,
+field,
+value,
+overrides:sessionModelState.overrides,
+roleDefaults:metaStateRef.current?.roleDefaults,
+groups:sessionModelCatalog.groups,
+}));
+setSessionModelNotice(null);
+};
+const sessionModelBaselineOf=(role)=>PANEL_STATE_B.sessionModelBaselineOf(
+sessionModelState.overrides,
+metaStateRef.current?.roleDefaults,
+role,
+);
+const sessionModelPendingChanges=()=>PANEL_STATE_B.sessionModelPendingChangesOf({
+drafts:sessionModelDrafts,
+meta:metaStateRef.current,
+baselineOf:sessionModelBaselineOf,
+});
+const sessionModelHasInvalidDraft=()=>PANEL_STATE_B.sessionModelHasInvalidDraftOf({
+drafts:sessionModelDrafts,
+meta:metaStateRef.current,
+});
+const applySessionModelView=(view,role)=>{
+setSessionModelState({status:"ready",overrides:view.overrides,revision:view.revision,live:view.live});
+setSessionModelDrafts((previous)=>PANEL_STATE_B.withoutRoleDraft(previous,role));
+};
+const settleSessionModelFailure=(error,role)=>{
+const roles=sessionModelRolesOf(metaStateRef.current);
+const outcome=PANEL_STATE_B.describeSessionModelFailure({error,role,roles,t});
+if(outcome.statePatch!==null){
+const patch=outcome.statePatch;
+setSessionModelState((previous)=>({
+...previous,
+status:"ready",
+revision:patch.revision===null?previous.revision:patch.revision,
+overrides:patch.overrides===null?previous.overrides:patch.overrides,
+}));
+}
+setSessionModelNotice(outcome.notice);
+};
+const sessionModelWriteReady=()=>PANEL_STATE_B.sessionModelWriteReadyOf({
+mounted:mountedRef.current,
+state:sessionModelState,
+saving:sessionModelSaving,
+rootSessionId,
+sidebarSessionId,
+});
+const commitSessionModelChanges=async()=>{
+if(sessionModelWriteReady()!==true)return;
+if(sessionModelHasInvalidDraft())return;
+const changes=sessionModelPendingChanges();
+if(changes.length===0)return;
+const targetSessionId=rootSessionId;
+const roles=sessionModelRolesOf(metaStateRef.current);
+setSessionModelSaving(true);
+setSessionModelNotice(null);
+let revision=sessionModelState.revision;
+try{
+for(const change of changes){
+const body=await callRpc(
+config,
+contextRef.current,
+{
+action:"session-override-set",
+sessionId:targetSessionId,
+role:change.role,
+expectedRevision:revision,
+selection:change.selection,
+},
+{},
+(value)=>object(value),
+);
+if(sidebarSurfaceStillCurrent()!==true)return;
+const view=normalizeSessionModelView(body,roles);
+if(view===null){
+setSessionModelNotice({kind:"error",role:change.role,text:t("sidebar.sessionModel.unavailable")});
+return;
+}
+revision=view.revision;
+applySessionModelView(view,change.role);
+}
+if(sidebarSurfaceStillCurrent()!==true)return;
+setSessionModelNotice({kind:"saved",revision});
+}catch(error){
+if(sidebarSurfaceStillCurrent()!==true)return;
+settleSessionModelFailure(error,changes[changes.length-1]?.role??null);
+}finally{
+if(sidebarSurfaceStillCurrent()===true)setSessionModelSaving(false);
+}
+};
+const clearSessionModelRole=async(role)=>{
+if(sessionModelWriteReady()!==true)return;
+if(sessionModelState.overrides[role]===undefined)return;
+const targetSessionId=rootSessionId;
+const roles=sessionModelRolesOf(metaStateRef.current);
+setSessionModelSaving(true);
+setSessionModelNotice(null);
+try{
+const body=await callRpc(
+config,
+contextRef.current,
+{
+action:"session-override-clear",
+sessionId:targetSessionId,
+role,
+expectedRevision:sessionModelState.revision,
+},
+{},
+(value)=>object(value),
+);
+if(sidebarSurfaceStillCurrent()!==true)return;
+const view=normalizeSessionModelView(body,roles);
+if(view===null){
+setSessionModelNotice({kind:"error",role,text:t("sidebar.sessionModel.unavailable")});
+return;
+}
+applySessionModelView(view,role);
+setSessionModelNotice({kind:"cleared",role,revision:view.revision});
+}catch(error){
+if(sidebarSurfaceStillCurrent()!==true)return;
+settleSessionModelFailure(error,role);
+}finally{
+if(sidebarSurfaceStillCurrent()===true)setSessionModelSaving(false);
+}
+};
+Object.assign(frame,{
+applySessionModelView,clearSessionModelRole,commitSessionModelChanges,sessionModelBaselineOf,sessionModelHasInvalidDraft,sessionModelPendingChanges,
+sessionModelWriteReady,settleSessionModelFailure,updateSessionModelDraft,
+});
+}
+function useSidebarPanelSessionModelPart2(frame){
+const{
+currentRootRef,currentSidebarSessionRef,mountedRef,react,rootSessionId,sidebarSessionId,
+}=frame;
+const surfaceTokenScopeRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const surfaceTokenRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const derivedSurfaceToken=PANEL_STATE_A.deriveSurfaceToken(
+surfaceTokenScopeRef.current,
+surfaceTokenRef.current,
+rootSessionId,
+sidebarSessionId,
+);
+surfaceTokenScopeRef.current=derivedSurfaceToken.scope;
+surfaceTokenRef.current=derivedSurfaceToken.token;
+const surfaceToken=surfaceTokenRef.current;
+const sidebarSurfaceStillCurrent=()=>mountedRef.current===true
+&&currentRootRef.current===rootSessionId
+&&currentSidebarSessionRef.current===sidebarSessionId
+&&surfaceTokenRef.current===surfaceToken;
+frame.late.sidebarSurfaceStillCurrent=sidebarSurfaceStillCurrent;
+Object.assign(frame,{
+derivedSurfaceToken,sidebarSurfaceStillCurrent,surfaceToken,surfaceTokenRef,surfaceTokenScopeRef,
+});
+}
+function useSidebarPanelHostServices(frame){
+const{
+config,contextRef,sessionId,setAutoOpenDraft,sidebarRight,sidebarSessionId,
+}=frame;
+const navigation=getOpenSession(config,contextRef.current);
+const readAutoOpenSetting=typeof config.getAutoOpenSubagentSidebar==="function"
+?config.getAutoOpenSubagentSidebar
+:null;
+const writeAutoOpenSetting=typeof config.setAutoOpenSubagentSidebar==="function"
+?config.setAutoOpenSubagentSidebar
+:null;
+const autoOpenEnabled=()=>{
+if(readAutoOpenSetting===null)return false;
+try{return readAutoOpenSetting()===true;}catch{return false;}
+};
+const toggleAutoOpen=(next)=>{
+const value=next===true;
+if(writeAutoOpenSetting===null)return;
+setAutoOpenDraft(value);
+void Promise.resolve()
+.then(()=>writeAutoOpenSetting(value))
+.then(
+(accepted)=>{if(accepted!==true)setAutoOpenDraft(null);},
+()=>{setAutoOpenDraft(null);},
+);
+};
+const splitSidebarPane=methodOf(sidebarRight,"split");
+const closeSidebarResource=methodOf(sidebarRight,"close");
+const readActiveSidebarResource=methodOf(sidebarRight,"active");
+const readSidebarOpenTabs=()=>{
+let inventory=null;
+try{inventory=sidebarRight?.openTabs??null;}catch{return null;}
+const getSnapshot=methodOf(inventory,"getSnapshot");
+if(getSnapshot===null)return null;
+try{
+const snapshot=getSnapshot.call(inventory);
+return Array.isArray(snapshot)?snapshot:null;
+}catch{return null;}
+};
+const presentSidebarTabIds=()=>SPLIT_SYNC.presentSidebarTabIds(globalThis.document,sidebarSessionId);
+const existingSubagentPaneId=()=>SPLIT_SYNC.existingSubagentPaneId(
+globalThis.document,
+sidebarSessionId,
+readSidebarOpenTabs(),
+);
+const sidebarSplitTargetEvidence=(resourceAddress,expectedPaneId=null)=>SPLIT_SYNC.sidebarSplitTargetEvidence({
+doc:globalThis.document,
+sidebarSessionId,
+inventory:readSidebarOpenTabs(),
+resourceAddress,
+expectedPaneId,
+});
+const seededGuideTabId=(beforeTabs,sessionId)=>SPLIT_SYNC.seededGuideTabId(
+beforeTabs,
+sessionId,
+readSidebarOpenTabs(),
+);
+const waitForSidebarSplitLayoutCommit=SPLIT_SYNC.waitForSidebarSplitLayoutCommit;
+Object.assign(frame,{
+autoOpenEnabled,closeSidebarResource,existingSubagentPaneId,navigation,presentSidebarTabIds,readActiveSidebarResource,
+readAutoOpenSetting,readSidebarOpenTabs,seededGuideTabId,sidebarSplitTargetEvidence,splitSidebarPane,toggleAutoOpen,
+waitForSidebarSplitLayoutCommit,writeAutoOpenSetting,
+});
+}
+function useSidebarPanelSnapshotDerived(frame){
+const{
+readSidebarOpenTabs,viewState,
+}=frame;
+const sidebarOpenTabsAvailable=readSidebarOpenTabs()!==null;
+const snapshot=viewState.snapshot;
+const partialSnapshot=snapshot?.partial===true;
+const usageFactPresent=snapshot===null?false:snapshotHasUsageFact(snapshot);
+Object.assign(frame,{
+partialSnapshot,sidebarOpenTabsAvailable,snapshot,usageFactPresent,
+});
+}
+global[SYMBOL]=Object.freeze({
+useSidebarPanelHostServices,useSidebarPanelSessionModel,useSidebarPanelSessionModelPart2,
+useSidebarPanelSnapshotDerived,useSidebarPanelStateCore,useSidebarPanelStoreAndMeta,
+useSidebarPanelWidth,
+});
+})(globalThis);
+/* source: client-sidebar-panel-hooks-effects.js */
+(function installSidebarPanelHooksEffects(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-effects");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+ANNOUNCEMENT_MAX_ITEMS,collectAnnouncementTasks,collectSnapshotSessionIds,normalizeSessionModelView,object,safeNormalize,
+sessionModelRolesOf,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+methodOf,subscribeSessions,
+}=DOM;
+const POLL_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-poll");
+const POLL=global[POLL_SYMBOL]||{};
+const{
+PANEL_ERROR_SOURCES,PANEL_POLL_TIMINGS,applyPanelPollCycle,callRpc,fanoutBatchIsStale,panelNextPollDelayMs,
+readFanoutEventBatch,samePanelSnapshot,
+}=POLL;
+const PANEL_STATE_A_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-state-a");
+const PANEL_STATE_A=global[PANEL_STATE_A_SYMBOL]||{};
+function useSidebarPanelAnnouncementEffect(frame){
+const{
+announcerRef,panelLocale,react,rootSessionId,setAnnouncement,state,
+t,
+}=frame;
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(state.snapshot===null)return;
+const tasks=collectAnnouncementTasks(state.snapshot);
+const update=PANEL_STATE_A.nextAnnouncementBaseline(announcerRef.current,rootSessionId,tasks);
+announcerRef.current=update.baseline;
+if(update.events.length===0)return;
+setAnnouncement(PANEL_STATE_A.announcementTextOf({
+events:update.events,
+t,
+locale:panelLocale,
+maxItems:ANNOUNCEMENT_MAX_ITEMS,
+}));
+},[state.snapshot,rootSessionId]);
+}
+Object.assign(frame,{
+});
+}
+function useSidebarPanelSessionModelEffects(frame){
+const{
+config,contextRef,loadMeta,metaStateRef,mountedRef,react,
+rootSessionId,sessionModelDialogRef,sessionModelEntryRef,sessionModelLoadedRootRef,sessionModelOpen,sessionModelReloadToken,
+sessionModelRequestSerialRef,sessionModelSurfaceRef,sessionModelWasOpenRef,setSessionModelCatalog,setSessionModelDrafts,setSessionModelNotice,
+setSessionModelSaving,setSessionModelState,sidebarSessionId,
+}=frame;
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(sessionModelOpen!==true)return()=>{};
+const targetSessionId=rootSessionId;
+const previousSurface=sessionModelSurfaceRef.current;
+const surfaceChanged=previousSurface.rootSessionId!==rootSessionId
+||previousSurface.sidebarSessionId!==sidebarSessionId;
+sessionModelSurfaceRef.current={rootSessionId,sidebarSessionId};
+if(surfaceChanged===true)setSessionModelSaving(false);
+if(sessionModelLoadedRootRef.current!==targetSessionId)setSessionModelNotice(null);
+if(targetSessionId===""||sidebarSessionId!==targetSessionId){
+sessionModelRequestSerialRef.current+=1;
+sessionModelLoadedRootRef.current=null;
+setSessionModelDrafts({});
+setSessionModelNotice(null);
+setSessionModelSaving(false);
+setSessionModelState({
+status:targetSessionId===""?"no-session":"child",
+overrides:{},
+revision:0,
+live:false,
+});
+return()=>{};
+}
+let cancelled=false;
+sessionModelRequestSerialRef.current+=1;
+const serial=sessionModelRequestSerialRef.current;
+setSessionModelState((previous)=>(previous.status==="ready"
+?{...previous,status:"loading"}
+:{status:"loading",overrides:{},revision:0,live:false}));
+void(async()=>{
+try{
+const pending=config.modelCatalog?.load?.();
+if(pending!==null&&pending!==undefined&&typeof pending.catch==="function")pending.catch(()=>{});
+}catch{/* 目录加载失败不阻塞覆盖读取：输入框仍可手填。 */}
+const loaded=await loadMeta();
+if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
+const effectiveMeta=loaded!==null?loaded:metaStateRef.current;
+if(effectiveMeta!==null&&effectiveMeta.capabilities.sessionOverride!==true){
+setSessionModelState({status:"unsupported",overrides:{},revision:0,live:false});
+return;
+}
+let body;
+try{
+body=await callRpc(
+config,
+contextRef.current,
+{action:"session-override-get",sessionId:targetSessionId},
+{},
+(value)=>object(value),
+);
+}catch(error){
+if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
+const code=text(object(error).code,null);
+setSessionModelState({
+status:code==="bad-request"&&effectiveMeta===null?"unsupported":"error",
+overrides:{},
+revision:0,
+live:false,
+});
+return;
+}
+if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
+const roles=sessionModelRolesOf(effectiveMeta);
+const view=normalizeSessionModelView(body,roles);
+if(view===null){
+setSessionModelState({status:"error",overrides:{},revision:0,live:false});
+return;
+}
+if(sessionModelLoadedRootRef.current!==targetSessionId)setSessionModelDrafts({});
+sessionModelLoadedRootRef.current=targetSessionId;
+setSessionModelState({status:"ready",overrides:view.overrides,revision:view.revision,live:view.live});
+})();
+return()=>{cancelled=true;};
+},[sessionModelOpen,rootSessionId,sidebarSessionId,sessionModelReloadToken,config]);
+}
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(sessionModelOpen!==true)return()=>{};
+const catalog=config.modelCatalog;
+if(catalog===null||catalog===undefined||typeof catalog!=="object")return()=>{};
+const read=()=>{
+if(mountedRef.current!==true)return;
+try{
+const snapshot=typeof catalog.getSnapshot==="function"?catalog.getSnapshot():null;
+const source=object(snapshot);
+setSessionModelCatalog({
+groups:Array.isArray(source.groups)?source.groups:[],
+status:text(source.status,"idle"),
+});
+}catch{
+setSessionModelCatalog({groups:[],status:"error"});
+}
+};
+read();
+let unsubscribe=null;
+try{
+if(typeof catalog.subscribe==="function")unsubscribe=catalog.subscribe(read);
+}catch{unsubscribe=null;}
+return()=>{if(typeof unsubscribe==="function")unsubscribe();};
+},[sessionModelOpen,config]);
+}
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(sessionModelOpen!==true)return;
+const node=sessionModelDialogRef.current;
+if(node===null||node===undefined)return;
+if(node.open===true)return;
+try{
+if(typeof node.showModal==="function")node.showModal();
+}catch{/* 宿主拒绝 showModal（已打开/非活动文档）时保持当前可见性。 */}
+},[sessionModelOpen]);
+}
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+const wasOpen=sessionModelWasOpenRef.current===true;
+sessionModelWasOpenRef.current=sessionModelOpen===true;
+if(wasOpen!==true||sessionModelOpen===true)return;
+const entry=sessionModelEntryRef.current;
+try{
+if(entry!==null&&entry!==undefined&&typeof entry.focus==="function")entry.focus();
+}catch{/* 宿主拒绝聚焦时忽略：关闭已经生效，焦点位置不是阻断条件。 */}
+},[sessionModelOpen]);
+}
+Object.assign(frame,{
+});
+}
+function useSidebarPanelSnapshotRefs(frame){
+const{
+react,rootSessionId,state,
+}=frame;
+const refreshStateRef=typeof react.useRef==="function"
+?react.useRef({rootSessionId:null,inFlight:null,pending:false})
+:{current:{rootSessionId:null,inFlight:null,pending:false}};
+const fanoutCursorRef=typeof react.useRef==="function"
+?react.useRef({rootSessionId,cursor:0})
+:{current:{rootSessionId,cursor:0}};
+fanoutCursorRef.current=PANEL_STATE_A.normalizeFanoutCursor(fanoutCursorRef.current,rootSessionId);
+const latestSnapshotRef=typeof react.useRef==="function"
+?react.useRef(state.snapshot)
+:{current:state.snapshot};
+latestSnapshotRef.current=state.snapshot;
+const latestPanelErrorRef=typeof react.useRef==="function"
+?react.useRef(state.error)
+:{current:state.error};
+latestPanelErrorRef.current=state.error;
+const pollSyncStateRef=typeof react.useRef==="function"
+?react.useRef({rootSessionId:null,inFlight:null,pending:false})
+:{current:{rootSessionId:null,inFlight:null,pending:false}};
+const pollCycleSequenceRef=typeof react.useRef==="function"?react.useRef(0):{current:0};
+const adoptFanoutCursorFromSnapshot=(requestRoot,envelope)=>{
+const next=PANEL_STATE_A.adoptFanoutCursor(fanoutCursorRef.current,requestRoot,envelope);
+if(next===null)return false;
+fanoutCursorRef.current=next;
+return true;
+};
+Object.assign(frame,{
+adoptFanoutCursorFromSnapshot,fanoutCursorRef,latestPanelErrorRef,latestSnapshotRef,pollCycleSequenceRef,pollSyncStateRef,
+refreshStateRef,
+});
+}
+function createPanelRefreshAction(deps){
+const{
+adoptFanoutCursorFromSnapshot,config,contextRef,mountedRef,peekCachedSnapshot,
+refreshStateRef,requestSequenceRef,rootSessionId,setState,writeCachedSnapshot,
+}=deps;
+return function refresh(refreshOptions){
+const commitManualTimestamp=refreshOptions?.manual===true;
+const refreshState=refreshStateRef.current;
+if(refreshState.rootSessionId!==rootSessionId){
+refreshState.inFlight?.controller?.abort?.();
+refreshState.inFlight=null;
+refreshState.pending=false;
+refreshState.rootSessionId=rootSessionId;
+}
+if(refreshState.inFlight!==null){
+refreshState.pending=true;
+return refreshState.inFlight.promise.then((outcome)=>(typeof outcome==="object"&&outcome!==null
+?{...outcome,merged:true}
+:{ok:false,snapshot:null,merged:true}));
+}
+const requestSequence=++requestSequenceRef.current;
+if(rootSessionId===""){
+setState({rootSessionId,snapshot:null,updatedAt:null,loading:false,error:null});
+return Promise.resolve({ok:true,snapshot:null,skipped:true});
+}
+const controller=typeof globalThis.AbortController==="function"?new globalThis.AbortController():null;
+const request={rootSessionId,requestSequence,controller,promise:null};
+refreshState.inFlight=request;
+const cachedBaseline=peekCachedSnapshot(rootSessionId);
+setState((previous)=>{
+if(previous.rootSessionId===rootSessionId){
+const nextLoading=previous.snapshot===null;
+const keptError=previous.error!==null&&previous.error.source===PANEL_ERROR_SOURCES.action
+?previous.error
+:null;
+if(previous.error===keptError&&previous.loading===nextLoading)return previous;
+return{
+rootSessionId,
+snapshot:previous.snapshot,
+updatedAt:previous.updatedAt,
+loading:nextLoading,
+error:keptError,
+};
+}
+return{
+rootSessionId,
+snapshot:cachedBaseline===null?null:cachedBaseline.snapshot,
+updatedAt:cachedBaseline===null?null:cachedBaseline.updatedAt,
+loading:cachedBaseline===null,
+error:null,
+};
+});
+const promise=fetchPanelSnapshot({
+adoptFanoutCursorFromSnapshot,cachedBaseline,commitManualTimestamp,config,contextRef,controller,
+mountedRef,outcomeReason:text(refreshOptions?.reason,"refresh"),refresh,refreshState,request,
+requestSequence,requestSequenceRef,rootSessionId,setState,writeCachedSnapshot,
+});
+request.promise=promise;
+return promise;
+};
+}
+async function fetchPanelSnapshot(ctx){
+const{
+adoptFanoutCursorFromSnapshot,cachedBaseline,commitManualTimestamp,config,contextRef,controller,
+mountedRef,outcomeReason,refresh,refreshState,request,requestSequence,requestSequenceRef,
+rootSessionId,setState,writeCachedSnapshot,
+}=ctx;
+let outcome={ok:false,snapshot:null,reason:outcomeReason};
+try{
+const envelope=await callRpc(
+config,
+contextRef.current,
+{action:"expert-group-snapshot",sessionId:rootSessionId},
+controller===null?{}:{signal:controller.signal},
+(body)=>object(body),
+);
+const raw=envelope.snapshot===undefined||envelope.snapshot===null?envelope:envelope.snapshot;
+const next=safeNormalize(raw);
+if(next===null)throw new Error("快照格式无效");
+const current=mountedRef.current===true
+&&refreshState.inFlight===request
+&&requestSequence===requestSequenceRef.current
+&&rootSessionId===request.rootSessionId;
+outcome={ok:true,snapshot:next,stale:current!==true,reason:outcome.reason};
+if(current){
+const updatedAt=Date.now();
+writeCachedSnapshot(rootSessionId,next,updatedAt);
+adoptFanoutCursorFromSnapshot(rootSessionId,envelope);
+setState((previous)=>{
+const keptError=previous.error!==null&&previous.error.source===PANEL_ERROR_SOURCES.action
+?previous.error
+:null;
+const sameRevision=typeof previous.snapshot?.revision==="string"
+&&typeof next.revision==="string"
+&&previous.snapshot.revision.length>0
+&&previous.snapshot.revision===next.revision;
+if(previous.rootSessionId===rootSessionId
+&&previous.loading===false
+&&previous.error===keptError
+&&(sameRevision||samePanelSnapshot(previous.snapshot,next))
+&&(commitManualTimestamp!==true||previous.updatedAt===updatedAt))return previous;
+return{rootSessionId,snapshot:next,updatedAt,loading:false,error:keptError};
+});
+}
+}catch(error){
+const aborted=controller?.signal?.aborted===true||error?.name==="AbortError";
+const current=mountedRef.current===true
+&&refreshState.inFlight===request
+&&requestSequence===requestSequenceRef.current
+&&rootSessionId===request.rootSessionId;
+outcome={ok:false,snapshot:null,aborted,stale:current!==true,reason:outcome.reason};
+if(!aborted&&current){
+const failedAt=Date.now();
+setState((previous)=>{
+const sameRoot=previous.rootSessionId===rootSessionId;
+const baseline=sameRoot
+?previous.snapshot
+:(cachedBaseline===null?null:cachedBaseline.snapshot);
+const message=error instanceof Error?error.message:String(error);
+if(sameRoot
+&&previous.error!==null
+&&previous.error.source===PANEL_ERROR_SOURCES.snapshot
+&&previous.error.message===message
+&&previous.loading===false
+&&previous.snapshot===baseline)return previous;
+return{
+rootSessionId,
+snapshot:baseline,
+updatedAt:sameRoot?previous.updatedAt:(cachedBaseline===null?null:cachedBaseline.updatedAt),
+loading:false,
+error:{source:PANEL_ERROR_SOURCES.snapshot,message,at:failedAt},
+};
+});
+}
+}
+if(refreshState.inFlight===request){
+refreshState.inFlight=null;
+if(refreshState.pending&&mountedRef.current===true&&refreshState.rootSessionId===rootSessionId){
+refreshState.pending=false;
+void refresh();
+}else{
+refreshState.pending=false;
+}
+}
+return outcome;
+}
+function createPanelPollCycle(deps){
+const{
+advanceFanoutCursor,config,contextRef,fanoutCursorRef,latestPanelErrorRef,latestSnapshotRef,
+pollCycleSequenceRef,pollSyncStateRef,pollSurfaceStillCurrent,refresh,rootSessionId,
+}=deps;
+const pollOnce=async(request)=>{
+const nextId=()=>{
+pollCycleSequenceRef.current+=1;
+return pollCycleSequenceRef.current;
+};
+const cancelledCycle=(outcome)=>({id:nextId(),outcome,ok:false,cancelled:true,snapshot:null});
+const partialBaseline=latestSnapshotRef.current!==null&&latestSnapshotRef.current?.partial===true;
+const lastSnapshotError=latestPanelErrorRef.current;
+const retryAfterFailure=lastSnapshotError!==null
+&&lastSnapshotError!==undefined
+&&lastSnapshotError.source===PANEL_ERROR_SOURCES.snapshot;
+if(partialBaseline||retryAfterFailure){
+const full=(await refresh({reason:partialBaseline?"partial":"retry"}))??{};
+return{
+id:nextId(),
+outcome:partialBaseline?"partial":"retry",
+ok:full.ok===true,
+cancelled:full.aborted===true||full.stale===true,
+snapshot:full.snapshot??null,
+};
+}
+const cursorBefore=fanoutCursorRef.current.rootSessionId===rootSessionId?fanoutCursorRef.current.cursor:0;
+let batch=null;
+try{
+const response=await callRpc(
+config,
+contextRef.current,
+{action:"fanout-events",sessionId:rootSessionId,after:cursorBefore},
+request.controller===null?{}:{signal:request.controller.signal},
+);
+batch=readFanoutEventBatch(response);
+}catch(error){
+const aborted=request.controller?.signal?.aborted===true||error?.name==="AbortError";
+if(aborted)return cancelledCycle("cancelled");
+batch=null;
+}
+if(!pollSurfaceStillCurrent())return cancelledCycle("stale");
+if(batch!==null&&batch.conclusive){
+if(fanoutBatchIsStale(batch,cursorBefore)){
+const full=(await refresh({reason:"gap"}))??{};
+if(full.ok===true&&full.stale!==true&&full.merged!==true)advanceFanoutCursor(batch.cursor);
+return{
+id:nextId(),
+outcome:"gap",
+ok:full.ok===true,
+cancelled:full.aborted===true||full.stale===true,
+snapshot:full.snapshot??null,
+};
+}
+if(batch.events.length>0){
+const full=(await refresh({reason:"events"}))??{};
+if(full.ok===true&&full.stale!==true&&full.merged!==true)advanceFanoutCursor(batch.cursor);
+return{
+id:nextId(),
+outcome:"events",
+ok:full.ok===true,
+cancelled:full.aborted===true||full.stale===true,
+snapshot:full.snapshot??null,
+};
+}
+advanceFanoutCursor(batch.cursor);
+return{id:nextId(),outcome:"none",ok:true,cancelled:false,snapshot:null};
+}
+const fallback=(await refresh({reason:"events-unavailable"}))??{};
+return{
+id:nextId(),
+outcome:"fallback",
+ok:fallback.ok===true,
+cancelled:fallback.aborted===true||fallback.stale===true,
+snapshot:fallback.snapshot??null,
+};
+};
+const runPollCycle=()=>{
+const state=pollSyncStateRef.current;
+if(state.rootSessionId!==rootSessionId){
+state.inFlight?.controller?.abort?.();
+state.inFlight=null;
+state.pending=false;
+state.rootSessionId=rootSessionId;
+}
+if(state.inFlight!==null){
+state.pending=true;
+return state.inFlight.promise;
+}
+const request={
+rootSessionId,
+controller:typeof globalThis.AbortController==="function"?new globalThis.AbortController():null,
+promise:null,
+};
+state.inFlight=request;
+const promise=(async()=>{
+let cycle=null;
+try{
+cycle=await pollOnce(request);
+while(state.pending&&state.inFlight===request&&pollSurfaceStillCurrent()){
+state.pending=false;
+cycle=await pollOnce(request);
+}
+}catch{
+pollCycleSequenceRef.current+=1;
+cycle={id:pollCycleSequenceRef.current,outcome:"error",ok:false,cancelled:false,snapshot:null};
+}finally{
+if(state.inFlight===request)state.inFlight=null;
+state.pending=false;
+}
+return cycle;
+})();
+request.promise=promise;
+return promise;
+};
+return{pollOnce,runPollCycle};
+}
+function useSidebarPanelPolling(frame){
+const{
+adoptFanoutCursorFromSnapshot,config,contextRef,fanoutCursorRef,latestPanelErrorRef,latestSnapshotRef,
+mountedRef,peekCachedSnapshot,pollCycleSequenceRef,pollSyncStateRef,react,refreshStateRef,
+requestSequenceRef,rootSessionId,setState,sidebarSurfaceStillCurrent,state,writeCachedSnapshot,
+}=frame;
+const advanceFanoutCursor=(nextCursor)=>{
+const next=PANEL_STATE_A.advanceFanoutCursor(fanoutCursorRef.current,rootSessionId,nextCursor);
+if(next===null)return false;
+fanoutCursorRef.current=next;
+return true;
+};
+const refresh=createPanelRefreshAction({
+adoptFanoutCursorFromSnapshot,config,contextRef,mountedRef,peekCachedSnapshot,refreshStateRef,
+requestSequenceRef,rootSessionId,setState,writeCachedSnapshot,
+});
+const refreshRef=typeof react.useRef==="function"?react.useRef(refresh):{current:refresh};
+refreshRef.current=refresh;
+const panelSchedulerRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const pollSurfaceStillCurrent=()=>sidebarSurfaceStillCurrent();
+const{pollOnce,runPollCycle}=createPanelPollCycle({
+advanceFanoutCursor,config,contextRef,fanoutCursorRef,latestPanelErrorRef,latestSnapshotRef,
+pollCycleSequenceRef,pollSyncStateRef,pollSurfaceStillCurrent,refresh,rootSessionId,
+});
+Object.assign(frame,{
+advanceFanoutCursor,panelSchedulerRef,pollOnce,pollSurfaceStillCurrent,refresh,refreshRef,
+runPollCycle,
+});
+}
+function useSidebarPanelMountEffects(frame){
+const{
+bump,cancelSidebarSplit,config,contextRef,latestSnapshotRef,mountedRef,
+panelSchedulerRef,pollSyncStateRef,react,refresh,refreshStateRef,releaseRightbarDragLock,
+requestSequenceRef,rootSessionId,runPollCycle,sidebarRight,sidebarSessionId,sidebarSplitIntentRef,
+sidebarTabSyncRef,tabActivityKey,
+}=frame;
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>runPanelMountEffect({
+bump,cancelSidebarSplit,config,contextRef,latestSnapshotRef,mountedRef,panelSchedulerRef,
+pollSyncStateRef,refresh,refreshStateRef,releaseRightbarDragLock,requestSequenceRef,rootSessionId,
+runPollCycle,sidebarRight,sidebarSessionId,sidebarSplitIntentRef,sidebarTabSyncRef,tabActivityKey,
+}),[rootSessionId,sidebarSessionId]);
+}
+Object.assign(frame,{
+});
+}
+function runPanelMountEffect(deps){
+const{
+bump,cancelSidebarSplit,config,contextRef,latestSnapshotRef,mountedRef,panelSchedulerRef,
+pollSyncStateRef,refresh,refreshStateRef,releaseRightbarDragLock,requestSequenceRef,rootSessionId,
+runPollCycle,sidebarRight,sidebarSessionId,sidebarSplitIntentRef,sidebarTabSyncRef,tabActivityKey,
+}=deps;
+mountedRef.current=true;
+const refreshState=refreshStateRef.current;
+refreshState.rootSessionId=rootSessionId;
+refreshState.pending=false;
+void refresh();
+const unsubscribe=subscribeSessions(config,contextRef.current,()=>{
+bump((value)=>value+1);
+void refresh();
+});
+const documentRef=globalThis.document;
+const{
+scheduler,armScheduler,clearSchedulerTimer,onVisibilityChange,pauseScheduler,pollSurfaceBlocked,resumeScheduler,
+}=createPanelPollScheduler({
+documentRef,latestSnapshotRef,panelSchedulerRef,refresh,runPollCycle,sidebarTabSyncRef,tabActivityKey,
+});
+panelSchedulerRef.current=scheduler;
+if(pollSurfaceBlocked()!==null)pauseScheduler();
+else armScheduler();
+try{documentRef?.addEventListener?.("visibilitychange",onVisibilityChange);}catch{/* 可选 API。 */}
+sidebarTabSyncRef.current?.();
+let unsubscribeOpenTabs=null;
+try{
+const inventory=sidebarRight?.openTabs??null;
+const subscribe=methodOf(inventory,"subscribe");
+if(subscribe!==null){
+const cleanup=subscribe.call(inventory,()=>{sidebarTabSyncRef.current?.();});
+if(typeof cleanup==="function")unsubscribeOpenTabs=cleanup;
+}
+}catch{/* 旧宿主没有公开 inventory 或订阅失败时继续靠 observer/轮询。 */}
+let tabObserver=null;
+try{
+const doc=globalThis.document;
+const Observer=globalThis.MutationObserver??doc?.defaultView?.MutationObserver;
+const target=doc?.body??null;
+if(typeof Observer==="function"&&target!==null&&target!==undefined){
+tabObserver=new Observer(()=>{sidebarTabSyncRef.current?.();});
+tabObserver.observe(target,{childList:true,subtree:true});
+}
+}catch{
+try{tabObserver?.disconnect?.();}catch{/* 可选 API。 */}
+tabObserver=null;
+}
+return()=>{
+mountedRef.current=false;
+try{releaseRightbarDragLock?.();}catch{/* 同上。 */}
+const splitIntent=sidebarSplitIntentRef.current;
+sidebarSplitIntentRef.current=null;
+if(splitIntent!==null&&cancelSidebarSplit!==null){
+try{cancelSidebarSplit.call(config,splitIntent.token,{reason:"unmount"});}catch{/* 事务收口失败不能阻断卸载。 */}
+}
+requestSequenceRef.current+=1;
+scheduler.detached=true;
+clearSchedulerTimer();
+if(panelSchedulerRef.current===scheduler)panelSchedulerRef.current=null;
+const pollState=pollSyncStateRef.current;
+pollState.pending=false;
+pollState.inFlight?.controller?.abort?.();
+pollState.inFlight=null;
+refreshState.pending=false;
+refreshState.inFlight?.controller?.abort?.();
+refreshState.inFlight=null;
+if(typeof unsubscribe==="function")unsubscribe();
+if(typeof unsubscribeOpenTabs==="function")unsubscribeOpenTabs();
+try{documentRef?.removeEventListener?.("visibilitychange",onVisibilityChange);}catch{/* 可选 API。 */}
+try{tabObserver?.disconnect?.();}catch{/* 可选 API。 */}
+};
+}
+function createPanelPollScheduler(deps){
+const{documentRef,latestSnapshotRef,panelSchedulerRef,refresh,runPollCycle,sidebarTabSyncRef,tabActivityKey}=deps;
+const scheduler={
+timer:null,
+delay:PANEL_POLL_TIMINGS.activeMs,
+paused:false,
+detached:false,
+failureCount:0,
+idleLevel:0,
+running:true,
+lastCycleId:0,
+activityKey:tabActivityKey,
+};
+const readDocumentHidden=()=>{
+try{return documentRef?.hidden===true;}catch{return false;}
+};
+const clearSchedulerTimer=()=>{
+if(scheduler.timer===null)return;
+if(typeof globalThis.clearInterval==="function"){
+try{globalThis.clearInterval(scheduler.timer);}catch{/* 清理失败不影响渲染。 */}
+}
+scheduler.timer=null;
+};
+const armScheduler=()=>{
+clearSchedulerTimer();
+if(scheduler.detached===true||scheduler.paused===true)return;
+if(typeof globalThis.setInterval!=="function")return;
+try{scheduler.timer=globalThis.setInterval(runScheduledPoll,scheduler.delay);}catch{scheduler.timer=null;}
+};
+const pauseScheduler=()=>{
+if(scheduler.paused===true){clearSchedulerTimer();return;}
+scheduler.paused=true;
+clearSchedulerTimer();
+};
+const resumeScheduler=(refreshImmediately)=>{
+if(scheduler.detached===true)return;
+scheduler.paused=false;
+scheduler.failureCount=0;
+scheduler.idleLevel=0;
+scheduler.delay=panelNextPollDelayMs(scheduler);
+if(readDocumentHidden()){clearSchedulerTimer();return;}
+armScheduler();
+if(refreshImmediately===true)void refresh();
+};
+scheduler.pause=pauseScheduler;
+scheduler.resume=resumeScheduler;
+const pollSurfaceBlocked=()=>{
+if(readDocumentHidden())return"hidden";
+if(scheduler.activityKey==="inactive")return"inactive";
+return null;
+};
+const runScheduledPoll=()=>{
+sidebarTabSyncRef.current?.();
+if(pollSurfaceBlocked()!==null){
+pauseScheduler();
+return;
+}
+void runPollCycle().then((cycle)=>{
+if(scheduler.detached===true||panelSchedulerRef.current!==scheduler)return;
+applyPanelPollCycle(scheduler,cycle,latestSnapshotRef.current);
+armScheduler();
+});
+};
+const onVisibilityChange=()=>{
+try{
+if(documentRef?.hidden!==true){
+resumeScheduler(true);
+sidebarTabSyncRef.current?.();
+}else{
+pauseScheduler();
+}
+}catch{/* 可见性通知只是加速恢复，读取失败不影响轮询。 */}
+};
+return{
+armScheduler,clearSchedulerTimer,onVisibilityChange,pauseScheduler,pollSurfaceBlocked,resumeScheduler,scheduler,
+};
+}
+function useSidebarPanelActivityEffect(frame){
+const{
+panelSchedulerRef,react,tabActivityKey,
+}=frame;
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+const scheduler=panelSchedulerRef.current;
+if(scheduler===null||scheduler.detached===true)return;
+if(scheduler.activityKey===tabActivityKey)return;
+scheduler.activityKey=tabActivityKey;
+if(tabActivityKey==="inactive"){
+scheduler.pause?.();
+return;
+}
+scheduler.resume?.(tabActivityKey==="active");
+},[tabActivityKey]);
+}
+Object.assign(frame,{
+});
+}
+function useSidebarPanelMetaEffect(frame){
+const{
+loadMeta,metaAutoAttemptRef,metaStateRef,react,rootSessionId,usageFactPresent,
+}=frame;
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(usageFactPresent!==true)return;
+if(metaStateRef.current!==null)return;
+if(metaAutoAttemptRef.current===rootSessionId)return;
+metaAutoAttemptRef.current=rootSessionId;
+void loadMeta();
+},[usageFactPresent,rootSessionId]);
+}
+Object.assign(frame,{
+});
+}
+function useSidebarPanelSnapshotSyncEffect(frame){
+const{
+react,rootSessionId,sidebarSessionId,sidebarSnapshotSyncRef,sidebarTabSyncRef,snapshot,
+}=frame;
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+const previous=sidebarSnapshotSyncRef.current;
+sidebarSnapshotSyncRef.current={rootSessionId,sidebarSessionId,snapshot};
+if(previous.rootSessionId===rootSessionId
+&&previous.sidebarSessionId===sidebarSessionId
+&&previous.snapshot!==snapshot)sidebarTabSyncRef.current?.();
+},[rootSessionId,sidebarSessionId,snapshot]);
+}
+Object.assign(frame,{
+});
+}
+function useSidebarPanelProjectionEffect(frame){
+const{
+config,ctx,projectionRefreshRequestedRef,react,rootSessionId,sessionId,
+sessionStatsPresentOf,snapshot,
+}=frame;
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(snapshot===null||snapshot===undefined)return;
+let service=null;
+let refreshProjections=null;
+try{
+service=config.sessions??ctx?.sessions??null;
+refreshProjections=service===null||service===undefined?null:service.refreshProjections;
+}catch{
+service=null;
+refreshProjections=null;
+}
+if(typeof refreshProjections!=="function")return;
+const requested=projectionRefreshRequestedRef.current;
+for(const sessionId of collectSnapshotSessionIds(snapshot)){
+if(requested.has(sessionId))continue;
+if(sessionStatsPresentOf(sessionId)===true)continue;
+requested.add(sessionId);
+try{
+const pending=refreshProjections.call(service,sessionId);
+if(pending!==null&&typeof pending==="object"&&typeof pending.catch==="function"){
+pending.catch(()=>{});
+}
+}catch{
+}
+}
+},[snapshot,rootSessionId]);
+}
+Object.assign(frame,{
+});
+}
+global[SYMBOL]=Object.freeze({
+useSidebarPanelActivityEffect,useSidebarPanelAnnouncementEffect,useSidebarPanelMetaEffect,
+useSidebarPanelMountEffects,useSidebarPanelPolling,useSidebarPanelProjectionEffect,
+useSidebarPanelSessionModelEffects,useSidebarPanelSnapshotRefs,useSidebarPanelSnapshotSyncEffect,
+});
+})(globalThis);
+/* source: client-sidebar-panel-hooks-tabs.js */
+(function installSidebarPanelHooksTabs(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-tabs");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+SIDEBAR_AUTO_KEY_LIMIT,SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS,SIDEBAR_TAB_KEY_SEPARATOR,object,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+methodOf,normalizeSubagentAddress,sidebarTabKey,
+}=DOM;
+const TAB_STATE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-tab-state");
+const TAB_STATE=global[TAB_STATE_SYMBOL]||{};
+const AUTO_CONTROLLER_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-controller");
+const AUTO_CONTROLLER=global[AUTO_CONTROLLER_SYMBOL]||{};
+const SIDEBAR_ACTIONS_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-actions");
+const SIDEBAR_ACTIONS=global[SIDEBAR_ACTIONS_SYMBOL]||{};
+function useSidebarPanelAutoRefs(frame){
+const{
+react,sessionId,sharedSidebarAutoCloseAttemptOwners,sharedSidebarAutoCloseAttempts,sharedSidebarAutoCloseCooldowns,sharedSidebarAutoCloseVerifications,
+sharedSidebarAutoOrigin,sharedSidebarAutoSuppressed,sharedSidebarAutoTabMisses,
+}=frame;
+const sidebarTabRecordsRef=typeof react.useRef==="function"?react.useRef(new Map()):{current:new Map()};
+const sidebarTabOpeningRef=typeof react.useRef==="function"?react.useRef(new Map()):{current:new Map()};
+const sidebarAutoOriginRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoOrigin):{current:sharedSidebarAutoOrigin};
+const sidebarAutoSuppressedRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoSuppressed):{current:sharedSidebarAutoSuppressed};
+const sidebarAutoCloseAttemptsRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoCloseAttempts):{current:sharedSidebarAutoCloseAttempts};
+const sidebarAutoCloseAttemptOwnersRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoCloseAttemptOwners):{current:sharedSidebarAutoCloseAttemptOwners};
+const sidebarAutoCloseVerificationsRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoCloseVerifications):{current:sharedSidebarAutoCloseVerifications};
+const sidebarAutoCloseCooldownsRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoCloseCooldowns):{current:sharedSidebarAutoCloseCooldowns};
+const sidebarAutoTabMissesRef=typeof react.useRef==="function"?react.useRef(sharedSidebarAutoTabMisses):{current:sharedSidebarAutoTabMisses};
+const sidebarAutoReservationRef=typeof react.useRef==="function"?react.useRef(new Map()):{current:new Map()};
+const sidebarAutoCascadeRef=typeof react.useRef==="function"?react.useRef(false):{current:false};
+const sidebarAutoFailedKeysRef=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
+const sidebarAutoEpochRef=typeof react.useRef==="function"?react.useRef(0):{current:0};
+const sidebarManualIntentRef=typeof react.useRef==="function"?react.useRef(new Map()):{current:new Map()};
+const sidebarAutoBusyRef=typeof react.useRef==="function"?react.useRef(false):{current:false};
+const sidebarAutoSignatureRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const sidebarSplitIntentRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const sidebarTabPendingRef=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
+const sidebarBatchPendingRef=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
+const sidebarBatchScopeKey=(sessionId,rootId)=>String(sessionId)+SIDEBAR_TAB_KEY_SEPARATOR+String(rootId);
+const sidebarBatchSignatureRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+const sidebarTabSyncRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
+Object.assign(frame,{
+sidebarAutoBusyRef,sidebarAutoCascadeRef,sidebarAutoCloseAttemptOwnersRef,sidebarAutoCloseAttemptsRef,sidebarAutoCloseCooldownsRef,sidebarAutoCloseVerificationsRef,
+sidebarAutoEpochRef,sidebarAutoFailedKeysRef,sidebarAutoOriginRef,sidebarAutoReservationRef,sidebarAutoSignatureRef,sidebarAutoSuppressedRef,
+sidebarAutoTabMissesRef,sidebarBatchPendingRef,sidebarBatchScopeKey,sidebarBatchSignatureRef,sidebarManualIntentRef,sidebarSplitIntentRef,
+sidebarTabOpeningRef,sidebarTabPendingRef,sidebarTabRecordsRef,sidebarTabSyncRef,
+});
+}
+function useSidebarPanelTabPrimitives(frame){
+const{
+model,react,rootSessionId,sidebarSessionId,snapshot,
+}=frame;
+const neutralRuntimeStatus=typeof model.UNKNOWN_RUNTIME_STATUS==="string"&&model.UNKNOWN_RUNTIME_STATUS.length>0
+?model.UNKNOWN_RUNTIME_STATUS
+:"unknown";
+const sidebarSnapshotSyncRef=typeof react.useRef==="function"
+?react.useRef({rootSessionId,sidebarSessionId,snapshot})
+:{current:{rootSessionId,sidebarSessionId,snapshot}};
+Object.assign(frame,{
+neutralRuntimeStatus,sidebarSnapshotSyncRef,
+});
+}
+function useSidebarPanelTabWiring(frame){
+const{
+bump,catalogEntryOf,model,navigation,readActiveSidebarResource,refresh,
+rootSessionId,sessionsService,setState,sidebarRight,store,
+}=frame;
+const retry=()=>{
+setState((previous)=>(previous.rootSessionId===rootSessionId&&previous.error!==null
+?{...previous,error:null}
+:previous));
+void refresh({manual:true});
+};
+const expand=(node)=>store?store.isExpanded(node):(node?.kind==="root"||(typeof model.defaultExpanded==="function"&&model.defaultExpanded(node)));
+const toggle=(node)=>{
+if(store)store.toggle(node);
+bump((value)=>value+1);
+};
+const handleOpen=(id,address)=>{
+if(navigation.available!==true)return;
+if(typeof id!=="string"||id.length===0)return;
+navigation.open(address===null||address===undefined||navigation.acceptsAddress!==true?id:address);
+};
+const subagentAddressOfChild=(childId,parentId,node)=>{
+const id=text(childId,null);
+if(id===null)return null;
+const lookup=methodOf(sessionsService,"subagentAddress");
+if(lookup!==null){
+let addressed;
+try{addressed=lookup.call(sessionsService,id);}catch{addressed=null;}
+const normalized=normalizeSubagentAddress(addressed);
+if(normalized!==null)return normalized;
+if(addressed!==undefined&&addressed!==null)return null;
+}
+const parent=text(parentId,null);
+const entry=catalogEntryOf(parent,id);
+const entrySource=object(entry);
+const entryHasMode=Object.prototype.hasOwnProperty.call(entrySource,"mode");
+const entryMode=text(entrySource.mode,null);
+const mode=entryHasMode
+?entryMode
+:(object(node).continuable===true?"continuable":null);
+return normalizeSubagentAddress({
+parentSessionId:parent,
+childSessionId:id,
+mode,
+});
+};
+const activeSidebarTabId=()=>{
+if(readActiveSidebarResource===null)return null;
+try{return text(object(readActiveSidebarResource.call(sidebarRight)).id,null);}catch{return null;}
+};
+Object.assign(frame,{
+activeSidebarTabId,expand,handleOpen,retry,subagentAddressOfChild,toggle,
+});
+}
+function useSidebarPanelTabWiringPart2(frame){
+const{
+cancelSidebarSplit,closeSidebarResource,config,neutralRuntimeStatus,partialSnapshot,readActiveSidebarResource,
+readSidebarOpenTabs,rootSessionId,sidebarAutoCloseAttemptOwnersRef,sidebarAutoCloseAttemptsRef,sidebarAutoCloseCooldownsRef,sidebarAutoTabMissesRef,
+sidebarManualIntentRef,sidebarRight,sidebarSessionId,sidebarSplitIntentRef,sidebarTabOpeningRef,snapshot,
+subagentAddressOfChild,
+}=frame;
+const runtimeStatusOfNode=(...args)=>frame.late.runtimeStatusOfNode(...args);
+const sidebarAutoCloseKeyIsActive=(...args)=>frame.late.sidebarAutoCloseKeyIsActive(...args);
+const tabTreeDeps=()=>({
+addressOf:subagentAddressOfChild,
+statusOf:runtimeStatusOfNode,
+partial:partialSnapshot,
+neutralStatus:neutralRuntimeStatus,
+});
+const autoCloseLedger=()=>({
+closeAttempts:sidebarAutoCloseAttemptsRef.current,
+owners:sidebarAutoCloseAttemptOwnersRef.current,
+closeCooldowns:sidebarAutoCloseCooldownsRef.current,
+tabMisses:sidebarAutoTabMissesRef.current,
+limit:SIDEBAR_AUTO_KEY_LIMIT,
+});
+const presentFloatingSubagentTitles=()=>TAB_STATE.presentFloatingSubagentTitles(globalThis.document);
+const knownSidebarResourceAddresses=()=>TAB_STATE.knownSidebarResourceAddresses(
+snapshot,
+rootSessionId,
+subagentAddressOfChild,
+);
+const sidebarExpertResourceAddresses=(node,parentId,addresses)=>TAB_STATE.sidebarExpertResourceAddresses(
+node,
+parentId,
+addresses,
+tabTreeDeps(),
+);
+const sidebarNodeIsIdleReady=(node,parentId,childId)=>TAB_STATE.sidebarNodeIsIdleReady(
+node,
+parentId,
+childId,
+tabTreeDeps(),
+);
+const sidebarNodeIsIdleMembership=(node,parentId,childId)=>TAB_STATE.sidebarNodeIsIdleMembership(
+node,
+parentId,
+childId,
+tabTreeDeps(),
+);
+const sidebarIdleChildren=()=>TAB_STATE.sidebarIdleChildren(sidebarRootChildren(),rootSessionId,tabTreeDeps());
+const runningSidebarResourceAddresses=()=>TAB_STATE.runningSidebarResourceAddresses(
+sidebarRootChildren(),
+rootSessionId,
+tabTreeDeps(),
+);
+const idleSidebarResourceAddresses=(nodes)=>TAB_STATE.idleSidebarResourceAddresses(
+nodes,
+rootSessionId,
+tabTreeDeps(),
+);
+const sidebarBatchCandidates=(addresses,inventory)=>TAB_STATE.sidebarBatchCandidates(
+addresses,
+inventory,
+sidebarSessionId,
+);
+const sidebarBatchStateFor=(addresses)=>TAB_STATE.sidebarBatchStateFor(addresses,{
+inventory:readSidebarOpenTabs(),
+sidebarSessionId,
+closeAvailable:closeSidebarResource!==null,
+});
+const sidebarBatchSignatureOf=TAB_STATE.sidebarBatchSignatureOf;
+const sidebarResourceTabStateOf=(resourceAddress)=>TAB_STATE.sidebarResourceTabStateOf(
+readSidebarOpenTabs(),
+sidebarSessionId,
+resourceAddress,
+);
+const sidebarAdoptionEvidenceAvailable=(resourceAddress)=>TAB_STATE.sidebarAdoptionEvidenceAvailable(
+readSidebarOpenTabs(),
+sidebarSessionId,
+resourceAddress,
+);
+const sidebarActiveResourceMatches=(resourceAddress)=>{
+if(readActiveSidebarResource===null)return false;
+let tab=null;
+try{tab=object(readActiveSidebarResource.call(sidebarRight));}catch{return false;}
+return TAB_STATE.sidebarActiveResourceMatches(tab,resourceAddress);
+};
+const sidebarManualIntentOf=(key)=>TAB_STATE.sidebarManualIntentOf(
+sidebarManualIntentRef.current,
+key,
+sidebarSessionId,
+rootSessionId,
+);
+const trimAutoKeyMap=(map,activeAware)=>TAB_STATE.trimAutoKeyMap(map,{
+limit:SIDEBAR_AUTO_KEY_LIMIT,
+activeAware,
+isActive:sidebarAutoCloseKeyIsActive,
+});
+const clearAutoCloseAttempt=(key)=>TAB_STATE.clearAutoCloseAttempt(autoCloseLedger(),key);
+const clearAutoCloseBudget=(key)=>TAB_STATE.clearAutoCloseBudget(autoCloseLedger(),key);
+const enterAutoCloseCooldown=(key)=>TAB_STATE.enterAutoCloseCooldown(
+autoCloseLedger(),
+key,
+sidebarAutoCloseKeyIsActive,
+);
+const autoCloseCooldownActive=(key)=>TAB_STATE.autoCloseCooldownActive(autoCloseLedger(),key);
+const releaseExpiredAutoCloseCooldown=(key)=>TAB_STATE.releaseExpiredAutoCloseCooldown(autoCloseLedger(),key);
+const autoTabMissesOf=(key,tabId)=>TAB_STATE.autoTabMissesOf(autoCloseLedger(),key,tabId);
+const sampleAutoTabMisses=(key,tabId,missing)=>TAB_STATE.sampleAutoTabMisses(
+autoCloseLedger(),
+key,
+{sidebarSessionId,rootSessionId,tabId,missing},
+);
+const settleAutoCloseAttempt=(key,context)=>TAB_STATE.settleAutoCloseAttempt(autoCloseLedger(),key,context);
+const sidebarRootChildren=()=>(Array.isArray(snapshot?.root?.children)?snapshot.root.children:[]);
+const cancelPendingSidebarSplit=(reason,expectedIntentToken)=>{
+const intent=sidebarSplitIntentRef.current;
+if(intent===null)return;
+if(expectedIntentToken!==undefined&&intent.token!==expectedIntentToken)return;
+sidebarSplitIntentRef.current=null;
+sidebarTabOpeningRef.current.delete(intent.key);
+if(cancelSidebarSplit===null)return;
+try{cancelSidebarSplit.call(config,intent.token,{reason});}catch{/* 收口失败不能阻断面板同步。 */}
+};
+const cancelPendingSidebarSplitOfClose=(key,splitIntentToken)=>{
+const intent=sidebarSplitIntentRef.current;
+if(intent===null||intent.key!==key)return;
+if(splitIntentToken===null||splitIntentToken===undefined)return;
+if(intent.token!==splitIntentToken)return;
+cancelPendingSidebarSplit("close",splitIntentToken);
+};
+Object.assign(frame,{
+autoCloseCooldownActive,autoCloseLedger,autoTabMissesOf,cancelPendingSidebarSplit,cancelPendingSidebarSplitOfClose,clearAutoCloseAttempt,
+clearAutoCloseBudget,enterAutoCloseCooldown,idleSidebarResourceAddresses,knownSidebarResourceAddresses,presentFloatingSubagentTitles,releaseExpiredAutoCloseCooldown,
+runningSidebarResourceAddresses,sampleAutoTabMisses,settleAutoCloseAttempt,sidebarActiveResourceMatches,sidebarAdoptionEvidenceAvailable,sidebarBatchCandidates,
+sidebarBatchSignatureOf,sidebarBatchStateFor,sidebarExpertResourceAddresses,sidebarIdleChildren,sidebarManualIntentOf,sidebarNodeIsIdleMembership,
+sidebarNodeIsIdleReady,sidebarResourceTabStateOf,sidebarRootChildren,tabTreeDeps,trimAutoKeyMap,
+});
+}
+function useSidebarPanelTabWiringPart3(frame){
+const{
+commitSidebarSplit,config,sidebarSplitIntentRef,sidebarSplitTargetEvidence,
+}=frame;
+const tryCommitSidebarSplit=()=>{
+const intent=sidebarSplitIntentRef.current;
+if(intent===null||intent.resourceIssued!==true||commitSidebarSplit===null)return;
+const evidence=sidebarSplitTargetEvidence(intent.resourceAddress,intent.paneId);
+if(evidence===null)return;
+try{
+if(commitSidebarSplit.call(config,intent.token,evidence)===true){
+sidebarSplitIntentRef.current=null;
+}
+}catch{
+}
+};
+Object.assign(frame,{
+tryCommitSidebarSplit,
+});
+}
+function useSidebarPanelTabSync(frame){
+const{
+activeSidebarTabId,bump,cancelPendingSidebarSplit,idleSidebarResourceAddresses,knownSidebarResourceAddresses,presentFloatingSubagentTitles,
+presentSidebarTabIds,requestRightbarDragSync,rootSessionId,runningSidebarResourceAddresses,sidebarAdoptionEvidenceAvailable,sidebarBatchSignatureOf,
+sidebarBatchSignatureRef,sidebarBatchStateFor,sidebarIdleChildren,sidebarManualIntentRef,sidebarSessionId,sidebarSplitIntentRef,
+sidebarTabOpeningRef,sidebarTabRecordsRef,tryCommitSidebarSplit,
+}=frame;
+const applyPendingManualIntent=(...args)=>frame.late.applyPendingManualIntent(...args);
+const recordSidebarTab=(...args)=>frame.late.recordSidebarTab(...args);
+const syncSidebarTabRecords=()=>{
+try{requestRightbarDragSync?.();}catch{/* 手柄锁只是体验优化，绝不影响面板。 */}
+const batchSignatureNow=sidebarBatchSignatureOf(
+sidebarBatchStateFor(runningSidebarResourceAddresses()),
+sidebarBatchStateFor(idleSidebarResourceAddresses(sidebarIdleChildren())),
+);
+if(sidebarBatchSignatureRef.current!==batchSignatureNow){
+sidebarBatchSignatureRef.current=batchSignatureNow;
+bump((value)=>value+1);
+}
+const records=sidebarTabRecordsRef.current;
+const openings=sidebarTabOpeningRef.current;
+const now=Date.now();
+const openingResolved=[];
+let scopedRecordExists=false;
+for(const record of records.values()){
+if(record.sessionId===sidebarSessionId&&record.rootSessionId===rootSessionId){
+scopedRecordExists=true;
+break;
+}
+}
+if(scopedRecordExists!==true){
+for(const resourceAddress of knownSidebarResourceAddresses()){
+if(sidebarAdoptionEvidenceAvailable(resourceAddress)!==true)continue;
+const key=sidebarTabKey(sidebarSessionId,rootSessionId,resourceAddress);
+if(recordSidebarTab(key,resourceAddress))openings.delete(key);
+}
+}
+for(const[key,opening]of openings){
+if(now>=opening.expiresAt){
+if(sidebarSplitIntentRef.current?.key===key)cancelPendingSidebarSplit("timeout");
+openingResolved.push(key);
+continue;
+}
+if(opening.sessionId!==sidebarSessionId||opening.rootSessionId!==rootSessionId)continue;
+if(recordSidebarTab(key,opening.resourceAddress))openingResolved.push(key);
+}
+for(const key of openingResolved){
+openings.delete(key);
+}
+tryCommitSidebarSplit();
+for(const key of[...sidebarManualIntentRef.current.keys()]){
+const entry=sidebarManualIntentRef.current.get(key);
+if(entry===undefined)continue;
+if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId){
+sidebarManualIntentRef.current.delete(key);
+continue;
+}
+applyPendingManualIntent(key);
+}
+if(records.size===0)return;
+const present=presentSidebarTabIds();
+if(present===null)return;
+const floatingTitles=presentFloatingSubagentTitles();
+if(floatingTitles===null)return;
+const activeTabId=activeSidebarTabId();
+const stale=[];
+for(const[key,record]of records){
+if(record.sessionId!==sidebarSessionId||record.rootSessionId!==rootSessionId)continue;
+if(present.has(record.tabId)===true
+||record.tabId===activeTabId
+||(text(record.title,null)!==null&&floatingTitles.has(record.title))){
+record.misses=0;
+continue;
+}
+record.misses+=1;
+if(record.misses>=SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS)stale.push(key);
+}
+if(stale.length===0)return;
+for(const key of stale){
+records.delete(key);
+}
+bump((value)=>value+1);
+};
+Object.assign(frame,{
+syncSidebarTabRecords,
+});
+}
+function useSidebarPanelAutoOrchestration(frame){
+const{
+autoCloseCooldownActive,autoOpenEnabled,bump,cancelPendingSidebarSplit,cancelPendingSidebarSplitOfClose,clearAutoCloseAttempt,
+clearAutoCloseBudget,closeSidebarResource,currentRootRef,currentSidebarSessionRef,enterAutoCloseCooldown,idleSidebarResourceAddresses,
+knownSidebarResourceAddresses,mountedRef,openSidebarResource,primitives,readActiveSidebarResource,readSidebarOpenTabs,
+releaseExpiredAutoCloseCooldown,rootSessionId,runningSidebarResourceAddresses,sampleAutoTabMisses,setAutoOpenDraft,settleAutoCloseAttempt,
+sharedSidebarTabCloseInFlight,sidebarActiveResourceMatches,sidebarAutoBusyRef,sidebarAutoCascadeRef,sidebarAutoCloseAttemptOwnersRef,sidebarAutoCloseAttemptsRef,
+sidebarAutoCloseCooldownsRef,sidebarAutoCloseVerificationsRef,sidebarAutoEpochRef,sidebarAutoFailedKeysRef,sidebarAutoOriginRef,sidebarAutoReservationRef,
+sidebarAutoSignatureRef,sidebarAutoSuppressedRef,sidebarIdleChildren,sidebarManualIntentOf,sidebarManualIntentRef,sidebarOpenTabsAvailable,
+sidebarResourceTabStateOf,sidebarRight,sidebarSessionId,sidebarSplitIntentRef,sidebarSurfaceStillCurrent,sidebarTabOpeningRef,
+sidebarTabPendingRef,sidebarTabRecordsRef,sidebarTabSyncRef,snapshot,syncSidebarTabRecords,trimAutoKeyMap,
+}=frame;
+const cleanupAutoSidebarKeys=(...args)=>frame.late.cleanupAutoSidebarKeys(...args);
+const clearManualSuppressionOfIdleResources=(...args)=>frame.late.clearManualSuppressionOfIdleResources(...args);
+const handleSidebarAction=(...args)=>frame.late.handleSidebarAction(...args);
+const sweepAutoOpenPlaceholders=(...args)=>frame.late.sweepAutoOpenPlaceholders(...args);
+let sidebarAutoFrameCache=null;
+const sidebarAutoFrame=()=>{
+if(sidebarAutoFrameCache===null){
+sidebarAutoFrameCache={
+autoCloseCandidate,
+autoCloseCooldownActive,
+autoOpenCandidate,
+autoOpenEnabled,
+bump,
+cancelPendingSidebarSplit,
+cancelPendingSidebarSplitOfClose,
+cleanupAutoSidebarKeys,
+clearAutoCloseAttempt,
+clearAutoCloseBudget,
+clearManualSuppressionOfIdleResources,
+closeSidebarResource,
+currentRootRef,
+currentSidebarSessionRef,
+enterAutoCloseCooldown,
+handleSidebarAction,
+idleSidebarResourceAddresses,
+knownSidebarResourceAddresses,
+mountedRef,
+openSidebarResource,
+primitives,
+readActiveSidebarResource,
+readSidebarOpenTabs,
+releaseExpiredAutoCloseCooldown,
+rootSessionId,
+runningSidebarResourceAddresses,
+sampleAutoTabMisses,
+setAutoOpenDraft,
+settleAutoCloseAttempt,
+sharedSidebarTabCloseInFlight,
+sidebarActiveResourceMatches,
+sidebarAutoBusyRef,
+sidebarAutoCascadeRef,
+sidebarAutoCloseAttemptOwnersRef,
+sidebarAutoCloseAttemptsRef,
+sidebarAutoCloseCooldownsRef,
+sidebarAutoCloseVerificationsRef,
+sidebarAutoEpochRef,
+sidebarAutoFailedKeysRef,
+sidebarAutoOriginRef,
+sidebarAutoReservationRef,
+sidebarAutoSignatureRef,
+sidebarAutoSuppressedRef,
+sidebarIdleChildren,
+sidebarManualIntentOf,
+sidebarManualIntentRef,
+sidebarOpenTabsAvailable,
+sidebarResourceTabStateOf,
+sidebarRight,
+sidebarSessionId,
+sidebarSplitIntentRef,
+sidebarSurfaceStillCurrent,
+sidebarTabOpeningRef,
+sidebarTabPendingRef,
+sidebarTabRecordsRef,
+sidebarTabSyncRef,
+snapshot,
+sweepAutoOpenPlaceholders,
+syncSidebarTabRecords,
+trimAutoKeyMap,
+verifyPendingSidebarCloses,
+};
+}
+return sidebarAutoFrameCache;
+};
+let sidebarAutoControllerCache=null;
+const autoController=()=>{
+if(sidebarAutoControllerCache===null){
+sidebarAutoControllerCache=AUTO_CONTROLLER.createSidebarAutoController(sidebarAutoFrame());
+}
+return sidebarAutoControllerCache;
+};
+let sidebarActionsCache=null;
+const sidebarActions=()=>{
+if(sidebarActionsCache===null){
+sidebarActionsCache=SIDEBAR_ACTIONS.createSidebarActions(sidebarAutoFrame());
+}
+return sidebarActionsCache;
+};
+const sidebarAutoOpenCapable=()=>autoController().sidebarAutoOpenCapable();
+const autoCloseCandidate=(running)=>autoController().autoCloseCandidate(running);
+const autoOpenCandidate=(running)=>autoController().autoOpenCandidate(running);
+const sidebarAutoCloseKeyIsActive=(key)=>autoController().sidebarAutoCloseKeyIsActive(key);
+const autoSidebarOwnershipHasCapacity=(key,address)=>autoController().autoSidebarOwnershipHasCapacity(key,address);
+const sidebarTabCloseKeyOf=(tabId)=>autoController().sidebarTabCloseKeyOf(tabId);
+const sidebarTabCloseLeaseOf=(tabId)=>autoController().sidebarTabCloseLeaseOf(tabId);
+const sidebarTabCloseInFlight=(tabId)=>autoController().sidebarTabCloseInFlight(tabId);
+const acquireSidebarTabClose=(tabId)=>autoController().acquireSidebarTabClose(tabId);
+const sidebarTabPresenceInInventory=(tabId,expectedAddress=null)=>autoController().sidebarTabPresenceInInventory(tabId,expectedAddress);
+const requestSidebarTabClose=(tabId)=>autoController().requestSidebarTabClose(tabId);
+const waitForSidebarCloseLease=(leaseToken,timeoutMs)=>autoController().waitForSidebarCloseLease(leaseToken,timeoutMs);
+const beginSidebarCloseVerification=(lease,tabId,verify)=>autoController().beginSidebarCloseVerification(lease,tabId,verify);
+const finishVerifiedSidebarClose=(key,entry,reason)=>autoController().finishVerifiedSidebarClose(key,entry,reason);
+const verifyPendingSidebarCloses=()=>autoController().verifyPendingSidebarCloses();
+frame.late.sidebarAutoCloseKeyIsActive=sidebarAutoCloseKeyIsActive;
+Object.assign(frame,{
+acquireSidebarTabClose,autoCloseCandidate,autoController,autoOpenCandidate,autoSidebarOwnershipHasCapacity,beginSidebarCloseVerification,
+finishVerifiedSidebarClose,requestSidebarTabClose,sidebarActions,sidebarActionsCache,sidebarAutoCloseKeyIsActive,sidebarAutoControllerCache,
+sidebarAutoFrame,sidebarAutoFrameCache,sidebarAutoOpenCapable,sidebarTabCloseInFlight,sidebarTabCloseKeyOf,sidebarTabCloseLeaseOf,
+sidebarTabPresenceInInventory,verifyPendingSidebarCloses,waitForSidebarCloseLease,
+});
+}
+function useSidebarPanelAutoOrchestrationPart2(frame){
+const{
+autoController,sidebarActions,sidebarTabSyncRef,
+}=frame;
+const closeSidebarTabWithLease=(tabId,options)=>autoController().closeSidebarTabWithLease(tabId,options);
+const cleanupAutoSidebarKeys=(known,actingKey)=>autoController().cleanupAutoSidebarKeys(known,actingKey);
+const sweepAutoOpenPlaceholders=(running)=>autoController().sweepAutoOpenPlaceholders(running);
+const launchAutoSidebarAction=(candidate)=>sidebarActions().launchAutoSidebarAction(candidate);
+const clearManualSuppressionOfIdleResources=(idle)=>autoController().clearManualSuppressionOfIdleResources(idle);
+const syncAutoSidebarTabs=()=>sidebarActions().syncAutoSidebarTabs();
+const autoActionStillValid=(context)=>sidebarActions().autoActionStillValid(context);
+const abandonAutoSidebarAction=(key,context)=>sidebarActions().abandonAutoSidebarAction(key,context);
+const releaseAutoCloseAttempt=(key,context)=>sidebarActions().releaseAutoCloseAttempt(key,context);
+const autoTakeoverStateOf=(key)=>sidebarActions().autoTakeoverStateOf(key);
+const recordSidebarManualIntent=(key,resourceAddress)=>sidebarActions().recordSidebarManualIntent(key,resourceAddress);
+const applyPendingManualIntent=(key)=>sidebarActions().applyPendingManualIntent(key);
+const syncSidebarTabs=()=>sidebarActions().syncSidebarTabs();
+sidebarTabSyncRef.current=syncSidebarTabs;
+frame.late.applyPendingManualIntent=applyPendingManualIntent;
+frame.late.cleanupAutoSidebarKeys=cleanupAutoSidebarKeys;
+frame.late.clearManualSuppressionOfIdleResources=clearManualSuppressionOfIdleResources;
+frame.late.sweepAutoOpenPlaceholders=sweepAutoOpenPlaceholders;
+Object.assign(frame,{
+abandonAutoSidebarAction,applyPendingManualIntent,autoActionStillValid,autoTakeoverStateOf,cleanupAutoSidebarKeys,clearManualSuppressionOfIdleResources,
+closeSidebarTabWithLease,launchAutoSidebarAction,recordSidebarManualIntent,releaseAutoCloseAttempt,sweepAutoOpenPlaceholders,syncAutoSidebarTabs,
+syncSidebarTabs,
+});
+}
+global[SYMBOL]=Object.freeze({
+useSidebarPanelAutoOrchestration,useSidebarPanelAutoOrchestrationPart2,useSidebarPanelAutoRefs,
+useSidebarPanelTabPrimitives,useSidebarPanelTabSync,useSidebarPanelTabWiring,
+useSidebarPanelTabWiringPart2,useSidebarPanelTabWiringPart3,
+});
+})(globalThis);
+/* source: client-sidebar-panel-hooks-actions.js */
+(function installSidebarPanelHooksActions(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-actions");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS,SIDEBAR_TAB_ORIGIN_AUTO,SIDEBAR_TAB_ORIGIN_MANUAL,modelFunction,object,text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+SUBAGENT_CHAT_KIND,runtimeStatusOf,
+}=DOM;
+const POLL_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-poll");
+const POLL=global[POLL_SYMBOL]||{};
+const{
+PANEL_ERROR_SOURCES,RPC_FAILURE_TRANSPORT,callRpc,rpcFailureKindOf,
+}=POLL;
+const AUTO_LEDGER_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
+const AUTO_LEDGER=global[AUTO_LEDGER_SYMBOL]||{};
+const{
+SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,readSidebarAutoOwnershipEntry,recordSidebarAutoDecision,sidebarAutoOriginEntry,sidebarAutoOriginTabIdOf,
+writeSidebarAutoOwnership,
+}=AUTO_LEDGER;
+function useSidebarPanelTabRecorder(frame){
+const{
+}=frame;
+Object.assign(frame,{
+});
+}
+function readSidebarTabEvidence(deps){
+const{readActiveSidebarResource,readSidebarOpenTabs,resourceAddress,sidebarRight,sidebarSessionId}=deps;
+let tab=null;
+const inventory=readSidebarOpenTabs();
+if(inventory!==null){
+for(const entry of inventory){
+const candidate=object(entry);
+if(text(candidate.sessionId,null)!==sidebarSessionId)continue;
+if(text(candidate.kind,null)!==SUBAGENT_CHAT_KIND)continue;
+if(text(candidate.contentId,null)!==resourceAddress)continue;
+const candidateId=text(candidate.tabId,null);
+if(candidateId!==null){
+tab={id:candidateId,kind:candidate.kind,contentId:candidate.contentId,title:null};
+break;
+}
+}
+}
+if(tab!==null&&readActiveSidebarResource!==null){
+try{
+const activeSource=object(readActiveSidebarResource.call(sidebarRight));
+if(text(activeSource.id,null)===tab.id)tab={...tab,title:text(activeSource.title,null)};
+}catch{/* inventory 已足够确认 tabId，标题读取失败不阻塞 toggle。 */}
+}
+if(tab===null){
+try{tab=readActiveSidebarResource.call(sidebarRight);}catch{return null;}
+}
+const source=object(tab);
+const tabId=text(source.id,null);
+const tabTitle=text(source.title,null);
+if(tabId===null)return null;
+if(text(source.kind,null)!==SUBAGENT_CHAT_KIND)return null;
+if(text(source.contentId,null)!==resourceAddress)return null;
+return{tabId,tabTitle};
+}
+function resolveSidebarTabOrigin(deps){
+const{
+actionOrigin,actionProof,key,openings,readPersistedEntry,records,resourceAddress,rootSessionId,
+sharedOrigins,sidebarManualIntentOf,sidebarSessionId,tabId,
+}=deps;
+const declaredOrigin=actionOrigin===SIDEBAR_TAB_ORIGIN_AUTO||actionOrigin===SIDEBAR_TAB_ORIGIN_MANUAL
+?actionOrigin
+:null;
+const declaredAutoProven=actionProof!==null&&actionProof!==undefined
+&&actionProof.autoProven===true;
+const previous=records.get(key);
+const opening=openings.get(key);
+const previousScoped=previous!==undefined
+&&previous.sessionId===sidebarSessionId&&previous.rootSessionId===rootSessionId
+?previous
+:undefined;
+const openingScoped=opening!==undefined
+&&opening.sessionId===sidebarSessionId&&opening.rootSessionId===rootSessionId
+?opening
+:undefined;
+if(openingScoped!==undefined
+&&(openingScoped.causalIssuedAt===null||openingScoped.causalIssuedAt===undefined)){
+openingScoped.foreignWriter=true;
+}
+const manualTakeover=sidebarManualIntentOf(key);
+const sharedOrigin=sharedOrigins.get(key);
+const sharedOriginScoped=sharedOrigin!==undefined
+&&sharedOrigin.sessionId===sidebarSessionId&&sharedOrigin.rootSessionId===rootSessionId
+?sharedOrigin
+:undefined;
+const sharedOriginTabId=sidebarAutoOriginTabIdOf(sharedOriginScoped);
+const sharedOriginBound=sharedOriginTabId!==null&&sharedOriginTabId===tabId;
+const sharedOriginStale=sharedOriginScoped!==undefined&&sharedOriginBound!==true;
+const persistedEntry=readPersistedEntry(sidebarSessionId,rootSessionId,resourceAddress);
+const persistedManual=persistedEntry!==null&&persistedEntry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL;
+const persistedAutoBound=persistedEntry!==null
+&&persistedEntry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
+&&persistedEntry.tabId!==null
+&&persistedEntry.tabId===tabId;
+const persistedStaleAuto=persistedEntry!==null
+&&persistedEntry.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO
+&&persistedAutoBound!==true;
+const previousUsableAuto=previousScoped!==undefined
+&&previousScoped.origin===SIDEBAR_TAB_ORIGIN_AUTO
+&&previousScoped.tabId===tabId;
+const openingUsableAuto=openingScoped!==undefined
+&&openingScoped.origin===SIDEBAR_TAB_ORIGIN_AUTO
+&&openingScoped.causalProof==="proven"
+&&openingScoped.causalIssuedAt!==null&&openingScoped.causalIssuedAt!==undefined
+&&openingScoped.foreignWriter!==true;
+const declaredUsable=declaredOrigin===SIDEBAR_TAB_ORIGIN_AUTO
+?(declaredAutoProven===true?SIDEBAR_TAB_ORIGIN_AUTO:SIDEBAR_TAB_ORIGIN_MANUAL)
+:declaredOrigin;
+const manualIntentOpen=manualTakeover!==undefined&&manualTakeover.intent==="open";
+const origin=manualIntentOpen||persistedManual
+?SIDEBAR_TAB_ORIGIN_MANUAL
+:(declaredUsable
+??(previousUsableAuto===true
+?SIDEBAR_TAB_ORIGIN_AUTO
+:(openingUsableAuto===true
+?SIDEBAR_TAB_ORIGIN_AUTO
+:(sharedOriginBound===true
+?SIDEBAR_TAB_ORIGIN_AUTO
+:(persistedAutoBound===true?SIDEBAR_TAB_ORIGIN_AUTO:SIDEBAR_TAB_ORIGIN_MANUAL)))));
+const recordOrigin=origin===SIDEBAR_TAB_ORIGIN_AUTO?SIDEBAR_TAB_ORIGIN_AUTO:SIDEBAR_TAB_ORIGIN_MANUAL;
+return{
+declaredAutoProven,declaredOrigin,manualIntentOpen,openingScoped,openingUsableAuto,persistedManual,
+persistedStaleAuto,previous,previousUsableAuto,recordOrigin,sharedOriginScoped,sharedOriginStale,
+};
+}
+function useSidebarPanelTabRecorderPart2(frame){
+const{
+bump,closeSidebarResource,primitives,readActiveSidebarResource,readSidebarOpenTabs,rootSessionId,
+sidebarAutoOriginRef,sidebarManualIntentOf,sidebarRight,sidebarSessionId,sidebarTabOpeningRef,sidebarTabRecordsRef,
+}=frame;
+const recordSidebarTab=(key,resourceAddress,actionOrigin,actionProof)=>{
+if(closeSidebarResource===null)return false;
+if(readActiveSidebarResource===null&&readSidebarOpenTabs()===null)return false;
+if(typeof primitives?.IconChevronLeftOutlineRegular!=="function")return false;
+const evidence=readSidebarTabEvidence({
+readActiveSidebarResource,readSidebarOpenTabs,resourceAddress,sidebarRight,sidebarSessionId,
+});
+if(evidence===null)return false;
+const{tabId,tabTitle}=evidence;
+const resolution=resolveSidebarTabOrigin({
+actionOrigin,actionProof,key,openings:sidebarTabOpeningRef.current,readPersistedEntry:readSidebarAutoOwnershipEntry,
+records:sidebarTabRecordsRef.current,resourceAddress,rootSessionId,
+sharedOrigins:sidebarAutoOriginRef.current,sidebarManualIntentOf,sidebarSessionId,tabId:evidence.tabId,
+});
+const{
+declaredAutoProven,declaredOrigin,manualIntentOpen,openingScoped,openingUsableAuto,persistedManual,
+persistedStaleAuto,previous,previousUsableAuto,recordOrigin,sharedOriginScoped,sharedOriginStale,
+}=resolution;
+if(sharedOriginStale===true
+||(persistedManual===true&&sharedOriginScoped!==undefined)){
+sidebarAutoOriginRef.current.delete(key);
+}
+if(recordOrigin===SIDEBAR_TAB_ORIGIN_AUTO){
+sidebarAutoOriginRef.current.set(
+key,
+sidebarAutoOriginEntry(sidebarSessionId,rootSessionId,resourceAddress,tabId),
+);
+}
+writeSidebarAutoOwnership(
+sidebarSessionId,
+rootSessionId,
+resourceAddress,
+recordOrigin===SIDEBAR_TAB_ORIGIN_AUTO?SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO:SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,
+recordOrigin===SIDEBAR_TAB_ORIGIN_AUTO
+?(declaredOrigin===SIDEBAR_TAB_ORIGIN_AUTO?"auto-open":"auto-adopt")
+:(manualIntentOpen===true
+?"manual-open"
+:(persistedStaleAuto===true
+?"manual-stale-auto"
+:(sharedOriginStale===true
+?"manual-stale-origin"
+:(declaredOrigin===SIDEBAR_TAB_ORIGIN_AUTO&&declaredAutoProven!==true
+?"manual-unproven-open"
+:(openingScoped!==undefined&&openingScoped.origin===SIDEBAR_TAB_ORIGIN_AUTO
+&&openingUsableAuto!==true&&previousUsableAuto!==true
+?"manual-unproven-open"
+:"manual-takeover"))))),
+tabId,
+);
+if(previous!==undefined&&previous.sessionId===sidebarSessionId
+&&previous.rootSessionId===rootSessionId&&previous.tabId===tabId){
+previous.title=tabTitle??previous.title;
+previous.misses=0;
+previous.origin=recordOrigin;
+return true;
+}
+sidebarTabRecordsRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,tabId,title:tabTitle,misses:0,origin:recordOrigin});
+bump((value)=>value+1);
+return true;
+};
+frame.late.recordSidebarTab=recordSidebarTab;
+Object.assign(frame,{
+recordSidebarTab,
+});
+}
+function useSidebarPanelActionHandlers(frame){
+const{
+}=frame;
+Object.assign(frame,{
+});
+}
+function createSidebarActionContext(deps,key,resourceAddress,actionOrigin,autoAction){
+const{
+releaseAutoCloseAttempt,rootSessionId,sidebarAutoEpochRef,sidebarAutoReservationRef,
+sidebarSessionId,sidebarSurfaceStillCurrent,sidebarTabRecordsRef,
+}=deps;
+const origin=actionOrigin===SIDEBAR_TAB_ORIGIN_AUTO?SIDEBAR_TAB_ORIGIN_AUTO:SIDEBAR_TAB_ORIGIN_MANUAL;
+if(origin===SIDEBAR_TAB_ORIGIN_MANUAL){
+const manualRecord=sidebarTabRecordsRef.current.get(key);
+writeSidebarAutoOwnership(
+sidebarSessionId,
+rootSessionId,
+resourceAddress,
+SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,
+manualRecord===undefined?"manual-open":"manual-close",
+);
+}
+const autoContext=origin===SIDEBAR_TAB_ORIGIN_AUTO&&autoAction!==null&&typeof autoAction==="object"
+?{
+kind:autoAction.kind==="close"?"close":"open",
+epoch:Number.isFinite(Number(autoAction.epoch))?Number(autoAction.epoch):sidebarAutoEpochRef.current,
+attemptsBefore:Number.isFinite(Number(autoAction.attemptsBefore))?Number(autoAction.attemptsBefore):0,
+attemptToken:autoAction.attemptToken!==null&&autoAction.attemptToken!==undefined
+&&typeof autoAction.attemptToken==="object"
+?autoAction.attemptToken
+:null,
+}
+:null;
+if(sidebarSurfaceStillCurrent()!==true){
+if(autoContext!==null){
+sidebarAutoReservationRef.current.delete(key);
+releaseAutoCloseAttempt(key,autoContext);
+}
+return null;
+}
+return{
+autoContext,canTrackOpen:false,effectiveOrigin:origin,key,openIssued:false,openProof:null,origin,
+resourceAddress,
+};
+}
+async function closeSidebarActionWithLease(action,deps,record){
+const{
+closeSidebarTabWithLease,releaseAutoCloseAttempt,sidebarAutoFailedKeysRef,sidebarAutoReservationRef,
+sidebarSplitIntentRef,sidebarSurfaceStillCurrent,
+}=deps;
+const{autoContext,key,origin,resourceAddress}=action;
+const splitIntentAtClose=sidebarSplitIntentRef.current;
+const closeSplitIntentToken=splitIntentAtClose!==null&&splitIntentAtClose.key===key
+?splitIntentAtClose.token
+:null;
+const closeOutcome=await closeSidebarTabWithLease(record.tabId,{
+waitForCompeting:origin===SIDEBAR_TAB_ORIGIN_MANUAL,
+verify:{
+key,
+address:resourceAddress,
+attemptToken:autoContext===null?null:autoContext.attemptToken,
+manual:origin===SIDEBAR_TAB_ORIGIN_MANUAL,
+splitIntentToken:closeSplitIntentToken,
+},
+});
+if(sidebarSurfaceStillCurrent()!==true){
+return;
+}
+if(closeOutcome.status==="contended"||closeOutcome.status==="contended-timeout"){
+if(autoContext!==null){
+sidebarAutoReservationRef.current.delete(key);
+releaseAutoCloseAttempt(key,autoContext);
+sidebarAutoFailedKeysRef.current.add(key);
+}
+return;
+}
+if(closeOutcome.status==="unreadable"){
+if(autoContext!==null){
+sidebarAutoReservationRef.current.delete(key);
+releaseAutoCloseAttempt(key,autoContext);
+sidebarAutoFailedKeysRef.current.add(key);
+}
+return;
+}
+if(closeOutcome.status==="stale"){
+if(autoContext!==null){
+sidebarAutoReservationRef.current.delete(key);
+releaseAutoCloseAttempt(key,autoContext);
+}
+return;
+}
+if(closeOutcome.status==="failed"||closeOutcome.status==="timeout"){
+sidebarAutoFailedKeysRef.current.add(key);
+return;
+}
+if(closeOutcome.status==="request-resolved-unverified"){
+return;
+}
+settleVerifiedSidebarClose(action,deps,record,closeOutcome,closeSplitIntentToken);
+}
+function settleVerifiedSidebarClose(action,deps,record,closeOutcome,closeSplitIntentToken){
+const{
+bump,cancelPendingSidebarSplitOfClose,rootSessionId,settleAutoCloseAttempt,sidebarAutoCloseCooldownsRef,
+sidebarAutoOriginRef,sidebarAutoSuppressedRef,sidebarSessionId,sidebarTabRecordsRef,syncSidebarTabs,
+trimAutoKeyMap,
+}=deps;
+const{autoContext,key,origin,resourceAddress}=action;
+if(closeOutcome.status==="verified-closed"||closeOutcome.status==="closed"
+||closeOutcome.status==="verified-recycled"){
+const currentRecord=sidebarTabRecordsRef.current.get(key);
+const recordStillSame=currentRecord!==undefined&&currentRecord.tabId===record.tabId;
+cancelPendingSidebarSplitOfClose(key,closeSplitIntentToken);
+if(recordStillSame===true){
+sidebarTabRecordsRef.current.delete(key);
+}
+settleAutoCloseAttempt(key,autoContext);
+if(recordStillSame===true&&closeOutcome.status==="verified-recycled"){
+sidebarAutoCloseCooldownsRef.current.delete(key);
+}
+if(recordStillSame===true){
+sidebarAutoOriginRef.current.delete(key);
+if(origin===SIDEBAR_TAB_ORIGIN_MANUAL){
+sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:resourceAddress});
+trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,resourceAddress,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
+}
+}
+bump((value)=>value+1);
+syncSidebarTabs();
+}
+}
+function reviewAutoSideEffect(action,deps){
+const{autoActionStillValid,autoTakeoverStateOf}=deps;
+const{autoContext,key}=action;
+if(autoContext===null)return"proceed";
+if(autoContext===null)return"proceed";
+if(autoActionStillValid(autoContext)!==true)return"abort";
+const takeover=autoTakeoverStateOf(key);
+if(takeover==="close")return"abort";
+if(takeover==="open")return"manual";
+return"proceed";
+}
+function runSidebarOpenAction(action,deps){
+const{
+clearAutoCloseAttempt,closeSidebarResource,existingSubagentPaneId,primitives,readActiveSidebarResource,
+rootSessionId,sidebarAutoOriginRef,sidebarAutoSuppressedRef,sidebarOpenTabsAvailable,sidebarSessionId,
+sidebarTabOpeningRef,splitSidebarPane,
+}=deps;
+const{key,origin,resourceAddress}=action;
+action.effectiveOrigin=origin;
+action.canTrackOpen=closeSidebarResource!==null
+&&(readActiveSidebarResource!==null||sidebarOpenTabsAvailable===true)
+&&typeof primitives?.IconChevronLeftOutlineRegular==="function";
+const canObserveOpenCommit=action.canTrackOpen
+&&globalThis.document!==null&&globalThis.document!==undefined;
+if(canObserveOpenCommit){
+sidebarTabOpeningRef.current.set(key,{
+sessionId:sidebarSessionId,
+rootSessionId,
+resourceAddress,
+expiresAt:Date.now()+SIDEBAR_TAB_OPEN_CONFIRMATION_TIMEOUT_MS,
+origin,
+causalProof:"pending",
+causalIssuedAt:null,
+foreignWriter:false,
+});
+}
+if(origin===SIDEBAR_TAB_ORIGIN_MANUAL){
+sidebarAutoSuppressedRef.current.delete(key);
+sidebarAutoOriginRef.current.delete(key);
+clearAutoCloseAttempt(key);
+}
+const targetPaneId=existingSubagentPaneId();
+let plan;
+if(targetPaneId!==null){
+plan={openOptions:{kind:SUBAGENT_CHAT_KIND,paneId:targetPaneId,preferNewPane:false},splitToken:null};
+}else if(splitSidebarPane===null){
+plan={openOptions:{kind:SUBAGENT_CHAT_KIND,preferNewPane:true},splitToken:null};
+}else{
+const splitState=beginSidebarSplitPreparation(action,deps);
+if(splitState===null)return;
+if(splitState.waitForLayout===true){
+return completeSidebarSplitPreparation(action,deps,splitState).then((splitPlan)=>{
+if(splitPlan===null)return;
+if(issueSidebarResourceOpen(action,deps,splitPlan)!==true)return;
+finishSidebarResourceOpen(action,deps,splitPlan);
+});
+}
+plan=finishSidebarSplitPreparation(action,deps,splitState);
+}
+if(plan===null)return;
+if(issueSidebarResourceOpen(action,deps,plan)!==true)return;
+finishSidebarResourceOpen(action,deps,plan);
+}
+function beginSidebarSplitPreparation(action,deps){
+const{
+beginSidebarSplit,config,readSidebarOpenTabs,rootSessionId,sidebarSessionId,sidebarSplitIntentRef,
+sidebarTabOpeningRef,
+}=deps;
+const{key,resourceAddress}=action;
+const tabsBeforeSplit=readSidebarOpenTabs();
+let splitToken=null;
+if(beginSidebarSplit===null)return{splitToken,tabsBeforeSplit,waitForLayout:false};
+let preparation=null;
+try{
+preparation=beginSidebarSplit.call(config,{
+sessionId:sidebarSessionId,
+rootSessionId,
+key,
+resourceAddress,
+});
+}catch{
+preparation=null;
+}
+if(preparation?.busy===true){
+sidebarTabOpeningRef.current.delete(key);
+return;
+}
+if(preparation===null||typeof preparation!=="object"
+||preparation.token===null||preparation.token===undefined){
+sidebarTabOpeningRef.current.delete(key);
+return;
+}
+splitToken=preparation.token;
+if(splitToken!==null){
+sidebarSplitIntentRef.current={
+token:splitToken,
+key,
+resourceAddress,
+paneId:null,
+resourceIssued:false,
+};
+}
+return{splitToken,tabsBeforeSplit,waitForLayout:true};
+}
+async function completeSidebarSplitPreparation(action,deps,state){
+const{
+abandonAutoSidebarAction,autoTakeoverStateOf,cancelPendingSidebarSplit,rootSessionId,
+sidebarAutoSuppressedRef,sidebarSessionId,sidebarSplitIntentRef,sidebarSurfaceStillCurrent,
+sidebarTabOpeningRef,trimAutoKeyMap,waitForSidebarSplitLayoutCommit,
+}=deps;
+const{autoContext,key,resourceAddress}=action;
+const{splitToken}=state;
+await waitForSidebarSplitLayoutCommit();
+const splitStillCurrent=sidebarSurfaceStillCurrent()===true
+&&sidebarSplitIntentRef.current?.token===splitToken;
+if(!splitStillCurrent){
+if(sidebarSplitIntentRef.current?.token===splitToken)cancelPendingSidebarSplit("split-stale");
+sidebarTabOpeningRef.current.delete(key);
+return null;
+}
+const afterLayoutReview=reviewAutoSideEffect(action,deps);
+if(afterLayoutReview==="abort"){
+abandonAutoSidebarAction(key,autoContext);
+if(autoTakeoverStateOf(key)==="close"){
+sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:resourceAddress});
+trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,resourceAddress,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
+}
+return null;
+}
+if(afterLayoutReview==="manual")action.effectiveOrigin=SIDEBAR_TAB_ORIGIN_MANUAL;
+return finishSidebarSplitPreparation(action,deps,state);
+}
+function finishSidebarSplitPreparation(action,deps,state){
+const{
+cancelPendingSidebarSplit,config,markSidebarSplitPane,seededGuideTabId,sidebarRight,sidebarSessionId,
+sidebarSplitIntentRef,sidebarTabOpeningRef,splitSidebarPane,
+}=deps;
+const{key}=action;
+const{splitToken,tabsBeforeSplit}=state;
+let paneId=null;
+try{paneId=splitSidebarPane.call(sidebarRight);}catch{paneId=null;}
+if(typeof paneId!=="string"||paneId.trim()===""){
+if(splitToken!==null)cancelPendingSidebarSplit("split-failed");
+sidebarTabOpeningRef.current.delete(key);
+return null;
+}
+if(splitToken!==null){
+let accepted=true;
+if(markSidebarSplitPane!==null){
+try{accepted=markSidebarSplitPane.call(config,splitToken,paneId)!==false;}catch{accepted=false;}
+}
+if(!accepted){
+cancelPendingSidebarSplit("pane-rejected");
+sidebarTabOpeningRef.current.delete(key);
+return null;
+}
+if(sidebarSplitIntentRef.current?.token===splitToken){
+sidebarSplitIntentRef.current.paneId=paneId;
+}
+}
+const guideTabId=seededGuideTabId(tabsBeforeSplit,sidebarSessionId);
+const openOptions={kind:SUBAGENT_CHAT_KIND,paneId,preferNewPane:false};
+if(guideTabId!==null)openOptions.replaceTab=guideTabId;
+return{openOptions,splitToken};
+}
+function issueSidebarResourceOpen(action,deps,plan){
+const{
+abandonAutoSidebarAction,autoTakeoverStateOf,openSidebarResource,rootSessionId,
+sidebarAutoOriginRef,sidebarAutoSuppressedRef,sidebarResourceTabStateOf,sidebarSessionId,
+sidebarTabOpeningRef,sidebarRight,trimAutoKeyMap,
+}=deps;
+const{autoContext,key,resourceAddress}=action;
+const{openOptions}=plan;
+const beforeOpenReview=reviewAutoSideEffect(action,deps);
+if(beforeOpenReview==="abort"){
+abandonAutoSidebarAction(key,autoContext);
+if(autoTakeoverStateOf(key)==="close"){
+sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:resourceAddress});
+trimAutoKeyMap(sidebarAutoSuppressedRef.current);
+writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,resourceAddress,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
+}
+return false;
+}
+if(beforeOpenReview==="manual")action.effectiveOrigin=SIDEBAR_TAB_ORIGIN_MANUAL;
+let openProof=null;
+if(autoContext!==null){
+const openWitness=sidebarResourceTabStateOf(resourceAddress);
+const autoProven=openWitness.readable===true&&openWitness.tabId===null;
+openProof={autoProven};
+if(autoProven!==true){
+recordSidebarAutoDecision("open",{key,kind:"open"},"downgrade","causal-unproven");
+}
+const pendingOpening=sidebarTabOpeningRef.current.get(key);
+if(pendingOpening!==undefined
+&&pendingOpening.sessionId===sidebarSessionId&&pendingOpening.rootSessionId===rootSessionId){
+pendingOpening.causalProof=autoProven===true?"proven":"failed";
+}
+}
+const issuedOpening=autoContext===null?undefined:sidebarTabOpeningRef.current.get(key);
+const issuedOpeningScoped=issuedOpening!==undefined
+&&issuedOpening.sessionId===sidebarSessionId&&issuedOpening.rootSessionId===rootSessionId
+?issuedOpening
+:undefined;
+const issuedAtBefore=issuedOpeningScoped===undefined
+||issuedOpeningScoped.causalIssuedAt===null||issuedOpeningScoped.causalIssuedAt===undefined
+?null
+:issuedOpeningScoped.causalIssuedAt;
+if(issuedOpeningScoped!==undefined)issuedOpeningScoped.causalIssuedAt=Date.now();
+try{
+openSidebarResource.call(sidebarRight,resourceAddress,openOptions);
+}catch(error){
+if(issuedOpeningScoped!==undefined)issuedOpeningScoped.causalIssuedAt=issuedAtBefore;
+throw error;
+}
+action.openIssued=true;
+action.openProof=openProof;
+if(action.effectiveOrigin===SIDEBAR_TAB_ORIGIN_AUTO&&action.canTrackOpen===true
+&&openProof!==null&&openProof.autoProven===true){
+const landedOriginEntry=sidebarAutoOriginRef.current.get(key);
+if(sidebarAutoOriginTabIdOf(landedOriginEntry)===null){
+sidebarAutoOriginRef.current.set(
+key,
+sidebarAutoOriginEntry(sidebarSessionId,rootSessionId,resourceAddress,null),
+);
+}
+}
+return true;
+}
+function finishSidebarResourceOpen(action,deps,plan){
+const{
+cancelPendingSidebarSplit,config,markSidebarSplitOpen,recordSidebarTab,sidebarSplitIntentRef,
+sidebarSurfaceStillCurrent,sidebarTabOpeningRef,syncSidebarTabs,
+}=deps;
+const{effectiveOrigin,key,openProof,resourceAddress}=action;
+const{splitToken}=plan;
+if(splitToken!==null){
+let acknowledged=true;
+if(markSidebarSplitOpen!==null){
+try{acknowledged=markSidebarSplitOpen.call(config,splitToken)!==false;}catch{acknowledged=false;}
+}
+if(!acknowledged){
+cancelPendingSidebarSplit("resource-not-acknowledged");
+}else if(sidebarSplitIntentRef.current?.token===splitToken){
+sidebarSplitIntentRef.current.resourceIssued=true;
+}
+}
+const opened=recordSidebarTab(key,resourceAddress,effectiveOrigin,openProof);
+if(opened)sidebarTabOpeningRef.current.delete(key);
+if(sidebarSurfaceStillCurrent()===true)syncSidebarTabs();
+}
+function useSidebarPanelActionHandlersPart2(frame){
+const{
+abandonAutoSidebarAction,autoActionStillValid,cancelPendingSidebarSplit,closeSidebarResource,
+openSidebarResource,recordSidebarManualIntent,sidebarSplitIntentRef,sidebarTabOpeningRef,
+sidebarTabPendingRef,sidebarTabRecordsRef,
+}=frame;
+const handleSidebarAction=async(key,resourceAddress,actionOrigin,autoAction)=>{
+const action=createSidebarActionContext(frame,key,resourceAddress,actionOrigin,autoAction);
+if(action===null)return;
+const pending=sidebarTabPendingRef.current;
+if(pending.has(key)){
+if(action.origin===SIDEBAR_TAB_ORIGIN_MANUAL)recordSidebarManualIntent(key,resourceAddress);
+return;
+}
+pending.add(key);
+try{
+if(action.autoContext!==null&&autoActionStillValid(action.autoContext)!==true){
+abandonAutoSidebarAction(key,action.autoContext);
+return;
+}
+const record=sidebarTabRecordsRef.current.get(key);
+if(record===undefined&&sidebarTabOpeningRef.current.has(key)){
+if(action.origin===SIDEBAR_TAB_ORIGIN_MANUAL)recordSidebarManualIntent(key,resourceAddress);
+return;
+}
+if(record!==undefined&&closeSidebarResource!==null){
+await closeSidebarActionWithLease(action,frame,record);
+return;
+}
+if(openSidebarResource===null)return;
+const openResult=runSidebarOpenAction(action,frame);
+if(openResult!==null&&openResult!==undefined&&typeof openResult.then==="function"){
+await openResult;
+}
+}catch{
+if(sidebarSplitIntentRef.current?.key===key)cancelPendingSidebarSplit("resource-failed");
+sidebarTabOpeningRef.current.delete(key);
+}finally{
+finishSidebarAction(action,frame);
+}
+};
+frame.late.handleSidebarAction=handleSidebarAction;
+Object.assign(frame,{
+handleSidebarAction,
+});
+}
+function finishSidebarAction(action,deps){
+const{
+applyPendingManualIntent,sidebarAutoFailedKeysRef,sidebarAutoOriginRef,sidebarAutoReservationRef,
+sidebarSurfaceStillCurrent,sidebarTabPendingRef,
+}=deps;
+const{autoContext,key,openIssued}=action;
+sidebarTabPendingRef.current.delete(key);
+const surfaceCurrent=sidebarSurfaceStillCurrent()===true;
+if(autoContext!==null){
+sidebarAutoReservationRef.current.delete(key);
+if(surfaceCurrent===true&&autoContext.kind==="open"&&openIssued!==true){
+sidebarAutoOriginRef.current.delete(key);
+sidebarAutoFailedKeysRef.current.add(key);
+}
+if(surfaceCurrent===true&&openIssued===true)sidebarAutoFailedKeysRef.current.delete(key);
+}
+if(surfaceCurrent===true)applyPendingManualIntent(key);
+}
+function useSidebarPanelBatchClose(frame){
+const{
+bump,closeSidebarResource,closeSidebarTabWithLease,rootSessionId,sidebarBatchPendingRef,sidebarBatchScopeKey,
+sidebarSessionId,sidebarSurfaceStillCurrent,sidebarTabPresenceInInventory,syncSidebarTabs,
+}=frame;
+const handleSidebarBatchClose=async(candidates)=>{
+if(sidebarSurfaceStillCurrent()!==true)return;
+if(closeSidebarResource===null)return;
+if(Array.isArray(candidates)!==true||candidates.length===0)return;
+const scopeKey=sidebarBatchScopeKey(sidebarSessionId,rootSessionId);
+const pendingScopes=sidebarBatchPendingRef.current;
+if(pendingScopes.has(scopeKey)===true)return;
+pendingScopes.add(scopeKey);
+bump((value)=>value+1);
+try{
+for(const candidate of candidates){
+if(sidebarSurfaceStillCurrent()!==true)return;
+const tabId=text(object(candidate).tabId,null);
+const candidateAddress=text(object(candidate).address,null);
+if(tabId===null||candidateAddress===null)continue;
+if(sidebarTabPresenceInInventory(tabId,candidateAddress)!=="present")continue;
+writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,candidateAddress,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
+await closeSidebarTabWithLease(tabId,{
+waitForCompeting:true,
+verify:{key:null,address:candidateAddress,attemptToken:null,manual:true},
+});
+if(sidebarSurfaceStillCurrent()!==true)return;
+}
+}finally{
+pendingScopes.delete(scopeKey);
+if(sidebarSurfaceStillCurrent()===true){
+bump((value)=>value+1);
+syncSidebarTabs();
+}
+}
+};
+Object.assign(frame,{
+handleSidebarBatchClose,
+});
+}
+function useSidebarPanelRunAction(frame){
+const{
+bump,catalogEntryOf,config,contextRef,currentRootRef,metaRefreshRef,metaStateRef,mountedRef,react,
+refreshRef,setState,
+}=frame;
+const runtimeStatusOfNode=(node,parentId,childId,options)=>runtimeStatusOf(
+node,
+catalogEntryOf(parentId,childId??text(object(node).sessionId,null)),
+options,
+);
+const pendingSet=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
+const recoveryRetryRef=typeof react.useRef==="function"
+?react.useRef({rootSessionId:null,inFlight:false,error:null})
+:{current:{rootSessionId:null,inFlight:false,error:null}};
+const runAction=async(request,key,requiresConfirm,message,options)=>{
+const actionOptions=object(options);
+if(mountedRef.current!==true)return null;
+if(pendingSet.current.has(key))return null;
+pendingSet.current.add(key);
+bump((value)=>value+1);
+setState((previous)=>{
+const current=previous.error;
+if(current===null||(current.source!==PANEL_ERROR_SOURCES.action&&current.source!==PANEL_ERROR_SOURCES.rpc)){
+return previous;
+}
+return{...previous,error:null};
+});
+try{
+if(requiresConfirm){
+if(typeof config.confirm!=="function")return null;
+let accepted=false;
+try{accepted=await config.confirm(message);}catch{accepted=false;}
+if(accepted!==true)return null;
+if(mountedRef.current!==true)return null;
+}
+const targetSessionId=typeof currentRootRef.current==="string"?currentRootRef.current:"";
+if(targetSessionId==="")return null;
+const result=await callRpc(config,contextRef.current,{...request,sessionId:targetSessionId});
+if(mountedRef.current!==true)return null;
+await refreshRef.current();
+if(metaStateRef.current!==null&&actionOptions.refreshMeta!==false){
+const refreshMeta=metaRefreshRef.current;
+if(typeof refreshMeta==="function")void refreshMeta();
+}
+return result;
+}catch(error){
+if(mountedRef.current!==true)return null;
+let message=error instanceof Error?error.message:String(error);
+if(actionOptions.safeMessage===true){
+const redact=modelFunction("redactDisplayText");
+const clean=redact===null?message:redact(message,200);
+message=clean===""?message:clean;
+}
+const code=actionOptions.includeErrorCode===true?text(object(error).code,null):null;
+if(code!==null)message=code+" · "+message;
+const source=rpcFailureKindOf(error)===RPC_FAILURE_TRANSPORT
+?PANEL_ERROR_SOURCES.rpc
+:PANEL_ERROR_SOURCES.action;
+const at=Date.now();
+setState((previous)=>({...previous,error:{source,message,at}}));
+return null;
+}finally{
+pendingSet.current.delete(key);
+if(mountedRef.current===true)bump((value)=>value+1);
+}
+};
+frame.late.runtimeStatusOfNode=runtimeStatusOfNode;
+Object.assign(frame,{
+pendingSet,recoveryRetryRef,runAction,runtimeStatusOfNode,
+});
+}
+function useSidebarPanelRunActionPart2(frame){
+const{
+bump,config,contextRef,currentRootRef,mountedRef,recoveryRetryRef,refreshRef,
+}=frame;
+const retryRecovery=async()=>{
+if(mountedRef.current!==true)return;
+const targetSessionId=typeof currentRootRef.current==="string"?currentRootRef.current:"";
+if(targetSessionId==="")return;
+const previous=recoveryRetryRef.current;
+if(previous.rootSessionId===targetSessionId&&previous.inFlight===true)return;
+recoveryRetryRef.current={rootSessionId:targetSessionId,inFlight:true,error:null};
+bump((value)=>value+1);
+let failure=null;
+try{
+const result=await callRpc(config,contextRef.current,{
+action:"fanout-restore-retry",
+sessionId:targetSessionId,
+});
+if(result?.restored!==true){
+const error=object(result?.error);
+const code=text(error.code,null);
+failure=code===null
+?{code:"NO_RESTORABLE_SNAPSHOT",message:"当前没有可恢复的持久化任务"}
+:{code,message:text(error.message,"")};
+}
+}catch(error){
+failure={
+code:"RETRY_FAILED",
+message:error instanceof Error?error.message:String(error),
+};
+}
+const stillCurrent=mountedRef.current===true&&currentRootRef.current===targetSessionId;
+recoveryRetryRef.current={rootSessionId:targetSessionId,inFlight:false,error:stillCurrent?failure:null};
+if(stillCurrent!==true)return;
+bump((value)=>value+1);
+await refreshRef.current();
+};
+Object.assign(frame,{
+retryRecovery,
+});
+}
+global[SYMBOL]=Object.freeze({
+useSidebarPanelActionHandlers,useSidebarPanelActionHandlersPart2,useSidebarPanelBatchClose,
+useSidebarPanelRunAction,useSidebarPanelRunActionPart2,useSidebarPanelTabRecorder,
+useSidebarPanelTabRecorderPart2,
+});
+})(globalThis);
+/* source: client-sidebar-panel.js */
+(function installSidebarPanel(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+SIDEBAR_AUTO_KEY_LIMIT,TIMELINE_EXPANDED_KEY_LIMIT,modelApi,object,
+text,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+createCatalogLookup,currentSessionIdOf,listSnapshot,makeIcon,
+methodOf,resolveClientService,runtimeStatusOf,statusIcon,
+styleTag,
+}=DOM;
+const POLL_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-poll");
+const POLL=global[POLL_SYMBOL]||{};
+const{
+formatPanelUpdatedTime,readPanelTabActivity,
+}=POLL;
+const AUTO_LEDGER_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
+const AUTO_LEDGER=global[AUTO_LEDGER_SYMBOL]||{};
+const{
+recordSidebarAutoDiag,resolveSidebarSharedAutoLedger,sidebarSharedAutoLedgerSizes,sidebarSharedAutoLedgerTotal,
+}=AUTO_LEDGER;
+const PANEL_CACHE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-cache");
+const PANEL_CACHE=global[PANEL_CACHE_SYMBOL]||{};
+const{
+createPanelSnapshotCache,
+}=PANEL_CACHE;
+const PANEL_STATE_A_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-state-a");
+const PANEL_STATE_A=global[PANEL_STATE_A_SYMBOL]||{};
+const VIEWS_A_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-views-a");
+const VIEWS_A=global[VIEWS_A_SYMBOL]||{};
+const VIEWS_B_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-views-b");
+const VIEWS_B=global[VIEWS_B_SYMBOL]||{};
+const VIEWS_C_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-views-c");
+const VIEWS_C=global[VIEWS_C_SYMBOL]||{};
+const HOOKS_STATE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-state");
+const HOOKS_STATE=global[HOOKS_STATE_SYMBOL]||{};
+const{
+useSidebarPanelHostServices,useSidebarPanelSessionModel,useSidebarPanelSessionModelPart2,
+useSidebarPanelSnapshotDerived,useSidebarPanelStateCore,useSidebarPanelStoreAndMeta,
+useSidebarPanelWidth,
+}=HOOKS_STATE;
+const HOOKS_EFFECTS_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-effects");
+const HOOKS_EFFECTS=global[HOOKS_EFFECTS_SYMBOL]||{};
+const{
+useSidebarPanelActivityEffect,useSidebarPanelAnnouncementEffect,useSidebarPanelMetaEffect,
+useSidebarPanelMountEffects,useSidebarPanelPolling,useSidebarPanelProjectionEffect,
+useSidebarPanelSessionModelEffects,useSidebarPanelSnapshotRefs,useSidebarPanelSnapshotSyncEffect,
+}=HOOKS_EFFECTS;
+const HOOKS_TABS_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-tabs");
+const HOOKS_TABS=global[HOOKS_TABS_SYMBOL]||{};
+const{
+useSidebarPanelAutoOrchestration,useSidebarPanelAutoOrchestrationPart2,useSidebarPanelAutoRefs,
+useSidebarPanelTabPrimitives,useSidebarPanelTabSync,useSidebarPanelTabWiring,
+useSidebarPanelTabWiringPart2,useSidebarPanelTabWiringPart3,
+}=HOOKS_TABS;
+const HOOKS_ACTIONS_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-actions");
+const HOOKS_ACTIONS=global[HOOKS_ACTIONS_SYMBOL]||{};
+const{
+useSidebarPanelActionHandlers,useSidebarPanelActionHandlersPart2,useSidebarPanelBatchClose,
+useSidebarPanelRunAction,useSidebarPanelRunActionPart2,useSidebarPanelTabRecorder,
+useSidebarPanelTabRecorderPart2,
+}=HOOKS_ACTIONS;
+function createSidebarPanelShared(deps){
+const{config,react,primitives}=deps;
+styleTag();
+const panelSnapshotCache=createPanelSnapshotCache();
+const peekCachedSnapshot=panelSnapshotCache.peek;
+const writeCachedSnapshot=panelSnapshotCache.write;
+const initialStateFor=panelSnapshotCache.initialStateFor;
+const sharedAutoLedgerState=resolveSidebarSharedAutoLedger();
+const sharedAutoLedger=sharedAutoLedgerState.ledger;
+recordSidebarAutoDiag({
+kind:"install",
+reused:sharedAutoLedgerState.reused,
+degraded:sharedAutoLedgerState.degraded,
+sizes:sidebarSharedAutoLedgerSizes(sharedAutoLedger),
+});
+if(sharedAutoLedgerState.reused===true&&sharedAutoLedgerState.degraded!==true
+&&sidebarSharedAutoLedgerTotal(sharedAutoLedger)>0){
+try{
+console.info("[dsh-expert-group] 本 realm 已有共享 Auto 账本：本次装载复用既有的归属 / 预算 / 确认计数（bundle 重新执行或 HMR）");
+}catch{/* 控制台不可用不影响功能。 */}
+}
+const sharedSidebarAutoOrigin=sharedAutoLedger.origin;
+const sharedSidebarAutoSuppressed=sharedAutoLedger.suppressed;
+const sharedSidebarAutoCloseAttempts=sharedAutoLedger.closeAttempts;
+const sharedSidebarAutoCloseAttemptOwners=sharedAutoLedger.closeAttemptOwners;
+const sharedSidebarAutoCloseVerifications=sharedAutoLedger.closeVerifications;
+const sharedSidebarAutoCloseCooldowns=sharedAutoLedger.closeCooldowns;
+const sharedSidebarAutoTabMisses=sharedAutoLedger.tabMisses;
+const trimSharedSidebarAutoTabMisses=()=>{
+while(sharedSidebarAutoTabMisses.size>SIDEBAR_AUTO_KEY_LIMIT){
+const oldest=sharedSidebarAutoTabMisses.keys().next();
+if(oldest.done===true)break;
+sharedSidebarAutoTabMisses.delete(oldest.value);
+}
+};
+const sharedSidebarTabCloseInFlight=sharedAutoLedger.tabCloseInFlight;
+return{
+config,react,primitives,
+panelSnapshotCache,peekCachedSnapshot,writeCachedSnapshot,initialStateFor,
+sharedAutoLedgerState,sharedAutoLedger,
+sharedSidebarAutoOrigin,sharedSidebarAutoSuppressed,sharedSidebarAutoCloseAttempts,
+sharedSidebarAutoCloseAttemptOwners,sharedSidebarAutoCloseVerifications,sharedSidebarAutoCloseCooldowns,
+sharedSidebarAutoTabMisses,trimSharedSidebarAutoTabMisses,sharedSidebarTabCloseInFlight,
+};
+}
+function createSidebarPanelFrame(props,shared){
+const{config}=shared;
+const frame=Object.assign(Object.create(null),shared);
+frame.props=props;
+frame.late=Object.create(null);
+const ctx=props?.ctx||config.ctx;
+let tabInfo=null;
+if(typeof props?.useTabInfo==="function"){
+try{tabInfo=props.useTabInfo();}catch{tabInfo=null;}
+}
+const tabParams=object(tabInfo?.tab?.navigation?.params);
+const sessionsSnapshot=listSnapshot(config,ctx);
+const catalogEntryOf=createCatalogLookup(sessionsSnapshot);
+const fallbackCurrent=currentSessionIdOf(sessionsSnapshot);
+const scopedId=typeof config.sessions?.scopeOf==="function"?config.sessions.scopeOf(ctx):undefined;
+const scope=props?.scope||props?.tab?.scope||tabInfo?.scope||{};
+const sessionId=text(scope.sessionId,text(props?.sessionId,text(props?.rootSessionId,text(tabParams.rootSessionId,text(scopedId,fallbackCurrent)))));
+let resolvedRoot=sessionId;
+if(typeof config.resolveRootSessionId==="function"&&sessionId!==null){
+try{resolvedRoot=text(config.resolveRootSessionId(sessionId,undefined,listSnapshot(config,ctx)),sessionId);}catch{resolvedRoot=sessionId;}
+}
+const rootSessionId=resolvedRoot||"";
+const sidebarSessionId=sessionId||rootSessionId;
+const tabActivity=readPanelTabActivity(config,props,tabInfo);
+const tabActivityKey=tabActivity===true?"active":(tabActivity===false?"inactive":"unknown");
+const model=modelApi();
+const panelLocale=PANEL_STATE_A.resolvePanelLocale(model,ctx,tabInfo);
+const t=PANEL_STATE_A.createPanelTranslator(model,panelLocale);
+const errorLabelOf=(source)=>PANEL_STATE_A.errorLabelOf(t,source);
+const serviceCandidates=[config,ctx,config.ctx];
+const sessionsService=resolveClientService(serviceCandidates,"sessions");
+const sidebarRight=resolveClientService(serviceCandidates,"sidebarRight");
+const requestRightbarDragSync=typeof config.syncRightbarDragLock==="function"?config.syncRightbarDragLock:null;
+const releaseRightbarDragLock=typeof config.releaseRightbarDragLock==="function"?config.releaseRightbarDragLock:null;
+const beginSidebarSplit=typeof config.beginSidebarSplit==="function"?config.beginSidebarSplit:null;
+const markSidebarSplitPane=typeof config.markSidebarSplitPane==="function"?config.markSidebarSplitPane:null;
+const markSidebarSplitOpen=typeof config.markSidebarSplitOpen==="function"?config.markSidebarSplitOpen:null;
+const commitSidebarSplit=typeof config.commitSidebarSplit==="function"?config.commitSidebarSplit:null;
+const cancelSidebarSplit=typeof config.cancelSidebarSplit==="function"?config.cancelSidebarSplit:null;
+const openSidebarResource=methodOf(sidebarRight,"openResource");
+Object.assign(frame,{
+ctx,tabInfo,tabParams,sessionsSnapshot,catalogEntryOf,fallbackCurrent,scopedId,scope,
+sessionId,resolvedRoot,rootSessionId,sidebarSessionId,tabActivity,tabActivityKey,
+model,panelLocale,t,errorLabelOf,
+serviceCandidates,sessionsService,sidebarRight,requestRightbarDragSync,releaseRightbarDragLock,
+beginSidebarSplit,markSidebarSplitPane,markSidebarSplitOpen,commitSidebarSplit,cancelSidebarSplit,
+openSidebarResource,
+});
+return frame;
+}
+function useSidebarPanelViews(frame){
+const{
+bump,catalogEntryOf,clearSessionModelRole,closeSidebarResource,commitSessionModelChanges,config,
+expand,handleOpen,handleSidebarAction,handleSidebarBatchClose,meta,model,
+navigation,neutralRuntimeStatus,openSidebarResource,partialSnapshot,primitives,react,
+readActiveSidebarResource,rootSessionId,sessionId,sessionModelCatalog,sessionModelDialogRef,sessionModelDrafts,
+sessionModelHasInvalidDraft,sessionModelNotice,sessionModelOpen,sessionModelPendingChanges,sessionModelSaving,sessionModelState,
+sessionsSnapshot,sidebarBatchPendingRef,sidebarBatchScopeKey,sidebarBatchStateFor,sidebarOpenTabsAvailable,sidebarSessionId,
+sidebarTabRecordsRef,snapshot,subagentAddressOfChild,t,timelineExpandedRef,toggle,
+updateSessionModelDraft,
+}=frame;
+const isTimelineExpanded=(key)=>timelineExpandedRef.current.has(key)===true;
+const toggleTimelineExpanded=(key)=>{
+const expandedKeys=timelineExpandedRef.current;
+if(expandedKeys.has(key))expandedKeys.delete(key);
+else{
+expandedKeys.add(key);
+while(expandedKeys.size>TIMELINE_EXPANDED_KEY_LIMIT){
+const oldest=expandedKeys.values().next();
+if(oldest.done===true)break;
+expandedKeys.delete(oldest.value);
+}
+}
+bump((value)=>value+1);
+};
+const isBatchPending=()=>sidebarBatchPendingRef.current.has(
+sidebarBatchScopeKey(sidebarSessionId,rootSessionId),
+)===true;
+const isTabOpen=(key)=>sidebarTabRecordsRef.current.get(key)!==undefined;
+const viewCtx={
+react,primitives,t,model,meta,snapshot,sessionsSnapshot,config,
+sessionId,sidebarSessionId,rootSessionId,catalogEntryOf,
+handleSidebarAction,handleSidebarBatchClose,
+openSidebarResource,closeSidebarResource,readActiveSidebarResource,sidebarOpenTabsAvailable,
+sidebarBatchStateFor,toggle,expand,handleOpen,subagentAddressOfChild,navigation,
+isBatchPending,isTabOpen,isTimelineExpanded,toggleTimelineExpanded,
+partialSnapshot,neutralRuntimeStatus,
+sessionModelOpen,sessionModelState,sessionModelCatalog,sessionModelSaving,sessionModelNotice,
+sessionModelDrafts,sessionModelHasInvalidDraft,sessionModelPendingChanges,sessionModelDialogRef,
+updateSessionModelDraft,clearSessionModelRole,commitSessionModelChanges,
+};
+const viewsA=VIEWS_A.createSidebarViewsA(viewCtx);
+const{renderChevron,renderSidebarBatchSlot}=viewsA;
+const viewsB=VIEWS_B.createSidebarViewsB(viewCtx,viewsA);
+const{sessionStatsPresentOf,renderMetrics,renderRowMain}=viewsB;
+Object.assign(frame,{
+isBatchPending,isTabOpen,isTimelineExpanded,renderChevron,renderMetrics,renderRowMain,
+renderSidebarBatchSlot,sessionStatsPresentOf,toggleTimelineExpanded,viewCtx,viewsA,viewsB,
+});
+}
+function useSidebarPanelProjectionRef(frame){
+const{
+react,
+}=frame;
+const projectionRefreshRequestedRef=typeof react.useRef==="function"
+?react.useRef(new Set())
+:{current:new Set()};
+Object.assign(frame,{
+projectionRefreshRequestedRef,
+});
+}
+function assembleSidebarPanelBody(frame){
+const{
+emptyFilter,errorLabelOf,expand,filterState,idleSidebarResourceAddresses,model,
+partialSnapshot,pendingSet,react,recoveryRetryRef,renderSidebarBatchSlot,retryRecovery,
+rootSessionId,runAction,runningSidebarResourceAddresses,runtimeStatusOfNode,sessionModelEntryRef,setFilterState,
+setSessionModelOpen,setSessionModelReloadToken,sidebarIdleChildren,snapshot,t,viewCtx,
+viewsA,viewsB,
+}=frame;
+const children=Array.isArray(snapshot?.root?.children)?snapshot.root.children:[];
+const{filterSource,taskFilter,filterActive,passesFilter}=PANEL_STATE_A.selectTaskFilter(
+model,
+filterState,
+rootSessionId,
+emptyFilter,
+);
+const updateFilter=(patch)=>{
+setFilterState(PANEL_STATE_A.nextFilterPatch(filterSource,patch,rootSessionId));
+};
+const idleChildren=sidebarIdleChildren();
+const visibleChildren=children.filter((node)=>!idleChildren.includes(node)).filter((node)=>passesFilter(node));
+const visibleIdleChildren=filterActive===true?idleChildren.filter((node)=>passesFilter(node)):idleChildren;
+const rootBatchSlot=filterActive===true?null:renderSidebarBatchSlot(runningSidebarResourceAddresses(),"运行中的子代理");
+const idleBatchSlot=filterActive===true?null:renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren),t("sidebar.idleGroup.name"));
+const root=snapshot?.root;
+const isActionPending=(key)=>pendingSet.current.has(key)===true;
+const toggleSessionModelDialog=()=>setSessionModelOpen((previous)=>previous!==true);
+const closeSessionModelDialog=()=>setSessionModelOpen(false);
+const retrySessionModelLoad=()=>setSessionModelReloadToken((value)=>value+1);
+const viewsC=VIEWS_C.createSidebarViewsC({
+...viewCtx,
+root,filterSource,updateFilter,passesFilter,filterActive,taskFilter,
+runAction,isActionPending,runtimeStatusOfNode,sessionModelEntryRef,
+closeSessionModelDialog,toggleSessionModelDialog,retrySessionModelLoad,
+},viewsA,viewsB);
+const{renderExpert,renderIdleGroup,renderFanout,renderToolbar,renderSessionModelDialog}=viewsC;
+const rootOpen=root===null?true:expand(root);
+const idleGroupVisible=!(filterActive===true&&visibleIdleChildren.length===0);
+const rootSiblingCount=visibleChildren.length+(idleGroupVisible?1:0);
+const rootStatus=runtimeStatusOf(root,null,{partial:partialSnapshot});
+const recovery=snapshot?.recovery??null;
+const recoveryFailed=recovery!==null&&recovery.status==="failed";
+const recoveryRetry=recoveryRetryRef.current;
+const recoveryRetryPending=recoveryRetry.inFlight===true&&recoveryRetry.rootSessionId===rootSessionId;
+const recoveryCode=recovery===null?null:text(recovery.code,"RESTORE_FAILED");
+const recoveryRetryError=recoveryFailed===true
+&&recoveryRetry.rootSessionId===rootSessionId
+&&recoveryRetry.error!==null
+&&(recoveryRetry.error.code===recoveryCode
+||recoveryRetry.error.code==="RETRY_FAILED"
+||recoveryRetry.error.code==="NO_RESTORABLE_SNAPSHOT")
+?recoveryRetry.error
+:null;
+const recoveryMessage=recovery===null?null:text(recovery.message,null);
+const recoveryBanner=recoveryFailed!==true
+?null
+:react.createElement("div",{
+className:"deg_expert_group_recovery",
+role:"alert",
+"data-recovery-status":"failed",
+"data-recovery-code":recoveryCode,
+title:recoveryMessage===null?"恢复失败（"+recoveryCode+"）":recoveryMessage,
+},
+react.createElement("span",{className:"deg_expert_group_recovery_text"},
+"任务恢复失败（"+recoveryCode+"）"+(recoveryMessage===null?"":"："+recoveryMessage)),
+recoveryRetryError===null
+?null
+:react.createElement("span",{className:"deg_expert_group_recovery_retry_error",role:"status"},
+"重试未恢复（"+text(recoveryRetryError.code,"RETRY_FAILED")+"）"
++(text(recoveryRetryError.message,"")===""?"":"："+text(recoveryRetryError.message,""))),
+react.createElement("button",{
+type:"button",
+className:"deg_expert_group_recovery_retry",
+title:recovery.retryable===false
+?"该原因通常需要修复持久化快照后才能恢复；点击会重新读取当前持久化快照"
+:"重新读取当前持久化快照并重跑恢复",
+"aria-label":t("sidebar.recovery.retry"),
+"aria-busy":recoveryRetryPending||undefined,
+disabled:recoveryRetryPending,
+onClick:retryRecovery,
+},recoveryRetryPending?t("sidebar.recovery.retrying"):t("sidebar.recovery.retry")));
+const errorEmptyState=(panelError)=>react.createElement("div",{
+className:"deg_expert_group_empty deg_expert_group_error_empty",
+role:"alert",
+"data-error-source":panelError.source,
+title:panelError.message,
+},
+react.createElement("div",{className:"deg_expert_group_error_empty_title"},
+errorLabelOf(panelError.source)),
+react.createElement("div",{className:"deg_expert_group_error_empty_detail"},panelError.message));
+Object.assign(frame,{
+children,closeSessionModelDialog,errorEmptyState,filterActive,filterSource,idleBatchSlot,
+idleChildren,idleGroupVisible,isActionPending,passesFilter,recovery,recoveryBanner,
+recoveryCode,recoveryFailed,recoveryMessage,recoveryRetry,recoveryRetryError,recoveryRetryPending,
+renderExpert,renderFanout,renderIdleGroup,renderSessionModelDialog,renderToolbar,retrySessionModelLoad,
+root,rootBatchSlot,rootOpen,rootSiblingCount,rootStatus,taskFilter,
+toggleSessionModelDialog,updateFilter,viewsC,visibleChildren,visibleIdleChildren,
+});
+}
+function assembleSidebarPanelBodyPart2(frame){
+const{
+errorEmptyState,filterActive,idleBatchSlot,idleChildren,idleGroupVisible,primitives,
+react,renderChevron,renderExpert,renderFanout,renderIdleGroup,renderMetrics,
+renderRowMain,renderToolbar,root,rootBatchSlot,rootOpen,rootSessionId,
+rootSiblingCount,rootStatus,snapshot,t,taskFilter,viewState,
+visibleChildren,visibleIdleChildren,
+}=frame;
+const body=viewState.loading&&snapshot===null
+?react.createElement("div",{className:"deg_expert_group_tree","aria-busy":"true"},react.createElement("div",{className:"deg_expert_group_skeleton"}),react.createElement("div",{className:"deg_expert_group_skeleton"}))
+:snapshot===null&&viewState.error!==null
+?errorEmptyState(viewState.error)
+:snapshot===null
+?react.createElement("div",{className:"deg_expert_group_empty"},t("sidebar.empty"))
+:react.createElement("div",{className:"deg_expert_group_tree"},
+renderToolbar(),
+react.createElement("div",{className:"deg_expert_group_tree_items",role:"tree","aria-label":"专家任务树"},
+react.createElement("div",{className:"deg_expert_group_node deg_expert_group_node_root",role:"none","data-root":"true"},
+react.createElement("div",{
+className:"deg_expert_group_row",
+role:"treeitem",
+"aria-level":1,
+"aria-posinset":1,
+"aria-setsize":1,
+"aria-expanded":rootOpen,
+"data-status":rootStatus,
+"data-expanded":rootOpen,
+},statusIcon(react,primitives,rootStatus),renderChevron(root,rootOpen),react.createElement("div",null,renderRowMain(root,{
+sessionId:root.sessionId,
+parentId:null,
+expanded:true,
+trailing:rootBatchSlot,
+metrics:renderMetrics(root,{kind:"root",runtimeStatus:rootStatus,sessionId:root.sessionId,sessionIds:[root.sessionId]}),
+}))),
+rootOpen?react.createElement("div",{className:"deg_expert_group_children",role:"group"},[
+...visibleChildren.map((node,index)=>node.kind==="fanout"
+?renderFanout(node,index,{level:2,posinset:index+1,setsize:rootSiblingCount})
+:renderExpert(node,index,rootSessionId,{level:2,posinset:index+1,setsize:rootSiblingCount})),
+idleGroupVisible
+?renderIdleGroup(filterActive===true?visibleIdleChildren:idleChildren,idleBatchSlot,{level:2,posinset:visibleChildren.length+1,setsize:rootSiblingCount})
+:null,
+filterActive===true&&visibleChildren.length===0&&visibleIdleChildren.length===0
+&&taskFilter!==null&&taskFilter.matches(root)!==true
+?react.createElement("div",{className:"deg_expert_group_filter_empty",role:"status"},t("sidebar.filter.empty"))
+:null,
+].filter((node)=>node!==null&&node!==undefined)):null)));
+Object.assign(frame,{
+body,
+});
+}
+function renderSidebarPanelSection(frame){
+const{
+announcement,autoOpenDraft,autoOpenEnabled,body,errorLabelOf,partialSnapshot,
+primitives,react,recoveryBanner,renderSessionModelDialog,retry,snapshot,
+t,toggleAutoOpen,version,viewState,widthResizer,writeAutoOpenSetting,
+}=frame;
+const autoOpenChecked=autoOpenDraft===null?autoOpenEnabled():autoOpenDraft===true;
+const autoOpenToggle=react.createElement("label",{
+className:"deg_expert_group_header_auto",
+title:"自动打开运行中的子代理侧栏会话",
+},
+react.createElement("input",{
+type:"checkbox",
+className:"deg_expert_group_header_auto_input",
+"aria-label":"Auto",
+checked:autoOpenChecked,
+disabled:writeAutoOpenSetting===null,
+onChange:(event)=>toggleAutoOpen(event?.target?.checked===true),
+}),
+react.createElement("span",{className:"deg_expert_group_header_auto_label"},"Auto"));
+const panelError=viewState.error;
+const panelErrorLabel=panelError===null
+?null
+:errorLabelOf(panelError.source);
+const updatedTime=snapshot===null?null:formatPanelUpdatedTime(viewState.updatedAt);
+const partialBadge=partialSnapshot===true
+?react.createElement("span",{
+className:"deg_expert_group_partial",
+role:"status",
+"data-partial":"true",
+title:t("sidebar.partial.title"),
+},t("sidebar.partial"))
+:null;
+const updatedBadge=updatedTime===null
+?null
+:react.createElement("span",{className:"deg_expert_group_updated",title:t("sidebar.updated.title")},t("sidebar.updated",{time:updatedTime}));
+const refreshLabel=panelError===null?t("sidebar.refresh"):t("sidebar.retry");
+const refreshButton=react.createElement("button",{
+type:"button",
+className:"deg_expert_group_header_action",
+title:refreshLabel,
+"aria-label":refreshLabel,
+onClick:retry,
+},makeIcon(primitives,"IconRefreshOutlineRegular",{size:14}));
+return react.createElement("section",{className:"deg_expert_group","data-version":version,"aria-label":"Expert Group"},
+widthResizer,
+react.createElement("div",{
+className:"deg_expert_group_announcer",
+role:"status",
+"aria-live":"polite",
+"aria-atomic":"true",
+"data-announcement":announcement===""?undefined:announcement,
+},announcement),
+react.createElement("header",{className:"deg_expert_group_header"},
+react.createElement("span",{className:"deg_expert_group_header_title"},t("sidebar.title")),
+partialBadge,
+updatedBadge,
+autoOpenToggle,
+panelError===null
+?null
+:react.createElement("span",{
+className:"deg_expert_group_error",
+"data-error-source":panelError.source,
+title:panelError.message,
+},panelErrorLabel),
+refreshButton),recoveryBanner,body,
+renderSessionModelDialog());
+Object.assign(frame,{
+autoOpenChecked,autoOpenToggle,panelError,panelErrorLabel,partialBadge,refreshButton,
+refreshLabel,updatedBadge,updatedTime,
+});
+}
+function createSidebarPanel(deps){
+const config=object(deps);
+const react=config.react;
+const primitives=config.primitives||{};
+if(!react||typeof react.createElement!=="function"){
+return function MissingReactPanel(){return null;};
+}
+const shared=createSidebarPanelShared({config,react,primitives});
+function Panel(props){
+const frame=createSidebarPanelFrame(props,shared);
+useSidebarPanelStateCore(frame);
+useSidebarPanelAnnouncementEffect(frame);
+useSidebarPanelWidth(frame);
+useSidebarPanelStoreAndMeta(frame);
+useSidebarPanelSessionModelEffects(frame);
+useSidebarPanelSessionModel(frame);
+useSidebarPanelSessionModelPart2(frame);
+useSidebarPanelSnapshotRefs(frame);
+useSidebarPanelPolling(frame);
+useSidebarPanelAutoRefs(frame);
+useSidebarPanelMountEffects(frame);
+useSidebarPanelActivityEffect(frame);
+useSidebarPanelHostServices(frame);
+useSidebarPanelSnapshotDerived(frame);
+useSidebarPanelMetaEffect(frame);
+useSidebarPanelTabPrimitives(frame);
+useSidebarPanelSnapshotSyncEffect(frame);
+useSidebarPanelTabWiring(frame);
+useSidebarPanelTabWiringPart2(frame);
+useSidebarPanelTabWiringPart3(frame);
+useSidebarPanelTabSync(frame);
+useSidebarPanelAutoOrchestration(frame);
+useSidebarPanelAutoOrchestrationPart2(frame);
+useSidebarPanelTabRecorder(frame);
+useSidebarPanelTabRecorderPart2(frame);
+useSidebarPanelActionHandlers(frame);
+useSidebarPanelActionHandlersPart2(frame);
+useSidebarPanelBatchClose(frame);
+useSidebarPanelViews(frame);
+useSidebarPanelProjectionRef(frame);
+useSidebarPanelProjectionEffect(frame);
+useSidebarPanelRunAction(frame);
+useSidebarPanelRunActionPart2(frame);
+assembleSidebarPanelBody(frame);
+assembleSidebarPanelBodyPart2(frame);
+return renderSidebarPanelSection(frame);
+}
+Panel.displayName="ExpertGroupPanel";
+return Panel;
+}
+global[SYMBOL]=Object.freeze({createSidebarPanel});
+})(globalThis);
+/* source: client-expert-group-sidebar.js */
+(function installExpertGroupSidebar(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-expert-group-sidebar");
+const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
+const PURE=global[PURE_SYMBOL]||{};
+const{
+BRAND_ICON_PATHS,
+}=PURE;
+const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
+const DOM=global[DOM_SYMBOL]||{};
+const{
+createBrandIcon,
+}=DOM;
+const PANEL_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel");
+const PANEL=global[PANEL_SYMBOL]||{};
+const{createSidebarPanel}=PANEL;
+const INSTALL_RESOURCES_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-install-resources");
+const INSTALL_RESOURCES=global[INSTALL_RESOURCES_SYMBOL]||{};
+const{createSidebarInstallCoordinator}=INSTALL_RESOURCES;
+function createExpertGroupPanel(deps){
+return createSidebarPanel(deps);
+}
+function installExpertGroupSidebar(ctx,deps){
+return createSidebarInstallCoordinator(ctx,deps,{createExpertGroupPanel});
 }
 global[SYMBOL]=Object.freeze({
 createExpertGroupPanel,
@@ -9104,18 +11330,10 @@ removedCapabilities:Object.freeze([
 ]),
 });
 })(globalThis);
-/* source: client-model-config.js */
-(function installModelConfig(global){
+/* source: client-model-config-paths.js */
+(function installClientModelConfigPaths(global){
 "use strict";
-const SYMBOL=Symbol.for("dsh-expert-group/client-model-config");
-const REASONING_EFFORTS=Object.freeze([
-"off","minimal","low","medium","high","xhigh","max",
-]);
-const REASONING_EFFORT_EMPTY="";
-const INPUT_MODALITIES=Object.freeze(["text","image"]);
-const DEFAULT_INPUT_MODALITIES=Object.freeze(["text"]);
-const CAPACITY_PATTERN=/^(\d+(?:\.\d+)?)([km])?$/i;
-const CAPACITY_SCALE=Object.freeze({k:1000,m:1000000});
+const SYMBOL=Symbol.for("dsh-expert-group/client-model-config-paths");
 function isBlankDraftValue(value){
 return value===undefined||value===null||value==="";
 }
@@ -9209,6 +11427,90 @@ function deriveKeyRef(provider){
 const text=isNonEmptyString(provider)?provider:"";
 return text.toUpperCase().replace(/[^A-Z0-9]+/g,"_")+"_API_KEY";
 }
+function pathOps(base,before,after,allowedKeys){
+const prefix=Array.isArray(base)?base:[];
+const previous=isPlainObject(before)?before:{};
+const next=isPlainObject(after)?after:{};
+const allowed=Array.isArray(allowedKeys)?new Set(allowedKeys):null;
+const ops=[];
+for(const[key,value]of Object.entries(next)){
+if(allowed!==null&&!allowed.has(key))continue;
+if(jsonEqual(previous[key],value))continue;
+ops.push({op:"set",path:[...prefix,key],value:deepClone(value)});
+}
+for(const key of Object.keys(previous)){
+if(allowed!==null&&!allowed.has(key))continue;
+if(Object.prototype.hasOwnProperty.call(next,key))continue;
+ops.push({op:"unset",path:[...prefix,key]});
+}
+return ops;
+}
+function hasOps(ops){
+return Array.isArray(ops)&&ops.length>0;
+}
+function revisionConflictOf(expectedRevision,currentRevision){
+if(!Number.isSafeInteger(expectedRevision)||expectedRevision<0)return false;
+if(!Number.isSafeInteger(currentRevision)||currentRevision<0)return true;
+return expectedRevision!==currentRevision;
+}
+function createEditorBaseline(snapshot,path){
+const source=isPlainObject(snapshot)?snapshot:{};
+const revision=Number.isSafeInteger(source.revision)&&source.revision>=0?source.revision:null;
+const user=source.user;
+const pinned=getPath(source.base,path);
+return{
+revision,
+userSubtree:getSubtree(user,path),
+effectiveSubtree:getSubtree(source.value,path),
+inherited:isPlainObject(pinned)?deepClone(pinned):{},
+};
+}
+function restoreDefaultOps(path){
+return[{op:"unset",path:[...(Array.isArray(path)?path:[]),"models"]}];
+}
+function providerSubtreeOps(stored,draft){
+return pathOps([],stored,draft);
+}
+global[SYMBOL]=Object.freeze({
+SYMBOL,
+isBlankDraftValue,
+isPlainObject,
+isSchemaNode,
+isNonEmptyString,
+jsonEqual,
+deepClone,
+getPath,
+hasPath,
+setPath,
+deletePath,
+getSubtree,
+deriveKeyRef,
+pathOps,
+hasOps,
+revisionConflictOf,
+createEditorBaseline,
+restoreDefaultOps,
+providerSubtreeOps,
+});
+})(globalThis);
+/* source: client-model-config-rows.js */
+(function installClientModelConfigRows(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-model-config-rows");
+const pathsSymbol=Symbol.for("dsh-expert-group/client-model-config-paths");
+const paths=global[pathsSymbol]||{};
+const{
+isPlainObject,isNonEmptyString,jsonEqual,isBlankDraftValue,createEditorBaseline,
+deepClone,deletePath,pathOps,hasPath,getSubtree,deriveKeyRef,isSchemaNode,getPath,
+}=paths;
+const REASONING_EFFORTS=Object.freeze([
+"off","minimal","low","medium","high","xhigh","max",
+]);
+const REASONING_EFFORT_EMPTY="";
+const INPUT_MODALITIES=Object.freeze(["text","image"]);
+const DEFAULT_INPUT_MODALITIES=Object.freeze(["text"]);
+const CAPACITY_PATTERN=/^(\d+(?:\.\d+)?)([km])?$/i;
+const CAPACITY_SCALE=Object.freeze({k:1000,m:1000000});
 function modelDisplayNameOf(model){
 if(!isPlainObject(model))return"";
 if(isNonEmptyString(model.name))return model.name;
@@ -9432,44 +11734,6 @@ const onlyIdentity=Object.keys(row).length<=1;
 return!(onlyIdentity&&(row.id===undefined||row.id===""));
 });
 }
-function pathOps(base,before,after,allowedKeys){
-const prefix=Array.isArray(base)?base:[];
-const previous=isPlainObject(before)?before:{};
-const next=isPlainObject(after)?after:{};
-const allowed=Array.isArray(allowedKeys)?new Set(allowedKeys):null;
-const ops=[];
-for(const[key,value]of Object.entries(next)){
-if(allowed!==null&&!allowed.has(key))continue;
-if(jsonEqual(previous[key],value))continue;
-ops.push({op:"set",path:[...prefix,key],value:deepClone(value)});
-}
-for(const key of Object.keys(previous)){
-if(allowed!==null&&!allowed.has(key))continue;
-if(Object.prototype.hasOwnProperty.call(next,key))continue;
-ops.push({op:"unset",path:[...prefix,key]});
-}
-return ops;
-}
-function hasOps(ops){
-return Array.isArray(ops)&&ops.length>0;
-}
-function revisionConflictOf(expectedRevision,currentRevision){
-if(!Number.isSafeInteger(expectedRevision)||expectedRevision<0)return false;
-if(!Number.isSafeInteger(currentRevision)||currentRevision<0)return true;
-return expectedRevision!==currentRevision;
-}
-function createEditorBaseline(snapshot,path){
-const source=isPlainObject(snapshot)?snapshot:{};
-const revision=Number.isSafeInteger(source.revision)&&source.revision>=0?source.revision:null;
-const user=source.user;
-const pinned=getPath(source.base,path);
-return{
-revision,
-userSubtree:getSubtree(user,path),
-effectiveSubtree:getSubtree(source.value,path),
-inherited:isPlainObject(pinned)?deepClone(pinned):{},
-};
-}
 function modelCatalogOverridden(baseline){
 if(!isPlainObject(baseline)||!isPlainObject(baseline.userSubtree))return false;
 return Object.prototype.hasOwnProperty.call(baseline.userSubtree,"models")
@@ -9503,9 +11767,6 @@ path:[...(Array.isArray(path)?path:[]),"models"],
 value:modelDraftsOf(models),
 }];
 }
-function restoreDefaultOps(path){
-return[{op:"unset",path:[...(Array.isArray(path)?path:[]),"models"]}];
-}
 function modelCatalogOps({profilePath,baseline,draft,catalogTouched}){
 const overridden=isOverridden(baseline);
 const rawDraft=isPlainObject(draft)?draft:{};
@@ -9521,10 +11782,6 @@ const next=Array.isArray(sourceNext.models)&&sourceNext.models.length===0&&inclu
 if(!overridden&&Object.keys(next).length===0)return[];
 return pathOps(profilePath,overridden?baseline.userSubtree:undefined,next,EDITABLE_PROFILE_FIELDS);
 }
-function providerSubtreeOps(stored,draft){
-return pathOps([],stored,draft);
-}
-const EDITABLE_PROFILE_FIELDS=Object.freeze(["displayName","apiKeyEnv","baseURL","api","models"]);
 function modelEditableProfileOf(source){
 if(!isPlainObject(source))return{};
 const next={};
@@ -10113,6 +12370,102 @@ return draft;
 },
 };
 }
+const EDITABLE_PROFILE_FIELDS=Object.freeze(["displayName","apiKeyEnv","baseURL","api","models"]);
+global[SYMBOL]=Object.freeze({
+SYMBOL,
+REASONING_EFFORTS,
+REASONING_EFFORT_EMPTY,
+INPUT_MODALITIES,
+DEFAULT_INPUT_MODALITIES,
+EDITABLE_PROFILE_FIELDS,
+modelDisplayNameOf,
+modelInputOf,
+modelDraftsOf,
+inputOverrideOf,
+emptyEffortSelection,
+effortSelectionFor,
+effortSelectionEqual,
+unknownEffortKeysOf,
+hasUnknownEffortKeys,
+reasoningDiffLines,
+selectedLevelsOf,
+applyEffortSelection,
+normalizeEffortsEntry,
+createModelRow,
+inputSelectionFor,
+patchModelDraft,
+setModelEffortSelection,
+setModelInputSelection,
+removeModelRow,
+appendModelRow,
+parseCapacity,
+formatCapacity,
+validateModelRows,
+normalizeModelRows,
+modelCatalogOverridden,
+isOverridden,
+inheritedModelsOf,
+fallbackModelsOf,
+materializeOverrideOps,
+modelCatalogOps,
+modelEditableProfileOf,
+importNamespace,
+catalogOpsFor,
+modelOverrideDecision,
+modelChoicesOf,
+indexModelsById,
+adoptModels,
+joinProviderDirectory,
+providerEditable,
+providerRemovable,
+providerProfileOf,
+apiKeyEnvOf,
+credentialRefOf,
+protocolChoices,
+createSchemaAdapter,
+namespaceSchemaInfo,
+validateProfileDraft,
+rolesAffectedByChange,
+reasoningGuardMessage,
+removedLevelsOf,
+namespaceViewOf,
+roleDefaultsOf,
+modelCardApply,
+providerListSections,
+apiKeyField,
+buildModelCardModel,
+createCardSession,
+});
+})(globalThis);
+/* source: client-model-config.js */
+(function installModelConfig(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-model-config");
+const pathsSymbol=Symbol.for("dsh-expert-group/client-model-config-paths");
+const rowsSymbol=Symbol.for("dsh-expert-group/client-model-config-rows");
+const paths=global[pathsSymbol]||{};
+const rows=global[rowsSymbol]||{};
+const{
+isBlankDraftValue,isPlainObject,isSchemaNode,isNonEmptyString,jsonEqual,deepClone,
+getPath,hasPath,setPath,deletePath,getSubtree,deriveKeyRef,pathOps,hasOps,
+revisionConflictOf,createEditorBaseline,restoreDefaultOps,providerSubtreeOps,
+}=paths;
+const{
+REASONING_EFFORTS,REASONING_EFFORT_EMPTY,INPUT_MODALITIES,DEFAULT_INPUT_MODALITIES,
+EDITABLE_PROFILE_FIELDS,modelDisplayNameOf,modelInputOf,modelDraftsOf,inputOverrideOf,
+emptyEffortSelection,effortSelectionFor,effortSelectionEqual,unknownEffortKeysOf,
+hasUnknownEffortKeys,reasoningDiffLines,selectedLevelsOf,applyEffortSelection,
+normalizeEffortsEntry,createModelRow,inputSelectionFor,patchModelDraft,
+setModelEffortSelection,setModelInputSelection,removeModelRow,appendModelRow,
+parseCapacity,formatCapacity,validateModelRows,normalizeModelRows,modelCatalogOverridden,
+isOverridden,inheritedModelsOf,fallbackModelsOf,materializeOverrideOps,modelCatalogOps,
+modelEditableProfileOf,importNamespace,catalogOpsFor,modelOverrideDecision,
+modelChoicesOf,indexModelsById,adoptModels,joinProviderDirectory,providerEditable,
+providerRemovable,providerProfileOf,apiKeyEnvOf,credentialRefOf,protocolChoices,
+createSchemaAdapter,namespaceSchemaInfo,validateProfileDraft,rolesAffectedByChange,
+reasoningGuardMessage,removedLevelsOf,namespaceViewOf,roleDefaultsOf,modelCardApply,
+providerListSections,apiKeyField,buildModelCardModel,createCardSession,
+}=rows;
 function buildSectionModel(input){
 const source=isPlainObject(input)?input:{};
 const open=source.open===true;
@@ -10507,8 +12860,6 @@ createCardSession,
 modelEditableProfileOf,
 EDITABLE_PROFILE_FIELDS,
 buildSectionModel,
-ROUTE_ID_PATTERN,
-BASE_URL_FALLBACK_PATTERN,
 validateRouteId,
 validateBaseUrl,
 validateProtocol,
@@ -10538,275 +12889,12 @@ roleDefaultsOf,
 });
 global[SYMBOL]=api;
 })(typeof globalThis!=="undefined"?globalThis:this);
-/* source: client-freshness.js */
-/* classic 投影：来自源文件的机械导出改写，权威实现仍是 client-freshness.js。 */
-(function installClientFreshness(global){
+/* source: client-text.js */
+(function installClientText(global){
 "use strict";
-const CLIENT_FRESHNESS_MODULE_ID="dsh-expert-group/client-freshness";
-const CLIENT_FRESHNESS_GLOBAL_KEY="dsh-expert-group/client-freshness";
-function rpcErrorStatus(error){
-const code=error?.code;
-if(code==="settings-conflict")return 409;
-if(code==="not-found"||code==="session-not-found")return 404;
-if(code==="forbidden"||code==="connection-required")return 403;
-if(code==="gateway/cancelled")return 499;
-if(code==="bad-request")return 400;
-return 500;
-}
-function normalizePluginRpcResult(result){
-const ok=result?.ok===true;
-const payload=ok?result.value:{ok:false,error:result?.error};
-const status=ok?200:(Number.isSafeInteger(result?.status)&&result.status>0?result.status:rpcErrorStatus(result?.error));
-return{
-ok,
-status,
-async json(){return payload;},
-};
-}
-async function requestPluginRpc(connection,request,init={},fetchImpl=globalThis.fetch,rpcTarget){
-const rpc=connection?.rpc;
-if(typeof rpc?.call==="function"){
-const result=await rpc.call(rpcTarget.channel,rpcTarget.endpoint,request,init.signal);
-return normalizePluginRpcResult(result);
-}
-if(typeof fetchImpl!=="function")throw new Error("当前 DSH 不支持插件 RPC");
-return fetchImpl(rpcTarget.path,{
-...init,
-method:init.method??"POST",
-credentials:init.credentials??"same-origin",
-headers:{"content-type":"application/json",...(init.headers??{})},
-body:init.body??JSON.stringify(request),
-});
-}
-function createClientFreshnessBoundary({sessionId="",onUpdate}={}){
-let disposed=false;
-let currentSessionId=typeof sessionId==="string"?sessionId:"";
-let sessionEpoch=0;
-let sequence=0;
-let notify=typeof onUpdate==="function"?onUpdate:null;
-const latestRequests=new Map();
-let settings={revision:-1,value:undefined};
-let catalog={generation:-1,value:undefined};
-let fanout={sessionId:currentSessionId,generation:-1,cursor:0,snapshot:undefined};
-const requestKey=(kind,key="")=>String(kind)+"\u0000"+String(key??"");
-const isObject=(value)=>value!==null&&typeof value==="object";
-const safeRevision=(value)=>Number.isSafeInteger(value)&&value>=0;
-const result=(accepted,reason,state)=>({accepted,reason,...(state===undefined?{}:{state})});
-const emit=(kind,state)=>{
-if(disposed||notify===null)return;
-try{notify({kind,state});}catch{/* UI 订阅者异常不能破坏响应判定。 */}
-};
-const tokenIsCurrent=(token)=>{
-if(disposed)return false;
-if(token===undefined)return true;
-if(!isObject(token))return false;
-if(token.epoch!==sessionEpoch||token.sessionId!==currentSessionId)return false;
-return latestRequests.get(token.key)===token.sequence;
-};
-const api={
-beginSession(nextSessionId=""){
-if(disposed)return Object.freeze({accepted:false,reason:"disposed",sessionId:currentSessionId,epoch:sessionEpoch});
-currentSessionId=typeof nextSessionId==="string"?nextSessionId:"";
-sessionEpoch+=1;
-sequence+=1;
-latestRequests.clear();
-fanout={sessionId:currentSessionId,generation:-1,cursor:0,snapshot:undefined};
-return Object.freeze({accepted:true,sessionId:currentSessionId,epoch:sessionEpoch,sequence});
-},
-beginRequest(kind,key=""){
-if(disposed)return Object.freeze({accepted:false,reason:"disposed",kind,key,sessionId:currentSessionId,epoch:sessionEpoch,sequence});
-const normalizedKey=requestKey(kind,key);
-const token={accepted:true,kind,key:normalizedKey,sessionId:currentSessionId,epoch:sessionEpoch,sequence:++sequence};
-latestRequests.set(normalizedKey,token.sequence);
-return Object.freeze(token);
-},
-isCurrent(token){
-return tokenIsCurrent(token);
-},
-isSessionCurrent(token){
-return!disposed&&isObject(token)&&token.epoch===sessionEpoch&&token.sessionId===currentSessionId;
-},
-acceptSettingsSnapshot({revision,value,requestToken}={}){
-if(!tokenIsCurrent(requestToken))return result(false,"stale-request",settings);
-if(!safeRevision(revision))return result(false,"invalid-revision",settings);
-if(revision<settings.revision)return result(false,"stale-revision",settings);
-if(revision===settings.revision&&settings.value!==undefined)return result(false,"duplicate",settings);
-settings={revision,value};
-emit("settings",settings);
-return result(true,undefined,settings);
-},
-acceptCatalogResponse({generation,groups,value,requestToken}={}){
-if(!tokenIsCurrent(requestToken))return result(false,"stale-request",catalog);
-if(!safeRevision(generation))return result(false,"invalid-generation",catalog);
-if(generation<catalog.generation)return result(false,"stale-generation",catalog);
-if(generation===catalog.generation&&catalog.value!==undefined)return result(false,"duplicate",catalog);
-catalog={generation,value:value===undefined?groups:value};
-emit("catalog",catalog);
-return result(true,undefined,catalog);
-},
-acceptFanoutSnapshot({sessionId:incomingSessionId,generation,cursor,snapshot,requestToken}={}){
-if(incomingSessionId!==currentSessionId)return result(false,"stale-session",fanout);
-if(!tokenIsCurrent(requestToken))return result(false,"stale-request",fanout);
-if(!safeRevision(generation))return result(false,"invalid-generation",fanout);
-if(!safeRevision(cursor))return result(false,"invalid-cursor",fanout);
-if(generation<fanout.generation)return result(false,"stale-generation",fanout);
-if(cursor<fanout.cursor)return result(false,"stale-cursor",fanout);
-if(generation===fanout.generation&&cursor===fanout.cursor&&fanout.snapshot!==undefined)return result(false,"duplicate",fanout);
-fanout={sessionId:currentSessionId,generation,cursor,snapshot};
-emit("fanout",fanout);
-return result(true,undefined,fanout);
-},
-acceptFanoutEvents({sessionId:incomingSessionId,generation,cursor,events,snapshot,requestToken}={}){
-return api.acceptFanoutSnapshot({
-sessionId:incomingSessionId,
-generation,
-cursor,
-snapshot:snapshot===undefined?events:snapshot,
-requestToken,
-});
-},
-acceptFanoutAction({sessionId:incomingSessionId,generation,requestToken}={}){
-if(incomingSessionId!==currentSessionId)return result(false,"stale-session");
-if(!tokenIsCurrent(requestToken))return result(false,"stale-request");
-if(generation!==undefined&&(!safeRevision(generation)||generation<fanout.generation))return result(false,"stale-generation");
-return result(true,undefined,fanout);
-},
-snapshot(){
-return{
-disposed,
-sessionId:currentSessionId,
-epoch:sessionEpoch,
-settings,
-catalog,
-fanout,
-};
-},
-dispose(){
-if(disposed)return false;
-disposed=true;
-latestRequests.clear();
-notify=null;
-settings={revision:-1,value:undefined};
-catalog={generation:-1,value:undefined};
-fanout={sessionId:currentSessionId,generation:-1,cursor:0,snapshot:undefined};
-return true;
-},
-};
-return Object.freeze(api);
-}
-async function commitSettingsCandidate(settings,revision,{request=globalThis.fetch,connection,normalizeSettingsDraft,roles,rpcTarget}={}){
-const body={action:"settings-commit",settings,expectedRevision:revision};
-const response=typeof connection?.rpc?.call==="function"
-?await requestPluginRpc(connection,body,{},globalThis.fetch,rpcTarget)
-:await request(rpcTarget.path,{
-method:"POST",
-credentials:"same-origin",
-headers:{"content-type":"application/json"},
-body:JSON.stringify(body),
-});
-return readSettingsCommitOutcome(response,normalizeSettingsDraft,roles);
-}
-async function readSettingsCommitOutcome(response,normalizeDraft,roles){
-let payload;
-try{
-payload=await response.json();
-}catch{
-throw new Error("设置保存响应无效");
-}
-if(!response.ok||payload?.ok!==true){
-const issue=payload?.error&&typeof payload.error==="object"?payload.error:{};
-const message=issue.message??payload?.message;
-const error=new Error(typeof message==="string"?message:"设置保存失败");
-if(typeof issue.code==="string")error.code=issue.code;
-if(Number.isSafeInteger(response.status)&&response.status>0)error.status=response.status;
-const currentRevision=issue.details?.revision??issue.details?.currentRevision??payload?.revision;
-if(Number.isSafeInteger(currentRevision)&&currentRevision>=0)error.currentRevision=currentRevision;
-throw error;
-}
-if(!payload.settings||typeof payload.settings!=="object"||Array.isArray(payload.settings)
-||!Number.isSafeInteger(payload.revision)||payload.revision<0){
-throw new Error("设置保存响应无效");
-}
-const rolePrompts=payload.rolePrompts!==null&&typeof payload.rolePrompts==="object"
-&&!Array.isArray(payload.rolePrompts)
-?payload.rolePrompts
-:void 0;
-return{
-settings:normalizeDraft(payload.settings,roles),
-revision:payload.revision,
-...(rolePrompts===void 0?{}:{rolePrompts}),
-};
-}
-const __DEG_CLIENT_FRESHNESS_DESCRIPTOR__=Object.freeze({
-id:CLIENT_FRESHNESS_MODULE_ID,
-factory:()=>Object.freeze({
-createClientFreshnessBoundary,
-rpcErrorStatus,
-normalizePluginRpcResult,
-requestPluginRpc,
-commitSettingsCandidate,
-readSettingsCommitOutcome,
-registerClientFreshnessModule,
-}),
-});
-const REGISTERED_LOADERS_KEY=Symbol.for("dsh-expert-group/client-freshness#registered-loaders");
-function registeredLoaderSet(host){
-const existing=host?.[REGISTERED_LOADERS_KEY];
-if(existing!==null&&typeof existing==="object"
-&&typeof existing.has==="function"&&typeof existing.add==="function"&&typeof existing.delete==="function"){
-return existing;
-}
-try{
-const created=new WeakSet();
-Object.defineProperty(host,REGISTERED_LOADERS_KEY,{value:created,configurable:true,writable:true});
-return created;
-}catch{
-return null;
-}
-}
-function registerClientFreshnessModule(loader=globalThis.__ModuleLoader__){
-if(loader===null||typeof loader!=="object"||typeof loader.load!=="function")return false;
-const registered=registeredLoaderSet(globalThis);
-if(registered!==null&&registered.has(loader))return false;
-if(registered!==null)registered.add(loader);
-try{
-loader.load(__DEG_CLIENT_FRESHNESS_DESCRIPTOR__);
-}catch(error){
-if(registered!==null)registered.delete(loader);
-throw error;
-}
-return true;
-}
-/** 投影尾部（构建期生成）：公开检查点 + ModuleLoader 登记。 */
-global[Symbol.for(CLIENT_FRESHNESS_GLOBAL_KEY)]=__DEG_CLIENT_FRESHNESS_DESCRIPTOR__.factory();
-registerClientFreshnessModule(global.__ModuleLoader__);
-})(globalThis);
-/* source: client.js */
-window.__ModuleLoader__.load({
-id:"dsh-expert-group",
-factory:(require)=>{
-const FRESHNESS_MODULE_ID="dsh-expert-group/client-freshness";
-const freshnessModule=(()=>{
-if(typeof require!=="function")return void 0;
-for(const specifier of[FRESHNESS_MODULE_ID,"./"+FRESHNESS_MODULE_ID,"./client-freshness.js"]){
-try{
-const loaded=require(specifier);
-if(loaded!==null&&typeof loaded==="object")return loaded;
-}catch{/* 未登记，尝试下一个 specifier 形式。 */}
-}
-return void 0;
-})();
-if(typeof freshnessModule?.registerClientFreshnessModule==="function"
-&&typeof globalThis!=="undefined"&&globalThis.__ModuleLoader__!==void 0){
-freshnessModule.registerClientFreshnessModule(globalThis.__ModuleLoader__);
-}
-var module={exports:{}};
-var exports=module.exports;
-Object.defineProperty(exports,Symbol.toStringTag,{value:"Module"});
-const react=require("react");
-const primitives=require("@deepseek-ai/dsh-client-ui-primitives");
-const expertGroupModel=globalThis[Symbol.for("dsh-expert-group/client-expert-group-model")];
-const expertGroupSidebar=globalThis[Symbol.for("dsh-expert-group/client-expert-group-sidebar")];
+const SYMBOL=Symbol.for("dsh-expert-group/client-text");
+const clientExpertGroupModelSymbol=Symbol.for("dsh-expert-group/client-expert-group-model");
+const expertGroupModel=global[clientExpertGroupModelSymbol];
 const localeModelApi=()=>globalThis[Symbol.for("dsh-expert-group/client-expert-group-model")]??expertGroupModel;
 function resolveSettingsLocale(ctx){
 const model=localeModelApi();
@@ -10887,6 +12975,14 @@ const value=values[name];
 return value===void 0||value===null?match:String(value);
 });
 }
+global[SYMBOL]=Object.freeze({
+SETTINGS_EXTRA_MESSAGES,SETTINGS_ZH_FALLBACK,resolveSettingsLocale,settingsExtraText,settingsText,
+});
+})(globalThis);
+/* source: client-styles.js */
+(function installClientStyles(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-styles");
 const css=""+
 ".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:760px;color:var(--dsw-alias-label-primary)}"+
 ".deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}"+
@@ -11130,40 +13226,14 @@ cssInjectedDocuments?.add(doc);
 return true;
 }
 ensurePluginStylesheet();
-const RPC_PATH="/api/dsh-expert-group";
-const RPC_CHANNEL="/dsh-expert-group";
-const RPC_ENDPOINT="rpc";
-const RPC_TARGET=Object.freeze({path:RPC_PATH,channel:RPC_CHANNEL,endpoint:RPC_ENDPOINT});
-function resolveFreshnessSurface(){
-if(typeof require==="function"){
-for(const specifier of[FRESHNESS_MODULE_ID,"./"+FRESHNESS_MODULE_ID,"./client-freshness.js"]){
-try{
-const loaded=require(specifier);
-if(loaded!==null&&typeof loaded==="object")return loaded;
-}catch{/* 未登记，尝试下一个 specifier 形式。 */}
-}
-}
-return freshnessModule;
-}
-function requireFreshnessSurface(){
-const surface=resolveFreshnessSurface();
-if(surface===void 0){
-throw new Error("dsh-expert-group: freshness 共享模块未装载（发布 bundle 缺少 client-freshness 投影片段）");
-}
-return surface;
-}
-function rpcErrorStatus(error){
-return requireFreshnessSurface().rpcErrorStatus(error);
-}
-function normalizePluginRpcResult(result){
-return requireFreshnessSurface().normalizePluginRpcResult(result);
-}
-async function requestPluginRpc(connection,request,init={},fetchImpl=globalThis.fetch){
-return requireFreshnessSurface().requestPluginRpc(connection,request,init,fetchImpl,RPC_TARGET);
-}
-function createClientFreshnessBoundary(options={}){
-return requireFreshnessSurface().createClientFreshnessBoundary(options);
-}
+global[SYMBOL]=Object.freeze({
+ensurePluginStylesheet,
+});
+})(globalThis);
+/* source: client-fanout-normalize.js */
+(function installClientFanoutNormalize(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-fanout-normalize");
 const FANOUT_SHARD_STATUS_KEYS=["queued","running","succeeded","failed","cancelled","timed_out","interrupted"];
 const FANOUT_TERMINAL_SHARD_STATUSES=new Set(["succeeded","failed","cancelled","timed_out","interrupted"]);
 const FANOUT_RETRYABLE_SHARD_STATUSES=new Set(["failed","timed_out","cancelled","interrupted"]);
@@ -11284,10 +13354,6 @@ return role+" · "+parentTaskId;
 function fanoutStatusLabel(status){
 return FANOUT_STATUS_LABELS[status]??fanoutString(status,"未知状态");
 }
-function fanoutTerminalCount(task){
-return(Array.isArray(task?.shards)?task.shards:[])
-.filter((shard)=>FANOUT_TERMINAL_SHARD_STATUSES.has(shard?.status)).length;
-}
 function fanoutCanCancelShard(shard){
 const status=typeof shard==="string"?shard:shard?.status;
 return!FANOUT_TERMINAL_SHARD_STATUSES.has(status);
@@ -11354,28 +13420,15 @@ next.settledAt=null;
 }
 return normalizeFanoutTask(next);
 }
-function mergeFanoutEvents(previousState,payload){
-if(!fanoutIsObject(previousState)||payload?.ok!==true||!Array.isArray(payload.events))return previousState;
-const currentCursor=fanoutCountOf(previousState.cursor,0);
-const events=payload.events
-.filter((event)=>Number.isSafeInteger(event?.sequence)&&event.sequence>currentCursor)
-.sort((left,right)=>left.sequence-right.sequence);
-const tasksById=new Map((Array.isArray(previousState.tasks)?previousState.tasks:[])
-.map((task)=>[task.parentTaskId,task]));
-for(const event of events){
-const current=tasksById.get(event.parentTaskId);
-if(current!==undefined)tasksById.set(event.parentTaskId,mergeFanoutEvent(current,event));
-}
-const reportedCursor=Number.isSafeInteger(payload.cursor)&&payload.cursor>=currentCursor
-?payload.cursor
-:currentCursor;
-if(events.length===0&&reportedCursor===currentCursor)return previousState;
-return{
-...previousState,
-tasks:[...tasksById.values()],
-cursor:reportedCursor,
-};
-}
+global[SYMBOL]=Object.freeze({
+fanoutCanCancelParent,fanoutCanCancelShard,fanoutCanRetryShard,fanoutStatusLabel,fanoutTaskLabel,
+mergeFanoutEvent,normalizeFanoutListResponse,normalizeFanoutTask,
+});
+})(globalThis);
+/* source: client-native-status.js */
+(function installClientNativeStatus(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-native-status");
 const STATUS_ROLE_IDS=["explorer","librarian","oracle","designer","fixer","observer"];
 const STATUS_ROLE_LABELS={
 explorer:"Explorer",
@@ -11876,17 +13929,1033 @@ entries=next;
 }
 return{apply,restore};
 }
+global[SYMBOL]=Object.freeze({
+NATIVE_RUNNING_STATUS_PREFIX,NATIVE_RUNNING_STATUS_PREFIXES,STATUS_ROLE_IDS,STATUS_ROLE_LABELS,STATUS_ROLE_MARKER,
+collectNativeStatusSessionIds,createNativeStatusRowRewriter,createNativeTextRewriter,findNativeConversationScope,findNativeStatusTextNode,
+isPluginChildSession,normalizeStatusRole,replaceNativeStatusPrefix,resolveNativeStatusTargets,resolveRunningStatusText,
+resolveStatusIdentity,
+});
+})(globalThis);
+/* source: client-settings-normalize.js */
+(function installClientSettingsNormalize(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-settings-normalize");
+const clientNativeStatusSymbol=Symbol.for("dsh-expert-group/client-native-status");
+const clientNativeStatus=global[clientNativeStatusSymbol]||{};
+const{
+STATUS_ROLE_IDS,STATUS_ROLE_LABELS,
+}=clientNativeStatus;
+let react=null;
+let requireFreshnessSurface=null;
+let requestPluginRpc=null;
+let createClientFreshnessBoundary=null;
+let RPC_TARGET=null;
+function bindClientRuntime(host){
+react=host.react??null;
+requireFreshnessSurface=host.requireFreshnessSurface??null;
+requestPluginRpc=host.requestPluginRpc??null;
+createClientFreshnessBoundary=host.createClientFreshnessBoundary??null;
+RPC_TARGET=host.RPC_TARGET??null;
+}
+const SETTINGS_ROLE_IDS=STATUS_ROLE_IDS;
+const SETTINGS_ROLE_LABELS=STATUS_ROLE_LABELS;
+const SETTINGS_REQUIRED_ROLE_IDS=SETTINGS_ROLE_IDS.filter((role)=>role!=="observer");
+const PROMPT_ROLE_IDS=SETTINGS_ROLE_IDS;
+const DEFAULT_PROMPT_MAX_GRAPHEMES=32000;
+const PROMPT_WARNING_RATIO=0.9;
+const GRAPHEME_SEGMENTER_CACHE=new Map();
+function graphemeSegmenterOf(locale,granularity){
+const key=(locale===undefined?"":String(locale))+"\u0000"+String(granularity);
+const cached=GRAPHEME_SEGMENTER_CACHE.get(key);
+if(cached!==undefined)return cached;
+try{
+const Segmenter=globalThis?.Intl?.Segmenter;
+if(typeof Segmenter!=="function")return null;
+const segmenter=new Segmenter(locale,{granularity});
+GRAPHEME_SEGMENTER_CACHE.set(key,segmenter);
+return segmenter;
+}catch{
+return null;
+}
+}
+function countUnicodeGraphemes(value){
+if(typeof value!=="string"||value.length===0)return 0;
+const segmenter=graphemeSegmenterOf(undefined,"grapheme");
+if(segmenter!==null){
+try{
+let count=0;
+for(const unused of segmenter.segment(value)){
+void unused;
+count+=1;
+}
+return count;
+}catch{
+}
+}
+return Array.from(value).length;
+}
+function validatePromptText(value,maxGraphemes=DEFAULT_PROMPT_MAX_GRAPHEMES){
+const text=typeof value==="string"?value:"";
+const max=Number.isSafeInteger(maxGraphemes)&&maxGraphemes>0
+?maxGraphemes
+:DEFAULT_PROMPT_MAX_GRAPHEMES;
+const count=countUnicodeGraphemes(text);
+if(text.trim().length===0){
+return{ok:false,code:"prompt-empty",message:"提示词不能为空",count,maxGraphemes:max};
+}
+if(count>max){
+return{ok:false,code:"prompt-too-long",message:"提示词不能超过 "+max+" 个字符",count,maxGraphemes:max};
+}
+return{ok:true,code:null,message:null,count,maxGraphemes:max};
+}
+function normalizePromptOverrides(value,maxGraphemes=DEFAULT_PROMPT_MAX_GRAPHEMES,roleIds=PROMPT_ROLE_IDS){
+if(value===null||typeof value!=="object"||Array.isArray(value))return{};
+const normalized={};
+const roles=Array.isArray(roleIds)&&roleIds.length>0?roleIds:PROMPT_ROLE_IDS;
+for(const role of roles){
+const text=value[role];
+if(typeof text!=="string")continue;
+if(!validatePromptText(text,maxGraphemes).ok)continue;
+normalized[role]=text;
+}
+return normalized;
+}
+function promptOverridesEqual(left,right){
+const leftValue=left&&typeof left==="object"?left:{};
+const rightValue=right&&typeof right==="object"?right:{};
+const roles=[...new Set([...Object.keys(leftValue),...Object.keys(rightValue)])].sort();
+return roles.every((role)=>leftValue[role]===rightValue[role]);
+}
+function normalizeRolePromptProjection(projection,settingsValue,snapshotOverridesAuthoritative=false,roleIds=PROMPT_ROLE_IDS){
+if(projection===null||typeof projection!=="object"||Array.isArray(projection)
+||!Array.isArray(projection.entries))return null;
+const roles=Array.isArray(roleIds)&&roleIds.length>0?roleIds:PROMPT_ROLE_IDS;
+const fallbackOverrides=normalizePromptOverrides(settingsValue?.promptOverrides,projection.maxGraphemes,roles);
+const settingsHasOverrides=settingsValue!==null&&typeof settingsValue==="object"
+&&Object.prototype.hasOwnProperty.call(settingsValue,"promptOverrides");
+const byRole=new Map(projection.entries
+.filter((entry)=>entry&&typeof entry.role==="string")
+.map((entry)=>[entry.role,entry]));
+const entries=[];
+for(const role of roles){
+const source=byRole.get(role);
+if(typeof source?.defaultPersona!=="string")return null;
+const snapshotControlsOverride=snapshotOverridesAuthoritative&&settingsHasOverrides;
+const settingsHasRoleOverride=snapshotControlsOverride&&Object.prototype.hasOwnProperty.call(fallbackOverrides,role);
+const override=snapshotControlsOverride
+?fallbackOverrides[role]
+:(typeof source.override==="string"?source.override:fallbackOverrides[role]);
+const customized=snapshotControlsOverride
+?settingsHasRoleOverride
+:source.customized===true;
+entries.push({
+role,
+defaultPersona:source.defaultPersona,
+...(customized&&typeof override==="string"?{override}:{}),
+customized,
+effective:customized&&typeof override==="string"?override:source.defaultPersona,
+});
+}
+const maxGraphemes=Number.isSafeInteger(projection.maxGraphemes)&&projection.maxGraphemes>0
+?projection.maxGraphemes
+:DEFAULT_PROMPT_MAX_GRAPHEMES;
+return{
+roles,
+maxGraphemes,
+customizable:projection.customizable===true,
+entries,
+};
+}
+function promptEntryOf(projection,role){
+return projection?.entries?.find((entry)=>entry.role===role)??null;
+}
+function updateRolePromptProjection(projection,role,text){
+if(projection===null||typeof projection!=="object")return projection;
+return{
+...projection,
+entries:projection.entries.map((entry)=>{
+if(entry.role!==role)return entry;
+const customized=text!==entry.defaultPersona;
+const next={...entry,customized,effective:text};
+if(customized)next.override=text;
+else delete next.override;
+return next;
+}),
+};
+}
+function settingsRolesForProvider(roles){
+const candidates=Array.isArray(roles)?roles:SETTINGS_REQUIRED_ROLE_IDS;
+return[...new Set(candidates.filter((role)=>typeof role==="string"&&role.length>0))];
+}
+function unifiedProviderOf(defaults,roles,legacyProvider=""){
+const activeRoles=settingsRolesForProvider(roles);
+if(activeRoles.length===0)return"";
+const providers=activeRoles.map((role)=>{
+const provider=defaults?.[role]?.provider;
+return typeof provider==="string"&&provider.length>0?provider:"";
+});
+const configured=providers.filter((provider)=>provider.length>0);
+if(configured.length===0)return typeof legacyProvider==="string"?legacyProvider:"";
+if(configured.length!==activeRoles.length)return"";
+const first=configured[0];
+return configured.every((provider)=>provider===first)?first:"";
+}
+const NOTIFICATION_EVENT_TYPES=Object.freeze(["completed","waiting","failed"]);
+function normalizeNotificationEvents(value){
+const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
+const normalized={};
+for(const type of NOTIFICATION_EVENT_TYPES)normalized[type]=source[type]!==false;
+return normalized;
+}
+function clampNotificationVolume(value){
+const number=Number(value);
+return Number.isFinite(number)?Math.min(100,Math.max(0,Math.round(number))):100;
+}
+const DEFAULT_ROLE_CONCURRENCY_LIMIT=20;
+const LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT=10;
+const CONFIG_MIGRATION_VERSION=1;
+function normalizeRoleConcurrencyLimit(value){
+return Number.isSafeInteger(value)&&value>=1&&value<=64
+?value
+:DEFAULT_ROLE_CONCURRENCY_LIMIT;
+}
+function effectiveRoleConcurrencyLimit(source){
+const limit=normalizeRoleConcurrencyLimit(source?.roleConcurrencyLimit);
+const rawVersion=source?.configMigrationVersion;
+const version=Number.isSafeInteger(rawVersion)&&rawVersion>=0?rawVersion:0;
+return version<CONFIG_MIGRATION_VERSION&&limit===LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT
+?DEFAULT_ROLE_CONCURRENCY_LIMIT
+:limit;
+}
+const DEFAULT_ROLE_TIMEOUT_MS=36000000;
+function normalizeRoleTimeoutMs(value){
+if(value===0)return 0;
+return Number.isSafeInteger(value)&&value>=1000&&value<=86400000&&value%1000===0
+?value
+:DEFAULT_ROLE_TIMEOUT_MS;
+}
+const MAX_MODEL_CANDIDATES_PER_ROLE=3;
+const MAX_MODEL_FALLBACK_LIMIT=4;
+const DEFAULT_MODEL_FALLBACK_LIMIT=2;
+const MAX_MODEL_PAGES=MAX_MODEL_CANDIDATES_PER_ROLE+1;
+function normalizeModelFallbackLimitDraft(value){
+return Number.isSafeInteger(value)&&value>=0&&value<=MAX_MODEL_FALLBACK_LIMIT?value:DEFAULT_MODEL_FALLBACK_LIMIT;
+}
+function normalizeModelCandidateSelection(entry){
+if(entry===null||typeof entry!=="object"||Array.isArray(entry))return null;
+if(typeof entry.provider!=="string"||typeof entry.model!=="string")return null;
+const reasoningEffort=typeof entry.reasoningEffort==="string"?entry.reasoningEffort:"";
+return{provider:entry.provider,model:entry.model,...(reasoningEffort.length>0?{reasoningEffort}:{})};
+}
+function normalizeModelCandidatesDraft(value){
+const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
+const candidates={};
+for(const[role,list]of Object.entries(source)){
+if(typeof role!=="string"||role.length===0||!Array.isArray(list))continue;
+if(!SETTINGS_ROLE_IDS.includes(role))continue;
+const normalized=[];
+for(const entry of list.slice(0,MAX_MODEL_CANDIDATES_PER_ROLE)){
+const selection=normalizeModelCandidateSelection(entry);
+if(selection!==null)normalized.push(selection);
+}
+if(normalized.length>0)candidates[role]=normalized;
+}
+return candidates;
+}
+function modelCandidateKeyOf(selection){
+return(selection?.provider??"")+"\u0000"+(selection?.model??"")+"\u0000"+(typeof selection?.reasoningEffort==="string"?selection.reasoningEffort:"");
+}
+function modelPageCountOf(draft){
+let longest=0;
+for(const role of SETTINGS_ROLE_IDS){
+const list=draft?.candidates?.[role];
+if(Array.isArray(list))longest=Math.max(longest,list.length);
+}
+return Math.min(MAX_MODEL_PAGES,Math.max(1,1+longest));
+}
+function modelLayerRolesOf(draft){
+const roles=[...SETTINGS_ROLE_IDS];
+for(const source of[draft?.defaults,draft?.candidates]){
+if(source===null||source===void 0||typeof source!=="object")continue;
+for(const role of Object.keys(source))if(!roles.includes(role))roles.push(role);
+}
+return roles;
+}
+function modelLayerSelectionOf(draft,role,page){
+if(!Number.isSafeInteger(page)||page<0)return null;
+const source=page===0
+?draft?.defaults?.[role]
+:(Array.isArray(draft?.candidates?.[role])?draft.candidates[role][page-1]:void 0);
+return source!==null&&source!==void 0&&typeof source==="object"&&!Array.isArray(source)?source:null;
+}
+function setModelLayerSelection(draft,role,page,selection){
+if(!Number.isSafeInteger(page)||page<0)return draft;
+const normalized=selection!==null&&typeof selection==="object"&&!Array.isArray(selection)?selection:null;
+if(page===0){
+const defaults={...(draft?.defaults??{})};
+if(normalized===null)delete defaults[role];
+else defaults[role]=normalized;
+return{...draft,defaults};
+}
+const candidates={...(draft?.candidates??{})};
+const list=Array.isArray(candidates[role])?candidates[role].slice():[];
+while(list.length<page-1)list.push({provider:"",model:""});
+list[page-1]=normalized===null?{provider:"",model:""}:normalized;
+candidates[role]=list;
+return{...draft,candidates};
+}
+function modelLayerMapOf(draft,page){
+const map={};
+for(const role of modelLayerRolesOf(draft)){
+const selection=modelLayerSelectionOf(draft,role,page);
+if(selection!==null)map[role]=selection;
+}
+return map;
+}
+function writeModelLayers(draft,layers){
+const defaults={};
+const candidates={};
+for(const role of modelLayerRolesOf(draft)){
+const primary=layers[0]?.[role]??null;
+if(primary!==null&&primary!==void 0)defaults[role]={...primary};
+let last=0;
+for(let page=1;page<layers.length;page+=1){
+const selection=layers[page]?.[role];
+if(selection!==null&&selection!==void 0)last=page;
+}
+if(last>=1){
+const list=[];
+for(let page=1;page<=last;page+=1){
+const selection=layers[page]?.[role]??null;
+list.push(selection===null?{provider:"",model:""}:{...selection});
+}
+candidates[role]=list;
+}
+}
+return{...draft,defaults,candidates};
+}
+function reorderModelLayers(draft,from,to){
+const count=modelPageCountOf(draft);
+if(!Number.isSafeInteger(from)||!Number.isSafeInteger(to))return draft;
+if(from<0||from>=count||to<0||to>=count||from===to)return draft;
+const layers=[];
+for(let page=0;page<count;page+=1)layers.push(modelLayerMapOf(draft,page));
+const[moved]=layers.splice(from,1);
+layers.splice(to,0,moved);
+return writeModelLayers(draft,layers);
+}
+function addModelCandidatePage(draft){
+const count=modelPageCountOf(draft);
+if(count>=MAX_MODEL_PAGES)return draft;
+const candidates={...(draft?.candidates??{})};
+for(const role of modelLayerRolesOf(draft)){
+const primary=modelLayerSelectionOf(draft,role,0);
+const list=Array.isArray(candidates[role])?candidates[role].slice():[];
+while(list.length<count-1)list.push({provider:"",model:""});
+list[count-1]=primary===null?{provider:"",model:""}:{...primary};
+candidates[role]=list;
+}
+return{...draft,candidates};
+}
+function removeModelCandidatePage(draft,page){
+if(!Number.isSafeInteger(page)||page<1)return draft;
+const candidates={...(draft?.candidates??{})};
+for(const[role,value]of Object.entries(candidates)){
+if(!Array.isArray(value))continue;
+const list=value.slice();
+if(list.length>=page)list.splice(page-1,1);
+if(list.length>0)candidates[role]=list;
+else delete candidates[role];
+}
+return{...draft,candidates};
+}
+function compactModelCandidatesDraft(candidates){
+const source=candidates!==null&&typeof candidates==="object"&&!Array.isArray(candidates)?candidates:{};
+const compacted={};
+for(const[role,list]of Object.entries(source)){
+if(!Array.isArray(list))continue;
+const rows=[];
+for(const entry of list){
+const selection=normalizeModelCandidateSelection(entry);
+if(selection===null)continue;
+if(selection.provider.length===0&&selection.model.length===0)continue;
+rows.push(selection);
+}
+if(rows.length>0)compacted[role]=rows;
+}
+return compacted;
+}
+function validateModelCandidateRows(candidates){
+const source=candidates!==null&&typeof candidates==="object"?candidates:{};
+for(const[role,list]of Object.entries(source)){
+if(!Array.isArray(list))continue;
+if(list.length>MAX_MODEL_CANDIDATES_PER_ROLE)return{ok:false,code:"limit",role,index:0};
+const seen=new Set();
+for(let index=0;index<list.length;index+=1){
+const selection=normalizeModelCandidateSelection(list[index]);
+if(selection===null)return{ok:false,code:"incomplete",role,index:index+1};
+if(selection.provider.length===0&&selection.model.length===0)continue;
+if(selection.provider.length===0||selection.model.length===0)return{ok:false,code:"incomplete",role,index:index+1};
+const key=modelCandidateKeyOf(selection);
+if(seen.has(key))return{ok:false,code:"duplicate",role,index:index+1};
+seen.add(key);
+}
+}
+return{ok:true,code:null,role:null,index:0};
+}
+function modelCandidatesErrorMessage(t,roleLabelOf,validation){
+if(validation.code==="limit")return t("settings.modelCandidates.limit");
+return(typeof roleLabelOf==="function"?roleLabelOf(validation.role):validation.role)+"："+t("settings.modelCandidates.error."+(validation.code??"incomplete"),{index:validation.index});
+}
+function normalizeSettingsDraft(value,roles,allowLegacyProviderFallback=true){
+const source=value&&typeof value==="object"?value:{};
+const configuredProvider=typeof source.provider==="string"?source.provider:"";
+const activeRoles=settingsRolesForProvider(roles);
+const entries=[];
+for(const[role,selection]of Object.entries(source.defaults??{})){
+if(!selection||typeof selection!=="object"
+||typeof selection.model!=="string"||selection.model.length===0)continue;
+const provider=typeof selection.provider==="string"&&selection.provider.length>0
+?selection.provider
+:"";
+entries.push({role,selection,provider});
+}
+const hasVisibleRowProvider=entries.some(({role,provider})=>activeRoles.includes(role)&&provider.length>0);
+const defaults={};
+for(const{role,selection,provider:explicitProvider}of entries){
+const provider=explicitProvider.length>0
+?explicitProvider
+:(allowLegacyProviderFallback&&!hasVisibleRowProvider&&activeRoles.includes(role)
+?configuredProvider
+:"");
+if(provider.length===0)continue;
+defaults[role]={provider,model:selection.model};
+if(typeof selection.reasoningEffort==="string")defaults[role].reasoningEffort=selection.reasoningEffort;
+}
+const visibleProviders=activeRoles
+.map((role)=>defaults[role]?.provider)
+.filter((provider)=>typeof provider==="string"&&provider.length>0);
+const inferredProvider=visibleProviders.length>0
+&&visibleProviders.length===activeRoles.length
+&&visibleProviders.every((provider)=>provider===visibleProviders[0])
+?visibleProviders[0]
+:"";
+return{
+provider:hasVisibleRowProvider
+?inferredProvider
+:(allowLegacyProviderFallback?configuredProvider:""),
+defaults,
+notificationEnabled:source.notificationEnabled!==false,
+notificationVolume:clampNotificationVolume(source.notificationVolume),
+notificationEvents:normalizeNotificationEvents(source.notificationEvents),
+roleConcurrencyLimit:effectiveRoleConcurrencyLimit(source),
+roleTimeoutMs:normalizeRoleTimeoutMs(source.roleTimeoutMs),
+observerPreferred:source.observerPreferred===true,
+taskManagementEnabled:source.taskManagementEnabled!==false,
+autoOpenSubagentSidebar:source.autoOpenSubagentSidebar===true,
+...(Object.prototype.hasOwnProperty.call(source,"candidates")
+?{candidates:normalizeModelCandidatesDraft(source.candidates)}
+:{}),
+...(Object.prototype.hasOwnProperty.call(source,"fallbackLimit")
+?{fallbackLimit:normalizeModelFallbackLimitDraft(source.fallbackLimit)}
+:{}),
+};
+}
+function settingsDraftEqual(left,right){
+return JSON.stringify(left)===JSON.stringify(right);
+}
+const SETTINGS_DRAFT_MERGE_FIELDS=Object.freeze([
+"provider",
+"defaults",
+"notificationEnabled",
+"notificationVolume",
+"notificationEvents",
+"roleConcurrencyLimit",
+"roleTimeoutMs",
+"observerPreferred",
+"taskManagementEnabled",
+"autoOpenSubagentSidebar",
+"candidates",
+"fallbackLimit",
+]);
+function mergeSettingsDraftOverSource(source,local,baseline){
+const merged={...source};
+for(const field of SETTINGS_DRAFT_MERGE_FIELDS){
+const hasLocal=Object.prototype.hasOwnProperty.call(local,field);
+const hasBaseline=Object.prototype.hasOwnProperty.call(baseline,field);
+if(hasLocal!==hasBaseline){
+if(hasLocal)merged[field]=local[field];
+else delete merged[field];
+continue;
+}
+if(!hasLocal)continue;
+if(settingsDraftEqual(local[field],baseline[field]))continue;
+merged[field]=local[field];
+}
+return merged;
+}
+function resolveSettingsForm(configForms,entryId,unavailableSnapshot){
+const fallback={
+getSnapshot:()=>unavailableSnapshot,
+subscribe:()=>()=>{},
+};
+if(configForms===null||typeof configForms.get!=="function")return fallback;
+try{
+const form=configForms.get(entryId);
+if(form!==null&&form!==undefined
+&&typeof form.getSnapshot==="function"&&typeof form.subscribe==="function")return form;
+}catch{/* 服务代理拒答或条目读取失败：按不可用降级。 */}
+return fallback;
+}
+function createSettingsModelCatalog(ctx){
+let state={groups:[],status:"idle",error:null};
+let inflight=null;
+let queued=false;
+let disposed=false;
+const freshness=createClientFreshnessBoundary();
+const listeners=new Set();
+const publish=(next)=>{
+state=next;
+for(const listener of listeners)listener();
+};
+const startRequest=()=>{
+if(disposed)return Promise.resolve();
+const requestToken=freshness.beginRequest("catalog","settings");
+publish({...state,status:"loading",error:null});
+const promise=Promise.resolve().then(()=>ctx.remote.session.modelCatalog()).then((response)=>{
+const catalog=response?.ok===true?response.value:response;
+if(!catalog||!Array.isArray(catalog.groups))throw new Error("模型目录不可用");
+const normalizedGroups=normalizeSettingsModelGroups(catalog.groups);
+const accepted=freshness.acceptCatalogResponse({
+generation:requestToken.sequence,
+groups:normalizedGroups,
+requestToken,
+});
+if(accepted.accepted)publish({groups:normalizedGroups,status:"ready",error:null});
+}).catch((cause)=>{
+if(freshness.isCurrent(requestToken)){
+publish({...state,status:"error",error:cause instanceof Error?cause.message:String(cause)});
+}
+}).finally(()=>{
+if(inflight!==promise)return;
+inflight=null;
+if(!queued)return;
+queued=false;
+startRequest();
+});
+inflight=promise;
+return promise;
+};
+const load=()=>{
+if(disposed)return Promise.resolve();
+if(inflight!==null)return inflight;
+return startRequest();
+};
+const refresh=(clear)=>{
+if(disposed)return;
+if(clear){
+inflight=null;
+queued=false;
+publish({groups:[],status:"idle",error:null});
+startRequest();
+return;
+}
+if(inflight!==null){
+if(!queued)freshness.beginRequest("catalog","settings");
+queued=true;
+return;
+}
+startRequest();
+};
+const subscribe=(listener)=>{
+listeners.add(listener);
+return()=>listeners.delete(listener);
+};
+const getSnapshot=()=>state;
+const eventStops=[];
+for(const event of["llm/adapters-updated","settings/document-updated","credentials/reference-updated"]){
+eventStops.push(ctx.remote.$on(event,()=>refresh(false)));
+}
+ctx.on("connection/reset",()=>refresh(true));
+ctx.effect(()=>()=>{
+disposed=true;
+inflight=null;
+queued=false;
+for(const stop of eventStops)if(typeof stop==="function")stop();
+freshness.dispose();
+},"dsh-expert-group: settings catalog events");
+return{load,subscribe,getSnapshot};
+}
+function normalizeSettingsModelGroups(groups){
+return(Array.isArray(groups)?groups:[]).flatMap((group)=>{
+if(!group||typeof group.id!=="string"||group.id.length===0)return[];
+const models=(Array.isArray(group.models)?group.models:[])
+.filter((model)=>model&&typeof model==="object"&&typeof model.id==="string"&&model.id.length>0)
+.map((model)=>{
+const normalized={
+...model,
+name:typeof model.name==="string"&&model.name.trim().length>0?model.name:model.id,
+};
+const reasoning=model.reasoning;
+if(!reasoning||typeof reasoning!=="object"||Array.isArray(reasoning)){
+delete normalized.reasoning;
+return normalized;
+}
+const efforts=(Array.isArray(reasoning.efforts)?reasoning.efforts:[])
+.flatMap((effort)=>{
+if(!effort||typeof effort!=="object"||typeof effort.id!=="string"||effort.id.length===0)return[];
+return[{
+...effort,
+name:typeof effort.name==="string"&&effort.name.trim().length>0?effort.name:effort.id,
+}];
+});
+const defaultEffort=typeof reasoning.defaultEffort==="string"
+&&reasoning.defaultEffort.trim().length>0
+&&efforts.some((effort)=>effort.id===reasoning.defaultEffort)
+?reasoning.defaultEffort
+:void 0;
+normalized.reasoning={
+efforts,
+...(defaultEffort===void 0?{}:{defaultEffort}),
+};
+return normalized;
+});
+return[{
+...group,
+name:typeof group.name==="string"&&group.name.trim().length>0?group.name:group.id,
+models,
+}];
+});
+}
+function modelDisplayNameOf(model){
+if(!model||typeof model!=="object")return"";
+if(typeof model.name==="string"&&model.name.trim().length>0)return model.name;
+return typeof model.id==="string"&&model.id.length>0?model.id:"";
+}
+function migrateSettingsSelection(selection,provider,groups){
+if(typeof provider!=="string"||provider.length===0)return null;
+const providerGroups=Array.isArray(groups)?groups:[];
+const providerGroup=providerGroups.find((group)=>group?.id===provider);
+if(!providerGroup)return null;
+if(!selection||typeof selection!=="object"
+||typeof selection.model!=="string"||selection.model.length===0)return null;
+const sourceGroup=typeof selection.provider==="string"&&selection.provider.length>0
+?providerGroups.find((group)=>group?.id===selection.provider)
+:void 0;
+const sourceModel=Array.isArray(sourceGroup?.models)
+?sourceGroup.models.find((candidate)=>candidate?.id===selection.model)
+:void 0;
+const sourceDisplayName=modelDisplayNameOf(sourceModel);
+if(sourceDisplayName.length===0)return null;
+const model=Array.isArray(providerGroup.models)
+?providerGroup.models.find((candidate)=>modelDisplayNameOf(candidate)===sourceDisplayName)
+:void 0;
+if(!model)return null;
+const next={provider:providerGroup.id,model:model.id};
+const reasoning=model.reasoning;
+if(typeof selection.reasoningEffort==="string"
+&&Array.isArray(reasoning?.efforts)
+&&reasoning.efforts.some((effort)=>effort?.id===selection.reasoningEffort)){
+next.reasoningEffort=selection.reasoningEffort;
+}
+return next;
+}
+function migrateSettingsDefaults(defaults,provider,groups){
+if(typeof provider!=="string"||provider.length===0)return{};
+const providerGroup=(Array.isArray(groups)?groups:[]).find((group)=>group?.id===provider);
+if(!providerGroup)return{};
+const migrated={};
+for(const[role,selection]of Object.entries(defaults??{})){
+const next=migrateSettingsSelection(selection,provider,groups);
+if(next!==null)migrated[role]=next;
+}
+return migrated;
+}
+function syncSettingsDefaultsProvider(defaults,provider,groups,roles){
+const next={...(defaults&&typeof defaults==="object"?defaults:{})};
+if(typeof provider!=="string"||provider.length===0)return next;
+for(const role of settingsRolesForProvider(roles)){
+const migrated=migrateSettingsSelection(next[role],provider,groups);
+next[role]=migrated??{provider,model:""};
+}
+return next;
+}
+function normalizeSettingsCommitDraft(value,roles){
+const normalized=normalizeSettingsDraft(value,roles);
+if(value!==null&&typeof value==="object"
+&&Object.prototype.hasOwnProperty.call(value,"promptOverrides")){
+normalized.promptOverrides=normalizePromptOverrides(value.promptOverrides);
+}
+return normalized;
+}
+async function commitSettingsCandidate(settings,revision,request=globalThis.fetch,connection,roles,changed){
+const surface=requireFreshnessSurface();
+if(changed===void 0){
+return surface.commitSettingsCandidate(settings,revision,{
+request,
+connection,
+normalizeSettingsDraft:normalizeSettingsCommitDraft,
+roles,
+rpcTarget:RPC_TARGET,
+});
+}
+const body={
+action:"settings-commit",
+settings,
+expectedRevision:revision,
+changed,
+};
+const response=await requestPluginRpc(connection,body,{},request);
+return surface.readSettingsCommitOutcome(response,normalizeSettingsCommitDraft,roles);
+}
+function useHostMeta(ctx){
+const[meta,setMeta]=react.useState(null);
+const[error,setError]=react.useState(null);
+const[version,setVersion]=react.useState(0);
+react.useEffect(()=>{
+let cancelled=false;
+setError(null);
+void requestPluginRpc(ctx?.connection,{action:"meta"}).then((response)=>(
+response.ok===true?response.json():null
+)).then((json)=>{
+if(cancelled)return;
+if(json!==null&&json?.ok===true){
+setMeta(json);
+setError(null);
+}else{
+setMeta(null);
+setError("提示词配置读取失败");
+}
+}).catch((cause)=>{
+if(cancelled)return;
+setMeta(null);
+setError(cause instanceof Error?cause.message:"提示词配置读取失败");
+});
+return()=>{cancelled=true;};
+},[ctx,version]);
+return[meta,()=>setVersion((value)=>value+1),error];
+}
+function useEnabledSettingsRoles(hostMeta){
+return react.useMemo(()=>{
+const configuredRoles=Array.isArray(hostMeta?.activeRoles)?hostMeta.activeRoles:hostMeta?.roles;
+if(!Array.isArray(configuredRoles))return SETTINGS_REQUIRED_ROLE_IDS;
+const enabled=configuredRoles.filter((role)=>typeof role==="string"&&role.length>0
+&&SETTINGS_ROLE_IDS.includes(role));
+if(hostMeta?.enableObserver===true&&!enabled.includes("observer"))enabled.push("observer");
+return enabled.filter((role,index)=>enabled.indexOf(role)===index);
+},[hostMeta]);
+}
+global[SYMBOL]=Object.freeze({
+DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,
+NOTIFICATION_EVENT_TYPES,PROMPT_ROLE_IDS,PROMPT_WARNING_RATIO,SETTINGS_ROLE_LABELS,addModelCandidatePage,
+bindClientRuntime,clampNotificationVolume,commitSettingsCandidate,compactModelCandidatesDraft,countUnicodeGraphemes,
+createSettingsModelCatalog,mergeSettingsDraftOverSource,migrateSettingsDefaults,migrateSettingsSelection,modelCandidatesErrorMessage,
+resolveSettingsForm,
+modelLayerMapOf,modelLayerSelectionOf,modelPageCountOf,normalizeModelCandidatesDraft,normalizeModelFallbackLimitDraft,
+normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsCommitDraft,normalizeSettingsDraft,normalizeSettingsModelGroups,
+promptEntryOf,promptOverridesEqual,removeModelCandidatePage,reorderModelLayers,setModelLayerSelection,
+settingsDraftEqual,settingsRolesForProvider,syncSettingsDefaultsProvider,unifiedProviderOf,updateRolePromptProjection,
+useEnabledSettingsRoles,useHostMeta,validateModelCandidateRows,validatePromptText,
+});
+})(globalThis);
+/* source: client-model-config-host.js */
+(function installClientModelConfigHost(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-model-config-host");
+const MODEL_CONFIG_GLOBAL_KEY="dsh-expert-group/client-model-config";
+const CUSTOM_PROVIDER_NS="llm-pi-ai";
+const CUSTOM_PROFILE_BASE_PATH=Object.freeze(["providers"]);
+const CUSTOM_ROUTE_PROBE="_probe";
+function resolveModelConfig(hostCtx,sidecar){
+if(sidecar!==null&&sidecar!==undefined)return sidecar;
+try{
+const fromCtx=typeof hostCtx?.get==="function"?hostCtx.get(MODEL_CONFIG_GLOBAL_KEY):null;
+if(fromCtx!==null&&fromCtx!==undefined)return fromCtx;
+}catch{/* 服务未安装或代理拒答。 */}
+try{
+return globalThis[Symbol.for(MODEL_CONFIG_GLOBAL_KEY)];
+}catch{
+return undefined;
+}
+}
+function createModelConfigHost(hostCtx,describeSource,sidecar){
+const config=resolveModelConfig(hostCtx,sidecar);
+if(config===undefined)return null;
+const readService=(name)=>{
+if(typeof hostCtx?.get==="function"){
+try{
+const value=hostCtx.get(name);
+if(value!==undefined&&value!==null)return value;
+}catch{/* 服务未安装或代理拒答，继续尝试属性回退。 */}
+}
+let current=hostCtx;
+for(const segment of String(name).split(".")){
+if(segment.length===0)continue;
+if(current===undefined||current===null)return null;
+try{
+current=current[segment];
+}catch{
+return null;
+}
+}
+return current===undefined?null:current;
+};
+const readMethod=(target,name)=>{
+try{
+const value=target?.[name];
+return typeof value==="function"?value:null;
+}catch{
+return null;
+}
+};
+const llm=readService("remote.llm");
+const credentials=readService("remote.credentials");
+const settingsRemote=readService("remote.settings");
+const describeFace=(()=>{
+try{
+return typeof describeSource?.describe==="function"?describeSource.describe():null;
+}catch{
+return null;
+}
+})();
+const schemaCache=new WeakMap();
+const adapter=(()=>{
+const schemaService=readService("settingsSchema");
+return config.createSchemaAdapter({
+rehydrate:(()=>{
+const rehydrate=readMethod(schemaService,"rehydrate");
+if(rehydrate===null)return null;
+return(serialized)=>{
+if(serialized!==null&&typeof serialized==="object"){
+const cached=schemaCache.get(serialized);
+if(cached!==undefined)return cached;
+const node=rehydrate(serialized);
+schemaCache.set(serialized,node);
+return node;
+}
+return rehydrate(serialized);
+};
+})(),
+validate:(()=>{
+const validate=readMethod(schemaService,"validate");
+return validate===null?null:(schema,draft)=>validate(schema,draft);
+})(),
+nodeAtPath:(()=>{
+const nodeAtPath=readMethod(schemaService,"nodeAtPath");
+return nodeAtPath===null?null:(root,path)=>nodeAtPath(root,path);
+})(),
+});
+})();
+let views=[];
+let writable=false;
+let credentialStates={};
+let describeError=null;
+let hostRevision=0;
+let hostInvalidation=0;
+const hostListeners=new Set();
+const notifyHostChange=(external)=>{
+hostRevision+=1;
+if(external===true)hostInvalidation+=1;
+for(const listener of[...hostListeners]){
+try{
+listener();
+}catch{/* 单个订阅者抛错不得影响其它订阅者与 settings 视图。 */}
+}
+};
+const subscribeHost=(listener)=>{
+if(typeof listener!=="function")return()=>{};
+hostListeners.add(listener);
+return()=>hostListeners.delete(listener);
+};
+const operations={
+listProviderDirectory:async()=>{
+const listProviders=readMethod(llm,"listProviders");
+const listConfigurable=readMethod(llm,"listConfigurableProviders");
+if(listConfigurable===null)throw new Error("当前宿主没有提供 provider 配置目录接口");
+const[registered,declared]=await Promise.all([
+listProviders===null?Promise.resolve({ok:true,value:[]}):listProviders.call(llm),
+listConfigurable.call(llm),
+]);
+if(declared?.ok!==true)throw new Error(declared?.error?.message??"provider 目录读取失败");
+if(registered!==null&&registered?.ok!==true)throw new Error(registered?.error?.message??"provider 列表读取失败");
+return config.joinProviderDirectory(
+registered===null?[]:registered.value,
+Array.isArray(declared.value)?declared.value:[],
+);
+},
+describeCredentials:async(refs)=>{
+const describe=readMethod(credentials,"describe");
+const wanted=[...new Set((Array.isArray(refs)?refs:[]).filter((ref)=>typeof ref==="string"&&ref.length>0))];
+if(describe===null||wanted.length===0){
+credentialStates={};
+return{};
+}
+const response=await describe.call(credentials,wanted);
+credentialStates=response?.ok===true&&response.value!==null&&typeof response.value==="object"?response.value:{};
+return credentialStates;
+},
+credentialState:(ref)=>(typeof ref==="string"?credentialStates[ref]:undefined),
+storeKey:async(ref,value)=>{
+const set=readMethod(credentials,"set");
+if(set===null)return"当前宿主没有提供凭据写入接口";
+try{
+const response=await set.call(credentials,ref,value);
+return response?.ok===true?null:(response?.error?.message??"API Key 保存失败");
+}catch(error){
+return error instanceof Error?error.message:String(error);
+}
+},
+removeKey:async(ref)=>{
+const unset=readMethod(credentials,"unset");
+if(unset===null)return"当前宿主没有提供凭据写入接口";
+try{
+const response=await unset.call(credentials,ref);
+return response?.ok===true?null:(response?.error?.message??"API Key 删除失败");
+}catch(error){
+return error instanceof Error?error.message:String(error);
+}
+},
+discoverModels:async(namespace,request)=>{
+const discover=readMethod(llm,"discoverModels");
+if(discover===null)return{kind:"refused",message:"当前宿主没有提供「获取模型」接口"};
+try{
+const response=await discover.call(llm,namespace,request);
+if(response?.ok!==true)return{kind:"refused",message:response?.error?.message??"获取模型失败"};
+return{kind:"found",models:Array.isArray(response.value)?response.value:[]};
+}catch(error){
+return{kind:"refused",message:error instanceof Error?error.message:String(error)};
+}
+},
+};
+const refreshSettingsView=async()=>{
+describeError=null;
+if(describeFace===null){
+describeError="当前宿主没有提供 settings namespace 视图";
+views=[];
+writable=false;
+return;
+}
+try{
+await describeFace.ensure();
+}catch{/* 读取失败由下面的一致性检查报错。 */}
+const snapshot=describeFace.getSnapshot?.()??{};
+const view=snapshot.view;
+if(view===undefined){
+describeError=snapshot.error??"settings 命名空间不可用";
+views=[];
+writable=false;
+return;
+}
+views=Array.isArray(view.namespaces)?view.namespaces:[];
+writable=view.writable!==false;
+notifyHostChange(false);
+};
+const invalidationStops=[];
+const remote=readService("remote");
+const remoteOn=readMethod(remote,"$on");
+if(remoteOn!==null){
+for(const event of["llm/adapters-updated","settings/document-updated","credentials/reference-updated"]){
+try{
+invalidationStops.push(remoteOn.call(remote,event,()=>notifyHostChange(true)));
+}catch{/* 旧宿主不支持该事件时保持设置页可用。 */}
+}
+}
+const hostOn=readMethod(hostCtx,"on");
+if(hostOn!==null){
+try{
+invalidationStops.push(hostOn.call(hostCtx,"connection/reset",()=>notifyHostChange(true)));
+}catch{/* 旧宿主没有连接事件面时无需额外刷新。 */}
+}
+if(typeof hostCtx?.effect==="function"){
+hostCtx.effect(()=>()=>{
+for(const stop of invalidationStops)if(typeof stop==="function")stop();
+hostListeners.clear();
+},"dsh-expert-group: model config settings mirror events");
+}
+const namespaceView=(ns)=>{
+if(describeFace!==null)return config.namespaceViewOf({namespaces:views},ns);
+return undefined;
+};
+const settingsSchemaInfo=(ns)=>{
+const view=namespaceView(ns);
+return config.namespaceSchemaInfo(view??{},adapter);
+};
+const writeNamespace=async({ns,ops,expectedRevision})=>{
+const mutate=readMethod(settingsRemote,"mutate");
+if(mutate===null)return{ok:false,conflict:false,message:"当前宿主没有提供 settings 写入接口"};
+if(!config.hasOps(ops))return{ok:true,view:namespaceView(ns)};
+const current=namespaceView(ns)?.revision;
+if(config.revisionConflictOf(expectedRevision,current)){
+return{ok:false,conflict:true,message:"配置已被其它会话或页面修改，本卡片的修改未提交；请重新打开该 provider 卡片后再试。"};
+}
+let response;
+try{
+response=await mutate.call(settingsRemote,ns,ops,expectedRevision);
+}catch(error){
+return{ok:false,conflict:false,message:error instanceof Error?error.message:String(error)};
+}
+if(response?.ok===true){
+const view=response.value;
+try{
+describeFace?.acceptView?.(view);
+}catch{/* 镜像折叠失败不影响本次提交结果。 */}
+views=Array.isArray(view?.namespaces)
+?view.namespaces
+:views.map((entry)=>(entry?.ns===ns?view:entry));
+return{ok:true,view};
+}
+const code=response?.error?.code;
+const message=response?.error?.message??"保存失败";
+if(code==="settings/conflict"||code==="settings-conflict"){
+return{ok:false,conflict:true,message:`配置已被其它会话或页面修改：${message}。请重新打开该 provider 卡片后再试。`};
+}
+return{ok:false,conflict:false,message};
+};
+return{
+config,
+adapter,
+operations,
+refreshSettingsView,
+namespaceView,
+settingsSchemaInfo,
+writeNamespace,
+subscribe:subscribeHost,
+getSnapshot:()=>hostRevision,
+getInvalidation:()=>hostInvalidation,
+describeError:()=>describeError,
+readView:()=>({namespaces:views,writable}),
+};
+}
+global[SYMBOL]=Object.freeze({
+CUSTOM_PROFILE_BASE_PATH,CUSTOM_PROVIDER_NS,CUSTOM_ROUTE_PROBE,createModelConfigHost,
+});
+})(globalThis);
+/* source: client-subagent-metadata.js */
+(function installClientSubagentMetadata(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-subagent-metadata");
+const clientNativeStatusSymbol=Symbol.for("dsh-expert-group/client-native-status");
+const clientNativeStatus=global[clientNativeStatusSymbol]||{};
+const{
+STATUS_ROLE_LABELS,STATUS_ROLE_MARKER,collectNativeStatusSessionIds,createNativeStatusRowRewriter,isPluginChildSession,normalizeStatusRole,
+resolveNativeStatusTargets,resolveRunningStatusText,resolveStatusIdentity,
+}=clientNativeStatus;
+let react=null;
+let requestPluginRpc=null;
+let RPC_PATH=null;
+let RPC_CHANNEL=null;
+let RPC_ENDPOINT=null;
+function bindClientRuntime(host){
+react=host.react??null;
+requestPluginRpc=host.requestPluginRpc??null;
+RPC_PATH=host.RPC_PATH??null;
+RPC_CHANNEL=host.RPC_CHANNEL??null;
+RPC_ENDPOINT=host.RPC_ENDPOINT??null;
+}
 function useSessionList(ctx,useSessions){
 if(typeof useSessions==="function")return useSessions((snapshot)=>snapshot);
 return react.useSyncExternalStore(ctx.sessions.list.subscribe,ctx.sessions.list.getSnapshot);
 }
-const EMPTY_PENDING_INTERACTIONS=()=>null;
-const IDENTITY_SELECTOR=(snapshot)=>snapshot;
-const PENDING_KIND_LABELS={
-approval:"审批确认",
-"plan-review":"计划确认",
-question:"问题待答",
-};
 function readEntries(value){
 if(value==null)return[];
 if(Array.isArray(value)){
@@ -11898,24 +14967,6 @@ try{return Array.from(value.entries());}catch{return[];}
 }
 if(typeof value==="object")return Object.entries(value);
 return[];
-}
-function readSessionPendingInteractions(sessionList){
-const pending=new Map();
-for(const[fallbackId,session]of readEntries(sessionList?.byId)){
-const interaction=session?.pendingInteraction;
-const sessionId=sessionIdOf(interaction,sessionIdOf(session,fallbackId));
-if(sessionId!==void 0&&interaction!==null&&(typeof interaction==="object"||typeof interaction==="string")){
-pending.set(sessionId,interaction);
-}
-}
-return pending;
-}
-function useOptionalSessionPendingInteraction(useSessionPendingInteraction,sessionList){
-const hook=typeof useSessionPendingInteraction==="function"
-?useSessionPendingInteraction
-:EMPTY_PENDING_INTERACTIONS;
-if(typeof useSessionPendingInteraction==="function")return hook(IDENTITY_SELECTOR);
-return readSessionPendingInteractions(sessionList);
 }
 function sessionIdOf(session,fallbackId){
 const id=session?.sessionId??session?.id??fallbackId;
@@ -12562,944 +15613,1869 @@ removeSubagentMetadata(root);
 },[catalogKey,rpcMetadata]);
 return null;
 }
-const SETTINGS_ROLE_IDS=STATUS_ROLE_IDS;
-const SETTINGS_ROLE_LABELS=STATUS_ROLE_LABELS;
-const SETTINGS_REQUIRED_ROLE_IDS=SETTINGS_ROLE_IDS.filter((role)=>role!=="observer");
-const PROMPT_ROLE_IDS=SETTINGS_ROLE_IDS;
-const DEFAULT_PROMPT_MAX_GRAPHEMES=32000;
-const PROMPT_WARNING_RATIO=0.9;
-const GRAPHEME_SEGMENTER_CACHE=new Map();
-function graphemeSegmenterOf(locale,granularity){
-const key=(locale===undefined?"":String(locale))+"\u0000"+String(granularity);
-const cached=GRAPHEME_SEGMENTER_CACHE.get(key);
-if(cached!==undefined)return cached;
-try{
-const Segmenter=globalThis?.Intl?.Segmenter;
-if(typeof Segmenter!=="function")return null;
-const segmenter=new Segmenter(locale,{granularity});
-GRAPHEME_SEGMENTER_CACHE.set(key,segmenter);
-return segmenter;
-}catch{
-return null;
+global[SYMBOL]=Object.freeze({
+SubagentMetadataBridge,applySubagentMetadata,bindClientRuntime,collectSubagentCatalog,expertGroupRootSessionIdOf,
+findNativeSubagentRowParts,findNativeSubagentTreeItems,findNativeSubagentTrees,formatSubagentMetadata,installNativeStatusBridge,
+normalizeSubagentMetadata,removeSubagentMetadata,requestSubagentMetadata,
+});
+})(globalThis);
+/* source: client-settings-main-b.js */
+(function installClientSettingsMainB(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-settings-main-b");
+const clientSettingsNormalizeSymbol=Symbol.for("dsh-expert-group/client-settings-normalize");
+const clientSettingsNormalize=global[clientSettingsNormalizeSymbol]||{};
+const{
+DEFAULT_MODEL_FALLBACK_LIMIT,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,NOTIFICATION_EVENT_TYPES,PROMPT_WARNING_RATIO,
+clampNotificationVolume,migrateSettingsSelection,modelLayerSelectionOf,normalizeRolePromptProjection,normalizeSettingsDraft,promptEntryOf,
+setModelLayerSelection,settingsRolesForProvider,syncSettingsDefaultsProvider,validatePromptText,
+}=clientSettingsNormalize;
+let react=null;
+let ModelConfigSection=null;
+function bindClientRuntime(host){
+react=host.react??null;
+ModelConfigSection=host.ModelConfigSection??null;
 }
+function renderSettingsTail(view){
+const{closePrompt,selectedPromptRole,settingsSnapshot}=view;
+const actions=createSettingsTailActions(view);
+if(settingsSnapshot.status==="loading"){
+return react.createElement("div",{className:"deg_settings"},
+selectedPromptRole===null?null:react.createElement("button",{
+type:"button",
+className:"deg_btn deg_prompt_back",
+"aria-label":"返回专家列表",
+onClick:closePrompt,
+},"返回专家列表"),
+react.createElement("p",{className:"deg_settings_status",role:"status","aria-live":"polite"},"正在读取设置…"));
 }
-function countUnicodeGraphemes(value){
-if(typeof value!=="string"||value.length===0)return 0;
-const segmenter=graphemeSegmenterOf(undefined,"grapheme");
-if(segmenter!==null){
-try{
-let count=0;
-for(const unused of segmenter.segment(value)){
-void unused;
-count+=1;
+if(settingsSnapshot.status==="unavailable"){
+return react.createElement("div",{className:"deg_settings"},
+selectedPromptRole===null?null:react.createElement("button",{
+type:"button",
+className:"deg_btn deg_prompt_back",
+"aria-label":"返回专家列表",
+onClick:closePrompt,
+},"返回专家列表"),
+react.createElement("p",{className:"deg_settings_error",role:"status"},"设置 namespace 不可用"));
 }
-return count;
-}catch{
+const promptEditor=renderSettingsPromptEditor(view,actions);
+const leaveDialog=renderSettingsLeaveDialog(view,actions);
+if(selectedPromptRole!==null)return react.createElement(react.Fragment,null,promptEditor,leaveDialog);
+return renderSettingsBody(view,actions);
 }
-}
-return Array.from(value).length;
-}
-function validatePromptText(value,maxGraphemes=DEFAULT_PROMPT_MAX_GRAPHEMES){
-const text=typeof value==="string"?value:"";
-const max=Number.isSafeInteger(maxGraphemes)&&maxGraphemes>0
-?maxGraphemes
-:DEFAULT_PROMPT_MAX_GRAPHEMES;
-const count=countUnicodeGraphemes(text);
-if(text.trim().length===0){
-return{ok:false,code:"prompt-empty",message:"提示词不能为空",count,maxGraphemes:max};
-}
-if(count>max){
-return{ok:false,code:"prompt-too-long",message:"提示词不能超过 "+max+" 个字符",count,maxGraphemes:max};
-}
-return{ok:true,code:null,message:null,count,maxGraphemes:max};
-}
-function normalizePromptOverrides(value,maxGraphemes=DEFAULT_PROMPT_MAX_GRAPHEMES,roleIds=PROMPT_ROLE_IDS){
-if(value===null||typeof value!=="object"||Array.isArray(value))return{};
-const normalized={};
-const roles=Array.isArray(roleIds)&&roleIds.length>0?roleIds:PROMPT_ROLE_IDS;
-for(const role of roles){
-const text=value[role];
-if(typeof text!=="string")continue;
-if(!validatePromptText(text,maxGraphemes).ok)continue;
-normalized[role]=text;
-}
-return normalized;
-}
-function promptOverridesEqual(left,right){
-const leftValue=left&&typeof left==="object"?left:{};
-const rightValue=right&&typeof right==="object"?right:{};
-const roles=[...new Set([...Object.keys(leftValue),...Object.keys(rightValue)])].sort();
-return roles.every((role)=>leftValue[role]===rightValue[role]);
-}
-function normalizeRolePromptProjection(projection,settingsValue,snapshotOverridesAuthoritative=false,roleIds=PROMPT_ROLE_IDS){
-if(projection===null||typeof projection!=="object"||Array.isArray(projection)
-||!Array.isArray(projection.entries))return null;
-const roles=Array.isArray(roleIds)&&roleIds.length>0?roleIds:PROMPT_ROLE_IDS;
-const fallbackOverrides=normalizePromptOverrides(settingsValue?.promptOverrides,projection.maxGraphemes,roles);
-const settingsHasOverrides=settingsValue!==null&&typeof settingsValue==="object"
-&&Object.prototype.hasOwnProperty.call(settingsValue,"promptOverrides");
-const byRole=new Map(projection.entries
-.filter((entry)=>entry&&typeof entry.role==="string")
-.map((entry)=>[entry.role,entry]));
-const entries=[];
-for(const role of roles){
-const source=byRole.get(role);
-if(typeof source?.defaultPersona!=="string")return null;
-const snapshotControlsOverride=snapshotOverridesAuthoritative&&settingsHasOverrides;
-const settingsHasRoleOverride=snapshotControlsOverride&&Object.prototype.hasOwnProperty.call(fallbackOverrides,role);
-const override=snapshotControlsOverride
-?fallbackOverrides[role]
-:(typeof source.override==="string"?source.override:fallbackOverrides[role]);
-const customized=snapshotControlsOverride
-?settingsHasRoleOverride
-:source.customized===true;
-entries.push({
-role,
-defaultPersona:source.defaultPersona,
-...(customized&&typeof override==="string"?{override}:{}),
-customized,
-effective:customized&&typeof override==="string"?override:source.defaultPersona,
+function createSettingsTailActions(view){
+const{
+authorityValue,baselineProjection,committedAuthorityRef,committedSnapshotLagging,editPromptText,hostMeta,
+leaveTriggerRef,promptDirty,promptProjection,promptRoleIds,roles,save,
+saving,selectedPromptRole,setCandidatesError,setDirty,setDraft,setEditorBaseline,
+setError,setExternalSettingsChanged,setLeaveIntent,setLocalPromptProjection,setPromptDrafts,setPromptError,
+setPromptTouched,setSaved,setSettingsConflict,settingsConflict,settingsForm,settingsReadOnly,
+settingsSnapshot,
+}=view;
+const discard=()=>{
+const snapshot=settingsForm.getSnapshot();
+const refreshedProjection=normalizeRolePromptProjection(hostMeta?.rolePrompts,authorityValue,true,promptRoleIds)??promptProjection;
+setDraft(normalizeSettingsDraft(authorityValue,roles));
+setCandidatesError(null);
+setPromptDrafts({});
+setPromptTouched({});
+if(selectedPromptRole!==null&&refreshedProjection!==null){
+setEditorBaseline({
+role:selectedPromptRole,
+value:authorityValue,
+revision:Number.isSafeInteger(committedAuthorityRef.current?.revision)&&committedSnapshotLagging
+?committedAuthorityRef.current.revision
+:(Number.isSafeInteger(snapshot.revision)?snapshot.revision:null),
+projection:refreshedProjection,
 });
 }
-const maxGraphemes=Number.isSafeInteger(projection.maxGraphemes)&&projection.maxGraphemes>0
-?projection.maxGraphemes
-:DEFAULT_PROMPT_MAX_GRAPHEMES;
-return{
-roles,
-maxGraphemes,
-customizable:projection.customizable===true,
-entries,
+setDirty(false);
+setSaved(false);
+setError(null);
+setPromptError(null);
+setSettingsConflict(null);
+setExternalSettingsChanged(false);
 };
+const loadLatestPromptSettings=()=>{
+const snapshot=settingsForm.getSnapshot();
+if(settingsConflict?.revision!==undefined
+&&(!Number.isSafeInteger(snapshot.revision)||snapshot.revision<settingsConflict.revision)){
+setPromptError("最新配置尚未到达，请稍后再加载");
+return;
 }
-function promptEntryOf(projection,role){
-return projection?.entries?.find((entry)=>entry.role===role)??null;
+const projection=normalizeRolePromptProjection(hostMeta?.rolePrompts,snapshot.value,true,promptRoleIds)??promptProjection;
+if(selectedPromptRole===null||projection===null){
+setPromptError("最新提示词配置不可用，请稍后重试");
+return;
 }
-function updateRolePromptProjection(projection,role,text){
-if(projection===null||typeof projection!=="object")return projection;
-return{
-...projection,
-entries:projection.entries.map((entry)=>{
-if(entry.role!==role)return entry;
-const customized=text!==entry.defaultPersona;
-const next={...entry,customized,effective:text};
-if(customized)next.override=text;
-else delete next.override;
-return next;
+setLocalPromptProjection(null);
+setDraft(normalizeSettingsDraft(snapshot.value,roles));
+setPromptDrafts({});
+setPromptTouched({});
+setEditorBaseline({role:selectedPromptRole,value:snapshot.value,revision:snapshot.revision,projection});
+setDirty(false);
+setSaved(false);
+setError(null);
+setPromptError(null);
+setSettingsConflict(null);
+setExternalSettingsChanged(false);
+};
+const retryPromptSave=async()=>{
+if(settingsConflict?.revision!==undefined
+&&(!Number.isSafeInteger(settingsSnapshot.revision)||settingsSnapshot.revision<settingsConflict.revision)){
+setPromptError("最新配置尚未到达，请先加载最新配置");
+return false;
+}
+return save({retry:true});
+};
+const restorePromptDefault=()=>{
+const role=selectedPromptRole;
+const entry=promptEntryOf(baselineProjection,role);
+if(role===null||entry===null||settingsReadOnly||saving||baselineProjection?.customizable!==true)return;
+if(promptDirty){
+leaveTriggerRef.current=typeof document==="undefined"?null:document.activeElement;
+setLeaveIntent({kind:"restore-default",role});
+return;
+}
+editPromptText(role,entry.defaultPersona);
+};
+return{discard,loadLatestPromptSettings,restorePromptDefault,retryPromptSave};
+}
+function renderSettingsPromptEditor(view,actions){
+const{
+baselineProjection,closePrompt,editPromptText,error,externalSettingsChanged,hasUnsavedChanges,
+hostMetaError,promptError,promptLoading,promptMaxGraphemes,promptProjection,promptTextOf,
+refreshHostMeta,roleLabelOf,save,saved,saving,selectedPromptRole,
+settingsConflict,settingsReadOnly,
+}=view;
+const selectedPromptEntry=promptEntryOf(promptProjection,selectedPromptRole);
+const selectedPromptText=selectedPromptRole===null?"":promptTextOf(selectedPromptRole);
+const promptValidation=validatePromptText(selectedPromptText,promptMaxGraphemes);
+const promptCounterClass=promptValidation.count>promptMaxGraphemes
+?" deg_prompt_counter_error"
+:promptValidation.count>=promptMaxGraphemes*PROMPT_WARNING_RATIO
+?" deg_prompt_counter_warning"
+:"";
+const promptMetaMessage=hostMetaError
+??(promptProjection===null&&!promptLoading?"提示词配置不可用，请刷新后重试":null);
+const promptStatusMessage=promptMetaMessage
+??(settingsReadOnly?"当前设置为只读，可查看提示词但不能编辑或保存。":null);
+const promptValidationMessage=selectedPromptRole!==null&&!promptValidation.ok?promptValidation.message:null;
+const promptErrorMessage=promptError??promptValidationMessage??error??promptMetaMessage;
+const promptLabel=selectedPromptRole===null
+?"专家"
+:roleLabelOf(selectedPromptRole);
+const promptEditor=selectedPromptRole===null?null:react.createElement("div",{className:"deg_settings deg_settings_prompt_editor"},
+react.createElement("div",{className:"deg_prompt_header"},
+react.createElement("h2",{className:"deg_settings_title"},promptLabel)),
+react.createElement("label",{className:"deg_prompt_label",htmlFor:"deg-prompt-textarea-"+selectedPromptRole},"提示词"),
+promptProjection===null
+?react.createElement(react.Fragment,null,
+react.createElement("p",{className:"deg_prompt_status",role:"status","aria-live":"polite"},promptStatusMessage??"提示词配置加载中…"),
+promptLoading?null:react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled:saving,
+onClick:refreshHostMeta,
+},"重试加载提示词配置"))
+:react.createElement(react.Fragment,null,
+react.createElement("textarea",{
+id:"deg-prompt-textarea-"+selectedPromptRole,
+className:"deg_prompt_textarea",
+"data-deg-prompt-role":selectedPromptRole,
+"aria-label":promptLabel+"提示词",
+"aria-describedby":"deg-prompt-counter-"+selectedPromptRole
++(promptErrorMessage===null?"":" deg-prompt-error-"+selectedPromptRole),
+"aria-invalid":!promptValidation.ok||promptErrorMessage!==null,
+value:selectedPromptText,
+disabled:settingsReadOnly||saving||promptProjection.customizable!==true,
+onChange:(event)=>{
+const text=typeof event?.target?.value==="string"?event.target.value:"";
+editPromptText(selectedPromptRole,text);
+},
 }),
-};
+react.createElement("div",{
+id:"deg-prompt-counter-"+selectedPromptRole,
+className:"deg_prompt_counter"+promptCounterClass,
+role:"status",
+"aria-live":"polite",
+},String(promptValidation.count)+" / "+String(promptMaxGraphemes)),
+promptStatusMessage===null?null:react.createElement("p",{className:"deg_prompt_status",role:"status"},promptStatusMessage)),
+promptErrorMessage===null?null:react.createElement("p",{
+id:"deg-prompt-error-"+selectedPromptRole,
+className:"deg_settings_error",
+role:"alert",
+"aria-live":"assertive",
+},promptErrorMessage),
+externalSettingsChanged?react.createElement("p",{
+className:"deg_prompt_status",
+role:"status",
+"aria-live":"polite",
+},"配置已发生外部变化"):null,
+settingsConflict===null?null:react.createElement("div",{className:"deg_prompt_conflict",role:"alert"},
+react.createElement("p",{className:"deg_settings_error"},"保存遇到配置冲突，请选择下一步。"),
+react.createElement("div",{className:"deg_prompt_dialog_actions"},
+react.createElement("button",{type:"button",className:"deg_btn",disabled:saving,onClick:actions.loadLatestPromptSettings},"加载最新配置"),
+react.createElement("button",{type:"button",className:"deg_btn deg_btn_primary",disabled:saving,onClick:actions.retryPromptSave},"继续使用当前修改重试"))),
+react.createElement("div",{className:"deg_prompt_footer"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_prompt_back",
+"aria-label":"返回专家列表",
+disabled:saving,
+onClick:closePrompt,
+},"返回专家列表"),
+react.createElement("span",{className:"deg_prompt_status",role:"status","aria-live":"polite"},saved?"已保存":hasUnsavedChanges?"有未保存的修改":""),
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+disabled:!hasUnsavedChanges||!promptValidation.ok||saving
+||settingsReadOnly||promptLoading||baselineProjection?.customizable!==true,
+onClick:save,
+},saving?"保存中…":"保存"),
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled:saving||settingsReadOnly||promptLoading||promptProjection?.customizable!==true
+||selectedPromptEntry===null||selectedPromptText===selectedPromptEntry.defaultPersona,
+onClick:actions.restorePromptDefault,
+},"恢复默认")));
+return promptEditor;
 }
-function settingsRolesForProvider(roles){
-const candidates=Array.isArray(roles)?roles:SETTINGS_REQUIRED_ROLE_IDS;
-return[...new Set(candidates.filter((role)=>typeof role==="string"&&role.length>0))];
-}
-function unifiedProviderOf(defaults,roles,legacyProvider=""){
-const activeRoles=settingsRolesForProvider(roles);
-if(activeRoles.length===0)return"";
-const providers=activeRoles.map((role)=>{
-const provider=defaults?.[role]?.provider;
-return typeof provider==="string"&&provider.length>0?provider:"";
-});
-const configured=providers.filter((provider)=>provider.length>0);
-if(configured.length===0)return typeof legacyProvider==="string"?legacyProvider:"";
-if(configured.length!==activeRoles.length)return"";
-const first=configured[0];
-return configured.every((provider)=>provider===first)?first:"";
-}
-const NOTIFICATION_EVENT_TYPES=Object.freeze(["completed","waiting","failed"]);
-function normalizeNotificationEvents(value){
-const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
-const normalized={};
-for(const type of NOTIFICATION_EVENT_TYPES)normalized[type]=source[type]!==false;
-return normalized;
-}
-function clampNotificationVolume(value){
-const number=Number(value);
-return Number.isFinite(number)?Math.min(100,Math.max(0,Math.round(number))):100;
-}
-const DEFAULT_ROLE_CONCURRENCY_LIMIT=20;
-const LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT=10;
-const CONFIG_MIGRATION_VERSION=1;
-function normalizeRoleConcurrencyLimit(value){
-return Number.isSafeInteger(value)&&value>=1&&value<=64
-?value
-:DEFAULT_ROLE_CONCURRENCY_LIMIT;
-}
-function effectiveRoleConcurrencyLimit(source){
-const limit=normalizeRoleConcurrencyLimit(source?.roleConcurrencyLimit);
-const rawVersion=source?.configMigrationVersion;
-const version=Number.isSafeInteger(rawVersion)&&rawVersion>=0?rawVersion:0;
-return version<CONFIG_MIGRATION_VERSION&&limit===LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT
-?DEFAULT_ROLE_CONCURRENCY_LIMIT
-:limit;
-}
-const DEFAULT_ROLE_TIMEOUT_MS=36000000;
-function normalizeRoleTimeoutMs(value){
-if(value===0)return 0;
-return Number.isSafeInteger(value)&&value>=1000&&value<=86400000&&value%1000===0
-?value
-:DEFAULT_ROLE_TIMEOUT_MS;
-}
-const MAX_MODEL_CANDIDATES_PER_ROLE=3;
-const MAX_MODEL_FALLBACK_LIMIT=4;
-const DEFAULT_MODEL_FALLBACK_LIMIT=2;
-const MAX_MODEL_PAGES=MAX_MODEL_CANDIDATES_PER_ROLE+1;
-function normalizeModelFallbackLimitDraft(value){
-return Number.isSafeInteger(value)&&value>=0&&value<=MAX_MODEL_FALLBACK_LIMIT?value:DEFAULT_MODEL_FALLBACK_LIMIT;
-}
-function normalizeModelCandidateSelection(entry){
-if(entry===null||typeof entry!=="object"||Array.isArray(entry))return null;
-if(typeof entry.provider!=="string"||typeof entry.model!=="string")return null;
-const reasoningEffort=typeof entry.reasoningEffort==="string"?entry.reasoningEffort:"";
-return{provider:entry.provider,model:entry.model,...(reasoningEffort.length>0?{reasoningEffort}:{})};
-}
-function normalizeModelCandidatesDraft(value){
-const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
-const candidates={};
-for(const[role,list]of Object.entries(source)){
-if(typeof role!=="string"||role.length===0||!Array.isArray(list))continue;
-if(!SETTINGS_ROLE_IDS.includes(role))continue;
-const normalized=[];
-for(const entry of list.slice(0,MAX_MODEL_CANDIDATES_PER_ROLE)){
-const selection=normalizeModelCandidateSelection(entry);
-if(selection!==null)normalized.push(selection);
-}
-if(normalized.length>0)candidates[role]=normalized;
-}
-return candidates;
-}
-function modelCandidateKeyOf(selection){
-return(selection?.provider??"")+"\u0000"+(selection?.model??"")+"\u0000"+(typeof selection?.reasoningEffort==="string"?selection.reasoningEffort:"");
-}
-function modelPageCountOf(draft){
-let longest=0;
-for(const role of SETTINGS_ROLE_IDS){
-const list=draft?.candidates?.[role];
-if(Array.isArray(list))longest=Math.max(longest,list.length);
-}
-return Math.min(MAX_MODEL_PAGES,Math.max(1,1+longest));
-}
-function modelLayerRolesOf(draft){
-const roles=[...SETTINGS_ROLE_IDS];
-for(const source of[draft?.defaults,draft?.candidates]){
-if(source===null||source===void 0||typeof source!=="object")continue;
-for(const role of Object.keys(source))if(!roles.includes(role))roles.push(role);
-}
-return roles;
-}
-function modelLayerSelectionOf(draft,role,page){
-if(!Number.isSafeInteger(page)||page<0)return null;
-const source=page===0
-?draft?.defaults?.[role]
-:(Array.isArray(draft?.candidates?.[role])?draft.candidates[role][page-1]:void 0);
-return source!==null&&source!==void 0&&typeof source==="object"&&!Array.isArray(source)?source:null;
-}
-function setModelLayerSelection(draft,role,page,selection){
-if(!Number.isSafeInteger(page)||page<0)return draft;
-const normalized=selection!==null&&typeof selection==="object"&&!Array.isArray(selection)?selection:null;
-if(page===0){
-const defaults={...(draft?.defaults??{})};
-if(normalized===null)delete defaults[role];
-else defaults[role]=normalized;
-return{...draft,defaults};
-}
-const candidates={...(draft?.candidates??{})};
-const list=Array.isArray(candidates[role])?candidates[role].slice():[];
-while(list.length<page-1)list.push({provider:"",model:""});
-list[page-1]=normalized===null?{provider:"",model:""}:normalized;
-candidates[role]=list;
-return{...draft,candidates};
-}
-function modelLayerMapOf(draft,page){
-const map={};
-for(const role of modelLayerRolesOf(draft)){
-const selection=modelLayerSelectionOf(draft,role,page);
-if(selection!==null)map[role]=selection;
-}
-return map;
-}
-function writeModelLayers(draft,layers){
-const defaults={};
-const candidates={};
-for(const role of modelLayerRolesOf(draft)){
-const primary=layers[0]?.[role]??null;
-if(primary!==null&&primary!==void 0)defaults[role]={...primary};
-let last=0;
-for(let page=1;page<layers.length;page+=1){
-const selection=layers[page]?.[role];
-if(selection!==null&&selection!==void 0)last=page;
-}
-if(last>=1){
-const list=[];
-for(let page=1;page<=last;page+=1){
-const selection=layers[page]?.[role]??null;
-list.push(selection===null?{provider:"",model:""}:{...selection});
-}
-candidates[role]=list;
-}
-}
-return{...draft,defaults,candidates};
-}
-function reorderModelLayers(draft,from,to){
-const count=modelPageCountOf(draft);
-if(!Number.isSafeInteger(from)||!Number.isSafeInteger(to))return draft;
-if(from<0||from>=count||to<0||to>=count||from===to)return draft;
-const layers=[];
-for(let page=0;page<count;page+=1)layers.push(modelLayerMapOf(draft,page));
-const[moved]=layers.splice(from,1);
-layers.splice(to,0,moved);
-return writeModelLayers(draft,layers);
-}
-function addModelCandidatePage(draft){
-const count=modelPageCountOf(draft);
-if(count>=MAX_MODEL_PAGES)return draft;
-const candidates={...(draft?.candidates??{})};
-for(const role of modelLayerRolesOf(draft)){
-const primary=modelLayerSelectionOf(draft,role,0);
-const list=Array.isArray(candidates[role])?candidates[role].slice():[];
-while(list.length<count-1)list.push({provider:"",model:""});
-list[count-1]=primary===null?{provider:"",model:""}:{...primary};
-candidates[role]=list;
-}
-return{...draft,candidates};
-}
-function removeModelCandidatePage(draft,page){
-if(!Number.isSafeInteger(page)||page<1)return draft;
-const candidates={...(draft?.candidates??{})};
-for(const[role,value]of Object.entries(candidates)){
-if(!Array.isArray(value))continue;
-const list=value.slice();
-if(list.length>=page)list.splice(page-1,1);
-if(list.length>0)candidates[role]=list;
-else delete candidates[role];
-}
-return{...draft,candidates};
-}
-function compactModelCandidatesDraft(candidates){
-const source=candidates!==null&&typeof candidates==="object"&&!Array.isArray(candidates)?candidates:{};
-const compacted={};
-for(const[role,list]of Object.entries(source)){
-if(!Array.isArray(list))continue;
-const rows=[];
-for(const entry of list){
-const selection=normalizeModelCandidateSelection(entry);
-if(selection===null)continue;
-if(selection.provider.length===0&&selection.model.length===0)continue;
-rows.push(selection);
-}
-if(rows.length>0)compacted[role]=rows;
-}
-return compacted;
-}
-function validateModelCandidateRows(candidates){
-const source=candidates!==null&&typeof candidates==="object"?candidates:{};
-for(const[role,list]of Object.entries(source)){
-if(!Array.isArray(list))continue;
-if(list.length>MAX_MODEL_CANDIDATES_PER_ROLE)return{ok:false,code:"limit",role,index:0};
-const seen=new Set();
-for(let index=0;index<list.length;index+=1){
-const selection=normalizeModelCandidateSelection(list[index]);
-if(selection===null)return{ok:false,code:"incomplete",role,index:index+1};
-if(selection.provider.length===0&&selection.model.length===0)continue;
-if(selection.provider.length===0||selection.model.length===0)return{ok:false,code:"incomplete",role,index:index+1};
-const key=modelCandidateKeyOf(selection);
-if(seen.has(key))return{ok:false,code:"duplicate",role,index:index+1};
-seen.add(key);
-}
-}
-return{ok:true,code:null,role:null,index:0};
-}
-function modelCandidatesErrorMessage(t,roleLabelOf,validation){
-if(validation.code==="limit")return t("settings.modelCandidates.limit");
-return(typeof roleLabelOf==="function"?roleLabelOf(validation.role):validation.role)+"："+t("settings.modelCandidates.error."+(validation.code??"incomplete"),{index:validation.index});
-}
-function normalizeSettingsDraft(value,roles,allowLegacyProviderFallback=true){
-const source=value&&typeof value==="object"?value:{};
-const configuredProvider=typeof source.provider==="string"?source.provider:"";
-const activeRoles=settingsRolesForProvider(roles);
-const entries=[];
-for(const[role,selection]of Object.entries(source.defaults??{})){
-if(!selection||typeof selection!=="object"
-||typeof selection.model!=="string"||selection.model.length===0)continue;
-const provider=typeof selection.provider==="string"&&selection.provider.length>0
-?selection.provider
-:"";
-entries.push({role,selection,provider});
-}
-const hasVisibleRowProvider=entries.some(({role,provider})=>activeRoles.includes(role)&&provider.length>0);
-const defaults={};
-for(const{role,selection,provider:explicitProvider}of entries){
-const provider=explicitProvider.length>0
-?explicitProvider
-:(allowLegacyProviderFallback&&!hasVisibleRowProvider&&activeRoles.includes(role)
-?configuredProvider
-:"");
-if(provider.length===0)continue;
-defaults[role]={provider,model:selection.model};
-if(typeof selection.reasoningEffort==="string")defaults[role].reasoningEffort=selection.reasoningEffort;
-}
-const visibleProviders=activeRoles
-.map((role)=>defaults[role]?.provider)
-.filter((provider)=>typeof provider==="string"&&provider.length>0);
-const inferredProvider=visibleProviders.length>0
-&&visibleProviders.length===activeRoles.length
-&&visibleProviders.every((provider)=>provider===visibleProviders[0])
-?visibleProviders[0]
-:"";
-return{
-provider:hasVisibleRowProvider
-?inferredProvider
-:(allowLegacyProviderFallback?configuredProvider:""),
-defaults,
-notificationEnabled:source.notificationEnabled!==false,
-notificationVolume:clampNotificationVolume(source.notificationVolume),
-notificationEvents:normalizeNotificationEvents(source.notificationEvents),
-roleConcurrencyLimit:effectiveRoleConcurrencyLimit(source),
-roleTimeoutMs:normalizeRoleTimeoutMs(source.roleTimeoutMs),
-observerPreferred:source.observerPreferred===true,
-taskManagementEnabled:source.taskManagementEnabled!==false,
-autoOpenSubagentSidebar:source.autoOpenSubagentSidebar===true,
-...(Object.prototype.hasOwnProperty.call(source,"candidates")
-?{candidates:normalizeModelCandidatesDraft(source.candidates)}
-:{}),
-...(Object.prototype.hasOwnProperty.call(source,"fallbackLimit")
-?{fallbackLimit:normalizeModelFallbackLimitDraft(source.fallbackLimit)}
-:{}),
-};
-}
-function settingsDraftEqual(left,right){
-return JSON.stringify(left)===JSON.stringify(right);
-}
-const SETTINGS_DRAFT_MERGE_FIELDS=Object.freeze([
-"provider",
-"defaults",
-"notificationEnabled",
-"notificationVolume",
-"notificationEvents",
-"roleConcurrencyLimit",
-"roleTimeoutMs",
-"observerPreferred",
-"taskManagementEnabled",
-"autoOpenSubagentSidebar",
-"candidates",
-"fallbackLimit",
-]);
-function mergeSettingsDraftOverSource(source,local,baseline){
-const merged={...source};
-for(const field of SETTINGS_DRAFT_MERGE_FIELDS){
-const hasLocal=Object.prototype.hasOwnProperty.call(local,field);
-const hasBaseline=Object.prototype.hasOwnProperty.call(baseline,field);
-if(hasLocal!==hasBaseline){
-if(hasLocal)merged[field]=local[field];
-else delete merged[field];
-continue;
-}
-if(!hasLocal)continue;
-if(settingsDraftEqual(local[field],baseline[field]))continue;
-merged[field]=local[field];
-}
-return merged;
-}
-function createSettingsModelCatalog(ctx){
-let state={groups:[],status:"idle",error:null};
-let inflight=null;
-let queued=false;
-let disposed=false;
-const freshness=createClientFreshnessBoundary();
-const listeners=new Set();
-const publish=(next)=>{
-state=next;
-for(const listener of listeners)listener();
-};
-const startRequest=()=>{
-if(disposed)return Promise.resolve();
-const requestToken=freshness.beginRequest("catalog","settings");
-publish({...state,status:"loading",error:null});
-const promise=Promise.resolve().then(()=>ctx.remote.session.modelCatalog()).then((response)=>{
-const catalog=response?.ok===true?response.value:response;
-if(!catalog||!Array.isArray(catalog.groups))throw new Error("模型目录不可用");
-const normalizedGroups=normalizeSettingsModelGroups(catalog.groups);
-const accepted=freshness.acceptCatalogResponse({
-generation:requestToken.sequence,
-groups:normalizedGroups,
-requestToken,
-});
-if(accepted.accepted)publish({groups:normalizedGroups,status:"ready",error:null});
-}).catch((cause)=>{
-if(freshness.isCurrent(requestToken)){
-publish({...state,status:"error",error:cause instanceof Error?cause.message:String(cause)});
-}
-}).finally(()=>{
-if(inflight!==promise)return;
-inflight=null;
-if(!queued)return;
-queued=false;
-startRequest();
-});
-inflight=promise;
-return promise;
-};
-const load=()=>{
-if(disposed)return Promise.resolve();
-if(inflight!==null)return inflight;
-return startRequest();
-};
-const refresh=(clear)=>{
-if(disposed)return;
-if(clear){
-inflight=null;
-queued=false;
-publish({groups:[],status:"idle",error:null});
-startRequest();
+function renderSettingsLeaveDialog(view,actions){
+const{
+applyPromptNavigation,baselineProjection,dismissLeaveDialog,editPromptText,leaveCancelRef,leaveIntent,
+save,saving,
+}=view;
+const leaveDialog=leaveIntent===null?null:react.createElement("div",{className:"deg_prompt_dialog_backdrop"},
+react.createElement("div",{
+className:"deg_prompt_dialog",
+role:"dialog",
+"aria-modal":"true",
+"aria-label":"未保存的修改",
+onKeyDown:(event)=>{
+if(event.key==="Escape"){
+event.preventDefault?.();
+dismissLeaveDialog();
 return;
 }
-if(inflight!==null){
-if(!queued)freshness.beginRequest("catalog","settings");
-queued=true;
-return;
+if(event.key!=="Tab")return;
+const controls=Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]")??[]);
+if(controls.length===0)return;
+const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
+const nextIndex=event.shiftKey
+?(current<=0?controls.length-1:current-1)
+:(current>=controls.length-1?0:current+1);
+event.preventDefault?.();
+try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
+},
+},
+react.createElement("h3",null,"未保存的修改"),
+react.createElement("p",null,"离开前请选择如何处理当前草稿。"),
+react.createElement("div",{className:"deg_prompt_dialog_actions"},
+leaveIntent.kind==="restore-default"
+?react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+"data-deg-dialog-action":"restore",
+disabled:saving,
+onClick:()=>{
+const role=leaveIntent.role;
+const entry=promptEntryOf(baselineProjection,role);
+dismissLeaveDialog();
+if(entry!==null)editPromptText(role,entry.defaultPersona);
+},
+},"恢复默认")
+:react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+"data-deg-dialog-action":"save",
+disabled:saving,
+onClick:async()=>{
+const savedNow=await save();
+if(savedNow!==true)return;
+const intent=leaveIntent;
+dismissLeaveDialog();
+applyPromptNavigation(intent?.role??null);
+},
+},saving?"保存中…":"保存并离开"),
+leaveIntent.kind==="restore-default"?null:react.createElement("button",{
+type:"button",
+className:"deg_btn",
+"data-deg-dialog-action":"actions.discard",
+disabled:saving,
+onClick:()=>{
+const intent=leaveIntent;
+actions.discard();
+dismissLeaveDialog();
+applyPromptNavigation(intent?.role??null);
+},
+},"放弃修改"),
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+"data-deg-dialog-action":"cancel",
+autoFocus:true,
+ref:leaveCancelRef,
+onClick:dismissLeaveDialog,
+},"取消"))));
+return leaveDialog;
 }
-startRequest();
-};
-const subscribe=(listener)=>{
-listeners.add(listener);
-return()=>listeners.delete(listener);
-};
-const getSnapshot=()=>state;
-const eventStops=[];
-for(const event of["llm/adapters-updated","settings/document-updated","credentials/reference-updated"]){
-eventStops.push(ctx.remote.$on(event,()=>refresh(false)));
-}
-ctx.on("connection/reset",()=>refresh(true));
-ctx.effect(()=>()=>{
-disposed=true;
-inflight=null;
-queued=false;
-for(const stop of eventStops)if(typeof stop==="function")stop();
-freshness.dispose();
-},"dsh-expert-group: settings catalog events");
-return{load,subscribe,getSnapshot};
-}
-function normalizeSettingsModelGroups(groups){
-return(Array.isArray(groups)?groups:[]).flatMap((group)=>{
-if(!group||typeof group.id!=="string"||group.id.length===0)return[];
-const models=(Array.isArray(group.models)?group.models:[])
-.filter((model)=>model&&typeof model==="object"&&typeof model.id==="string"&&model.id.length>0)
-.map((model)=>{
-const normalized={
-...model,
-name:typeof model.name==="string"&&model.name.trim().length>0?model.name:model.id,
-};
-const reasoning=model.reasoning;
-if(!reasoning||typeof reasoning!=="object"||Array.isArray(reasoning)){
-delete normalized.reasoning;
-return normalized;
-}
-const efforts=(Array.isArray(reasoning.efforts)?reasoning.efforts:[])
-.flatMap((effort)=>{
-if(!effort||typeof effort!=="object"||typeof effort.id!=="string"||effort.id.length===0)return[];
-return[{
-...effort,
-name:typeof effort.name==="string"&&effort.name.trim().length>0?effort.name:effort.id,
-}];
-});
-const defaultEffort=typeof reasoning.defaultEffort==="string"
-&&reasoning.defaultEffort.trim().length>0
-&&efforts.some((effort)=>effort.id===reasoning.defaultEffort)
-?reasoning.defaultEffort
-:void 0;
-normalized.reasoning={
-efforts,
-...(defaultEffort===void 0?{}:{defaultEffort}),
-};
-return normalized;
-});
-return[{
-...group,
-name:typeof group.name==="string"&&group.name.trim().length>0?group.name:group.id,
-models,
-}];
-});
-}
-function modelDisplayNameOf(model){
-if(!model||typeof model!=="object")return"";
-if(typeof model.name==="string"&&model.name.trim().length>0)return model.name;
-return typeof model.id==="string"&&model.id.length>0?model.id:"";
-}
-function migrateSettingsSelection(selection,provider,groups){
-if(typeof provider!=="string"||provider.length===0)return null;
-const providerGroups=Array.isArray(groups)?groups:[];
-const providerGroup=providerGroups.find((group)=>group?.id===provider);
-if(!providerGroup)return null;
-if(!selection||typeof selection!=="object"
-||typeof selection.model!=="string"||selection.model.length===0)return null;
-const sourceGroup=typeof selection.provider==="string"&&selection.provider.length>0
-?providerGroups.find((group)=>group?.id===selection.provider)
-:void 0;
-const sourceModel=Array.isArray(sourceGroup?.models)
-?sourceGroup.models.find((candidate)=>candidate?.id===selection.model)
-:void 0;
-const sourceDisplayName=modelDisplayNameOf(sourceModel);
-if(sourceDisplayName.length===0)return null;
-const model=Array.isArray(providerGroup.models)
-?providerGroup.models.find((candidate)=>modelDisplayNameOf(candidate)===sourceDisplayName)
-:void 0;
-if(!model)return null;
-const next={provider:providerGroup.id,model:model.id};
-const reasoning=model.reasoning;
-if(typeof selection.reasoningEffort==="string"
-&&Array.isArray(reasoning?.efforts)
-&&reasoning.efforts.some((effort)=>effort?.id===selection.reasoningEffort)){
-next.reasoningEffort=selection.reasoningEffort;
-}
-return next;
-}
-function migrateSettingsDefaults(defaults,provider,groups){
-if(typeof provider!=="string"||provider.length===0)return{};
-const providerGroup=(Array.isArray(groups)?groups:[]).find((group)=>group?.id===provider);
-if(!providerGroup)return{};
-const migrated={};
-for(const[role,selection]of Object.entries(defaults??{})){
-const next=migrateSettingsSelection(selection,provider,groups);
-if(next!==null)migrated[role]=next;
-}
-return migrated;
-}
-function syncSettingsDefaultsProvider(defaults,provider,groups,roles){
-const next={...(defaults&&typeof defaults==="object"?defaults:{})};
-if(typeof provider!=="string"||provider.length===0)return next;
-for(const role of settingsRolesForProvider(roles)){
-const migrated=migrateSettingsSelection(next[role],provider,groups);
-next[role]=migrated??{provider,model:""};
-}
-return next;
-}
-function normalizeSettingsCommitDraft(value,roles){
-const normalized=normalizeSettingsDraft(value,roles);
-if(value!==null&&typeof value==="object"
-&&Object.prototype.hasOwnProperty.call(value,"promptOverrides")){
-normalized.promptOverrides=normalizePromptOverrides(value.promptOverrides);
-}
-return normalized;
-}
-async function commitSettingsCandidate(settings,revision,request=globalThis.fetch,connection,roles,changed){
-const surface=requireFreshnessSurface();
-if(changed===void 0){
-return surface.commitSettingsCandidate(settings,revision,{
-request,
-connection,
-normalizeSettingsDraft:normalizeSettingsCommitDraft,
-roles,
-rpcTarget:RPC_TARGET,
-});
-}
-const body={
-action:"settings-commit",
-settings,
-expectedRevision:revision,
-changed,
-};
-const response=await requestPluginRpc(connection,body,{},request);
-return surface.readSettingsCommitOutcome(response,normalizeSettingsCommitDraft,roles);
-}
-function useHostMeta(ctx){
-const[meta,setMeta]=react.useState(null);
-const[error,setError]=react.useState(null);
-const[version,setVersion]=react.useState(0);
-react.useEffect(()=>{
-let cancelled=false;
-setError(null);
-void requestPluginRpc(ctx?.connection,{action:"meta"}).then((response)=>(
-response.ok===true?response.json():null
-)).then((json)=>{
-if(cancelled)return;
-if(json!==null&&json?.ok===true){
-setMeta(json);
-setError(null);
+function renderSettingsRoleTable(view){
+const{
+catalogAvailable,currentModelPage,draft,editDraft,error,modelRowRoles,
+openPrompt,promptProjection,promptRoleIds,providerGroups,roleLabelOf,roles,
+saving,selectedPromptRole,
+}=view;
+const header=react.createElement(react.Fragment,null,
+react.createElement("span",{className:"deg_settings_table_head"},"专家"),
+react.createElement("span",{className:"deg_settings_table_head"},"供应商"),
+react.createElement("span",{className:"deg_settings_table_head"},"模型选择"),
+react.createElement("span",{className:"deg_settings_table_head"},"思考深度"));
+const rows=modelRowRoles.map((role)=>{
+const roleLabel=roleLabelOf(role);
+const roleEnabled=roles.includes(role);
+const selection=modelLayerSelectionOf(draft,role,currentModelPage);
+const rowProvider=typeof selection?.provider==="string"?selection.provider:"";
+const rowProviderGroup=providerGroups.find((group)=>group.id===rowProvider);
+const rowModels=rowProviderGroup?.models??[];
+const currentModel=rowModels.find((model)=>model.id===selection?.model);
+const providerOptions=[
+react.createElement("option",{key:"__empty-provider",value:""},"未选择供应商"),
+...(rowProvider&&rowProviderGroup===undefined
+?[react.createElement("option",{key:"__unavailable-provider",value:rowProvider,disabled:true},rowProvider+"（不可用）")]
+:[]),
+...providerGroups.map((group)=>react.createElement("option",{key:group.id,value:group.id},group.name??group.id)),
+];
+const modelOptions=[];
+if(!rowProvider){
+modelOptions.push(react.createElement("option",{key:"__provider",value:""},"先选择供应商"));
 }else{
-setMeta(null);
-setError("提示词配置读取失败");
+modelOptions.push(react.createElement("option",{key:"__empty",value:""},"未选择模型"));
+if(selection?.model&&currentModel===undefined){
+modelOptions.push(react.createElement("option",{key:"__unavailable",value:selection.model,disabled:true},selection.model+"（不可用）"));
 }
-}).catch((cause)=>{
-if(cancelled)return;
-setMeta(null);
-setError(cause instanceof Error?cause.message:"提示词配置读取失败");
+for(const model of rowModels){
+modelOptions.push(react.createElement("option",{key:model.id,value:model.id},model.name??model.id));
+}
+}
+const reasoning=currentModel?.reasoning;
+const effortOptions=[];
+if(reasoning){
+effortOptions.push(react.createElement("option",{key:"__default",value:""},"模型默认"));
+for(const effort of reasoning.efforts??[]){
+effortOptions.push(react.createElement("option",{key:effort.id,value:effort.id},effort.name??effort.id));
+}
+}else{
+effortOptions.push(react.createElement("option",{key:"__unsupported",value:""},rowProvider?"模型无思考深度":"先选择模型"));
+}
+const updateProvider=(event)=>{
+const provider=event.target.value;
+editDraft((previous)=>{
+const current=modelLayerSelectionOf(previous,role,currentModelPage);
+const currentProvider=typeof current?.provider==="string"?current.provider:"";
+if(provider===currentProvider)return previous;
+if(currentModelPage===0){
+const next=!provider
+?null
+:(migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""});
+return{...setModelLayerSelection(previous,role,0,next),provider:""};
+}
+const next=!provider
+?{provider:"",model:""}
+:(migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""});
+return setModelLayerSelection(previous,role,currentModelPage,next);
 });
-return()=>{cancelled=true;};
-},[ctx,version]);
-return[meta,()=>setVersion((value)=>value+1),error];
-}
-function useEnabledSettingsRoles(hostMeta){
-return react.useMemo(()=>{
-const configuredRoles=Array.isArray(hostMeta?.activeRoles)?hostMeta.activeRoles:hostMeta?.roles;
-if(!Array.isArray(configuredRoles))return SETTINGS_REQUIRED_ROLE_IDS;
-const enabled=configuredRoles.filter((role)=>typeof role==="string"&&role.length>0
-&&SETTINGS_ROLE_IDS.includes(role));
-if(hostMeta?.enableObserver===true&&!enabled.includes("observer"))enabled.push("observer");
-return enabled.filter((role,index)=>enabled.indexOf(role)===index);
-},[hostMeta]);
-}
-const MODEL_CONFIG_GLOBAL_KEY="dsh-expert-group/client-model-config";
-const CUSTOM_PROVIDER_NS="llm-pi-ai";
-const CUSTOM_PROFILE_BASE_PATH=Object.freeze(["providers"]);
-const CUSTOM_ROUTE_PROBE="_probe";
-function resolveModelConfig(hostCtx,sidecar){
-if(sidecar!==null&&sidecar!==undefined)return sidecar;
-try{
-const fromCtx=typeof hostCtx?.get==="function"?hostCtx.get(MODEL_CONFIG_GLOBAL_KEY):null;
-if(fromCtx!==null&&fromCtx!==undefined)return fromCtx;
-}catch{/* 服务未安装或代理拒答。 */}
-try{
-return globalThis[Symbol.for(MODEL_CONFIG_GLOBAL_KEY)];
-}catch{
-return undefined;
-}
-}
-function createModelConfigHost(hostCtx,describeSource,sidecar){
-const config=resolveModelConfig(hostCtx,sidecar);
-if(config===undefined)return null;
-const readService=(name)=>{
-if(typeof hostCtx?.get==="function"){
-try{
-const value=hostCtx.get(name);
-if(value!==undefined&&value!==null)return value;
-}catch{/* 服务未安装或代理拒答，继续尝试属性回退。 */}
-}
-let current=hostCtx;
-for(const segment of String(name).split(".")){
-if(segment.length===0)continue;
-if(current===undefined||current===null)return null;
-try{
-current=current[segment];
-}catch{
-return null;
-}
-}
-return current===undefined?null:current;
 };
-const readMethod=(target,name)=>{
-try{
-const value=target?.[name];
-return typeof value==="function"?value:null;
-}catch{
-return null;
+const updateModel=(event)=>{
+const modelId=event.target.value;
+editDraft((previous)=>{
+const current=modelLayerSelectionOf(previous,role,currentModelPage);
+const provider=typeof current?.provider==="string"?current.provider:"";
+if(!provider)return previous;
+if(!modelId){
+if(typeof current?.model==="string"&&current.model.length===0)return previous;
+return setModelLayerSelection(previous,role,currentModelPage,{provider,model:""});
 }
-};
-const llm=readService("remote.llm");
-const credentials=readService("remote.credentials");
-const settingsRemote=readService("remote.settings");
-const describeFace=(()=>{
-try{
-return typeof describeSource?.describe==="function"?describeSource.describe():null;
-}catch{
-return null;
-}
-})();
-const schemaCache=new WeakMap();
-const adapter=(()=>{
-const schemaService=readService("settingsSchema");
-return config.createSchemaAdapter({
-rehydrate:(()=>{
-const rehydrate=readMethod(schemaService,"rehydrate");
-if(rehydrate===null)return null;
-return(serialized)=>{
-if(serialized!==null&&typeof serialized==="object"){
-const cached=schemaCache.get(serialized);
-if(cached!==undefined)return cached;
-const node=rehydrate(serialized);
-schemaCache.set(serialized,node);
-return node;
-}
-return rehydrate(serialized);
-};
-})(),
-validate:(()=>{
-const validate=readMethod(schemaService,"validate");
-return validate===null?null:(schema,draft)=>validate(schema,draft);
-})(),
-nodeAtPath:(()=>{
-const nodeAtPath=readMethod(schemaService,"nodeAtPath");
-return nodeAtPath===null?null:(root,path)=>nodeAtPath(root,path);
-})(),
+const model=providerGroups.find((group)=>group.id===provider)?.models?.find((candidate)=>candidate.id===modelId);
+if(!model)return previous;
+const selected={provider,model:model.id};
+if(typeof model.reasoning?.defaultEffort==="string")selected.reasoningEffort=model.reasoning.defaultEffort;
+return setModelLayerSelection(previous,role,currentModelPage,selected);
 });
-})();
-let views=[];
-let writable=false;
-let credentialStates={};
-let describeError=null;
-let hostRevision=0;
-let hostInvalidation=0;
-const hostListeners=new Set();
-const notifyHostChange=(external)=>{
-hostRevision+=1;
-if(external===true)hostInvalidation+=1;
-for(const listener of[...hostListeners]){
-try{
-listener();
-}catch{/* 单个订阅者抛错不得影响其它订阅者与 settings 视图。 */}
+};
+const updateReasoning=(event)=>{
+const effort=event.target.value;
+editDraft((previous)=>{
+const current=modelLayerSelectionOf(previous,role,currentModelPage);
+if(current===null||typeof current.model!=="string"||current.model.length===0)return previous;
+const next={...current};
+if(effort)next.reasoningEffort=effort;
+else delete next.reasoningEffort;
+if(next.reasoningEffort===current.reasoningEffort)return previous;
+return setModelLayerSelection(previous,role,currentModelPage,next);
+});
+};
+const promptEntryAvailable=promptRoleIds.includes(role);
+return react.createElement(react.Fragment,{key:role},
+react.createElement("div",{className:"deg_settings_table_cell deg_settings_role_cell"},
+promptEntryAvailable
+?react.createElement("button",{
+type:"button",
+className:"deg_settings_role_button",
+"data-deg-prompt-role":role,
+"aria-label":roleLabel+"提示词"
++(promptEntryOf(promptProjection,role)?.customized===true?"（已自定义提示词）":""),
+"aria-pressed":selectedPromptRole===role,
+disabled:saving,
+onClick:(event)=>openPrompt(role,event),
+},
+react.createElement("span",null,roleLabel),
+promptEntryOf(promptProjection,role)?.customized===true
+?react.createElement("span",{
+className:"deg_settings_prompt_customized_dot",
+"aria-hidden":"true",
+})
+:null)
+:react.createElement("span",{className:"deg_settings_label","data-deg-role-label":role},roleLabel),
+),
+react.createElement("div",{className:"deg_settings_table_cell"},
+react.createElement("select",{
+className:"deg_settings_provider_select",
+"aria-label":roleLabel+" 供应商",
+value:rowProvider,
+disabled:saving||!catalogAvailable||!roleEnabled,
+onChange:updateProvider,
+},providerOptions)),
+react.createElement("div",{className:"deg_settings_table_cell"},
+react.createElement("select",{
+className:"deg_settings_model_select",
+"aria-label":roleLabel+" 模型选择",
+value:selection?.model??"",
+disabled:saving||!catalogAvailable||!roleEnabled||!rowProvider||rowProviderGroup===undefined,
+onChange:updateModel,
+},modelOptions)),
+react.createElement("div",{className:"deg_settings_table_cell"},
+react.createElement("select",{
+className:"deg_settings_effort_select",
+"aria-label":roleLabel+" 思考深度",
+value:selection?.reasoningEffort??"",
+disabled:saving||!catalogAvailable||!roleEnabled||reasoning===undefined||!selection?.model,
+onChange:updateReasoning,
+},effortOptions)));
+});
+return react.createElement("div",{className:"deg_settings_table_wrap"},
+react.createElement("div",{className:"deg_settings_table"},header,rows));
 }
-};
-const subscribeHost=(listener)=>{
-if(typeof listener!=="function")return()=>{};
-hostListeners.add(listener);
-return()=>hostListeners.delete(listener);
-};
-const operations={
-listProviderDirectory:async()=>{
-const listProviders=readMethod(llm,"listProviders");
-const listConfigurable=readMethod(llm,"listConfigurableProviders");
-if(listConfigurable===null)throw new Error("当前宿主没有提供 provider 配置目录接口");
-const[registered,declared]=await Promise.all([
-listProviders===null?Promise.resolve({ok:true,value:[]}):listProviders.call(llm),
-listConfigurable.call(llm),
-]);
-if(declared?.ok!==true)throw new Error(declared?.error?.message??"provider 目录读取失败");
-if(registered!==null&&registered?.ok!==true)throw new Error(registered?.error?.message??"provider 列表读取失败");
-return config.joinProviderDirectory(
-registered===null?[]:registered.value,
-Array.isArray(declared.value)?declared.value:[],
+function renderSettingsModelTabs(view){
+const{
+addModelPage,beginModelTabDrag,currentModelPage,modelPageCount,modelPageLabelOf,modelTabDrag,
+modelTabRefs,requestModelPageDelete,saving,selectModelPage,settingsReadOnly,tExtra,
+}=view;
+const modelTabChildren=[];
+for(let page=0;page<modelPageCount;page+=1){
+if(modelTabDrag?.active===true&&modelTabDrag.dropIndex===page){
+modelTabChildren.push(react.createElement("span",{
+key:"drop-"+page,
+className:"deg_settings_model_tab_drop",
+"data-deg-model-tab-drop":String(page),
+"aria-hidden":"true",
+}));
+}
+const label=modelPageLabelOf(page);
+const selected=page===currentModelPage;
+const dragging=modelTabDrag?.active===true&&modelTabDrag.page===page;
+modelTabChildren.push(react.createElement("div",{
+key:"page-"+page,
+ref:(node)=>{modelTabRefs.current[page]=node;},
+className:"deg_settings_model_tab",
+role:"tab",
+tabIndex:selected?0:-1,
+"aria-selected":selected,
+"data-deg-model-tab":page,
+"data-dragging":dragging?"true":void 0,
+title:label,
+onPointerDown:(event)=>beginModelTabDrag(page,event),
+onClick:()=>selectModelPage(page),
+onKeyDown:(event)=>{
+if(event?.key!=="Enter"&&event?.key!==" ")return;
+event.preventDefault?.();
+selectModelPage(page);
+},
+},
+react.createElement("span",{className:"deg_settings_model_tab_label"},label),
+page===0?null:react.createElement("button",{
+type:"button",
+className:"deg_settings_model_tab_remove",
+"data-deg-model-tab-remove":page,
+"aria-label":label+" "+tExtra("settings.modelTabs.remove"),
+disabled:saving||settingsReadOnly,
+onPointerDown:(event)=>event?.stopPropagation?.(),
+onClick:(event)=>{
+event?.stopPropagation?.();
+requestModelPageDelete(page);
+},
+},"×")));
+}
+if(modelTabDrag?.active===true&&modelTabDrag.dropIndex===modelPageCount){
+modelTabChildren.push(react.createElement("span",{
+key:"drop-end",
+className:"deg_settings_model_tab_drop",
+"data-deg-model-tab-drop":String(modelPageCount),
+"aria-hidden":"true",
+}));
+}
+modelTabChildren.push(react.createElement("button",{
+key:"add-page",
+type:"button",
+className:"deg_settings_model_tab_add",
+"data-deg-model-tab-add":"true",
+"aria-label":tExtra("settings.modelTabs.add"),
+title:modelPageCount>=MAX_MODEL_PAGES?tExtra("settings.modelTabs.limit"):tExtra("settings.modelTabs.add.title"),
+disabled:saving||settingsReadOnly||modelPageCount>=MAX_MODEL_PAGES,
+onClick:()=>addModelPage(),
+},"+"));
+const modelTabRow=react.createElement("div",{
+className:"deg_settings_model_tabs",
+"data-deg-model-tabs":"true",
+role:"tablist",
+"aria-label":tExtra("settings.modelTabs.primary")+" / "+tExtra("settings.modelTabs.candidate",{index:MAX_MODEL_CANDIDATES_PER_ROLE}),
+},modelTabChildren);
+return modelTabRow;
+}
+function renderSettingsModelDeleteDialog(view){
+const{
+cancelModelPageDelete,confirmModelPageDelete,modelPageDeleteCancelRef,modelPageDeleteIntent,saving,tExtra,
+}=view;
+const modelPageDeleteDialog=modelPageDeleteIntent===null?null:react.createElement("div",{
+className:"deg_prompt_dialog_backdrop",
+onClick:()=>cancelModelPageDelete(),
+},
+react.createElement("div",{
+className:"deg_prompt_dialog",
+role:"dialog",
+"aria-modal":"true",
+"aria-label":tExtra("settings.modelTabs.remove.title"),
+onClick:(event)=>event?.stopPropagation?.(),
+onKeyDown:(event)=>{
+if(event?.key==="Escape"){
+event.preventDefault?.();
+event.stopPropagation?.();
+cancelModelPageDelete();
+return;
+}
+if(event?.key!=="Tab")return;
+const controls=Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]")??[]);
+if(controls.length===0)return;
+const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
+const nextIndex=event.shiftKey
+?(current<=0?controls.length-1:current-1)
+:(current>=controls.length-1?0:current+1);
+event.preventDefault?.();
+try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
+},
+},
+react.createElement("h3",null,tExtra("settings.modelTabs.remove.title")),
+react.createElement("p",null,tExtra("settings.modelTabs.remove.message",{index:modelPageDeleteIntent.page})),
+react.createElement("div",{className:"deg_prompt_dialog_actions"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+"data-deg-dialog-action":"cancel",
+"data-deg-model-tab-delete-cancel":"true",
+autoFocus:true,
+ref:modelPageDeleteCancelRef,
+disabled:saving,
+onClick:()=>cancelModelPageDelete(),
+},"取消"),
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+"data-deg-dialog-action":"confirm",
+"data-deg-model-tab-delete-confirm":"true",
+disabled:saving,
+onClick:()=>confirmModelPageDelete(),
+},"删除"))));
+return modelPageDeleteDialog;
+}
+function renderSettingsTaskRow(view){
+const{
+draft,editDraft,saving,t,
+}=view;
+const taskRow=(
+react.createElement("div",{className:"deg_settings_row deg_settings_task_row"},
+react.createElement("label",{className:"deg_settings_checkbox"},
+react.createElement("input",{
+type:"checkbox",
+"aria-label":t("settings.taskManagement"),
+checked:draft.taskManagementEnabled,
+disabled:saving,
+onChange:(event)=>editDraft((previous)=>({...previous,taskManagementEnabled:event.target.checked})),
+}),
+react.createElement("span",{className:"deg_settings_label"},t("settings.taskManagement"))),
+react.createElement("label",{className:"deg_settings_checkbox",title:t("settings.autoTitle")},
+react.createElement("input",{
+type:"checkbox",
+"aria-label":t("settings.auto"),
+checked:draft.autoOpenSubagentSidebar,
+disabled:saving,
+onChange:(event)=>editDraft((previous)=>({...previous,autoOpenSubagentSidebar:event.target.checked===true})),
+}),
+react.createElement("span",{className:"deg_settings_label"},t("settings.auto"))))
 );
-},
-describeCredentials:async(refs)=>{
-const describe=readMethod(credentials,"describe");
-const wanted=[...new Set((Array.isArray(refs)?refs:[]).filter((ref)=>typeof ref==="string"&&ref.length>0))];
-if(describe===null||wanted.length===0){
-credentialStates={};
-return{};
+return taskRow;
 }
-const response=await describe.call(credentials,wanted);
-credentialStates=response?.ok===true&&response.value!==null&&typeof response.value==="object"?response.value:{};
-return credentialStates;
+function renderSettingsNotificationRow(view){
+const{
+draft,editDraft,notificationEventsOpen,notificationEventsPanelRef,notificationEventsRootRef,notificationEventsTriggerRef,
+saving,setNotificationEventsOpen,t,
+}=view;
+const notificationEventsEnabledCount=NOTIFICATION_EVENT_TYPES.filter(
+(type)=>draft.notificationEvents[type]===true,
+).length;
+const notificationEventsTriggerLabel=t("settings.notificationEvents")+" ("+notificationEventsEnabledCount+")";
+const notificationRow=(
+react.createElement("div",{className:"deg_settings_row deg_settings_notification_row"},
+react.createElement("label",{className:"deg_settings_checkbox"},
+react.createElement("input",{
+type:"checkbox",
+checked:draft.notificationEnabled,
+disabled:saving,
+onChange:(event)=>editDraft((previous)=>({...previous,notificationEnabled:event.target.checked})),
+}),
+react.createElement("span",{className:"deg_settings_label"},t("settings.notifications"))),
+react.createElement("div",{className:"deg_settings_control"},
+react.createElement("span",{className:"deg_settings_label"},t("settings.notificationVolume")),
+react.createElement("input",{
+id:"deg-settings-notification-volume-range",
+type:"range",min:0,max:100,step:1,
+"aria-label":t("settings.notificationVolume.range"),
+value:draft.notificationVolume,
+disabled:saving,
+onChange:(event)=>editDraft((previous)=>({...previous,notificationVolume:clampNotificationVolume(event.target.value)})),
+}),
+react.createElement("input",{
+id:"deg-settings-notification-volume-number",
+type:"number",min:0,max:100,step:1,
+"aria-label":t("settings.notificationVolume.number"),
+value:draft.notificationVolume,
+disabled:saving,
+onChange:(event)=>editDraft((previous)=>({...previous,notificationVolume:clampNotificationVolume(event.target.value)})),
+})),
+react.createElement("div",{className:"deg_settings_events_dropdown",ref:notificationEventsRootRef},
+react.createElement("button",{
+type:"button",
+className:"deg_settings_events_trigger",
+id:"deg-settings-notification-events-trigger",
+ref:notificationEventsTriggerRef,
+"aria-label":notificationEventsTriggerLabel,
+"aria-haspopup":"true",
+"aria-expanded":notificationEventsOpen?"true":"false",
+"aria-controls":"deg-settings-notification-events-panel",
+disabled:saving,
+onClick:()=>setNotificationEventsOpen((previous)=>!previous),
 },
-credentialState:(ref)=>(typeof ref==="string"?credentialStates[ref]:undefined),
-storeKey:async(ref,value)=>{
-const set=readMethod(credentials,"set");
-if(set===null)return"当前宿主没有提供凭据写入接口";
-try{
-const response=await set.call(credentials,ref,value);
-return response?.ok===true?null:(response?.error?.message??"API Key 保存失败");
-}catch(error){
-return error instanceof Error?error.message:String(error);
+react.createElement("span",{className:"deg_settings_events_label"},t("settings.notificationEvents")),
+react.createElement("span",{className:"deg_settings_events_count","aria-hidden":"true"},"("+notificationEventsEnabledCount+")"),
+react.createElement("span",{className:"deg_settings_events_caret","aria-hidden":"true"},"▾")),
+notificationEventsOpen
+?react.createElement("div",{
+className:"deg_settings_events_panel",
+id:"deg-settings-notification-events-panel",
+ref:notificationEventsPanelRef,
+role:"group",
+"aria-label":t("settings.notificationEvents"),
+},NOTIFICATION_EVENT_TYPES.map((type)=>react.createElement("label",{key:type,className:"deg_settings_checkbox"},
+react.createElement("input",{
+type:"checkbox",
+"aria-label":t("settings.notificationEvent."+type+".aria"),
+checked:draft.notificationEvents[type]===true,
+disabled:saving,
+onChange:(event)=>editDraft((previous)=>({
+...previous,
+notificationEvents:{...previous.notificationEvents,[type]:event.target.checked===true},
+})),
+}),
+react.createElement("span",{className:"deg_settings_label"},t("settings.notificationEvent."+type)))))
+:null))
+);
+return notificationRow;
 }
-},
-removeKey:async(ref)=>{
-const unset=readMethod(credentials,"unset");
-if(unset===null)return"当前宿主没有提供凭据写入接口";
-try{
-const response=await unset.call(credentials,ref);
-return response?.ok===true?null:(response?.error?.message??"API Key 删除失败");
-}catch(error){
-return error instanceof Error?error.message:String(error);
+function renderSettingsUnifiedRow(view){
+const{
+catalogAvailable,currentModelPage,draft,editDraft,providerGroups,roles,
+saving,settingsReadOnly,t,tExtra,unifiedProvider,
+}=view;
+const fallbackLimitDraft=Number.isSafeInteger(draft.fallbackLimit)?draft.fallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT;
+const unifiedRow=(
+react.createElement("div",{className:"deg_settings_row deg_settings_unified_row"},
+react.createElement("div",{className:"deg_settings_provider_group"},
+react.createElement("label",{className:"deg_settings_label",htmlFor:"deg-settings-provider"},t("settings.unifiedProvider")),
+react.createElement("div",{className:"deg_settings_control"},
+react.createElement("select",{
+id:"deg-settings-provider",
+className:"deg_settings_provider_select",
+value:unifiedProvider,
+disabled:saving||!catalogAvailable,
+onChange:(event)=>editDraft((previous)=>{
+const provider=event.target.value;
+if(currentModelPage!==0){
+if(!provider)return previous;
+let next=previous;
+for(const role of settingsRolesForProvider(roles)){
+const current=modelLayerSelectionOf(next,role,currentModelPage);
+const migrated=migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""};
+next=setModelLayerSelection(next,role,currentModelPage,migrated);
 }
-},
-discoverModels:async(namespace,request)=>{
-const discover=readMethod(llm,"discoverModels");
-if(discover===null)return{kind:"refused",message:"当前宿主没有提供「获取模型」接口"};
-try{
-const response=await discover.call(llm,namespace,request);
-if(response?.ok!==true)return{kind:"refused",message:response?.error?.message??"获取模型失败"};
-return{kind:"found",models:Array.isArray(response.value)?response.value:[]};
-}catch(error){
-return{kind:"refused",message:error instanceof Error?error.message:String(error)};
+return next;
 }
-},
+if(!provider){
+const hasVisibleProvider=settingsRolesForProvider(roles).some((role)=>{
+const value=previous.defaults?.[role]?.provider;
+return typeof value==="string"&&value.length>0;
+});
+return hasVisibleProvider?{...previous,provider:""}:previous;
+}
+return{
+...previous,
+provider,
+defaults:syncSettingsDefaultsProvider(previous.defaults,provider,providerGroups,roles),
 };
-const refreshSettingsView=async()=>{
-describeError=null;
-if(describeFace===null){
-describeError="当前宿主没有提供 settings namespace 视图";
-views=[];
-writable=false;
-return;
+}),
+},
+react.createElement("option",{value:""},t("settings.noProvider")),
+providerGroups.map((group)=>react.createElement("option",{key:group.id,value:group.id},group.name??group.id))))),
+react.createElement("div",{className:"deg_settings_fallback_group"},
+react.createElement("label",{className:"deg_settings_label",htmlFor:"deg-settings-model-fallback-limit"},tExtra("settings.modelCandidates.fallbackLimit")),
+react.createElement("div",{className:"deg_settings_control"},
+react.createElement("input",{
+id:"deg-settings-model-fallback-limit",
+type:"number",min:0,max:MAX_MODEL_FALLBACK_LIMIT,step:1,inputMode:"numeric",
+"aria-label":tExtra("settings.modelCandidates.fallbackLimit"),
+title:tExtra("settings.modelCandidates.fallbackLimit.title"),
+value:draft.fallbackLimit===void 0?fallbackLimitDraft:draft.fallbackLimit,
+disabled:saving||settingsReadOnly,
+onChange:(event)=>{
+const raw=event.target.value;
+const number=raw===""?null:Number(raw);
+editDraft((previous)=>({...previous,fallbackLimit:raw===""?"":Number.isFinite(number)?Math.round(number):previous.fallbackLimit}));
+},
+}))))
+);
+return unifiedRow;
 }
-try{
-await describeFace.ensure();
-}catch{/* 读取失败由下面的一致性检查报错。 */}
-const snapshot=describeFace.getSnapshot?.()??{};
-const view=snapshot.view;
-if(view===undefined){
-describeError=snapshot.error??"settings 命名空间不可用";
-views=[];
-writable=false;
-return;
+function renderSettingsManagementRow(view){
+const{
+draft,editDraft,saving,t,
+}=view;
+const managementRow=(
+react.createElement("div",{className:"deg_settings_row deg_settings_management_row"},
+react.createElement("label",{className:"deg_settings_checkbox"},
+react.createElement("input",{type:"checkbox","aria-label":t("settings.observerPreferred"),checked:draft.observerPreferred,disabled:saving,onChange:(event)=>editDraft((previous)=>({...previous,observerPreferred:event.target.checked}))}),
+react.createElement("span",{className:"deg_settings_label"},t("settings.observerPreferred"))),
+react.createElement("label",{className:"deg_settings_control",htmlFor:"deg-settings-role-concurrency-limit"},
+react.createElement("span",{className:"deg_settings_label"},t("settings.concurrencyLimit")),
+react.createElement("input",{
+id:"deg-settings-role-concurrency-limit",
+type:"number",
+"aria-label":t("settings.concurrencyLimit"),
+title:t("settings.concurrencyLimit.title"),
+min:1,
+max:64,
+step:1,
+inputMode:"numeric",
+value:draft.roleConcurrencyLimit,
+disabled:saving,
+onChange:(event)=>{
+const raw=event.target.value;
+const number=raw===""?null:Number(raw);
+editDraft((previous)=>({
+...previous,
+roleConcurrencyLimit:raw===""
+?""
+:Number.isFinite(number)?number:previous.roleConcurrencyLimit,
+}));
+},
+})),
+react.createElement("label",{className:"deg_settings_control",htmlFor:"deg-settings-role-timeout-ms"},
+react.createElement("span",{className:"deg_settings_label"},t("settings.roleTimeout")),
+react.createElement("input",{
+id:"deg-settings-role-timeout-ms",
+type:"number",
+"aria-label":t("settings.roleTimeout.aria"),
+title:t("settings.roleTimeout.title"),
+min:0,
+max:86400,
+step:1,
+inputMode:"numeric",
+value:draft.roleTimeoutMs===""?"":draft.roleTimeoutMs/1000,
+disabled:saving,
+onChange:(event)=>{
+const raw=event.target.value;
+const seconds=raw===""?null:Number(raw);
+editDraft((previous)=>({
+...previous,
+roleTimeoutMs:raw===""
+?""
+:Number.isFinite(seconds)?Math.round(seconds)*1000:previous.roleTimeoutMs,
+}));
+},
+})))
+);
+return managementRow;
 }
-views=Array.isArray(view.namespaces)?view.namespaces:[];
-writable=view.writable!==false;
-notifyHostChange(false);
+function renderSettingsBody(view,actions){
+const{
+candidatesError,catalogAvailable,directoryState,draft,error,hasUnsavedChanges,modelConfigHost,modelFieldsChanged,
+roleLabelOf,roles,save,saved,saving,settingsSnapshot,t,
+}=view;
+const modelConfigSection=typeof modelConfigHost==="undefined"||modelConfigHost===null
+?null
+:react.createElement(ModelConfigSection,{
+host:modelConfigHost,
+roleDefaults:normalizeSettingsDraft(settingsSnapshot.value,roles).defaults,
+roleLabelOf,
+});
+const modelTabRow=renderSettingsModelTabs(view);
+const modelPageDeleteDialog=renderSettingsModelDeleteDialog(view);
+return react.createElement("div",{className:"deg_settings"},
+react.createElement("h2",{className:"deg_settings_title"},t("settings.title")),
+react.createElement("p",{className:"deg_settings_hint"},t("settings.hint")),
+modelConfigSection,
+renderSettingsTaskRow(view),
+renderSettingsNotificationRow(view),
+renderSettingsUnifiedRow(view),
+modelTabRow,
+renderSettingsRoleTable(view),
+renderSettingsManagementRow(view),
+candidatesError===null||candidatesError===void 0?null:react.createElement("p",{
+className:"deg_settings_error",
+role:"alert",
+"data-deg-model-candidates-error":"true",
+},candidatesError),
+directoryState.error?react.createElement("p",{className:"deg_settings_error",role:"status"},directoryState.error):null,
+error?react.createElement("p",{className:"deg_settings_error",role:"status"},error):null,
+modelPageDeleteDialog,
+react.createElement("div",{className:"deg_settings_footer"},
+react.createElement("span",{className:"deg_settings_status",role:"status"},saved?t("settings.saved"):hasUnsavedChanges?t("settings.unsaved"):""),
+react.createElement("button",{type:"button",className:"deg_btn",disabled:!hasUnsavedChanges||saving,onClick:actions.discard},t("settings.discard")),
+react.createElement("button",{type:"button",className:"deg_btn",disabled:!hasUnsavedChanges||saving||(modelFieldsChanged&&!catalogAvailable)||settingsSnapshot.writable!==true,onClick:save},saving?t("settings.saving"):t("settings.save"))));
+}
+global[SYMBOL]=Object.freeze({
+bindClientRuntime,renderSettingsTail,
+});
+})(globalThis);
+/* source: client-settings-main-a.js */
+(function installClientSettingsMainA(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-settings-main-a");
+const clientTextSymbol=Symbol.for("dsh-expert-group/client-text");
+const clientText=global[clientTextSymbol]||{};
+const clientSettingsNormalizeSymbol=Symbol.for("dsh-expert-group/client-settings-normalize");
+const clientSettingsNormalize=global[clientSettingsNormalizeSymbol]||{};
+const clientSettingsMainBSymbol=Symbol.for("dsh-expert-group/client-settings-main-b");
+const clientSettingsMainB=global[clientSettingsMainBSymbol]||{};
+const{
+resolveSettingsLocale,settingsExtraText,settingsText,
+}=clientText;
+const{
+DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_PAGES,PROMPT_ROLE_IDS,SETTINGS_ROLE_LABELS,addModelCandidatePage,
+commitSettingsCandidate,compactModelCandidatesDraft,mergeSettingsDraftOverSource,modelCandidatesErrorMessage,modelLayerMapOf,modelPageCountOf,
+normalizeModelCandidatesDraft,normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsCommitDraft,normalizeSettingsDraft,promptEntryOf,
+promptOverridesEqual,removeModelCandidatePage,reorderModelLayers,settingsDraftEqual,unifiedProviderOf,updateRolePromptProjection,
+useEnabledSettingsRoles,useHostMeta,validateModelCandidateRows,validatePromptText,
+}=clientSettingsNormalize;
+const{
+renderSettingsTail,
+}=clientSettingsMainB;
+let react=null;
+function bindClientRuntime(host){
+react=host.react??null;
+}
+function useSettingsLeaveFocus(view){
+react.useEffect(()=>{
+if(view.leaveIntent===null)return;
+try{view.leaveCancelRef.current?.focus?.();}catch{}
+},[view.leaveIntent]);
+}
+function createSettingsSaveAction(view){
+return async({retry=false}={})=>{
+const plan=deriveSettingsSavePlan(view,retry);
+if(plan===null)return false;
+return commitSettingsSavePlan(view,plan);
 };
-const invalidationStops=[];
-const remote=readService("remote");
-const remoteOn=readMethod(remote,"$on");
-if(remoteOn!==null){
-for(const event of["llm/adapters-updated","settings/document-updated","credentials/reference-updated"]){
-try{
-invalidationStops.push(remoteOn.call(remote,event,()=>notifyHostChange(true)));
-}catch{/* 旧宿主不支持该事件时保持设置页可用。 */}
+}
+function deriveSettingsSavePlan(view,retry){
+const{
+addModelPage,applyPromptNavigation,authorityValue,baselineProjection,beginModelTabDrag,cancelModelPageDelete,ctx,
+candidatesError,catalogAvailable,closePrompt,committedAuthorityRef,committedSnapshotLagging,confirmModelPageDelete,
+currentModelPage,directoryState,dismissLeaveDialog,draft,editDraft,editPromptText,
+error,externalSettingsChanged,hasUnsavedChanges,hostMeta,hostMetaError,leaveCancelRef,
+leaveIntent,leaveTriggerRef,modelConfigHost,modelFieldsChanged,modelPageCount,modelPageDeleteCancelRef,
+modelPageDeleteIntent,modelPageLabelOf,modelRowRoles,modelTabDrag,modelTabRefs,notificationEventsOpen,
+notificationEventsPanelRef,notificationEventsRootRef,notificationEventsTriggerRef,openPrompt,promptDirty,promptError,
+promptLoading,promptMaxGraphemes,promptProjection,promptRoleIds,promptTextOf,providerGroups,
+refreshHostMeta,requestModelPageDelete,roleLabelOf,roles,save,saved,
+saving,selectModelPage,selectedPromptRole,setCandidatesError,setDirty,setDraft,
+setEditorBaseline,setError,setExternalSettingsChanged,setLeaveIntent,setLocalPromptProjection,setNotificationEventsOpen,
+setPromptDrafts,setPromptError,setPromptTouched,setSaved,setSettingsConflict,settingsConflict,
+settingsForm,settingsReadOnly,settingsSnapshot,sourceDraftForSave,sourcePromptOverrides,t,tExtra,unifiedProvider,
+effectiveDraft,editorBaseline,promptTouchedRoles,setSaving,
+}=view;
+if(!hasUnsavedChanges||saving||settingsSnapshot.writable!==true)return null;
+if(modelFieldsChanged&&!catalogAvailable)return null;
+const source=sourceDraftForSave;
+const normalizedDraft=effectiveDraft;
+const sourceProvider=unifiedProviderOf(source.defaults,roles,source.provider);
+const draftProviderIntent=typeof effectiveDraft.provider==="string"?effectiveDraft.provider:"";
+const draftProvider=unifiedProviderOf(normalizedDraft.defaults,roles,draftProviderIntent);
+const modelChanged=modelFieldsChanged&&catalogAvailable;
+const candidatePromptOverrides={...sourcePromptOverrides};
+if(promptTouchedRoles.length>0){
+if(promptProjection===null){
+setPromptError(hostMetaError??"提示词配置加载中，请稍后重试");
+return null;
+}
+if(promptProjection.customizable!==true){
+setPromptError("当前提示词设置为只读");
+return null;
+}
+for(const role of promptTouchedRoles){
+const entry=promptEntryOf(baselineProjection,role);
+const text=promptTextOf(role);
+const validation=validatePromptText(text,promptMaxGraphemes);
+if(!validation.ok){
+setPromptError(roleLabelOf(role)+"："+validation.message);
+return null;
+}
+if(entry===null||typeof entry.defaultPersona!=="string"){
+setPromptError("提示词默认配置不可用，请刷新后重试");
+return null;
+}
+if(text===entry.defaultPersona)delete candidatePromptOverrides[role];
+else candidatePromptOverrides[role]=text;
 }
 }
-const hostOn=readMethod(hostCtx,"on");
-if(hostOn!==null){
-try{
-invalidationStops.push(hostOn.call(hostCtx,"connection/reset",()=>notifyHostChange(true)));
-}catch{/* 旧宿主没有连接事件面时无需额外刷新。 */}
+const sourceHasPromptOverrides=authorityValue!==null&&authorityValue!==void 0
+&&typeof authorityValue==="object"
+&&Object.prototype.hasOwnProperty.call(authorityValue,"promptOverrides");
+const promptChanged=!promptOverridesEqual(candidatePromptOverrides,sourcePromptOverrides);
+const includePromptOverrides=sourceHasPromptOverrides||promptTouchedRoles.length>0;
+const sourceCandidates=normalizeModelCandidatesDraft(authorityValue?.candidates);
+const candidateCandidates=compactModelCandidatesDraft(normalizeModelCandidatesDraft(normalizedDraft.candidates));
+const candidatesChanged=!settingsDraftEqual(candidateCandidates,sourceCandidates);
+if(candidatesChanged){
+const validation=validateModelCandidateRows(candidateCandidates);
+if(validation.ok!==true){setCandidatesError(modelCandidatesErrorMessage(tExtra,roleLabelOf,validation));return null;}
 }
-if(typeof hostCtx?.effect==="function"){
-hostCtx.effect(()=>()=>{
-for(const stop of invalidationStops)if(typeof stop==="function")stop();
-hostListeners.clear();
-},"dsh-expert-group: model config settings mirror events");
-}
-const namespaceView=(ns)=>{
-if(describeFace!==null)return config.namespaceViewOf({namespaces:views},ns);
-return undefined;
+const sourceFallbackLimit=source.fallbackLimit;
+const candidateFallbackLimit=normalizedDraft.fallbackLimit;
+const fallbackLimitChanged=candidateFallbackLimit!==void 0&&candidateFallbackLimit!==sourceFallbackLimit;
+const candidate={
+...normalizedDraft,
+provider:modelChanged?draftProvider:sourceProvider,
+...(modelChanged?{}:{defaults:source.defaults}),
+...(includePromptOverrides?{promptOverrides:candidatePromptOverrides}:{}),
+...(candidatesChanged?{candidates:candidateCandidates}:{}),
+...(fallbackLimitChanged
+?{fallbackLimit:typeof candidateFallbackLimit==="number"?candidateFallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT}
+:{}),
 };
-const settingsSchemaInfo=(ns)=>{
-const view=namespaceView(ns);
-return config.namespaceSchemaInfo(view??{},adapter);
+if(!candidatesChanged)delete candidate.candidates;
+if(!fallbackLimitChanged)delete candidate.fallbackLimit;
+const ops=[];
+if(modelChanged){
+ops.push({op:"set",path:["provider"],value:candidate.provider});
+ops.push({op:"set",path:["defaults"],value:candidate.defaults});
+}
+if(candidate.notificationEnabled!==source.notificationEnabled){
+ops.push({op:"set",path:["notificationEnabled"],value:candidate.notificationEnabled});
+}
+if(candidate.notificationVolume!==source.notificationVolume){
+ops.push({op:"set",path:["notificationVolume"],value:candidate.notificationVolume});
+}
+if(!settingsDraftEqual(candidate.notificationEvents,source.notificationEvents)){
+ops.push({op:"set",path:["notificationEvents"],value:candidate.notificationEvents});
+}
+if(candidate.observerPreferred!==source.observerPreferred){
+ops.push({op:"set",path:["observerPreferred"],value:candidate.observerPreferred});
+}
+if(candidate.roleConcurrencyLimit!==source.roleConcurrencyLimit){
+ops.push({op:"set",path:["roleConcurrencyLimit"],value:candidate.roleConcurrencyLimit});
+}
+if(candidate.roleTimeoutMs!==source.roleTimeoutMs){
+ops.push({op:"set",path:["roleTimeoutMs"],value:candidate.roleTimeoutMs});
+}
+if(candidate.taskManagementEnabled!==source.taskManagementEnabled){
+ops.push({op:"set",path:["taskManagementEnabled"],value:candidate.taskManagementEnabled});
+}
+if(candidate.autoOpenSubagentSidebar!==source.autoOpenSubagentSidebar){
+ops.push({op:"set",path:["autoOpenSubagentSidebar"],value:candidate.autoOpenSubagentSidebar});
+}
+if(promptChanged){
+ops.push({op:"set",path:["promptOverrides"],value:candidatePromptOverrides});
+}
+const changed=[];
+if(modelChanged){
+if(candidate.provider!==sourceProvider)changed.push("provider");
+for(const role of Object.keys(candidate.defaults)){
+if(!settingsDraftEqual(candidate.defaults[role],source.defaults[role]))changed.push("defaults."+role);
+}
+for(const role of Object.keys(source.defaults)){
+if(!Object.prototype.hasOwnProperty.call(candidate.defaults,role))changed.push("defaults."+role);
+}
+}
+for(const op of ops){
+const field=op.path[0];
+if(field==="defaults"||field==="provider")continue;
+changed.push(field);
+}
+if(candidatesChanged){
+changed.push("candidates");
+for(const role of new Set([...Object.keys(candidateCandidates),...Object.keys(sourceCandidates)])){
+if(!settingsDraftEqual(candidateCandidates[role]??null,sourceCandidates[role]??null))changed.push("candidates."+role);
+}
+}
+if(fallbackLimitChanged)changed.push("fallbackLimit");
+const expectedRevision=retry===true||selectedPromptRole===null||!Number.isSafeInteger(editorBaseline?.revision)
+?settingsSnapshot.revision
+:editorBaseline.revision;
+return{
+candidate,candidateCandidates,candidateFallbackLimit,candidatePromptOverrides,candidatesChanged,changed,
+expectedRevision,fallbackLimitChanged,ops,source,sourceCandidates,sourceFallbackLimit,
 };
-const writeNamespace=async({ns,ops,expectedRevision})=>{
-const mutate=readMethod(settingsRemote,"mutate");
-if(mutate===null)return{ok:false,conflict:false,message:"当前宿主没有提供 settings 写入接口"};
-if(!config.hasOps(ops))return{ok:true,view:namespaceView(ns)};
-const current=namespaceView(ns)?.revision;
-if(config.revisionConflictOf(expectedRevision,current)){
-return{ok:false,conflict:true,message:"配置已被其它会话或页面修改，本卡片的修改未提交；请重新打开该 provider 卡片后再试。"};
 }
-let response;
+async function commitSettingsSavePlan(view,plan){
+const{
+addModelPage,applyPromptNavigation,authorityValue,baselineProjection,beginModelTabDrag,cancelModelPageDelete,
+candidatesError,catalogAvailable,closePrompt,committedAuthorityRef,committedSnapshotLagging,confirmModelPageDelete,
+currentModelPage,directoryState,dismissLeaveDialog,draft,editDraft,editPromptText,
+error,externalSettingsChanged,hasUnsavedChanges,hostMeta,hostMetaError,leaveCancelRef,
+leaveIntent,leaveTriggerRef,modelConfigHost,modelFieldsChanged,modelPageCount,modelPageDeleteCancelRef,
+modelPageDeleteIntent,modelPageLabelOf,modelRowRoles,modelTabDrag,modelTabRefs,notificationEventsOpen,
+notificationEventsPanelRef,notificationEventsRootRef,notificationEventsTriggerRef,openPrompt,promptDirty,promptError,
+promptLoading,promptMaxGraphemes,promptProjection,promptRoleIds,promptTextOf,providerGroups,
+refreshHostMeta,requestModelPageDelete,roleLabelOf,roles,save,saved,
+saving,selectModelPage,selectedPromptRole,setCandidatesError,setDirty,setDraft,
+setEditorBaseline,setError,setExternalSettingsChanged,setLeaveIntent,setLocalPromptProjection,setNotificationEventsOpen,
+setPromptDrafts,setPromptError,setPromptTouched,setSaved,setSettingsConflict,settingsConflict,
+settingsForm,settingsReadOnly,settingsSnapshot,sourceDraftForSave,sourcePromptOverrides,t,tExtra,unifiedProvider,
+ctx,effectiveDraft,editorBaseline,promptTouchedRoles,setSaving,
+}=view;
+const{
+candidate,candidateCandidates,candidateFallbackLimit,candidatePromptOverrides,candidatesChanged,
+changed,expectedRevision,fallbackLimitChanged,ops,source,sourceCandidates,sourceFallbackLimit,
+}=plan;
+setSaving(true);
+setSaved(false);
+setError(null);
+setPromptError(null);
 try{
-response=await mutate.call(settingsRemote,ns,ops,expectedRevision);
-}catch(error){
-return{ok:false,conflict:false,message:error instanceof Error?error.message:String(error)};
+let accepted;
+let committed=null;
+if(ops.length>0||candidatesChanged||fallbackLimitChanged){
+committed=await commitSettingsCandidate(candidate,expectedRevision,globalThis.fetch,ctx?.connection,roles,changed);
+accepted=committed.settings;
+}else{
+accepted=normalizeSettingsCommitDraft(settingsForm.getSnapshot().value,roles);
 }
-if(response?.ok===true){
-const view=response.value;
-try{
-describeFace?.acceptView?.(view);
-}catch{/* 镜像折叠失败不影响本次提交结果。 */}
-views=Array.isArray(view?.namespaces)
-?view.namespaces
-:views.map((entry)=>(entry?.ns===ns?view:entry));
-return{ok:true,view};
+const acceptedPromptOverrides=normalizePromptOverrides(
+Object.prototype.hasOwnProperty.call(accepted??{},"promptOverrides")
+?{...candidatePromptOverrides,...accepted.promptOverrides}
+:candidatePromptOverrides,
+promptMaxGraphemes,
+promptRoleIds,
+);
+const acceptedDraft=accepted!==null&&typeof accepted==="object"?{...accepted}:accepted;
+if(acceptedDraft!==null&&typeof acceptedDraft==="object"){
+const keepNewField=(field,hadField,value)=>{
+if(Object.prototype.hasOwnProperty.call(acceptedDraft,field))return;
+if(hadField!==true)return;
+acceptedDraft[field]=value;
+};
+keepNewField("candidates",
+candidatesChanged||Object.prototype.hasOwnProperty.call(source,"candidates"),
+candidatesChanged?candidateCandidates:sourceCandidates);
+keepNewField("fallbackLimit",
+fallbackLimitChanged||Object.prototype.hasOwnProperty.call(source,"fallbackLimit"),
+fallbackLimitChanged
+?(typeof candidateFallbackLimit==="number"?candidateFallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT)
+:sourceFallbackLimit);
 }
-const code=response?.error?.code;
-const message=response?.error?.message??"保存失败";
-if(code==="settings/conflict"||code==="settings-conflict"){
-return{ok:false,conflict:true,message:`配置已被其它会话或页面修改：${message}。请重新打开该 provider 卡片后再试。`};
+setDraft(acceptedDraft);
+setPromptDrafts({});
+setPromptTouched({});
+setCandidatesError(null);
+const committedRevision=Number.isSafeInteger(committed?.revision)
+?committed.revision
+:settingsSnapshot.revision;
+committedAuthorityRef.current={revision:committedRevision,value:acceptedDraft};
+const responseProjection=normalizeRolePromptProjection(committed?.rolePrompts,accepted,true,promptRoleIds);
+let acceptedProjection=responseProjection??promptProjection;
+if(acceptedProjection!==null){
+for(const role of promptTouchedRoles){
+const entry=promptEntryOf(acceptedProjection,role);
+const text=Object.prototype.hasOwnProperty.call(acceptedPromptOverrides,role)
+?acceptedPromptOverrides[role]
+:entry?.defaultPersona??promptTextOf(role);
+acceptedProjection=updateRolePromptProjection(acceptedProjection,role,text);
 }
-return{ok:false,conflict:false,message};
+setLocalPromptProjection({revision:committedRevision,projection:acceptedProjection});
+}
+if(selectedPromptRole!==null){
+setEditorBaseline({
+role:selectedPromptRole,
+value:acceptedDraft,
+revision:committedRevision,
+projection:acceptedProjection??editorBaseline?.projection??null,
+});
+}
+setSettingsConflict(null);
+setExternalSettingsChanged(false);
+setDirty(false);
+setSaved(true);
+return true;
+}catch(cause){
+const message=cause instanceof Error?cause.message:String(cause);
+setError(message);
+if(cause?.code==="settings-conflict"){
+setSettingsConflict({revision:cause.currentRevision,message});
+}
+if(promptTouchedRoles.length>0)setPromptError(message);
+return false;
+}finally{
+setSaving(false);
+}
+}
+function createModelPageActions(view){
+const{
+editDraft,MAX_MODEL_PAGES,modelPageCount,modelPageDeleteIntent,modelTabSuppressClickRef,saving,
+setModelPageDeleteIntent,setSelectedModelPage,settingsReadOnly,
+}=view;
+const selectModelPage=(page)=>{
+if(modelTabSuppressClickRef.current===true)return;
+if(!Number.isSafeInteger(page)||page<0||page>=modelPageCount)return;
+setSelectedModelPage(page);
+};
+const addModelPage=()=>{
+if(saving||settingsReadOnly||modelPageCount>=MAX_MODEL_PAGES)return;
+const nextIndex=modelPageCount;
+editDraft((previous)=>addModelCandidatePage(previous));
+setSelectedModelPage(nextIndex);
+};
+const requestModelPageDelete=(page)=>{
+if(saving||settingsReadOnly||!Number.isSafeInteger(page)||page<1)return;
+setModelPageDeleteIntent({page});
+};
+const cancelModelPageDelete=()=>{
+setModelPageDeleteIntent(null);
+};
+const confirmModelPageDelete=()=>{
+const intent=modelPageDeleteIntent;
+if(intent===null)return;
+setModelPageDeleteIntent(null);
+editDraft((previous)=>removeModelCandidatePage(previous,intent.page));
+setSelectedModelPage((previous)=>(previous===intent.page
+?0
+:previous>intent.page?previous-1:previous));
 };
 return{
-config,
-adapter,
-operations,
-refreshSettingsView,
-namespaceView,
-settingsSchemaInfo,
-writeNamespace,
-subscribe:subscribeHost,
-getSnapshot:()=>hostRevision,
-getInvalidation:()=>hostInvalidation,
-describeError:()=>describeError,
-readView:()=>({namespaces:views,writable}),
+addModelPage,cancelModelPageDelete,confirmModelPageDelete,requestModelPageDelete,selectModelPage,
 };
+}
+function createModelTabDragController(view){
+const{
+editDraft,modelPageCount,modelTabDragRef,modelTabRefs,modelTabSuppressClickRef,saving,
+setModelTabDrag,setSelectedModelPage,settingsReadOnly,
+}=view;
+const MODEL_TAB_DRAG_THRESHOLD=4;
+const modelTabDropIndexOf=(clientX)=>{
+const refs=modelTabRefs.current??{};
+for(let page=0;page<modelPageCount;page+=1){
+const element=refs[page];
+const rect=typeof element?.getBoundingClientRect==="function"?element.getBoundingClientRect():null;
+if(rect===null||rect===void 0)continue;
+const left=Number(rect.left);
+const width=Number(rect.width);
+if(!Number.isFinite(left)||!Number.isFinite(width)||width<=0)continue;
+if(Number(clientX)<left+width/2)return page;
+}
+return modelPageCount;
+};
+const beginModelTabDrag=(page,event)=>{
+if(saving||settingsReadOnly)return;
+if(event===null||typeof event!=="object")return;
+if(typeof event.button==="number"&&event.button!==0)return;
+const doc=typeof document==="undefined"?null:document;
+if(doc===null||typeof doc.addEventListener!=="function")return;
+const startX=Number(event.clientX);
+const startY=Number(event.clientY);
+if(!Number.isFinite(startX)||!Number.isFinite(startY))return;
+const session={page,startX,startY,active:false,dropIndex:page,detach:null};
+const onMove=(moveEvent)=>{
+const current=modelTabDragRef.current;
+if(current===null)return;
+const x=Number(moveEvent?.clientX);
+const y=Number(moveEvent?.clientY);
+if(!Number.isFinite(x)||!Number.isFinite(y))return;
+if(current.active!==true){
+if(Math.abs(x-current.startX)+Math.abs(y-current.startY)<MODEL_TAB_DRAG_THRESHOLD)return;
+current.active=true;
+modelTabSuppressClickRef.current=true;
+}
+moveEvent?.preventDefault?.();
+current.dropIndex=modelTabDropIndexOf(x);
+setModelTabDrag({page:current.page,dropIndex:current.dropIndex,active:true});
+};
+const onEnd=(endEvent)=>{
+const current=modelTabDragRef.current;
+modelTabDragRef.current=null;
+try{
+doc.removeEventListener("pointermove",onMove);
+doc.removeEventListener("pointerup",onEnd);
+doc.removeEventListener("pointercancel",onEnd);
+}catch{/* 监听清理失败不影响后续手势。 */}
+setModelTabDrag(null);
+if(current===null||current.active!==true){
+modelTabSuppressClickRef.current=false;
+return;
+}
+endEvent?.preventDefault?.();
+const from=current.page;
+const target=endEvent?.type==="pointercancel"
+?from
+:(current.dropIndex>from?current.dropIndex-1:current.dropIndex);
+if(target!==from){
+editDraft((previous)=>reorderModelLayers(previous,from,target));
+setSelectedModelPage(target);
+}
+if(typeof globalThis?.setTimeout==="function")globalThis.setTimeout(()=>{modelTabSuppressClickRef.current=false;},0);
+else modelTabSuppressClickRef.current=false;
+};
+doc.addEventListener("pointermove",onMove);
+doc.addEventListener("pointerup",onEnd);
+doc.addEventListener("pointercancel",onEnd);
+session.detach=()=>{
+doc.removeEventListener("pointermove",onMove);
+doc.removeEventListener("pointerup",onEnd);
+doc.removeEventListener("pointercancel",onEnd);
+};
+modelTabDragRef.current=session;
+};
+return{beginModelTabDrag};
+}
+function bindSettingsText(locale){
+return(key,vars)=>settingsText(locale,key,vars);
+}
+function bindSettingsExtraText(locale){
+return(key,vars)=>settingsExtraText(locale,key,vars);
+}
+function bindRoleLabelOf(roleLabels){
+return(role)=>{
+const label=roleLabels?.[role];
+return typeof label==="string"&&label.length>0?label:(SETTINGS_ROLE_LABELS[role]??role);
+};
+}
+function bindPromptTextOf(promptDrafts,baselineProjection){
+return(role)=>{
+if(Object.prototype.hasOwnProperty.call(promptDrafts,role))return promptDrafts[role];
+return promptEntryOf(baselineProjection,role)?.effective??"";
+};
+}
+function bindModelPageLabelOf(tExtra){
+return(page)=>(page===0
+?tExtra("settings.modelTabs.primary")
+:tExtra("settings.modelTabs.candidate",{index:page}));
+}
+function bindNotificationEventsDismiss({isOpen,rootRef,triggerRef,setOpen}){
+if(!isOpen)return undefined;
+const restoreTriggerFocus=()=>{
+try{triggerRef.current?.focus?.();}catch{/* 无 DOM 的宿主忽略 */}
+};
+const closeAndRestoreFocus=()=>{
+setOpen(false);
+restoreTriggerFocus();
+};
+const onPointerDown=(event)=>{
+const root=rootRef.current;
+const target=event?.target;
+if(root!==null&&root!==void 0&&typeof root.contains==="function"
+&&target!==null&&target!==void 0&&root.contains(target))return;
+closeAndRestoreFocus();
+};
+const onKeyDown=(event)=>{
+if(event?.key!=="Escape")return;
+event.preventDefault?.();
+closeAndRestoreFocus();
+};
+const doc=typeof document==="undefined"?null:document;
+if(doc===null||typeof doc.addEventListener!=="function")return undefined;
+doc.addEventListener("mousedown",onPointerDown);
+doc.addEventListener("keydown",onKeyDown);
+return()=>{
+doc.removeEventListener?.("mousedown",onPointerDown);
+doc.removeEventListener?.("keydown",onKeyDown);
+};
+}
+function DshExpertGroupSettings({settingsForm,modelCatalog,modelConfigHost,ctx}){
+const subscribe=react.useMemo(()=>settingsForm.subscribe.bind(settingsForm),[settingsForm]);
+const getSnapshot=react.useMemo(()=>settingsForm.getSnapshot.bind(settingsForm),[settingsForm]);
+const settingsSnapshot=react.useSyncExternalStore(subscribe,getSnapshot);
+const catalogSubscribe=react.useMemo(()=>modelCatalog.subscribe.bind(modelCatalog),[modelCatalog]);
+const catalogGetSnapshot=react.useMemo(()=>modelCatalog.getSnapshot.bind(modelCatalog),[modelCatalog]);
+const directoryState=react.useSyncExternalStore(catalogSubscribe,catalogGetSnapshot);
+const[hostMeta,refreshHostMeta,hostMetaError]=useHostMeta(ctx);
+const roles=useEnabledSettingsRoles(hostMeta);
+const uiLocale=resolveSettingsLocale(ctx);
+const t=bindSettingsText(uiLocale);
+const tExtra=bindSettingsExtraText(uiLocale);
+const roleLabelOf=bindRoleLabelOf(hostMeta?.roleLabels);
+const promptRoleIds=react.useMemo(()=>{
+const declared=hostMeta?.rolePrompts?.roles;
+if(!Array.isArray(declared))return PROMPT_ROLE_IDS;
+const roles=declared.filter((role)=>typeof role==="string"&&role.length>0);
+return roles.length>0?roles:PROMPT_ROLE_IDS;
+},[hostMeta]);
+const hostPromptProjection=react.useMemo(
+()=>normalizeRolePromptProjection(hostMeta?.rolePrompts,settingsSnapshot.value,true,promptRoleIds),
+[hostMeta,settingsSnapshot.value,promptRoleIds],
+);
+react.useEffect(()=>{
+void modelCatalog.load();
+},[modelCatalog]);
+const[draft,setDraft]=react.useState(()=>normalizeSettingsDraft(settingsSnapshot.value,roles));
+const[candidatesError,setCandidatesError]=react.useState(null);
+const[selectedModelPage,setSelectedModelPage]=react.useState(0);
+const[modelTabDrag,setModelTabDrag]=react.useState(null);
+const[modelPageDeleteIntent,setModelPageDeleteIntent]=react.useState(null);
+const modelTabRefs=react.useRef({});
+const modelTabDragRef=react.useRef(null);
+const modelTabSuppressClickRef=react.useRef(false);
+const modelPageDeleteCancelRef=react.useRef(null);
+const[dirty,setDirty]=react.useState(false);
+const[saving,setSaving]=react.useState(false);
+const[error,setError]=react.useState(null);
+const[saved,setSaved]=react.useState(false);
+const[selectedPromptRole,setSelectedPromptRole]=react.useState(null);
+const[promptDrafts,setPromptDrafts]=react.useState(()=>({}));
+const[promptTouched,setPromptTouched]=react.useState({});
+const[promptError,setPromptError]=react.useState(null);
+const[localPromptProjection,setLocalPromptProjection]=react.useState(null);
+const[editorBaseline,setEditorBaseline]=react.useState(null);
+const[settingsConflict,setSettingsConflict]=react.useState(null);
+const[externalSettingsChanged,setExternalSettingsChanged]=react.useState(false);
+const[leaveIntent,setLeaveIntent]=react.useState(null);
+const leaveTriggerRef=react.useRef(null);
+const leaveCancelRef=react.useRef(null);
+const[notificationEventsOpen,setNotificationEventsOpen]=react.useState(false);
+const notificationEventsRootRef=react.useRef(null);
+const notificationEventsTriggerRef=react.useRef(null);
+const notificationEventsPanelRef=react.useRef(null);
+const promptProjection=localPromptProjection!==null
+&&Number.isSafeInteger(localPromptProjection.revision)
+&&localPromptProjection.revision>settingsSnapshot.revision
+?localPromptProjection.projection
+:hostPromptProjection;
+const baselineProjection=editorBaseline?.role===selectedPromptRole
+?editorBaseline.projection
+:promptProjection;
+const promptMaxGraphemes=baselineProjection?.maxGraphemes??DEFAULT_PROMPT_MAX_GRAPHEMES;
+const settingsReadOnly=settingsSnapshot.writable!==true;
+const promptLoading=hostMeta===null&&hostMetaError===null;
+const promptTextOf=bindPromptTextOf(promptDrafts,baselineProjection);
+const promptTouchedRoles=Object.keys(promptTouched).filter((role)=>promptRoleIds.includes(role));
+const promptDirty=baselineProjection!==null&&promptRoleIds.some((role)=>{
+if(!Object.prototype.hasOwnProperty.call(promptTouched,role))return false;
+const entry=promptEntryOf(baselineProjection,role);
+return entry!==null&&promptTextOf(role)!==entry.effective;
+});
+const committedAuthorityRef=react.useRef(null);
+const committedSnapshotLagging=committedAuthorityRef.current!==null
+&&Number.isSafeInteger(committedAuthorityRef.current.revision)
+&&(!Number.isSafeInteger(settingsSnapshot.revision)
+||settingsSnapshot.revision<committedAuthorityRef.current.revision);
+const authorityValue=committedSnapshotLagging?committedAuthorityRef.current.value:settingsSnapshot.value;
+const sourcePromptOverrides=normalizePromptOverrides(authorityValue?.promptOverrides,promptMaxGraphemes,promptRoleIds);
+const localDraft=normalizeSettingsDraft(draft,roles,false);
+const sourceDraftForDirty=normalizeSettingsDraft(authorityValue,roles,false);
+const settingsDirty=!settingsDraftEqual(localDraft,sourceDraftForDirty);
+const hasUnsavedChanges=settingsDirty||promptDirty;
+const editorHasUnsavedChanges=hasUnsavedChanges;
+const sourceDraftForSave=normalizeSettingsDraft(authorityValue,roles);
+const editorEntryValue=selectedPromptRole!==null&&editorBaseline?.role===selectedPromptRole
+?editorBaseline.value
+:authorityValue;
+const editorEntryDraft=normalizeSettingsDraft(editorEntryValue,roles,false);
+const effectiveDraft=selectedPromptRole!==null
+?mergeSettingsDraftOverSource(sourceDraftForSave,localDraft,editorEntryDraft)
+:localDraft;
+const modelFieldsChanged=react.useMemo(()=>{
+if(!settingsDraftEqual(effectiveDraft.defaults,sourceDraftForSave.defaults))return true;
+return unifiedProviderOf(effectiveDraft.defaults,roles,effectiveDraft.provider)
+!==unifiedProviderOf(sourceDraftForSave.defaults,roles,sourceDraftForSave.provider);
+},[effectiveDraft,sourceDraftForSave,roles]);
+react.useEffect(()=>{
+if(dirty)return;
+if(committedSnapshotLagging)return;
+setDraft(normalizeSettingsDraft(authorityValue,roles));
+setPromptDrafts({});
+setPromptTouched({});
+setPromptError(null);
+setCandidatesError(null);
+},[dirty,settingsSnapshot.value,settingsSnapshot.revision,roles,promptMaxGraphemes,committedSnapshotLagging,authorityValue]);
+react.useEffect(()=>{
+if(selectedPromptRole===null||editorBaseline?.role!==selectedPromptRole)return;
+if(editorBaseline.projection===null&&hostPromptProjection!==null){
+setEditorBaseline((previous)=>previous?.role===selectedPromptRole&&previous.projection===null
+?{...previous,projection:hostPromptProjection}
+:previous);
+return;
+}
+if(Number.isSafeInteger(localPromptProjection?.revision)
+&&localPromptProjection.revision>settingsSnapshot.revision)return;
+if(!Number.isSafeInteger(settingsSnapshot.revision))return;
+if(settingsSnapshot.revision===editorBaseline.revision)return;
+if(Number.isSafeInteger(editorBaseline.revision)&&settingsSnapshot.revision<editorBaseline.revision)return;
+if(hasUnsavedChanges||dirty){
+setExternalSettingsChanged(true);
+return;
+}
+const refreshedProjection=hostPromptProjection;
+if(refreshedProjection===null){
+setExternalSettingsChanged(true);
+return;
+}
+setLocalPromptProjection(null);
+setEditorBaseline({
+role:selectedPromptRole,
+value:settingsSnapshot.value,
+revision:settingsSnapshot.revision,
+projection:refreshedProjection,
+});
+setDraft(normalizeSettingsDraft(settingsSnapshot.value,roles));
+setPromptDrafts({});
+setPromptTouched({});
+setDirty(false);
+setSaved(false);
+setError(null);
+setPromptError(null);
+setSettingsConflict(null);
+setExternalSettingsChanged(false);
+},[selectedPromptRole,editorBaseline,localPromptProjection,settingsSnapshot.revision,settingsSnapshot.value,hostPromptProjection,hasUnsavedChanges,dirty,roles]);
+react.useEffect(()=>{
+if(selectedPromptRole===null||!editorHasUnsavedChanges)return;
+const target=typeof globalThis?.addEventListener==="function"
+?globalThis
+:(typeof globalThis?.window?.addEventListener==="function"?globalThis.window:null);
+if(target===null)return;
+const onBeforeUnload=(event)=>{
+event.preventDefault?.();
+event.returnValue="";
+return"";
+};
+target.addEventListener("beforeunload",onBeforeUnload);
+return()=>target.removeEventListener?.("beforeunload",onBeforeUnload);
+},[selectedPromptRole,editorHasUnsavedChanges]);
+react.useEffect(()=>bindNotificationEventsDismiss({
+isOpen:notificationEventsOpen,
+rootRef:notificationEventsRootRef,
+triggerRef:notificationEventsTriggerRef,
+setOpen:setNotificationEventsOpen,
+}),[notificationEventsOpen]);
+react.useEffect(()=>{
+if(!notificationEventsOpen)return;
+const panel=notificationEventsPanelRef.current;
+if(panel===null||panel===void 0||typeof panel.querySelector!=="function")return;
+try{panel.querySelector("input[type=checkbox]")?.focus?.();}catch{/* 忽略不可聚焦的宿主 */}
+},[notificationEventsOpen]);
+const editDraft=(update)=>{
+setDirty(true);
+setSaved(false);
+setError(null);
+setPromptError(null);
+setDraft((previous)=>update(previous));
+};
+const captureEditorBaseline=(role)=>{
+if(role===null)return null;
+return{
+role,
+value:settingsSnapshot.value,
+revision:Number.isSafeInteger(settingsSnapshot.revision)&&settingsSnapshot.revision>=0
+?settingsSnapshot.revision
+:null,
+projection:promptProjection,
+};
+};
+const applyPromptNavigation=(role)=>{
+setSelectedPromptRole(role);
+setEditorBaseline(captureEditorBaseline(role));
+setPromptDrafts({});
+setPromptTouched({});
+setDirty(false);
+setSaved(false);
+setError(null);
+setPromptError(null);
+};
+const requestPromptNavigation=(role,trigger)=>{
+if(editorHasUnsavedChanges){
+leaveTriggerRef.current=trigger?.currentTarget??(typeof document==="undefined"?null:document.activeElement);
+setLeaveIntent({kind:"navigate",role});
+return;
+}
+applyPromptNavigation(role);
+};
+const openPrompt=(role,event)=>{
+if(!promptRoleIds.includes(role))return;
+if(selectedPromptRole!==null&&selectedPromptRole!==role){
+requestPromptNavigation(role,event);
+return;
+}
+setSelectedPromptRole(role);
+setEditorBaseline(captureEditorBaseline(role));
+setPromptError(null);
+setError(null);
+};
+const closePrompt=(event)=>requestPromptNavigation(null,event);
+const dismissLeaveDialog=()=>{
+setLeaveIntent(null);
+const trigger=leaveTriggerRef.current;
+leaveTriggerRef.current=null;
+try{trigger?.focus?.();}catch{/* 焦点恢复失败不应阻断编辑器。 */}
+};
+const editPromptText=(role,text)=>{
+const nextPromptDirty=baselineProjection!==null&&promptRoleIds.some((candidate)=>{
+const entry=promptEntryOf(baselineProjection,candidate);
+if(entry===null)return false;
+return(candidate===role?text:promptTextOf(candidate))!==entry.effective;
+});
+setPromptDrafts((previous)=>({...previous,[role]:text}));
+setPromptTouched((previous)=>({...previous,[role]:true}));
+setDirty(settingsDirty||nextPromptDirty);
+setSaved(false);
+setError(null);
+setPromptError(null);
+};
+const groups=Array.isArray(directoryState.groups)?directoryState.groups:[];
+const providerGroups=groups.filter((group)=>group&&typeof group.id==="string");
+const modelRowRoles=react.useMemo(()=>{
+const next=[...PROMPT_ROLE_IDS];
+for(const role of roles)if(!next.includes(role))next.push(role);
+return next;
+},[roles]);
+const catalogAvailable=directoryState.status==="ready"||groups.length>0;
+const modelPageCount=modelPageCountOf(draft);
+const currentModelPage=Math.min(selectedModelPage,modelPageCount-1);
+const currentModelLayer=modelLayerMapOf(draft,currentModelPage);
+const unifiedProvider=unifiedProviderOf(currentModelLayer,roles,currentModelPage===0?draft.provider:"");
+const modelPageLabelOf=bindModelPageLabelOf(tExtra);
+react.useEffect(()=>()=>{
+const session=modelTabDragRef.current;
+modelTabDragRef.current=null;
+try{session?.detach?.();}catch{/* 卸载路径不抛错。 */}
+},[]);
+react.useEffect(()=>{
+if(modelPageDeleteIntent===null)return;
+try{modelPageDeleteCancelRef.current?.focus?.();}catch{/* 不支持 focus 的嵌入宿主仍可键盘点击。 */}
+},[modelPageDeleteIntent]);
+const view={
+applyPromptNavigation,authorityValue,baselineProjection,
+candidatesError,catalogAvailable,closePrompt,committedAuthorityRef,committedSnapshotLagging,
+currentModelPage,directoryState,dismissLeaveDialog,draft,editDraft,editPromptText,effectiveDraft,
+error,externalSettingsChanged,hasUnsavedChanges,hostMeta,hostMetaError,leaveCancelRef,
+leaveIntent,leaveTriggerRef,modelConfigHost,modelFieldsChanged,modelPageCount,modelPageDeleteCancelRef,
+modelPageDeleteIntent,modelPageLabelOf,modelRowRoles,modelTabDrag,modelTabDragRef,modelTabRefs,modelTabSuppressClickRef,notificationEventsOpen,
+notificationEventsPanelRef,notificationEventsRootRef,notificationEventsTriggerRef,openPrompt,promptDirty,promptError,
+promptLoading,promptMaxGraphemes,promptProjection,promptRoleIds,promptTextOf,promptTouchedRoles,providerGroups,
+refreshHostMeta,roleLabelOf,roles,saved,
+saving,selectedPromptRole,setCandidatesError,setDirty,setDraft,
+setEditorBaseline,setError,setExternalSettingsChanged,setLeaveIntent,setLocalPromptProjection,setModelPageDeleteIntent,
+setModelTabDrag,setNotificationEventsOpen,setSelectedModelPage,
+setPromptDrafts,setPromptError,setPromptTouched,setSaved,setSettingsConflict,settingsConflict,
+settingsForm,settingsReadOnly,settingsSnapshot,sourceDraftForSave,sourcePromptOverrides,t,tExtra,unifiedProvider,
+ctx,editorBaseline,setSaving,
+};
+Object.assign(view,createModelPageActions(view),createModelTabDragController(view));
+useSettingsLeaveFocus(view);
+view.save=createSettingsSaveAction(view);
+return renderSettingsTail(view);
+}
+global[SYMBOL]=Object.freeze({
+DshExpertGroupSettings,bindClientRuntime,
+});
+})(globalThis);
+/* source: client-model-views-b.js */
+(function installClientModelViewsB(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-model-views-b");
+let react=null;
+function bindClientRuntime(host){
+react=host.react??null;
+}
+let modelDiscoveryTitleSeq=0;
+function focusableDialogControls(scope){
+const nodes=Array.from(scope?.querySelectorAll?.("[data-deg-dialog-action]")??[]);
+return nodes.filter((node)=>{
+if(node===null||typeof node!=="object")return false;
+if(node.disabled===true)return false;
+if(node.hidden===true)return false;
+if(typeof node.getAttribute!=="function")return true;
+if(node.getAttribute("aria-disabled")==="true")return false;
+if(node.getAttribute("aria-hidden")==="true")return false;
+return true;
+});
+}
+function renderModelRow(model,options){
+const{
+key,attributes,idAttributes={},disabled,idLabel,nameLabel,parseCapacity,
+onChange,onToggleAdvanced,onRemove,onEffort,onInput,
+}=options;
+const advanced=model.advancedOpen
+?react.createElement("div",{className:"deg_mc_model_advanced"},
+react.createElement("label",{className:"deg_mc_field"},
+react.createElement("span",{className:"deg_mc_field_label"},"上下文窗口"),
+react.createElement("input",{
+className:"deg_mc_input",
+type:"text",
+inputMode:"numeric",
+value:model.contextWindow.value,
+placeholder:model.contextWindow.placeholder,
+"aria-label":"上下文窗口 "+String(model.position),
+disabled,
+onChange:(event)=>onChange(model.index,{contextWindow:parseCapacity(event.target.value)}),
+})),
+react.createElement("label",{className:"deg_mc_field"},
+react.createElement("span",{className:"deg_mc_field_label"},"最大输出 token"),
+react.createElement("input",{
+className:"deg_mc_input",
+type:"text",
+inputMode:"numeric",
+value:model.maxTokens.value,
+placeholder:model.maxTokens.placeholder,
+"aria-label":"最大输出 token "+String(model.position),
+disabled,
+onChange:(event)=>onChange(model.index,{maxTokens:parseCapacity(event.target.value)}),
+})),
+react.createElement("fieldset",{className:"deg_mc_efforts"},
+react.createElement("legend",{className:"deg_mc_efforts_label"},"思考档位（可多选）"),
+react.createElement("div",{className:"deg_mc_efforts_row"},
+model.efforts.map((effort)=>react.createElement("label",{
+key:effort.level,
+className:"deg_mc_effort",
+},react.createElement("input",{
+type:"checkbox",
+checked:effort.checked,
+disabled,
+"data-deg-effort":effort.level,
+"data-deg-model-index":model.index,
+"aria-label":"模型 "+String(model.position)+" 思考档位 "+effort.level,
+onChange:()=>onEffort(model.index,effort.level),
+}),react.createElement("span",null,effort.level))))),
+react.createElement("fieldset",{className:"deg_mc_efforts"},
+react.createElement("legend",{className:"deg_mc_efforts_label"},"输入类型"),
+react.createElement("div",{className:"deg_mc_input_types"},
+model.inputs.map((input)=>react.createElement("label",{
+key:input.modality,
+className:"deg_mc_effort",
+},react.createElement("input",{
+type:"checkbox",
+checked:input.checked,
+disabled:disabled||input.locked===true,
+"data-deg-input":input.modality,
+"data-deg-model-index":model.index,
+"aria-label":"模型 "+String(model.position)+" 输入类型 "+input.modality,
+onChange:()=>onInput(model.index,input.modality),
+}),react.createElement("span",null,input.modality))))))
+:null;
+return react.createElement("div",{
+key,
+className:"deg_mc_model",
+...attributes,
+},react.createElement("div",{className:"deg_mc_model_main"},
+react.createElement("input",{
+className:"deg_mc_input",
+type:"text",
+value:model.id.value,
+placeholder:"模型 ID",
+"aria-label":idLabel+String(model.position),
+disabled,
+onChange:(event)=>onChange(model.index,{id:event.target.value}),
+...idAttributes,
+}),
+react.createElement("input",{
+className:"deg_mc_input",
+type:"text",
+value:model.name.value,
+placeholder:"显示名",
+"aria-label":nameLabel+String(model.position),
+disabled,
+onChange:(event)=>onChange(model.index,{name:event.target.value}),
+}),
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_mc_icon_btn",
+"aria-label":"模型高级设置 "+String(model.position),
+"aria-expanded":model.advancedOpen,
+onClick:()=>onToggleAdvanced(model.index),
+},model.advancedOpen?"▾":"▸"),
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_mc_icon_btn",
+"aria-label":"删除模型 "+String(model.position),
+disabled,
+onClick:()=>onRemove(model.index),
+},"✕")),
+advanced);
+}
+function clearsAllCandidateSelection(candidates,visibleIds){
+const list=Array.isArray(candidates)?candidates:[];
+const wanted=visibleIds instanceof Set?visibleIds:new Set();
+const visible=list.filter((candidate)=>wanted.has(candidate?.id));
+return visible.length>0&&visible.every((candidate)=>candidate.picked===true);
+}
+function ModelDiscoveryDialog({candidates,query,onQueryChange,onToggle,onToggleVisible,onClose,onAdopt}){
+const source=Array.isArray(candidates)?candidates:[];
+const[titleId]=react.useState(()=>{
+modelDiscoveryTitleSeq+=1;
+return"deg-model-discovery-title-"+String(modelDiscoveryTitleSeq);
+});
+const dialogRef=react.useRef(null);
+const restoreTargetRef=react.useRef(typeof document==="undefined"?null:document.activeElement??null);
+react.useEffect(()=>()=>{
+const target=restoreTargetRef.current;
+try{
+if(target!==null&&typeof target?.focus==="function")target.focus();
+}catch{/* 焦点不可用时保持弹窗关闭语义，不抛出。 */}
+},[]);
+const normalizedQuery=typeof query==="string"?query.trim().toLowerCase():"";
+const visible=normalizedQuery.length===0
+?source
+:source.filter((candidate)=>{
+const id=typeof candidate?.id==="string"?candidate.id:"";
+const name=typeof candidate?.name==="string"?candidate.name:"";
+return id.toLowerCase().includes(normalizedQuery)||name.toLowerCase().includes(normalizedQuery);
+});
+const visibleIds=new Set(visible.map((candidate)=>candidate?.id));
+const clearsAll=clearsAllCandidateSelection(source,visibleIds);
+const pickedCount=source.filter((candidate)=>candidate.picked===true).length;
+const handleKeyDown=(event)=>{
+if(event?.key==="Escape"){
+event.preventDefault?.();
+event.stopPropagation?.();
+onClose();
+return;
+}
+if(event?.key!=="Tab")return;
+const controls=focusableDialogControls(dialogRef.current);
+if(controls.length===0)return;
+const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
+const nextIndex=event.shiftKey
+?(current<=0?controls.length-1:current-1)
+:(current>=controls.length-1?0:current+1);
+event.preventDefault?.();
+try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击控件。 */}
+};
+const list=visible.length===0
+?react.createElement("p",{className:"deg_mc_candidate_empty",role:"status"},"没有匹配的模型")
+:react.createElement("ul",{className:"deg_mc_candidate_list"},visible.map((candidate)=>(
+react.createElement("li",{key:candidate.id,className:"deg_mc_candidate_item"},
+react.createElement("label",{className:"deg_mc_candidate_label"},
+react.createElement("input",{
+type:"checkbox",
+checked:candidate.picked===true,
+"data-deg-create-candidate":candidate.id,
+"data-deg-dialog-action":"candidate",
+"aria-label":"选择模型 "+candidate.id,
+onChange:()=>onToggle(candidate.id),
+}),
+react.createElement("span",{className:"deg_mc_candidate_id"},candidate.id))))));
+return react.createElement("div",{
+className:"deg_mc_modal_backdrop",
+onClick:()=>onClose(),
+},
+react.createElement("div",{
+className:"deg_mc_modal",
+role:"dialog",
+"aria-modal":"true",
+"aria-labelledby":titleId,
+ref:dialogRef,
+onKeyDown:handleKeyDown,
+onClick:(event)=>event?.stopPropagation?.(),
+},
+react.createElement("div",{className:"deg_mc_modal_header"},
+react.createElement("h3",{className:"deg_mc_modal_title",id:titleId},"选择要添加的模型"),
+react.createElement("button",{
+type:"button",
+className:"deg_mc_modal_close",
+"aria-label":"关闭",
+"data-deg-dialog-action":"close",
+autoFocus:true,
+onClick:onClose,
+},"×")),
+react.createElement("p",{className:"deg_mc_modal_description"},"以下是模型提供方的可用模型，勾选要添加的模型。"),
+react.createElement("div",{className:"deg_mc_candidate_toolbar"},
+react.createElement("input",{
+className:"deg_mc_input deg_mc_candidate_search",
+type:"search",
+value:query,
+placeholder:"搜索模型",
+"aria-label":"搜索模型",
+"data-deg-dialog-action":"search",
+onChange:(event)=>onQueryChange(event.target.value),
+}),
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled:visible.length===0,
+"data-deg-dialog-action":"toggle-visible",
+onClick:()=>onToggleVisible(visible.map((candidate)=>candidate.id)),
+},clearsAll?"取消全选":"全选")),
+list,
+react.createElement("div",{className:"deg_mc_modal_footer"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+"data-deg-dialog-action":"cancel",
+onClick:onClose,
+},"取消"),
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+disabled:pickedCount===0,
+"data-deg-dialog-action":"adopt",
+onClick:onAdopt,
+},"添加所选"))));
+}
+global[SYMBOL]=Object.freeze({
+ModelDiscoveryDialog,clearsAllCandidateSelection,focusableDialogControls,renderModelRow,bindClientRuntime,
+});
+})(globalThis);
+/* source: client-model-views-a.js */
+(function installClientModelViewsA(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-model-views-a");
+const clientModelViewsBSymbol=Symbol.for("dsh-expert-group/client-model-views-b");
+const clientModelViewsB=global[clientModelViewsBSymbol]||{};
+const{ModelDiscoveryDialog,clearsAllCandidateSelection,renderModelRow}=clientModelViewsB;
+let react=null;
+function bindClientRuntime(host){
+react=host.react??null;
+}
+function renderProviderModelRows(card,handlers){
+const{disabled,edit,patchRow,toggleRow,toggleEffort,toggleInput,config,session}=handlers;
+return card.models.map((model)=>renderModelRow(model,{
+key:"model-"+String(model.index),
+attributes:{"data-deg-model-index":model.index},
+disabled,
+idLabel:"模型 ID ",
+nameLabel:"模型显示名 ",
+parseCapacity:config.parseCapacity,
+onChange:patchRow,
+onToggleAdvanced:toggleRow,
+onRemove:(index)=>edit((draft)=>({...draft,models:config.removeModelRow(session.modelRows,index)})),
+onEffort:toggleEffort,
+onInput:toggleInput,
+}));
 }
 function ModelConfigDisclosure({section,onToggle,extra}){
 return react.createElement("div",{className:"deg_mc_header"},
@@ -13514,6 +17490,214 @@ onClick:onToggle,
 react.createElement("span",{className:"deg_mc_chevron","aria-hidden":"true"},section.disclosure.expanded?"▾":"▸"),
 react.createElement("span",null,section.title)),
 extra);
+}
+function buildCandidateControls({setFetchState,setCandidateQuery}){
+const toggleCandidate=(id)=>{
+setFetchState((previous)=>previous===null||!Array.isArray(previous.candidates)
+?previous
+:{
+...previous,
+candidates:previous.candidates.map((candidate)=>candidate.id===id
+?{...candidate,picked:candidate.picked!==true}
+:candidate),
+});
+};
+const toggleVisibleCandidates=(ids)=>{
+const wanted=new Set(Array.isArray(ids)?ids:[]);
+setFetchState((previous)=>{
+if(previous===null||!Array.isArray(previous.candidates))return previous;
+if(clearsAllCandidateSelection(previous.candidates,wanted)){
+return{...previous,candidates:previous.candidates.map((candidate)=>({...candidate,picked:false}))};
+}
+return{
+...previous,
+candidates:previous.candidates.map((candidate)=>wanted.has(candidate.id)
+?{...candidate,picked:true}
+:candidate),
+};
+});
+};
+const closeModelPicker=()=>{
+setFetchState(null);
+setCandidateQuery("");
+};
+return{toggleCandidate,toggleVisibleCandidates,closeModelPicker};
+}
+function renderProviderCardCollapsed(context){
+const{card,row,removable,saving,onRemove,setOpen,setError,setSaved,setConflict}=context;
+const removeAction=removable&&typeof onRemove==="function"
+?react.createElement("button",{
+type:"button",
+className:"deg_btn deg_mc_delete_btn",
+disabled:saving||card.readOnly,
+"aria-label":card.displayName+" 删除",
+onClick:(event)=>{void onRemove(event);},
+},"删除")
+:null;
+return react.createElement("li",{className:"deg_mc_card"},
+react.createElement("div",{className:"deg_mc_card_head"},
+react.createElement("span",{className:"deg_mc_card_name"},card.displayName),
+card.provider===card.displayName?null:react.createElement("span",{className:"deg_mc_card_route"},card.provider),
+card.apiKey.placeholder==="已配置（留空表示不修改）"
+?react.createElement("span",{
+className:"deg_mc_dot",
+role:"img",
+"aria-label":"API Key 已配置",
+title:"API Key 已配置",
+"data-state":"available",
+style:{background:"var(--dsw-alias-state-success-primary,#22c55e)"},
+})
+:null,
+react.createElement("span",{className:"deg_mc_card_actions"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+"aria-label":card.displayName+" 编辑",
+onClick:()=>{setOpen(true);setError(null);setSaved(false);setConflict(false);},
+},"编辑"),removeAction)),
+row.error===undefined?null:react.createElement("p",{className:"deg_mc_error",role:"alert"},row.error));
+}
+function renderProviderCardExpanded(context){
+const{
+card,row,config,session,host,disabled,saving,saved,error,conflict,keyDraft,
+fetchState,candidateQuery,modelRows,setKeyDraft,setOpen,setSaved,setError,setConflict,
+setExpandedRows,setFetchState,setDraftRevision,setCandidateQuery,
+edit,apply,cancel,fetchModels,toggleCandidate,toggleVisibleCandidates,closeModelPicker,adoptPicked,
+}=context;
+return react.createElement("li",{className:"deg_mc_card","data-deg-provider":row.provider},
+react.createElement("div",{className:"deg_mc_card_head"},
+react.createElement("span",{className:"deg_mc_card_name"},card.displayName),
+card.provider===card.displayName?null:react.createElement("span",{className:"deg_mc_card_route"},card.provider)),
+row.error===undefined?null:react.createElement("p",{className:"deg_mc_error",role:"alert"},row.error),
+react.createElement("label",{className:"deg_mc_field"},
+react.createElement("span",{className:"deg_mc_field_label"},"API Key"),
+react.createElement("input",{
+className:"deg_mc_input",
+type:card.apiKey.type,
+autoComplete:card.apiKey.autoComplete,
+value:keyDraft,
+disabled:disabled||card.apiKey.disabled,
+"data-deg-api-key":row.provider,
+"aria-label":card.displayName+" API Key",
+placeholder:card.apiKey.placeholder,
+onChange:(event)=>{setKeyDraft(event.target.value);session.typeKey(event.target.value);},
+})),
+react.createElement("p",{className:"deg_mc_hint"},card.apiKey.hint),
+react.createElement("label",{className:"deg_mc_field"},
+react.createElement("span",{className:"deg_mc_field_label"},"Base URL"),
+react.createElement("input",{
+className:"deg_mc_input",
+type:"text",
+value:card.baseUrl.value,
+disabled,
+placeholder:card.baseUrl.placeholder,
+"data-deg-base-url":row.provider,
+"aria-label":card.displayName+" Base URL",
+onChange:(event)=>{
+const value=event.target.value;
+edit((draft)=>{
+const next={...draft};
+if(value.trim().length===0)Reflect.deleteProperty(next,"baseURL");
+else next.baseURL=value;
+return next;
+});
+},
+})),
+react.createElement("label",{className:"deg_mc_field"},
+react.createElement("span",{className:"deg_mc_field_label"},"协议"),
+react.createElement("select",{
+className:"deg_mc_select",
+value:card.protocol.value,
+disabled,
+"data-deg-protocol":row.provider,
+"aria-label":card.displayName+" 协议",
+onChange:(event)=>{
+const value=event.target.value;
+edit((draft)=>{
+const next={...draft};
+if(value.length===0)Reflect.deleteProperty(next,"api");
+else next.api=value;
+return next;
+});
+},
+},card.protocol.options.map((option)=>react.createElement("option",{key:option.value,value:option.value},option.label)))),
+react.createElement("div",{className:"deg_mc_models"},
+react.createElement("div",{className:"deg_mc_models_head"},
+react.createElement("span",{className:"deg_mc_models_title"},"模型"),
+react.createElement("span",{className:"deg_mc_models_meta"},card.modelCatalog.label),
+card.modelCatalog.canReset
+?react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled,
+"data-deg-reset-models":row.provider,
+onClick:()=>{
+session.resetModels();
+setDraftRevision((value)=>value+1);
+setExpandedRows(new Set());
+setFetchState(null);
+setSaved(false);
+setError(null);
+},
+},"恢复默认")
+:null,
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled:disabled||card.actions.fetchModels==="disabled",
+"data-deg-fetch-models":row.provider,
+onClick:()=>{void fetchModels();},
+},"获取模型")),
+card.models.length===0
+?react.createElement("p",{className:"deg_mc_hint"},card.modelCatalog.emptyHint)
+:react.createElement("div",{className:"deg_mc_model"},modelRows),
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled,
+"data-deg-add-model":row.provider,
+onClick:()=>edit((draft)=>({...draft,models:config.appendModelRow(session.modelRows)})),
+},"添加模型"),
+fetchState?.error===null||fetchState?.error===undefined
+?null
+:react.createElement("p",{className:"deg_mc_error",role:"alert"},fetchState.error)
+),
+error===null?null:react.createElement("p",{className:"deg_mc_error",role:"alert","data-deg-card-error":row.provider},error),
+conflict
+?react.createElement("div",{className:"deg_mc_conflict"},
+react.createElement("p",{className:"deg_mc_error"},"配置冲突：本卡片的修改未提交。"),
+react.createElement("div",{className:"deg_mc_conflict_actions"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled:saving,
+onClick:async()=>{
+await host.refreshSettingsView();
+cancel();
+},
+},"重新打开（加载最新配置）")))
+:null,
+react.createElement("div",{className:"deg_mc_card_footer"},
+react.createElement("span",{className:"deg_mc_status deg_settings_status",role:"status"},saved?"已保存":""),
+react.createElement("button",{type:"button",className:"deg_btn",disabled:saving,onClick:()=>{setOpen(false);cancel();}},"取消"),
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+disabled,
+"data-deg-apply":row.provider,
+onClick:()=>{void apply();},
+},saving?"应用中…":"应用")),
+fetchState!==null&&Array.isArray(fetchState.candidates)
+?react.createElement(ModelDiscoveryDialog,{
+candidates:fetchState.candidates,
+query:candidateQuery,
+onQueryChange:setCandidateQuery,
+onToggle:toggleCandidate,
+onToggleVisible:toggleVisibleCandidates,
+onClose:closeModelPicker,
+onAdopt:adoptPicked,
+})
+:null);
 }
 function ModelProviderCard({row,namespace,host,roleLabels,onSaved,onRemove}){
 const config=host.config;
@@ -13559,15 +17743,6 @@ draft:session.draft,
 });
 const disabled=card.readOnly||saving;
 const removable=config.providerRemovable(row,namespace);
-const removeAction=removable&&typeof onRemove==="function"
-?react.createElement("button",{
-type:"button",
-className:"deg_btn deg_mc_delete_btn",
-disabled:saving||card.readOnly,
-"aria-label":card.displayName+" 删除",
-onClick:(event)=>{void onRemove(event);},
-},"删除")
-:null;
 const edit=(update)=>{
 session.edit(update);
 setDraftRevision((value)=>value+1);
@@ -13753,35 +17928,7 @@ setDraftRevision((value)=>value+1);
 });
 return()=>{active=false;};
 },[host,namespace?.ns,open,row.declared,row.provider,session]);
-const toggleCandidate=(id)=>{
-setFetchState((previous)=>previous===null||!Array.isArray(previous.candidates)
-?previous
-:{
-...previous,
-candidates:previous.candidates.map((candidate)=>candidate.id===id
-?{...candidate,picked:candidate.picked!==true}
-:candidate),
-});
-};
-const toggleVisibleCandidates=(ids)=>{
-const wanted=new Set(Array.isArray(ids)?ids:[]);
-setFetchState((previous)=>{
-if(previous===null||!Array.isArray(previous.candidates))return previous;
-if(clearsAllCandidateSelection(previous.candidates,wanted)){
-return{...previous,candidates:previous.candidates.map((candidate)=>({...candidate,picked:false}))};
-}
-return{
-...previous,
-candidates:previous.candidates.map((candidate)=>wanted.has(candidate.id)
-?{...candidate,picked:true}
-:candidate),
-};
-});
-};
-const closeModelPicker=()=>{
-setFetchState(null);
-setCandidateQuery("");
-};
+const{toggleCandidate,toggleVisibleCandidates,closeModelPicker}=buildCandidateControls({setFetchState,setCandidateQuery});
 const adoptPicked=()=>{
 const picked=(fetchState?.candidates??[]).filter((candidate)=>candidate.picked===true);
 if(picked.length===0)return;
@@ -13793,244 +17940,189 @@ closeModelPicker();
 };
 if(!config.providerEditable(row,namespace))return null;
 if(!open){
-return react.createElement("li",{className:"deg_mc_card"},
-react.createElement("div",{className:"deg_mc_card_head"},
-react.createElement("span",{className:"deg_mc_card_name"},card.displayName),
-card.provider===card.displayName?null:react.createElement("span",{className:"deg_mc_card_route"},card.provider),
-card.apiKey.placeholder==="已配置（留空表示不修改）"
-?react.createElement("span",{
-className:"deg_mc_dot",
-role:"img",
-"aria-label":"API Key 已配置",
-title:"API Key 已配置",
-"data-state":"available",
-style:{background:"var(--dsw-alias-state-success-primary,#22c55e)"},
-})
-:null,
-react.createElement("span",{className:"deg_mc_card_actions"},
+return renderProviderCardCollapsed({card,row,removable,saving,onRemove,setOpen,setError,setSaved,setConflict});
+}
+const modelRows=renderProviderModelRows(card,{
+disabled,edit,patchRow,toggleRow,toggleEffort,toggleInput,config,session,
+});
+return renderProviderCardExpanded({
+card,row,config,session,host,disabled,saving,saved,error,conflict,keyDraft,
+fetchState,candidateQuery,modelRows,setKeyDraft,setOpen,setSaved,setError,setConflict,
+setExpandedRows,setFetchState,setDraftRevision,setCandidateQuery,
+edit,apply,cancel,fetchModels,toggleCandidate,toggleVisibleCandidates,closeModelPicker,adoptPicked,
+});
+}
+global[SYMBOL]=Object.freeze({
+ModelConfigDisclosure,ModelProviderCard,bindClientRuntime,
+});
+})(globalThis);
+/* source: client-provider-card.js */
+(function installClientProviderCard(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-provider-card");
+const clientModelConfigHostSymbol=Symbol.for("dsh-expert-group/client-model-config-host");
+const clientModelConfigHost=global[clientModelConfigHostSymbol]||{};
+const clientModelViewsBSymbol=Symbol.for("dsh-expert-group/client-model-views-b");
+const clientModelViewsB=global[clientModelViewsBSymbol]||{};
+const{ModelDiscoveryDialog,clearsAllCandidateSelection,renderModelRow}=clientModelViewsB;
+const{CUSTOM_ROUTE_PROBE}=clientModelConfigHost;
+let react=null;
+function bindClientRuntime(host){
+react=host.react??null;
+}
+function renderCustomProviderModelSection(context){
+const{
+card,config,schemaInfo,modelRows,profileDisabled,fetching,canFetchModels,
+fetchModels,patchRow,toggleRow,setModels,fetchState,
+}=context;
+return react.createElement("div",{className:"deg_mc_models"},
+react.createElement("div",{className:"deg_mc_models_head"},
+react.createElement("span",{className:"deg_mc_models_title"},"模型"),
+react.createElement("span",{className:"deg_mc_models_meta"},"至少配置一个模型"),
 react.createElement("button",{
 type:"button",
 className:"deg_btn",
-"aria-label":card.displayName+" 编辑",
-onClick:()=>{setOpen(true);setError(null);setSaved(false);setConflict(false);},
-},"编辑"),removeAction)),
-row.error===undefined?null:react.createElement("p",{className:"deg_mc_error",role:"alert"},row.error));
+disabled:!canFetchModels||fetching,
+"data-deg-create-fetch-models":"true",
+onClick:()=>{void fetchModels();},
+},fetching?"获取中…":"获取可用模型")),
+card.models.length===0
+?react.createElement("p",{className:"deg_mc_hint"},"还没有模型。")
+:react.createElement("div",{className:"deg_mc_model"},card.models.map((model)=>renderModelRow(model,{
+key:"create-model-"+String(model.index),
+attributes:{"data-deg-create-model-index":model.index},
+idAttributes:{"data-deg-create-model-id":model.index},
+disabled:profileDisabled,
+idLabel:"自定义 provider 模型 ID ",
+nameLabel:"自定义 provider 模型显示名 ",
+parseCapacity:config.parseCapacity,
+onChange:patchRow,
+onToggleAdvanced:toggleRow,
+onRemove:(index)=>setModels(config.removeModelRow(modelRows,index)),
+onEffort:(index,level)=>{
+const selection=config.effortSelectionFor(modelRows[index]);
+setModels(config.setModelEffortSelection(modelRows,index,{...selection,[level]:selection[level]!==true}));
+},
+onInput:(index,modality)=>{
+const selected=config.modelInputOf(modelRows[index],schemaInfo.defaultInput);
+const next=selected.includes(modality)?selected.filter((value)=>value!==modality):[...selected,modality];
+setModels(config.setModelInputSelection(modelRows,index,next));
+},
+}))),
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled:profileDisabled,
+"data-deg-create-add-model":"true",
+onClick:()=>setModels(config.appendModelRow(modelRows)),
+},"添加模型"),
+config.isNonEmptyString(card.modelsError)
+?react.createElement("p",{className:"deg_mc_error",role:"alert","data-deg-create-error":"models"},card.modelsError)
+:null);
 }
-const advancedSectionOf=(model)=>(!model.advancedOpen?null:react.createElement("div",{className:"deg_mc_model_advanced"},
-react.createElement("label",{className:"deg_mc_field"},
-react.createElement("span",{className:"deg_mc_field_label"},"上下文窗口"),
+function renderCustomProviderCard(context){
+const{
+card,config,schemaInfo,draft,profileDisabled,disabled,saving,fetching,canFetchModels,
+fetchModels,edit,patchRow,toggleRow,setModels,modelRows,fetchState,candidateQuery,
+setCandidateQuery,toggleCandidate,toggleVisibleCandidates,closeModelPicker,adoptFetchedModels,
+onClose,submit,
+}=context;
+return react.createElement("div",{className:"deg_mc_create","data-deg-custom-provider":"true"},
+react.createElement("div",{className:"deg_mc_create_head"},
+react.createElement("span",{className:"deg_mc_create_title"},card.title)),
+react.createElement("label",{className:"deg_mc_field_row"},
+react.createElement("span",{className:"deg_mc_field_label"},"路由 ID"),
 react.createElement("input",{
-className:"deg_mc_input",
+className:"deg_mc_input"+(card.routeId.error===null?"":" deg_mc_field_error"),
 type:"text",
-inputMode:"numeric",
-value:model.contextWindow.value,
-placeholder:model.contextWindow.placeholder,
-"aria-label":"上下文窗口 "+String(model.position),
-disabled,
-onChange:(event)=>patchRow(model.index,{contextWindow:config.parseCapacity(event.target.value)}),
-})),
-react.createElement("label",{className:"deg_mc_field"},
-react.createElement("span",{className:"deg_mc_field_label"},"最大输出 token"),
-react.createElement("input",{
-className:"deg_mc_input",
-type:"text",
-inputMode:"numeric",
-value:model.maxTokens.value,
-placeholder:model.maxTokens.placeholder,
-"aria-label":"最大输出 token "+String(model.position),
-disabled,
-onChange:(event)=>patchRow(model.index,{maxTokens:config.parseCapacity(event.target.value)}),
-})),
-react.createElement("fieldset",{className:"deg_mc_efforts"},
-react.createElement("legend",{className:"deg_mc_efforts_label"},"思考档位（可多选）"),
-react.createElement("div",{className:"deg_mc_efforts_row"},
-model.efforts.map((effort)=>react.createElement("label",{
-key:effort.level,
-className:"deg_mc_effort",
-},react.createElement("input",{
-type:"checkbox",
-checked:effort.checked,
-disabled,
-"data-deg-effort":effort.level,
-"data-deg-model-index":model.index,
-"aria-label":"模型 "+String(model.position)+" 思考档位 "+effort.level,
-onChange:()=>toggleEffort(model.index,effort.level),
-}),react.createElement("span",null,effort.level))))),
-react.createElement("fieldset",{className:"deg_mc_efforts"},
-react.createElement("legend",{className:"deg_mc_efforts_label"},"输入类型"),
-react.createElement("div",{className:"deg_mc_input_types"},
-model.inputs.map((input)=>react.createElement("label",{
-key:input.modality,
-className:"deg_mc_effort",
-},react.createElement("input",{
-type:"checkbox",
-checked:input.checked,
-disabled:disabled||input.locked===true,
-"data-deg-input":input.modality,
-"data-deg-model-index":model.index,
-"aria-label":"模型 "+String(model.position)+" 输入类型 "+input.modality,
-onChange:()=>toggleInput(model.index,input.modality),
-}),react.createElement("span",null,input.modality)))))));
-const modelRows=card.models.map((model)=>react.createElement("div",{
-key:"model-"+String(model.index),
-className:"deg_mc_model",
-"data-deg-model-index":model.index,
-},react.createElement("div",{className:"deg_mc_model_main"},
-react.createElement("input",{
-className:"deg_mc_input",
-type:"text",
-value:model.id.value,
-placeholder:"模型 ID",
-"aria-label":"模型 ID "+String(model.position),
-disabled,
-onChange:(event)=>patchRow(model.index,{id:event.target.value}),
+value:card.routeId.value,
+disabled:profileDisabled,
+placeholder:"例如 my-gateway",
+"data-deg-create-route":"true",
+"aria-label":"自定义 provider 路由 ID",
+onChange:(event)=>edit({routeId:event.target.value}),
 }),
+card.routeId.credentialRef.length===0
+?null
+:react.createElement("span",{className:"deg_mc_hint"},"凭据引用："+card.routeId.credentialRef),
+renderFieldMessage(config,card,"routeId")),
+react.createElement("label",{className:"deg_mc_field_row"},
+react.createElement("span",{className:"deg_mc_field_label"},"显示名"),
 react.createElement("input",{
-className:"deg_mc_input",
+className:"deg_mc_input"+(card.displayName.error===null?"":" deg_mc_field_error"),
 type:"text",
-value:model.name.value,
-placeholder:"显示名",
-"aria-label":"模型显示名 "+String(model.position),
-disabled,
-onChange:(event)=>patchRow(model.index,{name:event.target.value}),
+value:card.displayName.value,
+disabled:profileDisabled,
+placeholder:"留空则使用路由 ID",
+"data-deg-create-name":"true",
+"aria-label":"自定义 provider 显示名",
+onChange:(event)=>edit({displayName:event.target.value}),
 }),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_mc_icon_btn",
-"aria-label":"模型高级设置 "+String(model.position),
-"aria-expanded":model.advancedOpen,
-onClick:()=>toggleRow(model.index),
-},model.advancedOpen?"▾":"▸"),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_mc_icon_btn",
-"aria-label":"删除模型 "+String(model.position),
-disabled,
-onClick:()=>edit((draft)=>({...draft,models:config.removeModelRow(session.modelRows,model.index)})),
-},"✕")),advancedSectionOf(model)));
-return react.createElement("li",{className:"deg_mc_card","data-deg-provider":row.provider},
-react.createElement("div",{className:"deg_mc_card_head"},
-react.createElement("span",{className:"deg_mc_card_name"},card.displayName),
-card.provider===card.displayName?null:react.createElement("span",{className:"deg_mc_card_route"},card.provider)),
-row.error===undefined?null:react.createElement("p",{className:"deg_mc_error",role:"alert"},row.error),
-react.createElement("label",{className:"deg_mc_field"},
+renderFieldMessage(config,card,"displayName")),
+react.createElement("label",{className:"deg_mc_field_row"},
+react.createElement("span",{className:"deg_mc_field_label"},"Base URL"),
+react.createElement("input",{
+className:"deg_mc_input"+(card.baseUrl.error===null?"":" deg_mc_field_error"),
+type:"text",
+value:card.baseUrl.value,
+disabled:profileDisabled,
+placeholder:card.baseUrl.placeholder,
+"data-deg-create-base-url":"true",
+"aria-label":"自定义 provider Base URL",
+onChange:(event)=>edit({baseURL:event.target.value}),
+}),
+renderFieldMessage(config,card,"baseUrl")),
+react.createElement("label",{className:"deg_mc_field_row"},
+react.createElement("span",{className:"deg_mc_field_label"},"协议"),
+react.createElement("select",{
+className:"deg_mc_select"+(card.protocol.error===null?"":" deg_mc_field_error"),
+value:card.protocol.value,
+disabled:profileDisabled,
+"data-deg-create-protocol":"true",
+"aria-label":"自定义 provider 协议",
+onChange:(event)=>edit({api:event.target.value}),
+},
+react.createElement("option",{value:""},"选择协议"),
+card.protocol.options.map((option)=>react.createElement("option",{key:option.value,value:option.value},option.label))),
+renderFieldMessage(config,card,"api")),
+react.createElement("label",{className:"deg_mc_field_row"},
 react.createElement("span",{className:"deg_mc_field_label"},"API Key"),
 react.createElement("input",{
 className:"deg_mc_input",
 type:card.apiKey.type,
 autoComplete:card.apiKey.autoComplete,
-value:keyDraft,
+value:card.apiKey.value,
 disabled:disabled||card.apiKey.disabled,
-"data-deg-api-key":row.provider,
-"aria-label":card.displayName+" API Key",
 placeholder:card.apiKey.placeholder,
-onChange:(event)=>{setKeyDraft(event.target.value);session.typeKey(event.target.value);},
-})),
-react.createElement("p",{className:"deg_mc_hint"},card.apiKey.hint),
-react.createElement("label",{className:"deg_mc_field"},
-react.createElement("span",{className:"deg_mc_field_label"},"Base URL"),
-react.createElement("input",{
-className:"deg_mc_input",
-type:"text",
-value:card.baseUrl.value,
-disabled,
-placeholder:card.baseUrl.placeholder,
-"data-deg-base-url":row.provider,
-"aria-label":card.displayName+" Base URL",
-onChange:(event)=>{
-const value=event.target.value;
-edit((draft)=>{
-const next={...draft};
-if(value.trim().length===0)Reflect.deleteProperty(next,"baseURL");
-else next.baseURL=value;
-return next;
-});
-},
-})),
-react.createElement("label",{className:"deg_mc_field"},
-react.createElement("span",{className:"deg_mc_field_label"},"协议"),
-react.createElement("select",{
-className:"deg_mc_select",
-value:card.protocol.value,
-disabled,
-"data-deg-protocol":row.provider,
-"aria-label":card.displayName+" 协议",
-onChange:(event)=>{
-const value=event.target.value;
-edit((draft)=>{
-const next={...draft};
-if(value.length===0)Reflect.deleteProperty(next,"api");
-else next.api=value;
-return next;
-});
-},
-},card.protocol.options.map((option)=>react.createElement("option",{key:option.value,value:option.value},option.label)))),
-react.createElement("div",{className:"deg_mc_models"},
-react.createElement("div",{className:"deg_mc_models_head"},
-react.createElement("span",{className:"deg_mc_models_title"},"模型"),
-react.createElement("span",{className:"deg_mc_models_meta"},card.modelCatalog.label),
-card.modelCatalog.canReset
-?react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled,
-"data-deg-reset-models":row.provider,
-onClick:()=>{
-session.resetModels();
-setDraftRevision((value)=>value+1);
-setExpandedRows(new Set());
-setFetchState(null);
-setSaved(false);
-setError(null);
-},
-},"恢复默认")
+"data-deg-create-api-key":"true",
+"aria-label":"自定义 provider API Key",
+onChange:(event)=>edit({apiKey:event.target.value}),
+}),
+react.createElement("span",{className:"deg_mc_hint"},"API Key 只写入 credentials 服务，不进入 settings 快照，保存后不回显明文。")),
+renderCustomProviderModelSection(context),
+config.isNonEmptyString(fetchState?.error)
+?react.createElement("p",{className:"deg_mc_error",role:"alert","data-deg-create-fetch-error":"true"},fetchState.error)
 :null,
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled:disabled||card.actions.fetchModels==="disabled",
-"data-deg-fetch-models":row.provider,
-onClick:()=>{void fetchModels();},
-},"获取模型")),
-card.models.length===0
-?react.createElement("p",{className:"deg_mc_hint"},card.modelCatalog.emptyHint)
-:react.createElement("div",{className:"deg_mc_model"},modelRows),
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled,
-"data-deg-add-model":row.provider,
-onClick:()=>edit((draft)=>({...draft,models:config.appendModelRow(session.modelRows)})),
-},"添加模型"),
-fetchState?.error===null||fetchState?.error===undefined
+card.error===null||card.modelsError===card.error
 ?null
-:react.createElement("p",{className:"deg_mc_error",role:"alert"},fetchState.error)
-),
-error===null?null:react.createElement("p",{className:"deg_mc_error",role:"alert","data-deg-card-error":row.provider},error),
-conflict
-?react.createElement("div",{className:"deg_mc_conflict"},
-react.createElement("p",{className:"deg_mc_error"},"配置冲突：本卡片的修改未提交。"),
-react.createElement("div",{className:"deg_mc_conflict_actions"},
+:react.createElement("p",{className:"deg_mc_error",role:"alert","data-deg-create-card-error":"true"},card.error),
+react.createElement("div",{className:"deg_mc_create_footer"},
+react.createElement("span",{className:"deg_mc_status deg_settings_status",role:"status"},
+card.submitted?"配置已保存":""),
 react.createElement("button",{
 type:"button",
 className:"deg_btn",
-disabled:saving,
-onClick:async()=>{
-await host.refreshSettingsView();
-cancel();
-},
-},"重新打开（加载最新配置）")))
-:null,
-react.createElement("div",{className:"deg_mc_card_footer"},
-react.createElement("span",{className:"deg_mc_status deg_settings_status",role:"status"},saved?"已保存":""),
-react.createElement("button",{type:"button",className:"deg_btn",disabled:saving,onClick:()=>{setOpen(false);cancel();}},"取消"),
+disabled:saving||fetching,
+"data-deg-create-cancel":"true",
+onClick:()=>{onClose(draft.settingsCommitted);},
+},"取消"),
 react.createElement("button",{
 type:"button",
 className:"deg_btn deg_btn_primary",
 disabled,
-"data-deg-apply":row.provider,
-onClick:()=>{void apply();},
-},saving?"应用中…":"应用")),
+"data-deg-create-submit":"true",
+onClick:()=>{void submit();},
+},saving?"创建中…":(card.submitted?"重试保存 API Key":"创建")),
 fetchState!==null&&Array.isArray(fetchState.candidates)
 ?react.createElement(ModelDiscoveryDialog,{
 candidates:fetchState.candidates,
@@ -14039,142 +18131,16 @@ onQueryChange:setCandidateQuery,
 onToggle:toggleCandidate,
 onToggleVisible:toggleVisibleCandidates,
 onClose:closeModelPicker,
-onAdopt:adoptPicked,
+onAdopt:adoptFetchedModels,
 })
-:null);
+:null));
 }
-let modelDiscoveryTitleSeq=0;
-let removeConfirmSeq=0;
-function focusableDialogControls(scope){
-const nodes=Array.from(scope?.querySelectorAll?.("[data-deg-dialog-action]")??[]);
-return nodes.filter((node)=>{
-if(node===null||typeof node!=="object")return false;
-if(node.disabled===true)return false;
-if(node.hidden===true)return false;
-if(typeof node.getAttribute!=="function")return true;
-if(node.getAttribute("aria-disabled")==="true")return false;
-if(node.getAttribute("aria-hidden")==="true")return false;
-return true;
-});
-}
-function clearsAllCandidateSelection(candidates,visibleIds){
-const list=Array.isArray(candidates)?candidates:[];
-const wanted=visibleIds instanceof Set?visibleIds:new Set();
-const visible=list.filter((candidate)=>wanted.has(candidate?.id));
-return visible.length>0&&visible.every((candidate)=>candidate.picked===true);
-}
-function ModelDiscoveryDialog({candidates,query,onQueryChange,onToggle,onToggleVisible,onClose,onAdopt}){
-const source=Array.isArray(candidates)?candidates:[];
-const[titleId]=react.useState(()=>{
-modelDiscoveryTitleSeq+=1;
-return"deg-model-discovery-title-"+String(modelDiscoveryTitleSeq);
-});
-const dialogRef=react.useRef(null);
-const restoreTargetRef=react.useRef(typeof document==="undefined"?null:document.activeElement??null);
-react.useEffect(()=>()=>{
-const target=restoreTargetRef.current;
-try{
-if(target!==null&&typeof target?.focus==="function")target.focus();
-}catch{/* 焦点不可用时保持弹窗关闭语义，不抛出。 */}
-},[]);
-const normalizedQuery=typeof query==="string"?query.trim().toLowerCase():"";
-const visible=normalizedQuery.length===0
-?source
-:source.filter((candidate)=>{
-const id=typeof candidate?.id==="string"?candidate.id:"";
-const name=typeof candidate?.name==="string"?candidate.name:"";
-return id.toLowerCase().includes(normalizedQuery)||name.toLowerCase().includes(normalizedQuery);
-});
-const visibleIds=new Set(visible.map((candidate)=>candidate?.id));
-const clearsAll=clearsAllCandidateSelection(source,visibleIds);
-const pickedCount=source.filter((candidate)=>candidate.picked===true).length;
-const handleKeyDown=(event)=>{
-if(event?.key==="Escape"){
-event.preventDefault?.();
-event.stopPropagation?.();
-onClose();
-return;
-}
-if(event?.key!=="Tab")return;
-const controls=focusableDialogControls(dialogRef.current);
-if(controls.length===0)return;
-const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
-const nextIndex=event.shiftKey
-?(current<=0?controls.length-1:current-1)
-:(current>=controls.length-1?0:current+1);
-event.preventDefault?.();
-try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击控件。 */}
-};
-const list=visible.length===0
-?react.createElement("p",{className:"deg_mc_candidate_empty",role:"status"},"没有匹配的模型")
-:react.createElement("ul",{className:"deg_mc_candidate_list"},visible.map((candidate)=>(
-react.createElement("li",{key:candidate.id,className:"deg_mc_candidate_item"},
-react.createElement("label",{className:"deg_mc_candidate_label"},
-react.createElement("input",{
-type:"checkbox",
-checked:candidate.picked===true,
-"data-deg-create-candidate":candidate.id,
-"data-deg-dialog-action":"candidate",
-"aria-label":"选择模型 "+candidate.id,
-onChange:()=>onToggle(candidate.id),
-}),
-react.createElement("span",{className:"deg_mc_candidate_id"},candidate.id))))));
-return react.createElement("div",{
-className:"deg_mc_modal_backdrop",
-onClick:()=>onClose(),
-},
-react.createElement("div",{
-className:"deg_mc_modal",
-role:"dialog",
-"aria-modal":"true",
-"aria-labelledby":titleId,
-ref:dialogRef,
-onKeyDown:handleKeyDown,
-onClick:(event)=>event?.stopPropagation?.(),
-},
-react.createElement("div",{className:"deg_mc_modal_header"},
-react.createElement("h3",{className:"deg_mc_modal_title",id:titleId},"选择要添加的模型"),
-react.createElement("button",{
-type:"button",
-className:"deg_mc_modal_close",
-"aria-label":"关闭",
-"data-deg-dialog-action":"close",
-autoFocus:true,
-onClick:onClose,
-},"×")),
-react.createElement("p",{className:"deg_mc_modal_description"},"以下是模型提供方的可用模型，勾选要添加的模型。"),
-react.createElement("div",{className:"deg_mc_candidate_toolbar"},
-react.createElement("input",{
-className:"deg_mc_input deg_mc_candidate_search",
-type:"search",
-value:query,
-placeholder:"搜索模型",
-"aria-label":"搜索模型",
-"data-deg-dialog-action":"search",
-onChange:(event)=>onQueryChange(event.target.value),
-}),
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled:visible.length===0,
-"data-deg-dialog-action":"toggle-visible",
-onClick:()=>onToggleVisible(visible.map((candidate)=>candidate.id)),
-},clearsAll?"取消全选":"全选")),
-list,
-react.createElement("div",{className:"deg_mc_modal_footer"},
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-"data-deg-dialog-action":"cancel",
-onClick:onClose,
-},"取消"),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_btn_primary",
-disabled:pickedCount===0,
-"data-deg-dialog-action":"adopt",
-onClick:onAdopt,
-},"添加所选"))));
+function renderFieldMessage(config,card,key){
+return config.isNonEmptyString(card[key]?.error)?react.createElement(
+"span",
+{className:"deg_mc_field_message",role:"alert","data-deg-create-error":key},
+card[key].error,
+):null;
 }
 function CustomProviderCard({draft,protocols,host,onClose,onCreated,pageWritable,profileBasePath,directoryRows,liveRevision,fenceState}){
 const[fetching,setFetching]=react.useState(false);
@@ -14371,249 +18337,21 @@ return false;
 setSaving(false);
 }
 };
-const fieldMessage=(key)=>(config.isNonEmptyString(card[key]?.error)?react.createElement(
-"span",
-{className:"deg_mc_field_message",role:"alert","data-deg-create-error":key},
-card[key].error,
-):null);
-return react.createElement("div",{className:"deg_mc_create","data-deg-custom-provider":"true"},
-react.createElement("div",{className:"deg_mc_create_head"},
-react.createElement("span",{className:"deg_mc_create_title"},card.title)),
-react.createElement("label",{className:"deg_mc_field_row"},
-react.createElement("span",{className:"deg_mc_field_label"},"路由 ID"),
-react.createElement("input",{
-className:"deg_mc_input"+(card.routeId.error===null?"":" deg_mc_field_error"),
-type:"text",
-value:card.routeId.value,
-disabled:profileDisabled,
-placeholder:"例如 my-gateway",
-"data-deg-create-route":"true",
-"aria-label":"自定义 provider 路由 ID",
-onChange:(event)=>edit({routeId:event.target.value}),
-}),
-card.routeId.credentialRef.length===0
-?null
-:react.createElement("span",{className:"deg_mc_hint"},"凭据引用："+card.routeId.credentialRef),
-fieldMessage("routeId")),
-react.createElement("label",{className:"deg_mc_field_row"},
-react.createElement("span",{className:"deg_mc_field_label"},"显示名"),
-react.createElement("input",{
-className:"deg_mc_input"+(card.displayName.error===null?"":" deg_mc_field_error"),
-type:"text",
-value:card.displayName.value,
-disabled:profileDisabled,
-placeholder:"留空则使用路由 ID",
-"data-deg-create-name":"true",
-"aria-label":"自定义 provider 显示名",
-onChange:(event)=>edit({displayName:event.target.value}),
-}),
-fieldMessage("displayName")),
-react.createElement("label",{className:"deg_mc_field_row"},
-react.createElement("span",{className:"deg_mc_field_label"},"Base URL"),
-react.createElement("input",{
-className:"deg_mc_input"+(card.baseUrl.error===null?"":" deg_mc_field_error"),
-type:"text",
-value:card.baseUrl.value,
-disabled:profileDisabled,
-placeholder:card.baseUrl.placeholder,
-"data-deg-create-base-url":"true",
-"aria-label":"自定义 provider Base URL",
-onChange:(event)=>edit({baseURL:event.target.value}),
-}),
-fieldMessage("baseUrl")),
-react.createElement("label",{className:"deg_mc_field_row"},
-react.createElement("span",{className:"deg_mc_field_label"},"协议"),
-react.createElement("select",{
-className:"deg_mc_select"+(card.protocol.error===null?"":" deg_mc_field_error"),
-value:card.protocol.value,
-disabled:profileDisabled,
-"data-deg-create-protocol":"true",
-"aria-label":"自定义 provider 协议",
-onChange:(event)=>edit({api:event.target.value}),
-},
-react.createElement("option",{value:""},"选择协议"),
-card.protocol.options.map((option)=>react.createElement("option",{key:option.value,value:option.value},option.label))),
-fieldMessage("api")),
-react.createElement("label",{className:"deg_mc_field_row"},
-react.createElement("span",{className:"deg_mc_field_label"},"API Key"),
-react.createElement("input",{
-className:"deg_mc_input",
-type:card.apiKey.type,
-autoComplete:card.apiKey.autoComplete,
-value:card.apiKey.value,
-disabled:disabled||card.apiKey.disabled,
-placeholder:card.apiKey.placeholder,
-"data-deg-create-api-key":"true",
-"aria-label":"自定义 provider API Key",
-onChange:(event)=>edit({apiKey:event.target.value}),
-}),
-react.createElement("span",{className:"deg_mc_hint"},"API Key 只写入 credentials 服务，不进入 settings 快照，保存后不回显明文。")),
-react.createElement("div",{className:"deg_mc_models"},
-react.createElement("div",{className:"deg_mc_models_head"},
-react.createElement("span",{className:"deg_mc_models_title"},"模型"),
-react.createElement("span",{className:"deg_mc_models_meta"},"至少配置一个模型"),
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled:!canFetchModels||fetching,
-"data-deg-create-fetch-models":"true",
-onClick:()=>{void fetchModels();},
-},fetching?"获取中…":"获取可用模型")),
-card.models.length===0
-?react.createElement("p",{className:"deg_mc_hint"},"还没有模型。")
-:react.createElement("div",{className:"deg_mc_model"},card.models.map((model)=>react.createElement("div",{
-key:"create-model-"+String(model.index),
-className:"deg_mc_model",
-"data-deg-create-model-index":model.index,
-},
-react.createElement("div",{className:"deg_mc_model_main"},
-react.createElement("input",{
-className:"deg_mc_input",
-type:"text",
-value:model.id.value,
-placeholder:"模型 ID",
-disabled:profileDisabled,
-"data-deg-create-model-id":model.index,
-"aria-label":"自定义 provider 模型 ID "+String(model.position),
-onChange:(event)=>patchRow(model.index,{id:event.target.value}),
-}),
-react.createElement("input",{
-className:"deg_mc_input",
-type:"text",
-value:model.name.value,
-placeholder:"显示名",
-disabled:profileDisabled,
-"aria-label":"自定义 provider 模型显示名 "+String(model.position),
-onChange:(event)=>patchRow(model.index,{name:event.target.value}),
-}),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_mc_icon_btn",
-"aria-label":"模型高级设置 "+String(model.position),
-"aria-expanded":model.advancedOpen,
-onClick:()=>toggleRow(model.index),
-},model.advancedOpen?"▾":"▸"),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_mc_icon_btn",
-"aria-label":"删除模型 "+String(model.position),
-disabled:profileDisabled,
-onClick:()=>setModels(config.removeModelRow(modelRows,model.index)),
-},"✕")),
-model.advancedOpen?react.createElement("div",{className:"deg_mc_model_advanced"},
-react.createElement("label",{className:"deg_mc_field"},
-react.createElement("span",{className:"deg_mc_field_label"},"上下文窗口"),
-react.createElement("input",{
-className:"deg_mc_input",
-type:"text",
-inputMode:"numeric",
-value:model.contextWindow.value,
-placeholder:model.contextWindow.placeholder,
-disabled:profileDisabled,
-"aria-label":"上下文窗口 "+String(model.position),
-onChange:(event)=>patchRow(model.index,{contextWindow:config.parseCapacity(event.target.value)}),
-})),
-react.createElement("label",{className:"deg_mc_field"},
-react.createElement("span",{className:"deg_mc_field_label"},"最大输出 token"),
-react.createElement("input",{
-className:"deg_mc_input",
-type:"text",
-inputMode:"numeric",
-value:model.maxTokens.value,
-placeholder:model.maxTokens.placeholder,
-disabled:profileDisabled,
-"aria-label":"最大输出 token "+String(model.position),
-onChange:(event)=>patchRow(model.index,{maxTokens:config.parseCapacity(event.target.value)}),
-})),
-react.createElement("fieldset",{className:"deg_mc_efforts"},
-react.createElement("legend",{className:"deg_mc_efforts_label"},"思考档位（可多选）"),
-react.createElement("div",{className:"deg_mc_efforts_row"},
-model.efforts.map((effort)=>react.createElement("label",{
-key:effort.level,
-className:"deg_mc_effort",
-},react.createElement("input",{
-type:"checkbox",
-checked:effort.checked,
-disabled:profileDisabled,
-"data-deg-effort":effort.level,
-"data-deg-model-index":model.index,
-"aria-label":"模型 "+String(model.position)+" 思考档位 "+effort.level,
-onChange:()=>{
-const selection=config.effortSelectionFor(modelRows[model.index]);
-setModels(config.setModelEffortSelection(
-modelRows,
-model.index,
-{...selection,[effort.level]:selection[effort.level]!==true},
-));
-},
-}),react.createElement("span",null,effort.level))))),
-react.createElement("fieldset",{className:"deg_mc_efforts"},
-react.createElement("legend",{className:"deg_mc_efforts_label"},"输入类型"),
-react.createElement("div",{className:"deg_mc_input_types"},
-model.inputs.map((input)=>react.createElement("label",{
-key:input.modality,
-className:"deg_mc_effort",
-},react.createElement("input",{
-type:"checkbox",
-checked:input.checked,
-disabled:profileDisabled||input.locked===true,
-"data-deg-input":input.modality,
-"data-deg-model-index":model.index,
-"aria-label":"模型 "+String(model.position)+" 输入类型 "+input.modality,
-onChange:()=>{
-const selected=config.modelInputOf(modelRows[model.index],schemaInfo.defaultInput);
-const next=selected.includes(input.modality)
-?selected.filter((value)=>value!==input.modality)
-:[...selected,input.modality];
-setModels(config.setModelInputSelection(modelRows,model.index,next));
-},
-}),react.createElement("span",null,input.modality))))))
-:null))),
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled:profileDisabled,
-"data-deg-create-add-model":"true",
-onClick:()=>setModels(config.appendModelRow(modelRows)),
-},"添加模型"),
-config.isNonEmptyString(card.modelsError)
-?react.createElement("p",{className:"deg_mc_error",role:"alert","data-deg-create-error":"models"},card.modelsError)
-:null),
-config.isNonEmptyString(fetchState?.error)
-?react.createElement("p",{className:"deg_mc_error",role:"alert","data-deg-create-fetch-error":"true"},fetchState.error)
-:null,
-card.error===null||card.modelsError===card.error
-?null
-:react.createElement("p",{className:"deg_mc_error",role:"alert","data-deg-create-card-error":"true"},card.error),
-react.createElement("div",{className:"deg_mc_create_footer"},
-react.createElement("span",{className:"deg_mc_status deg_settings_status",role:"status"},
-card.submitted?"配置已保存":""),
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled:saving||fetching,
-"data-deg-create-cancel":"true",
-onClick:()=>{onClose(draft.settingsCommitted);},
-},"取消"),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_btn_primary",
-disabled,
-"data-deg-create-submit":"true",
-onClick:()=>{void submit();},
-},saving?"创建中…":(card.submitted?"重试保存 API Key":"创建")),
-fetchState!==null&&Array.isArray(fetchState.candidates)
-?react.createElement(ModelDiscoveryDialog,{
-candidates:fetchState.candidates,
-query:candidateQuery,
-onQueryChange:setCandidateQuery,
-onToggle:toggleCandidate,
-onToggleVisible:toggleVisibleCandidates,
-onClose:closeModelPicker,
-onAdopt:adoptFetchedModels,
-})
-:null));
+return renderCustomProviderCard({
+card,config,schemaInfo,draft,profileDisabled,disabled,saving,fetching,canFetchModels,
+fetchModels,edit,patchRow,toggleRow,setModels,modelRows,fetchState,candidateQuery,
+setCandidateQuery,toggleCandidate,toggleVisibleCandidates,closeModelPicker,adoptFetchedModels,
+onClose,submit,
+});
 }
+global[SYMBOL]=Object.freeze({
+CustomProviderCard,bindClientRuntime,
+});
+})(globalThis);
+/* source: client-focus-return.js */
+(function installClientFocusReturn(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-focus-return");
 const REMOVE_FOCUS_TARGET_SELECTORS=Object.freeze([
 '[data-deg-add-provider="true"]',
 '[data-deg-model-config-toggle="true"]',
@@ -14746,6 +18484,212 @@ const target=pickRemoveFocusTarget(scope);
 if(target===null)return;
 target.focus();
 }catch{/* 焦点不可用时保持删除结果不变。 */}
+}
+global[SYMBOL]=Object.freeze({
+removeFocusDocument,readFocusedElement,closestRemoveFocusScope,isUsableRemoveFocusTarget,pickRemoveFocusTarget,observeRemoveFocusIntent,createRemoveFocusObservationLedger,restoreRemoveFocus,
+});
+})(globalThis);
+/* source: client-model-section.js */
+(function installClientModelSection(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-model-section");
+const clientModelViewsASymbol=Symbol.for("dsh-expert-group/client-model-views-a");
+const clientModelViewsA=global[clientModelViewsASymbol]||{};
+const clientModelViewsBSymbol=Symbol.for("dsh-expert-group/client-model-views-b");
+const clientModelViewsB=global[clientModelViewsBSymbol]||{};
+const clientProviderCardSymbol=Symbol.for("dsh-expert-group/client-provider-card");
+const clientProviderCard=global[clientProviderCardSymbol]||{};
+const clientFocusReturnSymbol=Symbol.for("dsh-expert-group/client-focus-return");
+const clientFocusReturn=global[clientFocusReturnSymbol]||{};
+const clientModelConfigHostSymbol=Symbol.for("dsh-expert-group/client-model-config-host");
+const clientModelConfigHost=global[clientModelConfigHostSymbol]||{};
+const{ModelConfigDisclosure,ModelProviderCard}=clientModelViewsA;
+const{focusableDialogControls}=clientModelViewsB;
+const{CustomProviderCard}=clientProviderCard;
+const{
+removeFocusDocument,readFocusedElement,closestRemoveFocusScope,isUsableRemoveFocusTarget,
+pickRemoveFocusTarget,observeRemoveFocusIntent,createRemoveFocusObservationLedger,restoreRemoveFocus,
+}=clientFocusReturn;
+const{CUSTOM_PROFILE_BASE_PATH,CUSTOM_PROVIDER_NS,CUSTOM_ROUTE_PROBE}=clientModelConfigHost;
+let react=null;
+function bindClientRuntime(host){
+react=host.react??null;
+}
+let removeConfirmSeq=0;
+function renderRemoveConfirmDialog(removeIntent,handlers){
+const{dialogRef,onCancel,onConfirm}=handlers;
+if(removeIntent===null)return null;
+return react.createElement("div",{
+className:"deg_prompt_dialog_backdrop",
+onClick:()=>onCancel(),
+},
+react.createElement("div",{
+className:"deg_prompt_dialog",
+role:"dialog",
+"aria-modal":"true",
+"aria-label":"删除 provider 确认",
+ref:dialogRef,
+onClick:(event)=>event?.stopPropagation?.(),
+onKeyDown:(event)=>{
+if(removeIntent.phase==="running")return;
+if(event?.key==="Escape"){
+event.preventDefault?.();
+event.stopPropagation?.();
+onCancel();
+return;
+}
+if(event?.key!=="Tab")return;
+const controls=focusableDialogControls(dialogRef.current??event?.currentTarget??null);
+if(controls.length===0)return;
+const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
+const nextIndex=event.shiftKey
+?(current<=0?controls.length-1:current-1)
+:(current>=controls.length-1?0:current+1);
+event.preventDefault?.();
+try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
+},
+},
+react.createElement("h3",null,"删除 provider"),
+react.createElement("p",null,"确定删除 provider「"+removeIntent.label+"」及其配置吗？"),
+removeIntent.error===null?null:react.createElement("p",{
+className:"deg_remove_confirm_error",
+role:"alert",
+"aria-live":"assertive",
+},removeIntent.error),
+react.createElement("div",{className:"deg_prompt_dialog_actions"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+"data-deg-dialog-action":"cancel",
+"data-deg-remove-cancel":"true",
+autoFocus:true,
+disabled:removeIntent.phase==="running",
+onClick:()=>onCancel(),
+},"取消"),
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+"data-deg-dialog-action":"confirm",
+"data-deg-remove-confirm":"true",
+disabled:removeIntent.phase==="running",
+onClick:()=>{void onConfirm();},
+},removeIntent.phase==="running"?"删除中…":"删除"))));
+}
+function renderModelConfigBody(context){
+const{
+section,directory,settingsError,editableRows,viewRevision,configured,host,
+roleDefaults,roleLabelOf,load,openRemoveConfirm,adding,addChoice,addable,
+setSettingsError,setAdding,setAddChoice,customOpen,customDraft,customProtocols,
+pageWritable,customNamespace,customFence,setCustomOpen,setCustomDraft,openCustomProvider,
+}=context;
+return section.open?react.createElement("div",{className:"deg_mc_body",id:section.disclosure.bodyId},
+react.createElement("p",{className:"deg_settings_hint"},section.hint),
+directory.status==="error"?react.createElement("p",{className:"deg_mc_error",role:"alert"},directory.error):null,
+settingsError===null?null:react.createElement("p",{className:"deg_mc_error",role:"alert"},settingsError),
+directory.status==="ready"&&editableRows.length===0
+?react.createElement("p",{className:"deg_mc_hint"},"当前宿主没有可配置的 provider。")
+:null,
+react.createElement("ul",{className:"deg_mc_cards","data-deg-view-revision":viewRevision},
+configured.map((row)=>react.createElement(ModelProviderCard,{
+key:row.provider+"#"+String(viewRevision),
+row,
+namespace:host.namespaceView(row.settingsNs),
+host,
+roleLabels:{defaults:roleDefaults,labelOf:roleLabelOf},
+onSaved:()=>{void load();},
+onRemove:(event)=>openRemoveConfirm(row,event),
+}))),
+react.createElement("div",{className:"deg_mc_add"},
+adding
+?react.createElement(react.Fragment,null,
+react.createElement("select",{
+className:"deg_mc_select",
+value:addChoice,
+"aria-label":"选择要添加的 provider",
+disabled:directory.status!=="ready",
+onChange:(event)=>setAddChoice(event.target.value),
+},
+react.createElement("option",{value:""},"选择 provider"),
+addable.map((row)=>react.createElement("option",{key:row.provider,value:row.provider},row.displayName))),
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+disabled:addChoice===""||directory.status!=="ready",
+"data-deg-confirm-add-provider":"true",
+onClick:async()=>{
+const row=addable.find((candidate)=>candidate.provider===addChoice);
+if(row===undefined)return;
+const written=await host.writeNamespace({
+ns:row.settingsNs,
+ops:[{op:"set",path:[...row.settingsPath],value:{}}],
+expectedRevision:host.namespaceView(row.settingsNs)?.revision,
+});
+if(!written.ok){
+setSettingsError(written.message);
+return;
+}
+setAdding(false);
+setAddChoice("");
+await load();
+},
+},"添加"),
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+onClick:()=>{setAdding(false);setAddChoice("");},
+},"取消"))
+:react.createElement("div",{className:"deg_mc_entries"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled:section.actions.addProvider==="disabled",
+"data-deg-add-provider":"true",
+onClick:()=>{setAdding(true);setCustomOpen(false);},
+},section.entries.addProvider.label),
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled:section.actions.addCustom==="disabled",
+"data-deg-add-custom-provider":"true",
+onClick:openCustomProvider,
+},section.entries.addCustom.label))),
+customOpen&&customDraft!==null
+?react.createElement(CustomProviderCard,{
+draft:customDraft,
+protocols:customProtocols,
+host,
+pageWritable,
+profileBasePath:[...CUSTOM_PROFILE_BASE_PATH],
+directoryRows:directory.rows,
+liveRevision:customNamespace?.revision,
+fenceState:customFence.current,
+onClose:(committed)=>{
+setCustomOpen(false);
+setCustomDraft(null);
+if(committed===true)void load();
+},
+onCreated:()=>{
+setCustomOpen(false);
+setCustomDraft(null);
+void load();
+},
+})
+:null,
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+disabled:section.actions.reload==="disabled",
+"data-deg-reload-providers":"true",
+onClick:()=>{void load();},
+},directory.status==="loading"?"读取中…":"重新读取 provider 目录"))
+:null;
+}
+function renderModelConfigSection(context){
+const{section,body,open,removeConfirmDialog,setOpen}=context;
+return react.createElement("div",{className:"deg_mc_section"},
+react.createElement(ModelConfigDisclosure,{section,onToggle:()=>setOpen((value)=>!value)}),
+body,
+open?removeConfirmDialog:null);
 }
 function ModelConfigSection({host,roleDefaults,roleLabelOf}){
 const config=host.config;
@@ -14983,1489 +18927,36 @@ observation?.dispose();
 removeFocusObservations.current?.delete(observation);
 }
 };
-const body=section.open?react.createElement("div",{className:"deg_mc_body",id:section.disclosure.bodyId},
-react.createElement("p",{className:"deg_settings_hint"},section.hint),
-directory.status==="error"?react.createElement("p",{className:"deg_mc_error",role:"alert"},directory.error):null,
-settingsError===null?null:react.createElement("p",{className:"deg_mc_error",role:"alert"},settingsError),
-directory.status==="ready"&&editableRows.length===0
-?react.createElement("p",{className:"deg_mc_hint"},"当前宿主没有可配置的 provider。")
-:null,
-react.createElement("ul",{className:"deg_mc_cards","data-deg-view-revision":viewRevision},
-configured.map((row)=>react.createElement(ModelProviderCard,{
-key:row.provider+"#"+String(viewRevision),
-row,
-namespace:host.namespaceView(row.settingsNs),
-host,
-roleLabels:{defaults:roleDefaults,labelOf:roleLabelOf},
-onSaved:()=>{void load();},
-onRemove:(event)=>openRemoveConfirm(row,event),
-}))),
-react.createElement("div",{className:"deg_mc_add"},
-adding
-?react.createElement(react.Fragment,null,
-react.createElement("select",{
-className:"deg_mc_select",
-value:addChoice,
-"aria-label":"选择要添加的 provider",
-disabled:directory.status!=="ready",
-onChange:(event)=>setAddChoice(event.target.value),
-},
-react.createElement("option",{value:""},"选择 provider"),
-addable.map((row)=>react.createElement("option",{key:row.provider,value:row.provider},row.displayName))),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_btn_primary",
-disabled:addChoice===""||directory.status!=="ready",
-"data-deg-confirm-add-provider":"true",
-onClick:async()=>{
-const row=addable.find((candidate)=>candidate.provider===addChoice);
-if(row===undefined)return;
-const written=await host.writeNamespace({
-ns:row.settingsNs,
-ops:[{op:"set",path:[...row.settingsPath],value:{}}],
-expectedRevision:host.namespaceView(row.settingsNs)?.revision,
+const body=renderModelConfigBody({
+section,directory,settingsError,editableRows,viewRevision,configured,host,
+roleDefaults,roleLabelOf,load,openRemoveConfirm,adding,addChoice,addable,
+setSettingsError,setAdding,setAddChoice,customOpen,customDraft,customProtocols,
+pageWritable,customNamespace,customFence,setCustomOpen,setCustomDraft,openCustomProvider,
 });
-if(!written.ok){
-setSettingsError(written.message);
-return;
-}
-setAdding(false);
-setAddChoice("");
-await load();
-},
-},"添加"),
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-onClick:()=>{setAdding(false);setAddChoice("");},
-},"取消"))
-:react.createElement("div",{className:"deg_mc_entries"},
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled:section.actions.addProvider==="disabled",
-"data-deg-add-provider":"true",
-onClick:()=>{setAdding(true);setCustomOpen(false);},
-},section.entries.addProvider.label),
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled:section.actions.addCustom==="disabled",
-"data-deg-add-custom-provider":"true",
-onClick:openCustomProvider,
-},section.entries.addCustom.label))),
-customOpen&&customDraft!==null
-?react.createElement(CustomProviderCard,{
-draft:customDraft,
-protocols:customProtocols,
-host,
-pageWritable,
-profileBasePath:[...CUSTOM_PROFILE_BASE_PATH],
-directoryRows:directory.rows,
-liveRevision:customNamespace?.revision,
-fenceState:customFence.current,
-onClose:(committed)=>{
-setCustomOpen(false);
-setCustomDraft(null);
-if(committed===true)void load();
-},
-onCreated:()=>{
-setCustomOpen(false);
-setCustomDraft(null);
-void load();
-},
-})
-:null,
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled:section.actions.reload==="disabled",
-"data-deg-reload-providers":"true",
-onClick:()=>{void load();},
-},directory.status==="loading"?"读取中…":"重新读取 provider 目录"))
-:null;
-const removeConfirmDialog=removeIntent===null?null:react.createElement("div",{
-className:"deg_prompt_dialog_backdrop",
-onClick:()=>cancelRemoveConfirm(),
-},
-react.createElement("div",{
-className:"deg_prompt_dialog",
-role:"dialog",
-"aria-modal":"true",
-"aria-label":"删除 provider 确认",
-ref:removeDialogRef,
-onClick:(event)=>event?.stopPropagation?.(),
-onKeyDown:(event)=>{
-if(removeIntent.phase==="running")return;
-if(event?.key==="Escape"){
-event.preventDefault?.();
-event.stopPropagation?.();
-cancelRemoveConfirm();
-return;
-}
-if(event?.key!=="Tab")return;
-const controls=focusableDialogControls(removeDialogRef.current??event?.currentTarget??null);
-if(controls.length===0)return;
-const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
-const nextIndex=event.shiftKey
-?(current<=0?controls.length-1:current-1)
-:(current>=controls.length-1?0:current+1);
-event.preventDefault?.();
-try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
-},
-},
-react.createElement("h3",null,"删除 provider"),
-react.createElement("p",null,"确定删除 provider「"+removeIntent.label+"」及其配置吗？"),
-removeIntent.error===null?null:react.createElement("p",{
-className:"deg_remove_confirm_error",
-role:"alert",
-"aria-live":"assertive",
-},removeIntent.error),
-react.createElement("div",{className:"deg_prompt_dialog_actions"},
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-"data-deg-dialog-action":"cancel",
-"data-deg-remove-cancel":"true",
-autoFocus:true,
-disabled:removeIntent.phase==="running",
-onClick:()=>cancelRemoveConfirm(),
-},"取消"),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_btn_primary",
-"data-deg-dialog-action":"confirm",
-"data-deg-remove-confirm":"true",
-disabled:removeIntent.phase==="running",
-onClick:()=>{void confirmRemoveProvider();},
-},removeIntent.phase==="running"?"删除中…":"删除"))));
-return react.createElement("div",{className:"deg_mc_section"},
-react.createElement(ModelConfigDisclosure,{section,onToggle:()=>setOpen((value)=>!value)}),
-body,
-open?removeConfirmDialog:null);
-}
-function DshExpertGroupSettings({settingsForm,modelCatalog,modelConfigHost,ctx}){
-const subscribe=react.useMemo(()=>settingsForm.subscribe.bind(settingsForm),[settingsForm]);
-const getSnapshot=react.useMemo(()=>settingsForm.getSnapshot.bind(settingsForm),[settingsForm]);
-const settingsSnapshot=react.useSyncExternalStore(subscribe,getSnapshot);
-const catalogSubscribe=react.useMemo(()=>modelCatalog.subscribe.bind(modelCatalog),[modelCatalog]);
-const catalogGetSnapshot=react.useMemo(()=>modelCatalog.getSnapshot.bind(modelCatalog),[modelCatalog]);
-const directoryState=react.useSyncExternalStore(catalogSubscribe,catalogGetSnapshot);
-const[hostMeta,refreshHostMeta,hostMetaError]=useHostMeta(ctx);
-const roles=useEnabledSettingsRoles(hostMeta);
-const uiLocale=resolveSettingsLocale(ctx);
-const t=(key,vars)=>settingsText(uiLocale,key,vars);
-const tExtra=(key,vars)=>settingsExtraText(uiLocale,key,vars);
-const roleLabelOf=(role)=>{
-const label=hostMeta?.roleLabels?.[role];
-return typeof label==="string"&&label.length>0?label:(SETTINGS_ROLE_LABELS[role]??role);
-};
-const promptRoleIds=react.useMemo(()=>{
-const declared=hostMeta?.rolePrompts?.roles;
-if(!Array.isArray(declared))return PROMPT_ROLE_IDS;
-const roles=declared.filter((role)=>typeof role==="string"&&role.length>0);
-return roles.length>0?roles:PROMPT_ROLE_IDS;
-},[hostMeta]);
-const hostPromptProjection=react.useMemo(
-()=>normalizeRolePromptProjection(hostMeta?.rolePrompts,settingsSnapshot.value,true,promptRoleIds),
-[hostMeta,settingsSnapshot.value,promptRoleIds],
-);
-react.useEffect(()=>{
-void modelCatalog.load();
-},[modelCatalog]);
-const[draft,setDraft]=react.useState(()=>normalizeSettingsDraft(settingsSnapshot.value,roles));
-const[candidatesError,setCandidatesError]=react.useState(null);
-const[selectedModelPage,setSelectedModelPage]=react.useState(0);
-const[modelTabDrag,setModelTabDrag]=react.useState(null);
-const[modelPageDeleteIntent,setModelPageDeleteIntent]=react.useState(null);
-const modelTabRefs=react.useRef({});
-const modelTabDragRef=react.useRef(null);
-const modelTabSuppressClickRef=react.useRef(false);
-const modelPageDeleteCancelRef=react.useRef(null);
-const[dirty,setDirty]=react.useState(false);
-const[saving,setSaving]=react.useState(false);
-const[error,setError]=react.useState(null);
-const[saved,setSaved]=react.useState(false);
-const[selectedPromptRole,setSelectedPromptRole]=react.useState(null);
-const[promptDrafts,setPromptDrafts]=react.useState(()=>({}));
-const[promptTouched,setPromptTouched]=react.useState({});
-const[promptError,setPromptError]=react.useState(null);
-const[localPromptProjection,setLocalPromptProjection]=react.useState(null);
-const[editorBaseline,setEditorBaseline]=react.useState(null);
-const[settingsConflict,setSettingsConflict]=react.useState(null);
-const[externalSettingsChanged,setExternalSettingsChanged]=react.useState(false);
-const[leaveIntent,setLeaveIntent]=react.useState(null);
-const leaveTriggerRef=react.useRef(null);
-const leaveCancelRef=react.useRef(null);
-const[notificationEventsOpen,setNotificationEventsOpen]=react.useState(false);
-const notificationEventsRootRef=react.useRef(null);
-const notificationEventsTriggerRef=react.useRef(null);
-const notificationEventsPanelRef=react.useRef(null);
-const promptProjection=localPromptProjection!==null
-&&Number.isSafeInteger(localPromptProjection.revision)
-&&localPromptProjection.revision>settingsSnapshot.revision
-?localPromptProjection.projection
-:hostPromptProjection;
-const baselineProjection=editorBaseline?.role===selectedPromptRole
-?editorBaseline.projection
-:promptProjection;
-const promptMaxGraphemes=baselineProjection?.maxGraphemes??DEFAULT_PROMPT_MAX_GRAPHEMES;
-const settingsReadOnly=settingsSnapshot.writable!==true;
-const promptLoading=hostMeta===null&&hostMetaError===null;
-const promptTextOf=(role)=>{
-if(Object.prototype.hasOwnProperty.call(promptDrafts,role))return promptDrafts[role];
-return promptEntryOf(baselineProjection,role)?.effective??"";
-};
-const promptTouchedRoles=Object.keys(promptTouched).filter((role)=>promptRoleIds.includes(role));
-const promptDirty=baselineProjection!==null&&promptRoleIds.some((role)=>{
-if(!Object.prototype.hasOwnProperty.call(promptTouched,role))return false;
-const entry=promptEntryOf(baselineProjection,role);
-return entry!==null&&promptTextOf(role)!==entry.effective;
+const removeConfirmDialog=renderRemoveConfirmDialog(removeIntent,{
+dialogRef:removeDialogRef,onCancel:cancelRemoveConfirm,onConfirm:confirmRemoveProvider,
 });
-const committedAuthorityRef=react.useRef(null);
-const committedSnapshotLagging=committedAuthorityRef.current!==null
-&&Number.isSafeInteger(committedAuthorityRef.current.revision)
-&&(!Number.isSafeInteger(settingsSnapshot.revision)
-||settingsSnapshot.revision<committedAuthorityRef.current.revision);
-const authorityValue=committedSnapshotLagging?committedAuthorityRef.current.value:settingsSnapshot.value;
-const sourcePromptOverrides=normalizePromptOverrides(authorityValue?.promptOverrides,promptMaxGraphemes,promptRoleIds);
-const localDraft=normalizeSettingsDraft(draft,roles,false);
-const sourceDraftForDirty=normalizeSettingsDraft(authorityValue,roles,false);
-const settingsDirty=!settingsDraftEqual(localDraft,sourceDraftForDirty);
-const hasUnsavedChanges=settingsDirty||promptDirty;
-const editorHasUnsavedChanges=hasUnsavedChanges;
-const sourceDraftForSave=normalizeSettingsDraft(authorityValue,roles);
-const editorEntryValue=selectedPromptRole!==null&&editorBaseline?.role===selectedPromptRole
-?editorBaseline.value
-:authorityValue;
-const editorEntryDraft=normalizeSettingsDraft(editorEntryValue,roles,false);
-const effectiveDraft=selectedPromptRole!==null
-?mergeSettingsDraftOverSource(sourceDraftForSave,localDraft,editorEntryDraft)
-:localDraft;
-const modelFieldsChanged=react.useMemo(()=>{
-if(!settingsDraftEqual(effectiveDraft.defaults,sourceDraftForSave.defaults))return true;
-return unifiedProviderOf(effectiveDraft.defaults,roles,effectiveDraft.provider)
-!==unifiedProviderOf(sourceDraftForSave.defaults,roles,sourceDraftForSave.provider);
-},[effectiveDraft,sourceDraftForSave,roles]);
-react.useEffect(()=>{
-if(dirty)return;
-if(committedSnapshotLagging)return;
-setDraft(normalizeSettingsDraft(authorityValue,roles));
-setPromptDrafts({});
-setPromptTouched({});
-setPromptError(null);
-setCandidatesError(null);
-},[dirty,settingsSnapshot.value,settingsSnapshot.revision,roles,promptMaxGraphemes,committedSnapshotLagging,authorityValue]);
-react.useEffect(()=>{
-if(selectedPromptRole===null||editorBaseline?.role!==selectedPromptRole)return;
-if(editorBaseline.projection===null&&hostPromptProjection!==null){
-setEditorBaseline((previous)=>previous?.role===selectedPromptRole&&previous.projection===null
-?{...previous,projection:hostPromptProjection}
-:previous);
-return;
+return renderModelConfigSection({section,body,open,removeConfirmDialog,setOpen});
 }
-if(Number.isSafeInteger(localPromptProjection?.revision)
-&&localPromptProjection.revision>settingsSnapshot.revision)return;
-if(!Number.isSafeInteger(settingsSnapshot.revision))return;
-if(settingsSnapshot.revision===editorBaseline.revision)return;
-if(Number.isSafeInteger(editorBaseline.revision)&&settingsSnapshot.revision<editorBaseline.revision)return;
-if(hasUnsavedChanges||dirty){
-setExternalSettingsChanged(true);
-return;
-}
-const refreshedProjection=hostPromptProjection;
-if(refreshedProjection===null){
-setExternalSettingsChanged(true);
-return;
-}
-setLocalPromptProjection(null);
-setEditorBaseline({
-role:selectedPromptRole,
-value:settingsSnapshot.value,
-revision:settingsSnapshot.revision,
-projection:refreshedProjection,
+global[SYMBOL]=Object.freeze({
+ModelConfigSection,bindClientRuntime,
 });
-setDraft(normalizeSettingsDraft(settingsSnapshot.value,roles));
-setPromptDrafts({});
-setPromptTouched({});
-setDirty(false);
-setSaved(false);
-setError(null);
-setPromptError(null);
-setSettingsConflict(null);
-setExternalSettingsChanged(false);
-},[selectedPromptRole,editorBaseline,localPromptProjection,settingsSnapshot.revision,settingsSnapshot.value,hostPromptProjection,hasUnsavedChanges,dirty,roles]);
-react.useEffect(()=>{
-if(selectedPromptRole===null||!editorHasUnsavedChanges)return;
-const target=typeof globalThis?.addEventListener==="function"
-?globalThis
-:(typeof globalThis?.window?.addEventListener==="function"?globalThis.window:null);
-if(target===null)return;
-const onBeforeUnload=(event)=>{
-event.preventDefault?.();
-event.returnValue="";
-return"";
-};
-target.addEventListener("beforeunload",onBeforeUnload);
-return()=>target.removeEventListener?.("beforeunload",onBeforeUnload);
-},[selectedPromptRole,editorHasUnsavedChanges]);
-react.useEffect(()=>{
-if(!notificationEventsOpen)return undefined;
-const restoreTriggerFocus=()=>{
-try{notificationEventsTriggerRef.current?.focus?.();}catch{/* 无 DOM 的宿主忽略 */}
-};
-const closeAndRestoreFocus=()=>{
-setNotificationEventsOpen(false);
-restoreTriggerFocus();
-};
-const onPointerDown=(event)=>{
-const root=notificationEventsRootRef.current;
-const target=event?.target;
-if(root!==null&&root!==void 0&&typeof root.contains==="function"
-&&target!==null&&target!==void 0&&root.contains(target))return;
-closeAndRestoreFocus();
-};
-const onKeyDown=(event)=>{
-if(event?.key!=="Escape")return;
-event.preventDefault?.();
-closeAndRestoreFocus();
-};
-const doc=typeof document==="undefined"?null:document;
-if(doc===null||typeof doc.addEventListener!=="function")return undefined;
-doc.addEventListener("mousedown",onPointerDown);
-doc.addEventListener("keydown",onKeyDown);
-return()=>{
-doc.removeEventListener?.("mousedown",onPointerDown);
-doc.removeEventListener?.("keydown",onKeyDown);
-};
-},[notificationEventsOpen]);
-react.useEffect(()=>{
-if(!notificationEventsOpen)return;
-const panel=notificationEventsPanelRef.current;
-if(panel===null||panel===void 0||typeof panel.querySelector!=="function")return;
-try{panel.querySelector("input[type=checkbox]")?.focus?.();}catch{/* 忽略不可聚焦的宿主 */}
-},[notificationEventsOpen]);
-const editDraft=(update)=>{
-setDirty(true);
-setSaved(false);
-setError(null);
-setPromptError(null);
-setDraft((previous)=>update(previous));
-};
-const captureEditorBaseline=(role)=>{
-if(role===null)return null;
-return{
-role,
-value:settingsSnapshot.value,
-revision:Number.isSafeInteger(settingsSnapshot.revision)&&settingsSnapshot.revision>=0
-?settingsSnapshot.revision
-:null,
-projection:promptProjection,
-};
-};
-const applyPromptNavigation=(role)=>{
-setSelectedPromptRole(role);
-setEditorBaseline(captureEditorBaseline(role));
-setPromptDrafts({});
-setPromptTouched({});
-setDirty(false);
-setSaved(false);
-setError(null);
-setPromptError(null);
-};
-const requestPromptNavigation=(role,trigger)=>{
-if(editorHasUnsavedChanges){
-leaveTriggerRef.current=trigger?.currentTarget??(typeof document==="undefined"?null:document.activeElement);
-setLeaveIntent({kind:"navigate",role});
-return;
-}
-applyPromptNavigation(role);
-};
-const openPrompt=(role,event)=>{
-if(!promptRoleIds.includes(role))return;
-if(selectedPromptRole!==null&&selectedPromptRole!==role){
-requestPromptNavigation(role,event);
-return;
-}
-setSelectedPromptRole(role);
-setEditorBaseline(captureEditorBaseline(role));
-setPromptError(null);
-setError(null);
-};
-const closePrompt=(event)=>requestPromptNavigation(null,event);
-const dismissLeaveDialog=()=>{
-setLeaveIntent(null);
-const trigger=leaveTriggerRef.current;
-leaveTriggerRef.current=null;
-try{trigger?.focus?.();}catch{/* 焦点恢复失败不应阻断编辑器。 */}
-};
-const editPromptText=(role,text)=>{
-const nextPromptDirty=baselineProjection!==null&&promptRoleIds.some((candidate)=>{
-const entry=promptEntryOf(baselineProjection,candidate);
-if(entry===null)return false;
-return(candidate===role?text:promptTextOf(candidate))!==entry.effective;
-});
-setPromptDrafts((previous)=>({...previous,[role]:text}));
-setPromptTouched((previous)=>({...previous,[role]:true}));
-setDirty(settingsDirty||nextPromptDirty);
-setSaved(false);
-setError(null);
-setPromptError(null);
-};
-const groups=Array.isArray(directoryState.groups)?directoryState.groups:[];
-const providerGroups=groups.filter((group)=>group&&typeof group.id==="string");
-const modelRowRoles=react.useMemo(()=>{
-const next=[...PROMPT_ROLE_IDS];
-for(const role of roles)if(!next.includes(role))next.push(role);
-return next;
-},[roles]);
-const catalogAvailable=directoryState.status==="ready"||groups.length>0;
-const modelPageCount=modelPageCountOf(draft);
-const currentModelPage=Math.min(selectedModelPage,modelPageCount-1);
-const currentModelLayer=modelLayerMapOf(draft,currentModelPage);
-const unifiedProvider=unifiedProviderOf(currentModelLayer,roles,currentModelPage===0?draft.provider:"");
-const modelPageLabelOf=(page)=>(page===0
-?tExtra("settings.modelTabs.primary")
-:tExtra("settings.modelTabs.candidate",{index:page}));
-const selectModelPage=(page)=>{
-if(modelTabSuppressClickRef.current===true)return;
-if(!Number.isSafeInteger(page)||page<0||page>=modelPageCount)return;
-setSelectedModelPage(page);
-};
-const addModelPage=()=>{
-if(saving||settingsReadOnly||modelPageCount>=MAX_MODEL_PAGES)return;
-const nextIndex=modelPageCount;
-editDraft((previous)=>addModelCandidatePage(previous));
-setSelectedModelPage(nextIndex);
-};
-const requestModelPageDelete=(page)=>{
-if(saving||settingsReadOnly||!Number.isSafeInteger(page)||page<1)return;
-setModelPageDeleteIntent({page});
-};
-const cancelModelPageDelete=()=>{
-setModelPageDeleteIntent(null);
-};
-const confirmModelPageDelete=()=>{
-const intent=modelPageDeleteIntent;
-if(intent===null)return;
-setModelPageDeleteIntent(null);
-editDraft((previous)=>removeModelCandidatePage(previous,intent.page));
-setSelectedModelPage((previous)=>(previous===intent.page
-?0
-:previous>intent.page?previous-1:previous));
-};
-const MODEL_TAB_DRAG_THRESHOLD=4;
-const modelTabDropIndexOf=(clientX)=>{
-const refs=modelTabRefs.current??{};
-for(let page=0;page<modelPageCount;page+=1){
-const element=refs[page];
-const rect=typeof element?.getBoundingClientRect==="function"?element.getBoundingClientRect():null;
-if(rect===null||rect===void 0)continue;
-const left=Number(rect.left);
-const width=Number(rect.width);
-if(!Number.isFinite(left)||!Number.isFinite(width)||width<=0)continue;
-if(Number(clientX)<left+width/2)return page;
-}
-return modelPageCount;
-};
-const beginModelTabDrag=(page,event)=>{
-if(saving||settingsReadOnly)return;
-if(event===null||typeof event!=="object")return;
-if(typeof event.button==="number"&&event.button!==0)return;
-const doc=typeof document==="undefined"?null:document;
-if(doc===null||typeof doc.addEventListener!=="function")return;
-const startX=Number(event.clientX);
-const startY=Number(event.clientY);
-if(!Number.isFinite(startX)||!Number.isFinite(startY))return;
-const session={page,startX,startY,active:false,dropIndex:page,detach:null};
-const onMove=(moveEvent)=>{
-const current=modelTabDragRef.current;
-if(current===null)return;
-const x=Number(moveEvent?.clientX);
-const y=Number(moveEvent?.clientY);
-if(!Number.isFinite(x)||!Number.isFinite(y))return;
-if(current.active!==true){
-if(Math.abs(x-current.startX)+Math.abs(y-current.startY)<MODEL_TAB_DRAG_THRESHOLD)return;
-current.active=true;
-modelTabSuppressClickRef.current=true;
-}
-moveEvent?.preventDefault?.();
-current.dropIndex=modelTabDropIndexOf(x);
-setModelTabDrag({page:current.page,dropIndex:current.dropIndex,active:true});
-};
-const onEnd=(endEvent)=>{
-const current=modelTabDragRef.current;
-modelTabDragRef.current=null;
-try{
-doc.removeEventListener("pointermove",onMove);
-doc.removeEventListener("pointerup",onEnd);
-doc.removeEventListener("pointercancel",onEnd);
-}catch{/* 监听清理失败不影响后续手势。 */}
-setModelTabDrag(null);
-if(current===null||current.active!==true){
-modelTabSuppressClickRef.current=false;
-return;
-}
-endEvent?.preventDefault?.();
-const from=current.page;
-const target=endEvent?.type==="pointercancel"
-?from
-:(current.dropIndex>from?current.dropIndex-1:current.dropIndex);
-if(target!==from){
-editDraft((previous)=>reorderModelLayers(previous,from,target));
-setSelectedModelPage(target);
-}
-if(typeof globalThis?.setTimeout==="function")globalThis.setTimeout(()=>{modelTabSuppressClickRef.current=false;},0);
-else modelTabSuppressClickRef.current=false;
-};
-doc.addEventListener("pointermove",onMove);
-doc.addEventListener("pointerup",onEnd);
-doc.addEventListener("pointercancel",onEnd);
-session.detach=()=>{
-doc.removeEventListener("pointermove",onMove);
-doc.removeEventListener("pointerup",onEnd);
-doc.removeEventListener("pointercancel",onEnd);
-};
-modelTabDragRef.current=session;
-};
-react.useEffect(()=>()=>{
-const session=modelTabDragRef.current;
-modelTabDragRef.current=null;
-try{session?.detach?.();}catch{/* 卸载路径不抛错。 */}
-},[]);
-react.useEffect(()=>{
-if(modelPageDeleteIntent===null)return;
-try{modelPageDeleteCancelRef.current?.focus?.();}catch{/* 不支持 focus 的嵌入宿主仍可键盘点击。 */}
-},[modelPageDeleteIntent]);
-const save=async({retry=false}={})=>{
-if(!hasUnsavedChanges||saving||settingsSnapshot.writable!==true)return false;
-if(modelFieldsChanged&&!catalogAvailable)return false;
-const source=sourceDraftForSave;
-const normalizedDraft=effectiveDraft;
-const sourceProvider=unifiedProviderOf(source.defaults,roles,source.provider);
-const draftProviderIntent=typeof effectiveDraft.provider==="string"?effectiveDraft.provider:"";
-const draftProvider=unifiedProviderOf(normalizedDraft.defaults,roles,draftProviderIntent);
-const modelChanged=modelFieldsChanged&&catalogAvailable;
-const candidatePromptOverrides={...sourcePromptOverrides};
-if(promptTouchedRoles.length>0){
-if(promptProjection===null){
-setPromptError(hostMetaError??"提示词配置加载中，请稍后重试");
-return false;
-}
-if(promptProjection.customizable!==true){
-setPromptError("当前提示词设置为只读");
-return false;
-}
-for(const role of promptTouchedRoles){
-const entry=promptEntryOf(baselineProjection,role);
-const text=promptTextOf(role);
-const validation=validatePromptText(text,promptMaxGraphemes);
-if(!validation.ok){
-setPromptError(roleLabelOf(role)+"："+validation.message);
-return false;
-}
-if(entry===null||typeof entry.defaultPersona!=="string"){
-setPromptError("提示词默认配置不可用，请刷新后重试");
-return false;
-}
-if(text===entry.defaultPersona)delete candidatePromptOverrides[role];
-else candidatePromptOverrides[role]=text;
-}
-}
-const sourceHasPromptOverrides=authorityValue!==null&&authorityValue!==void 0
-&&typeof authorityValue==="object"
-&&Object.prototype.hasOwnProperty.call(authorityValue,"promptOverrides");
-const promptChanged=!promptOverridesEqual(candidatePromptOverrides,sourcePromptOverrides);
-const includePromptOverrides=sourceHasPromptOverrides||promptTouchedRoles.length>0;
-const sourceCandidates=normalizeModelCandidatesDraft(authorityValue?.candidates);
-const candidateCandidates=compactModelCandidatesDraft(normalizeModelCandidatesDraft(normalizedDraft.candidates));
-const candidatesChanged=!settingsDraftEqual(candidateCandidates,sourceCandidates);
-if(candidatesChanged){
-const validation=validateModelCandidateRows(candidateCandidates);
-if(validation.ok!==true){setCandidatesError(modelCandidatesErrorMessage(tExtra,roleLabelOf,validation));return false;}
-}
-const sourceFallbackLimit=source.fallbackLimit;
-const candidateFallbackLimit=normalizedDraft.fallbackLimit;
-const fallbackLimitChanged=candidateFallbackLimit!==void 0&&candidateFallbackLimit!==sourceFallbackLimit;
-const candidate={
-...normalizedDraft,
-provider:modelChanged?draftProvider:sourceProvider,
-...(modelChanged?{}:{defaults:source.defaults}),
-...(includePromptOverrides?{promptOverrides:candidatePromptOverrides}:{}),
-...(candidatesChanged?{candidates:candidateCandidates}:{}),
-...(fallbackLimitChanged
-?{fallbackLimit:typeof candidateFallbackLimit==="number"?candidateFallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT}
-:{}),
-};
-if(!candidatesChanged)delete candidate.candidates;
-if(!fallbackLimitChanged)delete candidate.fallbackLimit;
-const ops=[];
-if(modelChanged){
-ops.push({op:"set",path:["provider"],value:candidate.provider});
-ops.push({op:"set",path:["defaults"],value:candidate.defaults});
-}
-if(candidate.notificationEnabled!==source.notificationEnabled){
-ops.push({op:"set",path:["notificationEnabled"],value:candidate.notificationEnabled});
-}
-if(candidate.notificationVolume!==source.notificationVolume){
-ops.push({op:"set",path:["notificationVolume"],value:candidate.notificationVolume});
-}
-if(!settingsDraftEqual(candidate.notificationEvents,source.notificationEvents)){
-ops.push({op:"set",path:["notificationEvents"],value:candidate.notificationEvents});
-}
-if(candidate.observerPreferred!==source.observerPreferred){
-ops.push({op:"set",path:["observerPreferred"],value:candidate.observerPreferred});
-}
-if(candidate.roleConcurrencyLimit!==source.roleConcurrencyLimit){
-ops.push({op:"set",path:["roleConcurrencyLimit"],value:candidate.roleConcurrencyLimit});
-}
-if(candidate.roleTimeoutMs!==source.roleTimeoutMs){
-ops.push({op:"set",path:["roleTimeoutMs"],value:candidate.roleTimeoutMs});
-}
-if(candidate.taskManagementEnabled!==source.taskManagementEnabled){
-ops.push({op:"set",path:["taskManagementEnabled"],value:candidate.taskManagementEnabled});
-}
-if(candidate.autoOpenSubagentSidebar!==source.autoOpenSubagentSidebar){
-ops.push({op:"set",path:["autoOpenSubagentSidebar"],value:candidate.autoOpenSubagentSidebar});
-}
-if(promptChanged){
-ops.push({op:"set",path:["promptOverrides"],value:candidatePromptOverrides});
-}
-const changed=[];
-if(modelChanged){
-if(candidate.provider!==sourceProvider)changed.push("provider");
-for(const role of Object.keys(candidate.defaults)){
-if(!settingsDraftEqual(candidate.defaults[role],source.defaults[role]))changed.push("defaults."+role);
-}
-for(const role of Object.keys(source.defaults)){
-if(!Object.prototype.hasOwnProperty.call(candidate.defaults,role))changed.push("defaults."+role);
-}
-}
-for(const op of ops){
-const field=op.path[0];
-if(field==="defaults"||field==="provider")continue;
-changed.push(field);
-}
-if(candidatesChanged){
-changed.push("candidates");
-for(const role of new Set([...Object.keys(candidateCandidates),...Object.keys(sourceCandidates)])){
-if(!settingsDraftEqual(candidateCandidates[role]??null,sourceCandidates[role]??null))changed.push("candidates."+role);
-}
-}
-if(fallbackLimitChanged)changed.push("fallbackLimit");
-const expectedRevision=retry===true||selectedPromptRole===null||!Number.isSafeInteger(editorBaseline?.revision)
-?settingsSnapshot.revision
-:editorBaseline.revision;
-setSaving(true);
-setSaved(false);
-setError(null);
-setPromptError(null);
-try{
-let accepted;
-let committed=null;
-if(ops.length>0||candidatesChanged||fallbackLimitChanged){
-committed=await commitSettingsCandidate(candidate,expectedRevision,globalThis.fetch,ctx?.connection,roles,changed);
-accepted=committed.settings;
-}else{
-accepted=normalizeSettingsCommitDraft(settingsForm.getSnapshot().value,roles);
-}
-const acceptedPromptOverrides=normalizePromptOverrides(
-Object.prototype.hasOwnProperty.call(accepted??{},"promptOverrides")
-?{...candidatePromptOverrides,...accepted.promptOverrides}
-:candidatePromptOverrides,
-promptMaxGraphemes,
-promptRoleIds,
-);
-const acceptedDraft=accepted!==null&&typeof accepted==="object"?{...accepted}:accepted;
-if(acceptedDraft!==null&&typeof acceptedDraft==="object"){
-const keepNewField=(field,hadField,value)=>{
-if(Object.prototype.hasOwnProperty.call(acceptedDraft,field))return;
-if(hadField!==true)return;
-acceptedDraft[field]=value;
-};
-keepNewField("candidates",
-candidatesChanged||Object.prototype.hasOwnProperty.call(source,"candidates"),
-candidatesChanged?candidateCandidates:sourceCandidates);
-keepNewField("fallbackLimit",
-fallbackLimitChanged||Object.prototype.hasOwnProperty.call(source,"fallbackLimit"),
-fallbackLimitChanged
-?(typeof candidateFallbackLimit==="number"?candidateFallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT)
-:sourceFallbackLimit);
-}
-setDraft(acceptedDraft);
-setPromptDrafts({});
-setPromptTouched({});
-setCandidatesError(null);
-const committedRevision=Number.isSafeInteger(committed?.revision)
-?committed.revision
-:settingsSnapshot.revision;
-committedAuthorityRef.current={revision:committedRevision,value:acceptedDraft};
-const responseProjection=normalizeRolePromptProjection(committed?.rolePrompts,accepted,true,promptRoleIds);
-let acceptedProjection=responseProjection??promptProjection;
-if(acceptedProjection!==null){
-for(const role of promptTouchedRoles){
-const entry=promptEntryOf(acceptedProjection,role);
-const text=Object.prototype.hasOwnProperty.call(acceptedPromptOverrides,role)
-?acceptedPromptOverrides[role]
-:entry?.defaultPersona??promptTextOf(role);
-acceptedProjection=updateRolePromptProjection(acceptedProjection,role,text);
-}
-setLocalPromptProjection({revision:committedRevision,projection:acceptedProjection});
-}
-if(selectedPromptRole!==null){
-setEditorBaseline({
-role:selectedPromptRole,
-value:acceptedDraft,
-revision:committedRevision,
-projection:acceptedProjection??editorBaseline?.projection??null,
-});
-}
-setSettingsConflict(null);
-setExternalSettingsChanged(false);
-setDirty(false);
-setSaved(true);
-return true;
-}catch(cause){
-const message=cause instanceof Error?cause.message:String(cause);
-setError(message);
-if(cause?.code==="settings-conflict"){
-setSettingsConflict({revision:cause.currentRevision,message});
-}
-if(promptTouchedRoles.length>0)setPromptError(message);
-return false;
-}finally{
-setSaving(false);
-}
-};
-const discard=()=>{
-const snapshot=settingsForm.getSnapshot();
-const refreshedProjection=normalizeRolePromptProjection(hostMeta?.rolePrompts,authorityValue,true,promptRoleIds)??promptProjection;
-setDraft(normalizeSettingsDraft(authorityValue,roles));
-setCandidatesError(null);
-setPromptDrafts({});
-setPromptTouched({});
-if(selectedPromptRole!==null&&refreshedProjection!==null){
-setEditorBaseline({
-role:selectedPromptRole,
-value:authorityValue,
-revision:Number.isSafeInteger(committedAuthorityRef.current?.revision)&&committedSnapshotLagging
-?committedAuthorityRef.current.revision
-:(Number.isSafeInteger(snapshot.revision)?snapshot.revision:null),
-projection:refreshedProjection,
-});
-}
-setDirty(false);
-setSaved(false);
-setError(null);
-setPromptError(null);
-setSettingsConflict(null);
-setExternalSettingsChanged(false);
-};
-const loadLatestPromptSettings=()=>{
-const snapshot=settingsForm.getSnapshot();
-if(settingsConflict?.revision!==undefined
-&&(!Number.isSafeInteger(snapshot.revision)||snapshot.revision<settingsConflict.revision)){
-setPromptError("最新配置尚未到达，请稍后再加载");
-return;
-}
-const projection=normalizeRolePromptProjection(hostMeta?.rolePrompts,snapshot.value,true,promptRoleIds)??promptProjection;
-if(selectedPromptRole===null||projection===null){
-setPromptError("最新提示词配置不可用，请稍后重试");
-return;
-}
-setLocalPromptProjection(null);
-setDraft(normalizeSettingsDraft(snapshot.value,roles));
-setPromptDrafts({});
-setPromptTouched({});
-setEditorBaseline({role:selectedPromptRole,value:snapshot.value,revision:snapshot.revision,projection});
-setDirty(false);
-setSaved(false);
-setError(null);
-setPromptError(null);
-setSettingsConflict(null);
-setExternalSettingsChanged(false);
-};
-const retryPromptSave=async()=>{
-if(settingsConflict?.revision!==undefined
-&&(!Number.isSafeInteger(settingsSnapshot.revision)||settingsSnapshot.revision<settingsConflict.revision)){
-setPromptError("最新配置尚未到达，请先加载最新配置");
-return false;
-}
-return save({retry:true});
-};
-const restorePromptDefault=()=>{
-const role=selectedPromptRole;
-const entry=promptEntryOf(baselineProjection,role);
-if(role===null||entry===null||settingsReadOnly||saving||baselineProjection?.customizable!==true)return;
-if(promptDirty){
-leaveTriggerRef.current=typeof document==="undefined"?null:document.activeElement;
-setLeaveIntent({kind:"restore-default",role});
-return;
-}
-editPromptText(role,entry.defaultPersona);
-};
-if(settingsSnapshot.status==="loading"){
-return react.createElement("div",{className:"deg_settings"},
-selectedPromptRole===null?null:react.createElement("button",{
-type:"button",
-className:"deg_btn deg_prompt_back",
-"aria-label":"返回专家列表",
-onClick:closePrompt,
-},"返回专家列表"),
-react.createElement("p",{className:"deg_settings_status",role:"status","aria-live":"polite"},"正在读取设置…"));
-}
-if(settingsSnapshot.status==="unavailable"){
-return react.createElement("div",{className:"deg_settings"},
-selectedPromptRole===null?null:react.createElement("button",{
-type:"button",
-className:"deg_btn deg_prompt_back",
-"aria-label":"返回专家列表",
-onClick:closePrompt,
-},"返回专家列表"),
-react.createElement("p",{className:"deg_settings_error",role:"status"},"设置 namespace 不可用"));
-}
-const selectedPromptEntry=promptEntryOf(promptProjection,selectedPromptRole);
-const selectedPromptText=selectedPromptRole===null?"":promptTextOf(selectedPromptRole);
-const promptValidation=validatePromptText(selectedPromptText,promptMaxGraphemes);
-const promptCounterClass=promptValidation.count>promptMaxGraphemes
-?" deg_prompt_counter_error"
-:promptValidation.count>=promptMaxGraphemes*PROMPT_WARNING_RATIO
-?" deg_prompt_counter_warning"
-:"";
-const promptMetaMessage=hostMetaError
-??(promptProjection===null&&!promptLoading?"提示词配置不可用，请刷新后重试":null);
-const promptStatusMessage=promptMetaMessage
-??(settingsReadOnly?"当前设置为只读，可查看提示词但不能编辑或保存。":null);
-const promptValidationMessage=selectedPromptRole!==null&&!promptValidation.ok?promptValidation.message:null;
-const promptErrorMessage=promptError??promptValidationMessage??error??promptMetaMessage;
-const promptLabel=selectedPromptRole===null
-?"专家"
-:roleLabelOf(selectedPromptRole);
-const promptEditor=selectedPromptRole===null?null:react.createElement("div",{className:"deg_settings deg_settings_prompt_editor"},
-react.createElement("div",{className:"deg_prompt_header"},
-react.createElement("h2",{className:"deg_settings_title"},promptLabel)),
-react.createElement("label",{className:"deg_prompt_label",htmlFor:"deg-prompt-textarea-"+selectedPromptRole},"提示词"),
-promptProjection===null
-?react.createElement(react.Fragment,null,
-react.createElement("p",{className:"deg_prompt_status",role:"status","aria-live":"polite"},promptStatusMessage??"提示词配置加载中…"),
-promptLoading?null:react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled:saving,
-onClick:refreshHostMeta,
-},"重试加载提示词配置"))
-:react.createElement(react.Fragment,null,
-react.createElement("textarea",{
-id:"deg-prompt-textarea-"+selectedPromptRole,
-className:"deg_prompt_textarea",
-"data-deg-prompt-role":selectedPromptRole,
-"aria-label":promptLabel+"提示词",
-"aria-describedby":"deg-prompt-counter-"+selectedPromptRole
-+(promptErrorMessage===null?"":" deg-prompt-error-"+selectedPromptRole),
-"aria-invalid":!promptValidation.ok||promptErrorMessage!==null,
-value:selectedPromptText,
-disabled:settingsReadOnly||saving||promptProjection.customizable!==true,
-onChange:(event)=>{
-const text=typeof event?.target?.value==="string"?event.target.value:"";
-editPromptText(selectedPromptRole,text);
-},
-}),
-react.createElement("div",{
-id:"deg-prompt-counter-"+selectedPromptRole,
-className:"deg_prompt_counter"+promptCounterClass,
-role:"status",
-"aria-live":"polite",
-},String(promptValidation.count)+" / "+String(promptMaxGraphemes)),
-promptStatusMessage===null?null:react.createElement("p",{className:"deg_prompt_status",role:"status"},promptStatusMessage)),
-promptErrorMessage===null?null:react.createElement("p",{
-id:"deg-prompt-error-"+selectedPromptRole,
-className:"deg_settings_error",
-role:"alert",
-"aria-live":"assertive",
-},promptErrorMessage),
-externalSettingsChanged?react.createElement("p",{
-className:"deg_prompt_status",
-role:"status",
-"aria-live":"polite",
-},"配置已发生外部变化"):null,
-settingsConflict===null?null:react.createElement("div",{className:"deg_prompt_conflict",role:"alert"},
-react.createElement("p",{className:"deg_settings_error"},"保存遇到配置冲突，请选择下一步。"),
-react.createElement("div",{className:"deg_prompt_dialog_actions"},
-react.createElement("button",{type:"button",className:"deg_btn",disabled:saving,onClick:loadLatestPromptSettings},"加载最新配置"),
-react.createElement("button",{type:"button",className:"deg_btn deg_btn_primary",disabled:saving,onClick:retryPromptSave},"继续使用当前修改重试"))),
-react.createElement("div",{className:"deg_prompt_footer"},
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_prompt_back",
-"aria-label":"返回专家列表",
-disabled:saving,
-onClick:closePrompt,
-},"返回专家列表"),
-react.createElement("span",{className:"deg_prompt_status",role:"status","aria-live":"polite"},saved?"已保存":hasUnsavedChanges?"有未保存的修改":""),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_btn_primary",
-disabled:!hasUnsavedChanges||!promptValidation.ok||saving
-||settingsReadOnly||promptLoading||baselineProjection?.customizable!==true,
-onClick:save,
-},saving?"保存中…":"保存"),
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-disabled:saving||settingsReadOnly||promptLoading||promptProjection?.customizable!==true
-||selectedPromptEntry===null||selectedPromptText===selectedPromptEntry.defaultPersona,
-onClick:restorePromptDefault,
-},"恢复默认")));
-const leaveDialog=leaveIntent===null?null:react.createElement("div",{className:"deg_prompt_dialog_backdrop"},
-react.createElement("div",{
-className:"deg_prompt_dialog",
-role:"dialog",
-"aria-modal":"true",
-"aria-label":"未保存的修改",
-onKeyDown:(event)=>{
-if(event.key==="Escape"){
-event.preventDefault?.();
-dismissLeaveDialog();
-return;
-}
-if(event.key!=="Tab")return;
-const controls=Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]")??[]);
-if(controls.length===0)return;
-const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
-const nextIndex=event.shiftKey
-?(current<=0?controls.length-1:current-1)
-:(current>=controls.length-1?0:current+1);
-event.preventDefault?.();
-try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
-},
-},
-react.createElement("h3",null,"未保存的修改"),
-react.createElement("p",null,"离开前请选择如何处理当前草稿。"),
-react.createElement("div",{className:"deg_prompt_dialog_actions"},
-leaveIntent.kind==="restore-default"
-?react.createElement("button",{
-type:"button",
-className:"deg_btn deg_btn_primary",
-"data-deg-dialog-action":"restore",
-disabled:saving,
-onClick:()=>{
-const role=leaveIntent.role;
-const entry=promptEntryOf(baselineProjection,role);
-dismissLeaveDialog();
-if(entry!==null)editPromptText(role,entry.defaultPersona);
-},
-},"恢复默认")
-:react.createElement("button",{
-type:"button",
-className:"deg_btn deg_btn_primary",
-"data-deg-dialog-action":"save",
-disabled:saving,
-onClick:async()=>{
-const savedNow=await save();
-if(savedNow!==true)return;
-const intent=leaveIntent;
-dismissLeaveDialog();
-applyPromptNavigation(intent?.role??null);
-},
-},saving?"保存中…":"保存并离开"),
-leaveIntent.kind==="restore-default"?null:react.createElement("button",{
-type:"button",
-className:"deg_btn",
-"data-deg-dialog-action":"discard",
-disabled:saving,
-onClick:()=>{
-const intent=leaveIntent;
-discard();
-dismissLeaveDialog();
-applyPromptNavigation(intent?.role??null);
-},
-},"放弃修改"),
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-"data-deg-dialog-action":"cancel",
-autoFocus:true,
-ref:leaveCancelRef,
-onClick:dismissLeaveDialog,
-},"取消"))));
-react.useEffect(()=>{
-if(leaveIntent===null)return;
-try{leaveCancelRef.current?.focus?.();}catch{/* 不支持 focus 的嵌入宿主仍可键盘点击。 */}
-},[leaveIntent]);
-if(selectedPromptRole!==null)return react.createElement(react.Fragment,null,promptEditor,leaveDialog);
-const header=react.createElement(react.Fragment,null,
-react.createElement("span",{className:"deg_settings_table_head"},"专家"),
-react.createElement("span",{className:"deg_settings_table_head"},"供应商"),
-react.createElement("span",{className:"deg_settings_table_head"},"模型选择"),
-react.createElement("span",{className:"deg_settings_table_head"},"思考深度"));
-const rows=modelRowRoles.map((role)=>{
-const roleLabel=roleLabelOf(role);
-const roleEnabled=roles.includes(role);
-const selection=modelLayerSelectionOf(draft,role,currentModelPage);
-const rowProvider=typeof selection?.provider==="string"?selection.provider:"";
-const rowProviderGroup=providerGroups.find((group)=>group.id===rowProvider);
-const rowModels=rowProviderGroup?.models??[];
-const currentModel=rowModels.find((model)=>model.id===selection?.model);
-const providerOptions=[
-react.createElement("option",{key:"__empty-provider",value:""},"未选择供应商"),
-...(rowProvider&&rowProviderGroup===undefined
-?[react.createElement("option",{key:"__unavailable-provider",value:rowProvider,disabled:true},rowProvider+"（不可用）")]
-:[]),
-...providerGroups.map((group)=>react.createElement("option",{key:group.id,value:group.id},group.name??group.id)),
-];
-const modelOptions=[];
-if(!rowProvider){
-modelOptions.push(react.createElement("option",{key:"__provider",value:""},"先选择供应商"));
-}else{
-modelOptions.push(react.createElement("option",{key:"__empty",value:""},"未选择模型"));
-if(selection?.model&&currentModel===undefined){
-modelOptions.push(react.createElement("option",{key:"__unavailable",value:selection.model,disabled:true},selection.model+"（不可用）"));
-}
-for(const model of rowModels){
-modelOptions.push(react.createElement("option",{key:model.id,value:model.id},model.name??model.id));
-}
-}
-const reasoning=currentModel?.reasoning;
-const effortOptions=[];
-if(reasoning){
-effortOptions.push(react.createElement("option",{key:"__default",value:""},"模型默认"));
-for(const effort of reasoning.efforts??[]){
-effortOptions.push(react.createElement("option",{key:effort.id,value:effort.id},effort.name??effort.id));
-}
-}else{
-effortOptions.push(react.createElement("option",{key:"__unsupported",value:""},rowProvider?"模型无思考深度":"先选择模型"));
-}
-const updateProvider=(event)=>{
-const provider=event.target.value;
-editDraft((previous)=>{
-const current=modelLayerSelectionOf(previous,role,currentModelPage);
-const currentProvider=typeof current?.provider==="string"?current.provider:"";
-if(provider===currentProvider)return previous;
-if(currentModelPage===0){
-const next=!provider
-?null
-:(migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""});
-return{...setModelLayerSelection(previous,role,0,next),provider:""};
-}
-const next=!provider
-?{provider:"",model:""}
-:(migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""});
-return setModelLayerSelection(previous,role,currentModelPage,next);
-});
-};
-const updateModel=(event)=>{
-const modelId=event.target.value;
-editDraft((previous)=>{
-const current=modelLayerSelectionOf(previous,role,currentModelPage);
-const provider=typeof current?.provider==="string"?current.provider:"";
-if(!provider)return previous;
-if(!modelId){
-if(typeof current?.model==="string"&&current.model.length===0)return previous;
-return setModelLayerSelection(previous,role,currentModelPage,{provider,model:""});
-}
-const model=providerGroups.find((group)=>group.id===provider)?.models?.find((candidate)=>candidate.id===modelId);
-if(!model)return previous;
-const selected={provider,model:model.id};
-if(typeof model.reasoning?.defaultEffort==="string")selected.reasoningEffort=model.reasoning.defaultEffort;
-return setModelLayerSelection(previous,role,currentModelPage,selected);
-});
-};
-const updateReasoning=(event)=>{
-const effort=event.target.value;
-editDraft((previous)=>{
-const current=modelLayerSelectionOf(previous,role,currentModelPage);
-if(current===null||typeof current.model!=="string"||current.model.length===0)return previous;
-const next={...current};
-if(effort)next.reasoningEffort=effort;
-else delete next.reasoningEffort;
-if(next.reasoningEffort===current.reasoningEffort)return previous;
-return setModelLayerSelection(previous,role,currentModelPage,next);
-});
-};
-const promptEntryAvailable=promptRoleIds.includes(role);
-return react.createElement(react.Fragment,{key:role},
-react.createElement("div",{className:"deg_settings_table_cell deg_settings_role_cell"},
-promptEntryAvailable
-?react.createElement("button",{
-type:"button",
-className:"deg_settings_role_button",
-"data-deg-prompt-role":role,
-"aria-label":roleLabel+"提示词"
-+(promptEntryOf(promptProjection,role)?.customized===true?"（已自定义提示词）":""),
-"aria-pressed":selectedPromptRole===role,
-disabled:saving,
-onClick:(event)=>openPrompt(role,event),
-},
-react.createElement("span",null,roleLabel),
-promptEntryOf(promptProjection,role)?.customized===true
-?react.createElement("span",{
-className:"deg_settings_prompt_customized_dot",
-"aria-hidden":"true",
-})
-:null)
-:react.createElement("span",{className:"deg_settings_label","data-deg-role-label":role},roleLabel),
-),
-react.createElement("div",{className:"deg_settings_table_cell"},
-react.createElement("select",{
-className:"deg_settings_provider_select",
-"aria-label":roleLabel+" 供应商",
-value:rowProvider,
-disabled:saving||!catalogAvailable||!roleEnabled,
-onChange:updateProvider,
-},providerOptions)),
-react.createElement("div",{className:"deg_settings_table_cell"},
-react.createElement("select",{
-className:"deg_settings_model_select",
-"aria-label":roleLabel+" 模型选择",
-value:selection?.model??"",
-disabled:saving||!catalogAvailable||!roleEnabled||!rowProvider||rowProviderGroup===undefined,
-onChange:updateModel,
-},modelOptions)),
-react.createElement("div",{className:"deg_settings_table_cell"},
-react.createElement("select",{
-className:"deg_settings_effort_select",
-"aria-label":roleLabel+" 思考深度",
-value:selection?.reasoningEffort??"",
-disabled:saving||!catalogAvailable||!roleEnabled||reasoning===undefined||!selection?.model,
-onChange:updateReasoning,
-},effortOptions)));
-});
-const modelConfigSection=typeof modelConfigHost==="undefined"||modelConfigHost===null
-?null
-:react.createElement(ModelConfigSection,{
-host:modelConfigHost,
-roleDefaults:normalizeSettingsDraft(settingsSnapshot.value,roles).defaults,
-roleLabelOf,
-});
-const fallbackLimitDraft=Number.isSafeInteger(draft.fallbackLimit)?draft.fallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT;
-const notificationEventsEnabledCount=NOTIFICATION_EVENT_TYPES.filter(
-(type)=>draft.notificationEvents[type]===true,
-).length;
-const notificationEventsTriggerLabel=t("settings.notificationEvents")+" ("+notificationEventsEnabledCount+")";
-const modelTabChildren=[];
-for(let page=0;page<modelPageCount;page+=1){
-if(modelTabDrag?.active===true&&modelTabDrag.dropIndex===page){
-modelTabChildren.push(react.createElement("span",{
-key:"drop-"+page,
-className:"deg_settings_model_tab_drop",
-"data-deg-model-tab-drop":String(page),
-"aria-hidden":"true",
-}));
-}
-const label=modelPageLabelOf(page);
-const selected=page===currentModelPage;
-const dragging=modelTabDrag?.active===true&&modelTabDrag.page===page;
-modelTabChildren.push(react.createElement("div",{
-key:"page-"+page,
-ref:(node)=>{modelTabRefs.current[page]=node;},
-className:"deg_settings_model_tab",
-role:"tab",
-tabIndex:selected?0:-1,
-"aria-selected":selected,
-"data-deg-model-tab":page,
-"data-dragging":dragging?"true":void 0,
-title:label,
-onPointerDown:(event)=>beginModelTabDrag(page,event),
-onClick:()=>selectModelPage(page),
-onKeyDown:(event)=>{
-if(event?.key!=="Enter"&&event?.key!==" ")return;
-event.preventDefault?.();
-selectModelPage(page);
-},
-},
-react.createElement("span",{className:"deg_settings_model_tab_label"},label),
-page===0?null:react.createElement("button",{
-type:"button",
-className:"deg_settings_model_tab_remove",
-"data-deg-model-tab-remove":page,
-"aria-label":label+" "+tExtra("settings.modelTabs.remove"),
-disabled:saving||settingsReadOnly,
-onPointerDown:(event)=>event?.stopPropagation?.(),
-onClick:(event)=>{
-event?.stopPropagation?.();
-requestModelPageDelete(page);
-},
-},"×")));
-}
-if(modelTabDrag?.active===true&&modelTabDrag.dropIndex===modelPageCount){
-modelTabChildren.push(react.createElement("span",{
-key:"drop-end",
-className:"deg_settings_model_tab_drop",
-"data-deg-model-tab-drop":String(modelPageCount),
-"aria-hidden":"true",
-}));
-}
-modelTabChildren.push(react.createElement("button",{
-key:"add-page",
-type:"button",
-className:"deg_settings_model_tab_add",
-"data-deg-model-tab-add":"true",
-"aria-label":tExtra("settings.modelTabs.add"),
-title:modelPageCount>=MAX_MODEL_PAGES?tExtra("settings.modelTabs.limit"):tExtra("settings.modelTabs.add.title"),
-disabled:saving||settingsReadOnly||modelPageCount>=MAX_MODEL_PAGES,
-onClick:()=>addModelPage(),
-},"+"));
-const modelTabRow=react.createElement("div",{
-className:"deg_settings_model_tabs",
-"data-deg-model-tabs":"true",
-role:"tablist",
-"aria-label":tExtra("settings.modelTabs.primary")+" / "+tExtra("settings.modelTabs.candidate",{index:MAX_MODEL_CANDIDATES_PER_ROLE}),
-},modelTabChildren);
-const modelPageDeleteDialog=modelPageDeleteIntent===null?null:react.createElement("div",{
-className:"deg_prompt_dialog_backdrop",
-onClick:()=>cancelModelPageDelete(),
-},
-react.createElement("div",{
-className:"deg_prompt_dialog",
-role:"dialog",
-"aria-modal":"true",
-"aria-label":tExtra("settings.modelTabs.remove.title"),
-onClick:(event)=>event?.stopPropagation?.(),
-onKeyDown:(event)=>{
-if(event?.key==="Escape"){
-event.preventDefault?.();
-event.stopPropagation?.();
-cancelModelPageDelete();
-return;
-}
-if(event?.key!=="Tab")return;
-const controls=Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]")??[]);
-if(controls.length===0)return;
-const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
-const nextIndex=event.shiftKey
-?(current<=0?controls.length-1:current-1)
-:(current>=controls.length-1?0:current+1);
-event.preventDefault?.();
-try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
-},
-},
-react.createElement("h3",null,tExtra("settings.modelTabs.remove.title")),
-react.createElement("p",null,tExtra("settings.modelTabs.remove.message",{index:modelPageDeleteIntent.page})),
-react.createElement("div",{className:"deg_prompt_dialog_actions"},
-react.createElement("button",{
-type:"button",
-className:"deg_btn",
-"data-deg-dialog-action":"cancel",
-"data-deg-model-tab-delete-cancel":"true",
-autoFocus:true,
-ref:modelPageDeleteCancelRef,
-disabled:saving,
-onClick:()=>cancelModelPageDelete(),
-},"取消"),
-react.createElement("button",{
-type:"button",
-className:"deg_btn deg_btn_primary",
-"data-deg-dialog-action":"confirm",
-"data-deg-model-tab-delete-confirm":"true",
-disabled:saving,
-onClick:()=>confirmModelPageDelete(),
-},"删除"))));
-return react.createElement("div",{className:"deg_settings"},
-react.createElement("h2",{className:"deg_settings_title"},t("settings.title")),
-react.createElement("p",{className:"deg_settings_hint"},t("settings.hint")),
-modelConfigSection,
-react.createElement("div",{className:"deg_settings_row deg_settings_task_row"},
-react.createElement("label",{className:"deg_settings_checkbox"},
-react.createElement("input",{
-type:"checkbox",
-"aria-label":t("settings.taskManagement"),
-checked:draft.taskManagementEnabled,
-disabled:saving,
-onChange:(event)=>editDraft((previous)=>({...previous,taskManagementEnabled:event.target.checked})),
-}),
-react.createElement("span",{className:"deg_settings_label"},t("settings.taskManagement"))),
-react.createElement("label",{className:"deg_settings_checkbox",title:t("settings.autoTitle")},
-react.createElement("input",{
-type:"checkbox",
-"aria-label":t("settings.auto"),
-checked:draft.autoOpenSubagentSidebar,
-disabled:saving,
-onChange:(event)=>editDraft((previous)=>({...previous,autoOpenSubagentSidebar:event.target.checked===true})),
-}),
-react.createElement("span",{className:"deg_settings_label"},t("settings.auto")))),
-react.createElement("div",{className:"deg_settings_row deg_settings_notification_row"},
-react.createElement("label",{className:"deg_settings_checkbox"},
-react.createElement("input",{
-type:"checkbox",
-checked:draft.notificationEnabled,
-disabled:saving,
-onChange:(event)=>editDraft((previous)=>({...previous,notificationEnabled:event.target.checked})),
-}),
-react.createElement("span",{className:"deg_settings_label"},t("settings.notifications"))),
-react.createElement("div",{className:"deg_settings_control"},
-react.createElement("span",{className:"deg_settings_label"},t("settings.notificationVolume")),
-react.createElement("input",{
-id:"deg-settings-notification-volume-range",
-type:"range",min:0,max:100,step:1,
-"aria-label":t("settings.notificationVolume.range"),
-value:draft.notificationVolume,
-disabled:saving,
-onChange:(event)=>editDraft((previous)=>({...previous,notificationVolume:clampNotificationVolume(event.target.value)})),
-}),
-react.createElement("input",{
-id:"deg-settings-notification-volume-number",
-type:"number",min:0,max:100,step:1,
-"aria-label":t("settings.notificationVolume.number"),
-value:draft.notificationVolume,
-disabled:saving,
-onChange:(event)=>editDraft((previous)=>({...previous,notificationVolume:clampNotificationVolume(event.target.value)})),
-})),
-react.createElement("div",{className:"deg_settings_events_dropdown",ref:notificationEventsRootRef},
-react.createElement("button",{
-type:"button",
-className:"deg_settings_events_trigger",
-id:"deg-settings-notification-events-trigger",
-ref:notificationEventsTriggerRef,
-"aria-label":notificationEventsTriggerLabel,
-"aria-haspopup":"true",
-"aria-expanded":notificationEventsOpen?"true":"false",
-"aria-controls":"deg-settings-notification-events-panel",
-disabled:saving,
-onClick:()=>setNotificationEventsOpen((previous)=>!previous),
-},
-react.createElement("span",{className:"deg_settings_events_label"},t("settings.notificationEvents")),
-react.createElement("span",{className:"deg_settings_events_count","aria-hidden":"true"},"("+notificationEventsEnabledCount+")"),
-react.createElement("span",{className:"deg_settings_events_caret","aria-hidden":"true"},"▾")),
-notificationEventsOpen
-?react.createElement("div",{
-className:"deg_settings_events_panel",
-id:"deg-settings-notification-events-panel",
-ref:notificationEventsPanelRef,
-role:"group",
-"aria-label":t("settings.notificationEvents"),
-},NOTIFICATION_EVENT_TYPES.map((type)=>react.createElement("label",{key:type,className:"deg_settings_checkbox"},
-react.createElement("input",{
-type:"checkbox",
-"aria-label":t("settings.notificationEvent."+type+".aria"),
-checked:draft.notificationEvents[type]===true,
-disabled:saving,
-onChange:(event)=>editDraft((previous)=>({
-...previous,
-notificationEvents:{...previous.notificationEvents,[type]:event.target.checked===true},
-})),
-}),
-react.createElement("span",{className:"deg_settings_label"},t("settings.notificationEvent."+type)))))
-:null)),
-react.createElement("div",{className:"deg_settings_row deg_settings_unified_row"},
-react.createElement("div",{className:"deg_settings_provider_group"},
-react.createElement("label",{className:"deg_settings_label",htmlFor:"deg-settings-provider"},t("settings.unifiedProvider")),
-react.createElement("div",{className:"deg_settings_control"},
-react.createElement("select",{
-id:"deg-settings-provider",
-className:"deg_settings_provider_select",
-value:unifiedProvider,
-disabled:saving||!catalogAvailable,
-onChange:(event)=>editDraft((previous)=>{
-const provider=event.target.value;
-if(currentModelPage!==0){
-if(!provider)return previous;
-let next=previous;
-for(const role of settingsRolesForProvider(roles)){
-const current=modelLayerSelectionOf(next,role,currentModelPage);
-const migrated=migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""};
-next=setModelLayerSelection(next,role,currentModelPage,migrated);
-}
-return next;
-}
-if(!provider){
-const hasVisibleProvider=settingsRolesForProvider(roles).some((role)=>{
-const value=previous.defaults?.[role]?.provider;
-return typeof value==="string"&&value.length>0;
-});
-return hasVisibleProvider?{...previous,provider:""}:previous;
-}
-return{
-...previous,
-provider,
-defaults:syncSettingsDefaultsProvider(previous.defaults,provider,providerGroups,roles),
-};
-}),
-},
-react.createElement("option",{value:""},t("settings.noProvider")),
-providerGroups.map((group)=>react.createElement("option",{key:group.id,value:group.id},group.name??group.id))))),
-react.createElement("div",{className:"deg_settings_fallback_group"},
-react.createElement("label",{className:"deg_settings_label",htmlFor:"deg-settings-model-fallback-limit"},tExtra("settings.modelCandidates.fallbackLimit")),
-react.createElement("div",{className:"deg_settings_control"},
-react.createElement("input",{
-id:"deg-settings-model-fallback-limit",
-type:"number",min:0,max:MAX_MODEL_FALLBACK_LIMIT,step:1,inputMode:"numeric",
-"aria-label":tExtra("settings.modelCandidates.fallbackLimit"),
-title:tExtra("settings.modelCandidates.fallbackLimit.title"),
-value:draft.fallbackLimit===void 0?fallbackLimitDraft:draft.fallbackLimit,
-disabled:saving||settingsReadOnly,
-onChange:(event)=>{
-const raw=event.target.value;
-const number=raw===""?null:Number(raw);
-editDraft((previous)=>({...previous,fallbackLimit:raw===""?"":Number.isFinite(number)?Math.round(number):previous.fallbackLimit}));
-},
-})))),
-modelTabRow,
-react.createElement("div",{className:"deg_settings_table_wrap"},
-react.createElement("div",{className:"deg_settings_table"},header,rows)),
-react.createElement("div",{className:"deg_settings_row deg_settings_management_row"},
-react.createElement("label",{className:"deg_settings_checkbox"},
-react.createElement("input",{type:"checkbox","aria-label":t("settings.observerPreferred"),checked:draft.observerPreferred,disabled:saving,onChange:(event)=>editDraft((previous)=>({...previous,observerPreferred:event.target.checked}))}),
-react.createElement("span",{className:"deg_settings_label"},t("settings.observerPreferred"))),
-react.createElement("label",{className:"deg_settings_control",htmlFor:"deg-settings-role-concurrency-limit"},
-react.createElement("span",{className:"deg_settings_label"},t("settings.concurrencyLimit")),
-react.createElement("input",{
-id:"deg-settings-role-concurrency-limit",
-type:"number",
-"aria-label":t("settings.concurrencyLimit"),
-title:t("settings.concurrencyLimit.title"),
-min:1,
-max:64,
-step:1,
-inputMode:"numeric",
-value:draft.roleConcurrencyLimit,
-disabled:saving,
-onChange:(event)=>{
-const raw=event.target.value;
-const number=raw===""?null:Number(raw);
-editDraft((previous)=>({
-...previous,
-roleConcurrencyLimit:raw===""
-?""
-:Number.isFinite(number)?number:previous.roleConcurrencyLimit,
-}));
-},
-})),
-react.createElement("label",{className:"deg_settings_control",htmlFor:"deg-settings-role-timeout-ms"},
-react.createElement("span",{className:"deg_settings_label"},t("settings.roleTimeout")),
-react.createElement("input",{
-id:"deg-settings-role-timeout-ms",
-type:"number",
-"aria-label":t("settings.roleTimeout.aria"),
-title:t("settings.roleTimeout.title"),
-min:0,
-max:86400,
-step:1,
-inputMode:"numeric",
-value:draft.roleTimeoutMs===""?"":draft.roleTimeoutMs/1000,
-disabled:saving,
-onChange:(event)=>{
-const raw=event.target.value;
-const seconds=raw===""?null:Number(raw);
-editDraft((previous)=>({
-...previous,
-roleTimeoutMs:raw===""
-?""
-:Number.isFinite(seconds)?Math.round(seconds)*1000:previous.roleTimeoutMs,
-}));
-},
-}))),
-candidatesError===null||candidatesError===void 0?null:react.createElement("p",{
-className:"deg_settings_error",
-role:"alert",
-"data-deg-model-candidates-error":"true",
-},candidatesError),
-directoryState.error?react.createElement("p",{className:"deg_settings_error",role:"status"},directoryState.error):null,
-error?react.createElement("p",{className:"deg_settings_error",role:"status"},error):null,
-modelPageDeleteDialog,
-react.createElement("div",{className:"deg_settings_footer"},
-react.createElement("span",{className:"deg_settings_status",role:"status"},saved?t("settings.saved"):hasUnsavedChanges?t("settings.unsaved"):""),
-react.createElement("button",{type:"button",className:"deg_btn",disabled:!hasUnsavedChanges||saving,onClick:discard},t("settings.discard")),
-react.createElement("button",{type:"button",className:"deg_btn",disabled:!hasUnsavedChanges||saving||(modelFieldsChanged&&!catalogAvailable)||settingsSnapshot.writable!==true,onClick:save},saving?t("settings.saving"):t("settings.save"))));
+})(globalThis);
+/* source: client-conversation-adapters.js */
+(function installClientConversationAdapters(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-conversation-adapters");
+let react=null;
+let primitives=null;
+let RPC_PATH="";
+let RPC_CHANNEL="";
+let RPC_ENDPOINT="";
+function bindClientRuntime(host){
+react=host.react??null;
+primitives=host.primitives??null;
+RPC_PATH=host.RPC_PATH??"";
+RPC_CHANNEL=host.RPC_CHANNEL??"";
+RPC_ENDPOINT=host.RPC_ENDPOINT??"";
 }
 async function encodeImageFileForRoute(file){
 const mediaType=file?.type;
@@ -16771,6 +19262,16 @@ react.createElement("pre",{className:"deg_full_system_prompt"},text),
 ),
 );
 }
+global[SYMBOL]=Object.freeze({
+installImageSubmissionRoute,FullSystemPromptNode,bindClientRuntime,
+});
+})(globalThis);
+/* source: client-nav-icon.js */
+(function installClientNavIcon(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-nav-icon");
+const clientExpertGroupSidebarSymbol=Symbol.for("dsh-expert-group/client-expert-group-sidebar");
+const expertGroupSidebar=global[clientExpertGroupSidebarSymbol]||{};
 const DEG_SETTINGS_SECTION_ID="dsh-expert-group";
 const DEG_SETTINGS_NAV_ATTR="data-deg-settings-nav";
 const DEG_SETTINGS_NAV_NATIVE_ATTR="data-deg-settings-nav-native";
@@ -16889,6 +19390,27 @@ observer?.disconnect();
 observer=null;
 cleanup();
 };
+}
+global[SYMBOL]=Object.freeze({
+DEG_SETTINGS_SECTION_ID,DEG_SETTINGS_NAV_ICON_FALLBACK_PATHS,DEG_SETTINGS_NAV_ICON_PATHS,isDegSettingsNavRow,installDegSettingsNavIcon,
+});
+})(globalThis);
+/* source: client-plugin-detail.js */
+(function installClientPluginDetail(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-plugin-detail");
+const clientNativeStatusSymbol=Symbol.for("dsh-expert-group/client-native-status");
+const clientNativeStatus=global[clientNativeStatusSymbol]||{};
+const clientSettingsNormalizeSymbol=Symbol.for("dsh-expert-group/client-settings-normalize");
+const clientSettingsNormalize=global[clientSettingsNormalizeSymbol]||{};
+const clientNavIconSymbol=Symbol.for("dsh-expert-group/client-nav-icon");
+const clientNavIcon=global[clientNavIconSymbol]||{};
+const{STATUS_ROLE_IDS,STATUS_ROLE_LABELS}=clientNativeStatus;
+const{useHostMeta}=clientSettingsNormalize;
+const{DEG_SETTINGS_SECTION_ID}=clientNavIcon;
+let react=null;
+function bindClientRuntime(host){
+react=host.react??null;
 }
 const DEG_PLUGIN_DETAIL_SLOT_NAME="plugins.bundle.config";
 const DEG_PLUGIN_DETAIL_ENTRY_KEY=DEG_SETTINGS_SECTION_ID;
@@ -17209,6 +19731,388 @@ role:"status",
 ),
 );
 }
+global[SYMBOL]=Object.freeze({
+DEG_PLUGIN_DETAIL_SLOT_NAME,DEG_PLUGIN_DETAIL_ENTRY_KEY,DEG_SETTINGS_SECTION_SLOT_NAME,describeDegPluginDetailSummary,resolveDegSettingsSectionOpener,DegPluginDetailSummary,bindClientRuntime,
+});
+})(globalThis);
+/* source: client-freshness.js */
+/* classic 投影：来自源文件的机械导出改写，权威实现仍是 client-freshness.js。 */
+(function installClientFreshness(global){
+"use strict";
+const CLIENT_FRESHNESS_MODULE_ID="dsh-expert-group/client-freshness";
+const CLIENT_FRESHNESS_GLOBAL_KEY="dsh-expert-group/client-freshness";
+function rpcErrorStatus(error){
+const code=error?.code;
+if(code==="settings-conflict")return 409;
+if(code==="not-found"||code==="session-not-found")return 404;
+if(code==="forbidden"||code==="connection-required")return 403;
+if(code==="gateway/cancelled")return 499;
+if(code==="bad-request")return 400;
+return 500;
+}
+function normalizePluginRpcResult(result){
+const ok=result?.ok===true;
+const payload=ok?result.value:{ok:false,error:result?.error};
+const status=ok?200:(Number.isSafeInteger(result?.status)&&result.status>0?result.status:rpcErrorStatus(result?.error));
+return{
+ok,
+status,
+async json(){return payload;},
+};
+}
+async function requestPluginRpc(connection,request,init={},fetchImpl=globalThis.fetch,rpcTarget){
+const rpc=connection?.rpc;
+if(typeof rpc?.call==="function"){
+const result=await rpc.call(rpcTarget.channel,rpcTarget.endpoint,request,init.signal);
+return normalizePluginRpcResult(result);
+}
+if(typeof fetchImpl!=="function")throw new Error("当前 DSH 不支持插件 RPC");
+return fetchImpl(rpcTarget.path,{
+...init,
+method:init.method??"POST",
+credentials:init.credentials??"same-origin",
+headers:{"content-type":"application/json",...(init.headers??{})},
+body:init.body??JSON.stringify(request),
+});
+}
+function createClientFreshnessBoundary({sessionId="",onUpdate}={}){
+let disposed=false;
+let currentSessionId=typeof sessionId==="string"?sessionId:"";
+let sessionEpoch=0;
+let sequence=0;
+let notify=typeof onUpdate==="function"?onUpdate:null;
+const latestRequests=new Map();
+let settings={revision:-1,value:undefined};
+let catalog={generation:-1,value:undefined};
+let fanout={sessionId:currentSessionId,generation:-1,cursor:0,snapshot:undefined};
+const requestKey=(kind,key="")=>String(kind)+"\u0000"+String(key??"");
+const isObject=(value)=>value!==null&&typeof value==="object";
+const safeRevision=(value)=>Number.isSafeInteger(value)&&value>=0;
+const result=(accepted,reason,state)=>({accepted,reason,...(state===undefined?{}:{state})});
+const emit=(kind,state)=>{
+if(disposed||notify===null)return;
+try{notify({kind,state});}catch{/* UI 订阅者异常不能破坏响应判定。 */}
+};
+const tokenIsCurrent=(token)=>{
+if(disposed)return false;
+if(token===undefined)return true;
+if(!isObject(token))return false;
+if(token.epoch!==sessionEpoch||token.sessionId!==currentSessionId)return false;
+return latestRequests.get(token.key)===token.sequence;
+};
+const api={
+beginSession(nextSessionId=""){
+if(disposed)return Object.freeze({accepted:false,reason:"disposed",sessionId:currentSessionId,epoch:sessionEpoch});
+currentSessionId=typeof nextSessionId==="string"?nextSessionId:"";
+sessionEpoch+=1;
+sequence+=1;
+latestRequests.clear();
+fanout={sessionId:currentSessionId,generation:-1,cursor:0,snapshot:undefined};
+return Object.freeze({accepted:true,sessionId:currentSessionId,epoch:sessionEpoch,sequence});
+},
+beginRequest(kind,key=""){
+if(disposed)return Object.freeze({accepted:false,reason:"disposed",kind,key,sessionId:currentSessionId,epoch:sessionEpoch,sequence});
+const normalizedKey=requestKey(kind,key);
+const token={accepted:true,kind,key:normalizedKey,sessionId:currentSessionId,epoch:sessionEpoch,sequence:++sequence};
+latestRequests.set(normalizedKey,token.sequence);
+return Object.freeze(token);
+},
+isCurrent(token){
+return tokenIsCurrent(token);
+},
+isSessionCurrent(token){
+return!disposed&&isObject(token)&&token.epoch===sessionEpoch&&token.sessionId===currentSessionId;
+},
+acceptSettingsSnapshot({revision,value,requestToken}={}){
+if(!tokenIsCurrent(requestToken))return result(false,"stale-request",settings);
+if(!safeRevision(revision))return result(false,"invalid-revision",settings);
+if(revision<settings.revision)return result(false,"stale-revision",settings);
+if(revision===settings.revision&&settings.value!==undefined)return result(false,"duplicate",settings);
+settings={revision,value};
+emit("settings",settings);
+return result(true,undefined,settings);
+},
+acceptCatalogResponse({generation,groups,value,requestToken}={}){
+if(!tokenIsCurrent(requestToken))return result(false,"stale-request",catalog);
+if(!safeRevision(generation))return result(false,"invalid-generation",catalog);
+if(generation<catalog.generation)return result(false,"stale-generation",catalog);
+if(generation===catalog.generation&&catalog.value!==undefined)return result(false,"duplicate",catalog);
+catalog={generation,value:value===undefined?groups:value};
+emit("catalog",catalog);
+return result(true,undefined,catalog);
+},
+acceptFanoutSnapshot({sessionId:incomingSessionId,generation,cursor,snapshot,requestToken}={}){
+if(incomingSessionId!==currentSessionId)return result(false,"stale-session",fanout);
+if(!tokenIsCurrent(requestToken))return result(false,"stale-request",fanout);
+if(!safeRevision(generation))return result(false,"invalid-generation",fanout);
+if(!safeRevision(cursor))return result(false,"invalid-cursor",fanout);
+if(generation<fanout.generation)return result(false,"stale-generation",fanout);
+if(cursor<fanout.cursor)return result(false,"stale-cursor",fanout);
+if(generation===fanout.generation&&cursor===fanout.cursor&&fanout.snapshot!==undefined)return result(false,"duplicate",fanout);
+fanout={sessionId:currentSessionId,generation,cursor,snapshot};
+emit("fanout",fanout);
+return result(true,undefined,fanout);
+},
+acceptFanoutEvents({sessionId:incomingSessionId,generation,cursor,events,snapshot,requestToken}={}){
+return api.acceptFanoutSnapshot({
+sessionId:incomingSessionId,
+generation,
+cursor,
+snapshot:snapshot===undefined?events:snapshot,
+requestToken,
+});
+},
+acceptFanoutAction({sessionId:incomingSessionId,generation,requestToken}={}){
+if(incomingSessionId!==currentSessionId)return result(false,"stale-session");
+if(!tokenIsCurrent(requestToken))return result(false,"stale-request");
+if(generation!==undefined&&(!safeRevision(generation)||generation<fanout.generation))return result(false,"stale-generation");
+return result(true,undefined,fanout);
+},
+snapshot(){
+return{
+disposed,
+sessionId:currentSessionId,
+epoch:sessionEpoch,
+settings,
+catalog,
+fanout,
+};
+},
+dispose(){
+if(disposed)return false;
+disposed=true;
+latestRequests.clear();
+notify=null;
+settings={revision:-1,value:undefined};
+catalog={generation:-1,value:undefined};
+fanout={sessionId:currentSessionId,generation:-1,cursor:0,snapshot:undefined};
+return true;
+},
+};
+return Object.freeze(api);
+}
+async function commitSettingsCandidate(settings,revision,{request=globalThis.fetch,connection,normalizeSettingsDraft,roles,rpcTarget}={}){
+const body={action:"settings-commit",settings,expectedRevision:revision};
+const response=typeof connection?.rpc?.call==="function"
+?await requestPluginRpc(connection,body,{},globalThis.fetch,rpcTarget)
+:await request(rpcTarget.path,{
+method:"POST",
+credentials:"same-origin",
+headers:{"content-type":"application/json"},
+body:JSON.stringify(body),
+});
+return readSettingsCommitOutcome(response,normalizeSettingsDraft,roles);
+}
+async function readSettingsCommitOutcome(response,normalizeDraft,roles){
+let payload;
+try{
+payload=await response.json();
+}catch{
+throw new Error("设置保存响应无效");
+}
+if(!response.ok||payload?.ok!==true){
+const issue=payload?.error&&typeof payload.error==="object"?payload.error:{};
+const message=issue.message??payload?.message;
+const error=new Error(typeof message==="string"?message:"设置保存失败");
+if(typeof issue.code==="string")error.code=issue.code;
+if(Number.isSafeInteger(response.status)&&response.status>0)error.status=response.status;
+const currentRevision=issue.details?.revision??issue.details?.currentRevision??payload?.revision;
+if(Number.isSafeInteger(currentRevision)&&currentRevision>=0)error.currentRevision=currentRevision;
+throw error;
+}
+if(!payload.settings||typeof payload.settings!=="object"||Array.isArray(payload.settings)
+||!Number.isSafeInteger(payload.revision)||payload.revision<0){
+throw new Error("设置保存响应无效");
+}
+const rolePrompts=payload.rolePrompts!==null&&typeof payload.rolePrompts==="object"
+&&!Array.isArray(payload.rolePrompts)
+?payload.rolePrompts
+:void 0;
+return{
+settings:normalizeDraft(payload.settings,roles),
+revision:payload.revision,
+...(rolePrompts===void 0?{}:{rolePrompts}),
+};
+}
+const __DEG_CLIENT_FRESHNESS_DESCRIPTOR__=Object.freeze({
+id:CLIENT_FRESHNESS_MODULE_ID,
+factory:()=>Object.freeze({
+createClientFreshnessBoundary,
+rpcErrorStatus,
+normalizePluginRpcResult,
+requestPluginRpc,
+commitSettingsCandidate,
+readSettingsCommitOutcome,
+registerClientFreshnessModule,
+}),
+});
+const REGISTERED_LOADERS_KEY=Symbol.for("dsh-expert-group/client-freshness#registered-loaders");
+function registeredLoaderSet(host){
+const existing=host?.[REGISTERED_LOADERS_KEY];
+if(existing!==null&&typeof existing==="object"
+&&typeof existing.has==="function"&&typeof existing.add==="function"&&typeof existing.delete==="function"){
+return existing;
+}
+try{
+const created=new WeakSet();
+Object.defineProperty(host,REGISTERED_LOADERS_KEY,{value:created,configurable:true,writable:true});
+return created;
+}catch{
+return null;
+}
+}
+function registerClientFreshnessModule(loader=globalThis.__ModuleLoader__){
+if(loader===null||typeof loader!=="object"||typeof loader.load!=="function")return false;
+const registered=registeredLoaderSet(globalThis);
+if(registered!==null&&registered.has(loader))return false;
+if(registered!==null)registered.add(loader);
+try{
+loader.load(__DEG_CLIENT_FRESHNESS_DESCRIPTOR__);
+}catch(error){
+if(registered!==null)registered.delete(loader);
+throw error;
+}
+return true;
+}
+/** 投影尾部（构建期生成）：公开检查点 + ModuleLoader 登记。 */
+global[Symbol.for(CLIENT_FRESHNESS_GLOBAL_KEY)]=__DEG_CLIENT_FRESHNESS_DESCRIPTOR__.factory();
+registerClientFreshnessModule(global.__ModuleLoader__);
+})(globalThis);
+/* source: client.js */
+window.__ModuleLoader__.load({
+id:"dsh-expert-group",
+factory:(require)=>{
+const FRESHNESS_MODULE_ID="dsh-expert-group/client-freshness";
+const freshnessModule=(()=>{
+if(typeof require!=="function")return void 0;
+for(const specifier of[FRESHNESS_MODULE_ID,"./"+FRESHNESS_MODULE_ID,"./client-freshness.js"]){
+try{
+const loaded=require(specifier);
+if(loaded!==null&&typeof loaded==="object")return loaded;
+}catch{/* 未登记，尝试下一个 specifier 形式。 */}
+}
+return void 0;
+})();
+if(typeof freshnessModule?.registerClientFreshnessModule==="function"
+&&typeof globalThis!=="undefined"&&globalThis.__ModuleLoader__!==void 0){
+freshnessModule.registerClientFreshnessModule(globalThis.__ModuleLoader__);
+}
+var module={exports:{}};
+var exports=module.exports;
+Object.defineProperty(exports,Symbol.toStringTag,{value:"Module"});
+const react=require("react");
+const primitives=require("@deepseek-ai/dsh-client-ui-primitives");
+const expertGroupModel=globalThis[Symbol.for("dsh-expert-group/client-expert-group-model")];
+const expertGroupSidebar=globalThis[Symbol.for("dsh-expert-group/client-expert-group-sidebar")];
+const clientTextLayer=globalThis[Symbol.for("dsh-expert-group/client-text")]||{};
+const{
+SETTINGS_EXTRA_MESSAGES,SETTINGS_ZH_FALLBACK,settingsExtraText,
+}=clientTextLayer;
+const clientStylesModule=globalThis[Symbol.for("dsh-expert-group/client-styles")]||{};
+const{
+ensurePluginStylesheet,
+}=clientStylesModule;
+const clientModelConfigHostModule=globalThis[Symbol.for("dsh-expert-group/client-model-config-host")]||{};
+const{
+CUSTOM_PROFILE_BASE_PATH,CUSTOM_PROVIDER_NS,CUSTOM_ROUTE_PROBE,createModelConfigHost,
+}=clientModelConfigHostModule;
+const clientFanoutModule=globalThis[Symbol.for("dsh-expert-group/client-fanout-normalize")]||{};
+const{
+fanoutCanCancelParent,fanoutCanCancelShard,fanoutCanRetryShard,fanoutStatusLabel,fanoutTaskLabel,mergeFanoutEvent,
+normalizeFanoutListResponse,normalizeFanoutTask,
+}=clientFanoutModule;
+const clientNativeStatusModule=globalThis[Symbol.for("dsh-expert-group/client-native-status")]||{};
+const{
+NATIVE_RUNNING_STATUS_PREFIX,NATIVE_RUNNING_STATUS_PREFIXES,STATUS_ROLE_IDS,STATUS_ROLE_LABELS,createNativeTextRewriter,findNativeConversationScope,
+findNativeStatusTextNode,replaceNativeStatusPrefix,resolveRunningStatusText,
+}=clientNativeStatusModule;
+const clientSettingsNormalizeModule=globalThis[Symbol.for("dsh-expert-group/client-settings-normalize")]||{};
+const{
+PROMPT_ROLE_IDS,addModelCandidatePage,commitSettingsCandidate,compactModelCandidatesDraft,countUnicodeGraphemes,createSettingsModelCatalog,
+migrateSettingsDefaults,migrateSettingsSelection,modelLayerSelectionOf,modelPageCountOf,normalizeModelCandidatesDraft,normalizeModelFallbackLimitDraft,
+normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsDraft,normalizeSettingsModelGroups,removeModelCandidatePage,reorderModelLayers,
+resolveSettingsForm,setModelLayerSelection,syncSettingsDefaultsProvider,unifiedProviderOf,useHostMeta,validateModelCandidateRows,validatePromptText,
+}=clientSettingsNormalizeModule;
+const clientSubagentModule=globalThis[Symbol.for("dsh-expert-group/client-subagent-metadata")]||{};
+const{
+SubagentMetadataBridge,applySubagentMetadata,collectSubagentCatalog,expertGroupRootSessionIdOf,findNativeSubagentRowParts,findNativeSubagentTreeItems,
+findNativeSubagentTrees,formatSubagentMetadata,installNativeStatusBridge,normalizeSubagentMetadata,removeSubagentMetadata,requestSubagentMetadata,
+}=clientSubagentModule;
+const clientSettingsMainBModule=globalThis[Symbol.for("dsh-expert-group/client-settings-main-b")]||{};
+const clientSettingsMainAModule=globalThis[Symbol.for("dsh-expert-group/client-settings-main-a")]||{};
+const{
+DshExpertGroupSettings,
+}=clientSettingsMainAModule;
+const clientModelViewsAModule=globalThis[Symbol.for("dsh-expert-group/client-model-views-a")]||{};
+const clientModelViewsBModule=globalThis[Symbol.for("dsh-expert-group/client-model-views-b")]||{};
+const clientProviderCardModule=globalThis[Symbol.for("dsh-expert-group/client-provider-card")]||{};
+const clientModelSectionModule=globalThis[Symbol.for("dsh-expert-group/client-model-section")]||{};
+const{
+ModelConfigSection,
+}=clientModelSectionModule;
+const clientConversationAdaptersModule=globalThis[Symbol.for("dsh-expert-group/client-conversation-adapters")]||{};
+const{
+FullSystemPromptNode,installImageSubmissionRoute,
+}=clientConversationAdaptersModule;
+const clientNavIconModule=globalThis[Symbol.for("dsh-expert-group/client-nav-icon")]||{};
+const{
+DEG_SETTINGS_SECTION_ID,DEG_SETTINGS_NAV_ICON_FALLBACK_PATHS,DEG_SETTINGS_NAV_ICON_PATHS,
+installDegSettingsNavIcon,isDegSettingsNavRow,
+}=clientNavIconModule;
+const clientPluginDetailModule=globalThis[Symbol.for("dsh-expert-group/client-plugin-detail")]||{};
+const{
+DEG_PLUGIN_DETAIL_ENTRY_KEY,DEG_PLUGIN_DETAIL_SLOT_NAME,DEG_SETTINGS_SECTION_SLOT_NAME,
+DegPluginDetailSummary,describeDegPluginDetailSummary,resolveDegSettingsSectionOpener,
+}=clientPluginDetailModule;
+ensurePluginStylesheet();
+const RPC_PATH="/api/dsh-expert-group";
+const RPC_CHANNEL="/dsh-expert-group";
+const RPC_ENDPOINT="rpc";
+const RPC_TARGET=Object.freeze({path:RPC_PATH,channel:RPC_CHANNEL,endpoint:RPC_ENDPOINT});
+function resolveFreshnessSurface(){
+if(typeof require==="function"){
+for(const specifier of[FRESHNESS_MODULE_ID,"./"+FRESHNESS_MODULE_ID,"./client-freshness.js"]){
+try{
+const loaded=require(specifier);
+if(loaded!==null&&typeof loaded==="object")return loaded;
+}catch{/* 未登记，尝试下一个 specifier 形式。 */}
+}
+}
+return freshnessModule;
+}
+function requireFreshnessSurface(){
+const surface=resolveFreshnessSurface();
+if(surface===void 0){
+throw new Error("dsh-expert-group: freshness 共享模块未装载（发布 bundle 缺少 client-freshness 投影片段）");
+}
+return surface;
+}
+function rpcErrorStatus(error){
+return requireFreshnessSurface().rpcErrorStatus(error);
+}
+function normalizePluginRpcResult(result){
+return requireFreshnessSurface().normalizePluginRpcResult(result);
+}
+async function requestPluginRpc(connection,request,init={},fetchImpl=globalThis.fetch){
+return requireFreshnessSurface().requestPluginRpc(connection,request,init,fetchImpl,RPC_TARGET);
+}
+function createClientFreshnessBoundary(options={}){
+return requireFreshnessSurface().createClientFreshnessBoundary(options);
+}
+const clientRuntimeHost=Object.freeze({
+react,primitives,requestPluginRpc,requireFreshnessSurface,createClientFreshnessBoundary,
+RPC_PATH,RPC_CHANNEL,RPC_ENDPOINT,RPC_TARGET,ModelConfigSection,
+});
+clientSettingsNormalizeModule.bindClientRuntime?.(clientRuntimeHost);
+clientSubagentModule.bindClientRuntime?.(clientRuntimeHost);
+clientSettingsMainBModule.bindClientRuntime?.(clientRuntimeHost);
+clientSettingsMainAModule.bindClientRuntime?.(clientRuntimeHost);
+clientModelViewsAModule.bindClientRuntime?.(clientRuntimeHost);
+clientModelViewsBModule.bindClientRuntime?.(clientRuntimeHost);
+clientProviderCardModule.bindClientRuntime?.(clientRuntimeHost);
+clientModelSectionModule.bindClientRuntime?.(clientRuntimeHost);
+clientConversationAdaptersModule.bindClientRuntime?.(clientRuntimeHost);
+clientPluginDetailModule.bindClientRuntime?.(clientRuntimeHost);
 function apply(ctx){
 ctx.effect(()=>installImageSubmissionRoute(ctx),"dsh-expert-group: image submission route");
 ctx.effect(()=>installDegSettingsNavIcon(),"dsh-expert-group: settings nav brand icon");
@@ -17238,23 +20142,7 @@ revision:undefined,
 writable:false,
 mode:"memory",
 });
-const settingsForm=(()=>{
-if(configForms===null||typeof configForms.get!=="function"){
-return{
-getSnapshot:()=>UNAVAILABLE_SETTINGS_SNAPSHOT,
-subscribe:()=>()=>{},
-};
-}
-try{
-const form=configForms.get(SETTINGS_ENTRY_ID);
-if(form!==null&&form!==undefined
-&&typeof form.getSnapshot==="function"&&typeof form.subscribe==="function")return form;
-}catch{/* 服务代理拒答或条目读取失败：按不可用降级。 */}
-return{
-getSnapshot:()=>UNAVAILABLE_SETTINGS_SNAPSHOT,
-subscribe:()=>()=>{},
-};
-})();
+const settingsForm=resolveSettingsForm(configForms,SETTINGS_ENTRY_ID,UNAVAILABLE_SETTINGS_SNAPSHOT);
 const modelCatalog=createSettingsModelCatalog(ctx);
 const modelConfigHost=createModelConfigHost(ctx,configForms);
 slots.inject(DEG_SETTINGS_SECTION_SLOT_NAME,()=>slots.register({
@@ -17278,7 +20166,10 @@ react.Fragment,
 null,
 react.createElement(SubagentMetadataBridge,{...props,ctx}),
 )));
-if(typeof expertGroupSidebar?.installExpertGroupSidebar==="function"){
+installSettingsBoundSidebar(ctx,{settingsForm,modelCatalog});
+}
+function installSettingsBoundSidebar(ctx,{settingsForm,modelCatalog}){
+if(typeof expertGroupSidebar?.installExpertGroupSidebar!=="function")return;
 const sidebarDeps={
 react,
 primitives,
@@ -17372,7 +20263,6 @@ unsubscribe=()=>{};
 uninstall();
 };
 },"dsh-expert-group-sidebar");
-}
 }
 exports.normalizeSettingsModelGroups=normalizeSettingsModelGroups;
 exports.normalizeSettingsDraft=normalizeSettingsDraft;

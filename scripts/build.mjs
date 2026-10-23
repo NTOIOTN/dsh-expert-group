@@ -12,25 +12,12 @@ import {
   assembleClientBundle,
   measureBundleSizes,
 } from "./assemble-client.mjs";
-
-/**
- * 装配源与构建脚本的显式语法覆盖清单（ticket 17）。
- *
- * 背景：package.json files 不再发布 client.js / client-*.js 这些**装配输入**（体积收敛，
- * 安装面只需要装配产物），但"没发布"不等于"可以不检查"——它们仍然是构建的输入。
- * 之前 node --check 的覆盖面来自 files+exports+bin 的并集，收敛 files 后覆盖面会悄悄缩水，
- * 所以这里把不发布、但必须保持可解析的文件显式列出来。
- */
-const CLIENT_SOURCE_FILES = Object.freeze([
-  "client.js",
-  "client-notifications.js",
-  "client-expert-group-model.js",
-  "client-expert-group-sidebar.js",
-  "client-model-config.js",
-  // client-freshness.js 仍是公开导出的运行时模块（exports["./client-freshness"]），
-  // 出现在这里是为了让"装配源全集"只有一处清单，避免再按 files 推断。
-  "client-freshness.js",
-]);
+// 装配源清单已提取为无副作用的共享模块（R0）：门禁脚本必须与构建共用同一份清单，
+// 而 import build.mjs 会执行真实构建，所以清单单独成模块、两边共同导入。
+// 原先记录在这里的"为什么不发布也要检查"的背景说明，随清单一起移到了 client-sources.mjs。
+// R0 票据 03 起，构建不再直接读 client-sources.mjs：四语义清单（manifest）里的
+// `syntaxCheckSources` 就取那份冻结数组，构建与其它消费者共用同一个入口。
+import { syntaxCheckSources } from "./client-source-manifest.mjs";
 
 /** 构建脚本自身：不发布进 tarball，但每次构建都被执行，必须保持语法有效。 */
 const BUILD_SCRIPT_FILES = Object.freeze([
@@ -103,7 +90,7 @@ for (const target of [...targets].sort()) {
 }
 // 不发布、但参与构建的输入（装配源 + 构建脚本）同样要过 node --check：
 // files 收敛后语法覆盖面必须靠显式清单保持，而不是靠"碰巧还被发布"。
-for (const extra of [...CLIENT_SOURCE_FILES, ...BUILD_SCRIPT_FILES]) {
+for (const extra of [...syntaxCheckSources, ...BUILD_SCRIPT_FILES]) {
   const absolute = resolve(root, extra);
   await access(absolute, constants.R_OK);
   if (syntaxChecked.has(absolute)) continue;
@@ -185,5 +172,5 @@ if (dshPeers.length === 0 || new Set(dshPeers).size !== 1) {
 }
 
 console.log("DEG build verification passed: " + sourceTargets.length + " JavaScript files (含 "
-  + (CLIENT_SOURCE_FILES.length + BUILD_SCRIPT_FILES.length) + " 个不发布的装配源/构建脚本), "
+  + (syntaxCheckSources.length + BUILD_SCRIPT_FILES.length) + " 个不发布的装配源/构建脚本), "
   + targets.size + " published targets, prompt-inspector CLI smoke verified=" + cliSummary.verified);

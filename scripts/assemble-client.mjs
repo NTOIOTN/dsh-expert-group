@@ -49,37 +49,36 @@ import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { brotliCompressSync, constants as zlibConstants, gzipSync } from "node:zlib";
+// 装配顺序的**唯一事实源**是 manifest（R0 票据 03）：本脚本只派生、不复制。
+// manifest 只导出冻结数据（不读文件、不跑构建），因此在这里 import 不会产生副作用。
+import {
+  assemblyOrder as MANIFEST_ASSEMBLY_ORDER,
+  descriptorSource as MANIFEST_DESCRIPTOR_SOURCE,
+  freshnessSource as MANIFEST_FRESHNESS_SOURCE,
+  iifeSources as MANIFEST_IIFE_SOURCES,
+} from "./client-source-manifest.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const root = resolve(dirname(scriptPath), "..");
 
 /**
- * 浏览器安全的 classic IIFE 源，按数组顺序执行。
+ * 浏览器安全的 classic IIFE 源，按数组顺序执行（顺序来自 manifest）。
  * 这些片段各自把实现挂到 `globalThis[Symbol.for("dsh-expert-group/<name>")]`，
  * client.js 的 factory 只从那里取回实现，因此必须排在唯一 descriptor 之前。
  */
-const IIFE_SOURCES = Object.freeze([
-  "client-expert-group-model.js",
-  "client-expert-group-sidebar.js",
-  // 通知协调模块必须与其它浏览器安全 IIFE 一起先于唯一 descriptor 执行：
-  // client.js 的 factory 只从 globalThis 取回这份实现，不再自带通知队列/轮询逻辑。
-  "client-notifications.js",
-  // 「模型配置」区域的唯一纯数据流实现（provider 目录装配、草稿/路径操作、
-  // 七档 reasoningEfforts 映射、继承/恢复默认、revision 冲突与角色联动守卫）。
-  // 同样先于 descriptor 执行：client.js 只从 globalThis 取回它并负责渲染。
-  "client-model-config.js",
-]);
+const IIFE_SOURCES = MANIFEST_IIFE_SOURCES;
 
 /**
- * freshness/RPC 的 ESM 权威实现。构建期投影成 classic 片段，让真实发布 bundle 也通过
- * ModuleLoader seam 装载共享实现；必须排在唯一 descriptor 之前，登记才来得及生效。
+ * freshness/RPC 的 ESM 权威实现（来自 manifest）。构建期投影成 classic 片段，让真实发布
+ * bundle 也通过 ModuleLoader seam 装载共享实现；必须排在唯一 descriptor 之前，登记才来得及生效。
  */
-const FRESHNESS_SOURCE = "client-freshness.js";
+const FRESHNESS_SOURCE = MANIFEST_FRESHNESS_SOURCE;
 
-/** 唯一 ModuleLoader descriptor（client.js）始终最后执行，避免 HMR 留下重复子模块工厂。 */
-const DESCRIPTOR_SOURCE = "client.js";
+/** 唯一 ModuleLoader descriptor（client.js，来自 manifest）始终最后执行，避免 HMR 留下重复子模块工厂。 */
+const DESCRIPTOR_SOURCE = MANIFEST_DESCRIPTOR_SOURCE;
 
-const sourceNames = Object.freeze([...IIFE_SOURCES, FRESHNESS_SOURCE, DESCRIPTOR_SOURCE]);
+/** 装配顺序本身（manifest 已冻结；这里不再二次复制成新数组，保持"唯一事实源"可追溯）。 */
+const sourceNames = MANIFEST_ASSEMBLY_ORDER;
 const outputName = "client-bundle.js";
 const banner = "/* 此文件由 scripts/assemble-client.mjs 生成，请勿手工编辑。 */\n";
 
@@ -1085,6 +1084,12 @@ function verifyClientBundleContract(segments) {
   const descriptorIndex = names.indexOf(DESCRIPTOR_SOURCE);
   if (freshnessIndex === -1) throw new Error("发布 bundle 缺少 " + FRESHNESS_SOURCE + " 的 classic 投影段");
   if (descriptorIndex === -1) throw new Error("发布 bundle 缺少 " + DESCRIPTOR_SOURCE + " 的 descriptor 段");
+  // manifest 的语义是"唯一 descriptor 恒为最后一项"：descriptor 一旦前移，后面的 IIFE 就
+  // 来不及把检查点挂到 globalThis，客户端只会在运行期静默降级成"没有该模块"。门禁直接失败。
+  if (descriptorIndex !== names.length - 1) {
+    throw new Error("唯一 ModuleLoader descriptor 必须是最后一个装配段（实际在第 "
+      + (descriptorIndex + 1) + " 段，共 " + names.length + " 段）");
+  }
   if (freshnessIndex > descriptorIndex) throw new Error("freshness 投影必须在唯一 ModuleLoader descriptor 之前执行");
   const freshnessSegment = segments[freshnessIndex];
   const descriptorSegment = segments[descriptorIndex];

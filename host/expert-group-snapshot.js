@@ -21,8 +21,9 @@
  * @module dsh-expert-group/host/expert-group-snapshot
  */
 import { createHash } from "node:crypto";
-import { hasUsageMetrics, projectUsage, sumUsageByChildId } from "./usage-ledger.js";
-import { projectModelRouteFields, projectStructuredResult, structuredProjectionFields } from "../shared.js";
+import { hasUsageMetrics, projectUsage, sumUsageByChildId } from "./usage-projection.js";
+import { projectModelRouteFields } from "../shared/model-route.js";
+import { projectStructuredResult, structuredProjectionFields } from "../shared/structured.js";
 
 /** 投影 schema 版本；客户端只接受该版本的负载。 */
 export const EXPERT_GROUP_SNAPSHOT_SCHEMA_VERSION = 1;

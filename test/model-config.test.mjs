@@ -26,20 +26,37 @@ import {
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 /**
- * 装配期先于 descriptor 执行的两个浏览器安全 IIFE 模块：都不是 ESM（不能 import），
+ * 装配期先于 descriptor 执行的浏览器安全 IIFE 模块：都不是 ESM（不能 import），
  * 因此按发布 bundle 的真实做法在最小 global 替身里执行一次，再取回它们的检查点。
  * 「bundle 真的先执行它们」由 test/client-shared-boundary.test.mjs 的真实 realm 用例证明。
+ *
+ * 票据 28 之后，`client-model-config.js` 是**门面 + install/自定义 provider 创建面**，
+ * 求值期就要读 `client-model-config-paths.js` 与 `client-model-config-rows.js` 的检查点。
+ * 因此这里接受一条**装配链**：在同一个 sandbox 里按 manifest 顺序依次执行，最后取最后一个
+ * 文件写下的检查点——只迁移装载方式，不改任何断言（结构适配，语义不变）。
  */
-function evaluateSidecar(file, symbolKey) {
-  const source = readFileSync(join(root, file), "utf8");
+function evaluateSidecar(files, symbolKey) {
   const sandbox = {};
-  const run = new Function("globalThis", source + "\nreturn globalThis;");
-  return run(sandbox)[Symbol.for(symbolKey)];
+  const run = (source) => new Function("globalThis", source + "\nreturn globalThis;")(sandbox);
+  for (const file of (Array.isArray(files) ? files : [files])) {
+    run(readFileSync(join(root, file), "utf8"));
+  }
+  return sandbox[Symbol.for(symbolKey)];
 }
 
 const sidecars = {
-  modelConfig: evaluateSidecar("client-model-config.js", "dsh-expert-group/client-model-config"),
-  expertGroupModel: evaluateSidecar("client-expert-group-model.js", "dsh-expert-group/client-expert-group-model"),
+  modelConfig: evaluateSidecar([
+    "client-model-config-paths.js",
+    "client-model-config-rows.js",
+    "client-model-config.js",
+  ], "dsh-expert-group/client-model-config"),
+  // 票据 29：专家组模型拆为 normalize → format → 薄门面，按同一 sandbox 的装配顺序依次执行，
+  // 最后取门面写下的公开检查点（只迁移装载方式，不改任何断言）。
+  expertGroupModel: evaluateSidecar([
+    "client-expert-group-model-normalize.js",
+    "client-expert-group-model-format.js",
+    "client-expert-group-model.js",
+  ], "dsh-expert-group/client-expert-group-model"),
 };
 const modelConfig = sidecars.modelConfig;
 
@@ -1638,6 +1655,46 @@ test("模型配置：点击添加模型后立即出现可编辑的空模型行",
     cardHandle?.unmount();
     disclosureHandle?.unmount();
     modelHandle?.unmount();
+    harness.dispose();
+  }
+});
+
+test("模型配置回归：点击删除模型只移除该行且不抛 ReferenceError", async () => {
+  // 票据 40 的真实缺陷：renderProviderModelRows 只解构了 { disabled, edit, patchRow, toggleRow }，
+  // 删除按钮的 onClick 却引用 config.removeModelRow 与 session.modelRows。点击「删除模型」
+  // 时抛 ReferenceError（删除完全不生效）。调用点确实传了 config/session，因此这是纯粹的
+  // 解构遗漏；本用例锁定「不抛错 + 真的只移除目标行」两条行为。
+  const workspace = workspacesForRender();
+  const runtime = createClientReactRuntime();
+  const harness = createHarness(workspace);
+  let mounted = null;
+  let card = null;
+  try {
+    mounted = await openModelSection(harness, runtime);
+    card = await mounted.mount((node) => node?.type?.name === "ModelProviderCard"
+      && node.props?.row?.provider === "acme");
+    findNode(card.output, (node) => node.type === "button" && node.props?.children === "编辑").props.onClick();
+    await card.settle();
+    // 先添加一行：删除后仍应只剩这一行（证明删的是目标行，而不是整份草稿）。
+    findNode(card.output, (node) => node.props?.["data-deg-add-model"] === "acme").props.onClick();
+    await card.settle();
+    const secondRow = findNode(card.output, (node) => node.props?.["aria-label"] === "模型 ID 2");
+    assert.ok(secondRow, "添加模型后必须出现第二行");
+    assert.equal(secondRow.props.value, "", "新增的模型行必须是空行");
+    const remove = findNode(card.output, (node) => node.props?.["aria-label"] === "删除模型 1");
+    assert.ok(remove, "每一行都必须提供删除按钮");
+    assert.doesNotThrow(() => remove.props.onClick(), "点击删除模型不得抛 ReferenceError");
+    await card.settle();
+    const remaining = findNode(card.output, (node) => node.props?.["aria-label"] === "模型 ID 1");
+    assert.ok(remaining, "删除第一行后，原来的第二行应上移为第一行");
+    assert.equal(remaining.props.value, "", "剩下的必须是那行新增的空模型，而不是被删掉的 m1");
+    assert.equal(findNode(card.output, (node) => node.props?.["aria-label"] === "模型 ID 2"), null,
+      "删除后只应剩下一行");
+    assert.equal(findNode(card.output, (node) => node.props?.["aria-label"] === "删除模型 2"), null,
+      "删除按钮数量必须与剩余行数一致");
+  } finally {
+    card?.unmount();
+    mounted?.unmount();
     harness.dispose();
   }
 });
@@ -5360,3 +5417,5 @@ test("模型配置回归：双击删除让两个流程重叠时，卸载仍摘�
     scenario.cleanup();
   }
 });
+
+

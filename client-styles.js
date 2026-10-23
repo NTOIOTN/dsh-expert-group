@@ -1,0 +1,305 @@
+/**
+ * 设置页样式表（css 文本 + 幂等注入）（R8 票据 26）。
+ *
+ * 从 client.js 的 descriptor 工厂作用域机械外移：正文逐行保留，只有包装、依赖解构与导出面
+ * 是本票据新增的。检查点：globalThis[Symbol.for("dsh-expert-group/client-styles")]。
+ * 装配顺序见 scripts/client-source-manifest.mjs（恒在唯一 descriptor 之前）。
+ */
+(function installClientStyles(global) {
+  "use strict";
+
+  const SYMBOL = Symbol.for("dsh-expert-group/client-styles");
+
+    // ── 设置页样式：仅保留 dsh-expert-group settings section 使用的规则。
+    const css = "" +
+      ".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:760px;color:var(--dsw-alias-label-primary)}" +
+      ".deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}" +
+      ".deg_settings_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}" +
+      ".deg_settings_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);align-items:center;gap:20px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
+      // 任务管理与自动侧栏开关放在模型配置之后、通知之前，始终可见且共享标准设置行间距。
+      // 允许换行只为极窄屏兜底：宽屏下两个复选框仍是单排、列间距 28px，排布不变。
+      ".deg_settings_task_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:28px;row-gap:12px;min-height:29px}" +
+      ".deg_settings_task_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}" +
+      // 统一供应商与自动降级上限合成一行：两组左对齐排列、组间距 32px（刻意不用 space-between 把降级上限推到最右）；
+      // 组内标签紧贴控件 10px，下拉框 176px 且允许收缩，不再撑满行尾。
+      ".deg_settings_unified_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:32px;row-gap:12px;min-width:0}" +
+      ".deg_settings_provider_group,.deg_settings_fallback_group{display:flex;align-items:center;gap:10px;min-width:0;flex:0 1 auto}" +
+      ".deg_settings_provider_group>.deg_settings_label,.deg_settings_fallback_group>.deg_settings_label{flex:0 0 auto;white-space:nowrap}" +
+      ".deg_settings_provider_group>.deg_settings_control{flex:0 1 auto;min-width:0}" +
+      ".deg_settings_provider_group select.deg_settings_provider_select{flex:0 1 176px;width:176px;min-width:0;max-width:200px}" +
+      // 520px 以下两组各占一整排（标签不拆行、下拉不撑破容器），不产生横向滚动。
+      "@media (max-width:520px){.deg_settings_unified_row{column-gap:20px;row-gap:12px}.deg_settings_provider_group{flex:1 1 100%}}" +
+      // 底部管理行与上方任务行/统一行同一节奏：三个部分直接并排、统一 32px 列间距并左对齐，
+      // 不再用 space-between 把两个数值组推到行尾。
+      ".deg_settings_management_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:32px;row-gap:12px;min-width:0}" +
+      ".deg_settings_management_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}" +
+      // 每个数值部分仍是「标签 + 输入框」紧凑组：组内沿用 .deg_settings_control 的 10px 间距，
+      // 标签不换行、数字框固定 72px；整组不缩窄，空间不足时整组换行。
+      ".deg_settings_management_row>.deg_settings_control{flex:0 0 auto;min-width:max-content;white-space:nowrap;height:29px;box-sizing:border-box}" +
+      // 520px 以下三个部分允许换行并保持左对齐，行距 12px。
+      "@media (max-width:520px){.deg_settings_management_row{column-gap:20px;row-gap:12px}}" +
+      ".deg_settings_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}" +
+      ".deg_settings_control{display:flex;align-items:center;gap:10px;min-width:0}" +
+      ".deg_settings_control input[type=range]{width:100%;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      ".deg_settings_control input[type=number]{width:72px;box-sizing:border-box;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}" +
+      ".deg_settings_control select{width:100%;min-width:0;box-sizing:border-box;padding:7px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}" +
+      ".deg_settings_control select:disabled,.deg_settings_control input:disabled{opacity:.5;cursor:not-allowed}" +
+      ".deg_settings_checkbox{display:flex;align-items:center;gap:8px;cursor:pointer}" +
+      ".deg_settings_checkbox input{width:16px;height:16px;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      ".deg_settings_table_wrap{width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}" +
+      // 模型名称通常最长；压缩角色、供应商和思考深度列，把可用空间优先留给模型选择。
+      ".deg_settings_table{display:grid;min-width:540px;grid-template-columns:minmax(84px,.6fr) minmax(132px,.82fr) minmax(210px,1.5fr) minmax(96px,.62fr);border-top:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_settings_table_head,.deg_settings_table_cell{min-width:0;padding:10px 6px;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_settings_table_head{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);font-weight:600}" +
+      ".deg_settings_table_cell{display:flex;align-items:center;font-size:13px;line-height:20px}" +
+      ".deg_settings_table_cell select{width:100%;min-width:0;box-sizing:border-box;padding:6px 6px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}" +
+      ".deg_settings_table_cell select.deg_settings_provider_select{max-width:170px}" +
+      ".deg_settings_table_cell select.deg_settings_model_select{max-width:260px}" +
+      ".deg_settings_table_cell select.deg_settings_effort_select{max-width:112px}" +
+      ".deg_settings_table_cell select:disabled{opacity:.5;cursor:not-allowed}" +
+      ".deg_settings_role_cell{padding:0;align-items:center}" +
+      ".deg_settings_role_button{display:flex;align-items:center;justify-content:center;gap:7px;flex:0 0 74px;width:74px;height:28px;min-height:28px;padding:4px 6px;box-sizing:border-box;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;line-height:20px;cursor:pointer;text-align:center}" +
+      ".deg_settings_role_button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-label-secondary)}" +
+      ".deg_settings_role_button:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}" +
+      ".deg_settings_role_button[aria-pressed=true]{background:var(--dsw-alias-interactive-bg-secondary,var(--dsw-alias-bg-layer-2));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}" +
+      ".deg_settings_role_button:disabled{opacity:.45;cursor:not-allowed}" +
+      ".deg_settings_prompt_customized_dot{display:inline-block;width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}" +
+      ".deg_settings_prompt_editor{display:flex;flex-direction:column;gap:14px;min-width:0}" +
+      ".deg_prompt_header{display:flex;align-items:center;justify-content:center;min-width:0}" +
+      ".deg_prompt_header .deg_settings_title{margin:0;overflow-wrap:anywhere;text-align:center}" +
+      ".deg_prompt_back{flex:0 0 auto}" +
+      ".deg_prompt_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);font-weight:600}" +
+      ".deg_prompt_textarea{display:block;width:100%;min-height:320px;max-height:60vh;box-sizing:border-box;resize:vertical;overflow:auto;padding:12px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:13px/20px var(--ds-font-family-code,var(--ds-font-family-sans));white-space:pre-wrap}" +
+      ".deg_prompt_textarea:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}" +
+      ".deg_prompt_textarea:disabled{opacity:.55;cursor:not-allowed}" +
+      ".deg_prompt_counter{display:flex;justify-content:flex-end;margin-top:-8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_prompt_counter_warning{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-secondary))}" +
+      ".deg_prompt_counter_error{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}" +
+      ".deg_prompt_status{min-height:18px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_prompt_footer{display:flex;align-items:center;gap:8px;padding-top:4px}" +
+      ".deg_prompt_footer .deg_btn{flex:0 0 auto;min-width:88px}" +
+      ".deg_prompt_footer .deg_prompt_status{margin-right:auto}" +
+      ".deg_btn_primary{color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      ".deg_btn_primary:hover:not(:disabled){filter:brightness(1.08)}" +
+      ".deg_settings_table_cell .deg_settings_role_button + *{min-width:0}" +
+      ".deg_settings_footer{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding-top:4px}" +
+      ".deg_settings_status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin-right:auto}" +
+      ".deg_settings_error{font-size:12px;line-height:18px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));white-space:pre-wrap}" +
+      ".deg_btn{flex:1;box-sizing:border-box;min-height:32px;padding:6px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;cursor:pointer}" +
+      ".deg_btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}" +
+      ".deg_btn:disabled{opacity:.45;cursor:not-allowed}" +
+      ".deg_btn.deg_btn_primary{color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      ".deg_prompt_dialog_backdrop{position:fixed;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.45)}" +
+      ".deg_prompt_dialog{width:min(100%,440px);box-sizing:border-box;padding:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;box-shadow:0 12px 28px rgba(0,0,0,.28)}" +
+      ".deg_prompt_dialog h3{margin:0 0 8px;font-size:16px;line-height:24px;color:var(--dsw-alias-label-primary)}" +
+      ".deg_prompt_dialog p{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}" +
+      ".deg_prompt_dialog_actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-top:18px}" +
+      // 通知设置是紧凑工具条：通知弹窗 / 通知音量 / 通知事件下拉同处一行（停留时长字段已按票据 14 移除）。
+      // 音量组吸收剩余空间并保持 160px 最小宽；事件下拉按内容宽度，两个复选框以外的部分不再占整行。
+      ".deg_settings_notification_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:24px;row-gap:12px;min-width:0;white-space:nowrap}" +
+      ".deg_settings_notification_row>.deg_settings_checkbox{flex:0 0 auto}" +
+      ".deg_settings_notification_row>.deg_settings_control{flex:1 1 220px;min-width:160px}" +
+      ".deg_settings_notification_row>.deg_settings_control .deg_settings_label{flex:0 0 auto;white-space:nowrap}" +
+      ".deg_settings_notification_row>.deg_settings_control input[type=range]{flex:1 1 auto;min-width:48px}" +
+      ".deg_settings_notification_row>.deg_settings_control input[type=number]{flex:0 0 72px;width:72px}" +
+      // 「通知事件」多选下拉：触发按钮保持 29px 紧凑高度；面板绝对定位在按钮下方并右对齐，
+      // 避免在设置页右边缘溢出（窄屏改为独占一行 + 左对齐）。
+      ".deg_settings_events_dropdown{position:relative;flex:0 0 auto;min-width:0}" +
+      ".deg_settings_events_trigger{display:inline-flex;align-items:center;gap:6px;height:29px;box-sizing:border-box;padding:0 10px;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:13px;line-height:20px;white-space:nowrap;cursor:pointer}" +
+      ".deg_settings_events_trigger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}" +
+      ".deg_settings_events_trigger:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}" +
+      ".deg_settings_events_trigger:disabled{opacity:.45;cursor:not-allowed}" +
+      ".deg_settings_events_count{color:var(--dsw-alias-label-secondary)}" +
+      ".deg_settings_events_caret{display:inline-block;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1;transform:translateY(1px)}" +
+      // 面板背景/边框/圆角走主题变量；DSH 主题没有阴影变量，轻阴影沿用对话框的 rgba 先例。
+      ".deg_settings_events_panel{position:absolute;top:calc(100% + 6px);right:0;z-index:20;display:flex;flex-direction:column;gap:8px;min-width:180px;box-sizing:border-box;padding:10px 12px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;box-shadow:0 8px 20px rgba(0,0,0,.16)}" +
+      ".deg_settings_events_panel .deg_settings_checkbox{height:20px}" +
+      // 520px 以下：音量组与事件下拉各占一整排，面板从按钮左侧改为左对齐，避免横向溢出。
+      "@media (max-width:520px){.deg_settings_notification_row{flex-wrap:wrap;row-gap:12px}.deg_settings_notification_row>.deg_settings_control{flex-basis:100%}.deg_settings_events_dropdown{flex:1 1 100%}.deg_settings_events_panel{left:0;right:auto}}" +
+      ".deg_subagent_metadata{display:block;box-sizing:border-box;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary,var(--dsw-alias-label-primary));font-size:11px;line-height:16px}" +
+      ".deg_full_system_prompt_root[data-open]{padding-bottom:4px}" +
+      ".deg_full_system_prompt_chevron{color:var(--dsw-alias-label-secondary)}" +
+      ".deg_full_system_prompt_body{box-sizing:border-box;width:calc(100% - 22px - var(--dsh-content-font-delta, 0px));margin:4px 0 0 calc(22px + var(--dsh-content-font-delta, 0px));max-height:141px;overflow:auto;padding:10px 16px 12px 12px;border:none;border-radius:8px;background:var(--dsw-alias-markdown-code-block);color:var(--dsw-alias-label-tertiary);font:400 11px/16px var(--ds-font-family-code)}" +
+      ".deg_full_system_prompt{box-sizing:border-box;margin:0;white-space:pre-wrap;overflow-wrap:anywhere}" +
+      // ── 「模型配置」区域：默认折叠的 section + 按需展开的 provider 卡片 ──────────
+      ".deg_mc_section{display:flex;flex-direction:column;gap:10px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_mc_header{display:flex;align-items:center;gap:8px;min-width:0}" +
+      ".deg_mc_toggle{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;padding:0;color:var(--dsw-alias-label-primary);background:transparent;border:none;font:inherit;font-size:13px;line-height:20px;font-weight:600;text-align:left;cursor:pointer}" +
+      ".deg_mc_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}" +
+      ".deg_mc_chevron{flex:0 0 auto;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_body{display:flex;flex-direction:column;gap:10px;min-width:0}" +
+      ".deg_mc_cards{display:flex;flex-direction:column;gap:8px;margin:0;padding:0;list-style:none}" +
+      ".deg_mc_card{display:flex;flex-direction:column;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}" +
+      ".deg_mc_card_head{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}" +
+      ".deg_mc_card_name{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}" +
+      ".deg_mc_card_route{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);font-family:var(--ds-font-family-code,inherit)}" +
+      ".deg_mc_card_actions{display:flex;align-items:center;gap:8px;margin-left:auto}" +
+      ".deg_mc_card_actions .deg_btn{flex:0 0 auto;min-width:64px}" +
+       ".deg_mc_card_actions .deg_mc_delete_btn{color:var(--dsw-alias-state-error-primary,#ef4444)}" +
+       ".deg_mc_dot[data-state=available]{background:var(--dsw-alias-state-success-primary,#22c55e)}" +
+      ".deg_mc_dot{display:inline-block;width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_badge{font-size:11px;line-height:16px;padding:1px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_field{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,240px);align-items:center;gap:12px}" +
+      ".deg_mc_field_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}" +
+      ".deg_mc_input,.deg_mc_select{box-sizing:border-box;width:100%;min-width:0;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}" +
+      ".deg_mc_input:disabled,.deg_mc_select:disabled{opacity:.5;cursor:not-allowed}" +
+      ".deg_mc_input:focus-visible,.deg_mc_select:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}" +
+      ".deg_mc_models{display:flex;flex-direction:column;gap:8px;min-width:0;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2)}" +
+      ".deg_mc_models_head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}" +
+      ".deg_mc_models_title{font-size:12px;line-height:18px;font-weight:600;color:var(--dsw-alias-label-primary)}" +
+      ".deg_mc_models_meta{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_models_head .deg_btn{margin-left:auto;flex:0 0 auto;min-width:auto}" +
+      ".deg_mc_model{display:flex;flex-direction:column;gap:6px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1)}" +
+      ".deg_mc_model_main{display:flex;align-items:center;gap:6px;min-width:0}" +
+      ".deg_mc_model_main .deg_mc_input{flex:1 1 0;min-width:0}" +
+      ".deg_mc_icon_btn{flex:0 0 auto;min-width:auto;width:26px;height:26px;padding:0;line-height:1}" +
+      ".deg_mc_model_advanced{display:grid;grid-template-columns:max-content minmax(64px,1fr) max-content minmax(64px,1fr);column-gap:8px;row-gap:8px;padding-top:6px;border-top:1px dashed var(--dsw-alias-border-l2)}" +
+       ".deg_mc_model_advanced>.deg_mc_field{display:contents}" +
+       ".deg_mc_model_advanced>.deg_mc_field .deg_mc_field_label{align-self:center;min-width:0}" +
+       ".deg_mc_model_advanced>.deg_mc_field .deg_mc_input{min-width:0;text-align:center}" +
+       ".deg_mc_model_advanced>.deg_mc_efforts{grid-column:1 / -1}" +
+       "@media (max-width:640px){.deg_mc_model_advanced{grid-template-columns:max-content minmax(64px,1fr)}.deg_mc_model_advanced>.deg_mc_efforts{grid-column:1 / -1}}" +
+      ".deg_mc_efforts{margin:0;padding:0;border:none;min-width:0}" +
+      ".deg_mc_efforts_label{padding:0;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_mc_efforts_row{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px}" +
+      ".deg_mc_effort{display:inline-flex;align-items:center;gap:4px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);cursor:pointer}" +
+      ".deg_mc_effort input{width:14px;height:14px;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      ".deg_mc_input_types{display:flex;flex-wrap:wrap;gap:10px}" +
+      ".deg_mc_hint{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}" +
+      // 删除确认弹窗内的失败文本与卡片错误共用同一条规则（同一个错误视觉，不新增样式规则）。
+      ".deg_mc_error,.deg_remove_confirm_error{font-size:12px;line-height:18px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));white-space:pre-wrap}" +
+      ".deg_mc_card_footer{display:flex;align-items:center;gap:8px;padding-top:2px}" +
+      ".deg_mc_card_footer .deg_mc_status{margin-right:auto}" +
+      ".deg_mc_card_footer .deg_btn{flex:0 0 auto;min-width:76px}" +
+      ".deg_mc_conflict{display:flex;flex-direction:column;gap:6px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}" +
+      ".deg_mc_conflict_actions{display:flex;gap:8px}" +
+      ".deg_mc_conflict_actions .deg_btn{flex:0 0 auto;min-width:96px}" +
+      ".deg_mc_add{display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%}" +
+      ".deg_mc_add .deg_mc_select{width:auto;min-width:160px;flex:0 1 auto}" +
+      // 两个 provider 入口与原生模型设置页同级、等宽、同风格。
+      ".deg_mc_entries{display:flex;align-items:center;gap:8px;flex:1 1 100%;width:100%;min-width:0}" +
+      ".deg_mc_entries>.deg_btn{flex:1 1 0;min-width:0;border-style:dashed}" +
+       ".deg_mc_entries>.deg_btn::before{content:\"+\";display:inline-block;margin-right:4px;font-size:16px;line-height:1}" +
+      ".deg_mc_create{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}" +
+      ".deg_mc_create_head{display:flex;align-items:center;gap:8px;min-width:0}" +
+      ".deg_mc_create_title{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary)}" +
+      ".deg_mc_field_error{border-color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}" +
+      ".deg_mc_field_row{display:flex;flex-direction:column;gap:4px;min-width:0}" +
+      ".deg_mc_field_message{font-size:11px;line-height:16px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}" +
+      ".deg_mc_create_footer{display:flex;align-items:center;gap:8px;padding-top:2px}" +
+      ".deg_mc_create_footer .deg_mc_status{margin-right:auto}" +
+      ".deg_mc_create_footer .deg_btn{flex:0 0 auto;min-width:88px}" +
+      ".deg_mc_fetch_list{display:flex;flex-direction:column;gap:4px;max-height:240px;overflow:auto;margin:6px 0 0;padding:0;list-style:none}" +
+      ".deg_mc_fetch_item{display:flex;align-items:center;gap:6px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}" +
+       ".deg_mc_modal_backdrop{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.45)}" +
+       ".deg_mc_modal{display:flex;flex-direction:column;gap:12px;width:min(100%,380px);max-height:min(80vh,420px);box-sizing:border-box;padding:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;box-shadow:0 12px 28px rgba(0,0,0,.28)}" +
+       ".deg_mc_modal_header{display:flex;align-items:center;gap:8px;min-width:0}" +
+       ".deg_mc_modal_title{flex:1 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;color:var(--dsw-alias-label-primary)}" +
+       ".deg_mc_modal_close{flex:0 0 auto;width:28px;height:28px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:20px;line-height:28px;cursor:pointer}" +
+       ".deg_mc_modal_close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}" +
+       ".deg_mc_modal_description{margin:0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}" +
+       ".deg_mc_candidate_toolbar{display:flex;align-items:center;gap:8px;min-width:0}" +
+       ".deg_mc_candidate_search{flex:1 1 auto;min-width:0}" +
+       ".deg_mc_candidate_toolbar .deg_btn{flex:0 0 auto;min-width:auto;white-space:nowrap}" +
+       ".deg_mc_candidate_list{display:flex;flex-direction:column;gap:2px;max-height:240px;margin:0;overflow:auto;padding:0;list-style:none}" +
+       ".deg_mc_candidate_item{border-radius:6px}" +
+       ".deg_mc_candidate_label{display:flex;align-items:center;gap:8px;padding:6px 8px;color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px;cursor:pointer}" +
+       ".deg_mc_candidate_id{flex:1 1 auto;min-width:0;overflow-wrap:anywhere;font-family:var(--ds-font-family-code,inherit)}" +
+       ".deg_mc_candidate_empty{margin:18px 0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:center}" +
+       ".deg_mc_modal_footer{display:flex;justify-content:flex-end;gap:8px;padding-top:2px}" +
+       ".deg_mc_modal_footer .deg_btn{flex:0 0 auto;min-width:76px}" +
+       // 设置页导航行的品牌图标适配：宿主按 section id 硬编码 navIcon，未知 id 回退齿轮，
+       // 插件无法在注册字段里声明图标，因此只能在其 DOM 上做适配——
+       // 隐藏宿主原生 svg（不替换它的内容，React 重渲染会按 fiber 位置回写 path），
+       // 并让 DEG 自己插入的 svg 只占图标列（不参与伸缩），label 位置因此不变。
+       "[data-deg-settings-nav-native]{display:none}" +
+       "[data-deg-settings-nav-icon]{flex:none}" +
+       // ── 插件详情摘要（DSH 插件管理器的组合包页）────────────────────────────
+       // 全部规则都以 deg_pd_ 前缀命名，且只用宿主已有的 CSS 变量，不依赖宿主 CSS module 的哈希类名。
+       ".deg_pd{display:flex;flex-direction:column;gap:12px;width:min(100%,760px);min-width:0;box-sizing:border-box;color:var(--dsw-alias-label-primary)}" +
+       ".deg_pd_title{font-size:14px;line-height:22px;font-weight:600;margin:0}" +
+       ".deg_pd_roles{display:flex;flex-direction:column;gap:0;list-style:none;margin:0;padding:0}" +
+       ".deg_pd_roles_header{display:grid;grid-template-columns:minmax(84px,.7fr) minmax(0,1.6fr) auto;gap:10px;padding:6px 0 2px;border-top:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px;line-height:16px}" +
+       ".deg_pd_roles_header span{min-width:0}" +
+       ".deg_pd_roles_header span:last-child{text-align:right}" +
+       ".deg_pd_role{display:grid;grid-template-columns:minmax(84px,.7fr) minmax(0,1.6fr) auto;align-items:center;gap:10px;min-height:30px;padding:5px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
+       ".deg_pd_role:last-child{border-bottom:0}" +
+       ".deg_pd_role_name{min-width:0;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}" +
+       ".deg_pd_role_value{min-width:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}" +
+       ".deg_pd_role_value[title]{cursor:help}" +
+       ".deg_pd_role_state{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));white-space:nowrap;text-align:right}" +
+       ".deg_pd_role[data-deg-role-state=configured] .deg_pd_role_state{color:var(--dsw-alias-state-success-primary,var(--dsw-alias-label-secondary))}" +
+       ".deg_pd_role[data-deg-role-state=disabled] .deg_pd_role_name,.deg_pd_role[data-deg-role-state=disabled] .deg_pd_role_value{color:var(--dsw-alias-label-secondary)}" +
+       // 不完整配置（provider 已选、model 未选）用警示色表达"还没配完"，绝不与已配置同色。
+       ".deg_pd_role[data-deg-role-state=incomplete] .deg_pd_role_state{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-secondary))}" +
+       ".deg_pd_providers{display:flex;align-items:flex-start;gap:10px;min-width:0;flex-wrap:wrap}" +
+       ".deg_pd_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);flex:0 0 auto}" +
+       ".deg_pd_providers_list{display:flex;align-items:flex-start;gap:6px;flex:1 1 auto;flex-wrap:wrap;min-width:0;max-width:100%}" +
+       ".deg_pd_tag{max-width:100%;box-sizing:border-box;font-size:11px;line-height:16px;padding:1px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}" +
+       ".deg_pd_tag[data-deg-provider-known=false]{border-style:dashed;color:var(--dsw-alias-label-secondary)}" +
+       ".deg_pd_empty{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}" +
+       ".deg_pd_status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0;overflow-wrap:anywhere}" +
+       ".deg_pd_actions{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;padding-top:2px}" +
+       ".deg_pd_actions .deg_pd_open{flex:0 0 auto;min-width:auto}" +
+       ".deg_pd_actions .deg_pd_open:hover:not(:disabled),.deg_pd_actions .deg_pd_open:focus-visible:not(:disabled){color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));filter:brightness(1.08)}" +
+       ".deg_pd_actions .deg_pd_open:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}" +
+       ".deg_pd_actions .deg_pd_open:disabled{opacity:1;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));background:transparent;border-color:var(--dsw-alias-border-l2)}" +
+       ".deg_pd_note{min-width:0;flex:1 1 220px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}" +
+       // 窄屏将状态移到 Provider/模型下一行，避免六角色被三列硬挤成不可读的省略号。
+       "@media (max-width:480px){.deg_pd_roles_header,.deg_pd_role{grid-template-columns:minmax(72px,auto) minmax(0,1fr);column-gap:8px}.deg_pd_roles_header{padding-top:5px}.deg_pd_roles_header span:last-child{grid-column:2;text-align:left}.deg_pd_role{align-items:start;row-gap:2px;padding:7px 0}.deg_pd_role_name{grid-row:1 / span 2;align-self:start}.deg_pd_role_value{white-space:normal;overflow-wrap:anywhere;text-overflow:clip}.deg_pd_role_state{grid-column:2;justify-self:start;text-align:left}}" +
+      // ── 模型页签（主模型 / 候选1..3）：页签名只由位置推导，拖动排序只改本地草稿 ──────
+      ".deg_settings_model_tabs{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0;padding:0 0 8px;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
+      // 页签本体是 div[role=tab]（内部还有 × 按钮，不能嵌套 button）；touch-action 让触屏拖动不被滚动抢走。
+      ".deg_settings_model_tab{display:inline-flex;align-items:center;gap:6px;height:28px;box-sizing:border-box;padding:0 10px;color:var(--dsw-alias-label-secondary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:13px;line-height:20px;cursor:pointer;user-select:none;touch-action:none}" +
+      ".deg_settings_model_tab:hover{background:var(--dsw-alias-interactive-bg-hover)}" +
+      ".deg_settings_model_tab:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}" +
+      ".deg_settings_model_tab[aria-selected=true]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-secondary,var(--dsw-alias-bg-layer-2));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}" +
+      // 拖动中的页签半透明，明确「这一页正被拿走」而不是选中态。
+      ".deg_settings_model_tab[data-dragging=true]{opacity:.55;cursor:grabbing}" +
+      ".deg_settings_model_tab_remove{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:14px;line-height:1;cursor:pointer}" +
+      ".deg_settings_model_tab_remove:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}" +
+      ".deg_settings_model_tab_remove:disabled{opacity:.45;cursor:not-allowed}" +
+      ".deg_settings_model_tab_add{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px dashed var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:16px;line-height:1;cursor:pointer}" +
+      ".deg_settings_model_tab_add:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}" +
+      ".deg_settings_model_tab_add:disabled{opacity:.45;cursor:not-allowed}" +
+      // 落点指示：拖动时在插入边界画一条 2px 竖条，松手前就能看出新位置。
+      ".deg_settings_model_tab_drop{flex:0 0 2px;align-self:stretch;min-height:24px;border-radius:1px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}" +
+      "@media (max-width:520px){.deg_settings_model_tabs{gap:4px}}";
+
+
+    const cssTagId = "dsh-expert-group/settings.module.css";
+    /** 已注入过样式表的 document：同一 document 只注入一次，设置页适配样式不会重复注入。 */
+    const cssInjectedDocuments = typeof WeakSet === "function" ? new WeakSet() : null;
+
+    /**
+     * 幂等注入插件样式表。
+     * 模块求值可能早于 document 可用（测试替身、SSR、装配期求值），此时首次注入会被跳过；
+     * 设置页导航和模型配置需要的样式在运行期补注入；只写 DEG 自己的 style 标签，
+     * 不触碰 DSH 宿主样式。
+     */
+    function ensurePluginStylesheet() {
+      const doc = typeof document !== "undefined" ? document : null;
+      if (doc === null || typeof doc !== "object") return false;
+      if (cssInjectedDocuments?.has(doc) === true) return true;
+      const selector = "style[data-plugin-css=" + JSON.stringify(cssTagId) + "]";
+      if (typeof doc.querySelector === "function" && doc.querySelector(selector) !== null) {
+        cssInjectedDocuments?.add(doc);
+        return true;
+      }
+      if (typeof doc.createElement !== "function" || typeof doc.head?.appendChild !== "function") return false;
+      const tag = doc.createElement("style");
+      tag.dataset.plugin = "dsh-expert-group";
+      tag.dataset.pluginCss = cssTagId;
+      tag.textContent = css;
+      doc.head.appendChild(tag);
+      cssInjectedDocuments?.add(doc);
+      return true;
+    }
+    ensurePluginStylesheet();
+
+
+  // 只暴露被后续装配段实际消费的符号（无全量外挂）。
+  global[SYMBOL] = Object.freeze({
+    ensurePluginStylesheet,
+  });
+})(globalThis);
