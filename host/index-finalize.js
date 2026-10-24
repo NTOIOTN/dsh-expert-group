@@ -30,7 +30,6 @@ import {
   DONE_TOOL_NAME,
   evaluateContinuation,
   markTurnNudged,
-  recordContinuationDecision,
   resolveTurnForContinuation,
   turnClosedWithDone,
 } from "./turn-continuation-guard.js";
@@ -1311,13 +1310,6 @@ function maybeSteerContinuation(parent, payload, options) {
       exhausted: !canNudgeTurn(parent, turn),
       hasSteer: typeof parent?.steer === "function",
       force: options?.force === true,
-    });
-    // 先写内存诊断：每次决策（含跳过）都留在运行时诊断载荷里，侧栏 / RPC 可直接看到。
-    // 内容只有 reason 码 / turn / nudge / 时间戳，绝不含用户文本或路径。
-    recordContinuationDecision({
-      turn: result.reason === "turn-invalid" ? null : turn,
-      reason: result.reason,
-      nudge: result.nudge,
     });
     if (!result.nudge) {
       // 跳过必须可观测：固定前缀 + 稳定 reason 码，不含任何会话正文 / 路径 / 凭据。

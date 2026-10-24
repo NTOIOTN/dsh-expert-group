@@ -27,7 +27,6 @@ import {
   projectThrottleDiagnostics,
 } from "./runtime-diagnostics.js";
 import { AUTO_RECOVERY_LIMIT } from "../shared/recovery-ledger.js";
-import { describeContinuationDiagnostics } from "./turn-continuation-guard.js";
 
 /**
  * 创建运行时诊断投影能力面。
@@ -497,12 +496,6 @@ export function createRuntimeDiagnostics({ host, settings, storage, recovery, fa
        * 收口投递与有界 roots 摘要。只含计数/固定枚举/时间戳，不含任何 id 或正文。
        */
       rootTurnWait: describeRootTurnWaitDiagnostics(observability.rootWait),
-      /**
-       * root turn 续接保护的内存诊断（最近一次决策 + 有界历史）：只含 reason 码、turn、
-       * nudge 与时间戳，不含用户文本 / 路径；进程重启即清空。侧栏诊断面板直接读这一
-       * 段即可判断"这次 turn 为什么没有提醒"。
-       */
-      continuation: describeContinuationDiagnostics(),
       fanout: projectFanoutDiagnostics(diagnosticsState),
       recovery: {
         rebuilds: diagnosticCount(recoveryState.rebuilds),
