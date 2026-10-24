@@ -92,8 +92,21 @@ const PRECHECK_MODEL_ROUTE_ERROR_CODE_SET = new Set([
  * 有候选可切时立即切换，不把当前模型的 5 次预算浪费在必然复现的错误上；
  * 没有候选可切时才退回既有请求级重试/终态语义（保持 root 与「未配置候选」的行为）。
  *
- * QUOTA/INVALID_CREDENTIAL 等未列入：用户确认的确定性集合只包含下列码，
- * 其余错误一律按现有瞬态/未知语义处理，避免擅自扩大「换模型」的触发面。
+ * QUOTA（额度/余额耗尽）**已列入**：它是 dsh-llm 的 provider-neutral 稳定码
+ * （account 路由会把它重写为 ACCOUNT_QUOTA，第三方适配器可能拼作 QUOTA_EXCEEDED），
+ * 表示额度/余额已经用尽。这类失败重试同一路由**必然复现**，宿主适配器本身也把它判为
+ * 终态、不做任何重试，因此唯一出路是换候选：有候选时必须立即切换，绝不浪费预算。
+ * 注意它只认结构化 code——普通 429（RATE_LIMIT）仍属瞬态，必须继续走宿主退避重试。
+ *
+ * 重要边界：本集合**不再是「换候选」的唯一触发面**。错误码由各 provider/adapter
+ * 各自定义，插件无法穷举（provider 私有码、未知码都可能出现），因此运行期 handler
+ * 对「不可重试且不在本集合/宿主重试白名单里」的错误，同样会在**存在候选链时**先尝试
+ * 换下一个候选（见 host/index-agent-request-error.js 的 !isTransientRequestFailure 分支）。
+ * 本集合仍然决定「不浪费任何预算、立即切换」的那一类；两类最终都由候选链耗尽后的
+ * 既有失败语义收口，没有候选链的 root/child 行为完全不变。
+ *
+ * INVALID_CREDENTIAL 等其它码仍未列入：用户确认的确定性集合只包含下列码，
+ * 未列入的码按上面那条「不可重试错误也尝试换候选」的通用规则处理，而不是被直接终态化。
  */
 export const DETERMINISTIC_MODEL_FAILURE_CODES = Object.freeze([
   "MODEL_NOT_FOUND",
@@ -112,6 +125,18 @@ export const DETERMINISTIC_MODEL_FAILURE_CODES = Object.freeze([
    * 立即换候选，最终由候选链耗尽后的既有失败语义收口。
    */
   "CONTEXT_WINDOW_EXCEEDED",
+  /**
+   * 额度/余额耗尽（dsh-llm 的 provider-neutral 稳定码 QUOTA_EXCEEDED_CODE）。
+   *
+   * QUOTA 是宿主适配器判定的终态码：GoUsageLimitError / insufficient_quota 之类
+   * 上游错误在余额恢复前对同一 provider+model 重试必然复现，适配器自己也不会重试，
+   * 所以这里必须把它当作确定性失败，有候选时立即切换。
+   */
+  "QUOTA",
+  /** account 路由对 QUOTA 的稳定重写（账号级额度耗尽）。 */
+  "ACCOUNT_QUOTA",
+  /** 第三方 adapter 的兼容拼写（QUOTA_EXCEEDED），语义与 QUOTA 一致。 */
+  "QUOTA_EXCEEDED",
 ]);
 
 /**
@@ -124,6 +149,43 @@ export function isDeterministicModelFailure(failure) {
     && typeof failure === "object"
     && typeof failure.code === "string"
     && DETERMINISTIC_MODEL_FAILURE_CODES.includes(failure.code);
+}
+
+/**
+ * 运行期「不可降级」的错误码集合：取消 / 用户中断。
+ *
+ * 为什么单独一个集合：取消不是「模型可用性失败」。用户主动取消或宿主中断 turn 后，
+ * 换一个模型重新发请求**违背取消语义**——用户已经不想继续，插件不得替他把工作换台
+ * 机器接着跑（那还会额外产生 token 成本与副作用）。
+ *
+ * 因此即使 payload.signal.aborted 尚未反映（失败事件可能先于 signal 标记到达，或
+ * 宿主用独立失败码表达中断），只要结构化 code 命中这里就保持终态、绝不换候选。
+ *
+ * 只认**结构化 code**，绝不解析 message 文本：message 里的 "abort"/"cancel" 字样
+ * 可能只是上游的普通错误文案。
+ */
+export const NON_DEGRADABLE_MODEL_FAILURE_CODES = Object.freeze([
+  /** 宿主/适配器的通用取消码（AbortSignal 取消）。 */
+  "ABORTED",
+  "CANCELLED",
+  "CANCELED",
+  /** Node 风格的中断名（AbortError.name 的常见拼写）。 */
+  "ABORT_ERR",
+  /** turn 级中断（宿主终止当前 turn）。 */
+  "INTERRUPTED",
+]);
+
+/**
+ * 判断一次 request-error 的结构化 failure 是否属于取消/中断（禁止降级）。
+ *
+ * @param {object} [failure] - 公开 agent/request-error payload 的 failure。
+ * @returns {boolean} code 明确属于取消/中断集合时返回 true。
+ */
+export function isNonDegradableModelFailure(failure) {
+  return failure !== null
+    && typeof failure === "object"
+    && typeof failure.code === "string"
+    && NON_DEGRADABLE_MODEL_FAILURE_CODES.includes(failure.code);
 }
 
 /**

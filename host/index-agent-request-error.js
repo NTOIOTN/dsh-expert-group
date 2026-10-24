@@ -3,11 +3,17 @@
  *
  * 这是 `ctx.on("agent/request-error")` 的纯 handler：在公开 waterfall 上接管插件
  * root / 专家 child / fan-out 分片的模型失败，按三个触发点决定「重试、换候选、终态」：
- * 1. 确定性失败（模型不存在/无 adapter/鉴权失败/上下文超限）→ 有候选立即换，不浪费预算；
- * 2. Host retryPolicy 声明归它管理但已拒绝/耗尽重试 → 换候选；
- * 3. 插件自己的请求级预算（AUTO_RECOVERY_LIMIT）耗尽 → 换候选。
+ * 1. 确定性失败（模型不存在/无 adapter/鉴权失败/上下文超限/配额或余额耗尽
+ *    QUOTA、ACCOUNT_QUOTA）→ 有候选立即换，不浪费预算；
+ * 2. 其余**不可重试**的请求错误（provider 私有码、未知码等，既不在宿主重试白名单、
+ *    也不在确定性集合里）→ 同样有候选就立即换：错误码空间由各 provider/adapter 定义，
+ *    插件无法穷举，所以「不可重试」本身就足以成为换候选的理由，直接终态只会让一个
+ *    可用的备用模型白白闲置；
+ * 3. 可重试错误（RATE_LIMIT/5xx/TIMEOUT/流中断/EMPTY_RESPONSE 等）按当前模型的
+ *    请求级重试预算（AUTO_RECOVERY_LIMIT=5）重试，预算耗尽后再换候选。
  * 三者都只在「存在下一个候选且总降级次数未超 fallbackLimit」时生效；否则保持原有
- * exhausted/终态语义。取消（signal aborted）永不降级。
+ * exhausted/终态语义。没有候选链的 root/child 行为完全不变（继续走宿主 retryPolicy
+ * 与既有终态）。取消（signal aborted）永不降级。
  *
  * ## 铁律（票据 19）
  * 不接收 ctx、不注册事件：`ctx.on("agent/request-error", handler, { prepend: true })`
@@ -28,7 +34,7 @@ import {
   recoveryDelayForCount,
   requestRetryPolicyCoversFailure,
 } from "../shared/retry-policy.js";
-import { isDeterministicModelFailure } from "../shared/model-route.js";
+import { isDeterministicModelFailure, isNonDegradableModelFailure } from "../shared/model-route.js";
 import { waitForRequestRetryDelay } from "./rpc-request-lifecycle.js";
 
 /**
@@ -112,8 +118,22 @@ export function createAgentRequestErrorHandler({ logger, recovery }) {
         // 不可重试码由下面的终态分支收口（不在此处改变公共行为）。
       }
       if (!isTransientRequestFailure(failure)) {
-        // 已经发生过请求级重试后又出现永久/未知失败时，不能再落入 child
-        // continuation，把同一失败计两遍；没有前置请求重试则保留既有终态语义。
+        // 其余「不可重试且不属于确定性集合」的请求错误：provider 私有码、未知码等。
+        // 错误码空间由各 provider/adapter 定义，插件无法穷举；用户已确认的语义是
+        // 「任何报错都必须能降级」，因此只要存在候选链就先尝试换下一个候选，而不是
+        // 直接终态。只有候选链已尽（含降级预算耗尽）时才置 exhausted 并保持原始终态。
+        //
+        // 唯一例外是取消/用户中断（NON_DEGRADABLE_MODEL_FAILURE_CODES）：取消不是
+        // 模型可用性失败，换模型重发违背取消语义；即使 payload.signal.aborted 尚未
+        // 反映也必须走下面的原始终态分支（与改动前逐字一致，不新增分支语义）。
+        if (fallbackManaged === true && isNonDegradableModelFailure(failure) !== true) {
+          if (recovery.switchToNextModelCandidate(agent, target, state)) return { kind: "retry" };
+          state.exhausted = true;
+          return void 0;
+        }
+        // 没有候选链的 root/child：保持既有语义——已经发生过请求级重试后又出现
+        // 永久/未知失败时，不能再落入 child continuation，把同一失败计两遍；
+        // 没有前置请求重试则保留既有终态语义。
         if (state.retryCount > 0) state.exhausted = true;
         return void 0;
       }

@@ -1122,10 +1122,21 @@ function installModelFallback(deps, api) {
     chain.switches += 1;
     chain.triedRoutes.add(modelRouteKeyOf(next.selection));
     // 新候选重新获得完整请求级预算。取消语义：调用方必须先排除 signal.aborted
-    // （本函数只处理真实失败），因此这里不会把用户中断当成降级触发。
+    // 与取消/中断码（本函数只处理真实失败），因此这里不会把用户中断当成降级触发。
     state.retryCount = 0;
     state.exhausted = false;
     state.generation = Number.isSafeInteger(state.generation) ? state.generation + 1 : 1;
+    // 换候选 = 一次**全新的请求尝试**，请求级去重集合必须一起重置。
+    //
+    // 为什么必须重置：宿主在不同尝试之间可能复用同一个 requestId（甚至同一个
+    // failure 对象）。若不清理，候选上的第一次真实失败会被 markRequestRetryEvent
+    // 判成「重复事件」直接丢弃，handler 会在去重那一行 return void 0——表现为
+    // 「刚切到候选就再也不动」，候选链卡死且永远不会继续降级。
+    // 类型与 createRequestRetryState/resetRequestRetryState 保持一致：
+    // payload/failure 只存对象身份（WeakSet），requestId 是不透明字符串（Set）。
+    state.seenPayloads = new WeakSet();
+    state.seenFailures = new WeakSet();
+    state.seenRequestIds = new Set();
     writeModelRouteSnapshot(agent, chain, next);
     return true;
   }
