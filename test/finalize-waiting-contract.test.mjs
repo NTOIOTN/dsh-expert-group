@@ -156,6 +156,27 @@ function driveTurnStopping(host, root, turn = 1, signal) {
 }
 
 /**
+ * 构造「该 turn 已按协议打完成标记」的事件日志。
+ *
+ * 新协议要求**每个 turn** 都以 dsh_expert_group_done 收尾；本文件的关注点是收口结论的
+ * 投递次数，因此给后续 turn 边界补一个**完整三段式**的完成标记（assistant block 带 callId →
+ * tool/call 同名同 callId → 成功 tool/result），让 turn-stopping 的续接保护保持沉默，
+ * 而不是放宽「每批至多一次结论」的断言。
+ */
+function doneClosedTurnEvents(turn) {
+  const callId = "done-call-" + turn;
+  return [
+    { type: "turn/start", data: { turn } },
+    {
+      type: "assistant/message",
+      data: { turn, step: 1, message: { content: [{ type: "tool-call", name: "dsh_expert_group_done", callId, arguments: {} }] } },
+    },
+    { type: "tool/call", data: { turn, step: 1, callId, name: "dsh_expert_group_done", arguments: {} } },
+    { type: "tool/result", data: { turn, step: 1, message: { role: "tool", toolCallId: callId, content: [] } } },
+  ];
+}
+
+/**
  * 结束 child 的 turn 边界。
  *
  * 必须与真实 Host 同形：终态事件之外，会话日志里也要有本 turn 的 `turn/start` 与带着
@@ -375,6 +396,8 @@ test("wait 释放后只关闭并 steer 一次：重复 turn-stopping 不再参�
   await stop.settled;
   assert.equal(steerMessages(host, root).length, 1);
 
+  // 本 turn 已按协议收尾：后续边界不得再叠加续接提醒（只验证收口结论仍至多一次）。
+  root.session.events = doneClosedTurnEvents(2);
   const again = driveTurnStopping(host, root, 2);
   await flushAsyncWork(8);
   assert.equal(again.pending, 0, "已关闭批次不得再次悬挂 root turn");
@@ -475,6 +498,8 @@ test("单个 child：结算后 works 已空时不走进度放行，仍按 quiesc
   assert.match(text, /acceptedCount 1/);
 
   // 批次已经关闭：后续 turn 边界不再参与等待，也不需要补投递。
+  // 本 turn 已按协议收尾：续接保护必须保持沉默。
+  root.session.events = doneClosedTurnEvents(2);
   const after = driveTurnStopping(host, root, 2);
   await flushAsyncWork(8);
   assert.equal(after.pending, 0, "已关闭批次不得再次悬挂 root turn");
@@ -522,6 +547,8 @@ test("无 waiter 静止窗口回归：root 新 step 执行期间最后一个专�
   assert.match(text, /acceptedCount 2/, "终态结论必须表达整批 acceptedCount");
 
   // 批次已关闭：后续 turn 边界不再悬挂，也不会重复投递。
+  // 本 turn 已按协议收尾：续接保护必须保持沉默。
+  root.session.events = doneClosedTurnEvents(3);
   const after = driveTurnStopping(host, root, 3);
   await flushAsyncWork(8);
   assert.equal(after.pending, 0, "已关闭批次不得再次悬挂 root turn");

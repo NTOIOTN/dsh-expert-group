@@ -2142,8 +2142,9 @@ function stopRootTurn(host, root, turn = 1, signal) {
  * 构造 root 本 turn 的事件日志（用于续接保护用例）。
  *
  * 形状与真实 session 一致：turn/start → user/message → tool/call → assistant/message。
- * assistant 文本刻意写成「下一步动作宣言」，让 turn-continuation-guard 命中
- * continuation-intent；这样本文件才能验证「等待路径已经续接 turn 时不得再叠加提醒」。
+ * 本 turn 有过工具调用、但最后一个工具调用不是完成标记 dsh_expert_group_done，因此
+ * turn-continuation-guard 判定为「未完成、需要续接」。这样本文件才能验证「等待路径已经
+ * 续接 turn 时不得再叠加提醒」以及「等待静止且无收口结论时补一次提醒」。
  */
 function buildRootGuardEvents(turn, text) {
   return [
@@ -2238,7 +2239,7 @@ test("turn-stopping 兜底：收口结论已续接 turn 时绝不再叠加续接
   const outcome = await startAdmission(host, root, "continuation guard wait", ["docs/continuation-guard.md"]);
   const receipt = await finalize(host, root, outcome);
   assert.equal(receipt.kind, "waiting");
-  // root 本 turn 的最后一条消息是一次「下一步动作宣言」：续接保护本会命中。
+  // root 本 turn 有工具调用、但最后一个不是完成标记：续接保护本会判定为未完成。
   root.session.events = buildRootGuardEvents(1, "实现路径已经清楚，我去验证。");
 
   const stop = stopRootTurn(host, root);
@@ -2255,7 +2256,7 @@ test("turn-stopping 兜底：收口结论已续接 turn 时绝不再叠加续接
   assert.equal(delivered.length, 1, "整批收口只投递一次收口结论，绝不叠加续接提醒");
   const text = delivered[0].content.map((block) => block.text).join("");
   assert.match(text, /admissionEpoch/);
-  assert.doesNotMatch(text, /Turn continuation guard:/);
+  assert.doesNotMatch(text, /Turn not marked complete:/);
   assertNoGoalCalls(probe);
 });
 
@@ -2278,7 +2279,7 @@ test("turn-stopping 兜底：等待正常静止且无 pending-close 时补一次
   assert.equal(await stop.settled, "settled");
   const delivered = host.agentSteerMessages(root);
   assert.equal(delivered.length, 1, "等待静止且无收口结论时必须补一次续接提醒");
-  assert.match(delivered[0].content.map((block) => block.text).join(""), /^Turn continuation guard:/);
+  assert.match(delivered[0].content.map((block) => block.text).join(""), /^Turn not marked complete:/);
   assertNoGoalCalls(probe);
 });
 

@@ -1,30 +1,49 @@
 /**
- * root turn 续接保护（turn continuation guard）。
+ * root turn 完成标记（turn completion marker）与续接保护。
  *
- * ## 为什么需要它
- * 线上会话日志里 root 多次在任务中途只输出一段「下一步动作宣言」（例如“我去验证。”），
- * 这一步没有任何工具调用；DSH 随即以该消息结束 turn（turn/end completed），用户必须
- * 手动输入“继续”。提示词层的 Turn discipline 已经加载，但模型仍会这样收尾，因此在
- * 插件**自己的** `agent/turn-stopping` 边界再兜一层：当本 turn 明显处在“准备继续干活”
- * 的中途停顿时，用 `parent.steer(createUserMessage(...))` 往 next-step inbox 投递一条
- * 固定提醒；宿主重读 inbox 后会在同一 turn 继续一个 step，而不是把 turn 关掉。
+ * ## 协议是什么
+ * root 专用工具 dsh_expert_group_done（无参数）是**完成标记**：**每个 turn** 在给出最终
+ * 答复之前，都必须把这次调用作为本 turn 的**最后一个工具调用**——不区分本 turn 是否调用过
+ * 工具。root 的 agent/turn-stopping 边界据此做机械校验：turn 状态不是「以完成标记收尾」
+ * 就视为未完成，调用方 steer 一条固定提醒让同一 turn 继续，而不是把 turn 关掉、让用户
+ * 手动输入“继续”。
  *
- * ## 为什么有界
- * 同一个 root 的同一个 turn 最多提醒一次（模块级 WeakMap）。turn 变化即重置；一旦提醒过，
- * 即使后续 step 仍只写文本也不再重复投递——避免与模型形成“无限续接”的死循环，也避免
- * 在同一 turn 里反复打断模型或用户的正常节奏。
+ * ## 为什么不再用文本启发式
+ * 旧实现用「动作词表 + 末句正则」猜测模型是否在任务中途停顿（例如“我去验证。”），
+ * 该方案被证明既漏报又误报：同一句在不同上下文里既可能是承诺、也可能是陈述，词表永远
+ * 追不上真实措辞。完成标记把判定从**自然语言猜测**换成**协议事实**：只看本 turn 的工具
+ * 调用序列与其结果，不读任何文本内容，因此判定稳定、可测试、也不会被交付总结的措辞误导。
+ *
+ * ## 收尾判定（严格、fail-closed）
+ * - 工具调用序列按 **callId 去重**：tool/call 事件与 assistant 消息里的 tool-call block 是
+ *   同一次调用的两侧投影，重复出现只计一次（首次出现优先）；没有 callId 的条目用合成键
+ *   入列、name 记为 null——它会让“最后一条”不再等于完成标记，从而保守地判定为未完成。
+ * - 最后一条条目的 name 必须**严格等于** dsh_expert_group_done；尾部任何残缺/缺名调用都
+ *   会破坏收尾。
+ * - 最后这条 done **必须有非空 callId**：只有 assistant 消息里的 tool-call block、缺少
+ *   tool/call 事件与 tool/result 的投影，无法核对调用是否真的发生并成功，因此不算收尾。
+ * - 必须找到同一 callId、且**明确非失败**的 tool/result：结果缺失、
+ *   message.isError === true 或 data.error != null 都按未完成处理。失败只看结构化字段，
+ *   绝不解析结果正文（正文是模型可见文本，不能当协议凭据）。
+ *
+ * ## 为什么有界（best-effort）
+ * 同一个 root 的同一个 turn 最多提醒 MAX_CONTINUATIONS_PER_TURN（3）次（模块级 WeakMap
+ * 计数）。turn 变化即重置。DSH 没有硬锁：提醒只是 best-effort 的纠偏，模型连续 3 次忽略
+ * 后不再重复投递，避免把同一 turn 变成无限续接的死循环，也避免反复打断模型/用户节奏。
  *
  * ## 为什么 fail-open
  * turn-stopping 是 serial 且被宿主 await 的边界：监听器抛错会被 DSH 变成 turn 错误。
  * 本模块的判定全部是纯函数 / 只读事件投影（不写任何状态）；唯一的副作用（steer）由调用方
- * host/index-finalize.js 用 try/catch 包住并只记告警，异常绝不向宿主抛出。
+ * host/index-finalize.js 用 try/catch 包住并只记告警，异常绝不向宿主抛出。事件不可读
+ * （非数组 / 非法 turn）时判定返回 false，绝不因此抛错。
  *
  * ## 为什么只针对 root
  * 本模块只被 root 的 turn-stopping 兜底调用。专家子代理的 turn 由 DSH 的 subagent 机制
- * 管理（结算、续作、取消都有自己的一套语义），插件不去替它们续接。
+ * 管理（结算、续作、取消都有自己的一套语义），插件不去替它们续接；dsh_expert_group_done
+ * 本身也只允许 live root 调用。
  *
  * ## 为什么不碰等待账本
- * 续接提醒与 finalize/等待账本是**两条正交链路**：提醒只表达“这一步看起来还没说完”，
+ * 续接提醒与 finalize/等待账本是**两条正交链路**：提醒只表达“本 turn 还没有完成标记”，
  * 不登记工作、不关闭批次、不投递收口结论、也不读改任何等待状态。等待路径已经 steer 过
  * 结算消息或收口结论时，调用方会跳过本提醒，避免同一 turn 里叠加两条续接消息。
  *
@@ -33,85 +52,216 @@
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { PRODUCER_SOURCE_KIND } from "./plugin-identity.js";
 
+/** root 专用完成标记的工具名（协议事实，提示词/工具定义/判定共用同一常量）。 */
+export const DONE_TOOL_NAME = "dsh_expert_group_done";
+
+/**
+ * 同一 root 同一 turn 的续接提醒上限。
+ *
+ * DSH 没有“必须打标记才能结束”的硬锁，提醒只能是有界 best-effort：超过该次数说明模型
+ * 连续忽略纠偏，继续投递只会造成无限续接；把上限固定在 3 次并显式登记，便于测试与运维
+ * 观测（第 4 次起不再 steer）。
+ */
+export const MAX_CONTINUATIONS_PER_TURN = 3;
+
 /**
  * 续接提醒的固定正文（模型可见，逐字稳定）。
  *
- * 三段结构：解释为什么被提醒（上一条消息没有工具调用、turn 即将关闭）→ 要求继续调用工具、
- * 不要只描述下一步 → 给出两个合法收尾出口（真的交付完 / 正阻塞在用户输入）。
- *
- * 刻意**不**要求模型回复固定标记（旧版要求 “reply with exactly: DONE”）：那会诱导模型
- * 在未完成时也回一个 DONE 来规避提醒，也会污染正常交付文本。
+ * 只表达协议事实：本 turn 即将关闭，但没有以完成标记收尾。随后给出两个合法出口——没交付
+ * 完就继续调用工具；已交付完就先补 dsh_expert_group_done 再给最终答复，且**不要重复上一次
+ * 答复**（避免模型用一段重复文本充当“已标记”）。文案对纯文本 turn 与“最后调用不是 done”
+ * 的 turn 同样成立，因此不区分是否调用过工具。
  */
-const CONTINUATION_REMINDER_TEXT = "Turn continuation guard: your previous message contained no tool call, so this turn was about to close. If the user's request is not fully delivered yet, continue now with the next tool call instead of describing what you will do next; if it is already fully delivered, give a brief confirmation instead of repeating the answer; if it is blocked on the user, state what you need.";
+const CONTINUATION_REMINDER_TEXT = "Turn not marked complete: this turn is about to close, but it did not end with a dsh_expert_group_done tool call. If the user's request is not fully delivered yet, continue now with the next tool call instead of describing what you will do next. If it is already fully delivered, call dsh_expert_group_done as the last tool call and then give the final answer — do not repeat the previous answer.";
 
-/**
- * 完成声明：出现在该 turn 最后一条 assistant 文本里就表示这一步是交付，不是中途停顿。
- *
- * 覆盖中英文常见收尾（已完成 / 已实现 / 已修复 / 已交付 / 已通过 / 全部通过 / 全绿 /
- * 测试通过 / 搞定 / 改好 / 改完 / 完成以上 / 全部完成 / 交付完成 / All done），大小写不敏感。
- *
- * 刻意**不**接受裸的 “done”：它常出现在英文普通句子里（如 “well done, but I will check
- * the logs”），把它当完成声明会吞掉真正的续接意图；只有 “all done” 这种明确收尾才算。
- */
-const COMPLETION_PATTERN = /(已完成|已实现|已修复|已交付|已通过|全部通过|全绿|测试通过|搞定|改好|改完|完成以上|全部完成|交付完成|all done)/i;
+/** 安全取值：只接受普通对象，其余值一律视为“形状非法”。 */
+function asObject(value) {
+  return value !== null && typeof value === "object" ? value : null;
+}
 
-/**
- * 「下一步动作承诺」只按**句子末尾**判定，不做全文子串匹配。
- *
- * 为什么改成末句：全文子串会把正常陈述误判成交接意图——例如「我看这个方案可行。」里
- * 的 “我看” 只是观点表达，并不是“接下来去查看”。因此先切出最后一句话，再用三个中文
- * 互补分支 + 英文分支判定（任一命中即 continuation-intent）：
- *
- * 分支 A（动作词贴近句末）：我/让我 + ≤30 字 + 动作动词 + 极短语气补语
- * （一下 / 一遍 / 再 / 就 …）结尾。尾部范围的取舍有实测依据：
- * 1. oracle 给出的 0..6 字上界无法排除它自己指定的反例「我看这个方案可行。」——
- *    “这个方案可行”正好 6 字，会命中；收窄到 ≤4 才能过该反例；
- * 2. 但 ≤4 仍会误伤「这个实现我看没问题。」（“没问题”3 字）。因此最终改为
- *    **语气补语白名单**：动词之后只允许“一下/一遍/一眼/下/来/先/再/就”，
- *    陈述性尾巴（没问题 / 可行 / 这个方案可行）一律不命中。
- *
- * 分支 B（明确动作前缀 + 有限宾语）：只接受“我去/我会/我来/我先/让我”这类第一人称
- * **明确动作前缀**，动作词之后允许一个有限宾语（≤12 字），覆盖「我去检查日志」
- * 「我先看一下结果」「我去查文档」「我来确认结果」「我会检查日志」。
- * 宾语不允许出现分句标点（：:，,），因为那是“解释/结论”的形态：
- * 「让我确认：这个方案可行」必须继续保持不命中。分支 B 刻意不接受裸「我看」——
- * 「我看这个方案可行」只是评价，不是动作承诺。
- *
- * 分支 C（逗号衔接的后续动作）：只接受「明确动作前缀 + 动作词 + 逗号 + 连接词
- * （然后/再/随后/接着/必要时/之后/并）+ 后续动作动词」，覆盖「我去检查日志，然后修」
- * 「我先看一下结果，再决定」这类“先做一步、再做一步”的承诺。
- * 它刻意**不是**任意逗号宾语的通道：逗号后必须紧跟上述连接词，且后续动作必须是动作
- * 动词；「我去查文档，确认后回复」不命中（连接词白名单不含“确认”），冒号结论
- * 「让我确认：这个方案可行」也继续不命中。
- *
- * 英文：I'll / I will / Let me + 动作动词 + ≤20 字宾语结尾；“well done, but I will
- * check the logs.” 命中末句动作承诺，优先于完成声明。
- */
-const LAST_SENTENCE_ACTION_PATTERN = /(?:我|让我)[^。！？\n]{0,30}(?:看|读|查|确认|验证|核对|检查|跑|试|复现|抓|取|定位)(?:一下|一遍|一眼|下|来|先|再|就)?$/;
-const LAST_SENTENCE_OBJECT_ACTION_PATTERN = /(?:我(?:去|会|来|先)|让我)[^。！？\n]{0,24}(?:看|读|查|确认|验证|核对|检查|跑|试|复现|抓|取|定位)[^。！？\n：:，,]{0,12}$/;
-const LAST_SENTENCE_COMMA_CHAIN_PATTERN = /(?:我(?:去|会|来|先)|让我)[^。！？\n]{0,24}(?:看|读|查|确认|验证|核对|检查|跑|试|复现|抓|取|定位)[^。！？\n]{0,16}[，,]\s*(?:然后|再|随后|接着|必要时|之后|并)[^。！？\n：:]{0,24}(?:修|改|写|补|做|处理|决定|验证|确认|检查|跑|试|复现|分析|定位|继续|推进|实现)[^。！？\n]{0,6}$/;
-const LAST_SENTENCE_ACTION_PATTERN_EN = /\b(?:I(?:'ll| will)|Let me)\s+(?:now\s+)?(?:check|look|read|run|verify|test|inspect|open|search|continue)\b[^.!?\n]{0,20}$/i;
-
-/** 意图判定的文本上限：超过它的通常是交付总结，不做续接提醒。 */
-const MAX_INTENT_TEXT_LENGTH = 1200;
-
-/**
- * 取文本最后一个非空句子。
- *
- * 按中文句末标点、ASCII 的 !/? 与换行切分；ASCII 句点 “.” 不作为切分符（英文里它常与
- * 缩写/小数混用），但在末尾统一剥掉，保证末句以内容结尾、便于用 `$` 锚定动作动词。
- */
-function lastSentenceOf(text) {
-  const sentences = text.split(/[。！？!?\n]+/);
-  for (let index = sentences.length - 1; index >= 0; index -= 1) {
-    const sentence = sentences[index].trim().replace(/[.!?]+$/, "").trim();
-    if (sentence.length > 0) return sentence;
-  }
-  return "";
+/** 消息 content 数组；缺失或非数组时安全返回空数组。 */
+function contentBlocks(message) {
+  const content = asObject(message)?.content;
+  return Array.isArray(content) ? content : [];
 }
 
 /**
- * 每个 root 的提醒登记簿：`WeakMap<Agent, {turn, nudged}>`。
+ * 判定某个 block 是否是一次工具调用。
+ *
+ * 真实形状是 tool-call；旧会话日志里可能是 tool_use，两者都算——续接判定只关心
+ * “本 turn 的工具调用序列”这一协议事实，不区分日志版本。
+ */
+function isToolCallBlock(block) {
+  const part = asObject(block);
+  return part !== null && (part.type === "tool-call" || part.type === "tool_use");
+}
+
+/** 从 block 读取 callId：真实形状是 callId，旧形状也可能用 id。 */
+function blockCallId(block) {
+  const part = asObject(block);
+  if (part === null) return undefined;
+  if (typeof part.callId === "string" && part.callId.length > 0) return part.callId;
+  if (typeof part.id === "string" && part.id.length > 0) return part.id;
+  return undefined;
+}
+
+/**
+ * 按事件顺序收集该 turn 的**工具调用条目**（按 callId 去重）。
+ *
+ * 为什么合并两侧投影：tool/call 是宿主的权威调用事件；assistant 消息里的 tool-call block
+ * 是同一调用的消息侧投影（旧日志/流式增量里也可能只有它）。只看一侧会在残缺日志上误判
+ * 调用序列。两侧同时出现且 callId 相同时，**首次出现优先**、后续重复忽略。
+ *
+ * 没有 callId 的条目用合成键入列（不做去重）：它的 name 可能是 null，从而让“最后一条”
+ * 不再等于完成标记——这正是残缺调用必须被判为未完成的地方。
+ *
+ * @param {object[]} events - session 事件数组（顺序与 session 日志一致）。
+ * @param {number} turn - 目标 turn 号。
+ * @returns {{callId:string|null, name:string|null}[]} 去重后的有序条目。
+ */
+function turnToolCallEntries(events, turn) {
+  if (!Array.isArray(events) || !Number.isSafeInteger(turn)) return [];
+  const entries = [];
+  const seenCallIds = new Set();
+  const pushEntry = (callId, name) => {
+    const key = typeof callId === "string" && callId.length > 0 ? callId : null;
+    // 有 callId 时按 callId 去重；没有 callId 的条目各自独立入列。
+    if (key !== null) {
+      if (seenCallIds.has(key)) return;
+      seenCallIds.add(key);
+    }
+    entries.push({ callId: key, name: typeof name === "string" ? name : null });
+  };
+  for (const event of events) {
+    const item = asObject(event);
+    if (item === null) continue;
+    if (item.type === "tool/call") {
+      const data = asObject(item.data);
+      if (data === null || data.turn !== turn) continue;
+      pushEntry(data.callId, data.name);
+      continue;
+    }
+    if (item.type !== "assistant/message") continue;
+    const data = asObject(item.data);
+    if (data === null || data.turn !== turn) continue;
+    for (const block of contentBlocks(asObject(data.message))) {
+      if (!isToolCallBlock(block)) continue;
+      const part = asObject(block);
+      if (part === null) continue;
+      pushEntry(blockCallId(part), part.name);
+    }
+  }
+  return entries;
+}
+
+/**
+ * 该 turn 是否存在某个 callId 的**成功** tool/result。
+ *
+ * 事件形状：{type:"tool/result", data:{turn, step, message:{role:"tool", toolCallId, isError?, content}}}；
+ * 兼容结果 id 直接挂在 data.toolCallId 上的形状。
+ *
+ * 失败判定只看结构化字段：message.isError === true 或 data.error 非空 → 该结果不算成功
+ * （继续扫描；找不到成功结果即视为未完成）。缺失这些字段的旧日志按成功处理。刻意**不**
+ * 解析 content 正文：正文既可能提到错误、也可能被截断，不能当协议凭据。
+ *
+ * 匹配规则保守：data.turn 缺失或不是安全整数时接受（旧日志可能不写 turn），但它明确属于
+ * 另一个 turn 时跳过，避免把别的 turn 的结果当成这次 done 的成功凭据。
+ *
+ * @param {object[]} events - session 事件数组。
+ * @param {number} turn - 目标 turn 号。
+ * @param {string} callId - 待匹配的调用 id。
+ * @returns {boolean} 是否存在明确的成功结果。
+ */
+function hasToolResult(events, turn, callId) {
+  if (!Array.isArray(events) || typeof callId !== "string" || callId.length === 0) return false;
+  for (const event of events) {
+    const item = asObject(event);
+    if (item === null || item.type !== "tool/result") continue;
+    const data = asObject(item.data);
+    if (data === null) continue;
+    if (Number.isSafeInteger(data.turn) && data.turn !== turn) continue;
+    const message = asObject(data.message);
+    if (data.toolCallId !== callId && message?.toolCallId !== callId) continue;
+    // 结构化失败字段：任一明确失败都不算成功；缺失按成功处理（旧日志）。
+    if (message?.isError === true) continue;
+    if (data.error != null) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 取该 turn 全部 tool/call 事件的 data.name（按事件顺序，只含字符串名）。
+ *
+ * 纯函数、只读事件：非数组 events 或非法 turn 一律返回空数组，绝不抛错。
+ * 这是诊断/投影用的简化读面；收尾判定请用 turnClosedWithDone（它按 callId 去重并校验
+ * tool/result）。assistant 消息里的 tool-call block 不参与本函数。
+ *
+ * @param {object[]} events - session 事件数组。
+ * @param {number} turn - 目标 turn 号。
+ * @returns {string[]} 该 turn 的工具调用名列表。
+ */
+export function turnToolCallNames(events, turn) {
+  if (!Array.isArray(events) || !Number.isSafeInteger(turn)) return [];
+  const names = [];
+  for (const event of events) {
+    const item = asObject(event);
+    if (item === null || item.type !== "tool/call") continue;
+    const data = asObject(item.data);
+    if (data === null || data.turn !== turn) continue;
+    if (typeof data.name === "string") names.push(data.name);
+  }
+  return names;
+}
+
+/**
+ * 本 turn 是否**按协议收尾**：至少有一条工具调用，且最后一条是完成标记（并且它真的成功）。
+ *
+ * 判定（任何一步不满足都返回 false，fail-closed 到“继续”）：
+ * 1. 工具调用条目为空 → false（没有完成标记）；
+ * 2. 最后一条条目的 name 严格等于 dsh_expert_group_done；
+ * 3. 该条目必须有非空 callId：只有消息侧投影（assistant block）的 done 无法核对结果，
+ *    不能关闭 turn；
+ * 4. 必须找到该 callId 的**成功** tool/result；结果缺失、isError 或 data.error 都按未完成。
+ *
+ * 因此「done 之后又调用了别的工具」「done 之后出现缺名调用」「done 没有结果」
+ * 「done 结果失败」「只有消息侧 block 的 done」都不算收尾。
+ *
+ * @param {object[]} events - session 事件数组。
+ * @param {number} turn - 目标 turn 号。
+ * @returns {boolean} 是否以完成标记收尾。
+ */
+export function turnClosedWithDone(events, turn) {
+  if (!Array.isArray(events) || !Number.isSafeInteger(turn)) return false;
+  const entries = turnToolCallEntries(events, turn);
+  if (entries.length === 0) return false;
+  const last = entries[entries.length - 1];
+  if (last?.name !== DONE_TOOL_NAME) return false;
+  // 只有 assistant 消息侧投影（没有 callId）无法核对调用是否真的发生并成功 → fail-closed。
+  if (typeof last.callId !== "string" || last.callId.length === 0) return false;
+  return hasToolResult(events, turn, last.callId);
+}
+
+/**
+ * 本 turn 是否需要一次续接提醒（纯函数，只读事件）。
+ *
+ * 判定：不是「以完成标记收尾」就提醒——**不再豁免“本 turn 没有工具调用”的纯文本 turn**，
+ * 因为协议要求每个 turn 都以 dsh_expert_group_done 结束。
+ *
+ * 非数组 events / 非法 turn 返回 false：事件日志不可读时无法判定，提醒只会变成噪音；
+ * 这是本模块统一的 fail-open 边界。
+ *
+ * @param {object[]} events - session 事件数组。
+ * @param {number} turn - 目标 turn 号。
+ * @returns {boolean} 是否需要续接提醒。
+ */
+export function needsContinuation(events, turn) {
+  if (!Array.isArray(events) || !Number.isSafeInteger(turn)) return false;
+  return turnClosedWithDone(events, turn) !== true;
+}
+
+/**
+ * 每个 root 的提醒登记簿：WeakMap<Agent, {turn, count}>。
  *
  * 用 WeakMap 而不是 Map：root 退休/被回收时登记自然消失，不需要显式清理，也不会
  * 让插件持有 Agent 的强引用。turn 变化即视为重置（见 canNudgeTurn）。
@@ -123,128 +273,30 @@ function isTrackable(agent) {
   return (typeof agent === "object" && agent !== null) || typeof agent === "function";
 }
 
-function asObject(value) {
-  return value !== null && typeof value === "object" ? value : null;
-}
-
-/** 消息 content 数组；缺失或非数组时安全返回空数组。 */
-function contentBlocks(message) {
-  const content = asObject(message)?.content;
-  return Array.isArray(content) ? content : [];
-}
-
-/** 该消息是否携带工具调用 block（真实形状 `tool-call`，兼容旧形状 `tool_use`）。 */
-function hasToolCallBlock(message) {
-  return contentBlocks(message).some((block) => {
-    const part = asObject(block);
-    return part !== null && (part.type === "tool-call" || part.type === "tool_use");
-  });
-}
-
-/** 拼接全部 text block 并 trim；reasoning / 图片等 block 不参与判定。 */
-function messageText(message) {
-  return contentBlocks(message)
-    .map((block) => {
-      if (typeof block === "string") return block;
-      const part = asObject(block);
-      return part !== null && part.type === "text" && typeof part.text === "string" ? part.text : "";
-    })
-    .join("")
-    .trim();
-}
-
-/** 该 turn 里是否存在任何工具调用（`tool/call` 事件或 assistant 消息里的 tool-call block）。 */
-function turnHasToolCall(events, turn) {
-  for (const event of events) {
-    if (event?.type === "tool/call" && event.data?.turn === turn) return true;
-    if (event?.type === "assistant/message" && event.data?.turn === turn
-      && hasToolCallBlock(event.data?.message)) return true;
-  }
-  return false;
-}
-
-/**
- * 取某个 turn 最后一条 `assistant/message`。
- *
- * 真实事件形状：`{ type: "assistant/message", data: { turn, step, message: { content } } }`。
- * 同一 turn 可能有多个 step，因此必须**从后往前**取最后一条；找不到时返回 null。
- */
-export function lastAssistantMessageOfTurn(events, turn) {
-  if (!Array.isArray(events) || !Number.isSafeInteger(turn)) return null;
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event?.type !== "assistant/message") continue;
-    const data = asObject(event.data);
-    if (data === null || data.turn !== turn) continue;
-    return asObject(data.message);
-  }
-  return null;
-}
-
-/**
- * 判定本轮 turn 是否需要一次续接提醒（纯函数，只读事件）。
- *
- * 判定顺序（先排除、后命中，宁可漏报也不误报）：
- * 1. 该 turn 没有 assistant/message → null（日志尚未提交，不干预）；
- * 2. 最后一条消息含 tool-call → null（这一步本来就会继续）；
- * 3. 该 turn 完全没有工具调用 → null（纯问答 turn，不干预）；
- * 4. 文本长度 ≤1200 且**末句**是下一步动作承诺 → `continuation-intent`
- *    （即使正文前面有完成词，例如「代码已修复，我去验证。」也必须命中）；
- * 5. 否则文本命中完成声明 → null（这是交付，不是停顿）；
- * 6. 文本为空（只有 reasoning，典型是流被截断）→ `empty-assistant-message`；
- * 7. 其余 → null。
- *
- * 为什么“末句动作承诺”排在完成声明之前：模型常在交付句后面追加一句“我再去验证一下”，
- * 若完成词优先就会把真实的续作意图吞掉；反过来，没有动作承诺的完成声明仍然是交付。
- *
- * @param {object[]} events - session 事件数组（顺序与 session 日志一致）。
- * @param {number} turn - 当前 turn 号（必须是安全整数）。
- * @returns {{reason:string}|null} 命中时返回 reason，否则 null。
- */
-export function continuationHintOf(events, turn) {
-  if (!Array.isArray(events) || !Number.isSafeInteger(turn)) return null;
-  const message = lastAssistantMessageOfTurn(events, turn);
-  if (message === null) return null;
-  if (hasToolCallBlock(message)) return null;
-  if (!turnHasToolCall(events, turn)) return null;
-  const text = messageText(message);
-  const lastSentence = lastSentenceOf(text);
-  if (lastSentence.length > 0
-    && text.length <= MAX_INTENT_TEXT_LENGTH
-    && (LAST_SENTENCE_ACTION_PATTERN.test(lastSentence)
-      || LAST_SENTENCE_OBJECT_ACTION_PATTERN.test(lastSentence)
-      || LAST_SENTENCE_COMMA_CHAIN_PATTERN.test(lastSentence)
-      || LAST_SENTENCE_ACTION_PATTERN_EN.test(lastSentence))) {
-    return { reason: "continuation-intent" };
-  }
-  if (COMPLETION_PATTERN.test(text)) return null;
-  if (text.length === 0) return { reason: "empty-assistant-message" };
-  return null;
-}
-
 /**
  * 本 turn 是否还可以提醒。
  *
- * 同一 root 同一 turn 最多一次；turn 变化即重置。非对象 agent / 非安全整数 turn 返回 false
- * （调用方据此跳过，绝不抛错）。
+ * 同一 root 同一 turn 最多 MAX_CONTINUATIONS_PER_TURN 次；turn 变化即重置。非对象 agent /
+ * 非安全整数 turn 返回 false（调用方据此跳过，绝不抛错）。
  */
 export function canNudgeTurn(agent, turn) {
   if (!isTrackable(agent) || !Number.isSafeInteger(turn)) return false;
   const record = nudgeState.get(agent);
-  if (record === undefined) return true;
-  if (record.turn !== turn) return true;
-  return record.nudged !== true;
+  if (record === undefined || record.turn !== turn) return true;
+  return record.count < MAX_CONTINUATIONS_PER_TURN;
 }
 
 /**
- * 登记「本 turn 已提醒」。
+ * 登记「本 turn 又提醒了一次」（计数自增）。
  *
- * 调用方必须在 steer **之前**调用：即使 steer 抛错，同一 turn 也不会二次投递。
+ * 调用方必须在 steer **之前**调用：即使 steer 抛错，本次也计入上限，避免同一边界反复重试。
  * 非对象 agent / 非安全整数 turn 返回 false，不写任何状态。
  */
 export function markTurnNudged(agent, turn) {
   if (!isTrackable(agent) || !Number.isSafeInteger(turn)) return false;
-  nudgeState.set(agent, { turn, nudged: true });
+  const record = nudgeState.get(agent);
+  const count = record !== undefined && record.turn === turn ? record.count + 1 : 1;
+  nudgeState.set(agent, { turn, count });
   return true;
 }
 

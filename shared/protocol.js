@@ -59,6 +59,8 @@ export const EXPERT_DELEGATION_DENY = [
  */
 export const ROOT_ONLY_TOOL_DENY = [
   "dsh_expert_group_finalize",
+  // 完成标记只属于当前 live root：专家 child 打标记没有任何意义，也会污染 root 的协议判定。
+  "dsh_expert_group_done",
   "dsh_expert_group_release_scope",
   // 票据 11：人工逃生只属于 root；专家 child 绝不能关闭等待账本。
   "dsh_expert_group_abandon_wait",

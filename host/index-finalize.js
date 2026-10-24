@@ -3,7 +3,8 @@
  *
  * 覆盖 F1–F5：root 用户等待 guard、root turn 等待工作登记、admission token 诊断、
  * 两阶段收口（waiting 回执 + pending-close 活视图）、收口结论构造与一次性投递、
- * 三个 root-only 工具定义、以及 agent/turn-stopping 兜底等待。
+ * 四个 root-only 工具定义（含完成标记 dsh_expert_group_done）、以及
+ * agent/turn-stopping 兜底等待。
  *
  * ## 组合根保留的职责（铁律 1/2）
  * - 三个 `ctx.effect(() => tools.register(...))` 的注册仍由 index.js 在原注册点执行；
@@ -26,8 +27,9 @@ import { sessionEvents } from "./expert-group-projection.js";
 import {
   buildContinuationReminder,
   canNudgeTurn,
-  continuationHintOf,
+  DONE_TOOL_NAME,
   markTurnNudged,
+  needsContinuation,
 } from "./turn-continuation-guard.js";
 
 /**
@@ -660,7 +662,74 @@ function deliverRootFinalizationConclusion(parent, pendingClose, signal) {
 }
 
 /**
- * F4：三个 root-only 工具定义（注册仍由 index.js 的原注册点执行）。
+ * 构造 root 专用「完成标记」工具的 definition（协议式 turn 收尾）。
+ *
+ * 为什么需要它：旧实现用动作词表 + 末句正则猜测模型是否中途停顿，既漏报又误报。
+ * 现在把判定换成协议事实——模型在请求全部交付后必须把这次调用作为本 turn 的**最后一个
+ * 工具调用**；root 的 agent/turn-stopping 边界机械检查该事实（见 turn-continuation-guard.js）。
+ *
+ * 为什么放在模块级：F4 installer 已接近工厂行数上限，而工具定义本身与 installer 的装配
+ * 职责无关；提到模块级后 installer 只做一次注入（isLiveRootAgent 是唯一的域依赖）。
+ *
+ * 边界：
+ * - root-only：非 live root（专家子代理）返回结构化 rejected，不抛异常；
+ * - 无参数、无副作用：不写等待账本、不关闭批次、不投递任何结论，只回一个标记回执；
+ * - 回执文案要求模型"现在给出最终答复"，且明确**不要重复上一次答复**（避免用重复
+ *   文本冒充收尾）。
+ *
+ * @param {Function} isLiveRootAgent - root 身份判定（域注入的同一个 seam）。
+ * @returns {object} 注册就绪的 defineTool 定义。
+ */
+function defineDoneTool(isLiveRootAgent) {
+  return defineTool({
+    name: DONE_TOOL_NAME,
+    description: "Mark this root turn complete, immediately before the final answer, once the user's request for this turn is fully delivered. Call it as the LAST tool call of the turn: the turn-stopping guard treats a turn whose last tool call is not dsh_expert_group_done as unfinished and continues it. Do not call it while any work remains. No arguments; no side effects beyond the marker.",
+    parameters: {},
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          // done = 标记已写入（本轮可按协议收尾）；rejected = 非 live root 调用。
+          kind: { type: "string", required: true, enum: ["done", "rejected"] },
+          // 只在 done 回执上出现：明确告诉模型可以给最终答复。
+          turnComplete: { type: "boolean" },
+          // 只在 rejected 回执上出现：稳定机器码（root-only）+ 可执行提示。
+          reason: { type: "string" },
+          message: { type: "string" },
+        },
+      },
+      render(_args, value) {
+        if (value.kind === "done") {
+          return [{ type: "text", text: "root turn marked complete — give the final answer now (do not repeat the previous answer)." }];
+        }
+        // rejected 必须带上 message：reason 是机器码，message 才是可执行提示。
+        return [{ type: "text", text: "root turn NOT marked complete: " + value.reason
+          + (value.message ? " — " + value.message : "") }];
+      },
+    },
+    isConcurrencySafe: () => false,
+    execute(_args, exec) {
+      const parent = exec?.agent;
+      // root-only 不抛异常：调用方必须拿到结构化 rejected（稳定 reason + 可执行 message）。
+      if (!isLiveRootAgent(parent)) {
+        return {
+          kind: "rejected",
+          reason: "root-only",
+          message: "dsh_expert_group_done 只能由当前 live root agent 调用；专家子代理直接返回自己的结果。",
+        };
+      }
+      return {
+        kind: "done",
+        turnComplete: true,
+        message: "Turn marked complete. Give the user the final answer now (do not repeat the previous answer).",
+      };
+    },
+  });
+}
+
+/**
+ * F4：四个 root-only 工具定义（注册仍由 index.js 的原注册点执行）。
  *
  * @param {object} deps - 见 `createFinalizeDomain`。
  * @param {object} api - 域内能力面。
@@ -680,6 +749,8 @@ function installFinalizeTools(deps, api) {
   } = deps;
   // 跨组调用统一走域内能力面（运行期解析，构造期不依赖 install 顺序）。
   const finalizeRootAdmissionBatch = (...args) => api.finalizeRootAdmissionBatch(...args);
+  // 完成标记工具的定义提到模块级（见 defineDoneTool）；这里只注入 root 身份判定 seam。
+  const doneTool = defineDoneTool(isLiveRootAgent);
 const finalizeTool = defineTool({
   name: "dsh_expert_group_finalize",
   description: "Finalize the current root turn only after every result of the current admission batch has returned, the root summary and integration/review/verification check is done, and no safe non-overlapping parallel work remains. The batch is located by the current root/run plus admissionEpoch alone: the server enumerates the complete effective admission set, so admissionTokens is an optional diagnostic argument and missing, extra, duplicate, unknown, discarded, or non-string tokens never block finalization (they are only reported in tokenDiagnostics). This root-only action registers every accepted expert task on the root turn wait ledger and returns immediately with a non-terminal waiting receipt carrying admissionEpoch, acceptedCount, and tokenDiagnostics: it never waits inside the tool call, because the root turn lifecycle keeps waiting at the agent/turn-stopping boundary on that same ledger, with no timeout. A waiting receipt means the wait is registered, not that any expert finished; it is not an asynchronous task handle and there is no status to poll. After that receipt, do not call finalize again for that batch and do not poll for status: once every accepted task has actually finished, the plugin closes the batch and steers one DEG-sourced finalization message into your next step automatically. Do not call it while safe parallel work remains; a pure continue_parent_turn batch has no accepted admission to finalize. Every rejected receipt carries a stable reason code and an actionable message.",
@@ -1048,6 +1119,7 @@ const abandonWaitTool = defineTool({
 });
   return {
     finalizeTool,
+    doneTool,
     scopeDiagnosisTool,
     abandonWaitTool,
     readLastRefusedScopeRelease: () => lastRefusedScopeRelease,
@@ -1211,7 +1283,8 @@ async function awaitRootTurnWaitFallback(parent, signal) {
  * - **投递前重新复查**：插件卸载闩 `isRootWaitStopping()`、root 是否仍 live、
  *   批次是否已被人工逃生关闭（abandoned）——等待期间这三个事实都可能变化，
  *   只看入口处的判定会让“卸载/退休/人工逃生之后”仍然收到一条续接提醒；
- * - 同一 root 同一 turn 至多一次（canNudgeTurn / markTurnNudged），turn 变化即重置；
+ * - 同一 root 同一 turn 至多 MAX_CONTINUATIONS_PER_TURN（3）次（canNudgeTurn / markTurnNudged
+ *   计数），turn 变化即重置；有界 best-effort，DSH 没有“必须打标记”的硬锁；
  * - 先登记再 steer：即使 steer 抛错，同一 turn 也不会二次投递；
  * - 任何异常都只记告警（固定动作名 + 安全错误名），绝不抛回 DSH（turn-stopping 抛错
  *   会变成 turn error），也绝不把 error.message 写进日志（可能夹带会话正文/路径/凭据）；
@@ -1230,8 +1303,8 @@ function maybeSteerContinuation(parent, payload) {
     if (isRootWaitStopping()) return false;
     if (!isLiveRootAgent(parent)) return false;
     if (getAdmissionBatch(parent)?.abandoned === true) return false;
-    const hint = continuationHintOf(sessionEvents(parent?.session), turn);
-    if (hint === null) return false;
+    // 协议判定：每个 turn 都必须以 dsh_expert_group_done 收尾；否则需要续接（不再豁免纯文本 turn）。
+    if (!needsContinuation(sessionEvents(parent?.session), turn)) return false;
     if (!canNudgeTurn(parent, turn)) return false;
     if (typeof parent?.steer !== "function") return false;
     // 先登记后投递：steer 抛错也算本 turn 已提醒，避免同一边界反复重试。
@@ -1254,9 +1327,10 @@ function maybeSteerContinuation(parent, payload) {
  * 后再关闭 turn，因此这里可以安全地保持 turn 打开直到专家真正结束。监听器自身绝不
  * 抛错——DSH 会把 turn-stopping 的异常变成 turn 错误，兜底必须 fail-open。
  *
- * 同一边界还承担有界的**续接保护**（turn continuation guard）：没有等待工作时，如果
- * 本 turn 最后一条 assistant 消息是一次“下一步动作宣言”，就 steer 一次提醒让 turn 继续；
- * 走等待路径时只有在等待本身没有续接 turn（既无进度放行结算、也无收口结论投递）后才补提醒。
+ * 同一边界还承担有界的**续接保护**（turn continuation guard）：没有等待工作时，如果本 turn
+ * 没有以完成标记 dsh_expert_group_done 收尾（纯文本 turn 同样如此），就 steer 一次固定提醒
+ * 让同一 turn 继续（同 turn 至多 3 次）；走等待路径时只有在等待本身没有续接 turn（既无进度
+ * 放行结算、也无收口结论投递）后才补提醒。判定只看工具调用序列与其结果，不读任何文本内容。
  */
 function onTurnStopping(payload) {
   const parent = payload?.agent;

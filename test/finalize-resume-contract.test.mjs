@@ -103,6 +103,27 @@ function driveTurnStopping(host, root, turn = 1, signal) {
   return state;
 }
 
+/**
+ * 构造「该 turn 已按协议打完成标记」的事件日志。
+ *
+ * 新协议要求**每个 turn** 都以 dsh_expert_group_done 收尾；本文件的关注点是收口结论的
+ * 投递次数与幂等，因此给后续 turn 边界补一个**完整三段式**的完成标记（assistant block
+ * 带 callId → tool/call 同名同 callId → 成功 tool/result），让 turn-stopping 的续接保护
+ * 保持沉默，而不是放宽「每批至多一次结论」的断言。
+ */
+function doneClosedTurnEvents(turn) {
+  const callId = "resume-done-call-" + turn;
+  return [
+    { type: "turn/start", data: { turn } },
+    {
+      type: "assistant/message",
+      data: { turn, step: 1, message: { content: [{ type: "tool-call", name: "dsh_expert_group_done", callId, arguments: {} }] } },
+    },
+    { type: "tool/call", data: { turn, step: 1, callId, name: "dsh_expert_group_done", arguments: {} } },
+    { type: "tool/result", data: { turn, step: 1, message: { role: "tool", toolCallId: callId, content: [] } } },
+  ];
+}
+
 /** 结束 child 的 turn 边界（真实形状：turn/start + 携带 admission messageId 的 user/message + turn/end）。 */
 function endChildTurn(host, entry, turn = 1) {
   entry.child.session.events = [
@@ -204,6 +225,8 @@ test("用户插话取消等待后 pending 不丢：同一 child 与同一凭据�
   assert.match(text, /acceptedCount 1/);
 
   // 重复 turn-stopping：已关闭批次不再悬挂，也不再投递。
+  // 本 turn 已按协议收尾：续接保护必须保持沉默。
+  root.session.events = doneClosedTurnEvents(3);
   const again = driveTurnStopping(host, root, 3);
   await flushAsyncWork(8);
   assert.equal(again.pending, 0, "已关闭批次不得再次悬挂 root turn");
@@ -260,6 +283,7 @@ test("插话期间专家完成结算：恢复不会重新等待幽灵 work，也
   assert.equal(await settleWithin(resumed), "settled", "已结算的工作不得被重新登记成永不结算的幽灵 work");
   assert.match(soleConclusionText(host, root), /acceptedCount 1/);
 
+  root.session.events = doneClosedTurnEvents(3);
   const again = driveTurnStopping(host, root, 3);
   await flushAsyncWork(8);
   assert.equal(again.pending, 0);
@@ -317,6 +341,7 @@ test("pending-close 期间新 admission 归入同一开放批次：被一并等�
   assert.match(text, /acceptedCount 2/, "final count 必须反映收口时刻的完整 accepted 集");
   assert.equal(children.length, 2, "恢复与新 admission 都不得重建既有专家任务");
 
+  root.session.events = doneClosedTurnEvents(4);
   const again = driveTurnStopping(host, root, 4);
   await flushAsyncWork(8);
   assert.equal(again.pending, 0);
@@ -367,6 +392,8 @@ test("重复合法 finalize / 重复 settlement / 重复 turn-stopping 在含新
   assert.match(soleConclusionText(host, root), /acceptedCount 2/);
 
   // 重复 turn-stopping：不再参与、也不再投递。
+  // 本 turn 已按协议收尾：续接保护必须保持沉默。
+  root.session.events = doneClosedTurnEvents(4);
   const third = driveTurnStopping(host, root, 4);
   await flushAsyncWork(8);
   assert.equal(third.pending, 0);
@@ -396,7 +423,9 @@ test("等待期间 root 退休：批次随代际退休，替代 root 绝不收�
   assert.equal(children[0].child.status, "running", "取消等待不得改变专家任务本身的运行事实");
 
   // 同 id 的替代 root 必须从空状态开始：旧批次既不继承也不投递。
+  // 该 turn 已按协议收尾：替代 root 也不该收到任何续接提醒。
   const replacement = host.registerRootAgent(ROOT_ID);
+  replacement.session.events = doneClosedTurnEvents(2);
   const replacementStop = driveTurnStopping(host, replacement, 2);
   await flushAsyncWork(12);
   assert.equal(replacementStop.pending, 0, "替代 root 不得继承旧批次的 pending-close 等待");

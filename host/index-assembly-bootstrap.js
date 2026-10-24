@@ -313,9 +313,11 @@ export function assembleHandoffAndFinalize(state) {
   Object.assign(state, finalizeDomain);
   state.finalizeDomain = finalizeDomain;
 
-  // 三个 root-only 工具的注册仍按原注册顺序（finalize → scope diagnosis → abandon wait）。
+  // root-only 工具的注册仍按原注册顺序（finalize → 完成标记 → scope diagnosis → abandon wait）。
+  // 完成标记紧随 finalize 之后追加，既有条目的相对先后顺序不变。
   return [
     { kind: "tool", definition: finalizeDomain.finalizeTool, label: "dsh-expert-group: root finalization tool" },
+    { kind: "tool", definition: finalizeDomain.doneTool, label: "dsh-expert-group: root turn completion marker" },
     { kind: "tool", definition: finalizeDomain.scopeDiagnosisTool, label: "dsh-expert-group: scope diagnosis tool" },
     { kind: "tool", definition: finalizeDomain.abandonWaitTool, label: "dsh-expert-group: abandon wait ledger tool" },
     // turn-stopping 兜底：handler 在域服务里，注册复用它。
