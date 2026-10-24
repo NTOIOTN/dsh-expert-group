@@ -20,9 +20,11 @@ import {
   buildContinuationReminder,
   canNudgeTurn,
   DONE_TOOL_NAME,
+  evaluateContinuation,
   MAX_CONTINUATIONS_PER_TURN,
   markTurnNudged,
   needsContinuation,
+  resolveTurnForContinuation,
   turnClosedWithDone,
   turnToolCallNames,
 } from "../host/turn-continuation-guard.js";
@@ -412,6 +414,71 @@ test("PTC 与顶层调用混合：最后一条是顶层 done 时仍按 tool/resu
   assert.equal(needsContinuation(withResult, 1), false);
 });
 
+// ── 1c. 续接决策与 turn 解析（跳过原因可观测） ─────────────────────────────
+
+/** 一条“允许提醒”的基准事实；用例只覆盖需要验证的那一位。 */
+function nudgeFacts(overrides = {}) {
+  return {
+    turn: 1,
+    aborted: false,
+    waitStopping: false,
+    liveRoot: true,
+    abandoned: false,
+    closed: false,
+    exhausted: false,
+    hasSteer: true,
+    force: false,
+    ...overrides,
+  };
+}
+
+test("evaluateContinuation：默认事实允许提醒（reason nudge）", () => {
+  assert.deepEqual(evaluateContinuation(nudgeFacts()), { nudge: true, reason: "nudge" });
+});
+
+test("evaluateContinuation：每个跳过原因都有稳定 reason 码", () => {
+  const cases = [
+    ["turn-invalid", { turn: null }],
+    ["turn-invalid", { turn: 1.5 }],
+    ["turn-aborted", { aborted: true }],
+    ["wait-stopping", { waitStopping: true }],
+    ["root-not-live", { liveRoot: false }],
+    ["batch-abandoned", { abandoned: true }],
+    ["already-complete", { closed: true }],
+    ["nudge-exhausted", { exhausted: true }],
+    ["no-steer", { hasSteer: false }],
+  ];
+  for (const [reason, overrides] of cases) {
+    assert.deepEqual(evaluateContinuation(nudgeFacts(overrides)), { nudge: false, reason }, reason);
+  }
+});
+
+test("evaluateContinuation：force 只绕过 already-complete，其余约束仍然生效", () => {
+  assert.deepEqual(evaluateContinuation(nudgeFacts({ closed: true, force: true })), { nudge: true, reason: "nudge" });
+  const stillBlocked = [{ aborted: true }, { waitStopping: true }, { liveRoot: false }, { abandoned: true }, { exhausted: true }, { hasSteer: false }];
+  for (const overrides of stillBlocked) {
+    assert.equal(evaluateContinuation(nudgeFacts({ closed: true, force: true, ...overrides })).nudge, false, JSON.stringify(overrides));
+  }
+});
+
+test("evaluateContinuation：turn-invalid 优先于其它；aborted 优先于 already-complete", () => {
+  assert.equal(evaluateContinuation(nudgeFacts({ turn: null, aborted: true, closed: true, force: true })).reason, "turn-invalid");
+  assert.equal(evaluateContinuation(nudgeFacts({ aborted: true, closed: true, force: true })).reason, "turn-aborted");
+  assert.equal(evaluateContinuation(undefined).reason, "turn-invalid");
+});
+
+test("resolveTurnForContinuation：payload turn 优先，缺失时退 assistant/message 再退 turn/start", () => {
+  const events = [
+    { type: "turn/start", data: { turn: 7 } },
+    { type: "assistant/message", data: { turn: 9, message: { content: [] } } },
+  ];
+  assert.equal(resolveTurnForContinuation(events, 3), 3, "payloadTurn 是权威值");
+  assert.equal(resolveTurnForContinuation(events, undefined), 9, "退到最后一条 assistant/message 的 turn");
+  assert.equal(resolveTurnForContinuation([{ type: "turn/start", data: { turn: 7 } }], null), 7, "再退到最后一个 turn/start");
+  assert.equal(resolveTurnForContinuation([], undefined), null);
+  assert.equal(resolveTurnForContinuation(undefined, "1"), null);
+});
+
 // ── 2. turn-stopping 接线后的公开行为 ──────────────────────────────────────
 
 /** 最小受控 Host：只需要真实 apply、一个 live root 与宿主 steer 记录。 */
@@ -572,6 +639,29 @@ test("turn-stopping：session.events 是只读 getter 时仍能读取，且绝�
   assert.equal(host.agentSteerMessages(root).length, 1, "getter 读到的日志必须生效");
   assert.ok(reads > 0, "护栏必须通过 getter 读取 session.events");
   assert.equal(writes, 0, "护栏绝不能给 session.events 赋值");
+  await host.dispose();
+});
+
+test("turn-stopping：跳过时记录稳定 reason 日志（静默短路可定位）", async () => {
+  const { host, root } = createGuardHost();
+  root.session.events = buildTurnEvents({ calls: ["read"] });
+
+  // aborted：跳过并记录 turn-aborted。
+  const controller = new AbortController();
+  controller.abort();
+  turnStopping(host, root, 1, controller.signal);
+  // already-complete：已按协议收尾，同样留下 reason。
+  root.session.events = buildTurnEvents({
+    turn: 2,
+    calls: [DONE_TOOL_NAME],
+    results: [callIdOf(2, DONE_TOOL_NAME)],
+  });
+  turnStopping(host, root, 2);
+  const reasons = host.warnings
+    .filter((entry) => entry.kind === "logger-warn" && entry.message.includes("turn continuation skipped ("))
+    .map((entry) => entry.message);
+  assert.equal(reasons.some((message) => message.includes("(turn-aborted)")), true, "aborted 必须留下 reason");
+  assert.equal(reasons.some((message) => message.includes("(already-complete)")), true, "已收尾必须留下 reason");
   await host.dispose();
 });
 

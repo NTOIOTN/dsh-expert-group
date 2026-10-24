@@ -360,6 +360,77 @@ export function needsContinuation(events, turn) {
 }
 
 /**
+ * 续接提醒的**可测决策**：把「是否提醒」从副作用里拆成纯函数。
+ *
+ * 线上出现过「turn 关闭时没有提醒、也没有任何日志」的静默短路：判定散落在接线层的一串
+ * early-return 里，跳过时不可观测。这里按固定顺序短路并返回稳定 reason 码，接线层只负责
+ * 收集事实 + 记录 reason，因此每次跳过都能在日志里定位。
+ *
+ * 顺序（先排除、后命中）：
+ * turn-invalid → turn-aborted → wait-stopping → root-not-live → batch-abandoned →
+ * already-complete → nudge-exhausted → no-steer → nudge。
+ *
+ * force === true 只绕过 already-complete（“本 turn 已打完成标记”）：用于「turn 关闭时
+ * DEG 仍有在跑/未收的专家」这一兜底——此时即使模型已经打标，也要继续纠偏。其余生命周期、
+ * 取消与次数约束不受 force 影响（卸载/退休/取消/耗尽时依旧不提醒）。
+ *
+ * @param {object} input - 已算好的事实。
+ * @param {number|null} input.turn - 目标 turn（非安全整数 → turn-invalid）。
+ * @param {boolean} [input.aborted] - turn 的 signal 已取消。
+ * @param {boolean} [input.waitStopping] - 插件卸载闩已生效。
+ * @param {boolean} [input.liveRoot] - 是否仍是当前 live root。
+ * @param {boolean} [input.abandoned] - admission 批次已被人工逃生关闭。
+ * @param {boolean} [input.closed] - 本 turn 已按协议打完成标记。
+ * @param {boolean} [input.exhausted] - 本 turn 的提醒次数已用尽。
+ * @param {boolean} [input.hasSteer] - root 是否提供公开 steer。
+ * @param {boolean} [input.force] - 是否因「DEG 仍有未收工作」而绕过 already-complete。
+ * @returns {{nudge:boolean, reason:string}} 决策与稳定原因码。
+ */
+export function evaluateContinuation(input) {
+  const facts = input !== null && typeof input === "object" ? input : {};
+  if (!Number.isSafeInteger(facts.turn)) return { nudge: false, reason: "turn-invalid" };
+  if (facts.aborted === true) return { nudge: false, reason: "turn-aborted" };
+  if (facts.waitStopping === true) return { nudge: false, reason: "wait-stopping" };
+  if (facts.liveRoot !== true) return { nudge: false, reason: "root-not-live" };
+  if (facts.abandoned === true) return { nudge: false, reason: "batch-abandoned" };
+  // force 只在这里生效：其余约束（取消/卸载/退休/人工逃生/次数）都必须继续生效。
+  if (facts.closed === true && facts.force !== true) return { nudge: false, reason: "already-complete" };
+  if (facts.exhausted === true) return { nudge: false, reason: "nudge-exhausted" };
+  if (facts.hasSteer !== true) return { nudge: false, reason: "no-steer" };
+  return { nudge: true, reason: "nudge" };
+}
+
+/**
+ * 解析本次续接判定使用的 turn。
+ *
+ * payload.turn 是宿主在 turn-stopping 载荷里给出的权威值；但线上存在载荷缺 turn 的日志，
+ * 此时从会话事件里推导：最后一条 assistant/message 的 data.turn，再退到最后一次
+ * turn/start 的 data.turn。都推不出来返回 null（由 evaluateContinuation 判 turn-invalid，
+ * 并在日志里留下 reason，而不是静默跳过）。
+ *
+ * @param {object[]} events - session 事件数组。
+ * @param {unknown} payloadTurn - turn-stopping 载荷里的 turn。
+ * @returns {number|null} 解析出的 turn；无法解析时 null。
+ */
+export function resolveTurnForContinuation(events, payloadTurn) {
+  if (Number.isSafeInteger(payloadTurn)) return payloadTurn;
+  if (!Array.isArray(events)) return null;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const item = asObject(events[index]);
+    if (item === null || item.type !== "assistant/message") continue;
+    const turn = asObject(item.data)?.turn;
+    if (Number.isSafeInteger(turn)) return turn;
+  }
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const item = asObject(events[index]);
+    if (item === null || item.type !== "turn/start") continue;
+    const turn = asObject(item.data)?.turn;
+    if (Number.isSafeInteger(turn)) return turn;
+  }
+  return null;
+}
+
+/**
  * 每个 root 的提醒登记簿：WeakMap<Agent, {turn, count}>。
  *
  * 用 WeakMap 而不是 Map：root 退休/被回收时登记自然消失，不需要显式清理，也不会

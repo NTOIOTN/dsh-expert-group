@@ -1414,6 +1414,36 @@ test("投递失败：steer 抛错记录 lastDelivery 并一次性提示，批次
   }
 });
 
+test("force：本 turn 已打完成标记，但仍有 pending-close 工作 → 收口投递失败时仍补一次续接提醒", async () => {
+  const { host, root, children } = createHost();
+  try {
+    const outcome = await startAdmission(host, root, "force after done", ["docs/force-after-done.md"]);
+    await finalize(host, root, outcome);
+    // 本 turn 已按协议收尾（done + 成功结果）：正常情况下不会再有续接提醒。
+    root.session.events = doneClosedTurnEvents(1);
+
+    // 收口结论第一次投递抛错：批次保持 pending-close → DEG 仍有未收工作。
+    const originalSteer = root.steer;
+    let calls = 0;
+    root.steer = (message) => {
+      calls += 1;
+      if (calls === 1) throw new Error("steer boom");
+      originalSteer(message);
+    };
+
+    const stop = driveTurnStopping(host, root, 1);
+    await completeChild(host, root, children[0]);
+    await stop.settled;
+
+    assert.equal(calls, 2, "先尝试收口结论，再补续接提醒");
+    const messages = steerMessages(host, root);
+    assert.equal(messages.length, 1, "force 必须绕过 already-complete 补一次提醒");
+    assert.match(messages[0].content.map((block) => block.text).join(""), /^Turn not marked complete:/);
+  } finally {
+    await host.dispose();
+  }
+});
+
 test("后代查询降级：不再弹系统通知，等待保持 fail-closed，诊断能力等级为 degraded", async () => {
   const toastSpy = installToastSpy();
   const { host, root, children } = createHost({ toastSpy, descendantListing: "throw" });
