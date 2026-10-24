@@ -500,7 +500,6 @@
   const renderSessionModelFooter = (ctx, options) => {
     const { react, t, sessionModelState, commitSessionModelChanges } = ctx;
     const { canSave, invalidDraft, closeDialog } = options;
-    const revision = sessionModelState.revision;
     const footer = react.createElement("footer", {
       key: "footer",
       className: "deg_expert_group_session_model_footer",

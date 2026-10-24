@@ -650,8 +650,10 @@
       ...structuredFields(source),
       running: runningOf(status, source.running),
       runSummary: normalizeRunSummary(source.runSummary),
-      // 当前/最近一轮 turn 墙钟（与 DSH 状态行同源）；旧快照缺失时为 null。
+      // 该会话全部 turn 的累计墙钟（与 DSH 状态行同源，轮次之间空闲不计）；旧快照缺失时为 null。
       turnDurationMs: numberOrNull(source.turnDurationMs),
+      // 最后一个未闭合 turn 的起点（additive）：客户端锚定外推的唯一依据；闭合/旧快照为 null。
+      turnOpenSince: numberOrNull(source.turnOpenSince),
       continuable: typeof source.continuable === "boolean" ? source.continuable : null,
       // shard 能力（票据 09）：只有 Host 给出可判定项时才存在；缺失时渲染层回退状态推导。
       ...(() => {
@@ -801,8 +803,10 @@
       lastActivityAt: numberOrNull(source.lastActivityAt) ?? startedAt,
       finishedAt,
       durationMs: numberOrNull(source.durationMs) ?? durationBetween(startedAt, finishedAt),
-      // 当前/最近一轮 turn 墙钟（与 DSH 状态行同源）；旧快照缺失时为 null。
+      // 该会话全部 turn 的累计墙钟（与 DSH 状态行同源，轮次之间空闲不计）；旧快照缺失时为 null。
       turnDurationMs: numberOrNull(source.turnDurationMs),
+      // 最后一个未闭合 turn 的起点（additive）：客户端锚定外推的唯一依据；闭合/旧快照为 null。
+      turnOpenSince: numberOrNull(source.turnOpenSince),
       children: rawChildren.map((child) => normalizeSessionNode(child, "expert", null, nestedDepth + 1)),
     };
   }

@@ -370,44 +370,122 @@ function latestCommand(session, events = sessionEvents(session), state = toolCal
   return state.calls.length === 0 ? null : toolCommandText(state.calls[state.calls.length - 1].identity);
 }
 
+/** 时间戳是否可用来计算区间：必须是有限非负数（epoch ms）。 */
+function isUsableTimestamp(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
 /**
- * 当前（或最近一次）turn 的墙钟用时，与 DSH 状态行「用时 …」同源。
+ * 事件携带的 turn 编号；缺失或不是有限数字时返回 null（旧日志/旧宿主可以不写编号）。
  *
- * DSH 状态行的计时 = 当前打开 turn 的 turn/start 事件时间 → 现在；已完成轮次
- * 则显示 turn/end - turn/start。事件 time 由主机以 epoch ms 写入，所以这里复刻
- * 同一算法：
- * - 从尾部找最后一个 turn/start 作为起点；
- * - 再在该起点之后找最后一个 turn/end：找到即已完成轮次，未找到则是 open turn，
- *   结束时间取构建快照的 nowMs；
- * - 没有 turn/start 或时间戳非法时返回 null，调用方回退模型用时/会话时间。
+ * 只有「有限数字」才算有编号：字符串、NaN、Infinity 一律按「没有编号」处理，
+ * 让这类事件仍能按顺序配对，而不是被判成不匹配。
+ */
+function turnNumberOf(event) {
+  const turn = event?.data?.turn;
+  return typeof turn === "number" && Number.isFinite(turn) ? turn : null;
+}
+
+/**
+ * 该会话**全部 turn** 的累计墙钟用时与最后一个 open turn 的起点（不含 turn 之间的空闲区间）。
+ *
+ * 调用方（侧栏任务行「用时」）要的是「这个会话一共真正跑了多久」，而不是「当前/最近一轮
+ * 跑了多久」：一个 turn 结束后不清零，后续 turn 在其基础上继续累加。快照字段名仍是
+ * turnDurationMs，另以 additive 字段 turnOpenSince 给出 open turn 起点，供客户端在两次
+ * 权威快照之间做锚定外推（不新增 schemaVersion）。
+ *
+ * 计算规则（单次顺序 O(n) 扫描，顺序以事件数组顺序为准，不按时间戳排序、不复制数组、
+ * 不做缓存）：
+ * - 已闭合 turn：累加 turn/start.time → 对应 turn/end.time。
+ * - 最后一个未闭合 turn：累加 turn/start.time → nowMs（构建快照时刻）；nowMs 非法时不加。
+ * - 不同 turn 之间的空闲区间不计入：上一个 turn 的 end 到下一个 turn 的 start 之间的时间
+ *   不是「用时」。
+ * - 未闭合 turn 之后又出现合法 turn/start：丢弃前一个无法证明结束的区间（绝不隐式延长到
+ *   新 start，否则空闲时间会被算成用时），新 start 成为当前 open turn。超出扫描窗口的旧
+ *   open turn 同样只保留最后一段。
+ * - turn 配对：两侧都带合法编号（有限数字）时要求相邻；任一侧缺编号的旧日志按顺序配对；
+ *   编号不匹配时不结算该区间，且**不关闭**当前 open 状态（可能只是迟到/重复的 end）。
+ * - 非法时间戳（非有限数或负数）：turn/end 非法 → 不结算并清空 open 状态（不能继续算到
+ *   nowMs）；end 早于 start（时钟回拨/日志乱序）同样清空且不结算；非法 turn/start →
+ *   先清空当前 open 状态再忽略该事件，避免把旧区间错误地接到后面的事件上。
+ * - 扫描结束时仍有 open turn 且 nowMs 有限：累加 max(0, nowMs - openStart)（时钟回拨封底 0）。
+ * - 没有任何可证明的有效区间时返回 null，调用方已有回退（模型用时/会话时间），绝不补 0；
+ *   存在真实区间（即便长度为 0）时返回累计值，让「刚开始的一轮」显示 0 而不是伪造值。
+ * - openSince 只在扫描结束时仍有 open turn（其 turn/start.time 必然合法）时给出该起点；
+ *   全部闭合或没有任何 turn 时为 null。它与 durationMs 分开：nowMs 非法只是不加 open 段，
+ *   不改变「这一轮是否仍打开」这一事实。
+ *
+ * @param {Array|undefined} events - 会话事件数组（形状同 session.snapshotEvents()）。
+ * @param {number|undefined} nowMs - 构建快照时的 epoch ms；仅用于闭合未结束的 turn。
+ * @returns {{durationMs: number|null, openSince: number|null}} 累计墙钟毫秒与 open turn 起点。
+ */
+export function turnTimingOf(events, nowMs) {
+  const list = Array.isArray(events) ? events : [];
+  // nowMs 只在「扫描结束仍有 open turn」时使用；非法时不加这一段（不猜结束时间）。
+  const now = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : null;
+  let total = 0;
+  // 是否已经累加过至少一个可证明的区间：决定「返回 0」还是「返回 null」。
+  let proved = false;
+  // 当前 open turn 的起点与编号；两者一起维护，清空时必须同时清空。
+  let openStart = null;
+  let openTurn = null;
+  for (const event of list) {
+    const type = event?.type;
+    if (type !== "turn/start" && type !== "turn/end") continue;
+    const at = event?.time;
+    if (type === "turn/start") {
+      if (!isUsableTimestamp(at)) {
+        // 非法起点无法证明任何区间：先丢弃当前 open 状态，再忽略本事件。
+        openStart = null;
+        openTurn = null;
+        continue;
+      }
+      // 上一个 open turn 若没等到 end，就到此为止（不隐式延长到本 start）。
+      openStart = at;
+      openTurn = turnNumberOf(event);
+      continue;
+    }
+    // 没有 open turn 时到达的 turn/end 无处可结算（孤儿 end），忽略。
+    if (openStart === null) continue;
+    if (!isUsableTimestamp(at)) {
+      // end 非法：无法证明这一轮何时结束，也不能继续算到 nowMs。
+      openStart = null;
+      openTurn = null;
+      continue;
+    }
+    const endTurn = turnNumberOf(event);
+    // 两侧都有编号时必须一致；不匹配只跳过本 end，open 状态保持不变。
+    if (openTurn !== null && endTurn !== null && endTurn !== openTurn) continue;
+    const delta = at - openStart;
+    if (delta < 0) {
+      // end 早于 start：日志乱序/时钟回拨，不结算并清空，避免把后续事件接到坏区间上。
+      openStart = null;
+      openTurn = null;
+      continue;
+    }
+    total += delta;
+    proved = true;
+    openStart = null;
+    openTurn = null;
+  }
+  // 收尾：最后一个 turn 仍未闭合，就算到快照时刻（这是「正在跑的这一轮」的真实用时）。
+  if (openStart !== null && now !== null) {
+    total += Math.max(0, now - openStart);
+    proved = true;
+  }
+  // openSince：扫描结束时仍未闭合的那一轮的起点；已全部闭合或没有 turn 时为 null。
+  return { durationMs: proved ? total : null, openSince: openStart };
+}
+
+/**
+ * 只取累计墙钟的薄包装（既有纯函数调用方与测试保持原签名）。
+ *
+ * @param {Array|undefined} events - 会话事件数组。
+ * @param {number|undefined} nowMs - 构建快照时的 epoch ms。
+ * @returns {number|null} 累计墙钟毫秒；无任何有效区间时为 null。
  */
 export function turnDurationOf(events, nowMs) {
-  const list = Array.isArray(events) ? events : [];
-  let startAt = null;
-  for (let index = list.length - 1; index >= 0; index -= 1) {
-    const event = list[index];
-    if (event?.type !== "turn/start") continue;
-    const time = event?.time;
-    if (typeof time === "number" && Number.isFinite(time)) {
-      startAt = time;
-      break;
-    }
-  }
-  if (startAt === null) return null;
-  let endAt = null;
-  for (let index = list.length - 1; index >= 0; index -= 1) {
-    const event = list[index];
-    if (event?.type === "turn/start") break;
-    if (event?.type !== "turn/end") continue;
-    const time = event?.time;
-    if (typeof time === "number" && Number.isFinite(time)) {
-      endAt = time;
-      break;
-    }
-  }
-  const end = endAt === null ? (typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : null) : endAt;
-  if (end === null) return null;
-  return Math.max(0, end - startAt);
+  return turnTimingOf(events, nowMs).durationMs;
 }
 
 export function runSummary(session, status, mode, events = sessionEvents(session)) {
@@ -867,6 +945,7 @@ export const expertProjection = Object.freeze({
   expertStatus,
   runSummary,
   turnDurationOf,
+  turnTimingOf,
   modelMetadata,
   createdAtOf,
   subagentContextFields,

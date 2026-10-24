@@ -503,5 +503,7 @@
     PANEL_ERROR_SOURCES, PANEL_POLL_TIMINGS, RPC_FAILURE_TRANSPORT, applyPanelPollCycle,
     callRpc, fanoutBatchIsStale, formatPanelUpdatedTime, panelNextPollDelayMs,
     readFanoutEventBatch, readPanelTabActivity, rpcFailureKindOf, samePanelSnapshot,
+    // 运行态判定同时服务轮询节奏与「无 fanout 事件时仍刷新快照」：同一口径只有一个来源。
+    snapshotHasRunningWork,
   });
 })(globalThis);

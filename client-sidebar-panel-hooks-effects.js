@@ -24,7 +24,7 @@
   const POLL = global[POLL_SYMBOL] || {};
   const {
     PANEL_ERROR_SOURCES, PANEL_POLL_TIMINGS, applyPanelPollCycle, callRpc, fanoutBatchIsStale, panelNextPollDelayMs,
-    readFanoutEventBatch, samePanelSnapshot,
+    readFanoutEventBatch, samePanelSnapshot, snapshotHasRunningWork,
   } = POLL;
   const PANEL_STATE_A_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-panel-state-a");
   const PANEL_STATE_A = global[PANEL_STATE_A_SYMBOL] || {};
@@ -53,9 +53,6 @@
       }, [state.snapshot, rootSessionId]);
     }
 
-    Object.assign(frame, {
-
-    });
   }
 
   /** 「会话模型」读取、目录订阅、原生 dialog 与焦点归还四条 effect。 */
@@ -238,9 +235,6 @@
       }, [sessionModelOpen]);
     }
 
-    Object.assign(frame, {
-
-    });
   }
 
   /** 快照与轮询的单飞状态 ref、fanout 游标及其推进。 */
@@ -632,9 +626,21 @@
             snapshot: full.snapshot ?? null,
           };
         }
-        // 无事件且无缺口：整棵树一定没有变化 —— 不拉快照、不写状态、不重渲染。
-        // 这里推进游标是安全的：Host 明确回答「游标之后什么都没有」，不存在待处理的区间。
+        // 无事件且无缺口：游标推进是安全的（Host 明确回答「游标之后什么都没有」）。
+        // 但「没有 fanout 事件」不等于「快照没有变化」：运行中的 turn 会在没有 fanout 事件时
+        // 持续推进墙钟（turn/start 也不会产生 fanout 事件）。因此在运行态必须走一次全量刷新，
+        // 让「用时」与 DSH 状态行一样实时；空闲态仍走「不请求快照、零重渲染」的既有契约。
         advanceFanoutCursor(batch.cursor);
+        if (snapshotHasRunningWork(latestSnapshotRef.current)) {
+          const full = (await refresh({ reason: "running" })) ?? {};
+          return {
+            id: nextId(),
+            outcome: "running",
+            ok: full.ok === true,
+            cancelled: full.aborted === true || full.stale === true,
+            snapshot: full.snapshot ?? null,
+          };
+        }
         return { id: nextId(), outcome: "none", ok: true, cancelled: false, snapshot: null };
       }
       // 不可判定（缺 events 数组 / 读面失败）：全量降级。
@@ -776,9 +782,6 @@
       }), [rootSessionId, sidebarSessionId]);
     }
 
-    Object.assign(frame, {
-
-    });
   }
 
   /**
@@ -1022,9 +1025,52 @@
       }, [tabActivityKey]);
     }
 
-    Object.assign(frame, {
+  }
 
-    });
+  /** 1 秒本地时钟的间隔（只触发本地重渲染，不发起任何网络请求）。 */
+  const LIVE_TICK_INTERVAL_MS = 1000;
+
+  /**
+   * 快照里是否还有「运行中且带 open turn 起点」的节点（1 秒本地时钟的启用条件）。
+   *
+   * turnOpenSince 由 Host 只在最后一轮仍未闭合时投影；running 布尔与 status 二选一即可，
+   * 因为旧快照可能只有 status。快照来自 Host 的 JSON 投影（无环），不再自建遍历上限。
+   */
+  function snapshotHasLiveOpenTurn(snapshot) {
+    const pending = [object(snapshot).root];
+    while (pending.length > 0) {
+      const node = pending.pop();
+      if (node === null || typeof node !== "object") continue;
+      if (Number.isFinite(node.turnOpenSince) && (node.running === true || node.status === "running")) return true;
+      if (Array.isArray(node.children)) pending.push(...node.children);
+      if (Array.isArray(node.shards)) pending.push(...node.shards);
+    }
+    return false;
+  }
+
+  /**
+   * 运行中 turn 的 1 秒本地重渲染时钟（A）。
+   *
+   * - 只在「快照里存在 running 且 turnOpenSince 有效的节点」时启动；无 open turn 立即清理，
+   *   绝不留下一个空转定时器；
+   * - 不做 document.hidden 判断：隐藏 tab 下浏览器本来就会节流定时器，且 tick 只触发本地渲染
+   *   （权威同步仍由轮询负责，它自己会在页面隐藏时跳过）；
+   * - 计数直接 +1：React state 是 number，长会话的理论增长远达不到其上限，不需要取模；
+   * - 卸载/依赖变化时清掉定时器；无 open turn 时也返回空 cleanup，保持 effect 的 setup /
+   *   cleanup 槽位与卸载清理顺序稳定。
+   */
+  function useSidebarPanelLiveTick(frame) {
+    const { react, snapshot } = frame;
+    const tickPair = typeof react.useState === "function" ? react.useState(0) : [0, () => {}];
+    const setTick = tickPair[1];
+    const liveOpenTurn = snapshotHasLiveOpenTurn(snapshot);
+    if (typeof react.useEffect === "function") {
+      react.useEffect(() => {
+        if (liveOpenTurn !== true) return () => {};
+        const timer = globalThis.setInterval(() => setTick((value) => value + 1), LIVE_TICK_INTERVAL_MS);
+        return () => globalThis.clearInterval(timer);
+      }, [liveOpenTurn]);
+    }
   }
 
   /** 用量事实出现时懒加载一次 meta（每 root 至多一次）。 */
@@ -1043,9 +1089,6 @@
       }, [usageFactPresent, rootSessionId]);
     }
 
-    Object.assign(frame, {
-
-    });
   }
 
   /** 快照变化时重跑 tab 同步的 effect。 */
@@ -1064,9 +1107,6 @@
        }, [rootSessionId, sidebarSessionId, snapshot]);
      }
 
-    Object.assign(frame, {
-
-    });
   }
 
   /** 投影刷新 effect：快照出现用量事实时请求一次刷新。 */
@@ -1109,14 +1149,11 @@
       }, [snapshot, rootSessionId]);
     }
 
-    Object.assign(frame, {
-
-    });
   }
 
   global[SYMBOL] = Object.freeze({
-    useSidebarPanelActivityEffect, useSidebarPanelAnnouncementEffect, useSidebarPanelMetaEffect,
-    useSidebarPanelMountEffects, useSidebarPanelPolling, useSidebarPanelProjectionEffect,
+    useSidebarPanelActivityEffect, useSidebarPanelAnnouncementEffect, useSidebarPanelLiveTick,
+    useSidebarPanelMetaEffect, useSidebarPanelMountEffects, useSidebarPanelPolling, useSidebarPanelProjectionEffect,
     useSidebarPanelSessionModelEffects, useSidebarPanelSnapshotRefs, useSidebarPanelSnapshotSyncEffect,
   });
 })(globalThis);

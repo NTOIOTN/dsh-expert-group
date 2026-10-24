@@ -63,8 +63,8 @@
   const HOOKS_EFFECTS_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-effects");
   const HOOKS_EFFECTS = global[HOOKS_EFFECTS_SYMBOL] || {};
   const {
-    useSidebarPanelActivityEffect, useSidebarPanelAnnouncementEffect, useSidebarPanelMetaEffect,
-    useSidebarPanelMountEffects, useSidebarPanelPolling, useSidebarPanelProjectionEffect,
+    useSidebarPanelActivityEffect, useSidebarPanelAnnouncementEffect, useSidebarPanelLiveTick,
+    useSidebarPanelMetaEffect, useSidebarPanelMountEffects, useSidebarPanelPolling, useSidebarPanelProjectionEffect,
     useSidebarPanelSessionModelEffects, useSidebarPanelSnapshotRefs, useSidebarPanelSnapshotSyncEffect,
   } = HOOKS_EFFECTS;
   const HOOKS_TABS_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-tabs");
@@ -343,7 +343,7 @@
     const cancelSidebarSplit = typeof config.cancelSidebarSplit === "function" ? config.cancelSidebarSplit : null;
     const openSidebarResource = methodOf(sidebarRight, "openResource");
     Object.assign(frame, {
-      ctx, tabInfo, tabParams, sessionsSnapshot, catalogEntryOf, fallbackCurrent, scopedId, scope,
+      ctx, tabInfo, sessionsSnapshot, catalogEntryOf, scope,
       /**
        * 归属账本的「清除本 scope manual 抑制」写面：标题栏 Auto 由关→开时由 Panel 的 Host 服务 Hook
        * 调用（见 client-sidebar-panel-hooks-state.js 的 toggleAutoOpen）。
@@ -354,9 +354,9 @@
        * 一个点击路径上才用得到的装配依赖。
        */
       clearSidebarAutoManualSuppressions,
-      sessionId, resolvedRoot, rootSessionId, sidebarSessionId, tabActivity, tabActivityKey,
+      sessionId, rootSessionId, sidebarSessionId, tabActivityKey,
       model, panelLocale, t, errorLabelOf,
-      serviceCandidates, sessionsService, sidebarRight, requestRightbarDragSync, releaseRightbarDragLock,
+      sessionsService, sidebarRight, requestRightbarDragSync, releaseRightbarDragLock,
       beginSidebarSplit, markSidebarSplitPane, markSidebarSplitOpen, commitSidebarSplit, cancelSidebarSplit,
       openSidebarResource,
     });
@@ -619,10 +619,9 @@
     Object.assign(frame, {
       children, closeSessionModelDialog, errorEmptyState, filterActive, filterSource, idleBatchSlot,
       idleChildren, idleGroupVisible, isActionPending, passesFilter, recovery, recoveryBanner,
-      recoveryCode, recoveryFailed, recoveryMessage, recoveryRetry, recoveryRetryError, recoveryRetryPending,
       renderExpert, renderFanout, renderIdleGroup, renderSessionModelDialog, renderToolbar, retrySessionModelLoad,
       root, rootBatchSlot, rootOpen, rootSiblingCount, rootStatus, taskFilter,
-      toggleSessionModelDialog, updateFilter, viewsC, visibleChildren, visibleIdleChildren,
+      toggleSessionModelDialog, updateFilter, visibleChildren, visibleIdleChildren,
     });
   }
 
@@ -776,11 +775,6 @@
         refreshButton), recoveryBanner, body,
       // 「会话模型」弹窗挂在任务树之后：只在打开时渲染（关闭态 DOM 与既有面板一致）。
       renderSessionModelDialog());
-
-    Object.assign(frame, {
-      autoOpenChecked, autoOpenToggle, panelError, panelErrorLabel, partialBadge, refreshButton,
-      refreshLabel, updatedBadge, updatedTime,
-    });
   }
 
   /**
@@ -819,6 +813,7 @@
       useSidebarPanelActivityEffect(frame);
       useSidebarPanelHostServices(frame);
       useSidebarPanelSnapshotDerived(frame);
+      useSidebarPanelLiveTick(frame);
       useSidebarPanelMetaEffect(frame);
       useSidebarPanelTabPrimitives(frame);
       useSidebarPanelSnapshotSyncEffect(frame);

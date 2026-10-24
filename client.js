@@ -381,6 +381,7 @@ status,
 running:runningOf(status,source.running),
 runSummary:normalizeRunSummary(source.runSummary),
 turnDurationMs:numberOrNull(source.turnDurationMs),
+turnOpenSince:numberOrNull(source.turnOpenSince),
 continuable:typeof source.continuable==="boolean"?source.continuable:null,
 ...(()=>{
 const capabilities=normalizeCapabilities(source.capabilities,SHARD_CAPABILITY_ACTIONS);
@@ -503,6 +504,7 @@ lastActivityAt:numberOrNull(source.lastActivityAt)??startedAt,
 finishedAt,
 durationMs:numberOrNull(source.durationMs)??durationBetween(startedAt,finishedAt),
 turnDurationMs:numberOrNull(source.turnDurationMs),
+turnOpenSince:numberOrNull(source.turnOpenSince),
 children:rawChildren.map((child)=>normalizeSessionNode(child,"expert",null,nestedDepth+1)),
 };
 }
@@ -3338,6 +3340,7 @@ global[SYMBOL]=Object.freeze({
 PANEL_ERROR_SOURCES,PANEL_POLL_TIMINGS,RPC_FAILURE_TRANSPORT,applyPanelPollCycle,
 callRpc,fanoutBatchIsStale,formatPanelUpdatedTime,panelNextPollDelayMs,
 readFanoutEventBatch,readPanelTabActivity,rpcFailureKindOf,samePanelSnapshot,
+snapshotHasRunningWork,
 });
 })(globalThis);
 /* source: client-sidebar-layout.js */
@@ -4818,6 +4821,7 @@ return null;
 };
 const contextPressureOf=(ctx,sessionId)=>contextPressureOfValue(projectionValueOf(ctx,sessionId,"contextPressure"));
 const projectionNumber=(value)=>(typeof value==="number"&&Number.isFinite(value)&&value>=0?value:null);
+const LIVE_TURN_EXTRAPOLATION_MAX_AGE_MS=120000;
 const DSH_STATS_FIELDS=Object.freeze(["llmMs","toolMs","decodeMs","decodeTokens"]);
 const DSH_TOKEN_FIELDS=Object.freeze([
 "uncachedInputTokens","cacheReadTokens","cacheWriteTokens","outputTokens",
@@ -4937,8 +4941,14 @@ const measuredTps=dshThroughputOf(dsh);
 const dshLlmMs=dsh===null?null:dsh.llmMs;
 const dshDuration=dshLlmMs!==null&&dshLlmMs>0?dshLlmMs:null;
 const turnDurationMs=finiteNumber(source.turnDurationMs);
+const turnOpenSince=finiteNumber(source.turnOpenSince);
+const openSnapshot=object(ctx.snapshot);
+const generatedAt=finiteNumber(openSnapshot.generatedAt);
+const liveAge=generatedAt!==null&&runtimeStatus==="running"&&turnDurationMs!==null
+&&turnOpenSince!==null&&openSnapshot.partial!==true?Date.now()-generatedAt:-1;
+const extrapolationMs=liveAge>=0&&liveAge<=LIVE_TURN_EXTRAPOLATION_MAX_AGE_MS?liveAge:0;
 const durationMs=turnDurationMs!==null
-?turnDurationMs
+?turnDurationMs+extrapolationMs
 :(dshDuration!==null?dshDuration:durationOfNode(ctx,source,runtimeStatus,sessionId));
 const summary=typeof api?.summarizeUsageMetrics==="function"
 ?api.summarizeUsageMetrics(usage,{
@@ -4968,7 +4978,7 @@ const toolDurationText=dsh===null||dsh.toolMs===null?null:formatCompactDuration(
 const modelDurationText=dshDuration===null?null:formatCompactDuration(dshDuration);
 const durationTitle=summary.durationText===null?null
 :turnDurationMs!==null
-?"本轮用时 "+summary.durationText
+?"累计轮次用时 "+summary.durationText
 +(modelDurationText===null?"":" · 模型用时 "+modelDurationText)
 +(toolDurationText===null?"":" · 工具调用用时 "+toolDurationText)
 :dshDuration!==null
@@ -5425,7 +5435,6 @@ onChange:(event)=>updateSessionModelDraft(role,"reasoningEffort",event?.target?.
 const renderSessionModelFooter=(ctx,options)=>{
 const{react,t,sessionModelState,commitSessionModelChanges}=ctx;
 const{canSave,invalidDraft,closeDialog}=options;
-const revision=sessionModelState.revision;
 const footer=react.createElement("footer",{
 key:"footer",
 className:"deg_expert_group_session_model_footer",
@@ -5847,7 +5856,7 @@ function createSidebarAutoBookkeeping(scope){
 const{
 clearAutoCloseBudget,idleSidebarResourceAddresses,rootSessionId,runningSidebarResourceAddresses,
 sidebarAutoCloseCooldownsRef,sidebarAutoCloseVerificationsRef,sidebarAutoOriginRef,sidebarAutoReservationRef,
-sidebarAutoRunPhaseRef,sidebarAutoSuppressedRef,sidebarIdleChildren,sidebarResourceTabStateOf,sidebarSessionId,
+sidebarAutoSuppressedRef,sidebarIdleChildren,sidebarResourceTabStateOf,sidebarSessionId,
 sidebarTabOpeningRef,sidebarTabPendingRef,sidebarTabRecordsRef,trimAutoKeyMap,
 }=scope;
 function sidebarAutoCloseKeyIsActive(key){
@@ -6310,13 +6319,13 @@ const{
 autoCloseCandidate,autoOpenCandidate,autoOpenEnabled,
 bump,cancelPendingSidebarSplit,cleanupAutoSidebarKeys,
 clearAutoCloseAttempt,clearManualSuppressionOfIdleResources,currentRootRef,
-currentSidebarSessionRef,handleSidebarAction,idleSidebarResourceAddresses,
+currentSidebarSessionRef,handleSidebarAction,
 knownSidebarResourceAddresses,mountedRef,rootSessionId,
 runningSidebarResourceAddresses,setAutoOpenDraft,sidebarAutoBusyRef,
 sidebarAutoCascadeRef,sidebarAutoCloseAttemptOwnersRef,sidebarAutoCloseAttemptsRef,
 sidebarAutoEpochRef,sidebarAutoFailedKeysRef,sidebarAutoOriginRef,
 sidebarAutoReservationRef,sidebarAutoSignatureRef,sidebarAutoSuppressedRef,
-sidebarIdleChildren,sidebarManualIntentOf,sidebarManualIntentRef,
+sidebarManualIntentOf,sidebarManualIntentRef,
 sidebarSessionId,sidebarSplitIntentRef,sidebarSurfaceStillCurrent,
 sidebarTabOpeningRef,sidebarTabPendingRef,sidebarTabRecordsRef,
 sidebarTabSyncRef,snapshot,sweepAutoOpenPlaceholders,
@@ -7739,10 +7748,10 @@ const width=frame.width;
 const expand=frame.expand;
 const{
 beginVisit,beginVisitFor,continuityOverlay,flushInstantRestore,readHostActiveSurface,
-releaseTransitionRestore,requestRightbarDragSync,requestSplitTrackSync,rightbarDragLock,surfaceRecords,
+requestRightbarDragSync,requestSplitTrackSync,rightbarDragLock,surfaceRecords,
 }=layout;
 const{
-activeTabEvidenceOf,compositionReadFacesUnavailable,hasExistingExpertGroupTab,hasOtherRightbarPage,
+activeTabEvidenceOf,compositionReadFacesUnavailable,hasOtherRightbarPage,
 nativeSidebarFor,rightbarCompositionEvidenceOf,scheduleCurrentSurfaceExpand,scheduleSurfaceOpen,
 }=expand;
 const{
@@ -8327,15 +8336,15 @@ const announcementPair=typeof react.useState==="function"?react.useState(""):[""
 const announcement=announcementPair[0];
 const setAnnouncement=announcementPair[1];
 Object.assign(frame,{
-announcement,announcementPair,announcerRef,autoOpenDraft,autoOpenDraftPair,bump,
-emptyFilter,filterPair,filterState,meta,metaPair,metaStateRef,
-sessionModelCatalog,sessionModelCatalogPair,sessionModelDialogRef,sessionModelDrafts,sessionModelDraftsPair,sessionModelEntryRef,
-sessionModelLoadedRootRef,sessionModelNotice,sessionModelNoticePair,sessionModelOpen,sessionModelOpenPair,sessionModelReloadPair,
-sessionModelReloadToken,sessionModelRequestSerialRef,sessionModelSaving,sessionModelSavingPair,sessionModelState,sessionModelStatePair,
+announcement,announcerRef,autoOpenDraft,bump,
+emptyFilter,filterState,meta,metaStateRef,
+sessionModelCatalog,sessionModelDialogRef,sessionModelDrafts,sessionModelEntryRef,
+sessionModelLoadedRootRef,sessionModelNotice,sessionModelOpen,
+sessionModelReloadToken,sessionModelRequestSerialRef,sessionModelSaving,sessionModelState,
 sessionModelSurfaceRef,sessionModelWasOpenRef,setAnnouncement,setAutoOpenDraft,setFilterState,setMeta,
 setSessionModelCatalog,setSessionModelDrafts,setSessionModelNotice,setSessionModelOpen,setSessionModelReloadToken,setSessionModelSaving,
-setSessionModelState,setState,state,statePair,timelineExpandedRef,version,
-versionPair,viewState,
+setSessionModelState,setState,state,timelineExpandedRef,version,
+viewState,
 });
 }
 function useSidebarPanelWidth(frame){
@@ -8451,11 +8460,7 @@ onPointerDown:onWidthDragStart,
 onMouseDown:onWidthDragStart,
 onKeyDown:onWidthResizerKeyDown,
 });
-Object.assign(frame,{
-applyWidthRatio,commitWidthRatio,detachWidthDrag,endWidthDrag,onWidthDragMove,onWidthDragStart,
-onWidthResizerKeyDown,readWidthRatio,setWidthRatio,widthDragHost,widthDragRef,widthRatio,
-widthRatioPair,widthResizer,
-});
+Object.assign(frame,{widthResizer});
 }
 function useSidebarPanelStoreAndMeta(frame){
 const{
@@ -8505,8 +8510,8 @@ return pending;
 };
 metaRefreshRef.current=loadMeta;
 Object.assign(frame,{
-contextRef,createStore,currentRootRef,currentSidebarSessionRef,loadMeta,metaAutoAttemptRef,
-metaRefreshRef,metaRequestRef,mountedRef,requestSequenceRef,store,
+contextRef,currentRootRef,currentSidebarSessionRef,loadMeta,metaAutoAttemptRef,
+metaRefreshRef,mountedRef,requestSequenceRef,store,
 });
 }
 function useSidebarPanelSessionModel(frame){
@@ -8646,8 +8651,8 @@ if(sidebarSurfaceStillCurrent()===true)setSessionModelSaving(false);
 }
 };
 Object.assign(frame,{
-applySessionModelView,clearSessionModelRole,commitSessionModelChanges,sessionModelBaselineOf,sessionModelHasInvalidDraft,sessionModelPendingChanges,
-sessionModelWriteReady,settleSessionModelFailure,updateSessionModelDraft,
+clearSessionModelRole,commitSessionModelChanges,sessionModelBaselineOf,sessionModelHasInvalidDraft,sessionModelPendingChanges,
+updateSessionModelDraft,
 });
 }
 function useSidebarPanelSessionModelPart2(frame){
@@ -8670,9 +8675,7 @@ const sidebarSurfaceStillCurrent=()=>mountedRef.current===true
 &&currentSidebarSessionRef.current===sidebarSessionId
 &&surfaceTokenRef.current===surfaceToken;
 frame.late.sidebarSurfaceStillCurrent=sidebarSurfaceStillCurrent;
-Object.assign(frame,{
-derivedSurfaceToken,sidebarSurfaceStillCurrent,surfaceToken,surfaceTokenRef,surfaceTokenScopeRef,
-});
+Object.assign(frame,{sidebarSurfaceStillCurrent});
 }
 function useSidebarPanelHostServices(frame){
 const{
@@ -8746,7 +8749,7 @@ readSidebarOpenTabs(),
 const waitForSidebarSplitLayoutCommit=SPLIT_SYNC.waitForSidebarSplitLayoutCommit;
 Object.assign(frame,{
 autoOpenEnabled,closeSidebarResource,existingSubagentPaneId,navigation,presentSidebarTabIds,readActiveSidebarResource,
-readAutoOpenSetting,readSidebarOpenTabs,seededGuideTabId,sidebarSplitTargetEvidence,splitSidebarPane,toggleAutoOpen,
+readSidebarOpenTabs,seededGuideTabId,sidebarSplitTargetEvidence,splitSidebarPane,toggleAutoOpen,
 waitForSidebarSplitLayoutCommit,writeAutoOpenSetting,
 });
 }
@@ -8787,7 +8790,7 @@ const POLL_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-poll");
 const POLL=global[POLL_SYMBOL]||{};
 const{
 PANEL_ERROR_SOURCES,PANEL_POLL_TIMINGS,applyPanelPollCycle,callRpc,fanoutBatchIsStale,panelNextPollDelayMs,
-readFanoutEventBatch,samePanelSnapshot,
+readFanoutEventBatch,samePanelSnapshot,snapshotHasRunningWork,
 }=POLL;
 const PANEL_STATE_A_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-state-a");
 const PANEL_STATE_A=global[PANEL_STATE_A_SYMBOL]||{};
@@ -8811,8 +8814,6 @@ maxItems:ANNOUNCEMENT_MAX_ITEMS,
 }));
 },[state.snapshot,rootSessionId]);
 }
-Object.assign(frame,{
-});
 }
 function useSidebarPanelSessionModelEffects(frame){
 const{
@@ -8945,8 +8946,6 @@ if(entry!==null&&entry!==undefined&&typeof entry.focus==="function")entry.focus(
 }catch{/* 宿主拒绝聚焦时忽略：关闭已经生效，焦点位置不是阻断条件。 */}
 },[sessionModelOpen]);
 }
-Object.assign(frame,{
-});
 }
 function useSidebarPanelSnapshotRefs(frame){
 const{
@@ -9194,6 +9193,16 @@ snapshot:full.snapshot??null,
 };
 }
 advanceFanoutCursor(batch.cursor);
+if(snapshotHasRunningWork(latestSnapshotRef.current)){
+const full=(await refresh({reason:"running"}))??{};
+return{
+id:nextId(),
+outcome:"running",
+ok:full.ok===true,
+cancelled:full.aborted===true||full.stale===true,
+snapshot:full.snapshot??null,
+};
+}
 return{id:nextId(),outcome:"none",ok:true,cancelled:false,snapshot:null};
 }
 const fallback=(await refresh({reason:"events-unavailable"}))??{};
@@ -9288,8 +9297,6 @@ pollSyncStateRef,refresh,refreshStateRef,releaseRightbarDragLock,requestSequence
 runPollCycle,sidebarRight,sidebarSessionId,sidebarSplitIntentRef,sidebarTabSyncRef,tabActivityKey,
 }),[rootSessionId,sidebarSessionId]);
 }
-Object.assign(frame,{
-});
 }
 function runPanelMountEffect(deps){
 const{
@@ -9458,8 +9465,31 @@ return;
 scheduler.resume?.(tabActivityKey==="active");
 },[tabActivityKey]);
 }
-Object.assign(frame,{
-});
+}
+const LIVE_TICK_INTERVAL_MS=1000;
+function snapshotHasLiveOpenTurn(snapshot){
+const pending=[object(snapshot).root];
+while(pending.length>0){
+const node=pending.pop();
+if(node===null||typeof node!=="object")continue;
+if(Number.isFinite(node.turnOpenSince)&&(node.running===true||node.status==="running"))return true;
+if(Array.isArray(node.children))pending.push(...node.children);
+if(Array.isArray(node.shards))pending.push(...node.shards);
+}
+return false;
+}
+function useSidebarPanelLiveTick(frame){
+const{react,snapshot}=frame;
+const tickPair=typeof react.useState==="function"?react.useState(0):[0,()=>{}];
+const setTick=tickPair[1];
+const liveOpenTurn=snapshotHasLiveOpenTurn(snapshot);
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+if(liveOpenTurn!==true)return()=>{};
+const timer=globalThis.setInterval(()=>setTick((value)=>value+1),LIVE_TICK_INTERVAL_MS);
+return()=>globalThis.clearInterval(timer);
+},[liveOpenTurn]);
+}
 }
 function useSidebarPanelMetaEffect(frame){
 const{
@@ -9474,8 +9504,6 @@ metaAutoAttemptRef.current=rootSessionId;
 void loadMeta();
 },[usageFactPresent,rootSessionId]);
 }
-Object.assign(frame,{
-});
 }
 function useSidebarPanelSnapshotSyncEffect(frame){
 const{
@@ -9490,8 +9518,6 @@ if(previous.rootSessionId===rootSessionId
 &&previous.snapshot!==snapshot)sidebarTabSyncRef.current?.();
 },[rootSessionId,sidebarSessionId,snapshot]);
 }
-Object.assign(frame,{
-});
 }
 function useSidebarPanelProjectionEffect(frame){
 const{
@@ -9526,12 +9552,10 @@ pending.catch(()=>{});
 }
 },[snapshot,rootSessionId]);
 }
-Object.assign(frame,{
-});
 }
 global[SYMBOL]=Object.freeze({
-useSidebarPanelActivityEffect,useSidebarPanelAnnouncementEffect,useSidebarPanelMetaEffect,
-useSidebarPanelMountEffects,useSidebarPanelPolling,useSidebarPanelProjectionEffect,
+useSidebarPanelActivityEffect,useSidebarPanelAnnouncementEffect,useSidebarPanelLiveTick,
+useSidebarPanelMetaEffect,useSidebarPanelMountEffects,useSidebarPanelPolling,useSidebarPanelProjectionEffect,
 useSidebarPanelSessionModelEffects,useSidebarPanelSnapshotRefs,useSidebarPanelSnapshotSyncEffect,
 });
 })(globalThis);
@@ -9795,11 +9819,11 @@ if(intent.token!==splitIntentToken)return;
 cancelPendingSidebarSplit("close",splitIntentToken);
 };
 Object.assign(frame,{
-autoCloseCooldownActive,autoCloseLedger,autoTabMissesOf,cancelPendingSidebarSplit,cancelPendingSidebarSplitOfClose,clearAutoCloseAttempt,
+autoCloseCooldownActive,autoTabMissesOf,cancelPendingSidebarSplit,cancelPendingSidebarSplitOfClose,clearAutoCloseAttempt,
 clearAutoCloseBudget,enterAutoCloseCooldown,idleSidebarResourceAddresses,knownSidebarResourceAddresses,presentFloatingSubagentTitles,releaseExpiredAutoCloseCooldown,
 runningSidebarResourceAddresses,sampleAutoTabMisses,settleAutoCloseAttempt,sidebarActiveResourceMatches,sidebarAdoptionEvidenceAvailable,sidebarBatchCandidates,
 sidebarBatchSignatureOf,sidebarBatchStateFor,sidebarExpertResourceAddresses,sidebarIdleChildren,sidebarManualIntentOf,sidebarNodeIsIdleMembership,
-sidebarNodeIsIdleReady,sidebarResourceTabStateOf,sidebarRootChildren,tabTreeDeps,trimAutoKeyMap,
+sidebarNodeIsIdleReady,sidebarResourceTabStateOf,trimAutoKeyMap,
 });
 }
 function useSidebarPanelTabWiringPart3(frame){
@@ -10025,8 +10049,8 @@ frame.late.clearSidebarAutoSuppressionsOfScope=()=>clearAutoSuppressionsOfScope(
 frame.late.sidebarAutoCloseKeyIsActive=sidebarAutoCloseKeyIsActive;
 Object.assign(frame,{
 acquireSidebarTabClose,autoCloseCandidate,autoController,autoOpenCandidate,autoSidebarOwnershipHasCapacity,beginSidebarCloseVerification,
-finishVerifiedSidebarClose,requestSidebarTabClose,sidebarActions,sidebarActionsCache,sidebarAutoCloseKeyIsActive,sidebarAutoControllerCache,
-sidebarAutoFrame,sidebarAutoFrameCache,sidebarAutoOpenCapable,sidebarTabCloseInFlight,
+finishVerifiedSidebarClose,requestSidebarTabClose,sidebarActions,sidebarAutoCloseKeyIsActive,
+sidebarAutoOpenCapable,sidebarTabCloseInFlight,
 sidebarTabPresenceInInventory,verifyPendingSidebarCloses,waitForSidebarCloseLease,
 });
 }
@@ -10092,8 +10116,6 @@ writeSidebarAutoOwnership,
 function useSidebarPanelTabRecorder(frame){
 const{
 }=frame;
-Object.assign(frame,{
-});
 }
 function readSidebarTabEvidence(deps){
 const{readActiveSidebarResource,readSidebarOpenTabs,resourceAddress,sidebarRight,sidebarSessionId}=deps;
@@ -10272,8 +10294,6 @@ recordSidebarTab,
 function useSidebarPanelActionHandlers(frame){
 const{
 }=frame;
-Object.assign(frame,{
-});
 }
 function createSidebarActionContext(deps,key,resourceAddress,actionOrigin,autoAction){
 const{
@@ -10923,8 +10943,8 @@ useSidebarPanelWidth,
 const HOOKS_EFFECTS_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-effects");
 const HOOKS_EFFECTS=global[HOOKS_EFFECTS_SYMBOL]||{};
 const{
-useSidebarPanelActivityEffect,useSidebarPanelAnnouncementEffect,useSidebarPanelMetaEffect,
-useSidebarPanelMountEffects,useSidebarPanelPolling,useSidebarPanelProjectionEffect,
+useSidebarPanelActivityEffect,useSidebarPanelAnnouncementEffect,useSidebarPanelLiveTick,
+useSidebarPanelMetaEffect,useSidebarPanelMountEffects,useSidebarPanelPolling,useSidebarPanelProjectionEffect,
 useSidebarPanelSessionModelEffects,useSidebarPanelSnapshotRefs,useSidebarPanelSnapshotSyncEffect,
 }=HOOKS_EFFECTS;
 const HOOKS_TABS_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-tabs");
@@ -11027,11 +11047,11 @@ const commitSidebarSplit=typeof config.commitSidebarSplit==="function"?config.co
 const cancelSidebarSplit=typeof config.cancelSidebarSplit==="function"?config.cancelSidebarSplit:null;
 const openSidebarResource=methodOf(sidebarRight,"openResource");
 Object.assign(frame,{
-ctx,tabInfo,tabParams,sessionsSnapshot,catalogEntryOf,fallbackCurrent,scopedId,scope,
+ctx,tabInfo,sessionsSnapshot,catalogEntryOf,scope,
 clearSidebarAutoManualSuppressions,
-sessionId,resolvedRoot,rootSessionId,sidebarSessionId,tabActivity,tabActivityKey,
+sessionId,rootSessionId,sidebarSessionId,tabActivityKey,
 model,panelLocale,t,errorLabelOf,
-serviceCandidates,sessionsService,sidebarRight,requestRightbarDragSync,releaseRightbarDragLock,
+sessionsService,sidebarRight,requestRightbarDragSync,releaseRightbarDragLock,
 beginSidebarSplit,markSidebarSplitPane,markSidebarSplitOpen,commitSidebarSplit,cancelSidebarSplit,
 openSidebarResource,
 });
@@ -11190,10 +11210,9 @@ react.createElement("div",{className:"deg_expert_group_error_empty_detail"},pane
 Object.assign(frame,{
 children,closeSessionModelDialog,errorEmptyState,filterActive,filterSource,idleBatchSlot,
 idleChildren,idleGroupVisible,isActionPending,passesFilter,recovery,recoveryBanner,
-recoveryCode,recoveryFailed,recoveryMessage,recoveryRetry,recoveryRetryError,recoveryRetryPending,
 renderExpert,renderFanout,renderIdleGroup,renderSessionModelDialog,renderToolbar,retrySessionModelLoad,
 root,rootBatchSlot,rootOpen,rootSiblingCount,rootStatus,taskFilter,
-toggleSessionModelDialog,updateFilter,viewsC,visibleChildren,visibleIdleChildren,
+toggleSessionModelDialog,updateFilter,visibleChildren,visibleIdleChildren,
 });
 }
 function assembleSidebarPanelBodyPart2(frame){
@@ -11313,10 +11332,6 @@ title:panelError.message,
 },panelErrorLabel),
 refreshButton),recoveryBanner,body,
 renderSessionModelDialog());
-Object.assign(frame,{
-autoOpenChecked,autoOpenToggle,panelError,panelErrorLabel,partialBadge,refreshButton,
-refreshLabel,updatedBadge,updatedTime,
-});
 }
 function createSidebarPanel(deps){
 const config=object(deps);
@@ -11342,6 +11357,7 @@ useSidebarPanelMountEffects(frame);
 useSidebarPanelActivityEffect(frame);
 useSidebarPanelHostServices(frame);
 useSidebarPanelSnapshotDerived(frame);
+useSidebarPanelLiveTick(frame);
 useSidebarPanelMetaEffect(frame);
 useSidebarPanelTabPrimitives(frame);
 useSidebarPanelSnapshotSyncEffect(frame);
@@ -12546,8 +12562,8 @@ emptyEffortSelection,effortSelectionFor,effortSelectionEqual,unknownEffortKeysOf
 hasUnknownEffortKeys,reasoningDiffLines,selectedLevelsOf,applyEffortSelection,
 normalizeEffortsEntry,createModelRow,inputSelectionFor,patchModelDraft,
 setModelEffortSelection,setModelInputSelection,removeModelRow,appendModelRow,
-parseCapacity,formatCapacity,validateModelRows,normalizeModelRows,modelCatalogOverridden,
-isOverridden,inheritedModelsOf,fallbackModelsOf,materializeOverrideOps,modelCatalogOps,
+parseCapacity,formatCapacity,validateModelRows,normalizeModelRows,
+isOverridden,inheritedModelsOf,materializeOverrideOps,modelCatalogOps,
 modelEditableProfileOf,importNamespace,catalogOpsFor,modelOverrideDecision,
 modelChoicesOf,indexModelsById,adoptModels,joinProviderDirectory,providerEditable,
 providerRemovable,providerProfileOf,apiKeyEnvOf,credentialRefOf,protocolChoices,
@@ -19187,7 +19203,7 @@ body:JSON.stringify(request),
 });
 };
 const state={original,cleanup:void 0,active:true,observerFinalizers:new Set()};
-const wrapped=async function sendSessionWithImageRoute(session,text,imageIds,mode,signal){
+const wrapped=async function(session,text,imageIds,mode,signal){
 const sessionSnapshot=session?.getSnapshot?.();
 if(!Array.isArray(imageIds)||imageIds.length===0||sessionSnapshot===undefined||sessionSnapshot.subagent!=null){
 return original.call(this,session,text,imageIds,mode,signal);
@@ -20103,7 +20119,7 @@ ensurePluginStylesheet,
 }=clientStylesModule;
 const clientModelConfigHostModule=globalThis[Symbol.for("dsh-expert-group/client-model-config-host")]||{};
 const{
-CUSTOM_PROFILE_BASE_PATH,CUSTOM_PROVIDER_NS,CUSTOM_ROUTE_PROBE,createModelConfigHost,
+createModelConfigHost,
 }=clientModelConfigHostModule;
 const clientFanoutModule=globalThis[Symbol.for("dsh-expert-group/client-fanout-normalize")]||{};
 const{
@@ -20112,7 +20128,7 @@ normalizeFanoutListResponse,normalizeFanoutTask,
 }=clientFanoutModule;
 const clientNativeStatusModule=globalThis[Symbol.for("dsh-expert-group/client-native-status")]||{};
 const{
-NATIVE_RUNNING_STATUS_PREFIX,NATIVE_RUNNING_STATUS_PREFIXES,STATUS_ROLE_IDS,STATUS_ROLE_LABELS,createNativeTextRewriter,findNativeConversationScope,
+NATIVE_RUNNING_STATUS_PREFIX,NATIVE_RUNNING_STATUS_PREFIXES,createNativeTextRewriter,findNativeConversationScope,
 findNativeStatusTextNode,replaceNativeStatusPrefix,resolveRunningStatusText,
 }=clientNativeStatusModule;
 const clientSettingsNormalizeModule=globalThis[Symbol.for("dsh-expert-group/client-settings-normalize")]||{};
@@ -20120,7 +20136,7 @@ const{
 PROMPT_ROLE_IDS,addModelCandidatePage,commitSettingsCandidate,compactModelCandidatesDraft,countUnicodeGraphemes,createSettingsModelCatalog,
 migrateSettingsDefaults,migrateSettingsSelection,modelLayerSelectionOf,modelPageCountOf,normalizeModelCandidatesDraft,normalizeModelFallbackLimitDraft,
 normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsDraft,normalizeSettingsModelGroups,removeModelCandidatePage,reorderModelLayers,
-resolveSettingsForm,setModelLayerSelection,syncSettingsDefaultsProvider,unifiedProviderOf,useHostMeta,validateModelCandidateRows,validatePromptText,
+resolveSettingsForm,setModelLayerSelection,syncSettingsDefaultsProvider,unifiedProviderOf,validateModelCandidateRows,validatePromptText,
 }=clientSettingsNormalizeModule;
 const clientSubagentModule=globalThis[Symbol.for("dsh-expert-group/client-subagent-metadata")]||{};
 const{
@@ -20175,9 +20191,6 @@ if(surface===void 0){
 throw new Error("dsh-expert-group: freshness 共享模块未装载（发布 bundle 缺少 client-freshness 投影片段）");
 }
 return surface;
-}
-function rpcErrorStatus(error){
-return requireFreshnessSurface().rpcErrorStatus(error);
 }
 function normalizePluginRpcResult(result){
 return requireFreshnessSurface().normalizePluginRpcResult(result);

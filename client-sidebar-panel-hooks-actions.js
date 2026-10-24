@@ -62,9 +62,6 @@
      * 地址没有已提交 tab」写成（见 handleSidebarAction 的因果证明点）。缺证明一律 manual。
      */
 
-    Object.assign(frame, {
-
-    });
   }
 
   /**
@@ -422,9 +419,6 @@
      * 带着预支预算时新建的 attemptToken：回滚/收口共享重试计数只认这份不可复用的所有权凭据。
      */
 
-    Object.assign(frame, {
-
-    });
   }
 
   /**

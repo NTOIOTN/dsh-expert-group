@@ -227,7 +227,9 @@ export function assembleExpertGroupRuntime(state) {
  *
  * 快照缓存按 root 保存，必须跟随可观察的状态变化失效，否则 2.5s 轮询会一直复用同一份
  * 旧快照。复用既有事件挂点：
- * - session/event 只取真正改变快照内容的两类事件（turn/end 与 user/message）；
+ * - session/event 只取真正改变快照内容的事件（turn/start、turn/end 与 user/message）；
+ *   turn/start 必须包含：新 turn 开始后 turnOpenSince/turnDurationMs 的锚点变了，
+ *   若继续复用旧缓存，客户端会晚一整轮（甚至更久）才看到新起点；
  * - agent/created / agent/status / agent/disposed。
  * 两个挂点都只做一次 Map 读并在必要时递增代次，不写任何持久状态，也不产生第二套事实源。
  *
@@ -251,7 +253,7 @@ export function assembleSnapshotInvalidation(state) {
       event: "session/event",
       handler: (session, event) => {
         const type = event?.type;
-        if (type !== "turn/end" && type !== "user/message") return;
+        if (type !== "turn/start" && type !== "turn/end" && type !== "user/message") return;
         invalidateSnapshotFor(session?.id);
       },
     },

@@ -203,7 +203,7 @@
         });
       };
       const state = { original, cleanup: void 0, active: true, observerFinalizers: new Set() };
-      const wrapped = async function sendSessionWithImageRoute(session, text, imageIds, mode, signal) {
+      const wrapped = async function (session, text, imageIds, mode, signal) {
         const sessionSnapshot = session?.getSnapshot?.();
         if (!Array.isArray(imageIds) || imageIds.length === 0 || sessionSnapshot === undefined || sessionSnapshot.subagent != null) {
           return original.call(this, session, text, imageIds, mode, signal);

@@ -170,7 +170,7 @@ export async function collectExperts(root, deps) {
   } = deps;
   const {
     safeCall, firstText, sessionEvents, sessionTitle, dispatchedPrompt, expertStatus,
-    runSummary, turnDurationOf, modelMetadata, createdAtOf, collectParentEvidence,
+    runSummary, turnTimingOf, modelMetadata, createdAtOf, collectParentEvidence,
     parentEvidenceVerdict, usageOfChild, structuredOfChild, outputSchemaRequestedOfChild,
   } = project;
 
@@ -248,15 +248,18 @@ export async function collectExperts(root, deps) {
     // 结构化交付（票据 30）：只读投影；缺失省略，绝不伪造回退/空值。
     const structured = structuredOfChild(childId, persisted);
     const outputSchemaRequested = outputSchemaRequestedOfChild(childId, persisted);
-    // 当前/最近一轮 turn 的墙钟用时（与 DSH 状态行 "用时 …" 同源）；无 turn 事件时为 null。
-    const turnDurationMs = turnDurationOf(events, now());
+    // 该会话全部 turn 的累计墙钟用时 + 最后一个 open turn 起点（与 DSH 状态行 "用时 …" 同源，
+    // 但不含轮次之间的空闲）；一次扫描同时得到两者。没有可证明的区间时各自省略。
+    const timing = turnTimingOf(events, now());
     experts.push({
       id: childId,
       kind: "expert",
       sessionId: childId,
       parentSessionId: root.id,
-      // 当前/最近一轮的墙钟用时（与 DSH 状态行同源）；没有 turn 事件时省略。
-      ...(turnDurationMs === null ? {} : { turnDurationMs }),
+      // 全部 turn 的累计墙钟用时（与 DSH 状态行同源，空闲区间不计）；没有真实 turn 区间时省略。
+      ...(timing.durationMs === null ? {} : { turnDurationMs: timing.durationMs }),
+      // open turn 起点（additive）：客户端据此在两次权威快照之间锚定外推；闭合时省略。
+      ...(timing.openSince === null ? {} : { turnOpenSince: timing.openSince }),
       // context.label 是最新 accepted dispatch 的短描述；冷恢复再读持久 child model。
       // 降级顺序：context.label → lastDispatch.description → catalogLabels → projectionTitleOf
       //           → sessionTitle → 上一份 full 的展示名。
@@ -314,7 +317,7 @@ export async function collectExperts(root, deps) {
 async function projectFanoutShard(shard, task, deps) {
   const { project, rootId, persisted, recoveryRecords, resolveChildOwnership, usageFor, roleLabelOf, now } = deps;
   const {
-    firstText, nonEmpty, sessionEvents, modelMetadata, runSummary, turnDurationOf,
+    firstText, nonEmpty, sessionEvents, modelMetadata, runSummary, turnTimingOf,
     subagentContextFields, usageOfChild, structuredOfChild, outputSchemaRequestedOfChild,
   } = project;
 
@@ -427,8 +430,9 @@ async function projectFanoutShard(shard, task, deps) {
   // 不跨 attempt 合并 value，每个 attempt 自己的 structured 保留在 attempts 里。
   const shardStructured = structuredOfChild(navigationChildId, persisted);
   const shardRequested = outputSchemaRequestedOfChild(navigationChildId, persisted);
-  // 分片最新 child 的当前/最近一轮墙钟（与 DSH 状态行同源）；无 live 会话时省略。
-  const shardTurnDurationMs = turnDurationOf(sessionEvents(ownedChild?.session), now());
+  // 分片最新 child 会话内全部 turn 的累计墙钟 + 最后一个 open turn 起点（与 DSH 状态行同源，
+  // 空闲区间不计）；无 live 会话或没有任何可证明的 turn 区间时各自省略。
+  const shardTiming = turnTimingOf(sessionEvents(ownedChild?.session), now());
   return {
     ...shard,
     childId: ownedChild === undefined ? null : navigationChildId,
@@ -444,7 +448,9 @@ async function projectFanoutShard(shard, task, deps) {
     ...(shardUsage === null || !hasUsageMetrics(shardUsage) ? {} : { usage: shardUsage }),
     ...(shardStructured === null ? {} : { structured: shardStructured }),
     ...(shardRequested ? { outputSchemaRequested: true } : {}),
-    ...(shardTurnDurationMs === null ? {} : { turnDurationMs: shardTurnDurationMs }),
+    ...(shardTiming.durationMs === null ? {} : { turnDurationMs: shardTiming.durationMs }),
+    // open turn 起点（additive）：与 root/expert 同一口径，闭合时省略。
+    ...(shardTiming.openSince === null ? {} : { turnOpenSince: shardTiming.openSince }),
     attempts: projectedAttempts,
   };
 }

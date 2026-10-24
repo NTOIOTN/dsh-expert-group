@@ -58,10 +58,10 @@
     // 三个协作面的窄命令按拆分前的同名标识符取回：判定体逐字不变（同一份 frame / 同一批容器）。
     const {
       beginVisit, beginVisitFor, continuityOverlay, flushInstantRestore, readHostActiveSurface,
-      releaseTransitionRestore, requestRightbarDragSync, requestSplitTrackSync, rightbarDragLock, surfaceRecords,
+      requestRightbarDragSync, requestSplitTrackSync, rightbarDragLock, surfaceRecords,
     } = layout;
     const {
-      activeTabEvidenceOf, compositionReadFacesUnavailable, hasExistingExpertGroupTab, hasOtherRightbarPage,
+      activeTabEvidenceOf, compositionReadFacesUnavailable, hasOtherRightbarPage,
       nativeSidebarFor, rightbarCompositionEvidenceOf, scheduleCurrentSurfaceExpand, scheduleSurfaceOpen,
     } = expand;
     const {

@@ -44,7 +44,7 @@ import {
   safeCall,
   sessionEvents,
   sessionTitle,
-  turnDurationOf,
+  turnTimingOf,
 } from "./expert-group-projection.js";
 import { collectExperts, firstRejection, projectFanoutTasks } from "./expert-group-stage.js";
 import { createSnapshotCache } from "./snapshot-cache.js";
@@ -177,6 +177,24 @@ export function createExpertGroupRuntime(dependencies = {}) {
   ) {
     const id = nonEmpty(sessionId);
     if (id === null) throw new TypeError("expert-group-snapshot 需要 sessionId");
+    /**
+     * 本次构建的**唯一时间样本**（时间锚点，不得回归）。
+     *
+     * 客户端在两次权威快照之间做外推：显示值 = turnDurationMs + (客户端 now - generatedAt)。
+     * 因此同一份快照里**所有** turnDurationMs（root / expert / shard）必须与顶层 generatedAt
+     * 同源——否则运行中的行会被系统性低估，低估量正好是「该行采样时刻 → generatedAt」之间的
+     * 构建耗时（冷读慢时可达数秒）。
+     *
+     * 旧实现的两个缺陷：① stageDeps.now 直接透传注入时钟，expert 阶段（stage:253）与 fan-out
+     * 分片（stage:435）各自 now()；② 顶层 generatedAt 在两个阶段都 settle 之后才 now()。
+     * 于是 expert/shard 算到更早的时刻、root 算到 generatedAt，客户端却按统一的 generatedAt
+     * 外推，子任务用时被低估。
+     *
+     * 代价（有意接受）：generatedAt 早于响应返回时刻，即「快照年龄」包含本次构建耗时；而客户端
+     * 外推加的正是这段年龄，所以展示仍然精确（外推值 = 真实到客户端时刻的用时）。这里取在构建
+     * 最开始，构建耗时被完整覆盖，不会出现「锚点晚于采样」的反向低估。
+     */
+    const builtAt = now();
     // 本次构建独有的冷读协调器：root 冷读、普通 expert 阶段与 fan-out 阶段共用同一份读取
     // promise 缓存与同一个全局并发上限；构建结束即回收，不会被后续快照或别的 root 复用。
     // 轻量构建（fast）不会调用它——那时它只是一个空协调器，不产生任何 IO。
@@ -254,7 +272,10 @@ export function createExpertGroupRuntime(dependencies = {}) {
       agents,
       recovery,
       fanoutHost,
-      now,
+      // 阶段投影的时钟**固定成本次构建的唯一样本**（两个阶段共用同一时刻），而不是透传注入时钟：
+      // 这样 expert 与 shard 的 turnTimingOf 全部算到 builtAt，与顶层 generatedAt 同源。
+      // stageDeps 是 Object.freeze 的窄依赖对象，因此在**构造时**就给闭包，不改成可变对象。
+      now: () => builtAt,
       usageFor,
       roleLabelOf,
       projectionTitleOf,
@@ -292,9 +313,13 @@ export function createExpertGroupRuntime(dependencies = {}) {
      * 用户不必等完整快照就能看到错误横幅与重试入口。
      */
     const recoveryInput = recoveryInputFromRestoreStatus(safeCall(() => fanoutHost?.restoreStatus?.(), null));
-    const generatedAt = now();
-    // 根会话当前/最近一轮的墙钟用时（与 DSH 状态行同源）；placeholder root 没有事件时省略。
-    const rootTurnDurationMs = turnDurationOf(rootEvents, generatedAt);
+    // generatedAt 复用构建开始时的同一份样本（**不再在阶段结束后重新 now()**）：root 与
+    // expert/shard 的 turnDurationMs 因此全部锚定同一个时刻，客户端按 generatedAt 外推时不会
+    // 低估任何一行。此处只是把样本落到快照顶层，不重新读时钟。
+    const generatedAt = builtAt;
+    // 根会话全部 turn 的累计墙钟用时（与 DSH 状态行同源，轮次之间的空闲不计）；
+    // placeholder root 没有事件、或没有任何可证明的 turn 区间时省略。
+    const rootTiming = turnTimingOf(rootEvents, generatedAt);
     return buildExpertGroupSnapshot({
       sessionId: id,
       generatedAt,
@@ -314,7 +339,9 @@ export function createExpertGroupRuntime(dependencies = {}) {
         ...(placeholderRoot ? {} : { running: rootStatus === "running" }),
         runSummary: runSummary(session, placeholderRoot ? "unknown" : rootStatus, "one-shot", rootEvents),
         continuable: false,
-        ...(rootTurnDurationMs === null ? {} : { turnDurationMs: rootTurnDurationMs }),
+        ...(rootTiming.durationMs === null ? {} : { turnDurationMs: rootTiming.durationMs }),
+        // open turn 起点（additive）：客户端据此在两次权威快照之间锚定外推；闭合时省略。
+        ...(rootTiming.openSince === null ? {} : { turnOpenSince: rootTiming.openSince }),
         createdAt: createdAtOf(session?.createdAt, session?.header?.createdAt, header?.createdAt),
       },
       experts,

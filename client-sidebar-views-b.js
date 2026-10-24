@@ -83,6 +83,14 @@
   const contextPressureOf = (ctx, sessionId) => contextPressureOfValue(projectionValueOf(ctx, sessionId, "contextPressure"));
   /** DSH 投影里的有限数（允许 0，负数/非有限数一律 null）。 */
   const projectionNumber = (value) => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null);
+  /**
+   * 本地锚定外推的上限（毫秒）：快照年龄超过它就不再相加。
+   *
+   * 为什么有上限：外推只在「Host 刚说过这一轮还开着、且轮询还在正常跑」时可靠。快照陈旧
+   * 说明轮询可能已停摆（隐藏 tab / 网络中断 / Host 卡住），继续按 now 外推会把停止的时间
+   * 也算成用时；120 秒足以覆盖 2.5 秒轮询的任何正常抖动，又不会让停摆的快照无限漂移。
+   */
+  const LIVE_TURN_EXTRAPOLATION_MAX_AGE_MS = 120000;
   /** DSH sessionStats 里参与「用时/输出速度」的字段。 */
   const DSH_STATS_FIELDS = Object.freeze(["llmMs", "toolMs", "decodeMs", "decodeTokens"]);
   /** DSH tokenUsage 的四项口径。 */
@@ -247,11 +255,22 @@
     const measuredTps = dshThroughputOf(dsh);
     const dshLlmMs = dsh === null ? null : dsh.llmMs;
     const dshDuration = dshLlmMs !== null && dshLlmMs > 0 ? dshLlmMs : null;
-    // 用时口径（用户要求）：优先使用 Host 由 turn/start → now（或 turn/end）计算的
-    // 墙钟，与 DSH 状态行「用时 …」同源；旧快照没有该字段时才回退模型用时/会话时间。
+    // 用时口径（用户要求）：优先使用 Host 计算的**该会话全部 turn 累计墙钟**（每个 turn 的
+    // turn/start → turn/end，未闭合的一轮算到快照时刻；轮次之间的空闲不计），与 DSH 状态行
+    // 「用时 …」同源但不清零；旧快照没有该字段时才回退模型用时/会话时间。
     const turnDurationMs = finiteNumber(source.turnDurationMs);
+    // 锚定外推（A）：turnDurationMs 已含到 generatedAt 为止的 open 段，因此只加「快照之后
+    // 流逝的时间」就是精确值。五个条件必须同时成立，任一不满足增量为 0（只显示权威值）：
+    // turnDurationMs/turnOpenSince 有限、行严格 running、快照非 partial（证据不完整不外推）、
+    // generatedAt 有效且快照年龄在 0..120s（负年龄 = 时钟回拨，超龄 = 轮询可能停摆）。
+    const turnOpenSince = finiteNumber(source.turnOpenSince);
+    const openSnapshot = object(ctx.snapshot);
+    const generatedAt = finiteNumber(openSnapshot.generatedAt);
+    const liveAge = generatedAt !== null && runtimeStatus === "running" && turnDurationMs !== null
+      && turnOpenSince !== null && openSnapshot.partial !== true ? Date.now() - generatedAt : -1;
+    const extrapolationMs = liveAge >= 0 && liveAge <= LIVE_TURN_EXTRAPOLATION_MAX_AGE_MS ? liveAge : 0;
     const durationMs = turnDurationMs !== null
-      ? turnDurationMs
+      ? turnDurationMs + extrapolationMs
       : (dshDuration !== null ? dshDuration : durationOfNode(ctx, source, runtimeStatus, sessionId));
     const summary = typeof api?.summarizeUsageMetrics === "function"
       ? api.summarizeUsageMetrics(usage, {
@@ -280,11 +299,11 @@
       // 用时 tooltip：DSH 显示「模型用时」，并补充工具调用用时；回退 DEG 时仍写「运行时间」。
       const toolDurationText = dsh === null || dsh.toolMs === null ? null : formatCompactDuration(dsh.toolMs);
       const modelDurationText = dshDuration === null ? null : formatCompactDuration(dshDuration);
-      // 墙钟口径下 tooltip 主文案写「本轮用时」，并把模型/工具用时作为补充信息保留；
+      // 累计墙钟口径下 tooltip 主文案写「累计轮次用时」，并把模型/工具用时作为补充信息保留；
       // 旧快照仍沿用「模型用时 / 运行时间」的既有文案。
       const durationTitle = summary.durationText === null ? null
         : turnDurationMs !== null
-          ? "本轮用时 " + summary.durationText
+          ? "累计轮次用时 " + summary.durationText
             + (modelDurationText === null ? "" : " · 模型用时 " + modelDurationText)
             + (toolDurationText === null ? "" : " · 工具调用用时 " + toolDurationText)
           : dshDuration !== null

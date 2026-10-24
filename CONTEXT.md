@@ -97,7 +97,7 @@ Expert Group 某个角色当前默认使用的单一思考深度。它属于角�
 用于稳定识别一项工作的人类可读短名称。主代理使用根会话标题，普通专家任务使用派发 description，fan-out 分片使用分片标识。
 
 ## 运行摘要
-任务行主体固定两行：任务名（主代理固定“主代理”，专家为最新派发描述，fan-out 分片为“分片代号  任务名称”）与模型元数据（角色 · provider · model · 思考深度）。行内不再显示 tool/call 命令、continuability 或活动状态文案，运行状态只由行首状态点表达。任务名旁的用量速览按固定顺序显示：用时、输出速度（tok/s）、总 token、缓存命中率、上下文占用率（context）；数据优先来自 DSH 会话投影——sessionStats.llmMs（模型用时，tooltip 附工具调用用时）、decodeTokens/decodeMs（输出速度）、tokenUsage 四项（tok 与命中）与 contextPressure（context），投影缺失时才回退 DEG 用量账本与会话时间；sessionStats 是客户端按需投影（sessions 列表快照不含它），面板会对树里出现但尚未加载的 child 会话调用公开的 `sessions.refreshProjections(sessionId)` 各加载一次（同一会话只请求一次、失败不重试），首帧可能短暂回退 DEG，加载完成后切换为 DSH 权威值；任何一段数据不可证明时整段省略，绝不写 0 或占位词。开始时间、重试次数与最近活动不再出现在摘要条里；重试达到阈值仍显示「多次重试」警示，失败仍显示受限失败摘要。分片展开后另可查看该分片自己的 attempt 时间线、成本估算与结构化结果。
+任务行主体固定两行：任务名（主代理固定“主代理”，专家为最新派发描述，fan-out 分片为“分片代号  任务名称”）与模型元数据（角色 · provider · model · 思考深度）。行内不再显示 tool/call 命令、continuability 或活动状态文案，运行状态只由行首状态点表达。任务名旁的用量速览按固定顺序显示：用时、输出速度（tok/s）、总 token、缓存命中率、上下文占用率（context）。用时优先取 Host 投影的 turnDurationMs——该会话全部 turn 的累计墙钟（每个 turn 从 turn/start 到对应 turn/end，最后一个未闭合的 turn 算到快照时刻，轮次之间的空闲不计，一轮结束不清零；tooltip 主文案为「累计轮次用时」，并附模型用时与工具调用用时），旧宿主或该投影尚未加载时回退 sessionStats.llmMs（模型用时），再回退节点起止时间差；其余四段优先来自 DSH 会话投影——decodeTokens/decodeMs（输出速度）、tokenUsage 四项（tok 与命中）与 contextPressure（context），投影缺失时才回退 DEG 用量账本与会话时间；sessionStats 是客户端按需投影（sessions 列表快照不含它），面板会对树里出现但尚未加载的 child 会话调用公开的 `sessions.refreshProjections(sessionId)` 各加载一次（同一会话只请求一次、失败不重试），首帧可能短暂回退 DEG，加载完成后切换为 DSH 权威值；任何一段数据不可证明时整段省略，绝不写 0 或占位词。开始时间、重试次数与最近活动不再出现在摘要条里；重试达到阈值仍显示「多次重试」警示，失败仍显示受限失败摘要。分片展开后另可查看该分片自己的 attempt 时间线、成本估算与结构化结果。
 
 ## 空闲专家子代理
 当前没有正在执行任务、但仍属于当前会话任务树的专家子代理。DSH 的 idle 与 ready 均属于空闲状态；空闲不等同于失败、取消或等待用户处理。

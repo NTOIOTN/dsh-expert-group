@@ -55,7 +55,7 @@ window.__ModuleLoader__.load({
     } = clientStylesModule;
     const clientModelConfigHostModule = globalThis[Symbol.for("dsh-expert-group/client-model-config-host")] || {};
     const {
-      CUSTOM_PROFILE_BASE_PATH, CUSTOM_PROVIDER_NS, CUSTOM_ROUTE_PROBE, createModelConfigHost,
+      createModelConfigHost,
     } = clientModelConfigHostModule;
     const clientFanoutModule = globalThis[Symbol.for("dsh-expert-group/client-fanout-normalize")] || {};
     const {
@@ -64,7 +64,7 @@ window.__ModuleLoader__.load({
     } = clientFanoutModule;
     const clientNativeStatusModule = globalThis[Symbol.for("dsh-expert-group/client-native-status")] || {};
     const {
-      NATIVE_RUNNING_STATUS_PREFIX, NATIVE_RUNNING_STATUS_PREFIXES, STATUS_ROLE_IDS, STATUS_ROLE_LABELS, createNativeTextRewriter, findNativeConversationScope,
+      NATIVE_RUNNING_STATUS_PREFIX, NATIVE_RUNNING_STATUS_PREFIXES, createNativeTextRewriter, findNativeConversationScope,
       findNativeStatusTextNode, replaceNativeStatusPrefix, resolveRunningStatusText,
     } = clientNativeStatusModule;
     const clientSettingsNormalizeModule = globalThis[Symbol.for("dsh-expert-group/client-settings-normalize")] || {};
@@ -72,7 +72,7 @@ window.__ModuleLoader__.load({
       PROMPT_ROLE_IDS, addModelCandidatePage, commitSettingsCandidate, compactModelCandidatesDraft, countUnicodeGraphemes, createSettingsModelCatalog,
       migrateSettingsDefaults, migrateSettingsSelection, modelLayerSelectionOf, modelPageCountOf, normalizeModelCandidatesDraft, normalizeModelFallbackLimitDraft,
       normalizePromptOverrides, normalizeRolePromptProjection, normalizeSettingsDraft, normalizeSettingsModelGroups, removeModelCandidatePage, reorderModelLayers,
-      resolveSettingsForm, setModelLayerSelection, syncSettingsDefaultsProvider, unifiedProviderOf, useHostMeta, validateModelCandidateRows, validatePromptText,
+      resolveSettingsForm, setModelLayerSelection, syncSettingsDefaultsProvider, unifiedProviderOf, validateModelCandidateRows, validatePromptText,
     } = clientSettingsNormalizeModule;
     const clientSubagentModule = globalThis[Symbol.for("dsh-expert-group/client-subagent-metadata")] || {};
     const {
@@ -145,11 +145,6 @@ window.__ModuleLoader__.load({
         throw new Error("dsh-expert-group: freshness 共享模块未装载（发布 bundle 缺少 client-freshness 投影片段）");
       }
       return surface;
-    }
-
-    /** 错误 code → status 映射由共享实现统一（Connection envelope 与 legacy fetch 同一份判定）。 */
-    function rpcErrorStatus(error) {
-      return requireFreshnessSurface().rpcErrorStatus(error);
     }
 
     /** 将 Connection envelope 归一为 fetch-like Response，保持两条传输的错误字段一致。 */

@@ -222,7 +222,7 @@
     const {
       clearAutoCloseBudget, idleSidebarResourceAddresses, rootSessionId, runningSidebarResourceAddresses,
       sidebarAutoCloseCooldownsRef, sidebarAutoCloseVerificationsRef, sidebarAutoOriginRef, sidebarAutoReservationRef,
-      sidebarAutoRunPhaseRef, sidebarAutoSuppressedRef, sidebarIdleChildren, sidebarResourceTabStateOf, sidebarSessionId,
+      sidebarAutoSuppressedRef, sidebarIdleChildren, sidebarResourceTabStateOf, sidebarSessionId,
       sidebarTabOpeningRef, sidebarTabPendingRef, sidebarTabRecordsRef, trimAutoKeyMap,
     } = scope;
     function sidebarAutoCloseKeyIsActive(key) {

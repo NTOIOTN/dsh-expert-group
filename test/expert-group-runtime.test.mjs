@@ -2041,15 +2041,20 @@ test("轻量快照保持跨 root 隔离：别的根与错配的分片身份都�
 });
 
 /**
- * 用时口径（用户要求）：DEG 侧栏的“用时”必须与 DSH 状态行同源——当前/最近一轮 turn 的
- * 墙钟（turn/start → now，或 turn/end - turn/start），而不是模型用时 sessionStats.llmMs。
+ * 用时口径（用户要求）：DEG 侧栏的“用时”必须与 DSH 状态行同源，但**累计该会话全部 turn**
+ * 的墙钟（每个 turn 的 turn/end - turn/start，最后一个未闭合 turn 算到快照时刻），
+ * 一轮结束不清零、轮次之间的空闲不计；不是模型用时 sessionStats.llmMs，也不是最后一轮。
  * 这里用真实事件形状（顶层 time 为 epoch ms）锁定 root 与 expert 两条投影路径。
  */
-test("用时口径：turnDurationMs 投影当前/最近一轮 turn 墙钟，root 与 expert 同源", async () => {
+test("用时口径：turnDurationMs 累计全部 turn 墙钟（含一个未闭合 turn），root 与 expert 同源", async () => {
+  // 根：两个已闭合 turn + 一个 open turn；turn 之间有明显的空闲区间（必须不计入）。
+  // 3000（1→4s）+ 10000（10→20s）+ 20000（30s→now 50s） = 33000；只算最后一轮会得到 20000。
   const rootEvents = [
     { type: "turn/start", time: 1000, data: { turn: 1 } },
     { type: "turn/end", time: 4000, data: { turn: 1 } },
     { type: "turn/start", time: 10000, data: { turn: 2 } },
+    { type: "turn/end", time: 20000, data: { turn: 2 } },
+    { type: "turn/start", time: 30000, data: { turn: 3 } },
   ];
   const rootSession = {
     id: "root-clock",
@@ -2058,12 +2063,16 @@ test("用时口径：turnDurationMs 投影当前/最近一轮 turn 墙钟，root
     snapshotEvents: () => rootEvents,
     requestHeader: () => ({ config: {} }),
   };
+  // 专家：两个已闭合 turn，中间同样有空闲。7000（2→9s）+ 3000（12→15s） = 10000；
+  // 只算最后一轮会得到 3000。
   const coldLogs = new Map([
     ["child-clock", {
       session: { id: "child-clock", parentSession: "root-clock", createdAt: 20 },
       events: [
         { type: "turn/start", time: 2000, data: { turn: 1 } },
         { type: "turn/end", time: 9000, data: { turn: 1 } },
+        { type: "turn/start", time: 12000, data: { turn: 2 } },
+        { type: "turn/end", time: 15000, data: { turn: 2 } },
       ],
     }],
   ]);
@@ -2089,14 +2098,274 @@ test("用时口径：turnDurationMs 投影当前/最近一轮 turn 墙钟，root
     now: () => 50000,
   }));
   const snapshot = await fullSnapshotFor(runtime, "root-clock");
-  // 根：最后一个 turn 仍 open，用时 = now(50000) - 最后一个 turn/start(10000)。
-  assert.equal(snapshot.root.turnDurationMs, 40000, "root 必须取当前打开 turn 的墙钟");
-  // 专家：最后一次 turn 已结束，用时 = turn/end(9000) - turn/start(2000)。
-  assert.equal(snapshot.root.children[0].turnDurationMs, 7000, "expert 必须取最近一轮已完成 turn 的墙钟");
-  // 没有 turn 事件的会话不投影该字段（旧宿主/旧日志），由客户端回退模型用时。
+  // 根：两个已闭合 turn 累加，再加上 open turn 的 30000 → now(50000)；空闲区间（4–10s、20–30s）不计。
+  assert.equal(
+    snapshot.root.turnDurationMs,
+    33000,
+    "root 必须累计全部 turn 墙钟（含 open turn），不能只取最后一轮 20000",
+  );
+  // open turn 起点（additive）：root 的最后一个 turn 仍打开 ⇒ 必须投影 30000。
+  assert.equal(snapshot.root.turnOpenSince, 30000, "root 必须投影最后一个 open turn 的起点");
+  // 专家：两个已闭合 turn 累加，turn 之间的空闲（9–12s）不计。
+  assert.equal(
+    snapshot.root.children[0].turnDurationMs,
+    10000,
+    "expert 必须累计全部已闭合 turn，不能只取最后一轮 3000",
+  );
+  // 专家的最后一轮已闭合 ⇒ 不投影 turnOpenSince（缺失，而不是 null）。
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(snapshot.root.children[0], "turnOpenSince"),
+    false,
+    "已闭合的 expert 不得投影 turnOpenSince",
+  );
+  // 没有 turn 事件的会话不投影这两个字段（旧宿主/旧日志），由客户端回退模型用时。
   const plain = runtimeWithRootEvents({ id: "root-no-turn", status: "running", events: [{ type: "session/title", data: { title: "无轮次事件" } }] });
   const plainSnapshot = await plain.snapshotForSession("root-no-turn");
   assert.equal(Object.prototype.hasOwnProperty.call(plainSnapshot.root, "turnDurationMs"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(plainSnapshot.root, "turnOpenSince"), false);
+});
+
+/**
+ * 分片级累计口径：分片行的「用时」取**最新 attempt child 会话**内全部 turn 之和，
+ * 而不是最新那一轮；同一 shard 的历史 attempt 不参与累加（它们的会话属于别的 child）。
+ */
+test("fan-out 分片：turnDurationMs 累计最新 child 会话内多个 turn", async () => {
+  const rootId = "root-shard-clock";
+  const tasks = [{
+    parentTaskId: "task-clock",
+    role: "fixer",
+    basePrompt: "公共目标",
+    status: "running",
+    createdAt: 30,
+    shards: [{
+      shardId: "task-clock-s1",
+      prompt: "分片 1",
+      status: "running",
+      createdAt: 31,
+      attempts: [
+        // 历史 attempt：child 有一份**可读**的历史会话（明显非零的 turn 用时），
+        // 但它不参与分片级用时——这是本用例要证明的关键边界。
+        { attempt: 1, status: "failed", childId: "child-clock-prev", startedAt: 31 },
+        // 最新 attempt：在线 child，会话内有多个 turn。
+        { attempt: 2, status: "running", childId: "child-clock-new", startedAt: 32 },
+      ],
+    }],
+  }];
+  const childSession = {
+    id: "child-clock-new",
+    status: "running",
+    header: { id: "child-clock-new", parentSession: rootId },
+    // 2000（40→42s）+ 7000（45→52s）+ 30000（60s→now 90s） = 39000；
+    // 只算最后一轮会得到 30000，只算已闭合 turn 会得到 9000。
+    snapshotEvents: () => [
+      { type: "turn/start", time: 40000, data: { turn: 1 } },
+      { type: "turn/end", time: 42000, data: { turn: 1 } },
+      { type: "turn/start", time: 45000, data: { turn: 2 } },
+      { type: "turn/end", time: 52000, data: { turn: 2 } },
+      { type: "turn/start", time: 60000, data: { turn: 3 } },
+    ],
+    requestHeader: () => ({ config: {} }),
+  };
+  // 历史 attempt 的 child 会话：刻意给出明显非零的历史 turn 用时，用来证明分片级用时
+  // 只取**最新 child**，不会把历史 child 的累计值加进来。
+  // 20000（1→21s）+ 50000（30→80s）= 70000；若被误加，分片会变成 39000+70000=109000。
+  const previousSession = {
+    id: "child-clock-prev",
+    status: "failed",
+    header: { id: "child-clock-prev", parentSession: rootId },
+    snapshotEvents: () => [
+      { type: "turn/start", time: 1000, data: { turn: 1 } },
+      { type: "turn/end", time: 21000, data: { turn: 1 } },
+      { type: "turn/start", time: 30000, data: { turn: 2 } },
+      { type: "turn/end", time: 80000, data: { turn: 2 } },
+    ],
+    requestHeader: () => ({ config: {} }),
+  };
+  const runtime = createExpertGroupRuntime(runtimeDeps({
+    // 两个 attempt 的 child 都提供可读会话：历史 child 的会话可见、可读，但不参与分片用时。
+    agents: {
+      get: (id) => {
+        if (id === "child-clock-new") return { id, status: "running", session: childSession };
+        if (id === "child-clock-prev") return { id, status: "failed", session: previousSession };
+        return undefined;
+      },
+    },
+    goals: { get: () => undefined },
+    lineage: {
+      activeRoot: () => ({ id: rootId, status: "running", session: { id: rootId, snapshotEvents: () => [], requestHeader: () => ({ config: {} }) }, options: {} }),
+      tasksOwnedBy: () => tasks,
+    },
+    fanoutHost: { listTasks: () => tasks, tasksOwnedBy: () => tasks },
+    recovery: { contextFor: () => undefined },
+    recoveryRecords: new Map(),
+    source: () => ({ childModels: {} }),
+    sessionQuery: () => ({ async readSession() { throw new Error("session not found"); } }),
+    now: () => 90000,
+  }));
+
+  const snapshot = await runtime.snapshotForSession(rootId);
+  const fanoutNode = snapshot.root.children.find((node) => node.kind === "fanout");
+  assert.ok(fanoutNode, "fan-out 父任务必须出现在任务树里");
+  assert.equal(fanoutNode.shards[0].childId, "child-clock-new", "分片导航键取最新 attempt 的在线 child");
+  // 历史 attempt 的 childId 仍然保留：说明它的会话确实可读、归属证明成立。
+  // 因此下一条断言不是靠「旧 child 读不到会话」侥幸通过，而是真的只取最新 child。
+  assert.equal(
+    fanoutNode.shards[0].attempts[0].childId,
+    "child-clock-prev",
+    "历史 attempt 的可读 child 仍保留导航键（证明其会话可被读取）",
+  );
+  assert.equal(
+    fanoutNode.shards[0].turnDurationMs,
+    39000,
+    "分片用时必须是该 child 会话全部 turn 的累计墙钟（含未闭合 turn 到快照时刻，空闲不计）；"
+      + "历史 child 的 70000 不得加进来（否则是 109000）",
+  );
+  // 分片同样投影 open turn 起点（与 root/expert 同源），供客户端锚定外推。
+  assert.equal(fanoutNode.shards[0].turnOpenSince, 60000, "分片必须投影最新 child 的 open turn 起点");
+});
+
+/**
+ * 时间锚点（oracle 复审缺陷的回归锁）：同一份快照里 root / expert / shard 的 turnDurationMs
+ * **必须与顶层 generatedAt 同源**，否则客户端按 generatedAt 外推时会把运行中的行系统性低估，
+ * 低估量正好是「该行采样时刻 → generatedAt」之间的构建耗时（冷读慢时可达数秒）。
+ *
+ * 夹具要点：
+ * - 时钟**每次调用递增**：旧实现给 expert/shard 的 now 是注入时钟直通、顶层 generatedAt 又在
+ *   两个阶段都 settle 之后才采样，因此三段必然落在不同样本上，不变量会立刻失败；
+ * - 每个会话只有**一个 open turn**、没有已闭合 turn，于是「累计用时」恰好等于
+ *   generatedAt - turnOpenSince，不变量可以用等号锁住；
+ * - 冷读带 10ms 延迟：构建过程中必然出现真实的耗时窗口，旧实现正是在这里开始低估；
+ * - 含已闭合 turn 的累计口径由前面的用例（"用时口径：…" 与 "fan-out 分片：…"）继续锁定，
+ *   本用例不重复覆盖累计值，只在累计口径之上追加「同源」断言。
+ */
+test("时间锚点：同一快照内 root/expert/shard 的 turnDurationMs 与 generatedAt 同源", async () => {
+  const rootId = "root-anchor";
+  // 每次采样 +1000：样本值可区分，同时能证明构建过程中 now 被调用了多次。
+  let t = 1000;
+  const samples = [];
+  const clock = () => {
+    t += 1000;
+    samples.push(t);
+    return t;
+  };
+  // 第一次冷读开始时的计数器值：全量构建的 builtAt 必须早于（或等于）它。
+  // 旧实现顶层 generatedAt 采样于阶段 settle 之后，必然**大于**它，因此这条断言单独就能抓住缺陷。
+  let counterAtFirstColdRead = null;
+
+  // root：一个 open turn（起点 1000）；没有已闭合 turn ⇒ 用时 = generatedAt - 1000。
+  const rootSession = {
+    id: rootId,
+    status: "running",
+    createdAt: 1,
+    snapshotEvents: () => [{ type: "turn/start", time: 1000, data: { turn: 1 } }],
+    requestHeader: () => ({ config: {} }),
+  };
+  // 专家（冷读）：一个 open turn（起点 900）。
+  const expertEvents = [{ type: "turn/start", time: 900, data: { turn: 1 } }];
+  // fan-out 分片（live agent）：一个 open turn（起点 800）。
+  const shardSession = {
+    id: "child-anchor-shard",
+    status: "running",
+    header: { id: "child-anchor-shard", parentSession: rootId },
+    snapshotEvents: () => [{ type: "turn/start", time: 800, data: { turn: 1 } }],
+    requestHeader: () => ({ config: {} }),
+  };
+  const tasks = [{
+    parentTaskId: "task-anchor",
+    role: "fixer",
+    basePrompt: "公共目标",
+    status: "running",
+    createdAt: 30,
+    shards: [{
+      shardId: "task-anchor-s1",
+      prompt: "分片 1",
+      status: "running",
+      createdAt: 31,
+      attempts: [{ attempt: 1, status: "running", childId: "child-anchor-shard", startedAt: 32 }],
+    }],
+  }];
+  const runtime = createExpertGroupRuntime(runtimeDeps({
+    agents: {
+      get: (id) => {
+        if (id === rootId) return { id, status: "running", session: rootSession };
+        if (id === "child-anchor-shard") return { id, status: "running", session: shardSession };
+        return undefined;
+      },
+    },
+    goals: { get: () => undefined },
+    lineage: {
+      activeRoot: () => ({ id: rootId, status: "running", session: rootSession, options: {} }),
+      tasksOwnedBy: () => tasks,
+    },
+    fanoutHost: { listTasks: () => tasks, tasksOwnedBy: () => tasks },
+    recovery: { contextFor: () => undefined },
+    recoveryRecords: new Map(),
+    source: () => ({
+      childModels: { "child-anchor": { parentId: rootId, role: "fixer", continuable: true, createdAt: 20 } },
+    }),
+    sessionQuery: () => ({
+      async readSession(sessionId) {
+        if (counterAtFirstColdRead === null) counterAtFirstColdRead = t;
+        // 冷读延迟：构建期间 now 会被缓存/重建路径多次采样（旧实现据此与顶层采样错位）。
+        await delayMs(10);
+        if (sessionId !== "child-anchor") throw new Error("session not found");
+        return { session: { id: sessionId, parentSession: rootId, createdAt: 20 }, events: expertEvents };
+      },
+    }),
+    now: clock,
+  }));
+
+  const snapshot = await fullSnapshotFor(runtime, rootId);
+  const generatedAt = snapshot.generatedAt;
+  const expert = snapshot.root.children.find((node) => node.id === "child-anchor");
+  const fanout = snapshot.root.children.find((node) => node.kind === "fanout");
+  assert.ok(expert, "普通专家必须出现在任务树里");
+  assert.ok(fanout, "fan-out 父任务必须出现在任务树里");
+  const shard = fanout.shards[0];
+
+  // 前提自检：三段都真的投影了 turnDurationMs 与自己的 open turn 起点（否则不变量是空转）。
+  assert.equal(snapshot.root.turnOpenSince, 1000, "root 必须投影自己的 open turn 起点");
+  assert.equal(expert.turnOpenSince, 900, "expert 必须投影自己的 open turn 起点");
+  assert.equal(shard.turnOpenSince, 800, "shard 必须投影自己的 open turn 起点");
+  assert.equal(typeof snapshot.root.turnDurationMs, "number", "root 必须投影 turnDurationMs");
+  assert.equal(typeof expert.turnDurationMs, "number", "expert 必须投影 turnDurationMs");
+  assert.equal(typeof shard.turnDurationMs, "number", "shard 必须投影 turnDurationMs");
+
+  /**
+   * 核心不变量：generatedAt - turnDurationMs === turnOpenSince（root / expert / shard 三者）。
+   * 单 open turn 夹具下，durationMs === 采样时刻 - openSince，因此差值必须**精确**回到起点；
+   * 任何一段用了比 generatedAt 更早的样本，差值就会多出「早多少」，断言随即失败。
+   */
+  assert.equal(
+    generatedAt - snapshot.root.turnDurationMs,
+    1000,
+    "root 的 turnDurationMs 必须与 generatedAt 同源",
+  );
+  assert.equal(
+    generatedAt - expert.turnDurationMs,
+    900,
+    "expert 的 turnDurationMs 必须与 generatedAt 同源（旧实现在阶段内单独采样，会偏大）",
+  );
+  assert.equal(
+    generatedAt - shard.turnDurationMs,
+    800,
+    "shard 的 turnDurationMs 必须与 generatedAt 同源（旧实现在分片投影时单独采样，会偏大）",
+  );
+
+  // generatedAt 必须是**构建开始时**的那次采样，而不是构建结束后的最后一次采样。
+  assert.ok(samples.includes(generatedAt), "generatedAt 必须来自注入时钟的真实采样，实测 " + generatedAt);
+  assert.equal(
+    generatedAt,
+    counterAtFirstColdRead,
+    "generatedAt 必须等于构建开始时的采样值（早于第一次冷读），实测 generatedAt="
+      + generatedAt + "，首次冷读时计数器=" + counterAtFirstColdRead,
+  );
+  // 构建过程中/之后仍发生了多次采样：证明这条断言不是「只有一个样本」的巧合。
+  assert.ok(samples.length > 1, "构建过程中 now 必须被采样多次，实测 " + JSON.stringify(samples));
+  assert.ok(
+    samples[samples.length - 1] > generatedAt,
+    "generatedAt 不得是最后一次采样（末次样本更晚），实测 " + JSON.stringify(samples),
+  );
 });
 
 // ── R2 阶段收敛断言（票据 09 / plan R2.5-a） ─────────────────────────────────

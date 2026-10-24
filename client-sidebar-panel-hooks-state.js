@@ -199,15 +199,15 @@
     const setAnnouncement = announcementPair[1];
 
     Object.assign(frame, {
-      announcement, announcementPair, announcerRef, autoOpenDraft, autoOpenDraftPair, bump,
-      emptyFilter, filterPair, filterState, meta, metaPair, metaStateRef,
-      sessionModelCatalog, sessionModelCatalogPair, sessionModelDialogRef, sessionModelDrafts, sessionModelDraftsPair, sessionModelEntryRef,
-      sessionModelLoadedRootRef, sessionModelNotice, sessionModelNoticePair, sessionModelOpen, sessionModelOpenPair, sessionModelReloadPair,
-      sessionModelReloadToken, sessionModelRequestSerialRef, sessionModelSaving, sessionModelSavingPair, sessionModelState, sessionModelStatePair,
+      announcement, announcerRef, autoOpenDraft, bump,
+      emptyFilter, filterState, meta, metaStateRef,
+      sessionModelCatalog, sessionModelDialogRef, sessionModelDrafts, sessionModelEntryRef,
+      sessionModelLoadedRootRef, sessionModelNotice, sessionModelOpen,
+      sessionModelReloadToken, sessionModelRequestSerialRef, sessionModelSaving, sessionModelState,
       sessionModelSurfaceRef, sessionModelWasOpenRef, setAnnouncement, setAutoOpenDraft, setFilterState, setMeta,
       setSessionModelCatalog, setSessionModelDrafts, setSessionModelNotice, setSessionModelOpen, setSessionModelReloadToken, setSessionModelSaving,
-      setSessionModelState, setState, state, statePair, timelineExpandedRef, version,
-      versionPair, viewState,
+      setSessionModelState, setState, state, timelineExpandedRef, version,
+      viewState,
     });
   }
 
@@ -356,11 +356,7 @@
         onKeyDown: onWidthResizerKeyDown,
       });
 
-    Object.assign(frame, {
-      applyWidthRatio, commitWidthRatio, detachWidthDrag, endWidthDrag, onWidthDragMove, onWidthDragStart,
-      onWidthResizerKeyDown, readWidthRatio, setWidthRatio, widthDragHost, widthDragRef, widthRatio,
-      widthRatioPair, widthResizer,
-    });
+    Object.assign(frame, { widthResizer });
   }
 
   /** 展开态 store、跨 await 的身份 ref 与宿主 meta 单飞读取。 */
@@ -451,8 +447,8 @@
     metaRefreshRef.current = loadMeta;
 
     Object.assign(frame, {
-      contextRef, createStore, currentRootRef, currentSidebarSessionRef, loadMeta, metaAutoAttemptRef,
-      metaRefreshRef, metaRequestRef, mountedRef, requestSequenceRef, store,
+      contextRef, currentRootRef, currentSidebarSessionRef, loadMeta, metaAutoAttemptRef,
+      metaRefreshRef, mountedRef, requestSequenceRef, store,
     });
   }
 
@@ -635,8 +631,8 @@
     };
 
     Object.assign(frame, {
-      applySessionModelView, clearSessionModelRole, commitSessionModelChanges, sessionModelBaselineOf, sessionModelHasInvalidDraft, sessionModelPendingChanges,
-      sessionModelWriteReady, settleSessionModelFailure, updateSessionModelDraft,
+      clearSessionModelRole, commitSessionModelChanges, sessionModelBaselineOf, sessionModelHasInvalidDraft, sessionModelPendingChanges,
+      updateSessionModelDraft,
     });
   }
 
@@ -694,9 +690,7 @@
 
     // 登记给更早 Hook 的晚绑定包装（声明已完成，此后的调用都拿到本帧的实例）。
     frame.late.sidebarSurfaceStillCurrent = sidebarSurfaceStillCurrent;
-    Object.assign(frame, {
-      derivedSurfaceToken, sidebarSurfaceStillCurrent, surfaceToken, surfaceTokenRef, surfaceTokenScopeRef,
-    });
+    Object.assign(frame, { sidebarSurfaceStillCurrent });
   }
 
   /** 宿主服务解析、Auto 开关、split 事务入口与无标签同步读面。 */
@@ -823,7 +817,7 @@
 
     Object.assign(frame, {
       autoOpenEnabled, closeSidebarResource, existingSubagentPaneId, navigation, presentSidebarTabIds, readActiveSidebarResource,
-      readAutoOpenSetting, readSidebarOpenTabs, seededGuideTabId, sidebarSplitTargetEvidence, splitSidebarPane, toggleAutoOpen,
+      readSidebarOpenTabs, seededGuideTabId, sidebarSplitTargetEvidence, splitSidebarPane, toggleAutoOpen,
       waitForSidebarSplitLayoutCommit, writeAutoOpenSetting,
     });
   }

@@ -5083,12 +5083,12 @@ test("用量速览：任务行按 用时 · tok/s · tok · 命中 · context �
 
 /**
  * 用时口径（用户要求）：Host 投影的 turnDurationMs 必须优先于 sessionStats.llmMs。
- * 前者与 DSH 状态行「用时 …」同源（当前/最近一轮 turn 墙钟），后者只是模型用时；
- * tooltip 仍应保留模型用时，避免信息丢失。
+ * 前者与 DSH 状态行「用时 …」同源，但语义是**该会话全部 turn 的累计墙钟**（一轮结束不清零）；
+ * 后者只是模型用时；tooltip 仍应保留模型用时，避免信息丢失。
  */
-test("用量速览：turnDurationMs 优先于模型用时，与 DSH 状态行同源", async () => {
+test("用量速览：turnDurationMs 优先于模型用时，与 DSH 状态行同源（累计轮次）", async () => {
   const hostSnapshot = usageMetricsSnapshot();
-  // 模拟完整构建的投影：当前 turn 已运行 1h30m（远大于夹具里的模型用时）。
+  // 模拟完整构建的投影：该会话全部 turn 累计 1h30m（远大于夹具里的模型用时）。
   hostSnapshot.root.turnDurationMs = 90 * 60 * 1000;
   const mounted = mountPanel({ hostSnapshot, sessions: usageMetricsSessionsFixture(), storage: new MemoryStorage() });
   const { handle, intervals, restore } = mounted;
@@ -5097,15 +5097,164 @@ test("用量速览：turnDurationMs 优先于模型用时，与 DSH 状态行同
     await handle.settle();
     const rootRow = byClass(handle.output, "deg_expert_group_node_root")[0];
     const metrics = byClass(byClass(rootRow, "deg_expert_group_row")[0], "deg_expert_group_metrics")[0];
-    assert.equal(metricsParts(metrics)[0], "用时1h30m", "running 行必须用 turn 墙钟而不是模型用时");
+    assert.equal(metricsParts(metrics)[0], "用时1h30m", "running 行必须用累计 turn 墙钟而不是模型用时");
     const durationPart = byClass(metrics, "deg_expert_group_metrics_part").find((part) => textOf(part) === "用时1h30m");
     assert.ok(durationPart, "墙钟用时段必须渲染");
-    assert.equal(durationPart.props.title, "本轮用时 1h30m", "tooltip 明确本轮墙钟语义");
+    assert.equal(durationPart.props.title, "累计轮次用时 1h30m", "tooltip 明确累计轮次墙钟语义");
   } finally {
     handle.unmount();
     restore();
   }
   assert.equal(intervals.active, 0);
+});
+
+/**
+ * 本地锚定外推（A）：open turn 在两次权威快照之间按 1 秒本地时钟推进。
+ *
+ * 只允许在「turnDurationMs + turnOpenSince + generatedAt 都有效、行严格 running、快照新鲜」时
+ * 相加；closed / 非 running / partial / 缺 generatedAt / 超龄 / 时钟回拨一律只显示权威值。
+ * tok/s 回退同理跟随 durationMs 缓慢下降（用户要求的预期语义）。
+ */
+test("用量速览：open turn 按快照锚点外推；条件不全时只显示权威值", async () => {
+  const generatedAt = 1700000060000;
+  const clock = installFakeClock(generatedAt + 1000);
+  /** 构造「61s 累计 + 最后一段仍未闭合」的根快照；patch 用于逐条关闭外推条件。 */
+  const mountWith = (patch) => {
+    const hostSnapshot = usageMetricsSnapshot();
+    hostSnapshot.generatedAt = generatedAt;
+    hostSnapshot.root.turnDurationMs = 61000;
+    hostSnapshot.root.turnOpenSince = generatedAt - 61000;
+    if (typeof patch === "function") patch(hostSnapshot);
+    return mountPanel({ hostSnapshot, sessions: usageMetricsSessionsFixture(), storage: new MemoryStorage() });
+  };
+  const rootMetricsOf = (handle) => {
+    const rootRow = byClass(handle.output, "deg_expert_group_node_root")[0];
+    return byClass(byClass(rootRow, "deg_expert_group_row")[0], "deg_expert_group_metrics")[0];
+  };
+  const partsOf = (handle) => byClass(rootMetricsOf(handle), "deg_expert_group_metrics_part").map(textOf);
+  const durationPartOf = (handle) => byClass(rootMetricsOf(handle), "deg_expert_group_metrics_part")
+    .find((part) => textOf(part).startsWith("用时"));
+  const expectAuthorityOnly = async (patch, message) => {
+    const mounted = mountWith(patch);
+    try {
+      await mounted.handle.settle();
+      assert.equal(textOf(durationPartOf(mounted.handle)), "用时1m1s", message);
+    } finally {
+      mounted.handle.unmount();
+      mounted.restore();
+    }
+  };
+
+  try {
+    // ① 条件齐全：61s 权威值 + 快照之后 1s = 62s；tooltip 仍是「累计轮次用时」。
+    const live = mountWith(null);
+    try {
+      await live.handle.settle();
+      assert.equal(textOf(durationPartOf(live.handle)), "用时1m2s", "open turn 必须按快照锚点外推");
+      const durationPart = durationPartOf(live.handle);
+      assert.ok(durationPart.props.title.startsWith("累计轮次用时 1m2s"), "tooltip 语义不变");
+      // tok/s 回退公式：150 output tok ÷ 62s ≈ 2.4 tok/s（缺失 DSH 实测吞吐时）。
+      assert.deepEqual(
+        partsOf(live.handle).filter((part) => part.endsWith("tok/s")),
+        ["2.4tok/s"],
+        "缺 DSH 实测吞吐时按 durationMs 回退",
+      );
+      // 本地 1 秒时钟推进：文本跟着变化，tok/s 随用时增加而下降（2.3）。
+      clock.advance(2000);
+      await live.intervals.tick();
+      await live.handle.settle();
+      assert.equal(textOf(durationPartOf(live.handle)), "用时1m4s", "本地时钟推进后用时文本必须变化");
+      assert.deepEqual(
+        partsOf(live.handle).filter((part) => part.endsWith("tok/s")),
+        ["2.3tok/s"],
+        "tok/s 回退随 durationMs 增大而下降",
+      );
+      // 有 open turn ⇒ 真正的 1 秒 ticker 存在；轮询仍是 2.5 秒（未新增网络轮询）。
+      assert.equal(live.intervals.delays.includes(1000), true, "有 open turn ⇒ 存在 1 秒本地 ticker");
+      assert.equal(live.intervals.delays.includes(2500), true, "周期性权威同步仍是 2.5 秒轮询");
+    } finally {
+      live.handle.unmount();
+      live.restore();
+    }
+    assert.equal(live.intervals.active, 0, "卸载必须清理 ticker 与轮询定时器");
+
+    // ② 已闭合（没有 turnOpenSince）只显示权威值。
+    await expectAuthorityOnly(
+      (snapshot) => { delete snapshot.root.turnOpenSince; },
+      "closed turn 不得外推",
+    );
+    // ③ 非 running：状态已定格。
+    await expectAuthorityOnly(
+      (snapshot) => { snapshot.root.status = "ready"; },
+      "非 running 行不得外推",
+    );
+    // ④ partial 轻量快照：证据不完整，不做时间外推。
+    await expectAuthorityOnly(
+      (snapshot) => { snapshot.partial = true; },
+      "partial 快照不得外推",
+    );
+    // ⑤ 缺少 generatedAt：没有锚点。
+    await expectAuthorityOnly(
+      (snapshot) => { delete snapshot.generatedAt; },
+      "缺 generatedAt 不得外推",
+    );
+    // ⑥ 快照年龄超过 120s：轮询可能已停摆。
+    await expectAuthorityOnly(
+      (snapshot) => { snapshot.generatedAt = clock.now() - 130000; },
+      "快照年龄超过 120s 不得外推",
+    );
+    // ⑦ 时钟回拨（generatedAt 在未来）：负年龄不加。
+    await expectAuthorityOnly(
+      (snapshot) => { snapshot.generatedAt = clock.now() + 5000; },
+      "时钟回拨不得产生额外用时",
+    );
+  } finally {
+    clock.restore();
+  }
+});
+
+/**
+ * 1 秒本地 ticker 的启停边界：只在「存在 running 且 turnOpenSince 有效」的节点时启动，
+ * 没有 open turn 时不创建，卸载后必须清干净（不留下空转定时器）。
+ */
+test("用量速览：1 秒 ticker 仅在 open turn 存在时启动，卸载必须清理", async () => {
+  const generatedAt = 1700000060000;
+  const clock = installFakeClock(generatedAt + 1000);
+  const mountWith = (withOpenTurn) => {
+    const hostSnapshot = usageMetricsSnapshot();
+    hostSnapshot.generatedAt = generatedAt;
+    hostSnapshot.root.turnDurationMs = 61000;
+    if (withOpenTurn === true) hostSnapshot.root.turnOpenSince = generatedAt - 61000;
+    return mountPanel({ hostSnapshot, sessions: usageMetricsSessionsFixture(), storage: new MemoryStorage() });
+  };
+  try {
+    const live = mountWith(true);
+    try {
+      await live.handle.settle();
+      assert.equal(
+        live.intervals.delays.filter((delay) => delay === 1000).length,
+        1,
+        "有 open turn ⇒ 恰好一个 1 秒 ticker（每行各建 interval 会多于一个）",
+      );
+    } finally {
+      live.handle.unmount();
+      live.restore();
+    }
+    assert.equal(live.intervals.active, 0, "卸载必须清理 ticker 与轮询定时器");
+
+    const closed = mountWith(false);
+    try {
+      await closed.handle.settle();
+      assert.equal(closed.intervals.delays.includes(1000), false, "没有 open turn ⇒ 绝不启动 ticker");
+      assert.equal(closed.intervals.delays.includes(2500), true, "周期性权威同步的轮询照常存在");
+    } finally {
+      closed.handle.unmount();
+      closed.restore();
+    }
+    assert.equal(closed.intervals.active, 0);
+  } finally {
+    clock.restore();
+  }
 });
 
 /**
@@ -6275,31 +6424,55 @@ function idleSnapshot() {
   };
 }
 
-test("票据 15：自动轮询先读事件；无事件且无缺口时不请求快照、不重渲染", async () => {
-  const host = incrementalHostPanel();
-  const { handle, intervals, restore, state } = host;
+test("票据 15：自动轮询先读事件；空闲无事件不请求快照，运行态仍请求快照", async () => {
+  // ① 空闲快照：锁定「空闲零请求」的既有契约（无事件 ⇒ 不拉快照、不重渲染）。
+  const idleHost = incrementalHostPanel({ snapshot: idleSnapshot() });
   try {
-    await handle.settle();
-    assert.equal(state.snapshotCalls.length, 1, "挂载时一次首屏快照");
-    const renders = handle.renderCount;
-    assert.deepEqual(intervals.delays, [2500], "运行态初始间隔是 2.5 秒（时间参数集中定义）");
+    await idleHost.handle.settle();
+    assert.equal(idleHost.state.snapshotCalls.length, 1, "挂载时一次首屏快照");
+    const renders = idleHost.handle.renderCount;
+    assert.deepEqual(idleHost.intervals.delays, [2500], "轮询初始间隔是 2.5 秒（时间参数集中定义）");
 
     for (let round = 0; round < 3; round += 1) {
-      await intervals.tick();
-      await handle.settle();
+      await idleHost.intervals.tick();
+      await idleHost.handle.settle();
     }
     assert.deepEqual(
-      state.eventsCalls.map((call) => [call.sessionId, call.after]),
+      idleHost.state.eventsCalls.map((call) => [call.sessionId, call.after]),
       [["root-1", 0], ["root-1", 0], ["root-1", 0]],
       "每轮都先读事件；Host 没给新游标时继续用当前游标（绝不伪造进度）",
     );
-    assert.equal(state.snapshotCalls.length, 1, "无事件且无缺口 ⇒ 绝不请求快照");
-    assert.equal(handle.renderCount, renders, "无事件 ⇒ 零重渲染");
+    assert.equal(idleHost.state.snapshotCalls.length, 1, "空闲且无事件 ⇒ 绝不请求快照（空闲零请求契约）");
+    assert.equal(idleHost.handle.renderCount, renders, "空闲且无事件 ⇒ 零重渲染");
   } finally {
-    handle.unmount();
-    restore();
+    idleHost.handle.unmount();
+    idleHost.restore();
   }
-  assert.equal(intervals.active, 0);
+  assert.equal(idleHost.intervals.active, 0);
+
+  // ② 运行态快照：turn/start 不产生 fanout 事件，但「用时」必须实时推进 ⇒ 无事件也要刷新快照。
+  const runningHost = incrementalHostPanel();
+  try {
+    await runningHost.handle.settle();
+    assert.equal(runningHost.state.snapshotCalls.length, 1, "挂载时一次首屏快照");
+    const renders = runningHost.handle.renderCount;
+    for (let round = 0; round < 3; round += 1) {
+      await runningHost.intervals.tick();
+      await runningHost.handle.settle();
+    }
+    assert.equal(runningHost.state.snapshotCalls.length, 4, "运行态每轮无事件也必须刷新快照");
+    assert.deepEqual(
+      runningHost.state.eventsCalls.map((call) => call.after),
+      [0, 0, 0],
+      "刷新快照前仍然先读事件（顺序不变）",
+    );
+    // 内容相同时不重渲染：实时性由「新快照 → 新 generatedAt」驱动，而不是每轮强制刷新 DOM。
+    assert.equal(runningHost.handle.renderCount, renders, "内容相同的运行态刷新不产生重渲染");
+  } finally {
+    runningHost.handle.unmount();
+    runningHost.restore();
+  }
+  assert.equal(runningHost.intervals.active, 0);
 });
 
 test("票据 15：有事件时恰好补拉一次快照，并推进到 Host 返回的游标", async () => {
@@ -6320,7 +6493,20 @@ test("票据 15：有事件时恰好补拉一次快照，并推进到 Host 返�
     await intervals.tick();
     await handle.settle();
     assert.equal(state.eventsCalls.at(-1).after, 1, "游标推进到 Host 的 nextSequence");
-    assert.equal(state.snapshotCalls.length, 2, "事件已消费 ⇒ 不再请求快照");
+    // 行为契约变更（用户要求「用时实时跳动」）：运行态即使没有新事件也要刷新快照，
+    // 让 turnDurationMs/turnOpenSince 跟上。内容相同 ⇒ 不重渲染（见下一条断言）。
+    const runningRenders = handle.renderCount;
+    assert.equal(state.snapshotCalls.length, 3, "事件已消费，但运行态仍刷新快照");
+    assert.equal(handle.renderCount, runningRenders, "运行态内容相同 ⇒ 不重渲染");
+
+    // 切回空闲：恢复「无事件不请求快照」的既有契约。
+    state.snapshot = idleSnapshot();
+    await intervals.tick();
+    await handle.settle();
+    assert.equal(state.snapshotCalls.length, 4, "回到空闲的那一轮仍要拉一次快照（确认没有运行中工作）");
+    await intervals.tick();
+    await handle.settle();
+    assert.equal(state.snapshotCalls.length, 4, "空闲后恢复零快照请求");
   } finally {
     handle.unmount();
     restore();
@@ -6351,7 +6537,8 @@ test("票据 15：gap 或游标过旧时执行一次全量同步，并以响应 
     await intervals.tick();
     await handle.settle();
     assert.equal(state.eventsCalls.at(-1).after, 9, "游标按响应 cursor 重建");
-    assert.equal(state.snapshotCalls.length, 2, "重建后的游标没有新事件 ⇒ 不再请求快照");
+    // 游标已重建，但快照仍是运行态 ⇒ 新契约要求继续刷新（内容相同不重渲染）。
+    assert.equal(state.snapshotCalls.length, 3, "运行态无事件仍刷新快照（游标本身仍按 9 读取）");
   } finally {
     handle.unmount();
     restore();
@@ -6686,7 +6873,8 @@ test("票据 15：增量轮询保持单飞 + 一次尾随，事件读面失败�
         return { ok: true, async json() { return { ok: true, events: [], cursor: 3, gap: false, earliestSequence: 1, dropped: 0 }; } };
       }
       snapshotCalls.push(request);
-      return { ok: true, async json() { return { snapshot: snapshot() }; } };
+      // 本用例只锁定「单飞 + 一次尾随」：用空闲快照避免运行态刷新干扰计数（该行为由上方用例覆盖）。
+      return { ok: true, async json() { return { snapshot: idleSnapshot() }; } };
     },
   });
   const { handle, intervals, restore } = mounted;

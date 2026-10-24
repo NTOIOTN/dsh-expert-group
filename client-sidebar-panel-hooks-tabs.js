@@ -534,11 +534,11 @@
     };
 
     Object.assign(frame, {
-      autoCloseCooldownActive, autoCloseLedger, autoTabMissesOf, cancelPendingSidebarSplit, cancelPendingSidebarSplitOfClose, clearAutoCloseAttempt,
+      autoCloseCooldownActive, autoTabMissesOf, cancelPendingSidebarSplit, cancelPendingSidebarSplitOfClose, clearAutoCloseAttempt,
       clearAutoCloseBudget, enterAutoCloseCooldown, idleSidebarResourceAddresses, knownSidebarResourceAddresses, presentFloatingSubagentTitles, releaseExpiredAutoCloseCooldown,
       runningSidebarResourceAddresses, sampleAutoTabMisses, settleAutoCloseAttempt, sidebarActiveResourceMatches, sidebarAdoptionEvidenceAvailable, sidebarBatchCandidates,
       sidebarBatchSignatureOf, sidebarBatchStateFor, sidebarExpertResourceAddresses, sidebarIdleChildren, sidebarManualIntentOf, sidebarNodeIsIdleMembership,
-      sidebarNodeIsIdleReady, sidebarResourceTabStateOf, sidebarRootChildren, tabTreeDeps, trimAutoKeyMap,
+      sidebarNodeIsIdleReady, sidebarResourceTabStateOf, trimAutoKeyMap,
     });
   }
 
@@ -884,8 +884,8 @@
     frame.late.sidebarAutoCloseKeyIsActive = sidebarAutoCloseKeyIsActive;
     Object.assign(frame, {
       acquireSidebarTabClose, autoCloseCandidate, autoController, autoOpenCandidate, autoSidebarOwnershipHasCapacity, beginSidebarCloseVerification,
-      finishVerifiedSidebarClose, requestSidebarTabClose, sidebarActions, sidebarActionsCache, sidebarAutoCloseKeyIsActive, sidebarAutoControllerCache,
-      sidebarAutoFrame, sidebarAutoFrameCache, sidebarAutoOpenCapable, sidebarTabCloseInFlight,
+      finishVerifiedSidebarClose, requestSidebarTabClose, sidebarActions, sidebarAutoCloseKeyIsActive,
+      sidebarAutoOpenCapable, sidebarTabCloseInFlight,
       sidebarTabPresenceInInventory, verifyPendingSidebarCloses, waitForSidebarCloseLease,
     });
   }
