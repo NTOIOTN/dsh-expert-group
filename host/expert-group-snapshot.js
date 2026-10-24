@@ -464,10 +464,14 @@ function latestAttemptFailure(attempts) {
  * - finishedAt：最后一个 attempt 的 finishedAt；**仍在运行的分片恒为 null**——历史
  *   attempt 的完成时间不是当前这一轮的终点；
  * - lastActivityAt：manager 的 updatedAt（任何状态推进都会刷新它），缺失为 null；
- * - attemptCount/retryCount：attempts.length 与 max(0, length-1)；
+ * - attemptCount/retryCount：**两者语义不同**。attemptCount 统计总尝试数（attempts.length）；
+ *   retryCount 只统计**真实重试**（retryShard 追加 attempt、不增 task.round），由调用方按
+ *   「attempts.length − 本分片经历的轮次数（task.round）」算好传入。continuation 每个逻辑
+ *   轮次都会给每个分片追加一个 attempt 并递增 task.round（fanout/task-commands.js），
+ *   这类复用不是重试，因此不计入 retryCount——否则每复用一轮侧栏就会多出一个「重试」；
  * - failure：最新一次带 error 的 attempt 的受限摘要。
  */
-function projectShardTimeline(source, status, attempts, running) {
+function projectShardTimeline(source, status, attempts, running, retryCount) {
   const createdAt = numberOrNull(source?.createdAt);
   let startedAt = createdAt;
   for (const attempt of attempts) {
@@ -487,7 +491,8 @@ function projectShardTimeline(source, status, attempts, running) {
     durationMs: durationBetween(startedAt, finishedAt),
     lastActivityAt: numberOrNull(source?.updatedAt),
     attemptCount,
-    retryCount: Math.max(0, attemptCount - 1),
+    // 真实重试数由调用方按 attempts 与 task.round 的差算出（见函数注释），这里原样输出。
+    retryCount,
     failure: latestAttemptFailure(attempts),
   };
 }
@@ -514,7 +519,9 @@ function firstShardFailure(shards) {
  * - finishedAt 只给**终态**任务：优先 manager 的 settledAt；旧快照可能没有该字段，
  *   此时回退 updatedAt（manager 在结算时保证 updatedAt === settledAt，见 fanout.js 的
  *   aggregateTask）。非终态一律 null，绝不把「最后一次活动」伪装成完成时间；
- * - attemptCount/retryCount：所有 shard 的 attempt 总数与重试总数（分片内重试之和）；
+ * - attemptCount/retryCount：所有 shard 的 attempt 总数与**真实重试**总数（分片内重试之和）。
+ *   分片的 retryCount 已按 task.round 排除 continuation 复用轮次（见 projectShardTimeline），
+ *   这里只是求和，不再对同一份 attempts 二次推导；
  * - failure：首个失败 shard 的受限摘要。
  */
 function projectFanoutTimeline(source, status, shards) {
@@ -990,9 +997,21 @@ function projectShardNode(shard, inherited = {}) {
     ? latestAttempt?.status ?? "unknown"
     : normalizeStatus(managerStatus);
   const running = runningOf(source, status);
+  /**
+   * 真实重试数（与 continuation 轮次区分开，见 projectShardTimeline 注释）。
+   *
+   * 依据是父任务的 round：continuation 每轮 +1 且给每个分片各追加一个 attempt；
+   * retryShard 只追加 attempt、不增 round。因此「每个轮次基线一次尝试」，
+   * retryCount = attempts.length − max(1, min(attempts.length, rounds))：
+   * - rounds 缺失（旧快照）时默认 1，与改动前 max(0, length-1) 完全一致；
+   * - rounds 大于 attempts.length 时基线被钳到 attempts.length，重试数钳到 0，绝不出现负数。
+   */
+  const rounds = Math.max(1, numberOrNull(defaults?.round) ?? 1);
+  const baselineAttempts = Math.max(1, Math.min(attempts.length, rounds));
+  const retryCount = Math.max(0, attempts.length - baselineAttempts);
   // 时间线字段一次性算出：startedAt/finishedAt/durationMs/lastActivityAt/attemptCount/
   // retryCount/failure 全部由 attempts、createdAt、updatedAt 与状态推导（见 projectShardTimeline）。
-  const timeline = projectShardTimeline(source, status, attempts, running);
+  const timeline = projectShardTimeline(source, status, attempts, running, retryCount);
   // 分片用量（票据 25）：runtime 已按 childId 去重汇总时直接采用；直接调用本投影
   // （没有 runtime 参与）时从 attempts 的 usage 汇总同一口径，绝不补零。
   const explicitUsage = projectUsage(source?.usage);
@@ -1070,6 +1089,11 @@ function projectFanoutNode(task) {
     model: source?.model,
     reasoningEffort: source?.reasoningEffort,
     effort: source?.effort,
+    // 逻辑轮次：manager 快照恒给 round>=1（fanout/store.js），分片据此把 continuation 追加的
+    // attempt 从「重试」里排除；旧快照缺 round 时默认 1，退化为改动前的口径。
+    // 只接受安全整数且 >=1：numberOrNull 仅校验有限性，1.5 这类值会让基线变成小数，
+    // retryCount 随之出现 0.5 这种无法解释的「半次重试」；非整数一律按缺失（第 1 轮）处理。
+    round: Number.isSafeInteger(source?.round) && source.round >= 1 ? source.round : 1,
   }));
   const timeline = projectFanoutTimeline(source, status, shards);
   /**

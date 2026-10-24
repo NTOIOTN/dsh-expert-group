@@ -88,16 +88,32 @@ export function firstRejection(results) {
 /**
  * fan-out 分片身份一致性校验（**只用廉价记录，绝不冷读**）。
  *
- * 归属证明回答的是「这个 child 属于本 root 吗」；本函数回答的是更强的「它属于**本分片的这一次
+ * 归属证明回答的是「这个 child 属于本 root 吗」；本函数回答的是更强的「它属于**本分片的这些
  * attempt** 吗」。完整路径靠 `readSession` 的 header 证明前者，轻量路径没有这次读取，因此两种
  * 模式都用 `child_models` 记录自带的 fan-out 身份做**反证**：记录一旦声明了
- * fanoutParentTaskId / fanoutShardId / fanoutAttempt，就必须与当前父任务 / 分片 / attempt 一致，
+ * fanoutParentTaskId / fanoutShardId / fanoutAttempt，就必须与当前父任务 / 分片一致，
  * 否则返回 true（调用方把该 childId 清空），保证 fast 与 full 的归属结论一致、都 fail-closed。
+ *
+ * attempt 号的两种判定及其适用前提（oracle 复审）：
+ * - 号域成员判定只在记录**同时声明** fanoutParentTaskId 与 fanoutShardId 时成立：父任务与
+ *   分片声明把号域锁定到「本分片该 child 的 attempts」，此时成员关系才有归属含义；
+ * - 只声明 fanoutAttempt（或任一作用域字段缺失）的陈旧记录，其号域成员关系无法证明它属于
+ *   当前父任务 / 分片，必须回退精确比较（declaredAttempt !== attempt 即矛盾）。
  *
  * 只有「记录存在且与之矛盾」才算反证：完全没有记录的 child（例如由 live agent 的
  * header.parentSession 证明归属）不受影响，避免把可用的导航键误删。
+ *
+ * fanoutAttempt 的口径（continuation 合法复用同一 child）：
+ * child_models 里的 fanoutAttempt 记录的是 **child 创建时**的 attempt 号，只在创建 child 时
+ * 写一次（host/index-expert-tools-fanout.js）。continuation 会复用同一个 child 进入新的逻辑
+ * 轮次，于是该 child 的 attempt 号可以是 {1,2,…}（本分片 attempts 里出现的那些），而
+ * fanoutAttempt 仍是 1。若继续用「等于最新 attempt 号」做精确比较，第 2 轮起就会被误判成
+ * 身份矛盾、把导航键清空。因此在**作用域已声明**（见上）且号集合非空时，一致性口径是
+ * 「declaredAttempt 属于本分片该 child 的 attempt 号集合」（attemptNumbers），而不是「等于
+ * 传入的那一个 attempt 号」。号集合缺失 / 为空（没有 attempt 级证据）或作用域未声明时，
+ * 一律回退精确比较，保持既有 fail-closed 行为不变。
  */
-function fanoutIdentityContradicts(nonEmpty, record, childSnapshot, { parentTaskId, shardId, attempt }) {
+function fanoutIdentityContradicts(nonEmpty, record, childSnapshot, { parentTaskId, shardId, attempt, attemptNumbers }) {
   for (const source of [record, childSnapshot]) {
     if (source === null || source === undefined) continue;
     const declaredTask = nonEmpty(source.fanoutParentTaskId);
@@ -105,7 +121,17 @@ function fanoutIdentityContradicts(nonEmpty, record, childSnapshot, { parentTask
     const declaredShard = nonEmpty(source.fanoutShardId);
     if (declaredShard !== null && shardId !== null && declaredShard !== shardId) return true;
     const declaredAttempt = Number.isSafeInteger(source.fanoutAttempt) ? source.fanoutAttempt : null;
-    if (declaredAttempt !== null && attempt !== null && declaredAttempt !== attempt) return true;
+    if (declaredAttempt === null) continue;
+    // 号域成员判定的前提：该记录同时声明了父任务与分片，号集合才被锁定到「本分片该 child」。
+    // 只声明 fanoutAttempt 的陈旧记录无法用成员关系证明归属（号可能来自别的父任务/分片），
+    // 必须回退精确比较。作用域声明存在时仍按集合判定；集合 null/空（没有 attempt 级证据）
+    // 同样回退精确比较，保持既有 fail-closed 行为。
+    const declaresScope = declaredTask !== null && declaredShard !== null;
+    if (declaresScope && attemptNumbers !== null && attemptNumbers !== undefined && attemptNumbers.size > 0) {
+      if (!attemptNumbers.has(declaredAttempt)) return true;
+    } else if (attempt !== null && declaredAttempt !== attempt) {
+      return true;
+    }
   }
   return false;
 }
@@ -315,9 +341,26 @@ async function projectFanoutShard(shard, task, deps) {
   const proofs = new Map(proofIds.map((childId, index) => [childId, settled[index].value]));
   const navigationProof = navigationChildId === null ? undefined : proofs.get(navigationChildId);
   /**
+   * childId → 本分片 attempts 中出现的 attempt 号集合（身份反证的「合法号域」）。
+   *
+   * 只收 Number.isSafeInteger(attempt.attempt) 且 childId 非空的行：缺少 attempt 号的记录
+   * 不能证明任何号域，直接跳过。continuation 复用同一 child 时，同一 childId 会出现在多个
+   * attempt 号上，集合因此可能有多个成员；导航 child 与逐 attempt 两处反证共用这份集合，
+   * 保证「声明号属于本分片该 child 的号域」这一口径一致。
+   */
+  const attemptNumbersByChildId = new Map();
+  for (const attempt of attempts) {
+    const childId = firstText(attempt?.childId);
+    if (childId === null) continue;
+    if (!Number.isSafeInteger(attempt?.attempt)) continue;
+    const numbers = attemptNumbersByChildId.get(childId) ?? new Set();
+    numbers.add(attempt.attempt);
+    attemptNumbersByChildId.set(childId, numbers);
+  }
+  /**
    * 廉价反证（两种模式都执行，保证 fast 与 full 的归属结论一致、且都 fail-closed）：
-   * 记录里声明了别的父任务 / 别的分片 / 别的 attempt 时，即使归属证明还算通过，
-   * 也必须把该 childId 从输出副本清空——否则本行会挂上不属于它的会话。
+   * 记录里声明了别的父任务 / 别的分片，或声明的 attempt 号不在本分片该 child 的号域内时，
+   * 即使归属证明还算通过，也必须把该 childId 从输出副本清空——否则本行会挂上不属于它的会话。
    * 反证只用已经在手的持久化记录与 recovery 记录，不产生任何额外 IO。
    */
   const contradicts = (childId, attemptNumber) => {
@@ -326,6 +369,7 @@ async function projectFanoutShard(shard, task, deps) {
       parentTaskId,
       shardId,
       attempt: Number.isSafeInteger(attemptNumber) ? attemptNumber : null,
+      attemptNumbers: attemptNumbersByChildId.get(childId) ?? null,
     });
   };
   const ownedChild = navigationProof?.owned === true

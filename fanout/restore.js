@@ -632,6 +632,38 @@ function resumeRestoredShardAttempts(deps, task, taskRole, resume, rolesToSchedu
     }
 }
 
+/**
+ * 恢复入口的 round 不变量收口（oracle 复审）。
+ *
+ * 不变量：正常状态下 continuation 每轮必然给**每个**分片各追加一个 attempt，并同时把
+ * task.round +1（fanout/task-commands.js），因此恒有
+ * round <= min(各分片 attempts.length)。每个分片至少有 1 条 attempt（commitRestorePlan
+ * 构造时对空 attempts 缺省补 [{ attempt: 1 }]），所以这个上界至少为 1。
+ *
+ * 为什么要收口：快照可能被裁剪或损坏（人工编辑、旧版本写入、部分落盘）而留下
+ * round 大于 attempt 数的账面值。恢复后只要发生一次真实 retryShard，attempts.length
+ * 就会恰好追平这个虚高 round；投影端
+ * （host/expert-group-snapshot.js 的 retryCount = attempts.length − max(1, min(attempts.length, round))）
+ * 于是把这次真实重试静默漏计，侧栏少显示一次重试。
+ *
+ * 为什么不整份拒绝：拒绝会让用户任务永久不可恢复（每次启动都被同一份坏快照挡下）。
+ * 把 round 钳到可证明上界是保守且自洽的恢复——不变量本身来自真实写入路径，钳位只是
+ * 丢弃无法被 attempt 历史支持的那部分轮次。钳位只影响逻辑轮次的账面值：attempt 编号
+ * 仍来自 last.attempt + 1，attempt 历史与身份字段一律不改写。
+ *
+ * @param {object} task - 已重建（含 shards 与 attempts）的任务对象，就地修改 round。
+ */
+function clampRestoredRound(task) {
+  const headroom = task.shards.reduce(
+    (lowest, shard) => Math.min(lowest, shard.attempts.length),
+    Number.POSITIVE_INFINITY,
+  );
+  // 空 shards（理论上已在上游拒绝）不产生可证明上界，保持原值；否则钳到最小值。
+  if (Number.isSafeInteger(headroom) && task.round > headroom) {
+    task.round = headroom;
+  }
+}
+
 export function commitRestorePlan(deps, plan) {
   const {
     // 已校验的快照输入与恢复决定。
@@ -812,6 +844,8 @@ export function commitRestorePlan(deps, plan) {
         return shard;
       }),
     };
+    // round 不变量收口：虚高轮次会让随后的真实 retry 在投影端被静默漏计（详见 clampRestoredRound）。
+    clampRestoredRound(task);
     // resume 语义：被中断的 running shard 只有换一个新 attempt 才可能继续执行——
     // 原来的 attempt 已经写成 interrupted 终态，调度器只派发 queued attempt。
     // 这里复用 retryShard 的语义（追加 attempt、保留历史、清取消标记），但只在

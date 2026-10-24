@@ -5145,7 +5145,7 @@ react.createElement("div",{className:"deg_expert_group_idle_title_line"},...idle
 open?react.createElement("div",{className:"deg_expert_group_children deg_expert_group_idle_children",role:"group"},members.map((node,index)=>node.kind==="fanout"?renderFanout(ctx,node,index,{level:meta.level+1,posinset:index+1,setsize:members.length}):renderExpert(ctx,node,index,rootSessionId,{level:meta.level+1,posinset:index+1,setsize:members.length}))):null);
 };
 const renderShard=(ctx,task,shard,index,treeMeta)=>{
-const{react,primitives,rootSessionId,expand,runAction,isActionPending}=ctx;
+const{react,primitives,rootSessionId,runAction,isActionPending}=ctx;
 const shardKey=text(shard.shardId,"shard-"+index);
 const latestChildId=text(shard.childId,null);
 const status=statusOf(shard);
@@ -5167,13 +5167,10 @@ const showRetry=retryCapability===null?RETRY_STATUSES.has(status):retryCapabilit
 if(showCancel)actions.push(ctx.a.renderAction("取消分片 "+shardKey,"IconStopFillRegular",()=>runAction({action:"fanout-cancel-shard",parentTaskId:task.parentTaskId,shardId:shardKey},cancelKey,true,"确认取消分片 "+shardKey+"？"),isActionPending(cancelKey)));
 if(showRetry)actions.push(ctx.a.renderAction("重试分片 "+shardKey,"IconRefreshOutlineRegular",()=>runAction({action:"fanout-retry-shard",parentTaskId:task.parentTaskId,shardId:shardKey},retryKey,false,""),isActionPending(retryKey)));
 const runtimeStatus=ctx.runtimeStatusOfNode(shardNode,rootSessionId,latestChildId);
-const shardOpen=expand(shardNode);
-const timelineKey="shard:"+rootSessionId+":"+task.parentTaskId+":"+shardKey;
 const shardStructured=ctx.a.renderStructuredBlock(shard.structured,shard.outputSchemaRequested,{kind:"shard"});
-const shardTimeline=shardOpen?ctx.a.renderAttemptTimeline(shard,{key:timelineKey}):null;
-const shardFooter=shardStructured===null&&shardTimeline===null
+const shardFooter=shardStructured===null
 ?null
-:react.createElement("div",{className:"deg_expert_group_shard_extra"},shardStructured,shardTimeline);
+:react.createElement("div",{className:"deg_expert_group_shard_extra"},shardStructured);
 const meta=treeMeta!==undefined&&treeMeta!==null
 ?treeMeta
 :{level:3,posinset:index+1,setsize:index+1};
@@ -5186,10 +5183,10 @@ role:"treeitem",
 "aria-setsize":meta.setsize,
 "data-shard-id":shardKey,
 "data-status":runtimeStatus,
-"data-expanded":shardOpen,
+"data-expanded":true,
 },
 statusIcon(react,primitives,runtimeStatus),
-ctx.a.renderChevron(shardNode,shardOpen),
+react.createElement("span",{className:"deg_expert_group_chevron_placeholder","aria-hidden":"true"}),
 ctx.b.renderRowMain(shardNode,{
 sessionId:latestChildId,
 parentId:rootSessionId,

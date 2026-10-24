@@ -128,12 +128,14 @@
   };
 
   const renderShard = (ctx, task, shard, index, treeMeta) => {
-    const { react, primitives, rootSessionId, expand, runAction, isActionPending } = ctx;
+    // 注意：这里刻意不读 ctx.expand。分片行不再有可折叠内容（见下方注释），
+    // 展开存储对分片不再有渲染期副作用。
+    const { react, primitives, rootSessionId, runAction, isActionPending } = ctx;
     const shardKey = text(shard.shardId, "shard-" + index);
     const latestChildId = text(shard.childId, null);
     const status = statusOf(shard);
-    // shardId 只在 parentTaskId 内唯一；折叠存储必须使用复合 id，避免不同 fan-out
-    // 中同名 shard 互相覆盖。最新 attempt childId 仍是唯一导航目标。
+    // shardId 只在 parentTaskId 内唯一；shardNode.id 仍使用 parentTaskId:shardId 复合键，
+    // 避免不同 fan-out 中同名分片共用同一节点身份。最新 attempt childId 仍是唯一导航目标。
     // 第一行文本：有任务名称时是"分片代号  任务名称"，没有名称的旧数据只有分片代号。
     // 拼接结果作为完整文本进入 renderRowMain，并以 oneLine:false 走分片专用的可换行
     // 第一行样式：渲染层不再做 grapheme 截断，分片代号因此不会挤掉任务名称的显示额度。
@@ -162,19 +164,14 @@
     // 展示状态用规范运行状态，证据与行内圆点同源（最新 attempt 的 childId 查目录项）；
     // status 仍保留给取消/重试判定（管理语义不变）。
     const runtimeStatus = ctx.runtimeStatusOfNode(shardNode, rootSessionId, latestChildId);
-    // 分片的展开状态复用既有 chevron 机制：默认规则沿用 defaultExpanded（运行/等待/失败展开，
-    // 空闲/完成/取消收起），用户的手动选择由 createExpansionStore 持久化并优先。
-    // shardNode.id 是 parentTaskId:shardId 复合键，因此不同 fan-out 的同名分片互不覆盖。
-    const shardOpen = expand(shardNode);
-    // 键含 rootSessionId：同一实例切换 root 后，不同会话的同名分片绝不共享展开状态。
-    const timelineKey = "shard:" + rootSessionId + ":" + task.parentTaskId + ":" + shardKey;
-    // 票据 30：分片详情先展示结构化结果（最新 attempt 的投影），再展示 attempt 时间线；
-    // 两者都缺时 footer 保持 null，分片 DOM 与改动前逐字一致。
+    // 分片不再展示 attempt 时间线（用户要求）：分片行只保留与普通叶子子代理行一致的信息
+    // （状态点 + 箭头占位 + 任务名 + 行尾双箭头 + 用量摘要 + 结构化结果），
+    // 因此这里不再读取展开状态、也不再生成 timelineKey。
+    // 结构化结果仍常驻：它不是「多出来的信息」，普通专家行同样有，缺省时 footer 保持 null。
     const shardStructured = ctx.a.renderStructuredBlock(shard.structured, shard.outputSchemaRequested, { kind: "shard" });
-    const shardTimeline = shardOpen ? ctx.a.renderAttemptTimeline(shard, { key: timelineKey }) : null;
-    const shardFooter = shardStructured === null && shardTimeline === null
+    const shardFooter = shardStructured === null
       ? null
-      : react.createElement("div", { className: "deg_expert_group_shard_extra" }, shardStructured, shardTimeline);
+      : react.createElement("div", { className: "deg_expert_group_shard_extra" }, shardStructured);
     // 分片是 fan-out 父任务下的下一级树项（顶层 fan-out 时为第 3 层）。
     // 位置/总数只按**当前可见分片**计算（过滤后集合）。
     const meta = treeMeta !== undefined && treeMeta !== null
@@ -189,15 +186,19 @@
       "aria-setsize": meta.setsize,
       "data-shard-id": shardKey,
       "data-status": runtimeStatus,
-      "data-expanded": shardOpen,
+      // data-expanded 恒为 true：分片行永远完整显示，同时避免 CSS
+      // .deg_expert_group_shard[data-expanded=false]{min-height:24px} 意外命中而改变行高。
+      "data-expanded": true,
     },
       statusIcon(react, primitives, runtimeStatus),
-      ctx.a.renderChevron(shardNode, shardOpen),
+      // 折叠箭头改为占位 span，与 renderExpert 的叶子分支完全一致：
+      // 分片已经没有可折叠内容，绝不留下点了没有变化的按钮。
+      react.createElement("span", { className: "deg_expert_group_chevron_placeholder", "aria-hidden": "true" }),
       ctx.b.renderRowMain(shardNode, {
         sessionId: latestChildId,
         parentId: rootSessionId,
         oneLine: false,
-        // 用量摘要条常驻（用时/tok/s/tok/命中/context + 异常提示），attempt 时间线只在展开时渲染。
+        // 用量摘要条常驻（用时/tok/s/tok/命中/context + 异常提示）；attempt 时间线已移除。
         metrics: ctx.b.renderMetrics(shard, { kind: "shard", runtimeStatus, sessionId: latestChildId, sessionIds: [latestChildId] }),
         footer: shardFooter,
       }),
@@ -227,8 +228,9 @@
     const runtimeStatus = runtimeStatusOf(task, null);
     // 父任务的用量摘要条（用时/tok/s/tok/命中；无单一会话因此没有 context）与标题同列纵向排列：
     // 标题仍可点击导航，摘要条不参与导航、不拦截点击。
-    // 用户精简侧栏后，父任务不再显示跨分片的聚合 attempt 时间线；分片展开后仍可查看
-    // 该分片自己的 attempt 历史（见 renderShard 的 shardTimeline），渐进披露语义不变。
+    // 用户精简侧栏后，父任务不再显示跨分片的聚合 attempt 时间线；
+    // 分片行同样不再展示自己的 attempt 历史（用户要求，见 renderShard），
+    // 因此整棵 fan-out 子树里都不存在 attempt 时间线节点。
     // 树语义：fan-out 头部是第 2 层 treeitem，分片容器是它的 group（位置只算可见分片）。
     const meta = treeMeta !== undefined && treeMeta !== null
       ? treeMeta
