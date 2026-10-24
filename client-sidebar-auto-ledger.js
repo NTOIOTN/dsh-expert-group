@@ -436,6 +436,11 @@
       return {
         origin,
         tabId: typeof entry.tabId === "string" && entry.tabId.length > 0 ? entry.tabId : null,
+        /**
+         * 写入原因（manual-stale-auto / manual-stale-origin / manual-unproven-open 等）：相位对账据此
+         * 区分「用户手动意图」与「安全降级的 manual」——后者 tabId 不可证明，绝不跨相位接管。
+         */
+        reason: entry.reason ?? null,
       };
     } catch {
       return null;

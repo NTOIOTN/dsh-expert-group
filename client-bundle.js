@@ -1777,6 +1777,7 @@ if(entry===undefined)return null;
 return{
 origin,
 tabId:typeof entry.tabId==="string"&&entry.tabId.length>0?entry.tabId:null,
+reason:entry.reason??null,
 };
 }catch{
 return null;
@@ -5718,7 +5719,8 @@ SUBAGENT_CHAT_KIND,sidebarTabCloseKey,sidebarTabKey,
 const LEDGER_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
 const LEDGER=global[LEDGER_SYMBOL]||{};
 const{
-SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,deleteSidebarAutoOwnership,readSidebarAutoOwnershipEntry,
+SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,deleteSidebarAutoOwnership,
+readSidebarAutoOwnershipEntry,sidebarAutoOriginEntry,
 recordSidebarAutoDecision,recordSidebarAutoDiag,sidebarAutoKeyDigest,
 sidebarAutoOriginTabIdOf,sidebarAutoOriginWrittenAtOf,sidebarOwnershipAcceptsNewAuto,
 writeSidebarAutoOwnership,
@@ -5739,7 +5741,7 @@ return sidebarTabCloseLeaseOf(tabId)!==null;
 }
 function acquireSidebarTabClose(tabId){
 const key=sidebarTabCloseKeyOf(tabId);
-if(sharedSidebarTabCloseInFlight.has(key)===true)return null;
+if(sharedSidebarTabCloseInFlight.has(key))return null;
 let settleWaiters=null;
 const settled=new Promise((resolve)=>{settleWaiters=resolve;});
 const token={
@@ -5755,7 +5757,7 @@ release:null,
 sharedSidebarTabCloseInFlight.set(key,token);
 let released=false;
 const release=(outcome)=>{
-if(released===true)return;
+if(released)return;
 released=true;
 const reason=closeSettleReason(outcome);
 token.result=reason;
@@ -5770,7 +5772,7 @@ token.release=release;
 return{
 token,
 hold(state,holdUntil){
-if(released===true)return;
+if(released)return;
 token.state=state;
 token.holdUntil=holdUntil;
 },
@@ -5800,7 +5802,7 @@ return new Promise((resolve)=>{
 let settled=false;
 let timer=null;
 const finish=(outcome)=>{
-if(settled===true)return;
+if(settled)return;
 settled=true;
 if(timer!==null){
 try{globalThis.clearTimeout?.(timer);}catch{/* 清理失败不影响结果。 */}
@@ -5827,7 +5829,7 @@ return new Promise((resolve)=>{
 let done=false;
 let timer=null;
 const finish=(value)=>{
-if(done===true)return;
+if(done)return;
 done=true;
 if(timer!==null){
 try{globalThis.clearTimeout?.(timer);}catch{/* 同上。 */}
@@ -5846,17 +5848,17 @@ sidebarTabCloseKeyOf,sidebarTabCloseLeaseOf,sidebarTabCloseInFlight,acquireSideb
 }
 function createSidebarAutoBookkeeping(scope){
 const{
-clearAutoCloseBudget,rootSessionId,sidebarAutoCloseCooldownsRef,
-sidebarAutoCloseVerificationsRef,sidebarAutoOriginRef,sidebarAutoReservationRef,
-sidebarAutoSuppressedRef,sidebarResourceTabStateOf,sidebarSessionId,
-sidebarTabOpeningRef,sidebarTabPendingRef,sidebarTabRecordsRef,
+clearAutoCloseBudget,idleSidebarResourceAddresses,rootSessionId,runningSidebarResourceAddresses,
+sidebarAutoCloseCooldownsRef,sidebarAutoCloseVerificationsRef,sidebarAutoOriginRef,sidebarAutoReservationRef,
+sidebarAutoRunPhaseRef,sidebarAutoSuppressedRef,sidebarIdleChildren,sidebarResourceTabStateOf,sidebarSessionId,
+sidebarTabOpeningRef,sidebarTabPendingRef,sidebarTabRecordsRef,trimAutoKeyMap,
 }=scope;
 function sidebarAutoCloseKeyIsActive(key){
-if(sidebarTabPendingRef.current.has(key)===true)return true;
-if(sidebarTabOpeningRef.current.has(key)===true)return true;
-if(sidebarAutoReservationRef.current.has(key)===true)return true;
-if(sidebarAutoCloseVerificationsRef.current.has(key)===true)return true;
-if(sidebarAutoCloseCooldownsRef.current.has(key)===true)return true;
+if(sidebarTabPendingRef.current.has(key))return true;
+if(sidebarTabOpeningRef.current.has(key))return true;
+if(sidebarAutoReservationRef.current.has(key))return true;
+if(sidebarAutoCloseVerificationsRef.current.has(key))return true;
+if(sidebarAutoCloseCooldownsRef.current.has(key))return true;
 const record=sidebarTabRecordsRef.current.get(key);
 return record!==undefined
 &&record.sessionId===sidebarSessionId
@@ -5878,8 +5880,8 @@ for(const map of[sidebarAutoOriginRef.current,sidebarAutoSuppressedRef.current])
 for(const[key,entry]of map){
 if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId)continue;
 if(key===actingKey)continue;
-if(known.has(entry.address)===true)continue;
-if(sidebarAutoCloseKeyIsActive(key)===true)continue;
+if(known.has(entry.address))continue;
+if(sidebarAutoCloseKeyIsActive(key))continue;
 map.delete(key);
 clearAutoCloseBudget(key);
 }
@@ -5887,8 +5889,8 @@ clearAutoCloseBudget(key);
 for(const[key,entry]of sidebarAutoReservationRef.current){
 if(entry.sessionId!==sidebarSessionId||entry.rootSessionId!==rootSessionId)continue;
 if(key===actingKey)continue;
-if(known.has(entry.address)===true)continue;
-if(sidebarTabPendingRef.current.has(key)===true)continue;
+if(known.has(entry.address))continue;
+if(sidebarTabPendingRef.current.has(key))continue;
 sidebarAutoReservationRef.current.delete(key);
 }
 }
@@ -5907,8 +5909,8 @@ recordSidebarAutoDiag({kind:"ownership",event:"delete",reason:"placeholder-forei
 continue;
 }
 if(age<SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS)continue;
-if(sidebarTabPendingRef.current.has(key)===true)continue;
-if(sidebarTabOpeningRef.current.has(key)===true)continue;
+if(sidebarTabPendingRef.current.has(key))continue;
+if(sidebarTabOpeningRef.current.has(key))continue;
 const state=sidebarResourceTabStateOf(entry.address);
 if(state.readable!==true){
 recordSidebarAutoDiag({kind:"ownership",event:"keep",reason:"placeholder-unreadable",key:sidebarAutoKeyDigest(key)});
@@ -5919,7 +5921,7 @@ recordSidebarAutoDiag({
 kind:"ownership",
 event:"delete",
 reason:state.tabId===null
-?(running!==null&&running!==undefined&&running.has(entry.address)===true
+?(running?.has(entry.address)
 ?"placeholder-retry"
 :"placeholder-released")
 :"placeholder-superseded",
@@ -5927,15 +5929,41 @@ key:sidebarAutoKeyDigest(key),
 });
 }
 }
-function clearManualSuppressionOfIdleResources(idle){
-if(idle===null||idle===undefined||idle.size===0)return;
-for(const address of idle){
+function clearManualSuppressionOfIdleResources(){
+const suppressed=sidebarAutoSuppressedRef.current;
+for(const[idle,addresses]of[[0,runningSidebarResourceAddresses()],[1,idleSidebarResourceAddresses(sidebarIdleChildren())]]){
+for(const address of addresses){
 const key=sidebarTabKey(sidebarSessionId,rootSessionId,address);
-if(sidebarAutoSuppressedRef.current.has(key)===true)sidebarAutoSuppressedRef.current.delete(key);
 const persisted=readSidebarAutoOwnershipEntry(sidebarSessionId,rootSessionId,address,{quiet:true});
-if(persisted===null||persisted.origin!==SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL)continue;
-deleteSidebarAutoOwnership(sidebarSessionId,rootSessionId,address,"resource-idle",{manual:true});
+const manual=persisted?.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL;
+if(idle===1?(!manual&&!suppressed.has(key)):!manual)continue;
+const state=sidebarResourceTabStateOf(address);
+if(!state.readable)continue;
+const idleMark=suppressed.get(key)?.idle;
+if(idle===1){
+if(state.tabId!==null){
+if(manual)suppressed.set(key,{sessionId:sidebarSessionId,rootSessionId,address,idle:state.tabId});
+continue;
 }
+suppressed.delete(key);
+if(manual)deleteSidebarAutoOwnership(sidebarSessionId,rootSessionId,address,"new-run",{manual:true});
+continue;
+}
+if(state.tabId===null){
+if(idleMark!==undefined)delete suppressed.get(key).idle;
+continue;
+}
+const wasIdle=idleMark===state.tabId;
+const reason=persisted.reason;
+if(!(reason==="manual-open"||(wasIdle&&(reason==="manual-takeover"||reason==="manual-close"))))continue;
+if(writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,address,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO,"auto-rearm",state.tabId)!==true)continue;
+suppressed.delete(key);
+sidebarAutoOriginRef.current.set(key,sidebarAutoOriginEntry(sidebarSessionId,rootSessionId,address,state.tabId));
+const record=sidebarTabRecordsRef.current.get(key);
+if(record?.tabId===state.tabId)record.origin=SIDEBAR_TAB_ORIGIN_AUTO;
+}
+}
+trimAutoKeyMap(suppressed);
 }
 return Object.freeze({
 sidebarAutoCloseKeyIsActive,autoSidebarOwnershipHasCapacity,cleanupAutoSidebarKeys,sweepAutoOpenPlaceholders,clearManualSuppressionOfIdleResources,
@@ -5980,20 +6008,20 @@ const scopedRecord=record!==undefined
 :undefined;
 const sameTab=scopedRecord!==undefined&&scopedRecord.tabId===entry.tabId;
 cancelPendingSidebarSplitOfClose(key,entry.splitIntentToken);
-if(sameTab===true){
+if(sameTab){
 records.delete(key);
 if(entry.attemptToken===null||entry.attemptToken===undefined)clearAutoCloseAttempt(key);
 else settleAutoCloseAttempt(key,{kind:"close",attemptToken:entry.attemptToken});
 sidebarAutoCloseCooldownsRef.current.delete(key);
 sidebarAutoOriginRef.current.delete(key);
-if(entry.manual===true&&entry.address!==null&&entry.address!==undefined){
+if(entry.manual&&entry.address!=null){
 sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:entry.address});
 trimAutoKeyMap(sidebarAutoSuppressedRef.current);
 writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,entry.address,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
-}else if(entry.address!==null&&entry.address!==undefined){
+}else if(entry.address!=null){
 deleteSidebarAutoOwnership(sidebarSessionId,rootSessionId,entry.address,"verified-closed");
 }
-}else if(entry.attemptToken!==null&&entry.attemptToken!==undefined){
+}else if(entry.attemptToken!=null){
 settleAutoCloseAttempt(key,{kind:"close",attemptToken:entry.attemptToken});
 }
 sidebarAutoCloseVerificationsRef.current.delete(key);
@@ -6050,7 +6078,7 @@ lease=acquireSidebarTabClose(tabId);
 if(lease===null)return{status:"contended",closed:false};
 }
 const preflight=sidebarTabPresenceInInventory(tabId,verify?.address??null);
-const manualWithoutEvidence=preflight==="unreadable"&&verify!==null&&verify.manual===true;
+const manualWithoutEvidence=preflight==="unreadable"&&verify?.manual===true;
 if(preflight==="unreadable"&&manualWithoutEvidence!==true){
 lease.release("failed");
 return{status:"unreadable",closed:false};
@@ -6072,7 +6100,7 @@ if(outcome==="timeout"){
 lease.hold("quarantined",Date.now()+SIDEBAR_TAB_CLOSE_LATE_QUARANTINE_MS);
 return{status:"timeout",closed:false};
 }
-if(manualWithoutEvidence===true){
+if(manualWithoutEvidence){
 lease.release("closed");
 return{status:"closed",closed:true};
 }
@@ -6105,7 +6133,7 @@ const{autoSidebarOwnershipHasCapacity}=bookkeeping;
 function sidebarAutoOpenCapable(){
 return openSidebarResource!==null
 &&closeSidebarResource!==null
-&&(readActiveSidebarResource!==null||sidebarOpenTabsAvailable===true)
+&&(readActiveSidebarResource!==null||sidebarOpenTabsAvailable)
 &&typeof primitives?.IconChevronLeftOutlineRegular==="function";
 }
 function autoCloseCandidate(running){
@@ -6139,7 +6167,7 @@ continue;
 }
 }
 }
-if(runningNow===true){
+if(runningNow){
 if(attempts.has(key)
 ||sidebarAutoCloseCooldownsRef.current.has(key)
 ||sidebarAutoCloseVerificationsRef.current.has(key)){
@@ -6159,10 +6187,10 @@ origin.delete(key);
 clearAutoCloseAttempt(key);
 continue;
 }
-if(sidebarTabCloseInFlight(scopedRecord.tabId)===true)continue;
+if(sidebarTabCloseInFlight(scopedRecord.tabId))continue;
 const recordPresence=sidebarTabPresenceInInventory(scopedRecord.tabId,entry.address);
 const recordMissing=recordPresence==="absent"||recordPresence==="recycled";
-if(recordMissing===true){
+if(recordMissing){
 if(sampleAutoTabMisses(key,scopedRecord.tabId,true)<SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS)continue;
 }else if(recordPresence==="present"){
 sampleAutoTabMisses(key,scopedRecord.tabId,false);
@@ -6188,11 +6216,11 @@ origin.delete(key);
 clearAutoCloseAttempt(key);
 continue;
 }
-if(sidebarTabPendingRef.current.has(key)===true)continue;
-if(sidebarAutoFailedKeysRef.current.has(key)===true)continue;
+if(sidebarTabPendingRef.current.has(key))continue;
+if(sidebarAutoFailedKeysRef.current.has(key))continue;
 if(sidebarManualIntentOf(key)!==undefined)continue;
-if(sidebarAutoCloseVerificationsRef.current.has(key)===true)continue;
-if(autoCloseCooldownActive(key)===true)continue;
+if(sidebarAutoCloseVerificationsRef.current.has(key))continue;
+if(autoCloseCooldownActive(key))continue;
 releaseExpiredAutoCloseCooldown(key);
 const used=attempts.get(key)??0;
 if(used>=SIDEBAR_AUTO_CLOSE_MAX_ATTEMPTS){
@@ -6217,20 +6245,20 @@ const records=sidebarTabRecordsRef.current;
 const openings=sidebarTabOpeningRef.current;
 for(const address of running){
 const key=sidebarTabKey(sidebarSessionId,rootSessionId,address);
-if(sidebarAutoFailedKeysRef.current.has(key)===true)continue;
-if(suppressed.has(key)===true)continue;
+if(sidebarAutoFailedKeysRef.current.has(key))continue;
+if(suppressed.has(key))continue;
 const persistedForOpen=readSidebarAutoOwnershipEntry(sidebarSessionId,rootSessionId,address,{quiet:true});
 if(persistedForOpen!==null&&persistedForOpen.origin===SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL){
 recordSidebarAutoDecision("open",{key,kind:"open"},"skip","persisted-manual");
 continue;
 }
-if(origin.has(key)===true)continue;
+if(origin.has(key))continue;
 if(autoSidebarOwnershipHasCapacity(key,address)!==true){
 recordSidebarAutoDecision("open",{key,kind:"open"},"skip","owner-capacity");
 continue;
 }
-if(reservations.has(key)===true)continue;
-if(sidebarTabPendingRef.current.has(key)===true)continue;
+if(reservations.has(key))continue;
+if(sidebarTabPendingRef.current.has(key))continue;
 if(sidebarManualIntentOf(key)!==undefined)continue;
 const record=records.get(key);
 if(record!==undefined&&record.sessionId===sidebarSessionId&&record.rootSessionId===rootSessionId)continue;
@@ -6239,7 +6267,7 @@ if(opening!==undefined&&opening.sessionId===sidebarSessionId&&opening.rootSessio
 const state=sidebarResourceTabStateOf(address);
 if(state.readable!==true)continue;
 if(state.tabId!==null)continue;
-if(sidebarActiveResourceMatches(address)===true)continue;
+if(sidebarActiveResourceMatches(address))continue;
 const epoch=sidebarAutoEpochRef.current;
 reservations.set(key,{sessionId:sidebarSessionId,rootSessionId,address,epoch});
 trimAutoKeyMap(reservations);
@@ -6327,7 +6355,6 @@ const known=knownSidebarResourceAddresses();
 const running=runningSidebarResourceAddresses();
 const enabled=autoOpenEnabled();
 sweepAutoOpenPlaceholders(running);
-clearManualSuppressionOfIdleResources(idleSidebarResourceAddresses(sidebarIdleChildren()));
 let candidate=null;
 if(enabled===true&&sidebarAutoBusyRef.current!==true){
 candidate=autoCloseCandidate(running)??autoOpenCandidate(running);
@@ -6433,6 +6460,7 @@ clearAutoCloseAttempt(key);
 }
 function syncSidebarTabs(){
 if(sidebarAutoCascadeRef.current!==true)sidebarAutoFailedKeysRef.current.clear();
+clearManualSuppressionOfIdleResources();
 syncSidebarTabRecords();
 verifyPendingSidebarCloses();
 const autoNow=autoOpenEnabled();
@@ -10214,7 +10242,7 @@ resourceAddress,
 recordOrigin===SIDEBAR_TAB_ORIGIN_AUTO?SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO:SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,
 recordOrigin===SIDEBAR_TAB_ORIGIN_AUTO
 ?(declaredOrigin===SIDEBAR_TAB_ORIGIN_AUTO?"auto-open":"auto-adopt")
-:(manualIntentOpen===true
+:(manualIntentOpen===true||declaredOrigin===SIDEBAR_TAB_ORIGIN_MANUAL
 ?"manual-open"
 :(persistedStaleAuto===true
 ?"manual-stale-auto"

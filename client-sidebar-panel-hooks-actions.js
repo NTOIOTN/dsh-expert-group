@@ -364,7 +364,7 @@
          *   或因果证明成立却在途期间观察到了别的写入者——落地到的这个 tab 无法与「用户自己打开的
          *   同一个资源」区分，按安全侧落 manual（缺陷 1）。
          */
-        : (manualIntentOpen === true
+        : (manualIntentOpen === true || declaredOrigin === SIDEBAR_TAB_ORIGIN_MANUAL
           ? "manual-open"
           : (persistedStaleAuto === true
             ? "manual-stale-auto"

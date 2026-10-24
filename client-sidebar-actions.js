@@ -144,12 +144,6 @@
        * （与下面的记账清理同一条边界）。放在候选选择之前，被回收的容量当轮就能重新用上。
        */
       sweepAutoOpenPlaceholders(running);
-      /**
-       * manual 抑制的清除只由「明确空闲」驱动，且与 Auto 开关无关（与上面的记账清理同一条边界：
-       * 它只维护本插件自己的标记，绝不触碰宿主）。先清再选候选：清掉之后这一轮的开候选判据读到的
-       * 就是最新状态；空闲地址本来就不在 running 集合里，因此这一步不会为本次运行重新打开任何 tab。
-       */
-      clearManualSuppressionOfIdleResources(idleSidebarResourceAddresses(sidebarIdleChildren()));
       let candidate = null;
       if (enabled === true && sidebarAutoBusyRef.current !== true) {
         candidate = autoCloseCandidate(running) ?? autoOpenCandidate(running);
@@ -339,6 +333,12 @@
        * 只是同一批微任务里的推进，不构成「宿主状态可能已经改变」的新证据。
        */
       if (sidebarAutoCascadeRef.current !== true) sidebarAutoFailedKeysRef.current.clear();
+      /**
+       * 手动归属与运行相位对账（用户规则：manual 只在偏离相位正常状态时有效）必须**早于**记录同步：
+       * 收敛出的 auto 归属要在同一次同步里被收养链路认领（否则这次同步仍按 manual 处理，收回要再等
+       * 一轮）。顺序即判据，不得后移。
+       */
+      clearManualSuppressionOfIdleResources();
       syncSidebarTabRecords();
       // 关闭请求的验证链先跑：上一轮 close 的验证结果必须先收口，候选选择才按真实归属推进。
       verifyPendingSidebarCloses();

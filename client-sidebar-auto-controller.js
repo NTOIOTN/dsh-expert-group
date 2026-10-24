@@ -47,7 +47,8 @@
   const LEDGER_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
   const LEDGER = global[LEDGER_SYMBOL] || {};
   const {
-    SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, deleteSidebarAutoOwnership, readSidebarAutoOwnershipEntry,
+    SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, deleteSidebarAutoOwnership,
+    readSidebarAutoOwnershipEntry, sidebarAutoOriginEntry,
     recordSidebarAutoDecision, recordSidebarAutoDiag, sidebarAutoKeyDigest,
     sidebarAutoOriginTabIdOf, sidebarAutoOriginWrittenAtOf, sidebarOwnershipAcceptsNewAuto,
     writeSidebarAutoOwnership,
@@ -76,7 +77,7 @@
     }
     function acquireSidebarTabClose(tabId) {
       const key = sidebarTabCloseKeyOf(tabId);
-      if (sharedSidebarTabCloseInFlight.has(key) === true) return null;
+      if (sharedSidebarTabCloseInFlight.has(key)) return null;
       let settleWaiters = null;
       const settled = new Promise((resolve) => { settleWaiters = resolve; });
       const token = {
@@ -115,7 +116,7 @@
        * 绝不移除后来者的租约。
        */
       const release = (outcome) => {
-        if (released === true) return;
+        if (released) return;
         released = true;
         const reason = closeSettleReason(outcome);
         token.result = reason;
@@ -131,7 +132,7 @@
         token,
         /** 保留租约到 holdUntil：期间候选选择一律让位（绝不重复 close），迟到结果也没有机会重叠。 */
         hold(state, holdUntil) {
-          if (released === true) return;
+          if (released) return;
           token.state = state;
           token.holdUntil = holdUntil;
         },
@@ -170,7 +171,7 @@
       let settled = false;
       let timer = null;
       const finish = (outcome) => {
-        if (settled === true) return;
+        if (settled) return;
         settled = true;
         if (timer !== null) {
           try { globalThis.clearTimeout?.(timer); } catch { /* 清理失败不影响结果。 */ }
@@ -198,7 +199,7 @@
       let done = false;
       let timer = null;
       const finish = (value) => {
-        if (done === true) return;
+        if (done) return;
         done = true;
         if (timer !== null) {
           try { globalThis.clearTimeout?.(timer); } catch { /* 同上。 */ }
@@ -219,17 +220,17 @@
   /** Auto 记账清理（活动判定 / 容量 / 快照清理 / 占位回收 / manual 抑制）。 */
   function createSidebarAutoBookkeeping(scope) {
     const {
-      clearAutoCloseBudget, rootSessionId, sidebarAutoCloseCooldownsRef,
-      sidebarAutoCloseVerificationsRef, sidebarAutoOriginRef, sidebarAutoReservationRef,
-      sidebarAutoSuppressedRef, sidebarResourceTabStateOf, sidebarSessionId,
-      sidebarTabOpeningRef, sidebarTabPendingRef, sidebarTabRecordsRef,
+      clearAutoCloseBudget, idleSidebarResourceAddresses, rootSessionId, runningSidebarResourceAddresses,
+      sidebarAutoCloseCooldownsRef, sidebarAutoCloseVerificationsRef, sidebarAutoOriginRef, sidebarAutoReservationRef,
+      sidebarAutoRunPhaseRef, sidebarAutoSuppressedRef, sidebarIdleChildren, sidebarResourceTabStateOf, sidebarSessionId,
+      sidebarTabOpeningRef, sidebarTabPendingRef, sidebarTabRecordsRef, trimAutoKeyMap,
     } = scope;
     function sidebarAutoCloseKeyIsActive(key) {
-      if (sidebarTabPendingRef.current.has(key) === true) return true;
-      if (sidebarTabOpeningRef.current.has(key) === true) return true;
-      if (sidebarAutoReservationRef.current.has(key) === true) return true;
-      if (sidebarAutoCloseVerificationsRef.current.has(key) === true) return true;
-      if (sidebarAutoCloseCooldownsRef.current.has(key) === true) return true;
+      if (sidebarTabPendingRef.current.has(key)) return true;
+      if (sidebarTabOpeningRef.current.has(key)) return true;
+      if (sidebarAutoReservationRef.current.has(key)) return true;
+      if (sidebarAutoCloseVerificationsRef.current.has(key)) return true;
+      if (sidebarAutoCloseCooldownsRef.current.has(key)) return true;
       const record = sidebarTabRecordsRef.current.get(key);
       return record !== undefined
         && record.sessionId === sidebarSessionId
@@ -259,12 +260,12 @@
         for (const [key, entry] of map) {
           if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
           if (key === actingKey) continue;
-          if (known.has(entry.address) === true) continue;
+          if (known.has(entry.address)) continue;
           /**
            * 快照里暂时缺了这个地址，但 key 上仍有活动记账（record / 在途打开 / pending / 验证 / 冷却）：
            * 绝不删除 origin——否则冷却到期后就再也关不掉这个 tab（快照缺项不等于宿主里没有）。
            */
-          if (sidebarAutoCloseKeyIsActive(key) === true) continue;
+          if (sidebarAutoCloseKeyIsActive(key)) continue;
           map.delete(key);
           clearAutoCloseBudget(key);
         }
@@ -274,8 +275,8 @@
       for (const [key, entry] of sidebarAutoReservationRef.current) {
         if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
         if (key === actingKey) continue;
-        if (known.has(entry.address) === true) continue;
-        if (sidebarTabPendingRef.current.has(key) === true) continue;
+        if (known.has(entry.address)) continue;
+        if (sidebarTabPendingRef.current.has(key)) continue;
         sidebarAutoReservationRef.current.delete(key);
       }
     }
@@ -296,8 +297,8 @@
           continue;
         }
         if (age < SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS) continue;
-        if (sidebarTabPendingRef.current.has(key) === true) continue;
-        if (sidebarTabOpeningRef.current.has(key) === true) continue;
+        if (sidebarTabPendingRef.current.has(key)) continue;
+        if (sidebarTabOpeningRef.current.has(key)) continue;
         const state = sidebarResourceTabStateOf(entry.address);
         if (state.readable !== true) {
           // fail-closed：读不到 inventory 时保留占位，绝不把「读不到」当成「没有 tab」。
@@ -309,7 +310,7 @@
           kind: "ownership",
           event: "delete",
           reason: state.tabId === null
-            ? (running !== null && running !== undefined && running.has(entry.address) === true
+            ? (running?.has(entry.address)
               ? "placeholder-retry"
               : "placeholder-released")
             : "placeholder-superseded",
@@ -317,15 +318,84 @@
         });
       }
     }
-    function clearManualSuppressionOfIdleResources(idle) {
-      if (idle === null || idle === undefined || idle.size === 0) return;
-      for (const address of idle) {
-        const key = sidebarTabKey(sidebarSessionId, rootSessionId, address);
-        if (sidebarAutoSuppressedRef.current.has(key) === true) sidebarAutoSuppressedRef.current.delete(key);
-        const persisted = readSidebarAutoOwnershipEntry(sidebarSessionId, rootSessionId, address, { quiet: true });
-        if (persisted === null || persisted.origin !== SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL) continue;
-        deleteSidebarAutoOwnership(sidebarSessionId, rootSessionId, address, "resource-idle", { manual: true });
+    /**
+     * 手动归属与「运行相位」对账（名字沿用历史的 clearManualSuppressionOfIdleResources：工厂 / frame
+     * API 与 hook 顺序 golden 都引用它；语义已升级为下表的完整对账）。
+     *
+     * 用户规则：manual 只在「手动操作让状态偏离该相位的**正常状态**」时存在，回到正常状态即交回 Auto。
+     * 每轮同步按 (phase, presence) 直接对账，不做过渡检测、不新增 ref，也不缓存上一帧：
+     * - running + present：正常态（运行中就该开着）⇒ 收敛成 auto（用当前亲眼读到的 tabId）；
+     * - running + absent：偏离态（运行中关了它）⇒ 保持 manual，既有 suppressed / persisted-manual
+     *   判据继续抑制重开；
+     * - idle + absent：正常态（空闲就该关着）⇒ 删除 manual 并清内存抑制；
+     * - idle + present：偏离态（手动打开空闲会话）⇒ 保持 manual，绝不被自动关闭；
+     * - unknown（不在任一集合）或 inventory 不可读 ⇒ 一律不改（fail-closed）。
+     * 只改 manual：绝不把 auto 改成 manual，也绝不为腾位淘汰任何 auto owner；容量仍由
+     * writeSidebarAutoOwnership 把关（失败则保持 manual + reject 诊断）。manual-stale-* /
+     * manual-unproven-open 是安全降级而非用户意图，tabId 不可证明，跨相位也不接管。
+     */
+    function clearManualSuppressionOfIdleResources() {
+      const suppressed = sidebarAutoSuppressedRef.current;
+      for (const [idle, addresses] of [[0, runningSidebarResourceAddresses()], [1, idleSidebarResourceAddresses(sidebarIdleChildren())]]) {
+        for (const address of addresses) {
+          const key = sidebarTabKey(sidebarSessionId, rootSessionId, address);
+          // 先读内存索引（便宜、不碰宿主）：没有 manual 也没有内存抑制的地址与相位对账无关。
+          const persisted = readSidebarAutoOwnershipEntry(sidebarSessionId, rootSessionId, address, { quiet: true });
+          const manual = persisted?.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL;
+          if (idle === 1 ? (!manual && !suppressed.has(key)) : !manual) continue;
+          const state = sidebarResourceTabStateOf(address);
+          if (!state.readable) continue;
+          const idleMark = suppressed.get(key)?.idle;
+          if (idle === 1) {
+            // idle+present（偏离态）：保持 manual，并把「这一轮亲眼见过空闲」连同 tabId 记在抑制表
+            // 上（不依赖 record：新实例首帧还没有 record，必须早于 records 同步也能记下证据）。
+            if (state.tabId !== null) {
+              if (manual) suppressed.set(key, { sessionId: sidebarSessionId, rootSessionId, address, idle: state.tabId });
+              continue;
+            }
+            // idle+absent（正常态）：清抑制与 manual。
+            suppressed.delete(key);
+            if (manual) deleteSidebarAutoOwnership(sidebarSessionId, rootSessionId, address, "new-run", { manual: true });
+            continue;
+          }
+          if (state.tabId === null) {
+            // running+absent：门已经关上。消费 idle 证据（只删标记、保留手动关闭抑制）：该 tab 若在
+            // 本轮重新出现，缺少新的空闲观察就不再算「跨轮」，绝不据此交回 Auto。
+            if (idleMark !== undefined) delete suppressed.get(key).idle;
+            continue;
+          }
+          const wasIdle = idleMark === state.tabId;
+          /**
+           * manual-open 当场交回 Auto；manual-takeover / manual-close 只在**观察到「空闲→运行」**
+           * 且仍是同一张 tab 时才交回（= 用户「手动只管 1 轮」）。
+           *
+           * P1 边界：三条红线用例（同步抛错 / verified-recycled / 刷新后 manual）保护的是「**同一
+           * 轮内**不认领、不误关外部写入者的 tab」，它们的 reason 是 takeover / close 且**没有**
+           * idle→running 证据；跨轮交回 Auto 是用户规则要求的有意行为，不在 P1 范围内（见 README）。
+           * 宿主 tabId 唯一性假设：同一 tabId 被复用给**同一地址**时无法区分 incarnation，本实现依赖
+           * 宿主不复用；若将来需要证据，必须走代次记录而不是再加一个容器（体积约束见 AGENTS §7）。
+           */
+          const reason = persisted.reason;
+          if (!(reason === "manual-open" || (wasIdle && (reason === "manual-takeover" || reason === "manual-close")))) continue;
+          /**
+           * 容量 / 语义拒绝（返回值 false）⇒ **保持 manual**：同 scope 满 128 / 全局满 512 时持久仍是
+           * manual，此时把内存改成 auto 会让关闭候选把用户的 tab 误关；抑制也不清，下一次同步在容量
+           * 释放后重试（ledger 自己已留 reject/capacity 诊断）。
+           *
+           * 持久化的两种失败语义**不同**：存储 I/O 失败（localStorage setItem 抛错）时 ledger 仍返回
+           * true（只有 manual 会登记 unpersisted），本实现对它**以内存状态继续**——持久层仍是 manual，
+           * 刷新后按 manual 回落、不会误关，属 fail-safe；不为此增加持久层直读校验（余量不足且不更安全）。
+           */
+          if (writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, address, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO, "auto-rearm", state.tabId) !== true) continue;
+          suppressed.delete(key);
+          sidebarAutoOriginRef.current.set(key, sidebarAutoOriginEntry(sidebarSessionId, rootSessionId, address, state.tabId));
+          const record = sidebarTabRecordsRef.current.get(key);
+          if (record?.tabId === state.tabId) record.origin = SIDEBAR_TAB_ORIGIN_AUTO;
+        }
       }
+      // idle 证据与手动关闭抑制共用同一张表：同样受容量上限约束，按 FIFO 淘汰最旧项。
+      // 方向偏安全：被淘汰 ⇒ 该地址的 hand-back 延后（继续保持 manual），绝不会提前交回 Auto。
+      trimAutoKeyMap(suppressed);
     }
     return Object.freeze({
       sidebarAutoCloseKeyIsActive, autoSidebarOwnershipHasCapacity, cleanupAutoSidebarKeys, sweepAutoOpenPlaceholders, clearManualSuppressionOfIdleResources,
@@ -391,22 +461,22 @@
        * 它——旧 close 的迟到收口取消一个新事务，会让右栏从 50% 掉回、新 pane 的打开失去归属。
        */
       cancelPendingSidebarSplitOfClose(key, entry.splitIntentToken);
-      if (sameTab === true) {
+      if (sameTab) {
         records.delete(key);
         if (entry.attemptToken === null || entry.attemptToken === undefined) clearAutoCloseAttempt(key);
         else settleAutoCloseAttempt(key, { kind: "close", attemptToken: entry.attemptToken });
         sidebarAutoCloseCooldownsRef.current.delete(key);
         sidebarAutoOriginRef.current.delete(key);
-        if (entry.manual === true && entry.address !== null && entry.address !== undefined) {
+        if (entry.manual && entry.address != null) {
           sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: entry.address });
           trimAutoKeyMap(sidebarAutoSuppressedRef.current);
           // 手动关闭：抑制语义同步落到持久归属标记上（刷新之后同样绝不再当 auto）。
           writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
-        } else if (entry.address !== null && entry.address !== undefined) {
+        } else if (entry.address != null) {
           // 验证关闭成功 / inventory 已证明这个 tabId 不在：归属标记同步删除，绝不残留陈旧 auto。
           deleteSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, "verified-closed");
         }
-      } else if (entry.attemptToken !== null && entry.attemptToken !== undefined) {
+      } else if (entry.attemptToken != null) {
         // tabId 已经不属于这次验证：只按令牌结算本次动作自己的那一笔预算（owner 已被后来者替换时
         // settleAutoCloseAttempt 会自动放弃）。
         settleAutoCloseAttempt(key, { kind: "close", attemptToken: entry.attemptToken });
@@ -520,7 +590,7 @@
        * 照旧调用 close 并按历史语义收口，绝不因为读面缺失把用户的关闭意图丢掉。
        * 自动路径没有这条退路：没有精确证据时 fail-closed（不调用 close、不清理归属）。
        */
-      const manualWithoutEvidence = preflight === "unreadable" && verify !== null && verify.manual === true;
+      const manualWithoutEvidence = preflight === "unreadable" && verify?.manual === true;
       if (preflight === "unreadable" && manualWithoutEvidence !== true) {
         // 什么都没发出、也什么都没证明：结算原因只能是 failed（等待者必须自己复核）。
         lease.release("failed");
@@ -562,7 +632,7 @@
        * resolve 只代表请求完成：登记验证记录并**保留租约**，由后续同步按精确 inventory 收口。
        * 没有可验证的 key（调用方没有 Auto 记账，例如批量入口）时按未验证归还租约，绝不当作已关闭。
        */
-      if (manualWithoutEvidence === true) {
+      if (manualWithoutEvidence) {
         // 无 inventory 读面的手动关闭：历史语义（用户意图优先），按「已关闭」结算并归还租约。
         lease.release("closed");
         return { status: "closed", closed: true };
@@ -600,7 +670,7 @@
     function sidebarAutoOpenCapable() {
       return openSidebarResource !== null
       && closeSidebarResource !== null
-      && (readActiveSidebarResource !== null || sidebarOpenTabsAvailable === true)
+      && (readActiveSidebarResource !== null || sidebarOpenTabsAvailable)
       && typeof primitives?.IconChevronLeftOutlineRegular === "function";
     }
     function autoCloseCandidate(running) {
@@ -644,7 +714,7 @@
             }
           }
         }
-        if (runningNow === true) {
+        if (runningNow) {
           // 资源重新变成运行中：它已经开着就保持开着，重试预算、owner 身份与失败冷却一并清零。
           // **绝不**丢弃仍在验证中的关闭：那条链属于「已经发出的一次关闭」，它的收口（删记录、
           // 撤销来源 / 登记抑制）与重试预算无关；丢掉它会让 record 与箭头永久停在 <<。
@@ -687,7 +757,7 @@
          * 轮次只是「有人在关，别插手」。真正的执行点还会再确认一次（候选选择与执行之间隔着一次
          * 微任务跳转与一次可能的组件重挂载，见 handleSidebarAction）。
          */
-        if (sidebarTabCloseInFlight(scopedRecord.tabId) === true) continue;
+        if (sidebarTabCloseInFlight(scopedRecord.tabId)) continue;
         /**
          * 宿主的公开 inventory 明确读到这个 tabId 不在（absent），或已经被回收给**另一个资源**
          * （recycled：条目暴露的 contentId 与本 key 的资源地址不一致）——两者都必须先过
@@ -712,7 +782,7 @@
          */
         const recordPresence = sidebarTabPresenceInInventory(scopedRecord.tabId, entry.address);
         const recordMissing = recordPresence === "absent" || recordPresence === "recycled";
-        if (recordMissing === true) {
+        if (recordMissing) {
           // 还没到连续两次的确认次数：本轮保留 record / 来源 / 预算 / 冷却，既不关闭也不收口。
           if (sampleAutoTabMisses(key, scopedRecord.tabId, true) < SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS) continue;
         } else if (recordPresence === "present") {
@@ -743,15 +813,15 @@
           clearAutoCloseAttempt(key);
           continue;
         }
-        if (sidebarTabPendingRef.current.has(key) === true) continue;
+        if (sidebarTabPendingRef.current.has(key)) continue;
         // 本次级联里已经为它尝试过并失败：同一批微任务里绝不重试（见 sidebarAutoFailedKeysRef）。
-        if (sidebarAutoFailedKeysRef.current.has(key) === true) continue;
+        if (sidebarAutoFailedKeysRef.current.has(key)) continue;
         // 用户刚刚在这个 key 上表达过手动意图：交给手动链路结算，Auto 本轮让位（手动恒优先）。
         if (sidebarManualIntentOf(key) !== undefined) continue;
         // 上一次关闭请求还在验证中（租约被验证链持有）：这一轮让位，绝不为同一个 key 再发一次 close。
-        if (sidebarAutoCloseVerificationsRef.current.has(key) === true) continue;
+        if (sidebarAutoCloseVerificationsRef.current.has(key)) continue;
         // 冷却慢车道：冷却期内零次 close 请求，origin / record 一律保留（绝不删除归属）。
-        if (autoCloseCooldownActive(key) === true) continue;
+        if (autoCloseCooldownActive(key)) continue;
         // 冷却到期：清空快速预算，允许一次新的真实 close（失败后再退避到下一档）。
         releaseExpiredAutoCloseCooldown(key);
         const used = attempts.get(key) ?? 0;
@@ -791,9 +861,9 @@
       for (const address of running) {
         const key = sidebarTabKey(sidebarSessionId, rootSessionId, address);
         // 本次级联里已经为它尝试过并失败：绝不在同一批微任务里重试（见 sidebarAutoFailedKeysRef）。
-        if (sidebarAutoFailedKeysRef.current.has(key) === true) continue;
+        if (sidebarAutoFailedKeysRef.current.has(key)) continue;
         // 用户手动关闭过：绝不立刻重开（抑制只由用户手动重新打开，或资源明确空闲后的清点清除）。
-        if (suppressed.has(key) === true) continue;
+        if (suppressed.has(key)) continue;
         /**
          * 持久 manual 抑制（跨整页刷新）：内存里的 suppressed 在刷新之后是空的，但用户的关闭意图
          * 落在持久条目上（见 SIDEBAR_AUTO_OWNERSHIP_KEY）——manual 恒优先，这里必须与内存抑制同强度
@@ -812,7 +882,7 @@
           continue;
         }
         // 本次运行已经为它成功发出过打开动作：绝不重复打开（与失败无关，失败会撤销预留）。
-        if (origin.has(key) === true) continue;
+        if (origin.has(key)) continue;
         /**
          * 容量 fail-closed：内存账本或持久表装不下这条新 owner 时**不打开**（记 owner-capacity
          * 诊断）。绝不为了腾位淘汰别的 scope 仍然有效的 owner——到达上限是可用性代价而不是错误：
@@ -823,8 +893,8 @@
           continue;
         }
         // 已经有一个候选为它预留：同一资源绝不并发两个动作。
-        if (reservations.has(key) === true) continue;
-        if (sidebarTabPendingRef.current.has(key) === true) continue;
+        if (reservations.has(key)) continue;
+        if (sidebarTabPendingRef.current.has(key)) continue;
         // 用户在同一个 key 上有未结算的手动意图：让手动链路先结算，Auto 本轮跳过。
         if (sidebarManualIntentOf(key) !== undefined) continue;
         const record = records.get(key);
@@ -840,7 +910,7 @@
         const state = sidebarResourceTabStateOf(address);
         if (state.readable !== true) continue;
         if (state.tabId !== null) continue;
-        if (sidebarActiveResourceMatches(address) === true) continue;
+        if (sidebarActiveResourceMatches(address)) continue;
         /**
          * 先写**预留**再发动作：任何重入（observer/轮询/尾随同步）都不会为同一个资源再选一次。
          * 预留只是候选去重，绝不等于「Auto 已经打开」——只有 openResource 真的成功发出后才会
