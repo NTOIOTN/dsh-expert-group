@@ -25,7 +25,7 @@
  * 装配顺序的新增/调整只在 manifest 里做。
  */
 export const CLIENT_SOURCE_FILES = Object.freeze([
-  "client.js",
+  "client-entry.js",
   "client-notifications.js",
   // R8（票据 29）：专家组模型拆出的 normalize / format 两个子模块（门面 client-expert-group-model.js
   // 保留）。三者都是装配输入：既要有 node --check，也要进入行数门禁的统计范围。

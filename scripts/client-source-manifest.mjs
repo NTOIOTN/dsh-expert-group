@@ -145,7 +145,7 @@ const IIFE_EXECUTION_ORDER = Object.freeze([
 const FRESHNESS_EXECUTION_SOURCE = "client-freshness.js";
 
 /** 唯一 ModuleLoader descriptor（client.js）恒为装配顺序的最后一项，避免 HMR 留下重复子模块工厂。 */
-const DESCRIPTOR_EXECUTION_SOURCE = "client.js";
+const DESCRIPTOR_EXECUTION_SOURCE = "client-entry.js";
 
 /**
  * ① 装配顺序：51 个 IIFE → freshness 投影 → 唯一 descriptor。
@@ -250,19 +250,19 @@ export const iifeDependencies = Object.freeze([
   }),
   Object.freeze({
     from: "client-expert-group-model.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-expert-group-model"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-expert-group-sidebar.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-expert-group-sidebar"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-model-config.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-model-config"]),
     via: "iife-symbol",
   }),
@@ -717,13 +717,13 @@ export const iifeDependencies = Object.freeze([
   }),
   Object.freeze({
     from: "client-fanout-normalize.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-fanout-normalize"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-model-config-host.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-model-config-host"]),
     via: "iife-symbol",
   }),
@@ -769,13 +769,13 @@ export const iifeDependencies = Object.freeze([
   }),
   Object.freeze({
     from: "client-native-status.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-native-status"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-settings-main-a.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-settings-main-a"]),
     via: "iife-symbol",
   }),
@@ -787,7 +787,7 @@ export const iifeDependencies = Object.freeze([
   }),
   Object.freeze({
     from: "client-settings-main-b.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-settings-main-b"]),
     via: "iife-symbol",
   }),
@@ -805,19 +805,19 @@ export const iifeDependencies = Object.freeze([
   }),
   Object.freeze({
     from: "client-settings-normalize.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-settings-normalize"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-styles.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-styles"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-subagent-metadata.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-subagent-metadata"]),
     via: "iife-symbol",
   }),
@@ -829,7 +829,7 @@ export const iifeDependencies = Object.freeze([
   }),
   Object.freeze({
     from: "client-text.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-text"]),
     via: "iife-symbol",
   }),
@@ -911,43 +911,43 @@ export const iifeDependencies = Object.freeze([
   }),
   Object.freeze({
     from: "client-model-views-a.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-model-views-a"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-model-views-b.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-model-views-b"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-provider-card.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-provider-card"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-model-section.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-model-section"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-conversation-adapters.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-conversation-adapters"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-nav-icon.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-nav-icon"]),
     via: "iife-symbol",
   }),
   Object.freeze({
     from: "client-plugin-detail.js",
-    to: "client.js",
+    to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-plugin-detail"]),
     via: "iife-symbol",
   }),

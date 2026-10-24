@@ -72,8 +72,8 @@ test.after(() => { restoreModelConfig(); });
 
 const { client: bundle } = await loadClientBundle();
 
-// 身份一致：client.js 导出的 modelConfig 必须就是本文件断言的同一份侧车实现。
-assert.equal(bundle.modelConfig, modelConfig, "client.js 的 modelConfig 必须来自装配期侧车检查点");
+// 身份一致：client-entry.js 导出的 modelConfig 必须就是本文件断言的同一份侧车实现。
+assert.equal(bundle.modelConfig, modelConfig, "client-entry.js 的 modelConfig 必须来自装配期侧车检查点");
 
 /** 被渲染的子树里按条件查找第一个匹配节点（沿用设置页测试的遍历语义）。 */
 function findNode(node, predicate) {
@@ -1026,7 +1026,7 @@ test("模型配置：卡片上的单行删除触发与删除 provider 相同的�
     revision: fixtures.namespace.revision,
     roleDefaults: { fixer: { provider: "acme", model: "m1", reasoningEffort: "high" } },
   });
-  // 与 UI 的「删除」按钮同一条路径（client.js 调用 config.removeModelRow）。
+  // 与 UI 的「删除」按钮同一条路径（client-entry.js 调用 config.removeModelRow）。
   session.edit((draft) => ({ ...draft, models: modelConfig.removeModelRow(session.modelRows, 0) }));
   assert.deepEqual(modelConfig.modelDraftsOf(session.draft.models), [], "夹具必须真的删掉了那一行");
   const plan = session.plan();
@@ -3840,7 +3840,7 @@ test("模型配置回归：新增后删除 provider 的刷新突发合并为尾�
       },
     },
   };
-  /** 真实 store：设置页拿到的就是 client.js 在 apply 期创建的那一个。 */
+  /** 真实 store：设置页拿到的就是 client-entry.js 在 apply 期创建的那一个。 */
   const storeOf = () => harness.registrations.get("settings.section").descriptor.inject().modelCatalog;
   const roleSelect = (suffix) => findNode(mounted.handle.output,
     (node) => node.type === "select" && node.props?.["aria-label"] === "Explorer " + suffix);

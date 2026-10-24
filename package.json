@@ -10,7 +10,7 @@
   },
   "exports": {
     ".": "./index.js",
-    "./client": "./client-bundle.js",
+    "./client": "./client.js",
     "./client-freshness": "./client-freshness.js",
     "./shared": "./shared.js",
     "./role-registry": "./role-registry.js",
@@ -21,9 +21,11 @@
     "./prompt-inspector": "./prompt-inspector.js",
     "./prompt-sidecar": "./prompt-sidecar.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client-bundle": "./client-bundle.js"
   },
   "files": [
+    "client.js",
     "client-sidebar-panel-cache.js",
     "client-sidebar-panel-state-a.js",
     "client-sidebar-panel-state-b.js",

@@ -20042,7 +20042,7 @@ return true;
 global[Symbol.for(CLIENT_FRESHNESS_GLOBAL_KEY)]=__DEG_CLIENT_FRESHNESS_DESCRIPTOR__.factory();
 registerClientFreshnessModule(global.__ModuleLoader__);
 })(globalThis);
-/* source: client.js */
+/* source: client-entry.js */
 window.__ModuleLoader__.load({
 id:"dsh-expert-group",
 factory:(require)=>{

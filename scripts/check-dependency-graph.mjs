@@ -1078,7 +1078,7 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
   { file: "client-sidebar-views-a.js", name: "createSidebarViewsA", groups: 1 },
   { file: "client-sidebar-views-b.js", name: "createSidebarViewsB", groups: 2 },
   { file: "client-sidebar-views-c.js", name: "createSidebarViewsC", groups: 3 },
-  { file: "client.js", name: "createClientFreshnessBoundary", groups: 2 },
+  { file: "client-entry.js", name: "createClientFreshnessBoundary", groups: 2 },
   { file: "host/index-expert-tools-admission.js", name: "createNewChild", groups: 4 },
   { file: "host/index-recovery.js", name: "createRootAdmissionBatch", groups: 0 },
   // ── 票据 35/36：变量绑定声明（全深度收集后逐条分类）────────────────────────

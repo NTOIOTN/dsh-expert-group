@@ -79,7 +79,9 @@ export const MODULE_SIZE_LIMITS = Object.freeze({
 const EXCLUDED_PATH_PREFIXES = Object.freeze(["test/", "node_modules/", ".git/", ".scratch/"]);
 
 /** 白名单：构建产物只受体积门禁约束，不参与行数门禁。 */
-const WHITELISTED_FILES = Object.freeze(["client-bundle.js"]);
+// 构建产物不参与行数门禁：client-bundle.js 是历史发布入口，client.js 是 DSH 0.2.x
+// web boot 约定的同名入口，两者内容恒等（scripts/assemble-client.mjs 双写）。
+const WHITELISTED_FILES = Object.freeze(["client-bundle.js", "client.js"]);
 
 /** 参与统计的源码扩展名。 */
 const SOURCE_FILE_PATTERN = /\.(?:js|mjs)$/i;

@@ -80,6 +80,8 @@ const DESCRIPTOR_SOURCE = MANIFEST_DESCRIPTOR_SOURCE;
 /** 装配顺序本身（manifest 已冻结；这里不再二次复制成新数组，保持"唯一事实源"可追溯）。 */
 const sourceNames = MANIFEST_ASSEMBLY_ORDER;
 const outputName = "client-bundle.js";
+/** 新版宿主（DSH 0.2.x web boot）约定的客户端入口文件名。 */
+const entryOutputName = "client.js";
 const banner = "/* 此文件由 scripts/assemble-client.mjs 生成，请勿手工编辑。 */\n";
 
 /** 字符串形式的投影尾部语句：生成与校验共用同一份常量，避免两边写法漂移。 */
@@ -1260,9 +1262,18 @@ export async function assembleClientBundle({ write = true } = {}) {
   // 行为核对直接用刚生成的那一段（而不是重新渲染），确保校验对象就是要写盘的内容。
   const projection = await verifyFreshnessProjection({ segment: segments[placement.freshnessIndex].text });
   const outputPath = join(root, outputName);
-  if (write) await writeFile(outputPath, content, "utf8");
+  // DSH 0.2.x 的 web boot 以固定文件名 client.js 请求插件客户端入口（combo 路由
+  // /plugins/<包名>/client.js?rev=...），因此发布面同时产出两份同内容产物：
+  // - client.js：新版宿主的约定入口；
+  // - client-bundle.js：旧宿主与既有门禁/测试沿用的入口，保持向后兼容。
+  const entryOutputPath = join(root, entryOutputName);
+  if (write) {
+    await writeFile(outputPath, content, "utf8");
+    await writeFile(entryOutputPath, content, "utf8");
+  }
   return Object.freeze({
     outputPath,
+    entryOutputPath,
     sourceNames,
     segments,
     content,
