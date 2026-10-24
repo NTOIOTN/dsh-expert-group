@@ -15,7 +15,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createPluginHost } from "../test-support/plugin-host.mjs";
+import { createPluginHost, RPC_ENDPOINT } from "../test-support/plugin-host.mjs";
 import {
   buildContinuationReminder,
   canNudgeTurn,
@@ -24,9 +24,11 @@ import {
   MAX_CONTINUATIONS_PER_TURN,
   markTurnNudged,
   needsContinuation,
+  describeContinuationDiagnostics,
+  recordContinuationDecision,
+  resetContinuationDiagnostics,
   resolveTurnForContinuation,
   turnClosedWithDone,
-  turnToolCallNames,
 } from "../host/turn-continuation-guard.js";
 
 const ROOT_ID = "root-turn-completion-marker";
@@ -151,7 +153,6 @@ function buildPtcEvents({ turn = 1, nested = [], text = "", extraEvents = [] } =
 
 test("纯文本 turn（没有工具调用、没有 done）：需要提醒", () => {
   const events = buildTurnEvents({ text: "这是纯问答收尾。" });
-  assert.deepEqual(turnToolCallNames(events, 1), []);
   assert.equal(turnClosedWithDone(events, 1), false);
   assert.equal(needsContinuation(events, 1), true, "每个 turn 都必须打完成标记，纯文本 turn 不豁免");
 });
@@ -162,7 +163,6 @@ test("最后一个工具调用是完成标记且结果成功：本 turn 按协�
     results: [callIdOf(1, DONE_TOOL_NAME)],
     text: "已交付。",
   });
-  assert.deepEqual(turnToolCallNames(events, 1), ["read", DONE_TOOL_NAME]);
   assert.equal(turnClosedWithDone(events, 1), true);
   assert.equal(needsContinuation(events, 1), false);
 });
@@ -282,7 +282,6 @@ test("多个 turn 各自独立判定", () => {
   ];
   assert.equal(turnClosedWithDone(events, 1), true);
   assert.equal(needsContinuation(events, 1), false);
-  assert.deepEqual(turnToolCallNames(events, 2), ["read"]);
   assert.equal(needsContinuation(events, 2), true);
   assert.equal(needsContinuation(events, 3), true, "纯文本 turn 同样需要标记");
   assert.equal(needsContinuation(events, 4), true, "不存在的 turn 没有完成标记");
@@ -292,7 +291,6 @@ test("assistant 消息里的 tool-call block 也计入本 turn 的工具调用",
   // 没有 tool/call 事件，只有消息侧 block：仍算“有调用”，且最后不是 done。
   const onlyBlock = [{ type: "tool-call", name: "read", arguments: {} }];
   const blockEvents = buildTurnEvents({ calls: [], text: "", blocks: onlyBlock });
-  assert.deepEqual(turnToolCallNames(blockEvents, 1), [], "turnToolCallNames 只投影 tool/call 事件");
   assert.equal(turnClosedWithDone(blockEvents, 1), false);
   assert.equal(needsContinuation(blockEvents, 1), true, "消息侧 tool-call block 必须计入工具调用");
 
@@ -305,13 +303,11 @@ test("assistant 消息里的 tool-call block 也计入本 turn 的工具调用",
 
 test("非法输入一律安全返回空判定（fail-open，不抛错）", () => {
   for (const badEvents of [undefined, null, 0, "events", {}]) {
-    assert.deepEqual(turnToolCallNames(badEvents, 1), []);
     assert.equal(turnClosedWithDone(badEvents, 1), false);
     assert.equal(needsContinuation(badEvents, 1), false);
   }
   const events = buildTurnEvents({ calls: ["read"] });
   for (const badTurn of [undefined, null, "1", 1.5, Number.NaN]) {
-    assert.deepEqual(turnToolCallNames(events, badTurn), []);
     assert.equal(turnClosedWithDone(events, badTurn), false);
     assert.equal(needsContinuation(events, badTurn), false);
   }
@@ -477,6 +473,50 @@ test("resolveTurnForContinuation：payload turn 优先，缺失时退 assistant/
   assert.equal(resolveTurnForContinuation([{ type: "turn/start", data: { turn: 7 } }], null), 7, "再退到最后一个 turn/start");
   assert.equal(resolveTurnForContinuation([], undefined), null);
   assert.equal(resolveTurnForContinuation(undefined, "1"), null);
+});
+
+// ── 1d. 续接诊断（内存环形缓冲） ────────────────────────────────────────────
+
+test("续接诊断：环形上限 20、时间倒序、计数与 reason/turn 归一", () => {
+  resetContinuationDiagnostics();
+  const base = Date.now();
+  for (let index = 0; index < 25; index += 1) {
+    recordContinuationDecision({
+      turn: index,
+      reason: index % 2 === 0 ? "nudge" : "already-complete",
+      nudge: index % 2 === 0,
+      at: base + index,
+    });
+  }
+  const snapshot = describeContinuationDiagnostics();
+  assert.equal(snapshot.version, 1);
+  assert.equal(snapshot.total, 25);
+  assert.equal(snapshot.nudged, 13);
+  assert.equal(snapshot.skipped, 12);
+  assert.equal(snapshot.recent.length, 20, "环形上限固定 20 条");
+  assert.equal(snapshot.last.turn, 24, "last 是最近一条（时间倒序）");
+  assert.equal(snapshot.recent[0].turn, 24);
+  assert.equal(snapshot.recent[19].turn, 5, "只保留最近 20 条");
+
+  // 返回的是拷贝：改写快照不影响内部缓冲。
+  snapshot.recent[0].turn = 999;
+  assert.equal(describeContinuationDiagnostics().last.turn, 24);
+
+  // 归一：非法 turn → null；非字符串 reason → "unknown"；at 非有限数字 → 当前时间。
+  recordContinuationDecision({ turn: 1.5, reason: 42, nudge: "yes", at: "now" });
+  const normalized = describeContinuationDiagnostics();
+  assert.deepEqual(
+    { turn: normalized.last.turn, reason: normalized.last.reason, nudge: normalized.last.nudge },
+    { turn: null, reason: "unknown", nudge: false },
+  );
+  assert.equal(Number.isFinite(normalized.last.at), true);
+  assert.equal(normalized.total, 26);
+  assert.equal(normalized.skipped, 13);
+
+  resetContinuationDiagnostics();
+  assert.deepEqual(describeContinuationDiagnostics(), {
+    version: 1, total: 0, nudged: 0, skipped: 0, last: null, recent: [],
+  });
 });
 
 // ── 2. turn-stopping 接线后的公开行为 ──────────────────────────────────────
@@ -663,6 +703,37 @@ test("turn-stopping：跳过时记录稳定 reason 日志（静默短路可定�
   assert.equal(reasons.some((message) => message.includes("(turn-aborted)")), true, "aborted 必须留下 reason");
   assert.equal(reasons.some((message) => message.includes("(already-complete)")), true, "已收尾必须留下 reason");
   await host.dispose();
+});
+
+test("诊断接线：describeRuntimeDiagnostics().continuation 反映最近一次跳过与提醒", async () => {
+  resetContinuationDiagnostics();
+  const { host, root } = createGuardHost();
+  try {
+    // 跳过：turn 的 signal 已取消 → turn-aborted。
+    const controller = new AbortController();
+    controller.abort();
+    turnStopping(host, root, 1, controller.signal);
+    let meta = await host.invokeConnection(RPC_ENDPOINT, { action: "meta" });
+    assert.equal(meta.value.diagnostics.continuation.last.reason, "turn-aborted");
+    assert.equal(meta.value.diagnostics.continuation.last.nudge, false);
+    assert.equal(meta.value.diagnostics.continuation.skipped, 1);
+    assert.equal(meta.value.diagnostics.continuation.nudged, 0);
+
+    // 提醒：正常边界 + 未打完成标记 → nudge。
+    root.session.events = buildTurnEvents({ turn: 2, calls: ["read"] });
+    turnStopping(host, root, 2);
+    meta = await host.invokeConnection(RPC_ENDPOINT, { action: "meta" });
+    const continuation = meta.value.diagnostics.continuation;
+    assert.equal(continuation.last.reason, "nudge");
+    assert.equal(continuation.last.nudge, true);
+    assert.equal(continuation.total, 2);
+    assert.equal(continuation.nudged, 1);
+    assert.equal(continuation.skipped, 1);
+    // 侧栏可见的字段面固定：只允许版本/计数/时间倒序历史（无用户文本、无路径）。
+    assert.deepEqual(Object.keys(continuation).sort(), ["last", "nudged", "recent", "skipped", "total", "version"]);
+  } finally {
+    await host.dispose();
+  }
 });
 
 // ── 3. dsh_expert_group_done 工具契约 ───────────────────────────────────────

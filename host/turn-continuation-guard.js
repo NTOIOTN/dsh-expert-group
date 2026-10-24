@@ -285,30 +285,6 @@ function hasToolResult(events, turn, callId) {
 }
 
 /**
- * 取该 turn 全部 tool/call 事件的 data.name（按事件顺序，只含字符串名）。
- *
- * 纯函数、只读事件：非数组 events 或非法 turn 一律返回空数组，绝不抛错。
- * 这是诊断/投影用的简化读面；收尾判定请用 turnClosedWithDone（它按 callId 去重并校验
- * tool/result）。assistant 消息里的 tool-call block 不参与本函数。
- *
- * @param {object[]} events - session 事件数组。
- * @param {number} turn - 目标 turn 号。
- * @returns {string[]} 该 turn 的工具调用名列表。
- */
-export function turnToolCallNames(events, turn) {
-  if (!Array.isArray(events) || !Number.isSafeInteger(turn)) return [];
-  const names = [];
-  for (const event of events) {
-    const item = asObject(event);
-    if (item === null || item.type !== "tool/call") continue;
-    const data = asObject(item.data);
-    if (data === null || data.turn !== turn) continue;
-    if (typeof data.name === "string") names.push(data.name);
-  }
-  return names;
-}
-
-/**
  * 本 turn 是否**按协议收尾**：至少有一条工具调用，且最后一条是完成标记（并且它真的成功）。
  *
  * 判定（任何一步不满足都返回 false，fail-closed 到“继续”）：
@@ -428,6 +404,74 @@ export function resolveTurnForContinuation(events, payloadTurn) {
     if (Number.isSafeInteger(turn)) return turn;
   }
   return null;
+}
+
+/**
+ * 最近一次续接决策的内存诊断（环形缓冲）。
+ *
+ * 为什么需要它：续接保护跳过时只写进程日志（stdout），会话 JSONL 里看不到；线上排查
+ * 「turn 关闭却没有提醒」时因此缺少观测面。这里把**每次**决策（含 reason 码）留在内存里，
+ * 经运行时诊断 RPC 暴露给侧栏。
+ *
+ * 边界（只读诊断，不是业务状态）：
+ * - 进程内存：重启即清空，不持久化、不参与任何判定；
+ * - 固定上限 CONTINUATION_DIAGNOSTIC_LIMIT 条，按时间倒序，报告大小不随历史增长；
+ * - 内容只有 reason 码 / turn / nudge / 时间戳：**不含用户文本、路径、prompt 或异常正文**。
+ */
+const CONTINUATION_DIAGNOSTIC_LIMIT = 20;
+const continuationDiagnostics = { total: 0, nudged: 0, skipped: 0, recent: [] };
+
+/**
+ * 记录一次续接决策（供运行时诊断读取）。
+ *
+ * 归一规则：turn 只接受安全整数（其余记为 null）；reason 只接受非空字符串（其余记为
+ * "unknown"）；nudge 只有严格 true 才算提醒；at 非有限数字时用当前时间。
+ *
+ * @param {object} decision - { turn, reason, nudge, at }。
+ */
+export function recordContinuationDecision(decision) {
+  const facts = asObject(decision) ?? {};
+  const turn = Number.isSafeInteger(facts.turn) ? facts.turn : null;
+  const reason = typeof facts.reason === "string" && facts.reason.length > 0 ? facts.reason : "unknown";
+  const nudge = facts.nudge === true;
+  const at = Number.isFinite(facts.at) ? facts.at : Date.now();
+  continuationDiagnostics.total += 1;
+  if (nudge) continuationDiagnostics.nudged += 1;
+  else continuationDiagnostics.skipped += 1;
+  continuationDiagnostics.recent.unshift({ turn, reason, nudge, at });
+  if (continuationDiagnostics.recent.length > CONTINUATION_DIAGNOSTIC_LIMIT) {
+    continuationDiagnostics.recent.length = CONTINUATION_DIAGNOSTIC_LIMIT;
+  }
+}
+
+/**
+ * 只读快照：最近一次续接决策 + 计数 + 有界历史（时间倒序）。
+ *
+ * 返回的是拷贝，调用方无法改写内部缓冲；last 在从未记录时为 null。
+ *
+ * @returns {{version:number, total:number, nudged:number, skipped:number,
+ *   last:object|null, recent:object[]}} 诊断载荷。
+ */
+export function describeContinuationDiagnostics() {
+  const recent = continuationDiagnostics.recent.map((entry) => ({ ...entry }));
+  return {
+    version: 1,
+    total: continuationDiagnostics.total,
+    nudged: continuationDiagnostics.nudged,
+    skipped: continuationDiagnostics.skipped,
+    last: recent.length === 0 ? null : recent[0],
+    recent,
+  };
+}
+
+/**
+ * 清空诊断缓冲（仅测试用；生产路径不会调用）。
+ */
+export function resetContinuationDiagnostics() {
+  continuationDiagnostics.total = 0;
+  continuationDiagnostics.nudged = 0;
+  continuationDiagnostics.skipped = 0;
+  continuationDiagnostics.recent.length = 0;
 }
 
 /**

@@ -27,6 +27,7 @@ import {
   projectThrottleDiagnostics,
 } from "./runtime-diagnostics.js";
 import { AUTO_RECOVERY_LIMIT } from "../shared/recovery-ledger.js";
+import { describeContinuationDiagnostics } from "./turn-continuation-guard.js";
 
 /**
  * 创建运行时诊断投影能力面。
@@ -341,6 +342,25 @@ function projectPersistenceDiagnostics(diagnosticsState) {
   };
 }
 
+/**
+ * 两阶段图片路由的只读计数投影（纯数字，不含 claim id / child id / provider / model）。
+ *
+ * 提到模块级是为了让 describeRuntimeDiagnostics 保持在其行数预算内；投影本身无状态。
+ *
+ * @param {object} state - claim 域只读状态。
+ * @returns {{claims:number, cleanupTokens:number, cleanupReservations:number,
+ *   claimLimit:number, cleanupTokenLimit:number}} 计数投影。
+ */
+function projectImageRoutes(state) {
+  return {
+    claims: diagnosticCount(state.claims),
+    cleanupTokens: diagnosticCount(state.cleanupTokens),
+    cleanupReservations: diagnosticCount(state.cleanupReservations),
+    claimLimit: diagnosticCount(state.claimLimit),
+    cleanupTokenLimit: diagnosticCount(state.cleanupTokenLimit),
+  };
+}
+
 export function createRuntimeDiagnostics({ host, settings, storage, recovery, fanout, roles, delegation, observability }) {
   function describeRuntimeDiagnostics() {
     const settingsState = settings.describe();
@@ -477,6 +497,12 @@ export function createRuntimeDiagnostics({ host, settings, storage, recovery, fa
        * 收口投递与有界 roots 摘要。只含计数/固定枚举/时间戳，不含任何 id 或正文。
        */
       rootTurnWait: describeRootTurnWaitDiagnostics(observability.rootWait),
+      /**
+       * root turn 续接保护的内存诊断（最近一次决策 + 有界历史）：只含 reason 码、turn、
+       * nudge 与时间戳，不含用户文本 / 路径；进程重启即清空。侧栏诊断面板直接读这一
+       * 段即可判断"这次 turn 为什么没有提醒"。
+       */
+      continuation: describeContinuationDiagnostics(),
       fanout: projectFanoutDiagnostics(diagnosticsState),
       recovery: {
         rebuilds: diagnosticCount(recoveryState.rebuilds),
@@ -487,16 +513,7 @@ export function createRuntimeDiagnostics({ host, settings, storage, recovery, fa
       // 两阶段图片路由的只读计数（纯数字，不含 claim id / child id / provider / model）：
       // 客户端与测试据此证明签发/提交/取消/失败路径都会回收 claim 与 cleanup token。
       // 两阶段图片路由的只读计数由 claim 域投影（纯数字，不含 id/provider/model）。
-      imageRoutes: (() => {
-        const state = observability.imageRoutes();
-        return {
-          claims: diagnosticCount(state.claims),
-          cleanupTokens: diagnosticCount(state.cleanupTokens),
-          cleanupReservations: diagnosticCount(state.cleanupReservations),
-          claimLimit: diagnosticCount(state.claimLimit),
-          cleanupTokenLimit: diagnosticCount(state.cleanupTokenLimit),
-        };
-      })(),
+      imageRoutes: projectImageRoutes(observability.imageRoutes()),
       settings: {
         // 模型目录代次、在途写入与已跟踪的目录 namespace 数（settings 提交诊断面）。
         generation: diagnosticCount(settingsState.generation),
