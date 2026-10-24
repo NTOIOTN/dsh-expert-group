@@ -606,19 +606,33 @@ test("同一 child/activation：notice 只标记真正结束的 admission，未�
   // 唯一的通知只证明「B 所在 turn 已完成」：它绝不能顺带把 A 也标成已反馈。
   emitSplicedNotice(host, root, { childId, seq: 4301 });
   await flushAsyncWork(14);
-  assert.equal(pending.status, "pending", "A 仍未结束：通知不得结算 A 的 work");
+  // 新语义：B 的精确结算会逐 child 进度放行（本次等待收口），但 A 的 work 仍未结算——
+  // 因此只能是「取消/未投递」形态，绝不出现 finalized 结论。
+  assert.equal(pending.status, "resolved", "B 的精确结算必须逐 child 进度放行");
+  assert.notEqual(pending.value.kind, "finalized", "A 仍未结束：通知不得结算 A 的 work");
+  assert.deepEqual(host.agentSteerMessages(root), [], "A 仍未结束：绝不投递收口结论");
 
   // A 所在 turn 随后结束，但没有任何新通知：A 必须保持「未收到反馈」。
   endChildTurnForMessage(host, children[0], { turn: 1, messageId: first.messageId });
   await flushAsyncWork(20);
-  assert.equal(pending.status, "pending",
+  assert.deepEqual(host.agentSteerMessages(root), [],
     "A 结束后没有新通知时不得凭错误镜像标记提前结算 A 的 work");
+
+  const beforeNotice = await host.invokeConnection(RPC_ENDPOINT, { action: "meta" });
+  assert.equal(beforeNotice.value.diagnostics.rootTurnWait.outstandingTotal, 1,
+    "A 的 work 必须仍未结算：账本只能由精确通知减少");
 
   // 新的合法通知（新 seq、且 A 的终态接收顺序更早）仍然可以精确结算 A。
   emitSplicedNotice(host, root, { childId, seq: 4302 });
   await flushAsyncWork(20);
-  assert.equal(pending.status, "resolved");
-  assert.equal(pending.value.kind, "finalized");
+  const afterNotice = await host.invokeConnection(RPC_ENDPOINT, { action: "meta" });
+  assert.equal(afterNotice.value.diagnostics.rootTurnWait.outstandingTotal, 0,
+    "新的合法通知必须精确结算 A 的 work");
+  // 结论只在下一个 turn 边界（整批静止）一次性投递。
+  const resumed = track(stopRootTurn(host, root, 2).settled);
+  await flushAsyncWork(20);
+  assert.equal(resumed.status, "resolved");
+  assert.equal(host.agentSteerMessages(root).length, 1, "整批静止后只投递一次收口结论");
   assertNoGoalCalls(probe);
 });
 
@@ -645,7 +659,10 @@ test("跨轮同 seq 重放不得消费未来 entry，新 seq 的下一轮通知�
   await flushAsyncWork(10);
   emitSplicedNotice(host, root, { childId, seq: 4501 });
   await flushAsyncWork(14);
-  assert.equal(pending.status, "pending", "第一轮的 work 已结算，但第二轮的 work 仍未结算");
+  // 新语义：第一轮的精确结算逐 child 进度放行（等待收口、不投递），第二轮 work 仍未结算。
+  assert.equal(pending.status, "resolved", "第一轮的精确结算必须逐 child 进度放行");
+  assert.notEqual(pending.value.kind, "finalized", "第一轮的 work 已结算，但第二轮的 work 仍未结算");
+  assert.deepEqual(host.agentSteerMessages(root), [], "进度放行绝不投递收口结论");
 
   // 第二轮：turn 1 结束；随后重放**同一条 delivery**（同 seq）。它没有新的 delivery 身份，
   // 绝不能消费这一轮的 entry。
@@ -653,13 +670,21 @@ test("跨轮同 seq 重放不得消费未来 entry，新 seq 的下一轮通知�
   await flushAsyncWork(12);
   emitSplicedNotice(host, root, { childId, seq: 4501 });
   await flushAsyncWork(20);
-  assert.equal(pending.status, "pending", "同 seq 重放不得消费未来 entry（delivery 身份只用于去重）");
+  assert.deepEqual(host.agentSteerMessages(root), [], "同 seq 重放不得消费未来 entry（delivery 身份只用于去重）");
+  const beforeNotice = await host.invokeConnection(RPC_ENDPOINT, { action: "meta" });
+  assert.equal(beforeNotice.value.diagnostics.rootTurnWait.outstandingTotal, 1,
+    "同 seq 重放不得消费未来 entry：第二轮的 work 必须仍未结算");
 
-  // 真正的新一轮通知（新 seq）仍然可以结算。
+  // 真正的新一轮通知（新 seq）仍然可以结算；结论在下一个 turn 边界一次性投递。
   emitSplicedNotice(host, root, { childId, seq: 4502 });
   await flushAsyncWork(20);
-  assert.equal(pending.status, "resolved");
-  assert.equal(pending.value.kind, "finalized");
+  const afterNotice = await host.invokeConnection(RPC_ENDPOINT, { action: "meta" });
+  assert.equal(afterNotice.value.diagnostics.rootTurnWait.outstandingTotal, 0,
+    "新 seq 的下一轮通知必须精确结算第二轮的 work");
+  const resumed = track(stopRootTurn(host, root, 2).settled);
+  await flushAsyncWork(20);
+  assert.equal(resumed.status, "resolved");
+  assert.equal(host.agentSteerMessages(root).length, 1, "整批静止后只投递一次收口结论");
   assertNoGoalCalls(probe);
 });
 
@@ -1514,7 +1539,7 @@ test("rc.2：runtime 快照里当前 root 自带字符串 parentSession（root�
 });
 // ── 5. 多 child / 部分完成不提前释放 ────────────────────────────────────────
 
-test("多 child 部分完成不提前释放：最后一个 admission 结束才收口", async () => {
+test("多 child 逐 child 进度放行：第一个 admission 结算即释放本次等待但不收口，最后一个结束才投递结论", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
   const first = await startAdmission(host, root, "wait probe task one", ["docs/wait-one.md"]);
@@ -1523,23 +1548,44 @@ test("多 child 部分完成不提前释放：最后一个 admission 结束才�
   assert.equal(second.kind, "continuable");
   assert.equal(children.length, 2, "两次不同任务必须各自新建 child");
 
-  const pending = track(finalizeLifecycle(host, root, [first, second]));
+  const waiting = await finalize(host, root, [first, second]);
+  assert.equal(waiting.kind, "waiting");
+  assert.equal(waiting.acceptedCount, 2);
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1);
+  const firstWait = track(stop.settled);
   await flushAsyncWork(8);
-  assert.equal(pending.status, "pending");
+  assert.equal(firstWait.status, "pending");
 
-  // 只有第一个 child 完成：等待必须继续。
+  // 第一个 child 完成：turn/end 先落地（handoff 记账完成），settlement 随后到达——
+  // 这是真实 Host 的顺序；两者合并到同一同步批次会让通知被 recovery gate 撤回。
   endChildTurn(host, children[0]);
+  await flushAsyncWork(8);
   host.setAgentStatus(children[0].child, "idle");
   insertNotice(host, root, children[0], "fb-multi-1");
+  await flushAsyncWork(20);
+  // 逐 child 进度放行：本次等待收口（宿主会在同一 turn 的下一个 step 消费该 settlement），
+  // 但**不是**最终结论，批次也没有关闭。
+  assert.equal(firstWait.status, "resolved", "精确结算后必须逐 child 进度放行");
+  assert.deepEqual(host.agentSteerMessages(root), [], "进度放行绝不投递最终结论");
+
+  // 同一 turn 下一个 step 之后的 turn 边界：剩余 child 仍在运行 → 继续等待。
+  const stopAgain = stopRootTurn(host, root, 2);
+  assert.equal(stopAgain.pending, 1, "批次仍是 pending-close：新边界必须继续参与等待");
+  const secondWait = track(stopAgain.settled);
   await flushAsyncWork(16);
-  assert.equal(pending.status, "pending", "还有 running 后代时不得提前释放");
+  assert.equal(secondWait.status, "pending", "还有 running 后代时不得提前释放");
 
   endChildTurn(host, children[1]);
+  await flushAsyncWork(8);
   host.setAgentStatus(children[1].child, "idle");
   insertNotice(host, root, children[1], "fb-multi-2");
-  await flushAsyncWork(16);
-  assert.equal(pending.status, "resolved");
-  assert.equal(pending.value.acceptedCount, 2);
+  await flushAsyncWork(24);
+  assert.equal(secondWait.status, "resolved", "最后一个 admission 结束后才收口");
+  const messages = host.agentSteerMessages(root);
+  assert.equal(messages.length, 1, "整批静止后只投递一次收口结论");
+  const text = messages.map((message) => message.content.map((block) => block.text).join("")).join("\n");
+  assert.match(text, /acceptedCount 2/);
   assertNoGoalCalls(probe);
 });
 
@@ -2092,6 +2138,25 @@ function stopRootTurn(host, root, turn = 1, signal) {
   return { returned: results.length, pending: pending.length, settled: Promise.all(pending).then(() => "settled") };
 }
 
+/**
+ * 构造 root 本 turn 的事件日志（用于续接保护用例）。
+ *
+ * 形状与真实 session 一致：turn/start → user/message → tool/call → assistant/message。
+ * assistant 文本刻意写成「下一步动作宣言」，让 turn-continuation-guard 命中
+ * continuation-intent；这样本文件才能验证「等待路径已经续接 turn 时不得再叠加提醒」。
+ */
+function buildRootGuardEvents(turn, text) {
+  return [
+    { type: "turn/start", data: { turn } },
+    {
+      type: "user/message",
+      data: { id: "root-user-" + turn, role: "user", content: [{ type: "text", text: "继续任务" }], source: { kind: "user" } },
+    },
+    { type: "tool/call", data: { turn, step: 1, callId: "root-call-" + turn, name: "read", arguments: {} } },
+    { type: "assistant/message", data: { turn, step: 2, message: { content: [{ type: "text", text }] } } },
+  ];
+}
+
 test("turn-stopping 兜底：纯 continue_parent_turn 留下的 running child 让 turn 保持打开", async () => {
   const probe = createGoalProbe();
   const { host, root, children } = createWaitHost({ goalProbe: probe });
@@ -2164,6 +2229,115 @@ test("AbortSignal：finalize 不再用 exec.signal 等待；payload.signal 只�
   const delivered = host.agentSteerMessages(root);
   assert.equal(delivered.length, 1, "静止后必须一次性投递终态结论");
   assert.equal(delivered[0].source.kind, "plugin:dsh-expert-group");
+  assertNoGoalCalls(probe);
+});
+
+test("turn-stopping 兜底：收口结论已续接 turn 时绝不再叠加续接提醒", async () => {
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe });
+  const outcome = await startAdmission(host, root, "continuation guard wait", ["docs/continuation-guard.md"]);
+  const receipt = await finalize(host, root, outcome);
+  assert.equal(receipt.kind, "waiting");
+  // root 本 turn 的最后一条消息是一次「下一步动作宣言」：续接保护本会命中。
+  root.session.events = buildRootGuardEvents(1, "实现路径已经清楚，我去验证。");
+
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1, "有未收口工作时必须进入等待路径");
+  await flushAsyncWork(8);
+  assert.deepEqual(host.agentSteerMessages(root), [], "等待期间不得叠加续接提醒");
+
+  endChildTurn(host, children[0]);
+  host.setAgentStatus(children[0].child, "idle");
+  await flushAsyncWork(20);
+  assert.equal(await stop.settled, "settled", "原有等待放行语义不变");
+  // 收口结论已经 steer 续接 turn：本 turn 的提醒额度必须保持未使用，结论也只投递一次。
+  const delivered = host.agentSteerMessages(root);
+  assert.equal(delivered.length, 1, "整批收口只投递一次收口结论，绝不叠加续接提醒");
+  const text = delivered[0].content.map((block) => block.text).join("");
+  assert.match(text, /admissionEpoch/);
+  assert.doesNotMatch(text, /Turn continuation guard:/);
+  assertNoGoalCalls(probe);
+});
+
+test("turn-stopping 兜底：等待正常静止且无 pending-close 时补一次续接提醒", async () => {
+  const probe = createGoalProbe();
+  const { host, root, children } = createWaitHost({ goalProbe: probe });
+  // 只派发、不 finalize：等待兜底会等 child 静止，但没有 pending-close 批次可投递结论，
+  // 因此等待路径本身没有续接 turn —— 这正是“可以补续接提醒”的分支。
+  const outcome = await startAdmission(host, root, "continuation guard quiescent", ["docs/continuation-guard-quiescent.md"]);
+  assert.equal(outcome.accepted, true);
+  root.session.events = buildRootGuardEvents(1, "实现路径已经清楚，我去验证。");
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1);
+  await flushAsyncWork(8);
+  assert.deepEqual(host.agentSteerMessages(root), [], "等待期间不得提醒");
+
+  endChildTurn(host, children[0]);
+  host.setAgentStatus(children[0].child, "idle");
+  await flushAsyncWork(24);
+  assert.equal(await stop.settled, "settled");
+  const delivered = host.agentSteerMessages(root);
+  assert.equal(delivered.length, 1, "等待静止且无收口结论时必须补一次续接提醒");
+  assert.match(delivered[0].content.map((block) => block.text).join(""), /^Turn continuation guard:/);
+  assertNoGoalCalls(probe);
+});
+
+test("turn-stopping 兜底：等待期间插件卸载绝不投递续接提醒", async () => {
+  const probe = createGoalProbe();
+  const { host, root } = createWaitHost({ goalProbe: probe });
+  const outcome = await startAdmission(host, root, "continuation guard unload", ["docs/continuation-guard-unload.md"]);
+  const waiting = await finalize(host, root, outcome);
+  assert.equal(waiting.kind, "waiting");
+  root.session.events = buildRootGuardEvents(1, "实现路径已经清楚，我去验证。");
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1);
+  await flushAsyncWork(8);
+  assert.deepEqual(host.agentSteerMessages(root), [], "等待期间不得提醒");
+
+  // 卸载会让等待以 cancelled 结束；此时 turn 正在失效，绝不能再 steer 一条提醒。
+  await host.dispose();
+  await stop.settled;
+  assert.deepEqual(host.agentSteerMessages(root), [], "卸载后绝不能再投递续接提醒");
+  assertNoGoalCalls(probe);
+});
+
+test("turn-stopping 兜底：等待期间 root 代际退休绝不投递续接提醒", async () => {
+  const probe = createGoalProbe();
+  const { host, root } = createWaitHost({ goalProbe: probe });
+  const outcome = await startAdmission(host, root, "continuation guard retire", ["docs/continuation-guard-retire.md"]);
+  const waiting = await finalize(host, root, outcome);
+  assert.equal(waiting.kind, "waiting");
+  root.session.events = buildRootGuardEvents(1, "实现路径已经清楚，我去验证。");
+  const stop = stopRootTurn(host, root);
+  assert.equal(stop.pending, 1);
+  await flushAsyncWork(8);
+
+  // 同 id 的新代际：旧 root 先 dispose，再登记新 root。旧代际的等待以取消结束。
+  host.disposeAgent(root);
+  const replacement = host.registerRootAgent(ROOT_ID);
+  await stop.settled;
+  await flushAsyncWork(12);
+  assert.deepEqual(host.agentSteerMessages(root), [], "旧代际不得投递续接提醒");
+  assert.deepEqual(host.agentSteerMessages(replacement), [], "新代际不得继承旧 turn 的提醒");
+  assertNoGoalCalls(probe);
+});
+
+test("turn-stopping 兜底：等待被用户插话取消后绝不投递续接提醒", async () => {
+  const probe = createGoalProbe();
+  const { host, root } = createWaitHost({ goalProbe: probe });
+  const outcome = await startAdmission(host, root, "continuation guard abort", ["docs/continuation-guard-abort.md"]);
+  const waiting = await finalize(host, root, outcome);
+  assert.equal(waiting.kind, "waiting");
+  root.session.events = buildRootGuardEvents(1, "实现路径已经清楚，我去验证。");
+  const controller = new AbortController();
+  const stop = stopRootTurn(host, root, 1, controller.signal);
+  assert.equal(stop.pending, 1);
+  await flushAsyncWork(8);
+
+  controller.abort();
+  await stop.settled;
+  await flushAsyncWork(8);
+  assert.deepEqual(host.agentSteerMessages(root), [], "被取消的等待不得投递续接提醒");
   assertNoGoalCalls(probe);
 });
 

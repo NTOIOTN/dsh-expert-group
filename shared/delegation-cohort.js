@@ -97,6 +97,16 @@ export function createHandoffAdmissionCohort() {
       feedbackExact: false,
       pauseDone: false,
       failed: false,
+      /**
+       * 逐 child 进度放行的**一次性资格**（P1-B）。
+       *
+       * 首次精确结算（cohort.ready 且尚未用过资格）才允许把本次结算当作「进度放行」；
+       * 等待账本重新登记旧 admission 后重放同一条 settlement 不得再次放行 waiter。
+       * 新 admission / 新 child 天生是新 entry（重新获得资格）；activation replacement 在
+       * rebindChild / updateActivation 里显式撤销资格（新代际是新的结算机会）。
+       * 纯进程内状态：不进入快照、持久化或 RPC 字段。
+       */
+      progressGranted: false,
     };
     entries.push(entry);
     return entry;
@@ -117,6 +127,8 @@ export function createHandoffAdmissionCohort() {
     if (entry.turnGroup !== void 0 && !isValidTurnGroup(entry.turnGroup)) return false;
     entry.childId = childId;
     entry.messageId = void 0;
+    // replacement child 是新的 activation：重新给一次进度资格（旧代际的放行已消费）。
+    entry.progressGranted = false;
     if (entry.turnGroup !== void 0) {
       entry.turnGroup.childId = childId;
       entry.turnGroup.entries = entry.turnGroup.entries.filter(owns);
@@ -307,6 +319,8 @@ export function createHandoffAdmissionCohort() {
     }
     for (const entry of matches) {
       if (nextSession !== void 0) entry.session = nextSession;
+      // activation replacement / 冷恢复：新代际的结算机会重新获得一次进度资格。
+      if (entry.activation !== nextActivation) entry.progressGranted = false;
       entry.activation = nextActivation;
       if (entry.turnGroup !== void 0) {
         entry.turnGroup.activation = nextActivation;
@@ -323,6 +337,17 @@ export function createHandoffAdmissionCohort() {
     if (entry === void 0) return void 0;
     for (const member of groupEntries(entry)) member.feedbackSeen = true;
     return entry.turnGroup ?? entry;
+  };
+  /**
+   * 领取该 admission 的一次性进度放行资格（P1-B）。
+   *
+   * @param {object} entry - cohort entry（与 handoff entry 同一对象）。
+   * @returns {boolean} 是否**首次**领取成功；重复领取返回 false（幂等且不重复放行）。
+   */
+  const claimProgress = (entry) => {
+    if (!owns(entry) || entry.progressGranted === true) return false;
+    entry.progressGranted = true;
+    return true;
   };
   const markPauseDone = (entry) => {
     if (!owns(entry)) return false;
@@ -368,6 +393,7 @@ export function createHandoffAdmissionCohort() {
     markFeedback,
     updateActivation,
     markFeedbackGroup,
+    claimProgress,
     markPauseDone,
     allPaused,
     ready,

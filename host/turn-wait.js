@@ -197,6 +197,18 @@ function createTurnWaitRecord(agent, startedAt) {
     rootId: typeof agent.id === "string" ? agent.id : void 0,
     works: new Map(),
     waiters: new Set(),
+    /**
+     * 「待消费的进度信号」集合（P1-A）。
+     *
+     * 场景：child A 的精确 settlement 在 root 某个 step 执行期间到达，此时还没有 waiter。
+     * 若直接丢弃 progress 意图，随后建立的 waiter 会因剩余 child 未结算而持续 pending，
+     * A 已进入 next-step 的结算消息也就无法被宿主消费。因此这里按 workKey 记一笔 credit，
+     * wait() 建立 waiter 后立即消费它并做一次进度放行。
+     *
+     * 有界性：只有「结算后仍存在未结算工作且没有 waiter」才会写入；每个 key 至多一条
+     * （Set 幂等），work 只会减少，记录销毁时整体清空。
+     */
+    progressCredits: new Set(),
     version: 0,
     querySequence: 0,
     activeQueryId: 0,
@@ -621,6 +633,8 @@ function createTurnWaitLifecycle(state, observability) {
     releaseListeners(record);
     settleWaiters(record, released === true, reason);
     record.works.clear();
+    // 记录一旦退休，进度信号也必须一起失效：它们只对同一代际的 waiter 有意义。
+    record.progressCredits.clear();
     // 先按 owner 摘除，再清空引用：清空后 record 不再能让 Map 保留已退休 Agent。
     const owner = record.owner;
     record.owner = void 0;
@@ -832,17 +846,62 @@ function createTurnWaitCommands(state, lifecycle, observability) {
   /**
    * 精确结算一项工作。只有确实命中未结算项时才算结算（幂等）。
    *
+   * ## 逐 child 进度放行（options.progress）
+   * 默认语义（不传 options / progress 非 true）：结算只推进登记集，是否收口由
+   * `scheduleCheck` 的静止判定决定——只有**全部**工作结算且没有 running 后代时，
+   * 才销毁记录并把结论交给等待者。
+   *
+   * `options.progress === true` 时额外做一次「进度放行」：如果本次结算**之后**仍有
+   * 未结算工作（`works.size > 0`）且当前确实有 waiter 正在等待，就以
+   * `released:false, reason:"partial-settled"` 收口这些 waiter。
+   *
+   * 边界（必须严格保持）：
+   * - 只收口 waiter：**不**销毁记录、**不**清空 works、**不**解除监听、**不**关闭批次。
+   *   剩余工作继续由同一张账本登记，后续 settlement 仍走同一条精确结算路径；
+   * - 最后一个 child 结算时（结算后 `works.size === 0`）绝不走 progress，仍按原有
+   *   `scheduleCheck` → 静止判定 → `destroyRecord(record, true, "quiescent")` 收口，
+   *   因此单 child 场景不会被拆成「先放行、再投递」两段；
+   * - 没有 waiter（例如只登记、还没到 turn 边界）时 progress 是无副作用空操作；
+   * - 原因码固定为 `"partial-settled"`：调用方据此区分「进度放行」与「被取消」，
+   *   绝不对进度放行投递最终结论。
+   *
+   * @param {object} agent - exact root Agent。
+   * @param {{kind:string}} work - 工作描述（键规则见 turnWaitWorkKey）。
+   * @param {{progress?:boolean}} [options] - `progress:true` 允许逐 child 进度放行。
    * @returns {boolean} 是否结算成功。
    */
-  function settle(agent, work) {
+  function settle(agent, work, options) {
     const key = turnWaitWorkKey(work);
     if (key === void 0) return false;
     const record = records.get(agent);
     if (record === void 0 || record.destroyed === true) return false;
     const entry = record.works.get(key);
-    if (entry === void 0 || entry.settled === true) return false;
+    if (entry === void 0 || entry.settled === true) {
+      // 迟到的精确 settlement（真实时序）：回退通道（known snapshot）可能已先把这条 work
+      // 结算掉——Host 的 turn/end 与 settlement 之间约有 0.5s 间隔，回退复查往往先落地；
+      // 之后父 inbox 的 settlement 才真正进入 root 的 next-step。若这里直接返回，
+      // 「settlement 已进入 next-step」将永远拿不到一次进度放行，逐 child 放行永久丢失。
+      // 因此允许这**唯一一次**补放行：资格由调用方 claimProgress 保证只发一次，
+      // work 不会重复结算（它已不在 works 里）。
+      // works.size === 0 时不放行：最后一个 child 必须交给 scheduleCheck 的静止判定以
+      // quiescent 一次性收口，否则单 child 会被拆成「空放行 + 再投递」两段。
+      if (options?.progress === true && record.works.size > 0) {
+        if (record.waiters.size > 0) settleWaiters(record, false, "partial-settled");
+        else record.progressCredits.add(key);
+      }
+      return false;
+    }
     record.works.delete(key);
     record.version += 1;
+    // 进度放行：本次结算后仍有未结算工作 → 让 root 的当前 turn 在下一个 step 立刻消费
+    // 已经进入 next-step 的 child 结算消息。只收口 waiter：记录、works、监听与
+    // pending-close 批次全部保留，最终结论仍只在整批静止后投递一次。
+    // P1-A：通知可能先于 waiter 到达（root 正在执行 step）。此时不能丢弃进度意图，而是
+    // 把本次 workKey 记入 progressCredits，等下一个 waiter 建立时消费（见 wait()）。
+    if (options?.progress === true && record.works.size > 0) {
+      if (record.waiters.size > 0) settleWaiters(record, false, "partial-settled");
+      else record.progressCredits.add(key);
+    }
     // 工作与等待者都为空时提醒已无意义；有 waiter 仍在（等待静止确认）则保留。
     if (record.works.size === 0 && record.waiters.size === 0) clearLongWaitTimer(record);
     scheduleCheck(record);
@@ -872,7 +931,14 @@ function createTurnWaitCommands(state, lifecycle, observability) {
    */
   function cancelWaiters(agent, reason = "cancelled") {
     const record = records.get(agent);
-    if (record === void 0 || record.destroyed === true || record.waiters.size === 0) return false;
+    if (record === void 0 || record.destroyed === true) return false;
+    // 用户插话开启的是新一轮 run：**无论当前有没有 waiter**，都必须丢弃上一轮累积的
+    // 进度信号（P1-A 的 credit）。新输入路径即使此刻没有 waiter 也会调用本函数；若把
+    // 清理放在 waiters 检查之后，旧 credit 就会跨 run 存活，在下一次 turn-stopping 被
+    // 消费，导致没有新 settlement 也返回 partial-settled，制造无新信息的空 step。
+    // 这里只清 credit：works、监听与 pending-close 状态保持不变（专家仍可能运行）。
+    record.progressCredits.clear();
+    if (record.waiters.size === 0) return false;
     settleWaiters(record, false, reason);
     clearRetryTimer(record);
     // 票据 11：取消 waiter 后必须清理长等待提醒；后续新 waiter/track 会从当前时间桶
@@ -924,6 +990,21 @@ function createTurnWaitCommands(state, lifecycle, observability) {
       waiter.cleanup = cleanup;
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted === true) onAbort();
+    }
+    // P1-A：结算先于 waiter 到达的进度信号已记在 credit 上。waiter 一建立就消费它并立即
+    // 按进度放行（语义等同于结算时刻 progress），宿主因此能在当前 turn 继续一个 step 消费
+    // 已进入 next-step 的 settlement。剩余 credit 一并丢弃：一次放行已足以让宿主消费该
+    // step 内的全部已到达结算，留下旧信号只会在后续边界产生没有新信息的空放行。
+    // works 已空时（最后一个 child 已结算）绝不走这条路径：交由 scheduleCheck 的静止判定
+    // 走 quiescent，否则单 child 场景会被拆成「先空放行、再投递」两段。
+    if (record.progressCredits.size > 0 && record.works.size > 0) {
+      record.progressCredits.clear();
+      if (record.waiters.delete(waiter)) {
+        waiter.cleanup?.();
+        waiter.cleanup = void 0;
+        waiter.resolve({ released: false, reason: "partial-settled" });
+        return deferred.promise;
+      }
     }
     scheduleCheck(record);
     return deferred.promise;

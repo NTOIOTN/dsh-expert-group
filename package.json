@@ -97,6 +97,7 @@
     "host/handoff.js",
     "host/lineage.js",
     "host/turn-wait.js",
+    "host/turn-continuation-guard.js",
     "host/notifications.js",
     "host/rpc-transport.js",
     "host/settings-source.js",

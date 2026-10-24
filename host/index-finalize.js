@@ -20,8 +20,15 @@
  */
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
-import { diagnosticToken } from "./runtime-diagnostics.js";
+import { diagnosticToken, safeErrorLabel } from "./runtime-diagnostics.js";
 import { PRODUCER_SOURCE_KIND } from "./plugin-identity.js";
+import { sessionEvents } from "./expert-group-projection.js";
+import {
+  buildContinuationReminder,
+  canNudgeTurn,
+  continuationHintOf,
+  markTurnNudged,
+} from "./turn-continuation-guard.js";
 
 /**
  * 创建 finalize 收口域能力面（F1–F5）。
@@ -1123,14 +1130,33 @@ function pendingRootAutomaticAdmissions(parent) {
  * - **一次性投递**：等待明确 released 且 signal 未取消、exact root/generation 仍 live
  *   时，才投递一次终态结论并关闭批次。
  *
+ * ## 逐 child 进度放行（同一 turn 多 step，不结束 turn）
+ * 等待账本的精确通道（child turn 已结束且收到精确关联的父 inbox settlement）会在结算
+ * 一个 child 时以 `released:false, reason:"partial-settled"` 提前收口本次 waiter。此时
+ * **不**结束 turn：DSH 的 `agent/turn-stopping` 监听器 resolve 后仍会再读 nextStep，而
+ * 该 child 的 settlement 已经作为 inject/steer 进入 `inbox.next-step`，因此宿主会在
+ * 同一 turn 继续一个 **step** 消费它——root 不进入 idle，goal round driver 也不会前进。
+ *
+ * 边界：进度放行只收口 waiter，等待记录、剩余工作与 pending-close 批次全部保留；
+ * 最终结论仍只在整批静止（`quiescent`）后**一次性**投递一次。被取消的 waiting
+ * （abort / root 退休 / 卸载）依旧不投递，留给后续 turn 接续。
+ *
+ * ## 返回值：本次等待路径是否已经续接 turn / 是否被取消
+ * 调用方（onTurnStopping）据此决定是否再补一条续接提醒，避免同一 turn 里叠加两条续接消息：
+ * - `continued: true`：逐 child 进度放行（结算消息已进入 next-step）或收口结论已成功 steer；
+ * - `cancelled: true`：等待被取消（用户插话 / abort / root 退休 / 插件卸载 / 人工逃生）——
+ *   turn 正在收尾或已失效，绝不能在这个时刻再投递续接提醒；
+ * - 其余：既没有续接、也没有取消（静止但没有 pending-close、本来就没有可等待的工作），
+ *   调用方可以补一条续接提醒。
+ *
  * @param {object} parent - exact live root Agent。
  * @param {AbortSignal} [signal] - 本次 root turn 的 signal。
- * @returns {Promise<void>} 静止、收口完成或等待被取消后返回。
+ * @returns {Promise<{continued:boolean, cancelled:boolean}>} 等待结束后的续接/取消事实。
  */
 async function awaitRootTurnWaitFallback(parent, signal) {
   // 票据 11：人工逃生已经关闭该批次时直接放行。abandoned 是显式标记（closed 之外
   // 的语义位），保证即使账本仍被其它路径 engage 也绝不重新等待或投递。
-  if (getAdmissionBatch(parent)?.abandoned === true) return;
+  if (getAdmissionBatch(parent)?.abandoned === true) return { continued: false, cancelled: true };
   // 同步取一次 pending-close 快照：等待期间批次可能被其它边界关闭或代际退休，
   // 投递前的身份复查（deliverRootFinalizationConclusion）据此拒绝过期投递。
   const pendingClose = pendingCloseBatchFor(parent);
@@ -1143,22 +1169,94 @@ async function awaitRootTurnWaitFallback(parent, signal) {
   if (pendingClose !== void 0) reengagePendingCloseWorks(parent, pendingClose);
   // 即使没有补登记的工作项，只要该 root 曾经 engage 过等待体系（例如纯
   // continue_parent_turn 留下的正在运行的 child），也必须让同一状态机判定一次。
-  if (!rootTurnWaits.isEngaged(parent)) return;
+  //
+  // 但 pending-close 批次存在时**不能**因为 isEngaged() 为 false 提前返回：逐 child 进度
+  // 放行会制造一个「没有 waiter 的静止窗口」——最后一个 child 在 root 新 step 执行期间精确
+  // 结算，settle 后 works 已空，静止判定直接以 quiescent 销毁记录并收口，而此刻没有 waiter
+  // 接收；随后 reengage 也可能找不到可重新登记的 admission（结算后已离开 handoff）。
+  // 若这里直接返回，pending-close 批次将永远不关闭，收口结论永远不会投递。继续 wait 是安全
+  // 的：它会 ensureRecord，并立即按静止判定收口（没有 running 后代时以 released 收口）。
+  if (pendingClose === void 0 && !rootTurnWaits.isEngaged(parent)) {
+    return { continued: false, cancelled: false };
+  }
   const outcome = await rootTurnWaits.wait(parent, signal);
   if (outcome.released !== true) {
+    if (outcome.reason === "partial-settled") {
+      // 进度放行：已完成 child 的结算消息已经在 root 的 next-step 里，
+      // turn-stopping 返回后宿主会在同一 turn 继续一个 step 消费它。
+      // 记录/剩余工作/pending-close 全部保留，最终结论仍只在整批静止后投递一次。
+      // 这里标记 continued：turn 已经被结算消息续接，调用方不得再补续接提醒。
+      return { continued: true, cancelled: false };
+    }
     // 取消（用户插话 / abort / root 退休 / 插件卸载）不是专家完成：pending-close 批次
     // 保持开放，既不关闭也不投递，后续 root turn 可以重建等待继续收口。
+    // cancelled 必须如实返回：取消时刻 turn 正在失效，续接提醒会造成“卸载后仍投递”。
     logger.warn("dsh-expert-group: root turn wait fallback was cancelled (" + outcome.reason + ")");
-    return;
+    return { continued: false, cancelled: true };
   }
-  if (pendingClose === void 0) return;
-  deliverRootFinalizationConclusion(parent, pendingClose, signal);
+  if (pendingClose === void 0) return { continued: false, cancelled: false };
+  return { continued: deliverRootFinalizationConclusion(parent, pendingClose, signal) === true, cancelled: false };
+}
+
+/**
+ * 有界的 root turn 续接提醒（turn continuation guard 的接线层）。
+ *
+ * 为什么在 turn-stopping 里做：DSH 在 turn 即将关闭时先 await 这个 serial 监听器，
+ * 之后重新检查 next-step inbox。因此在这里 steer 一条 DEG 来源的 user message，宿主
+ * 会在同一 turn 继续一个 step，而不是把 turn 关掉、让用户手动输入“继续”。
+ *
+ * 边界（缺一不可）：
+ * - 只对 root 生效（本函数只由 root 的 turn-stopping 兜底调用）；
+ * - `payload.turn` 必须是安全整数；`payload.signal` 已取消的 turn 不提醒；
+ * - **投递前重新复查**：插件卸载闩 `isRootWaitStopping()`、root 是否仍 live、
+ *   批次是否已被人工逃生关闭（abandoned）——等待期间这三个事实都可能变化，
+ *   只看入口处的判定会让“卸载/退休/人工逃生之后”仍然收到一条续接提醒；
+ * - 同一 root 同一 turn 至多一次（canNudgeTurn / markTurnNudged），turn 变化即重置；
+ * - 先登记再 steer：即使 steer 抛错，同一 turn 也不会二次投递；
+ * - 任何异常都只记告警（固定动作名 + 安全错误名），绝不抛回 DSH（turn-stopping 抛错
+ *   会变成 turn error），也绝不把 error.message 写进日志（可能夹带会话正文/路径/凭据）；
+ * - 不读改等待账本、不关闭批次、不投递收口结论。
+ *
+ * @param {object} parent - exact live root Agent。
+ * @param {object} payload - turn-stopping 载荷（agent / turn / signal）。
+ * @returns {boolean} 是否真的投递了续接提醒。
+ */
+function maybeSteerContinuation(parent, payload) {
+  try {
+    const turn = payload?.turn;
+    if (!Number.isSafeInteger(turn)) return false;
+    if (payload?.signal?.aborted === true) return false;
+    // 投递前重新复查生命周期：等待期间插件可能卸载、root 可能退休、批次可能被人工关闭。
+    if (isRootWaitStopping()) return false;
+    if (!isLiveRootAgent(parent)) return false;
+    if (getAdmissionBatch(parent)?.abandoned === true) return false;
+    const hint = continuationHintOf(sessionEvents(parent?.session), turn);
+    if (hint === null) return false;
+    if (!canNudgeTurn(parent, turn)) return false;
+    if (typeof parent?.steer !== "function") return false;
+    // 先登记后投递：steer 抛错也算本 turn 已提醒，避免同一边界反复重试。
+    markTurnNudged(parent, turn);
+    try {
+      parent.steer(buildContinuationReminder());
+    } catch (error) {
+      logger.warn("dsh-expert-group: turn continuation steer failed: " + safeErrorLabel(error));
+      return false;
+    }
+    return true;
+  } catch (error) {
+    logger.warn("dsh-expert-group: turn continuation guard failed: " + safeErrorLabel(error));
+    return false;
+  }
 }
 
 /**
  * DSH 的 agent/turn-stopping 是 serial 事件：监听器可以返回 Promise，loop 会 await
  * 后再关闭 turn，因此这里可以安全地保持 turn 打开直到专家真正结束。监听器自身绝不
  * 抛错——DSH 会把 turn-stopping 的异常变成 turn 错误，兜底必须 fail-open。
+ *
+ * 同一边界还承担有界的**续接保护**（turn continuation guard）：没有等待工作时，如果
+ * 本 turn 最后一条 assistant 消息是一次“下一步动作宣言”，就 steer 一次提醒让 turn 继续；
+ * 走等待路径时只有在等待本身没有续接 turn（既无进度放行结算、也无收口结论投递）后才补提醒。
  */
 function onTurnStopping(payload) {
   const parent = payload?.agent;
@@ -1171,10 +1269,22 @@ function onTurnStopping(payload) {
   // （isEngaged() 为 false），只看账本现状会漏掉整条收口链路。
   if (pendingCloseBatchFor(parent) === void 0
     && !rootTurnWaits.isEngaged(parent)
-    && pendingRootAutomaticAdmissions(parent).length === 0) return;
-  return awaitRootTurnWaitFallback(parent, payload?.signal).catch((error) => {
-    logger.warn("dsh-expert-group: root turn wait fallback failed: " + (error instanceof Error ? error.message : String(error)));
-  });
+    && pendingRootAutomaticAdmissions(parent).length === 0) {
+    // 没有等待工作：本边界唯一的职责就是续接保护（有界、fail-open）。
+    maybeSteerContinuation(parent, payload);
+    return;
+  }
+  return awaitRootTurnWaitFallback(parent, payload?.signal)
+    .then((outcome) => {
+      // 只有“既没续接、也没取消”才补提醒：取消（用户插话 / abort / 退休 / 卸载 /
+      // 人工逃生）说明 turn 正在收尾或已失效，此刻投递会造成卸载后仍写消息。
+      if (!outcome.continued && !outcome.cancelled) maybeSteerContinuation(parent, payload);
+    })
+    .catch((error) => {
+      // 与续接护栏同一安全口径：只记录动作名 + 安全错误名，绝不拼接 error.message
+      // （等待路径的异常可能夹带会话正文、prompt 片段、路径或凭据）。
+      logger.warn("dsh-expert-group: root turn wait fallback failed: " + safeErrorLabel(error));
+    });
 }
 
 

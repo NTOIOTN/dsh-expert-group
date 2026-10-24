@@ -64,6 +64,22 @@ export function diagnosticTime(value) {
 }
 
 /**
+ * 异常的安全标签：只保留"看起来像常规错误名"的标识符，其余一律归为 Error/类型名。
+ *
+ * 为什么**不能**输出 message：日志里的异常可能来自宿主 provider、会话读取器甚至文件系统，
+ * message 里可能夹带会话正文、prompt 片段、绝对路径或凭据；日志只需要回答"哪一步失败、
+ * 错误类型是什么"。白名单口径与 host/index-root-wait.js 的本地实现完全一致：只接受
+ * ASCII 标识符（允许 . 分隔的命名空间形），长度上限 64；控制字符、换行、路径分隔符与
+ * 中文等一律不输出，非对象按 typeof 归类。
+ */
+export function safeErrorLabel(error) {
+  const isObject = error !== null && typeof error === "object";
+  const name = isObject ? error.name : undefined;
+  if (typeof name === "string" && /^[A-Za-z_$][A-Za-z0-9_$.]{0,63}$/.test(name)) return name;
+  return isObject ? "Error" : typeof error;
+}
+
+/**
  * 限流诊断的行数上限（票据 26）：role/provider 映射来自设置，诊断投影必须有界。
  * 超出部分按对象插入序截断——它们是低频配置项，不是需要完整分页的数据面。
  */

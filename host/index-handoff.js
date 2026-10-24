@@ -905,22 +905,12 @@ function markPendingHandoffFeedback(agent, childId, message, deliveryId, sourceL
   });
   return entry;
 }
-/**
- * 把 cohort 已就绪的 admission 从等待登记表里**精确结算**。
- *
- * 就绪 = 该 admission 的 turn 已经结束（child turn/end 边界）且收到了精确关联的
- * 父 inbox settlement（cohort.ready 的判定）。这是「exact 完成通知」这条释放通道：
- * 只有精确关联的通知才结算对应的 token，重复/错误/他 root/旧代际的通知都不会命中
- * 未结算项，因此是安全的幂等空操作。
- *
- * entry 本身**不**在这里摘除：它仍由既有的 release/清理路径负责，保证「同一 child
- * 的后续 admission 不会绕过 cohort」的既有语义不变。
- */
-/** 精确结算一个 admission 的等待工作（token 非法 / 已结算时是安全空操作）。 */
-function settleAdmissionTurnWait(agent, entry) {
+/** 精确结算一个 admission 的等待工作（token 非法 / 已结算时是安全空操作）。
+ * options.progress 透传给等待账本，仅精确通道使用（见 settleFinishedChildTurnWaits）。 */
+function settleAdmissionTurnWait(agent, entry, options) {
   const token = typeof entry?.token === "string" && entry.token.length > 0 ? entry.token : void 0;
   if (token === void 0) return false;
-  return rootTurnWaits.settle(agent, { kind: "admission", token });
+  return rootTurnWaits.settle(agent, { kind: "admission", token }, options);
 }
 /**
  * 把已经真正结束的 admission 从等待登记表里**精确结算**。
@@ -933,8 +923,10 @@ function settleAdmissionTurnWait(agent, entry) {
  *    已结束，且它的 exact child 明确不在 running 后代列表里。unknown / 查询失败 /
  *    血缘无法确定时绝不会走到这里——调用方只在 `known === true` 的快照上调用。
  *
- * entry 本身**不**在这里摘除：它仍由既有的 release/清理路径负责，保证「同一 child
- * 的后续 admission 不会绕过 cohort」的既有语义不变。
+ * ## 进度放行（**只有精确通道**，一次性资格）
+ * 回退通道可能先结算同一 admission（Host 的 turn/end 与 settlement 间隔约 0.5s），但那时
+ * settlement **还没进入 root 的 next-step**，放行会让 turn 空转收口（root 进 idle，durable
+ * goal round 可能推进）。故回退只结算 work；迟到的精确 settlement 由 turn-wait 补放行。
  *
  * @param {object} agent - exact root Agent。
  * @param {{known:boolean,runningIds?:Set<string>}} [snapshot] - 明确的后代快照；
@@ -944,10 +936,15 @@ function settleFinishedChildTurnWaits(agent, snapshot) {
   if (!isLiveRootAgent(agent)) return;
   const known = snapshot?.known === true;
   const runningIds = known && snapshot.runningIds instanceof Set ? snapshot.runningIds : void 0;
+  // 只有**精确通道**才申请进度资格（传 snapshot 即回退通道）：回退时 settlement 未进
+  // next-step，放行会让 turn 空转收口。
+  const allowProgress = snapshot === void 0;
   for (const entry of host.handoff.entries()) {
     if (entry.parent !== agent || entry.failed === true) continue;
     if (handoffAdmissionCohort.ready(agent, entry)) {
-      settleAdmissionTurnWait(agent, entry);
+      // 精确通道：每个 admission 只有一次进度资格，重放/重复复查不得再放行。
+      const grant = allowProgress === true && handoffAdmissionCohort.claimProgress(entry);
+      settleAdmissionTurnWait(agent, entry, grant ? { progress: true } : void 0);
       continue;
     }
     if (runningIds === void 0) continue;
@@ -955,6 +952,8 @@ function settleFinishedChildTurnWaits(agent, snapshot) {
     const childId = entry.childId;
     if (typeof childId !== "string" || childId.length === 0) continue;
     if (runningIds.has(childId)) continue;
+    // 回退通道：只结算 work，**不**申请 progress（空放行会让 turn 结束、root 进 idle）；
+    // 迟到的精确 settlement 会再进本函数，那时才补放行。
     settleAdmissionTurnWait(agent, entry);
   }
 }
