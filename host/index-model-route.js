@@ -1055,6 +1055,12 @@ function installSettingsCandidateValidation(deps, api) {
       if (hasAutoOpenSubagentSidebar && typeof candidate.autoOpenSubagentSidebar !== "boolean") {
         throw new ValidationError("设置 autoOpenSubagentSidebar 无效");
       }
+      // 左侧栏入口沿用同一兼容语义（与 taskManagementEnabled / autoOpenSubagentSidebar 逐字同款）：
+      // 缺字段表示旧客户端，不写 patch；显式提供时严格要求布尔，绝不用 truthy 值隐式隐藏入口。
+      const hasSidebarEntryEnabled = candidate.sidebarEntryEnabled !== void 0;
+      if (hasSidebarEntryEnabled && typeof candidate.sidebarEntryEnabled !== "boolean") {
+        throw new ValidationError("设置 sidebarEntryEnabled 无效");
+      }
       // 角色集合固定为内置六角色（自定义角色能力已删除）。
       const candidateRoleRegistry = roleCatalog();
       const candidateRoleIds = STATUS_ROLE_IDS;
@@ -1156,6 +1162,8 @@ function installSettingsCandidateValidation(deps, api) {
           taskManagementEnabled: candidate.taskManagementEnabled !== false,
           // 缺字段（旧客户端/旧文档）按关闭归一：默认必须维持「无自动 open/close」的历史行为。
           autoOpenSubagentSidebar: candidate.autoOpenSubagentSidebar === true,
+          // 缺字段（旧客户端/旧文档）按开启归一：默认必须维持左侧栏入口可见的历史行为。
+          sidebarEntryEnabled: candidate.sidebarEntryEnabled !== false,
         },
         // 本次真正调用过真实目录解析的角色（测试与诊断据此证明"只解析变更项"）。
         modelRoles: resolvedRoles,
@@ -1241,6 +1249,9 @@ function installSettingsCommit(deps, api) {
       // 自动打开同理：缺字段不写 patch，也不在响应里新增字段——一次无关的通知设置保存
       // 绝不能把用户已经开启的自动打开重置回默认关闭。
       const hasAutoOpenSubagentSidebar = candidate?.autoOpenSubagentSidebar !== void 0;
+      // 左侧栏入口同理：缺字段不写 patch，也不在响应里新增字段——一次无关的通知设置保存
+      // 绝不能把用户已经关闭（或开启）的左侧栏入口重置回默认值。
+      const hasSidebarEntryEnabled = candidate?.sidebarEntryEnabled !== void 0;
       // 提示词覆盖同理：缺字段不写 patch，避免旧客户端的保存顺带清空已有自定义提示词。
       const hasPromptOverrides = candidate?.[PROMPT_OVERRIDES_SETTINGS_KEY] !== void 0;
       // 通知事件类型（票据 14）同样是显式字段才写 patch / 才回传：旧客户端的响应形状不变。
@@ -1297,6 +1308,8 @@ function installSettingsCommit(deps, api) {
           ...(hasTaskManagementEnabled ? { taskManagementEnabled: validatedSettings.taskManagementEnabled } : {}),
           // 自动打开沿用同一写面规则：只有显式提供该字段的候选才能改写它。
           ...(hasAutoOpenSubagentSidebar ? { autoOpenSubagentSidebar: validatedSettings.autoOpenSubagentSidebar } : {}),
+          // 左侧栏入口沿用同一写面规则：只有显式提供该字段的候选才能改写它。
+          ...(hasSidebarEntryEnabled ? { sidebarEntryEnabled: validatedSettings.sidebarEntryEnabled } : {}),
           // 提示词覆盖按整份映射提交（不做键级合并）：空对象显式清空全部自定义提示词。
           ...(hasPromptOverrides ? { [PROMPT_OVERRIDES_SETTINGS_KEY]: validatedSettings[PROMPT_OVERRIDES_SETTINGS_KEY] } : {}),
           // 并发映射按整份映射 replace（票据 26）：空对象显式清空覆盖，回到默认值/不限制。
@@ -1318,6 +1331,7 @@ function installSettingsCommit(deps, api) {
         if (candidate.roleTimeoutMs === void 0) delete committedSettings.roleTimeoutMs;
         if (!hasTaskManagementEnabled) delete committedSettings.taskManagementEnabled;
         if (!hasAutoOpenSubagentSidebar) delete committedSettings.autoOpenSubagentSidebar;
+        if (!hasSidebarEntryEnabled) delete committedSettings.sidebarEntryEnabled;
         if (!hasPromptOverrides) delete committedSettings[PROMPT_OVERRIDES_SETTINGS_KEY];
         if (!hasNotificationEvents) delete committedSettings.notificationEvents;
         if (!hasCandidates) delete committedSettings.candidates;

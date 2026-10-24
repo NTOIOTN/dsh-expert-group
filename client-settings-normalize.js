@@ -623,6 +623,8 @@
         taskManagementEnabled: source.taskManagementEnabled !== false,
         // 自动打开缺字段/非法值时一律按关闭归一：默认不做任何自动 open/close。
         autoOpenSubagentSidebar: source.autoOpenSubagentSidebar === true,
+        // 左侧栏入口与任务管理同款宽松语义：只有显式 false 才隐藏入口；缺字段/非法值按开启归一。
+        sidebarEntryEnabled: source.sidebarEntryEnabled !== false,
         // 票据 24：候选与降级上限**只在源文档显式存在时**进入草稿/提交形状。
         // 缺字段 = 旧客户端/旧文档：不凭空写回默认值，Host 因此可以保持已有配置。
         ...(Object.prototype.hasOwnProperty.call(source, "candidates")
@@ -656,6 +658,7 @@
       "observerPreferred",
       "taskManagementEnabled",
       "autoOpenSubagentSidebar",
+      "sidebarEntryEnabled",
       "candidates",
       "fallbackLimit",
     ]);

@@ -133,6 +133,9 @@ const IIFE_EXECUTION_ORDER = Object.freeze([
   "client-conversation-adapters.js",
   "client-nav-icon.js",
   "client-plugin-detail.js",
+  // 左侧栏入口 + 同名 main 面板：不读任何兄弟 IIFE 检查点（react 与设置依赖由 descriptor
+  // 在运行期传入），因此排在同类 R8 客户端模块之后、唯一 descriptor 之前即可。
+  "client-sidebar-entry.js",
 ]);
 
 /**
@@ -148,7 +151,7 @@ const FRESHNESS_EXECUTION_SOURCE = "client-freshness.js";
 const DESCRIPTOR_EXECUTION_SOURCE = "client-entry.js";
 
 /**
- * ① 装配顺序：51 个 IIFE → freshness 投影 → 唯一 descriptor。
+ * ① 装配顺序：52 个 IIFE → freshness 投影 → 唯一 descriptor。
  *
  * 消费者：`scripts/assemble-client.mjs`（决定段序与 sourceNames）、
  * `test/bundle-size-gate.test.mjs`（段序断言的期望值）、
@@ -264,6 +267,14 @@ export const iifeDependencies = Object.freeze([
     from: "client-model-config.js",
     to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-model-config"]),
+    via: "iife-symbol",
+  }),
+  // 左侧栏入口提供检查点给 descriptor：descriptor 在 apply 里取回 installDegSidebarEntry，
+  // 由它注册 sidebar.panellist 行与同名 main 面板。
+  Object.freeze({
+    from: "client-sidebar-entry.js",
+    to: "client-entry.js",
+    symbols: Object.freeze(["dsh-expert-group/client-sidebar-entry"]),
     via: "iife-symbol",
   }),
   Object.freeze({

@@ -328,10 +328,9 @@
    * 布局装配体：把「宿主布局句柄 + 每次访问的记账 + 宽度状态容器」交给本次 install。
    *
    * `frame` 是 coordinator 持有的**同一份可写框**（config / 服务 / disposed / 各模块句柄），
-   * 本模块只读 config 与服务、只写自己的句柄；绝不复制 `disposed` 或 config（复制即双 owner）。
+   * 本模块只读 frame 上的服务、只写自己的句柄；绝不复制 `disposed` 或 config（复制即双 owner）。
    */
   function createSidebarInstallLayout(frame) {
-    const config = frame.config;
     /**
      * 右栏拖拽手柄锁（Expert Group 页专属）：只在当前活动 tab 就是 Expert Group 时生效，
      * 切换页面、切换会话或卸载都会按同一条证据链恢复。状态与 DOM 写入都在这里，面板只通过
@@ -423,17 +422,6 @@
      * **全局**展示是否已经展开过，它才是「切换 child 时不再重展开」的判据。
      */
     const surfaceRecords = new Map();
-    /** 每次访问最多发出的打开请求次数（首次 + 通知/定时器驱动的有界重试）。 */
-    const MAX_SURFACE_OPEN_ATTEMPTS = 3;
-    /** 每次访问内自动定时重试的上限（其余重试机会由后续通知驱动，同样受上面的总次数约束）。 */
-    const MAX_SURFACE_OPEN_RETRIES = 1;
-    /** 打开请求的 defer 延迟：至少一个宏任务，排在宿主本次提交（surface/seat/binding）之后。 */
-    const SURFACE_OPEN_DELAY_MS = 0;
-    /** 打开失败后的短重试间隔（timer 纳入 dispose 清理）。 */
-    const SURFACE_OPEN_RETRY_MS = 250;
-    /** 「等宿主提交活跃会话」的短重试上限与间隔：通知先到、binding 稍后提交时靠它兜住。 */
-    const MAX_READINESS_RETRIES = 3;
-    const HOST_COMMIT_RETRY_MS = 250;
     const surfaceRecordOf = (sessionId) => {
       let record = surfaceRecords.get(sessionId);
       if (record === undefined) {

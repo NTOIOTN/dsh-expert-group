@@ -5,7 +5,7 @@
  * **归一与状态推导**这一半：
  * 1. 无副作用原语：isObject / text / firstText / numberOrNull，以及有界归一原语
  *    （countOrNull / boundedText / durationBetween / collapseFailureMessage / redactFailurePaths）；
- * 2. 状态推导：normalizeStatus / statusFromTask / identityOf / runningOf / activitySignalOf /
+ * 2. 状态推导：normalizeStatus / statusFromTask / runningOf / activitySignalOf /
  *    runtimeStatusOf，以及运行摘要（normalizeRunSummary）与恢复块（normalizeRecovery）归一；
  * 3. 快照树归一：能力、时间线、attempt / shard / fanout / session 节点，直到
  *    normalizeExpertGroupSnapshot —— 快照树归一是状态推导的核心，不留在展示侧。
@@ -248,11 +248,6 @@
     if (source === "completed" || source === "complete") return "succeeded";
     if (source === "completed_with_errors") return "failed";
     return normalizeStatus(source);
-  }
-
-  function identityOf(value) {
-    const source = isObject(value) ? value : {};
-    return firstText(source.id, source.sessionId, source.childId, source.parentTaskId);
   }
 
   function runningOf(status, explicit) {

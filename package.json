@@ -59,6 +59,7 @@
     "client-conversation-adapters.js",
     "client-nav-icon.js",
     "client-plugin-detail.js",
+    "client-sidebar-entry.js",
     "client-sidebar-views-a.js",
     "client-sidebar-views-b.js",
     "client-sidebar-views-c.js",

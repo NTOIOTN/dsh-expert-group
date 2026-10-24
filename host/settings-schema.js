@@ -293,6 +293,9 @@ export const Config = z.object({
   // 「自动打开运行中的子代理侧栏」默认关闭：这是纯增量体验，旧文档/旧客户端缺字段时
   // 必须保持「不做任何自动 open/close」的历史行为，绝不能按开启解释。
   autoOpenSubagentSidebar: z.boolean().default(false).volatile(),
+  // 「左侧栏 DEG 入口」默认开启：缺字段的旧文档/旧客户端必须维持左侧栏入口可见的历史行为，
+  // 因此读取面一律用宽松语义（!== false）归一，绝不按关闭解释。
+  sidebarEntryEnabled: z.boolean().default(true).volatile(),
   // 六个角色的专家专属提示词覆盖（角色 id -> 自定义文本）。缺失或空对象表示全部
   // 使用代码里的默认 persona；这里只做类型层（角色键与长度）校验，写入边界的
   // 语义校验在 DEG 自有提交端点内（宿主新契约没有 validate 钩子）。

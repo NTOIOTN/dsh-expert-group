@@ -81,6 +81,63 @@
   }
 
   /**
+   * 把「标量 / 开关」字段的保存 op 追加到 ops（provider/defaults 与提示词由调用方负责）。
+   *
+   * 为什么单独成函数：deriveSettingsSavePlan 已经贴着 200 行上限，新增「左侧栏入口」时
+   * 必须把整块逐字段判定外移，而不是继续在保存计划里堆行数。这里**只做搬移**：判定条件、
+   * op 形状与追加顺序与搬移前逐字一致（`changed` 集由 ops 顺序推导，顺序不得调整）。
+   *
+   * @param {object[]} ops - 保存计划的可变 op 数组（就地追加）。
+   * @param {object} candidate - 已组装的完整候选。
+   * @param {object} source - 最新权威配置（草稿合成的基底）。
+   * @param {boolean} promptChanged - 提示词覆盖是否真的变化。
+   * @param {Record<string, string>} candidatePromptOverrides - 归一后的提示词覆盖映射。
+   * @returns {void}
+   */
+  function pushScalarChangeOps(ops, candidate, source, promptChanged, candidatePromptOverrides) {
+        if (candidate.notificationEnabled !== source.notificationEnabled) {
+          ops.push({ op: "set", path: ["notificationEnabled"], value: candidate.notificationEnabled });
+        }
+        if (candidate.notificationVolume !== source.notificationVolume) {
+          ops.push({ op: "set", path: ["notificationVolume"], value: candidate.notificationVolume });
+        }
+        // 通知事件过滤（票据 14）：三个类别是一组完整设置，只有真正变化才写 op；
+        // 旧 Host 不认识该字段时会被提交端点按"未知字段"忽略，不会影响其它字段。
+        if (!settingsDraftEqual(candidate.notificationEvents, source.notificationEvents)) {
+          ops.push({ op: "set", path: ["notificationEvents"], value: candidate.notificationEvents });
+        }
+        if (candidate.observerPreferred !== source.observerPreferred) {
+          ops.push({ op: "set", path: ["observerPreferred"], value: candidate.observerPreferred });
+        }
+        if (candidate.roleConcurrencyLimit !== source.roleConcurrencyLimit) {
+          ops.push({ op: "set", path: ["roleConcurrencyLimit"], value: candidate.roleConcurrencyLimit });
+        }
+        // 角色默认超时（票据 06）：只有真正变化才写 op，避免一次无关保存把
+        // 用户已保存的值重置回 0。
+        if (candidate.roleTimeoutMs !== source.roleTimeoutMs) {
+          ops.push({ op: "set", path: ["roleTimeoutMs"], value: candidate.roleTimeoutMs });
+        }
+        // 任务管理开关单独成一个保存 op，只用于判定「是否真的需要提交」；
+        // 新客户端的完整候选始终显式携带该字段，Host 按「显式字段才写 patch」处理。
+        if (candidate.taskManagementEnabled !== source.taskManagementEnabled) {
+          ops.push({ op: "set", path: ["taskManagementEnabled"], value: candidate.taskManagementEnabled });
+        }
+        // 自动打开与任务管理同一形状：新客户端的完整候选始终显式携带该字段，
+        // Host 按「显式字段才写 patch」处理，旧客户端缺字段因此不可能覆盖它。
+        if (candidate.autoOpenSubagentSidebar !== source.autoOpenSubagentSidebar) {
+          ops.push({ op: "set", path: ["autoOpenSubagentSidebar"], value: candidate.autoOpenSubagentSidebar });
+        }
+        // 左侧栏入口与上面两个开关同一形状：只有真的变化才写 op（change 集由 ops 自动推导），
+        // 新客户端的完整候选始终显式携带该字段，旧客户端缺字段因此不可能覆盖它。
+        if (candidate.sidebarEntryEnabled !== source.sidebarEntryEnabled) {
+          ops.push({ op: "set", path: ["sidebarEntryEnabled"], value: candidate.sidebarEntryEnabled });
+        }
+        if (promptChanged) {
+          ops.push({ op: "set", path: ["promptOverrides"], value: candidatePromptOverrides });
+        }
+  }
+
+  /**
    * 保存的「守卫 + 组装候选 + 变更集」阶段；返回 null 表示被守卫或校验拦下（调用方直接返回 false）。
    */
   function deriveSettingsSavePlan(view, retry) {
@@ -198,41 +255,8 @@
           ops.push({ op: "set", path: ["provider"], value: candidate.provider });
           ops.push({ op: "set", path: ["defaults"], value: candidate.defaults });
         }
-        if (candidate.notificationEnabled !== source.notificationEnabled) {
-          ops.push({ op: "set", path: ["notificationEnabled"], value: candidate.notificationEnabled });
-        }
-        if (candidate.notificationVolume !== source.notificationVolume) {
-          ops.push({ op: "set", path: ["notificationVolume"], value: candidate.notificationVolume });
-        }
-        // 通知事件过滤（票据 14）：三个类别是一组完整设置，只有真正变化才写 op；
-        // 旧 Host 不认识该字段时会被提交端点按"未知字段"忽略，不会影响其它字段。
-        if (!settingsDraftEqual(candidate.notificationEvents, source.notificationEvents)) {
-          ops.push({ op: "set", path: ["notificationEvents"], value: candidate.notificationEvents });
-        }
-        if (candidate.observerPreferred !== source.observerPreferred) {
-          ops.push({ op: "set", path: ["observerPreferred"], value: candidate.observerPreferred });
-        }
-        if (candidate.roleConcurrencyLimit !== source.roleConcurrencyLimit) {
-          ops.push({ op: "set", path: ["roleConcurrencyLimit"], value: candidate.roleConcurrencyLimit });
-        }
-        // 角色默认超时（票据 06）：只有真正变化才写 op，避免一次无关保存把
-        // 用户已保存的值重置回 0。
-        if (candidate.roleTimeoutMs !== source.roleTimeoutMs) {
-          ops.push({ op: "set", path: ["roleTimeoutMs"], value: candidate.roleTimeoutMs });
-        }
-        // 任务管理开关单独成一个保存 op，只用于判定「是否真的需要提交」；
-        // 新客户端的完整候选始终显式携带该字段，Host 按「显式字段才写 patch」处理。
-        if (candidate.taskManagementEnabled !== source.taskManagementEnabled) {
-          ops.push({ op: "set", path: ["taskManagementEnabled"], value: candidate.taskManagementEnabled });
-        }
-        // 自动打开与任务管理同一形状：新客户端的完整候选始终显式携带该字段，
-        // Host 按「显式字段才写 patch」处理，旧客户端缺字段因此不可能覆盖它。
-        if (candidate.autoOpenSubagentSidebar !== source.autoOpenSubagentSidebar) {
-          ops.push({ op: "set", path: ["autoOpenSubagentSidebar"], value: candidate.autoOpenSubagentSidebar });
-        }
-        if (promptChanged) {
-          ops.push({ op: "set", path: ["promptOverrides"], value: candidatePromptOverrides });
-        }
+        // 其余标量/开关字段的 op 由模块级纯函数补齐（判定条件、op 形状与顺序均未改变）。
+        pushScalarChangeOps(ops, candidate, source, promptChanged, candidatePromptOverrides);
         /**
          * 变更集（票据 20，settings-commit 的可选协议字段 `changed`）。
          *

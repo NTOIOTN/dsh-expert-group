@@ -2944,9 +2944,13 @@ test("client：公开 apply 注册设置页、插件详情摘要、chat node、s
   assert.deepEqual([...host.registrations.keys()].sort(),
     [
       "conversation.chat.node",
+      // 左侧栏入口与主面板：sidebar.panellist 行随 sidebarEntryEnabled 动态注册，
+      // main 面板始终注册（见 client-sidebar-entry.js 与 test/sidebar-entry.test.mjs）。
+      "main",
       "plugins.bundle.config",
       "settings.section",
       "shell.overlay",
+      "sidebar.panellist",
       "sidebar.right.pane.tab",
     ]);
   const section = host.registrations.get("settings.section");

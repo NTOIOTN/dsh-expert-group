@@ -675,7 +675,7 @@
   }
 
   /**
-   * 任务管理与 Auto 开关行：两个开关各自独立，绝不随模型配置的折叠内容一起消失。
+   * 任务管理、Auto 与左侧栏入口开关行：三个开关各自独立，绝不随模型配置的折叠内容一起消失。
    */
   function renderSettingsTaskRow(view) {
     const {
@@ -702,7 +702,18 @@
               disabled: saving,
               onChange: (event) => editDraft((previous) => ({ ...previous, autoOpenSubagentSidebar: event.target.checked === true })),
             }),
-            react.createElement("span", { className: "deg_settings_label" }, t("settings.auto"))))
+            react.createElement("span", { className: "deg_settings_label" }, t("settings.auto"))),
+          // 「左侧栏入口」：默认开启，只有显式取消勾选才隐藏入口；与上面两个开关同处一行
+          // （行容器是 flex + wrap + 28px column-gap，第三个开关直接并入即可，无需改样式）。
+          react.createElement("label", { className: "deg_settings_checkbox" },
+            react.createElement("input", {
+              type: "checkbox",
+              "aria-label": t("settings.sidebarEntry"),
+              checked: draft.sidebarEntryEnabled,
+              disabled: saving,
+              onChange: (event) => editDraft((previous) => ({ ...previous, sidebarEntryEnabled: event.target.checked })),
+            }),
+            react.createElement("span", { className: "deg_settings_label" }, t("settings.sidebarEntry"))))
     );
 
     return taskRow;

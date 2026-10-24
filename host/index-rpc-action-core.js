@@ -684,6 +684,8 @@ async function handleMeta(deps, req) {
       taskManagementEnabled: snap.taskManagementEnabled !== false,
       // 自动打开默认关闭：meta 只回传归一后的生效布尔值。
       autoOpenSubagentSidebar: snap.autoOpenSubagentSidebar === true,
+      // 左侧栏入口默认开启（与任务管理同款宽松语义）：只有显式 false 才为 false。
+      sidebarEntryEnabled: snap.sidebarEntryEnabled !== false,
       // 只读提示词自定义投影：六个角色（含未启用的 observer）、各自当前生效的
       // 专家专属 persona 与 grapheme 上限。设置页据此渲染编辑器与"恢复默认"，
       // 不需要也不允许自己猜测 Host 状态。这里不含固定执行纪律副本。

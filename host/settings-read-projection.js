@@ -362,5 +362,8 @@ export function normalizeSnapshot(snapshot, visibleRoles) {
     // 只有显式 true 才开启自动打开；缺字段（旧文档/旧客户端/非法值）一律按关闭归一，
     // 历史行为因此逐字节不变：默认不做任何自动 open/close。
     autoOpenSubagentSidebar: snapshot?.autoOpenSubagentSidebar === true,
+    // 左侧栏入口与任务管理同款宽松语义：只有显式 false 才隐藏入口；缺字段（旧文档/旧客户端）
+    // 与非布尔值一律按开启归一，历史行为因此逐字节不变。
+    sidebarEntryEnabled: snapshot?.sidebarEntryEnabled !== false,
   };
 }

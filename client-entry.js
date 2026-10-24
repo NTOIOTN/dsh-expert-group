@@ -105,6 +105,12 @@ window.__ModuleLoader__.load({
       DEG_PLUGIN_DETAIL_ENTRY_KEY, DEG_PLUGIN_DETAIL_SLOT_NAME, DEG_SETTINGS_SECTION_SLOT_NAME,
       DegPluginDetailSummary, describeDegPluginDetailSummary, resolveDegSettingsSectionOpener,
     } = clientPluginDetailModule;
+    // 左侧栏入口与全页设置面板：已裁出为独立 IIFE，本 descriptor 只从检查点取回装配函数
+    // （react/settings 依赖由下面 apply 在运行期传入，模块求值期不解引用 react）。
+    const clientSidebarEntryModule = globalThis[Symbol.for("dsh-expert-group/client-sidebar-entry")] || {};
+    const {
+      installDegSidebarEntry,
+    } = clientSidebarEntryModule;
     // 样式表仍在原位置幂等注入（设置页导航与模型配置卡片共用同一份 css）。
     ensurePluginStylesheet();
     // 路由路径是插件固定接口，供 Host 与 Client 共享；纯内部标识，用户不可见。
@@ -248,6 +254,22 @@ window.__ModuleLoader__.load({
         label: () => SETTINGS_ENTRY_ID,
         inject: () => ({ settingsForm, modelCatalog, modelConfigHost, ctx }),
       }, DshExpertGroupSettings));
+      // 左侧栏入口 + 同名 main 面板（全页设置页）：
+      // - 侧栏行的注册/卸载跟随设置字段 sidebarEntryEnabled；主面板始终注册，取消勾选时
+      //   只隐藏入口、不把用户从当前页面踢走（未保存草稿因此保留）；
+      // - 点击行为完全交给宿主（选中行 → 主区域渲染同名 key 的 main 面板），插件侧不碰 DOM。
+      // 检查点缺失（契约外直载 client.js / 裁剪过的宿主）时保持无侧栏降级，不抛错。
+      if (typeof installDegSidebarEntry === "function") {
+        installDegSidebarEntry(ctx, {
+          react,
+          id: DEG_SETTINGS_SECTION_ID,
+          iconPaths: DEG_SETTINGS_NAV_ICON_PATHS,
+          settingsComponent: DshExpertGroupSettings,
+          settingsForm,
+          modelCatalog,
+          modelConfigHost,
+        });
+      }
 
       // 插件详情摘要挂在插件管理器的组合包页上：keyed slot，key 必须是组合包的 npm 包名。
       // 摘要只读（配置表单 + 模型目录 + meta），入口按钮走严格能力适配器真实跳转设置分区。

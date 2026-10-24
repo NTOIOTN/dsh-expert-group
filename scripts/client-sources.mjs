@@ -93,6 +93,8 @@ export const CLIENT_SOURCE_FILES = Object.freeze([
   "client-conversation-adapters.js",
   "client-nav-icon.js",
   "client-plugin-detail.js",
+  // 左侧栏入口 + 同名 main 面板（全页设置页）：装配输入，既过 node --check 也进行数门禁。
+  "client-sidebar-entry.js",
   // client-freshness.js 仍是公开导出的运行时模块（exports["./client-freshness"]），
   // 出现在这里是为了让"装配源全集"只有一处清单，避免再按 files 推断。
   "client-freshness.js",

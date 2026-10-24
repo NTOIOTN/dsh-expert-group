@@ -47,6 +47,7 @@
       "settings.taskManagement": "任务管理",
       "settings.auto": "Auto",
       "settings.autoTitle": "自动打开运行中的子代理侧栏会话",
+      "settings.sidebarEntry": "左侧栏入口",
       "settings.notifications": "通知弹窗",
       "settings.notificationVolume": "通知音量",
       "settings.notificationEvents": "通知事件",

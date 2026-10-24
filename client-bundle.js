@@ -112,10 +112,6 @@ if(source==="completed"||source==="complete")return"succeeded";
 if(source==="completed_with_errors")return"failed";
 return normalizeStatus(source);
 }
-function identityOf(value){
-const source=isObject(value)?value:{};
-return firstText(source.id,source.sessionId,source.childId,source.parentTaskId);
-}
 function runningOf(status,explicit){
 if(typeof explicit==="boolean")return explicit;
 if(status==="unknown")return null;
@@ -649,11 +645,8 @@ en:"Last update time (when this data was rendered)",
 "sidebar.filter.empty":{zh:"没有匹配的任务",en:"No matching tasks"},
 "sidebar.collapse":{zh:"收起",en:"Collapse"},
 "sidebar.expand":{zh:"展开",en:"Expand"},
-"sidebar.timeline.showAll":{zh:"查看全部",en:"Show all"},
 "sidebar.recovery.retry":{zh:"重试恢复",en:"Retry recovery"},
 "sidebar.recovery.retrying":{zh:"重试中…",en:"Retrying…"},
-"sidebar.recovery.failed":{zh:"任务恢复失败（{code}）",en:"Task recovery failed ({code})"},
-"sidebar.recovery.retryFailed":{zh:"重试未恢复（{code}）",en:"Retry did not recover ({code})"},
 "sidebar.sessionModel.open":{zh:"会话模型",en:"Session models"},
 "sidebar.sessionModel.title":{zh:"会话模型",en:"Session models"},
 "sidebar.sessionModel.hint":{
@@ -686,16 +679,12 @@ en:"This host version does not support session model overrides.",
 zh:"会话未运行：会话级覆盖只读。",
 en:"The session is not running; session overrides are read-only.",
 },
-"sidebar.sessionModel.followGlobal":{zh:"跟随全局默认",en:"Follow global default"},
-"sidebar.sessionModel.override":{zh:"本会话覆盖",en:"Session override"},
 "sidebar.sessionModel.revision":{zh:"代次 {revision}",en:"Revision {revision}"},
 "sidebar.sessionModel.provider":{zh:"供应商",en:"Provider"},
-"sidebar.sessionModel.model":{zh:"模型",en:"Model"},
 "sidebar.sessionModel.effort":{zh:"思考深度",en:"Reasoning effort"},
 "sidebar.sessionModel.effortDefault":{zh:"模型默认",en:"Model default"},
 "sidebar.sessionModel.save":{zh:"保存覆盖",en:"Save override"},
 "sidebar.sessionModel.clear":{zh:"清除",en:"Clear"},
-"sidebar.sessionModel.saving":{zh:"保存中…",en:"Saving…"},
 "sidebar.sessionModel.saved":{zh:"已保存本会话覆盖",en:"Session override saved"},
 "sidebar.sessionModel.cleared":{zh:"已清除，恢复全局默认",en:"Cleared; global default restored"},
 "sidebar.sessionModel.conflict":{
@@ -704,8 +693,6 @@ en:"Another page changed this session's overrides (current revision {revision});
 },
 "sidebar.sessionModel.failed":{zh:"保存失败：{message}",en:"Save failed: {message}"},
 "sidebar.sessionModel.retry":{zh:"重新读取",en:"Reload"},
-"sidebar.sessionModel.globalSummary":{zh:"全局：{provider} / {model}",en:"Global: {provider} / {model}"},
-"sidebar.sessionModel.emptyGlobal":{zh:"未配置全局默认",en:"No global default configured"},
 "sidebar.sessionModel.emptyRoles":{zh:"没有可配置的专家角色。",en:"No configurable expert roles."},
 "sidebar.sessionModel.columnRole":{zh:"专家",en:"Expert"},
 "sidebar.sessionModel.columnModel":{zh:"模型选择",en:"Model"},
@@ -730,6 +717,7 @@ en:"Expert models use the providers and model catalog configured in DSH.",
 zh:"自动打开运行中的子代理侧栏会话",
 en:"Automatically open running subagent sidebar sessions",
 },
+"settings.sidebarEntry":{zh:"左侧栏入口",en:"Sidebar entry"},
 "settings.notifications":{zh:"通知弹窗",en:"Notifications"},
 "settings.notificationVolume":{zh:"通知音量",en:"Notification volume"},
 "settings.notificationEvents":{zh:"通知事件",en:"Notification events"},
@@ -6837,7 +6825,6 @@ pendingInstantRestore={restore,cancel};
 return Object.freeze({flushInstantRestore,scheduleInstantRestore});
 }
 function createSidebarInstallLayout(frame){
-const config=frame.config;
 const rightbarDragLock=createRightbarDragLock();
 const splitTrackRatio=createSplitTrackRatio();
 let splitTrackReader=null;
@@ -6856,12 +6843,6 @@ try{rightbarDragLock.setLocked(false);}catch{/* 同上。 */}
 try{requestSplitTrackSync();}catch{/* 配比只是布局微调，绝不影响卸载。 */}
 };
 const surfaceRecords=new Map();
-const MAX_SURFACE_OPEN_ATTEMPTS=3;
-const MAX_SURFACE_OPEN_RETRIES=1;
-const SURFACE_OPEN_DELAY_MS=0;
-const SURFACE_OPEN_RETRY_MS=250;
-const MAX_READINESS_RETRIES=3;
-const HOST_COMMIT_RETRY_MS=250;
 const surfaceRecordOf=(sessionId)=>{
 let record=surfaceRecords.get(sessionId);
 if(record===undefined){
@@ -13019,6 +13000,7 @@ const SETTINGS_ZH_FALLBACK=Object.freeze({
 "settings.taskManagement":"任务管理",
 "settings.auto":"Auto",
 "settings.autoTitle":"自动打开运行中的子代理侧栏会话",
+"settings.sidebarEntry":"左侧栏入口",
 "settings.notifications":"通知弹窗",
 "settings.notificationVolume":"通知音量",
 "settings.notificationEvents":"通知事件",
@@ -13090,6 +13072,9 @@ SETTINGS_EXTRA_MESSAGES,SETTINGS_ZH_FALLBACK,resolveSettingsLocale,settingsExtra
 const SYMBOL=Symbol.for("dsh-expert-group/client-styles");
 const css=""+
 ".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:760px;color:var(--dsw-alias-label-primary)}"+
+".deg_main_page{height:100%;overflow:auto;padding:32px;box-sizing:border-box}"+
+".deg_main_page>.deg_settings{max-width:760px;margin:0 auto}"+
+"[data-platform=darwin] .deg_main_page{padding-top:calc(32px + var(--dsh-frame-top-clearance,0px))}"+
 ".deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}"+
 ".deg_settings_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}"+
 ".deg_settings_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);align-items:center;gap:20px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}"+
@@ -13197,7 +13182,6 @@ const css=""+
 ".deg_mc_card_actions .deg_mc_delete_btn{color:var(--dsw-alias-state-error-primary,#ef4444)}"+
 ".deg_mc_dot[data-state=available]{background:var(--dsw-alias-state-success-primary,#22c55e)}"+
 ".deg_mc_dot{display:inline-block;width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--dsw-alias-label-secondary)}"+
-".deg_mc_badge{font-size:11px;line-height:16px;padding:1px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;color:var(--dsw-alias-label-secondary)}"+
 ".deg_mc_field{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,240px);align-items:center;gap:12px}"+
 ".deg_mc_field_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}"+
 ".deg_mc_input,.deg_mc_select{box-sizing:border-box;width:100%;min-width:0;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}"+
@@ -13246,8 +13230,6 @@ const css=""+
 ".deg_mc_create_footer{display:flex;align-items:center;gap:8px;padding-top:2px}"+
 ".deg_mc_create_footer .deg_mc_status{margin-right:auto}"+
 ".deg_mc_create_footer .deg_btn{flex:0 0 auto;min-width:88px}"+
-".deg_mc_fetch_list{display:flex;flex-direction:column;gap:4px;max-height:240px;overflow:auto;margin:6px 0 0;padding:0;list-style:none}"+
-".deg_mc_fetch_item{display:flex;align-items:center;gap:6px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}"+
 ".deg_mc_modal_backdrop{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.45)}"+
 ".deg_mc_modal{display:flex;flex-direction:column;gap:12px;width:min(100%,380px);max-height:min(80vh,420px);box-sizing:border-box;padding:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;box-shadow:0 12px 28px rgba(0,0,0,.28)}"+
 ".deg_mc_modal_header{display:flex;align-items:center;gap:8px;min-width:0}"+
@@ -14458,6 +14440,7 @@ roleTimeoutMs:normalizeRoleTimeoutMs(source.roleTimeoutMs),
 observerPreferred:source.observerPreferred===true,
 taskManagementEnabled:source.taskManagementEnabled!==false,
 autoOpenSubagentSidebar:source.autoOpenSubagentSidebar===true,
+sidebarEntryEnabled:source.sidebarEntryEnabled!==false,
 ...(Object.prototype.hasOwnProperty.call(source,"candidates")
 ?{candidates:normalizeModelCandidatesDraft(source.candidates)}
 :{}),
@@ -14480,6 +14463,7 @@ const SETTINGS_DRAFT_MERGE_FIELDS=Object.freeze([
 "observerPreferred",
 "taskManagementEnabled",
 "autoOpenSubagentSidebar",
+"sidebarEntryEnabled",
 "candidates",
 "fallbackLimit",
 ]);
@@ -16327,7 +16311,16 @@ checked:draft.autoOpenSubagentSidebar,
 disabled:saving,
 onChange:(event)=>editDraft((previous)=>({...previous,autoOpenSubagentSidebar:event.target.checked===true})),
 }),
-react.createElement("span",{className:"deg_settings_label"},t("settings.auto"))))
+react.createElement("span",{className:"deg_settings_label"},t("settings.auto"))),
+react.createElement("label",{className:"deg_settings_checkbox"},
+react.createElement("input",{
+type:"checkbox",
+"aria-label":t("settings.sidebarEntry"),
+checked:draft.sidebarEntryEnabled,
+disabled:saving,
+onChange:(event)=>editDraft((previous)=>({...previous,sidebarEntryEnabled:event.target.checked})),
+}),
+react.createElement("span",{className:"deg_settings_label"},t("settings.sidebarEntry"))))
 );
 return taskRow;
 }
@@ -16611,6 +16604,38 @@ if(plan===null)return false;
 return commitSettingsSavePlan(view,plan);
 };
 }
+function pushScalarChangeOps(ops,candidate,source,promptChanged,candidatePromptOverrides){
+if(candidate.notificationEnabled!==source.notificationEnabled){
+ops.push({op:"set",path:["notificationEnabled"],value:candidate.notificationEnabled});
+}
+if(candidate.notificationVolume!==source.notificationVolume){
+ops.push({op:"set",path:["notificationVolume"],value:candidate.notificationVolume});
+}
+if(!settingsDraftEqual(candidate.notificationEvents,source.notificationEvents)){
+ops.push({op:"set",path:["notificationEvents"],value:candidate.notificationEvents});
+}
+if(candidate.observerPreferred!==source.observerPreferred){
+ops.push({op:"set",path:["observerPreferred"],value:candidate.observerPreferred});
+}
+if(candidate.roleConcurrencyLimit!==source.roleConcurrencyLimit){
+ops.push({op:"set",path:["roleConcurrencyLimit"],value:candidate.roleConcurrencyLimit});
+}
+if(candidate.roleTimeoutMs!==source.roleTimeoutMs){
+ops.push({op:"set",path:["roleTimeoutMs"],value:candidate.roleTimeoutMs});
+}
+if(candidate.taskManagementEnabled!==source.taskManagementEnabled){
+ops.push({op:"set",path:["taskManagementEnabled"],value:candidate.taskManagementEnabled});
+}
+if(candidate.autoOpenSubagentSidebar!==source.autoOpenSubagentSidebar){
+ops.push({op:"set",path:["autoOpenSubagentSidebar"],value:candidate.autoOpenSubagentSidebar});
+}
+if(candidate.sidebarEntryEnabled!==source.sidebarEntryEnabled){
+ops.push({op:"set",path:["sidebarEntryEnabled"],value:candidate.sidebarEntryEnabled});
+}
+if(promptChanged){
+ops.push({op:"set",path:["promptOverrides"],value:candidatePromptOverrides});
+}
+}
 function deriveSettingsSavePlan(view,retry){
 const{
 addModelPage,applyPromptNavigation,authorityValue,baselineProjection,beginModelTabDrag,cancelModelPageDelete,ctx,
@@ -16694,33 +16719,7 @@ if(modelChanged){
 ops.push({op:"set",path:["provider"],value:candidate.provider});
 ops.push({op:"set",path:["defaults"],value:candidate.defaults});
 }
-if(candidate.notificationEnabled!==source.notificationEnabled){
-ops.push({op:"set",path:["notificationEnabled"],value:candidate.notificationEnabled});
-}
-if(candidate.notificationVolume!==source.notificationVolume){
-ops.push({op:"set",path:["notificationVolume"],value:candidate.notificationVolume});
-}
-if(!settingsDraftEqual(candidate.notificationEvents,source.notificationEvents)){
-ops.push({op:"set",path:["notificationEvents"],value:candidate.notificationEvents});
-}
-if(candidate.observerPreferred!==source.observerPreferred){
-ops.push({op:"set",path:["observerPreferred"],value:candidate.observerPreferred});
-}
-if(candidate.roleConcurrencyLimit!==source.roleConcurrencyLimit){
-ops.push({op:"set",path:["roleConcurrencyLimit"],value:candidate.roleConcurrencyLimit});
-}
-if(candidate.roleTimeoutMs!==source.roleTimeoutMs){
-ops.push({op:"set",path:["roleTimeoutMs"],value:candidate.roleTimeoutMs});
-}
-if(candidate.taskManagementEnabled!==source.taskManagementEnabled){
-ops.push({op:"set",path:["taskManagementEnabled"],value:candidate.taskManagementEnabled});
-}
-if(candidate.autoOpenSubagentSidebar!==source.autoOpenSubagentSidebar){
-ops.push({op:"set",path:["autoOpenSubagentSidebar"],value:candidate.autoOpenSubagentSidebar});
-}
-if(promptChanged){
-ops.push({op:"set",path:["promptOverrides"],value:candidatePromptOverrides});
-}
+pushScalarChangeOps(ops,candidate,source,promptChanged,candidatePromptOverrides);
 const changed=[];
 if(modelChanged){
 if(candidate.provider!==sourceProvider)changed.push("provider");
@@ -19840,6 +19839,144 @@ global[SYMBOL]=Object.freeze({
 DEG_PLUGIN_DETAIL_SLOT_NAME,DEG_PLUGIN_DETAIL_ENTRY_KEY,DEG_SETTINGS_SECTION_SLOT_NAME,describeDegPluginDetailSummary,resolveDegSettingsSectionOpener,DegPluginDetailSummary,bindClientRuntime,
 });
 })(globalThis);
+/* source: client-sidebar-entry.js */
+(function installClientSidebarEntryModule(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-entry");
+const DEG_MAIN_SLOT_NAME="main";
+const DEG_SIDEBAR_PANELLIST_SLOT_NAME="sidebar.panellist";
+const DEG_SIDEBAR_ENTRY_ORDER=5;
+const DEG_MAIN_PAGE_CLASS="deg_main_page";
+const DEG_MAIN_PAGE_ATTR="data-deg-panel-page";
+const DEG_PANEL_ICON_SIZE=16;
+const DEG_PANEL_ICON_STROKE="1.3";
+const noop=()=>{};
+function installDegSidebarEntry(ctx,deps){
+const react=deps?.react;
+if(react===null||react===undefined||typeof react.createElement!=="function")return noop;
+const slots=ctx?.slots;
+if(slots===null||slots===undefined
+||typeof slots.inject!=="function"||typeof slots.register!=="function")return noop;
+if(typeof ctx.effect!=="function")return noop;
+const id=deps.id;
+const iconPaths=Array.isArray(deps.iconPaths)
+?deps.iconPaths.filter((path)=>typeof path==="string")
+:[];
+const{settingsComponent,settingsForm,modelCatalog,modelConfigHost}=deps;
+function DegPanelIcon(props){
+const size=props?.size??DEG_PANEL_ICON_SIZE;
+return react.createElement("svg",{
+width:size,
+height:size,
+viewBox:"0 0 16 16",
+fill:"none",
+stroke:"currentColor",
+strokeWidth:DEG_PANEL_ICON_STROKE,
+"aria-hidden":"true",
+},iconPaths.map((path)=>react.createElement("path",{
+key:path,
+d:path,
+stroke:"currentColor",
+fill:"none",
+})));
+}
+function DegSettingsPage(props){
+return react.createElement("div",{
+className:DEG_MAIN_PAGE_CLASS,
+[DEG_MAIN_PAGE_ATTR]:"true",
+},react.createElement(props.settingsComponent,{
+settingsForm:props.settingsForm,
+modelCatalog:props.modelCatalog,
+modelConfigHost:props.modelConfigHost,
+ctx:props.ctx,
+}));
+}
+function readSidebarEntryEnabled(){
+try{
+const snapshot=typeof settingsForm?.getSnapshot==="function"?settingsForm.getSnapshot():void 0;
+return snapshot?.value?.sidebarEntryEnabled!==false;
+}catch{
+return true;
+}
+}
+let mainReady=false;
+let notifyMainReady=noop;
+try{
+slots.inject(DEG_MAIN_SLOT_NAME,()=>ctx.effect(()=>{
+const release=slots.register({
+name:DEG_MAIN_SLOT_NAME,
+key:id,
+inject:()=>({settingsComponent,settingsForm,modelCatalog,modelConfigHost,ctx}),
+},DegSettingsPage);
+mainReady=true;
+notifyMainReady();
+return()=>{
+mainReady=false;
+notifyMainReady();
+if(typeof release==="function")release();
+};
+},"dsh-expert-group: settings panel"));
+}catch{
+}
+try{
+slots.inject(DEG_SIDEBAR_PANELLIST_SLOT_NAME,()=>ctx.effect(()=>{
+let releaseRow=null;
+const installRow=()=>{
+if(releaseRow!==null)return;
+const release=slots.register({
+name:DEG_SIDEBAR_PANELLIST_SLOT_NAME,
+id,
+order:DEG_SIDEBAR_ENTRY_ORDER,
+label:()=>id,
+},DegPanelIcon);
+releaseRow=typeof release==="function"?release:noop;
+};
+const uninstallRow=()=>{
+const release=releaseRow;
+releaseRow=null;
+if(release===null)return;
+try{
+release();
+}catch{
+}
+};
+const sync=()=>{
+if(mainReady&&readSidebarEntryEnabled())installRow();
+else uninstallRow();
+};
+notifyMainReady=sync;
+sync();
+let unsubscribe=noop;
+if(typeof settingsForm?.subscribe==="function"){
+try{
+const release=settingsForm.subscribe(()=>{
+try{
+sync();
+}catch{
+}
+});
+if(typeof release==="function")unsubscribe=release;
+}catch{
+}
+}
+return()=>{
+if(notifyMainReady===sync)notifyMainReady=noop;
+try{
+unsubscribe();
+}catch{
+}
+unsubscribe=noop;
+uninstallRow();
+};
+},"dsh-expert-group: sidebar entry"));
+}catch{
+}
+return noop;
+}
+global[SYMBOL]=Object.freeze({
+installDegSidebarEntry,
+});
+})(globalThis);
 /* source: client-freshness.js */
 /* classic 投影：来自源文件的机械导出改写，权威实现仍是 client-freshness.js。 */
 (function installClientFreshness(global){
@@ -20169,6 +20306,10 @@ const{
 DEG_PLUGIN_DETAIL_ENTRY_KEY,DEG_PLUGIN_DETAIL_SLOT_NAME,DEG_SETTINGS_SECTION_SLOT_NAME,
 DegPluginDetailSummary,describeDegPluginDetailSummary,resolveDegSettingsSectionOpener,
 }=clientPluginDetailModule;
+const clientSidebarEntryModule=globalThis[Symbol.for("dsh-expert-group/client-sidebar-entry")]||{};
+const{
+installDegSidebarEntry,
+}=clientSidebarEntryModule;
 ensurePluginStylesheet();
 const RPC_PATH="/api/dsh-expert-group";
 const RPC_CHANNEL="/dsh-expert-group";
@@ -20254,6 +20395,17 @@ order:25,
 label:()=>SETTINGS_ENTRY_ID,
 inject:()=>({settingsForm,modelCatalog,modelConfigHost,ctx}),
 },DshExpertGroupSettings));
+if(typeof installDegSidebarEntry==="function"){
+installDegSidebarEntry(ctx,{
+react,
+id:DEG_SETTINGS_SECTION_ID,
+iconPaths:DEG_SETTINGS_NAV_ICON_PATHS,
+settingsComponent:DshExpertGroupSettings,
+settingsForm,
+modelCatalog,
+modelConfigHost,
+});
+}
 slots.inject(DEG_PLUGIN_DETAIL_SLOT_NAME,()=>slots.register({
 name:DEG_PLUGIN_DETAIL_SLOT_NAME,
 key:DEG_PLUGIN_DETAIL_ENTRY_KEY,

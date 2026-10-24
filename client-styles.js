@@ -13,6 +13,13 @@
     // ── 设置页样式：仅保留 dsh-expert-group settings section 使用的规则。
     const css = "" +
       ".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:760px;color:var(--dsw-alias-label-primary)}" +
+      // 左侧栏入口打开后的全页设置页：外层容器只负责滚动与留白（高度撑满主区域、内容可滚动），
+      // 内层仍是同一个 .deg_settings 设置页，保持 760px 阅读宽度并水平居中，不复制任何设置页实现。
+      ".deg_main_page{height:100%;overflow:auto;padding:32px;box-sizing:border-box}" +
+      ".deg_main_page>.deg_settings{max-width:760px;margin:0 auto}" +
+      // macOS 桌面端顶部有窗口控件区：主面板入口页统一叠加宿主的 top clearance
+      //（与 ui-plugin-manager 的 [data-platform=darwin] 规则同款；其它平台变量缺省为 0）。
+      "[data-platform=darwin] .deg_main_page{padding-top:calc(32px + var(--dsh-frame-top-clearance,0px))}" +
       ".deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}" +
       ".deg_settings_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}" +
       ".deg_settings_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);align-items:center;gap:20px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}" +
@@ -138,7 +145,6 @@
        ".deg_mc_card_actions .deg_mc_delete_btn{color:var(--dsw-alias-state-error-primary,#ef4444)}" +
        ".deg_mc_dot[data-state=available]{background:var(--dsw-alias-state-success-primary,#22c55e)}" +
       ".deg_mc_dot{display:inline-block;width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--dsw-alias-label-secondary)}" +
-      ".deg_mc_badge{font-size:11px;line-height:16px;padding:1px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;color:var(--dsw-alias-label-secondary)}" +
       ".deg_mc_field{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,240px);align-items:center;gap:12px}" +
       ".deg_mc_field_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}" +
       ".deg_mc_input,.deg_mc_select{box-sizing:border-box;width:100%;min-width:0;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}" +
@@ -189,8 +195,6 @@
       ".deg_mc_create_footer{display:flex;align-items:center;gap:8px;padding-top:2px}" +
       ".deg_mc_create_footer .deg_mc_status{margin-right:auto}" +
       ".deg_mc_create_footer .deg_btn{flex:0 0 auto;min-width:88px}" +
-      ".deg_mc_fetch_list{display:flex;flex-direction:column;gap:4px;max-height:240px;overflow:auto;margin:6px 0 0;padding:0;list-style:none}" +
-      ".deg_mc_fetch_item{display:flex;align-items:center;gap:6px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}" +
        ".deg_mc_modal_backdrop{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.45)}" +
        ".deg_mc_modal{display:flex;flex-direction:column;gap:12px;width:min(100%,380px);max-height:min(80vh,420px);box-sizing:border-box;padding:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;box-shadow:0 12px 28px rgba(0,0,0,.28)}" +
        ".deg_mc_modal_header{display:flex;align-items:center;gap:8px;min-width:0}" +

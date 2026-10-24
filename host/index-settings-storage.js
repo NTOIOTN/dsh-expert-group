@@ -75,6 +75,8 @@ export function defaultSettingsEntry() {
     observerPreferred: false,
     taskManagementEnabled: true,
     autoOpenSubagentSidebar: false,
+    // 左侧栏入口默认开启：与 schema 默认值、读取面归一必须同源。
+    sidebarEntryEnabled: true,
     // 单价（票据 25）：旧配置/未配置 => 空数组（不估算成本）。
     modelPrices: [],
     // 上下文继承（票据 29）：旧配置/未配置 => 空映射（全部关闭）。
@@ -206,6 +208,9 @@ function installSettingsSource(deps, api) {
         // 自动打开属于全局 settings：必须随同一份快照进入 source()，否则冷恢复/服务重载
         // 之后 client 读到的值会悄悄退回默认关闭。
         autoOpenSubagentSidebar: settingsSnapshot.autoOpenSubagentSidebar,
+        // 左侧栏入口同理：漏掉它会让冷恢复/服务重载之后的读源悄悄退回默认值，
+        // 设置页与侧栏注册读到的事实就会与用户已保存的开关不一致。
+        sidebarEntryEnabled: settingsSnapshot.sidebarEntryEnabled,
         // 单价（票据 25）：与 settings 同源进入运行期读源，RPC meta/get 与客户端设置页
         // 读到同一份归一值；诊断只服务 meta，不进入设置响应。
         modelPrices: settingsSnapshot.modelPrices,
