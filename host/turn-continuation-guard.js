@@ -22,9 +22,21 @@
  *   会破坏收尾。
  * - 最后这条 done **必须有非空 callId**：只有 assistant 消息里的 tool-call block、缺少
  *   tool/call 事件与 tool/result 的投影，无法核对调用是否真的发生并成功，因此不算收尾。
- * - 必须找到同一 callId、且**明确非失败**的 tool/result：结果缺失、
- *   message.isError === true 或 data.error != null 都按未完成处理。失败只看结构化字段，
- *   绝不解析结果正文（正文是模型可见文本，不能当协议凭据）。
+ * - 必须找到同一 callId、且**明确非失败**的成功凭据：顶层调用看 tool/result（结果缺失、
+ *   message.isError === true 或 data.error != null 都按未完成处理）；PTC 嵌套调用看
+ *   tool/ptc-dispatch 完成事件的 completed 与 isError。失败只看结构化字段，绝不解析正文
+ *   （正文是模型可见文本，不能当协议凭据）。
+ *
+ * ## 为什么同时识别顶层 tool/call 与 PTC 嵌套调用
+ * root 在 PTC 模式下只能直接调用 run_code，真实工具调用发生在 run_code 内部：宿主为它
+ * 发布 tool/ptc-dispatch-start（开始）与 tool/ptc-dispatch（完成）两个事件，且**嵌套调用
+ * 没有独立的 tool/result**——tool/result 只属于顶层 run_code 调用。只认 tool/call 会让
+ * 嵌套的 dsh_expert_group_done 永远不可见，每个 turn 都被误判为未完成。
+ *
+ * PTC 事件没有 turn 字段：先用顶层 tool/call 建立 callId → turn 映射，再用
+ * rootCallId / parentCallId 反查（parentCallId 指向上一个 subCallId，因此多层嵌套链可
+ * 逐级解析）；都查不到时归属当前 turn——方向安全：只会让判定更保守地要求完成标记，
+ * 不会误放行。
  *
  * ## 为什么有界（best-effort）
  * 同一个 root 的同一个 turn 最多提醒 MAX_CONTINUATIONS_PER_TURN（3）次（模块级 WeakMap
@@ -105,40 +117,122 @@ function blockCallId(block) {
   return undefined;
 }
 
+/** 读取非空字符串 id；其余值一律视为“缺失”。 */
+function nonEmptyId(value) {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 /**
- * 按事件顺序收集该 turn 的**工具调用条目**（按 callId 去重）。
+ * 解析 PTC 嵌套事件归属的 turn。
  *
- * 为什么合并两侧投影：tool/call 是宿主的权威调用事件；assistant 消息里的 tool-call block
- * 是同一调用的消息侧投影（旧日志/流式增量里也可能只有它）。只看一侧会在残缺日志上误判
- * 调用序列。两侧同时出现且 callId 相同时，**首次出现优先**、后续重复忽略。
+ * PTC 事件本身没有 turn 字段，只能沿调用链反查：rootCallId → parentCallId → 当前 turn。
+ * parentCallId 指向上一级 subCallId，而上一级在处理开始事件时已写入映射，因此多层嵌套可
+ * 逐级解析。都查不到时归属当前 turn：这是**方向安全**的兜底——只会让判定更保守地要求
+ * 完成标记，不会把别的 turn 的调用误算成已收尾。
+ *
+ * @param {object} data - PTC 事件 data。
+ * @param {Map<string, number>} callTurnById - callId/subCallId → turn 映射。
+ * @param {number} fallbackTurn - 当前判定的 turn。
+ * @returns {number} 归属的 turn。
+ */
+function resolveNestedTurn(data, callTurnById, fallbackTurn) {
+  const rootTurn = callTurnById.get(nonEmptyId(data.rootCallId));
+  if (Number.isSafeInteger(rootTurn)) return rootTurn;
+  const parentTurn = callTurnById.get(nonEmptyId(data.parentCallId));
+  if (Number.isSafeInteger(parentTurn)) return parentTurn;
+  return fallbackTurn;
+}
+
+/**
+ * 按事件顺序收集该 turn 的**工具调用条目**（按 callId 去重、首次出现优先）。
+ *
+ * 条目来源（同一 callId 只保留第一条，后续事件只更新该条目的状态）：
+ * - tool/call（data.turn === turn）→ 顶层调用，kind "top"；
+ * - assistant 消息里的 tool-call block → 顶层调用的消息侧投影，kind "top"；
+ * - tool/ptc-dispatch-start → run_code 内部的嵌套调用，kind "nested"、completed=false；
+ * - tool/ptc-dispatch → 同一 subCallId 的完成事件，更新 completed/failed；残缺日志里只有
+ *   完成事件时补一条已完成条目（仍按首次出现的事件位置排序）。
+ *
+ * 嵌套条目与顶层条目共用同一序列：判定只看“本 turn 最后一次调用是什么”。嵌套调用没有
+ * 独立的 tool/result，因此它的成功与否由完成事件的结构化 isError 决定。
  *
  * 没有 callId 的条目用合成键入列（不做去重）：它的 name 可能是 null，从而让“最后一条”
  * 不再等于完成标记——这正是残缺调用必须被判为未完成的地方。
  *
  * @param {object[]} events - session 事件数组（顺序与 session 日志一致）。
  * @param {number} turn - 目标 turn 号。
- * @returns {{callId:string|null, name:string|null}[]} 去重后的有序条目。
+ * @returns {{callId:string|null, name:string|null, kind:"top"|"nested",
+ *   completed:boolean, failed:boolean}[]} 去重后的有序条目。
  */
 function turnToolCallEntries(events, turn) {
   if (!Array.isArray(events) || !Number.isSafeInteger(turn)) return [];
   const entries = [];
   const seenCallIds = new Set();
-  const pushEntry = (callId, name) => {
-    const key = typeof callId === "string" && callId.length > 0 ? callId : null;
+  const entryByCallId = new Map();
+  const callTurnById = new Map();
+  const pushEntry = (callId, name, kind) => {
+    const key = nonEmptyId(callId) ?? null;
     // 有 callId 时按 callId 去重；没有 callId 的条目各自独立入列。
     if (key !== null) {
-      if (seenCallIds.has(key)) return;
+      if (seenCallIds.has(key)) return entryByCallId.get(key);
       seenCallIds.add(key);
     }
-    entries.push({ callId: key, name: typeof name === "string" ? name : null });
+    const entry = {
+      callId: key,
+      name: typeof name === "string" ? name : null,
+      kind,
+      // 顶层调用的成功由 tool/result 核对；嵌套调用由 PTC 完成事件核对。
+      completed: kind === "top",
+      failed: false,
+    };
+    entries.push(entry);
+    if (key !== null) entryByCallId.set(key, entry);
+    return entry;
   };
   for (const event of events) {
     const item = asObject(event);
     if (item === null) continue;
     if (item.type === "tool/call") {
       const data = asObject(item.data);
-      if (data === null || data.turn !== turn) continue;
-      pushEntry(data.callId, data.name);
+      if (data === null) continue;
+      const callId = nonEmptyId(data.callId);
+      // 先登记映射：后续 PTC 事件可能以它为 rootCallId / parentCallId。
+      if (callId !== undefined && Number.isSafeInteger(data.turn)) callTurnById.set(callId, data.turn);
+      if (data.turn !== turn) continue;
+      pushEntry(callId, data.name, "top");
+      continue;
+    }
+    if (item.type === "tool/ptc-dispatch-start") {
+      const data = asObject(item.data);
+      if (data === null) continue;
+      const subCallId = nonEmptyId(data.subCallId);
+      const nestedTurn = resolveNestedTurn(data, callTurnById, turn);
+      if (subCallId !== undefined) callTurnById.set(subCallId, nestedTurn);
+      if (nestedTurn !== turn) continue;
+      pushEntry(subCallId, data.name, "nested");
+      continue;
+    }
+    if (item.type === "tool/ptc-dispatch") {
+      const data = asObject(item.data);
+      if (data === null) continue;
+      const subCallId = nonEmptyId(data.subCallId);
+      const knownTurn = subCallId === undefined ? undefined : callTurnById.get(subCallId);
+      const nestedTurn = Number.isSafeInteger(knownTurn) ? knownTurn : resolveNestedTurn(data, callTurnById, turn);
+      if (subCallId !== undefined) callTurnById.set(subCallId, nestedTurn);
+      if (nestedTurn !== turn) continue;
+      const failed = data.isError === true;
+      const existing = subCallId === undefined ? undefined : entryByCallId.get(subCallId);
+      if (existing !== undefined) {
+        existing.completed = true;
+        existing.failed = failed;
+        continue;
+      }
+      // 残缺日志：只有完成事件 → 补一条已完成的嵌套条目（沿用当前位置排序）。
+      const entry = pushEntry(subCallId, data.name, "nested");
+      if (entry !== undefined) {
+        entry.completed = true;
+        entry.failed = failed;
+      }
       continue;
     }
     if (item.type !== "assistant/message") continue;
@@ -148,7 +242,7 @@ function turnToolCallEntries(events, turn) {
       if (!isToolCallBlock(block)) continue;
       const part = asObject(block);
       if (part === null) continue;
-      pushEntry(blockCallId(part), part.name);
+      pushEntry(blockCallId(part), part.name, "top");
     }
   }
   return entries;
@@ -222,10 +316,13 @@ export function turnToolCallNames(events, turn) {
  * 2. 最后一条条目的 name 严格等于 dsh_expert_group_done；
  * 3. 该条目必须有非空 callId：只有消息侧投影（assistant block）的 done 无法核对结果，
  *    不能关闭 turn；
- * 4. 必须找到该 callId 的**成功** tool/result；结果缺失、isError 或 data.error 都按未完成。
+ * 4. 顶层调用（kind "top"）必须找到该 callId 的**成功** tool/result；结果缺失、isError
+ *    或 data.error 都按未完成；
+ * 5. 嵌套调用（kind "nested"）必须已完成（收到 tool/ptc-dispatch）且 isError !== true——
+ *    嵌套调用没有独立 tool/result，完成事件就是它唯一的成功凭据。
  *
  * 因此「done 之后又调用了别的工具」「done 之后出现缺名调用」「done 没有结果」
- * 「done 结果失败」「只有消息侧 block 的 done」都不算收尾。
+ * 「done 结果失败」「只有消息侧 block 的 done」「嵌套 done 未完成/失败」都不算收尾。
  *
  * @param {object[]} events - session 事件数组。
  * @param {number} turn - 目标 turn 号。
@@ -239,6 +336,8 @@ export function turnClosedWithDone(events, turn) {
   if (last?.name !== DONE_TOOL_NAME) return false;
   // 只有 assistant 消息侧投影（没有 callId）无法核对调用是否真的发生并成功 → fail-closed。
   if (typeof last.callId !== "string" || last.callId.length === 0) return false;
+  // 嵌套调用没有独立 tool/result：成功与否只看 PTC 完成事件的结构化字段。
+  if (last.kind === "nested") return last.completed === true && last.failed !== true;
   return hasToolResult(events, turn, last.callId);
 }
 

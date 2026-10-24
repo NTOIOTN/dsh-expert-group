@@ -92,6 +92,59 @@ function buildTurnEvents({ turn = 1, calls = [], results = [], text = "", blocks
   ];
 }
 
+/** PTC 嵌套调用的开始事件（真实形状：无 turn 字段；rootCallId/parentCallId 指向调用链）。 */
+function ptcStartEvent({ rootCallId, parentCallId, subCallId, name }) {
+  return { type: "tool/ptc-dispatch-start", data: { rootCallId, parentCallId, subCallId, name, arguments: {} } };
+}
+
+/** PTC 嵌套调用的完成事件（isError 是它唯一的成功凭据；嵌套调用没有独立 tool/result）。 */
+function ptcDoneEvent({ rootCallId, parentCallId, subCallId, name, isError = false }) {
+  return {
+    type: "tool/ptc-dispatch",
+    data: { rootCallId, parentCallId, subCallId, name, arguments: {}, isError, content: [] },
+  };
+}
+
+/** 顶层 run_code 调用：PTC 模式下 root 唯一能直接调用的工具。 */
+function runCodeCallEvent(turn, callId = "call-" + turn + "-run_code") {
+  return { type: "tool/call", data: { turn, step: 1, callId, name: "run_code", arguments: {} } };
+}
+
+/**
+ * 构造 PTC turn：顶层 run_code + 一串嵌套调用 + 最终 assistant 文本。
+ *
+ * nested 每项 {name, isError?, complete?, subCallId?, parentCallId?}；complete:false 表示
+ * 只有 dispatch-start（模拟未完成/被截断）。默认 parentCallId 指向 rootCallId。
+ *
+ * @param {object} [options]
+ * @param {number} [options.turn] 该日志所属 turn。
+ * @param {object[]} [options.nested] 嵌套调用描述（按发生顺序）。
+ * @param {string} [options.text] 最终 assistant 文本。
+ * @param {object[]} [options.extraEvents] 插在嵌套调用之后、最终文本之前的事件（如 run_code 结果）。
+ */
+function buildPtcEvents({ turn = 1, nested = [], text = "", extraEvents = [] } = {}) {
+  const rootCallId = "call-" + turn + "-run_code";
+  const events = [
+    { type: "turn/start", data: { turn } },
+    {
+      type: "user/message",
+      data: { id: "u-" + turn, role: "user", content: [{ type: "text", text: "任务" }], source: { kind: "user" } },
+    },
+    runCodeCallEvent(turn, rootCallId),
+  ];
+  for (const [index, item] of nested.entries()) {
+    const subCallId = item.subCallId ?? "sub-call-" + turn + "-" + index;
+    const parentCallId = item.parentCallId ?? rootCallId;
+    events.push(ptcStartEvent({ rootCallId, parentCallId, subCallId, name: item.name }));
+    if (item.complete !== false) {
+      events.push(ptcDoneEvent({ rootCallId, parentCallId, subCallId, name: item.name, isError: item.isError === true }));
+    }
+  }
+  events.push(...extraEvents);
+  events.push(assistantEvent(turn, text));
+  return events;
+}
+
 // ── 1. 纯函数判定矩阵 ────────────────────────────────────────────────────────
 
 test("纯文本 turn（没有工具调用、没有 done）：需要提醒", () => {
@@ -281,6 +334,82 @@ test("提醒消息使用 DEG 生产者来源与固定正文", () => {
   assert.equal(message.source.kind, "plugin:dsh-expert-group");
   assert.equal(message.content.map((block) => block.text).join(""), REMINDER_TEXT);
   assert.equal(DONE_TOOL_NAME, "dsh_expert_group_done");
+});
+
+// ── 1b. PTC 嵌套调用（run_code 内部） ───────────────────────────────────────
+
+test("PTC：嵌套 done 完成且 isError:false → 按协议收尾，不提醒", () => {
+  const events = buildPtcEvents({ nested: [{ name: DONE_TOOL_NAME }] });
+  assert.equal(turnClosedWithDone(events, 1), true);
+  assert.equal(needsContinuation(events, 1), false);
+});
+
+test("PTC：嵌套 done 完成但 isError:true → 需要提醒", () => {
+  const events = buildPtcEvents({ nested: [{ name: DONE_TOOL_NAME, isError: true }] });
+  assert.equal(turnClosedWithDone(events, 1), false);
+  assert.equal(needsContinuation(events, 1), true);
+});
+
+test("PTC：嵌套 done 之后又出现别的嵌套调用 → 需要提醒", () => {
+  const events = buildPtcEvents({ nested: [{ name: DONE_TOOL_NAME }, { name: "read", complete: false }] });
+  assert.equal(turnClosedWithDone(events, 1), false);
+  assert.equal(needsContinuation(events, 1), true);
+});
+
+test("PTC：只有 dispatch-start、没有完成事件 → 需要提醒", () => {
+  const events = buildPtcEvents({ nested: [{ name: DONE_TOOL_NAME, complete: false }] });
+  assert.equal(turnClosedWithDone(events, 1), false);
+  assert.equal(needsContinuation(events, 1), true);
+});
+
+test("PTC：嵌套 done 之后的 run_code tool/result 不影响判定", () => {
+  const rootCallId = "call-1-run_code";
+  const events = buildPtcEvents({
+    nested: [{ name: DONE_TOOL_NAME }],
+    extraEvents: [
+      {
+        type: "tool/result",
+        data: { turn: 1, step: 1, message: { role: "tool", toolCallId: rootCallId, content: [] } },
+      },
+    ],
+  });
+  assert.equal(turnClosedWithDone(events, 1), true);
+  assert.equal(needsContinuation(events, 1), false);
+});
+
+test("PTC：多层嵌套按 parentCallId 逐级解析 turn，完成顺序不影响条目顺序", () => {
+  const rootCallId = "call-1-run_code";
+  const outer = "sub-call-outer";
+  const inner = "sub-call-inner";
+  const events = [
+    { type: "turn/start", data: { turn: 1 } },
+    runCodeCallEvent(1, rootCallId),
+    // 第一层：root → outer。
+    ptcStartEvent({ rootCallId, parentCallId: rootCallId, subCallId: outer, name: "run_code" }),
+    // 第二层：outer → inner（不带 rootCallId，必须靠 parentCallId 反查 turn 1）。
+    ptcStartEvent({ parentCallId: outer, subCallId: inner, name: DONE_TOOL_NAME }),
+    ptcDoneEvent({ parentCallId: outer, subCallId: inner, name: DONE_TOOL_NAME, isError: false }),
+    // 外层在 inner 之后完成：只更新状态，不得把条目挪到末尾。
+    ptcDoneEvent({ rootCallId, parentCallId: rootCallId, subCallId: outer, name: "run_code", isError: false }),
+    assistantEvent(1, "已交付。"),
+  ];
+  assert.equal(turnClosedWithDone(events, 1), true);
+  assert.equal(needsContinuation(events, 1), false);
+});
+
+test("PTC 与顶层调用混合：最后一条是顶层 done 时仍按 tool/result 判定", () => {
+  const events = [
+    { type: "turn/start", data: { turn: 1 } },
+    runCodeCallEvent(1, "call-1-run_code"),
+    ptcStartEvent({ rootCallId: "call-1-run_code", parentCallId: "call-1-run_code", subCallId: "sub-read", name: "read" }),
+    ptcDoneEvent({ rootCallId: "call-1-run_code", parentCallId: "call-1-run_code", subCallId: "sub-read", name: "read" }),
+    toolCallEvent(1, DONE_TOOL_NAME),
+  ];
+  assert.equal(turnClosedWithDone(events, 1), false, "顶层 done 缺结果 → 未收尾");
+  assert.equal(needsContinuation(events, 1), true);
+  const withResult = [...events, toolResultEvent(1, callIdOf(1, DONE_TOOL_NAME))];
+  assert.equal(turnClosedWithDone(withResult, 1), true);
+  assert.equal(needsContinuation(withResult, 1), false);
 });
 
 // ── 2. turn-stopping 接线后的公开行为 ──────────────────────────────────────
