@@ -435,21 +435,67 @@ test("代理行只显示 running/ready 圆点与两行主体，根第一行固�
   assert.equal(intervals.active, 0);
 });
 
-test("fan-out 完成、取消或空闲时仍默认展示全部子代理", async () => {
-  for (const status of ["succeeded", "cancelled", "idle", "ready"]) {
-    const hostSnapshot = snapshot();
+/**
+ * 需求二的默认展开红线：判定只看**结算状态**，不看挂载位置。
+ *
+ * - 已结算（succeeded / failed / cancelled）：默认收起 —— 这类 fan-out 必然被「空闲子代理（N）」分组收纳，
+ *   用户要求进入分组后默认收起；
+ * - 未结算（idle / ready 等不在结算词表里的状态）：默认展开 —— 运行期行为逐字不变。
+ *
+ * 收起只是折叠，不是删数据：点击 chevron（用户唯一入口）后 3 个分片全部回来，
+ * 且 fan-out 仍然只渲染一次（不重复渲染）。
+ */
+test("fan-out 结算态默认收起、未结算态默认展开全部子代理", async () => {
+  /** 把 fan-out 父任务与它的 3 个分片一起改到目标状态（父任务状态决定默认展开值）。 */
+  const applyStatus = (hostSnapshot, status) => {
     const task = hostSnapshot.root.children.find((node) => node.kind === "fanout");
     task.status = status;
     for (const shard of task.shards) {
       shard.status = status;
       shard.attempts.at(-1).status = status;
     }
+  };
+
+  // ① 结算态（三种终态逐一覆盖，与空闲组成员判定 FANOUT_SETTLED_STATUSES 同集合）：
+  //    默认 aria-expanded=false 且 0 个可见分片；点击后展开出全部分片。
+  for (const status of ["succeeded", "failed", "cancelled"]) {
+    const hostSnapshot = snapshot();
+    applyStatus(hostSnapshot, status);
     const { handle, restore } = mountPanel({ hostSnapshot, storage: new MemoryStorage() });
     try {
       await handle.settle();
       const branch = byClass(handle.output, "deg_expert_group_fanout")[0];
-      assert.equal(byClass(branch, "deg_expert_group_chevron")[0].props["aria-expanded"], true, status);
-      assert.equal(byClass(branch, "deg_expert_group_shard").length, 3, status);
+      assert.ok(branch, status + "：结算态 fan-out 必须仍渲染父任务行");
+      assert.equal(branch.props["data-task-status"], status);
+      assert.equal(byClass(branch, "deg_expert_group_chevron")[0].props["aria-expanded"], false, status + "：结算态必须默认收起");
+      assert.equal(byClass(branch, "deg_expert_group_shard").length, 0, status + "：收起时不得渲染分片行");
+      // 默认收起与「归入空闲组」是同一语义的两面：先确认它确实在分组内，再展开。
+      const idleGroup = byClass(handle.output, "deg_expert_group_idle_group")[0];
+      assert.ok(idleGroup, status + "：结算态 fan-out 必须归入空闲子代理分组");
+      assert.equal(byClass(idleGroup, "deg_expert_group_fanout").length, 1, status + "：分组内恰好一条 fan-out");
+
+      byClass(branch, "deg_expert_group_chevron")[0].props.onClick({ stopPropagation() {} });
+      await handle.settle();
+      const expanded = byClass(handle.output, "deg_expert_group_fanout")[0];
+      assert.equal(byClass(expanded, "deg_expert_group_chevron")[0].props["aria-expanded"], true, status + "：点击后必须展开");
+      assert.equal(byClass(expanded, "deg_expert_group_shard").length, 3, status + "：展开后分片必须全在");
+      assert.equal(byClass(handle.output, "deg_expert_group_fanout").length, 1, status + "：展开前后 fan-out 只渲染一次");
+    } finally {
+      handle.unmount();
+      restore();
+    }
+  }
+
+  // ② 未结算态：默认展开（运行期红线，行为不变）。
+  for (const status of ["idle", "ready"]) {
+    const hostSnapshot = snapshot();
+    applyStatus(hostSnapshot, status);
+    const { handle, restore } = mountPanel({ hostSnapshot, storage: new MemoryStorage() });
+    try {
+      await handle.settle();
+      const branch = byClass(handle.output, "deg_expert_group_fanout")[0];
+      assert.equal(byClass(branch, "deg_expert_group_chevron")[0].props["aria-expanded"], true, status + "：未结算必须默认展开");
+      assert.equal(byClass(branch, "deg_expert_group_shard").length, 3, status + "：未结算必须直接展示全部分片");
     } finally {
       handle.unmount();
       restore();
@@ -458,15 +504,20 @@ test("fan-out 完成、取消或空闲时仍默认展示全部子代理", async 
 });
 
 test("fan-out 未完成时留在主代理下，完成后完整进入空闲子代理组", async () => {
+  // 展开 override 只在有可写 storage 时持久（无 storage 时点击后的下一次渲染会退回默认值），
+  // 本用例要区分「默认值」与「用户点击后的展开」，因此必须提供一个真实存储替身。
+  const storage = new MemoryStorage();
   const hostSnapshot = snapshot();
   const task = hostSnapshot.root.children.find((node) => node.kind === "fanout");
   task.status = "running";
-  const { handle, intervals, restore } = mountPanel({ hostSnapshot });
+  const { handle, intervals, restore } = mountPanel({ hostSnapshot, storage });
   try {
     await handle.settle();
     assert.equal(byClass(handle.output, "deg_expert_group_fanout").length, 1);
     const idleGroupWhileRunning = byClass(handle.output, "deg_expert_group_idle_group")[0];
     assert.equal(byClass(idleGroupWhileRunning, "deg_expert_group_fanout").length, 0);
+    // 运行态红线（需求二之前的行为逐字保留）：未结算 fan-out 默认展开，分片直接可见。
+    assert.equal(byClass(handle.output, "deg_expert_group_shard").length, 3, "未结算 fan-out 默认展开");
 
     const terminalCases = [
       ["succeeded", ["succeeded", "succeeded", "succeeded"]],
@@ -479,6 +530,8 @@ test("fan-out 未完成时留在主代理下，完成后完整进入空闲子代
         shard.status = shardStatuses[index];
         shard.attempts.at(-1).status = shardStatuses[index];
       });
+      // 清掉上一轮手动展开留下的 override：下面要断言的是**默认值**本身，不是上一轮的点击残留。
+      storage.values.clear();
       hostSnapshot.generatedAt += 1;
       await intervals.tick();
       await handle.settle();
@@ -487,9 +540,22 @@ test("fan-out 未完成时留在主代理下，完成后完整进入空闲子代
       const groupedFanout = byClass(idleGroup, "deg_expert_group_fanout")[0];
       assert.ok(groupedFanout, "终态 fan-out 父任务应归入空闲子代理组");
       assert.equal(groupedFanout.props["data-task-status"], taskStatus);
-      assert.equal(byClass(groupedFanout, "deg_expert_group_shard").length, 3, "移入分组后仍保留完整分片树");
+      // 需求二：结算态 fan-out 默认收起（aria-expanded=false，分片行不进渲染树）。
+      assert.equal(
+        byClass(groupedFanout, "deg_expert_group_chevron")[0].props["aria-expanded"],
+        false,
+        "结算态 fan-out 默认收起",
+      );
+      assert.equal(byClass(groupedFanout, "deg_expert_group_shard").length, 0, "默认收起时不渲染分片行");
+
+      // 用户在空闲组内点击 chevron 展开：完整分片树与重试动作都仍在组内，且 fan-out 只渲染一次。
+      byClass(groupedFanout, "deg_expert_group_chevron")[0].props.onClick({ stopPropagation() {} });
+      await handle.settle();
+      const expandedFanout = byClass(byClass(handle.output, "deg_expert_group_idle_group")[0], "deg_expert_group_fanout")[0];
+      assert.equal(byClass(expandedFanout, "deg_expert_group_chevron")[0].props["aria-expanded"], true, "点击后必须展开");
+      assert.equal(byClass(expandedFanout, "deg_expert_group_shard").length, 3, "移入分组后仍保留完整分片树");
       if (taskStatus === "failed") {
-        const retryAction = byClass(groupedFanout, "deg_expert_group_action")
+        const retryAction = byClass(expandedFanout, "deg_expert_group_action")
           .find((action) => action.props["aria-label"]?.startsWith("重试分片 "));
         assert.ok(retryAction, "失败分片的重试操作应随 fan-out 一起保留在空闲组");
       }
@@ -501,37 +567,66 @@ test("fan-out 未完成时留在主代理下，完成后完整进入空闲子代
   }
 });
 
-test("fan-out 手动折叠优先于默认展开，状态刷新和重新挂载后仍可再次展开", async () => {
+/**
+ * 手动选择恒优先于缺省值（需求二把缺省值改成「结算态收起」，这条优先级因此必须双向验证）。
+ *
+ * 顺序刻意按新缺省值重排：默认已折叠 → 手动展开 → 再手动折叠 → 刷新后仍折叠 → 重挂载后仍折叠
+ * → 再次展开仍可见。否则「默认值本来就是折叠」会让断言假通过，证明不了 override 的存在。
+ */
+test("fan-out 手动展开/折叠优先于默认值，状态刷新和重新挂载后仍保持用户选择", async () => {
   const storage = new MemoryStorage();
   const hostSnapshot = snapshot();
   const task = hostSnapshot.root.children.find((node) => node.kind === "fanout");
+  // 夹具直接处于结算态：只有此时「默认收起」与「手动展开」才会真正竞争。
+  task.status = "succeeded";
+  for (const shard of task.shards) {
+    shard.status = "succeeded";
+    shard.attempts.at(-1).status = "succeeded";
+  }
   const { handle, intervals, restore } = mountPanel({ hostSnapshot, storage });
   try {
     await handle.settle();
-    const branch = byClass(handle.output, "deg_expert_group_fanout")[0];
-    byClass(branch, "deg_expert_group_chevron")[0].props.onClick({ stopPropagation() {} });
-    await handle.settle();
-    assert.equal(byClass(handle.output, "deg_expert_group_shard").length, 0);
+    // ① 默认收起：结算态 fan-out 不进分片行。
+    const initial = byClass(handle.output, "deg_expert_group_fanout")[0];
+    assert.equal(byClass(initial, "deg_expert_group_chevron")[0].props["aria-expanded"], false, "结算态 fan-out 默认收起");
+    assert.equal(byClass(initial, "deg_expert_group_shard").length, 0);
 
-    // 任务完成后的新快照不能覆盖用户刚才的手动折叠选择。
-    task.status = "succeeded";
-    for (const shard of task.shards) {
-      shard.status = "succeeded";
-      shard.attempts.at(-1).status = "succeeded";
-    }
+    // ② 手动展开：override=true，分片全部可见，且 override 真的落盘。
+    byClass(initial, "deg_expert_group_chevron")[0].props.onClick({ stopPropagation() {} });
+    await handle.settle();
+    const expandedOnce = byClass(handle.output, "deg_expert_group_fanout")[0];
+    assert.equal(byClass(expandedOnce, "deg_expert_group_chevron")[0].props["aria-expanded"], true, "手动展开必须压过默认收起");
+    assert.equal(byClass(expandedOnce, "deg_expert_group_shard").length, 3);
+    assert.ok(
+      [...storage.values.values()].some((raw) => raw.includes("\"expanded\":true")),
+      "手动展开必须以 override 形式落盘（默认值绝不落盘）",
+    );
+
+    // ③ 再手动折叠：override=false。
+    byClass(expandedOnce, "deg_expert_group_chevron")[0].props.onClick({ stopPropagation() {} });
+    await handle.settle();
+    assert.equal(byClass(byClass(handle.output, "deg_expert_group_fanout")[0], "deg_expert_group_shard").length, 0);
+
+    // ④ 状态刷新（真实内容变化的快照）不得覆盖用户刚才的手动折叠选择。
+    hostSnapshot.root.children.find((node) => node.id === "expert-ready").taskName = "刷新后的空闲专家";
     hostSnapshot.generatedAt += 1;
     await intervals.tick();
     await handle.settle();
+    assert.ok(textOf(handle.output).includes("刷新后的空闲专家"), "确认刷新真的上屏（折叠不被刷新静默覆盖）");
     const refreshed = byClass(handle.output, "deg_expert_group_fanout")[0];
     assert.equal(refreshed.props["data-task-status"], "succeeded", "确认已显示完成后的快照");
     assert.equal(byClass(refreshed, "deg_expert_group_chevron")[0].props["aria-expanded"], false);
     assert.equal(byClass(refreshed, "deg_expert_group_shard").length, 0);
+    assert.ok(
+      [...storage.values.values()].some((raw) => raw.includes("\"expanded\":false")),
+      "手动折叠同样以 override 形式落盘",
+    );
   } finally {
     handle.unmount();
     restore();
   }
 
-  // 沿用同一存储重新挂载，模拟刷新页面后恢复状态；再次点击仍能展示分片。
+  // ⑤ 沿用同一存储重新挂载，模拟刷新页面后恢复状态；再次点击仍能展示分片。
   const remounted = mountPanel({ hostSnapshot, storage });
   try {
     await remounted.handle.settle();
@@ -1511,6 +1606,7 @@ test("票据 09：侧栏严格按能力渲染取消/重试按钮，缺失或非�
   }
 
   // ③ 失败分片 + 能力允许重试：重试按钮出现，且取消能力拒绝时不出现取消。
+  // 该夹具是结算态（failed）fan-out，需求二下默认收起；先按用户方式展开再读动作按钮。
   const retryable = mountPanel({
     hostSnapshot: singleShardSnapshotWithCapabilities({
       active: false,
@@ -1519,9 +1615,11 @@ test("票据 09：侧栏严格按能力渲染取消/重试按钮，缺失或非�
         retry: { allowed: true },
       },
     }),
+    storage: new MemoryStorage(),
   });
   try {
     await retryable.handle.settle();
+    await expandFanouts(retryable.handle);
     assert.ok(actionByLabel(retryable.handle, "重试分片 only-shard"), "能力允许时必须渲染重试");
     assert.equal(actionByLabel(retryable.handle, "取消分片 only-shard"), undefined);
   } finally {
@@ -1740,6 +1838,8 @@ test("取消/重试 RPC 在途期间组件卸载：成功或失败都不得再�
     const inFlight = [];
     const mounted = mountPanel({
       hostSnapshot: singleShardSnapshot(false),
+      // 结算态（failed）fan-out 默认收起，需要一条可写存储让「展开」成为持久的 override。
+      storage: new MemoryStorage(),
       requestPluginRpc(_connection, request) {
         if (request.action === "fanout-retry-shard") {
           return new Promise((resolve, reject) => inFlight.push({ resolve, reject }));
@@ -1755,6 +1855,7 @@ test("取消/重试 RPC 在途期间组件卸载：成功或失败都不得再�
   const successCase = mountPendingRetry();
   try {
     await successCase.handle.settle();
+    await expandFanouts(successCase.handle);
     const retryButton = actionByLabel(successCase.handle, "重试分片 only-shard");
     assert.ok(retryButton, "失败分片必须提供重试动作");
     const pendingClick = retryButton.props.onClick();
@@ -1779,6 +1880,7 @@ test("取消/重试 RPC 在途期间组件卸载：成功或失败都不得再�
   const failureCase = mountPendingRetry();
   try {
     await failureCase.handle.settle();
+    await expandFanouts(failureCase.handle);
     const retryButton = actionByLabel(failureCase.handle, "重试分片 only-shard");
     const pendingClick = retryButton.props.onClick();
     await failureCase.handle.settle();
@@ -1883,6 +1985,9 @@ function mountContractPanel(options = {}) {
   const mounted = mountPanel({
     sessions: options.sessions ?? addressedSessionsFixture(options.addresses),
     hostSnapshot: options.hostSnapshot,
+    // 展开 override 只有在 storage 可写时才持久（需求二：结算态 fan-out 默认收起，
+    // 需要读分片行的用例必须先展开）。默认不传，行为与既有用例一致。
+    storage: options.storage,
     primitives: options.primitives ?? sidebarArrowPrimitives,
     uiWorkspace,
     sidebarRight,
@@ -4985,6 +5090,36 @@ function rowOfShard(root, shardId) {
   return byClass(root, "deg_expert_group_shard").find((row) => row.props["data-shard-id"] === shardId) ?? null;
 }
 
+/**
+ * 展开输出树里所有仍处于收起状态的 fan-out（需求二：结算态 fan-out 默认为收起）。
+ *
+ * 背景：大量既有用例使用「结算态 fan-out 夹具」（status 为 failed / succeeded / cancelled），
+ * 它们要验证的是折叠之后依然正确的内容——分片行文本、取消/重试动作、用量摘要、attempt
+ * 时间线缺席等，而**不是**默认展开本身。需求二把这些 fan-out 的缺省值改成收起以后，分片行
+ * 不再进入渲染树，断言目标随之中断。
+ *
+ * 这里走的是用户唯一可点的入口：点击 fan-out 头部的 chevron（同一条 toggle →
+ * sessionStorage override 生产路径），再 settle 一次让分片行上屏。不绕过任何生产逻辑，
+ * 原断言一条都不删、不改弱。
+ *
+ * 注意：override 只有在 storage 可写时才持久（无 storage 时下一次渲染会退回缺省值），
+ * 因此调用方必须给 mountPanel 提供 storage；没有 storage 的用例补一个 MemoryStorage。
+ *
+ * @param {{ output: any, settle: () => Promise<any> }} handle 渲染会话
+ * @returns {Promise<number>} 本次真正被点击展开的 fan-out 数量
+ */
+async function expandFanouts(handle) {
+  let expanded = 0;
+  for (const fanout of byClass(handle.output, "deg_expert_group_fanout")) {
+    const chevron = byClass(fanout, "deg_expert_group_chevron")[0];
+    if (!chevron || chevron.props["aria-expanded"] !== false) continue;
+    chevron.props.onClick({ stopPropagation() {} });
+    expanded += 1;
+  }
+  if (expanded > 0) await handle.settle();
+  return expanded;
+}
+
 function rowOfExpert(root, needle) {
   return byClass(root, "deg_expert_group_row").find((row) => textOf(row).includes(needle)) ?? null;
 }
@@ -4999,6 +5134,8 @@ test("用量速览：任务行按 用时 · tok/s · tok · 命中 · context �
   const metricsParts = (node) => byClass(node, "deg_expert_group_metrics_part").map(textOf);
   try {
     await handle.settle();
+    // 结算态 fan-out 默认收起（需求二）；本用例验证的是摘要内容本身，先按用户方式展开。
+    await expandFanouts(handle);
     // 生产会话列表快照（DSH getListSnapshot）没有 generatedAt：root 的「用时5m2s」
     // 只能由 DEG Host 快照的 generatedAt 与节点 startedAt 算出。
     assert.equal(mounted.sessions.list.getSnapshot().generatedAt, undefined, "sessions 快照不得提供 generatedAt");
@@ -5281,6 +5418,8 @@ test("用量速览：context 依次读取 byId / projectionsBySession / projecti
   const metricsParts = (node) => byClass(node, "deg_expert_group_metrics_part").map(textOf);
   try {
     await handle.settle();
+    // 结算态 fan-out 默认收起（需求二）；分片 context 断言需要分片行在树上，先展开。
+    await expandFanouts(handle);
     // 1) root：byId[sessionId].projectionValues.contextPressure。
     const rootRow = byClass(handle.output, "deg_expert_group_node_root")[0];
     assert.ok(
@@ -5437,6 +5576,8 @@ test("用量速览：分片取最新 child 的 DSH 投影，fan-out 聚合各 sh
   const { handle, intervals, restore } = mounted;
   try {
     await handle.settle();
+    // 结算态 fan-out 默认收起（需求二）；分片投影断言需要分片行在树上，先展开。
+    await expandFanouts(handle);
     // 失败分片：600000ms = 10m；40000/2s = 20000tok/s；2000+8000+0+40000 = 50k；8000/10000 = 80%；context 25%。
     assert.deepEqual(
       metricsParts(byClass(rowOfShard(handle.output, "failed-shard"), "deg_expert_group_metrics")[0]),
@@ -5704,6 +5845,8 @@ test("票据 12：分片不再渲染 attempt 时间线（用户要求），仅�
   const runningMounted = mountPanel({ hostSnapshot: runningSnapshot, storage: new MemoryStorage() });
   try {
     await runningMounted.handle.settle();
+    // 夹具的父任务仍是结算态（failed）⇒ 默认收起；先展开，才能读到分片行本身。
+    await expandFanouts(runningMounted.handle);
     const runningRow = rowOfShard(runningMounted.handle.output, "failed-shard");
     assert.ok(runningRow, "运行状态的分片行必须渲染");
     assert.equal(byClass(runningRow, "deg_expert_group_attempts").length, 0, "运行状态分片不得渲染 attempt 时间线");
@@ -5717,6 +5860,8 @@ test("票据 12：分片不再渲染 attempt 时间线（用户要求），仅�
   const { handle, requests, intervals, restore } = mounted;
   try {
     await handle.settle();
+    // 结算态 fan-out 默认收起（需求二）；本用例验证分片行内部结构，先按用户方式展开。
+    await expandFanouts(handle);
     const requestCountBefore = requests.length;
 
     // 每个分片行（失败 / 成功 / 取消）都不得再有 attempt 时间线或条目。
@@ -5791,6 +5936,8 @@ test("侧栏精简回归：行主体固定两行、父任务无聚合时间线�
   const { handle, intervals, restore } = mounted;
   try {
     await handle.settle();
+    // 结算态 fan-out 默认收起（需求二）；行主体断言需要分片行在树上，先展开。
+    await expandFanouts(handle);
 
     // 1) 第三行摘要节点不存在（选择器命中 0 个）。
     assert.equal(byClass(handle.output, "deg_expert_group_content").length, 0, "第三行摘要节点必须为 0");
@@ -5872,6 +6019,10 @@ test("票据 12：客户端本地搜索/角色/状态过滤保留祖先路径，
   const { handle, requests, intervals, restore } = mounted;
   try {
     await handle.settle();
+    // 结算态 fan-out 默认收起（需求二）；过滤断言要看分片名是否命中，先展开到分片行可见。
+    await expandFanouts(handle);
+    // 展开是唯一会写 sessionStorage 的 UI 状态；记下它，用来证明过滤本身一个字都没写。
+    const storageAfterExpand = [...storage.values.entries()];
     const requestCountBefore = requests.length;
     const search = byAria(handle.output, "搜索任务");
     const roleSelect = byAria(handle.output, "按角色筛选");
@@ -5926,7 +6077,17 @@ test("票据 12：客户端本地搜索/角色/状态过滤保留祖先路径，
     // 过滤是纯客户端视图：不发新 RPC、不写存储（展开状态才是唯一持久化的 UI 状态）。
     assert.equal(requests.length, requestCountBefore, "过滤不产生任何 RPC");
     assert.equal(requests.some((request) => request.action !== "expert-group-snapshot"), false);
-    assert.equal(storage.values.size, 0, "过滤状态不落盘（展开状态才是唯一持久化的 UI 状态）");
+    // 展开状态是唯一持久化的 UI 状态：整轮过滤前后存储条目必须逐条一致（过滤绝不落盘）。
+    assert.deepEqual(
+      [...storage.values.entries()],
+      storageAfterExpand,
+      "过滤状态不落盘（展开状态才是唯一持久化的 UI 状态）",
+    );
+    assert.equal(
+      [...storage.values.keys()].some((key) => key.toLowerCase().includes("filter")),
+      false,
+      "存储里绝不允许出现过滤键",
+    );
   } finally {
     handle.unmount();
     restore();
@@ -6011,27 +6172,14 @@ test("票据 12：旧快照降级——没有 usage/duration/context 时不渲�
     loading.restore();
   }
 });
-// ── 票据 13：状态可读性（错误来源 / partial 徽标 / 更新时间 / 常驻刷新） ─────────────
-/**
- * 与源码集中定义的时间格式**同源**的期望值：本地时区、24 小时制、HH:MM:SS。
- *
- * 用例自己按 Date 的本地读数重算，而不是写死字符串：同一份代码在任何时区跑都必须成立，
- * 写死 "06:13:20" 只会在 UTC 机器上失败。
- */
-function expectedClockText(ms) {
-  const date = new Date(ms);
-  const pad = (part) => (part < 10 ? "0" + part : String(part));
-  return pad(date.getHours()) + ":" + pad(date.getMinutes()) + ":" + pad(date.getSeconds());
-}
+// ── 票据 13：状态可读性（错误来源 / 常驻刷新） ──────────────────────────────────
+// 「更新于 HH:MM:SS」文本与 partial 徽标已按用户要求从标题栏移除，对应的两个查询 helper
+// （时间格式期望值 / deg_expert_group_updated 节点）随节点一起删除；原本由它们承载的两条契约
+// 已改写为 renderCount 可观测断言（手动刷新不被短路吞掉、内容相同的轮询零重渲染）。
 
 /** 标题栏错误槽节点（按类名精确匹配，data-error-source 由用例另行断言）。 */
 function headerErrorNode(handle) {
   return byClass(handle.output, "deg_expert_group_error")[0];
-}
-
-/** 标题栏「更新于」节点。 */
-function headerUpdatedNode(handle) {
-  return byClass(handle.output, "deg_expert_group_updated")[0];
 }
 
 test("票据 13：快照失败、动作传输失败与动作被拒绝分别显示三类文案与来源标记", async () => {
@@ -6039,6 +6187,8 @@ test("票据 13：快照失败、动作传输失败与动作被拒绝分别显�
   const hostSnapshot = singleShardSnapshot(false);
   const host = { snapshotFails: false, action: "ok" };
   const mounted = mountPanel({
+    // 结算态（failed）fan-out 默认收起，需要可写存储让「展开」成为持久的 override。
+    storage: new MemoryStorage(),
     requestPluginRpc(_connection, request) {
       if (String(request.action).startsWith("fanout-")) {
         // 传输层失败（adapter reject）与被 Host 结构化拒绝是两类不同的事实：
@@ -6054,6 +6204,8 @@ test("票据 13：快照失败、动作传输失败与动作被拒绝分别显�
   const { handle, intervals, restore } = mounted;
   try {
     await handle.settle();
+    // 需求二：结算态 fan-out 默认收起；用例要断言「旧快照不清屏」的分片内容，先展开。
+    await expandFanouts(handle);
     assert.equal(headerErrorNode(handle), undefined, "成功首屏不得有错误槽");
 
     // ① 快照请求失败 → snapshot（即使底层是传输失败，用户看到的事实仍是任务树没读到）。
@@ -6096,7 +6248,14 @@ test("票据 13：快照失败、动作传输失败与动作被拒绝分别显�
   assert.equal(intervals.active, 0);
 });
 
-test("票据 13：partial 快照显示可见的「数据不完整」徽标，完整快照到达后消失", async () => {
+/**
+ * 票据 13 的 partial 契约**收窄**后的事实：标题栏的「数据不完整」徽标已按用户要求移除，
+ * partial 只由状态圆点表达，不再有可见文字提示。
+ *
+ * 断言按新契约反转（不是删掉）：partial 快照下徽标节点必须不存在、文案必须不上屏；
+ * 圆点契约与「partial 参与上屏内容比较 ⇒ 完整快照到达必须重渲染」照旧成立。
+ */
+test("票据 13：partial 快照不再渲染「数据不完整」徽标，状态圆点契约不变", async () => {
   const hostState = { snapshot: { ...snapshot(), partial: true } };
   const mounted = mountPanel({
     requestPluginRpc() { return { ok: true, async json() { return { snapshot: hostState.snapshot }; } }; },
@@ -6104,21 +6263,21 @@ test("票据 13：partial 快照显示可见的「数据不完整」徽标，完
   const { handle, intervals, restore } = mounted;
   try {
     await handle.settle();
-    const badge = byClass(handle.output, "deg_expert_group_partial")[0];
-    assert.ok(badge, "partial 快照必须显示可见徽标，而不是只靠圆点颜色暗示");
-    assert.equal(textOf(badge), "数据不完整");
-    assert.equal(badge.props.role, "status", "徽标进入可访问性状态面");
-    assert.equal(badge.props["data-partial"], "true");
-    // 既有 aria/状态点契约不变：徽标只是补充文案，圆点仍由同一条 partial 规则渲染。
+    // 徽标与文案都必须从渲染树消失：partial 只能靠圆点颜色暗示。
+    assert.equal(byClass(handle.output, "deg_expert_group_partial").length, 0, "partial 快照不得再渲染徽标节点");
+    assert.equal(textOf(handle.output).includes("数据不完整"), false, "partial 文案必须从界面彻底消失");
+    // 既有 aria/状态点契约不变：圆点仍由同一条 partial 规则渲染。
     const partialStatuses = byClass(handle.output, "deg_expert_group_status_icon");
     assert.ok(partialStatuses.length > 0);
     assert.ok(partialStatuses.every((node) => typeof node.props["data-status"] === "string"));
 
-    // 完整快照到达：徽标消失，圆点契约不变（partial 参与上屏内容比较，必须重新渲染）。
+    // 完整快照到达：partial 参与上屏内容比较 ⇒ 必须重新渲染，圆点契约不变。
+    const rendersBefore = handle.renderCount;
     hostState.snapshot = snapshot();
     await intervals.tick();
     await handle.settle();
-    assert.equal(byClass(handle.output, "deg_expert_group_partial").length, 0, "完整快照到达后徽标必须消失");
+    assert.ok(handle.renderCount > rendersBefore, "partial → 完整必须重渲染（partial 参与上屏内容比较）");
+    assert.equal(byClass(handle.output, "deg_expert_group_partial").length, 0, "完整快照到达后依然没有徽标节点");
     const fullStatuses = byClass(handle.output, "deg_expert_group_status_icon");
     assert.ok(fullStatuses.length > 0);
     assert.ok(fullStatuses.every((node) => typeof node.props["data-status"] === "string"));
@@ -6129,7 +6288,16 @@ test("票据 13：partial 快照显示可见的「数据不完整」徽标，完
   assert.equal(intervals.active, 0);
 });
 
-test("票据 13：成功快照显示「更新于 HH:MM:SS」，常驻刷新入口可手动刷新，内容相同的轮询不重渲染", async () => {
+/**
+ * 标题栏「更新于 HH:MM:SS」按用户要求移除后，本条契约改用**可观测量**表达，强度不降反升：
+ *
+ * 1. 常驻刷新入口（成功态也在）必须真的发一次快照请求；
+ * 2. 手动刷新是用户的显式推进，内容一字未变也必须提交一次状态（renderCount 增加）——
+ *    这正是旧断言「手动刷新推进更新时间」证明的同一件事：手动刷新不被内容短路吞掉；
+ * 3. 内容完全相同的**自动轮询**依然零重渲染（renderCount 不变）；
+ * 4. 真实内容变化必须重渲染并上屏。
+ */
+test("票据 13：常驻刷新入口不被内容短路吞掉，内容相同的轮询零重渲染", async () => {
   const clock = installFakeClock(1700000000000);
   const hostState = { snapshot: snapshot() };
   const mounted = mountPanel({
@@ -6137,39 +6305,39 @@ test("票据 13：成功快照显示「更新于 HH:MM:SS」，常驻刷新入�
   });
   const { handle, intervals, restore, requests } = mounted;
   try {
-    assert.equal(headerUpdatedNode(handle), undefined, "没有快照时不显示更新时间");
     await handle.settle();
-    assert.equal(textOf(headerUpdatedNode(handle)), "更新于 " + expectedClockText(clock.now()));
-    assert.match(textOf(headerUpdatedNode(handle)), /^更新于 \d{2}:\d{2}:\d{2}$/, "时间格式集中定义为 HH:MM:SS");
 
     // 常驻刷新入口：成功态下同样存在（aria-label="刷新"），点击真的发一次快照请求。
-    // 用受控时钟把时间推进 1 秒，手动刷新必须提交新的「更新于」（可见反馈）。
-    clock.advance(1000);
     const refreshButton = walk(handle.output).find((node) => node?.props?.["aria-label"] === "刷新");
     assert.ok(refreshButton, "无错误时刷新按钮必须常驻，而不是只在错误时出现");
+
+    // 手动刷新不被「内容相同」短路吞掉：内容一字未变，仍必须提交一次新状态。
+    const rendersBeforeManual = handle.renderCount;
     const requestsBeforeRefresh = requests.length;
+    clock.advance(1000);
     refreshButton.props.onClick();
     await handle.settle();
     assert.equal(requests.length, requestsBeforeRefresh + 1, "刷新按钮必须真的发起一次快照请求");
-    const manualAt = clock.now();
-    assert.equal(textOf(headerUpdatedNode(handle)), "更新于 " + expectedClockText(manualAt));
+    assert.ok(
+      handle.renderCount > rendersBeforeManual,
+      "手动刷新即使内容完全相同也必须提交一次可见状态（不被短路吞掉）",
+    );
 
-    // 自动轮询：内容完全相同 ⇒ 零重渲染，屏幕上的时间停在内容最后一次上屏的时刻。
+    // 自动轮询：内容完全相同 ⇒ 零重渲染（不回归）。
     const rendersBeforePoll = handle.renderCount;
     clock.advance(5000);
     await intervals.tick();
     await handle.settle();
     assert.equal(handle.renderCount, rendersBeforePoll, "内容相同的轮询不得重渲染（不回归）");
-    assert.equal(textOf(headerUpdatedNode(handle)), "更新于 " + expectedClockText(manualAt), "未重渲染时时间保持上屏那一刻");
 
-    // 内容真的变化：必须刷新更新时间并上屏新内容（根行固定显示「主代理」，因此改专家的任务名）。
+    // 内容真的变化：必须上屏并重渲染（根行固定显示「主代理」，因此改专家的任务名）。
     const changed = snapshot();
     changed.root.children[0].taskName = "变化后的专家";
     hostState.snapshot = changed;
     await intervals.tick();
     await handle.settle();
     assert.ok(textOf(handle.output).includes("变化后的专家"), "真实变化必须上屏");
-    assert.equal(textOf(headerUpdatedNode(handle)), "更新于 " + expectedClockText(clock.now()));
+    assert.ok(handle.renderCount > rendersBeforePoll, "真实变化必须重渲染");
   } finally {
     handle.unmount();
     restore();
@@ -6212,6 +6380,8 @@ test("票据 13：action 错误保留到下一次动作或手动刷新，绝不�
   const actionGates = [];
   const gateSnapshot = { value: false };
   const mounted = mountPanel({
+    // 结算态（failed）fan-out 默认收起，需要可写存储让「展开」成为持久的 override。
+    storage: new MemoryStorage(),
     requestPluginRpc(_connection, request) {
       if (String(request.action).startsWith("fanout-")) {
         if (actionState.mode === "pending") return new Promise((resolve) => actionGates.push(resolve));
@@ -6225,6 +6395,8 @@ test("票据 13：action 错误保留到下一次动作或手动刷新，绝不�
   const { handle, intervals, restore } = mounted;
   try {
     await handle.settle();
+    // 需求二：结算态 fan-out 默认收起；本用例的动作入口是分片行上的重试按钮，先展开。
+    await expandFanouts(handle);
 
     // 动作失败 → action 错误上屏。
     await actionByLabel(handle, "重试分片 only-shard").props.onClick();
@@ -6296,7 +6468,7 @@ test("票据 13：快照请求以 AbortError 形态失败时仍按取消处理�
   }
 });
 
-test("票据 13：切换到新 root 后，旧 root 的迟到失败既不写错误也不占用更新时间", async () => {
+test("票据 13：切换到新 root 后，旧 root 的迟到失败既不写错误也不顶掉新 root 的首屏", async () => {
   const clock = installFakeClock(1700000000000);
   const pending = [];
   const mounted = mountPanel({
@@ -6318,16 +6490,20 @@ test("票据 13：切换到新 root 后，旧 root 的迟到失败既不写错�
     handle.rerender({ scope: { sessionId: "root-2" } });
     assert.equal(pending.length, 2);
     assert.equal(pending[1].request.sessionId, "root-2");
-    assert.equal(headerUpdatedNode(handle), undefined, "新 root 等待首屏时不得显示旧 root 的更新时间");
+    // 「更新于」节点已按用户要求移除，等价断言落到**首屏内容**上：新 root 的响应还没回来时，
+    // 面板必须保持空态骨架（loading + snapshot=null），绝不把旧 root 的任何内容留在屏上。
+    assert.ok(byClass(handle.output, "deg_expert_group_skeleton").length > 0, "新 root 等待首屏时必须显示骨架空态");
+    assert.equal(byClass(handle.output, "deg_expert_group_node_root").length, 0, "新 root 等待首屏时不得显示旧 root 的任务树");
 
-    // 旧 root 的响应迟到失败：绝不把错误写进新会话，也绝不显示旧时间。
+    // 旧 root 的响应迟到失败：绝不把错误写进新会话，也绝不顶掉新 root 的空态。
     pending[0].reject(new Error("旧会话请求失败"));
     await handle.settle();
     assert.equal(headerErrorNode(handle), undefined, "旧请求失败不得污染新会话的错误槽");
     assert.equal(textOf(handle.output).includes("快照读取失败"), false);
-    assert.equal(headerUpdatedNode(handle), undefined);
+    assert.ok(byClass(handle.output, "deg_expert_group_skeleton").length > 0, "旧 root 的迟到失败不得提前结束新 root 的加载态");
+    assert.equal(byClass(handle.output, "deg_expert_group_node_root").length, 0, "旧 root 的迟到失败不得把旧任务树顶上屏");
 
-    // 新 root 成功：内容与更新时间都属于新会话。
+    // 新 root 成功：上屏内容属于新会话。
     clock.advance(3000);
     const next = snapshot();
     next.rootSessionId = "root-2";
@@ -6341,7 +6517,8 @@ test("票据 13：切换到新 root 后，旧 root 的迟到失败既不写错�
     await handle.settle();
     assert.ok(textOf(handle.output).includes("新根会话专家"), "新会话响应必须正常上屏");
     assert.equal(headerErrorNode(handle), undefined);
-    assert.equal(textOf(headerUpdatedNode(handle)), "更新于 " + expectedClockText(clock.now()));
+    assert.equal(byClass(handle.output, "deg_expert_group_skeleton").length, 0, "新 root 上屏后骨架空态必须消失");
+    assert.equal(byClass(handle.output, "deg_expert_group_node_root").length, 1, "新 root 的任务树必须上屏");
   } finally {
     handle.unmount();
     restore();
@@ -6594,7 +6771,7 @@ test("票据 15：gap 或游标过旧时执行一次全量同步，并以响应 
   }
 });
 
-test("票据 15：revision 相同 ⇒ 保留旧快照、零重渲染；手动刷新仍推进更新时间", async () => {
+test("票据 15：revision 相同 ⇒ 保留旧快照、零重渲染；手动刷新不被短路吞掉", async () => {
   const clock = installFakeClock(1700000000000);
   const first = snapshot();
   first.revision = "rev-1";
@@ -6603,10 +6780,9 @@ test("票据 15：revision 相同 ⇒ 保留旧快照、零重渲染；手动刷
   try {
     await handle.settle();
     const renders = handle.renderCount;
-    const updatedAtText = textOf(headerUpdatedNode(handle));
 
     // 事件到达，但 Host 的快照内容与 revision 都没变（只有 generatedAt 不同）：
-    // 快照确实被拉了一次，但 revision 短路 ⇒ 保留旧对象、零重渲染、更新时间不动。
+    // 快照确实被拉了一次，但 revision 短路 ⇒ 保留旧对象、零重渲染。
     clock.advance(4000);
     state.events.push({ sequence: 1, type: "turn/end", parentTaskId: "fan-1" });
     state.snapshot = { ...first, generatedAt: 99 };
@@ -6614,9 +6790,8 @@ test("票据 15：revision 相同 ⇒ 保留旧快照、零重渲染；手动刷
     await handle.settle();
     assert.equal(state.snapshotCalls.length, 2, "有事件仍然要拉一次快照");
     assert.equal(handle.renderCount, renders, "revision 相同不得重渲染");
-    assert.equal(textOf(headerUpdatedNode(handle)), updatedAtText, "未重渲染时更新时间保持上屏那一刻");
 
-    // 内容真的变化 ⇒ revision 变化 ⇒ 正常上屏并推进更新时间。
+    // 内容真的变化 ⇒ revision 变化 ⇒ 正常上屏并重渲染。
     const changed = snapshot();
     changed.revision = "rev-2";
     changed.root.children[0] = { ...changed.root.children[0], taskName: "revision 变化后的内容" };
@@ -6625,13 +6800,17 @@ test("票据 15：revision 相同 ⇒ 保留旧快照、零重渲染；手动刷
     await intervals.tick();
     await handle.settle();
     assert.ok(textOf(handle.output).includes("revision 变化后的内容"), "revision 变化必须上屏");
-    assert.equal(textOf(headerUpdatedNode(handle)), "更新于 " + expectedClockText(clock.now()));
+    const rendersAfterChange = handle.renderCount;
+    assert.ok(rendersAfterChange > renders, "revision 变化必须重渲染");
 
-    // 手动刷新：revision 相同也提交一次新的更新时间（票据 13 的可见反馈不能被短路吞掉）。
+    // 手动刷新：revision 相同也必须提交一次状态（票据 13 的可见反馈不能被短路吞掉）。
+    // 标题栏「更新于」节点已按用户要求移除，因此用 renderCount 观测同一条契约。
+    const snapshotCallsBeforeManual = state.snapshotCalls.length;
     clock.advance(2000);
     walk(handle.output).find((node) => node?.props?.["aria-label"] === "刷新").props.onClick();
     await handle.settle();
-    assert.equal(textOf(headerUpdatedNode(handle)), "更新于 " + expectedClockText(clock.now()));
+    assert.equal(state.snapshotCalls.length, snapshotCallsBeforeManual + 1, "手动刷新必须真的再拉一次快照");
+    assert.ok(handle.renderCount > rendersAfterChange, "手动刷新即使 revision 相同也必须提交一次可见状态");
   } finally {
     handle.unmount();
     restore();
@@ -6674,9 +6853,11 @@ test("票据 15：切换 root / 手动刷新 / sessions 通知 / 动作完成都
   assert.equal(intervals.active, 0);
 
   // 4) 动作完成：动作的尾随刷新同样是全量快照（不经过事件探测）。
-  const actionHost = incrementalHostPanel({ snapshot: singleShardSnapshot(false) });
+  // 结算态（failed）fan-out 默认收起，重试按钮在分片行上：给一条可写存储并先展开。
+  const actionHost = incrementalHostPanel({ snapshot: singleShardSnapshot(false), mount: { storage: new MemoryStorage() } });
   try {
     await actionHost.handle.settle();
+    await expandFanouts(actionHost.handle);
     const snapshotsBeforeAction = actionHost.state.snapshotCalls.length;
     const eventsBeforeAction = actionHost.state.eventsCalls.length;
     await actionByLabel(actionHost.handle, "重试分片 only-shard").props.onClick();
@@ -7222,10 +7403,14 @@ test("票据 19：英文宿主下侧栏核心文案来自消息表（标题/刷�
     await handle.settle();
     assert.equal(textOf(byClass(handle.output, "deg_expert_group_header_title")[0]), "Expert Group");
 
-    // 刷新入口；partial 徽标与更新时间文案。
+    // 刷新入口（英文宿主下同样来自消息表）。
     assert.equal(walk(handle.output).some((node) => node?.props?.["aria-label"] === "Refresh"), true);
-    assert.equal(textOf(byClass(handle.output, "deg_expert_group_partial")[0]), "Incomplete data");
-    assert.match(textOf(byClass(handle.output, "deg_expert_group_updated")[0]), /^Updated \d{2}:\d{2}:\d{2}$/);
+    // partial 徽标与「更新于」已按用户要求移除，两份文案表里的 sidebar.partial / sidebar.updated
+    // 四个键也一并删除：英文宿主下这两个节点与两段文案都不得再上屏（断言反转，不是删除）。
+    assert.equal(byClass(handle.output, "deg_expert_group_partial").length, 0, "partial 徽标不得再渲染");
+    assert.equal(byClass(handle.output, "deg_expert_group_updated").length, 0, "更新时间文本不得再渲染");
+    assert.equal(textOf(handle.output).includes("Incomplete data"), false, "Incomplete data 文案必须彻底消失");
+    assert.equal(textOf(handle.output).includes("Updated "), false, "Updated HH:MM:SS 文案必须彻底消失");
 
     // 工具条：搜索、角色/状态筛选；诊断与导出入口已移除。
     const search = byClass(handle.output, "deg_expert_group_search")[0];
@@ -7343,10 +7528,12 @@ test("续作复用：分片行不误报「多次重试」且保留行尾双箭�
     return base;
   };
 
-  const mounted = mountContractPanel({ hostSnapshot: continuationSnapshot() });
+  // 结算态（succeeded）fan-out 默认收起：本用例验证分片行内容，先按用户方式展开。
+  const mounted = mountContractPanel({ hostSnapshot: continuationSnapshot(), storage: new MemoryStorage() });
   const { handle, resourceCalls, intervals, restore } = mounted;
   try {
     await handle.settle();
+    await expandFanouts(handle);
     const fanout = byClass(handle.output, "deg_expert_group_fanout")[0];
     assert.ok(fanout, "fan-out 父任务必须渲染");
 
@@ -7387,9 +7574,11 @@ test("续作复用：分片行不误报「多次重试」且保留行尾双箭�
   //    这证明第 1 步的「没有徽标」来自宿主的续作口径，而不是徽标阈值逻辑被整体删除。
   const retriedSnapshot = continuationSnapshot();
   retriedSnapshot.root.children[0].shards[0].retryCount = 3;
-  const retried = mountContractPanel({ hostSnapshot: retriedSnapshot });
+  const retried = mountContractPanel({ hostSnapshot: retriedSnapshot, storage: new MemoryStorage() });
   try {
     await retried.handle.settle();
+    // 结算态 fan-out 默认收起：徽标在分片行上，先展开。
+    await expandFanouts(retried.handle);
     const retriedShard = rowOfShard(retried.handle.output, "cont-shard");
     const warning = byClass(retriedShard, "deg_expert_group_retry_warning")[0];
     assert.ok(warning, "retryCount 达到阈值时分片行必须重新出现徽标");

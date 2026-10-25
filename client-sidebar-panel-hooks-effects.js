@@ -453,8 +453,9 @@
         // 写入同时完成 LRU 提权：正在被观察的 root 由它自己的成功拉取保持新鲜
         // （渲染期不再有任何重排，因此提权只能发生在这里）。
         //
-        // 时间戳只在这里取一次（事件路径），并同时写进缓存与状态：标题栏的「更新于」与
-        // 重挂载首屏的缓存时间因此同源，不可能出现两份互相矛盾的时间。
+        // 时间戳只在这里取一次（事件路径），并同时写进缓存与状态：状态里的提交基线与
+        // 重挂载首屏的缓存时间因此同源，不可能出现两份互相矛盾的基线。
+        // （标题栏的「更新于」文本已按用户要求移除，updatedAt 只服务这条同源基线与手动刷新语义。）
         const updatedAt = Date.now();
         writeCachedSnapshot(rootSessionId, next, updatedAt);
         // 强制全量路径（票据 15）：响应带 cursor 就采纳并重建游标；Host 当前不带，
@@ -474,9 +475,8 @@
           // 全部内容」的摘要，两份快照 revision 相同就意味着**上屏内容完全相同**。此时直接返回
           // 原状态对象（保留旧 snapshot 引用、零重渲染），连深比较都不做。
           //
-          // 与票据 13 的时间语义冲突时的取舍（以不重渲染优先）：revision 相同 ⇒ 不更新 updatedAt，
-          // 「更新于」继续表示「内容最后一次上屏的时刻」——这正是 13 已经写明的既有语义；
-          // 用户想要一次可见的新时间戳，走的是 manual 刷新（下面那一条显式排除它）。
+          // 与提交基线语义冲突时的取舍（以不重渲染优先）：revision 相同 ⇒ 不更新 updatedAt。
+          // 用户想要一次显式的新提交，走的是 manual 刷新（下面那一条显式排除它）。
           // samePanelSnapshot 仍然保留：旧 Host 没有 revision 时由它承担同一职责（逐字段深比较）。
           const sameRevision = typeof previous.snapshot?.revision === "string"
             && typeof next.revision === "string"
@@ -486,7 +486,8 @@
             && previous.loading === false
             && previous.error === keptError
             && (sameRevision || samePanelSnapshot(previous.snapshot, next))
-            // 手动刷新：内容一致也提交一次新时间戳（等于同一毫秒时仍然 bail out）。
+            // 手动刷新：内容一致也提交一次新状态（updatedAt 推进，等于同一毫秒时仍然 bail out）。
+            // 标题栏不再显示时间后，这条路径仍由测试用 renderCount 证明「刷新没有被短路吞掉」。
             && (commitManualTimestamp !== true || previous.updatedAt === updatedAt)) return previous;
           return { rootSessionId, snapshot: next, updatedAt, loading: false, error: keptError };
         });

@@ -91,6 +91,18 @@
    */
   const DEFAULT_COLLAPSED_STATUSES = new Set(["idle", "ready", "succeeded", "cancelled"]);
 
+  /**
+   * fan-out 父任务的「已结算」状态词表：父任务到达这些终态即代表全部分片都已结算。
+   *
+   * 取值必须与 client-sidebar-pure.js 的 FANOUT_SETTLED_STATUSES **同值**：那边是运行侧
+   * 唯一定义，这里保留一份投影只是为了不让模型层反向依赖侧栏类库。client-sidebar-tab-state.js
+   * 的空闲子代理分组（sidebarIdleChildren）正是用这份词表判定成员，因此
+   * 「结算态 fan-out」与「位于空闲子代理分组内的 fan-out」在当前代码里等价，
+   * defaultExpanded 据此决定已结算 fan-out 的默认折叠。两处词表由本注释与空闲组成员判定对齐，
+   * 改动其一时必须同步另一处。
+   */
+  const FANOUT_SETTLED_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
+
   /** 单条结构化结果 JSON 预览的字符上限：UI 只显示有界前缀，完整值仍留在导出 JSON 里。 */
   const STRUCTURED_PREVIEW_MAX_CHARS = 400;
 
@@ -110,16 +122,6 @@ const MESSAGE_CATALOG = Object.freeze({
   "sidebar.error.rpc": { zh: "请求失败", en: "Request failed" },
   "sidebar.refresh": { zh: "刷新", en: "Refresh" },
   "sidebar.retry": { zh: "重试", en: "Retry" },
-  "sidebar.partial": { zh: "数据不完整", en: "Incomplete data" },
-  "sidebar.partial.title": {
-    zh: "数据不完整：轻量快照已先上屏，状态与任务名可能尚未读取完整",
-    en: "Incomplete data: a lightweight snapshot is shown first; statuses and task names may not be fully loaded yet",
-  },
-  "sidebar.updated": { zh: "更新于 {time}", en: "Updated {time}" },
-  "sidebar.updated.title": {
-    zh: "最后更新时间（本次数据上屏的时刻）",
-    en: "Last update time (when this data was rendered)",
-  },
   "sidebar.idleGroup": { zh: "空闲子代理（{count}）", en: "Idle subagents ({count})" },
   "sidebar.idleGroup.name": { zh: "空闲子代理", en: "Idle subagents" },
   "sidebar.search.label": { zh: "任务过滤", en: "Filter tasks" },
@@ -912,10 +914,16 @@ const MESSAGE_CATALOG = Object.freeze({
     // 根节点是任务树入口，默认展开；空闲分组也默认展示成员。
     if (isObject(node) && node.kind === "root") return true;
     if (isObject(node) && node.kind === "idle-group") return true;
-    // fan-out 始终默认展示子代理，不因完成或取消自动收起；
-    // 这里只改变缺省值，createExpansionStore 仍优先保留用户手动折叠的选择。
-    if (isObject(node) && node.kind === "fanout") return true;
     const status = normalizeStatus(isObject(node) ? (node.status ?? node.taskStatus) : undefined);
+    // fan-out 的缺省展开规则（有意行为变更）：
+    // - 未结算（queued / waiting / running 等）：默认展开，运行时看到全部分片，行为不变；
+    // - 已结算（succeeded / failed / cancelled）：默认收起 —— 用户要求「进入空闲组后默认收起」。
+    //   结算态 fan-out 必然被 client-sidebar-tab-state.js 的空闲子代理分组收纳
+    //   （sidebarIdleChildren 用与 FANOUT_SETTLED_STATUSES 同值的词表判定成员），
+    //   所以这里按状态判定与「在空闲组内默认收起」等价。
+    // 这里只改变**默认值**，且绝不写进 sessionStorage：createExpansionStore 的 isExpanded
+    // 仍优先返回用户手动展开/折叠留下的 override，手动选择永远压过缺省值。
+    if (isObject(node) && node.kind === "fanout") return !FANOUT_SETTLED_STATUSES.has(status);
     return !DEFAULT_COLLAPSED_STATUSES.has(status);
   }
 

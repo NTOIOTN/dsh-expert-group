@@ -367,22 +367,6 @@
   }
 
   /**
-   * 「更新于」时间的**唯一**格式化入口（票据 13）：本地时区、24 小时制、固定 HH:MM:SS。
-   *
-   * 集中在这里的理由：标题栏可见文案、title 提示与测试断言必须同源，任何一处单独手写
-   * 时间拼接都会让同一份数据在界面上出现两种格式。读不到有效时间戳（null / NaN / 非正数）
-   * 返回 null，调用方据此不渲染时间片段，绝不显示「更新于 Invalid Date」。
-   */
-  function formatPanelUpdatedTime(value) {
-    const at = Number(value);
-    if (Number.isFinite(at) !== true || at <= 0) return null;
-    const date = new Date(at);
-    if (Number.isNaN(date.getTime()) === true) return null;
-    const pad = (part) => (part < 10 ? "0" + part : String(part));
-    return pad(date.getHours()) + ":" + pad(date.getMinutes()) + ":" + pad(date.getSeconds());
-  }
-
-  /**
    * 注入侧声明 RPC adapter 协议的字段名。
    *
    * 历史实现按被调用函数的 `length >= 2` 猜测 adapter 是 connection-first 还是 request-first：
@@ -501,7 +485,7 @@
   // 只暴露兄弟模块与主 IIFE 实际消费的符号（无全量外挂）。
   global[SYMBOL] = Object.freeze({
     PANEL_ERROR_SOURCES, PANEL_POLL_TIMINGS, RPC_FAILURE_TRANSPORT, applyPanelPollCycle,
-    callRpc, fanoutBatchIsStale, formatPanelUpdatedTime, panelNextPollDelayMs,
+    callRpc, fanoutBatchIsStale, panelNextPollDelayMs,
     readFanoutEventBatch, readPanelTabActivity, rpcFailureKindOf, samePanelSnapshot,
     // 运行态判定同时服务轮询节奏与「无 fanout 事件时仍刷新快照」：同一口径只有一个来源。
     snapshotHasRunningWork,

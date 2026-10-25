@@ -32,7 +32,7 @@
   const POLL_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-poll");
   const POLL = global[POLL_SYMBOL] || {};
   const {
-    formatPanelUpdatedTime, readPanelTabActivity,
+    readPanelTabActivity,
   } = POLL;
   const AUTO_LEDGER_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
   const AUTO_LEDGER = global[AUTO_LEDGER_SYMBOL] || {};
@@ -694,8 +694,8 @@
 
   function renderSidebarPanelSection(frame) {
     const {
-      announcement, autoOpenDraft, autoOpenEnabled, body, errorLabelOf, partialSnapshot,
-      primitives, react, recoveryBanner, renderSessionModelDialog, retry, snapshot,
+      announcement, autoOpenDraft, autoOpenEnabled, body, errorLabelOf,
+      primitives, react, recoveryBanner, renderSessionModelDialog, retry,
       t, toggleAutoOpen, version, viewState, widthResizer, writeAutoOpenSetting,
     } = frame;
 
@@ -714,32 +714,21 @@
     }),
     react.createElement("span", { className: "deg_expert_group_header_auto_label" }, "Auto"));
     /**
-     * 标题栏的状态区（票据 13）：
+     * 标题栏的状态区：
      *
-     * - partial 徽标：只在 snapshot.partial === true 时出现，明确告诉用户「这份数据不完整」；
-     *   中性圆点、空闲分组等既有 partial 契约逐字不变，徽标只是把它们已经在表达的事实显式化。
-     * - 「更新于 HH:MM:SS」：只在该 root 有成功快照时出现；时间来自提交成功快照时记录的时间戳，
-     *   格式由 formatPanelUpdatedTime 集中定义（本地时区 24 小时制）。
      * - 错误槽：按来源选择固定文案（快照读取失败 / 操作失败 / 请求失败），完整 message 只在 title。
      * - 刷新按钮：**常驻**（不再只在错误时出现）。无错误时 aria-label="刷新"，有错误时保留
      *   既有「重试」语义与 aria-label，两者都走同一个 retry（先清错误再刷新）。
+     *
+     * 「数据不完整」徽标与「更新于 HH:MM:SS」时间文本已按用户要求从界面移除：
+     * 标题栏不再渲染这两项，因此本函数也不再读取 snapshot / partialSnapshot，
+     * 对应的四条文案键（partial / updated 两组）与两个标题栏样式类已一并删除。
+     * 数据完整性仍通过既有中性圆点、空闲分组与错误槽表达，行为契约未变。
      */
     const panelError = viewState.error;
     const panelErrorLabel = panelError === null
       ? null
       : errorLabelOf(panelError.source);
-    const updatedTime = snapshot === null ? null : formatPanelUpdatedTime(viewState.updatedAt);
-    const partialBadge = partialSnapshot === true
-      ? react.createElement("span", {
-        className: "deg_expert_group_partial",
-        role: "status",
-        "data-partial": "true",
-        title: t("sidebar.partial.title"),
-      }, t("sidebar.partial"))
-      : null;
-    const updatedBadge = updatedTime === null
-      ? null
-      : react.createElement("span", { className: "deg_expert_group_updated", title: t("sidebar.updated.title") }, t("sidebar.updated", { time: updatedTime }));
     const refreshLabel = panelError === null ? t("sidebar.refresh") : t("sidebar.retry");
     const refreshButton = react.createElement("button", {
       type: "button",
@@ -762,8 +751,6 @@
       }, announcement),
       react.createElement("header", { className: "deg_expert_group_header" },
         react.createElement("span", { className: "deg_expert_group_header_title" }, t("sidebar.title")),
-        partialBadge,
-        updatedBadge,
         autoOpenToggle,
         panelError === null
           ? null

@@ -38,16 +38,6 @@ export const MESSAGE_CATALOG = Object.freeze({
   "sidebar.error.rpc": { zh: "请求失败", en: "Request failed" },
   "sidebar.refresh": { zh: "刷新", en: "Refresh" },
   "sidebar.retry": { zh: "重试", en: "Retry" },
-  "sidebar.partial": { zh: "数据不完整", en: "Incomplete data" },
-  "sidebar.partial.title": {
-    zh: "数据不完整：轻量快照已先上屏，状态与任务名可能尚未读取完整",
-    en: "Incomplete data: a lightweight snapshot is shown first; statuses and task names may not be fully loaded yet",
-  },
-  "sidebar.updated": { zh: "更新于 {time}", en: "Updated {time}" },
-  "sidebar.updated.title": {
-    zh: "最后更新时间（本次数据上屏的时刻）",
-    en: "Last update time (when this data was rendered)",
-  },
   "sidebar.idleGroup": { zh: "空闲子代理（{count}）", en: "Idle subagents ({count})" },
   "sidebar.idleGroup.name": { zh: "空闲子代理", en: "Idle subagents" },
   "sidebar.search.label": { zh: "任务过滤", en: "Filter tasks" },

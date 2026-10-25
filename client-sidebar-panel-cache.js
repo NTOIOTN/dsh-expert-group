@@ -22,7 +22,7 @@
  *   变成两次额外 LRU 重排。
  *
  * 只缓存 normalized 成功快照（真正上屏的那一份）：失败、被取消或过期 root 的响应都不进缓存。
- * 条目带 \`updatedAt\`：重挂载时标题栏的「更新于」必须与首屏快照同源。
+ * 条目带 \`updatedAt\`：重挂载时首屏快照的状态提交基线与缓存同源（标题栏的「更新于」文本已按用户要求移除，该字段现在只服务这条同源基线）。
  *
  * 检查点：globalThis[Symbol.for("dsh-expert-group/client-sidebar-panel-cache")]
  * 装配：本文件不依赖任何兄弟 IIFE（纯 Map + 数字），也不修改任何外部模块的实现。

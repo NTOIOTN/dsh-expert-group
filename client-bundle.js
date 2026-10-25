@@ -611,6 +611,7 @@ cancelled:Object.freeze(["cancelled"]),
 idle:Object.freeze(["idle","ready","unknown"]),
 });
 const DEFAULT_COLLAPSED_STATUSES=new Set(["idle","ready","succeeded","cancelled"]);
+const FANOUT_SETTLED_STATUSES=new Set(["succeeded","failed","cancelled"]);
 const STRUCTURED_PREVIEW_MAX_CHARS=400;
 const SUPPORTED_LOCALES=Object.freeze(["zh","en"]);
 const DEFAULT_LOCALE="zh";
@@ -623,16 +624,6 @@ const MESSAGE_CATALOG=Object.freeze({
 "sidebar.error.rpc":{zh:"请求失败",en:"Request failed"},
 "sidebar.refresh":{zh:"刷新",en:"Refresh"},
 "sidebar.retry":{zh:"重试",en:"Retry"},
-"sidebar.partial":{zh:"数据不完整",en:"Incomplete data"},
-"sidebar.partial.title":{
-zh:"数据不完整：轻量快照已先上屏，状态与任务名可能尚未读取完整",
-en:"Incomplete data: a lightweight snapshot is shown first; statuses and task names may not be fully loaded yet",
-},
-"sidebar.updated":{zh:"更新于 {time}",en:"Updated {time}"},
-"sidebar.updated.title":{
-zh:"最后更新时间（本次数据上屏的时刻）",
-en:"Last update time (when this data was rendered)",
-},
 "sidebar.idleGroup":{zh:"空闲子代理（{count}）",en:"Idle subagents ({count})"},
 "sidebar.idleGroup.name":{zh:"空闲子代理",en:"Idle subagents"},
 "sidebar.search.label":{zh:"任务过滤",en:"Filter tasks"},
@@ -1261,8 +1252,8 @@ content:format==="json"?JSON.stringify(snapshot,null,2):renderMarkdownSnapshot(s
 function defaultExpanded(node){
 if(isObject(node)&&node.kind==="root")return true;
 if(isObject(node)&&node.kind==="idle-group")return true;
-if(isObject(node)&&node.kind==="fanout")return true;
 const status=normalizeStatus(isObject(node)?(node.status??node.taskStatus):undefined);
+if(isObject(node)&&node.kind==="fanout")return!FANOUT_SETTLED_STATUSES.has(status);
 return!DEFAULT_COLLAPSED_STATUSES.has(status);
 }
 function taskIdOf(value){
@@ -2598,8 +2589,6 @@ const PANEL_CSS_SHELL=[
 ".deg_expert_group{position:relative;display:flex;flex-direction:column;min-width:0;height:100%;overflow:auto;padding:8px 10px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1,transparent);font-size:12px;line-height:16px}",
 ".deg_expert_group_header{display:flex;flex-wrap:wrap;align-items:center;min-height:28px;gap:6px;border-bottom:1px solid var(--dsw-alias-border-l2);font-weight:600}",
 ".deg_expert_group_header_title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-".deg_expert_group_partial{flex:0 0 auto;box-sizing:border-box;padding:0 4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);border-radius:4px;color:var(--dsw-alias-state-warning-primary,#f59e0b);font-size:11px;font-weight:600;line-height:14px;white-space:nowrap}",
-".deg_expert_group_updated{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px;font-weight:400;font-variant-numeric:tabular-nums}",
 ".deg_expert_group_header_action,.deg_expert_group_chevron,.deg_expert_group_action,.deg_expert_group_sidebar_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}",
 ".deg_expert_group_header_action{width:24px;height:24px;margin-left:auto}",
 ".deg_expert_group_header_auto{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;margin-left:8px;font-weight:400;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
@@ -3260,14 +3249,6 @@ writable:false,
 }catch{/* 冻结/不可扩展错误对象：保留 message 即可。 */}
 return error;
 }
-function formatPanelUpdatedTime(value){
-const at=Number(value);
-if(Number.isFinite(at)!==true||at<=0)return null;
-const date=new Date(at);
-if(Number.isNaN(date.getTime())===true)return null;
-const pad=(part)=>(part<10?"0"+part:String(part));
-return pad(date.getHours())+":"+pad(date.getMinutes())+":"+pad(date.getSeconds());
-}
 const RPC_ADAPTER_PROTOCOL_FIELD="rpcAdapterProtocol";
 const RPC_ADAPTER_PROTOCOLS=Object.freeze({
 object:"object",
@@ -3326,7 +3307,7 @@ return typeof select==="function"?select(response):(response?.snapshot??response
 }
 global[SYMBOL]=Object.freeze({
 PANEL_ERROR_SOURCES,PANEL_POLL_TIMINGS,RPC_FAILURE_TRANSPORT,applyPanelPollCycle,
-callRpc,fanoutBatchIsStale,formatPanelUpdatedTime,panelNextPollDelayMs,
+callRpc,fanoutBatchIsStale,panelNextPollDelayMs,
 readFanoutEventBatch,readPanelTabActivity,rpcFailureKindOf,samePanelSnapshot,
 snapshotHasRunningWork,
 });
@@ -10893,7 +10874,7 @@ styleTag,
 const POLL_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-poll");
 const POLL=global[POLL_SYMBOL]||{};
 const{
-formatPanelUpdatedTime,readPanelTabActivity,
+readPanelTabActivity,
 }=POLL;
 const AUTO_LEDGER_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
 const AUTO_LEDGER=global[AUTO_LEDGER_SYMBOL]||{};
@@ -11248,8 +11229,8 @@ body,
 }
 function renderSidebarPanelSection(frame){
 const{
-announcement,autoOpenDraft,autoOpenEnabled,body,errorLabelOf,partialSnapshot,
-primitives,react,recoveryBanner,renderSessionModelDialog,retry,snapshot,
+announcement,autoOpenDraft,autoOpenEnabled,body,errorLabelOf,
+primitives,react,recoveryBanner,renderSessionModelDialog,retry,
 t,toggleAutoOpen,version,viewState,widthResizer,writeAutoOpenSetting,
 }=frame;
 const autoOpenChecked=autoOpenDraft===null?autoOpenEnabled():autoOpenDraft===true;
@@ -11270,18 +11251,6 @@ const panelError=viewState.error;
 const panelErrorLabel=panelError===null
 ?null
 :errorLabelOf(panelError.source);
-const updatedTime=snapshot===null?null:formatPanelUpdatedTime(viewState.updatedAt);
-const partialBadge=partialSnapshot===true
-?react.createElement("span",{
-className:"deg_expert_group_partial",
-role:"status",
-"data-partial":"true",
-title:t("sidebar.partial.title"),
-},t("sidebar.partial"))
-:null;
-const updatedBadge=updatedTime===null
-?null
-:react.createElement("span",{className:"deg_expert_group_updated",title:t("sidebar.updated.title")},t("sidebar.updated",{time:updatedTime}));
 const refreshLabel=panelError===null?t("sidebar.refresh"):t("sidebar.retry");
 const refreshButton=react.createElement("button",{
 type:"button",
@@ -11301,8 +11270,6 @@ role:"status",
 },announcement),
 react.createElement("header",{className:"deg_expert_group_header"},
 react.createElement("span",{className:"deg_expert_group_header_title"},t("sidebar.title")),
-partialBadge,
-updatedBadge,
 autoOpenToggle,
 panelError===null
 ?null

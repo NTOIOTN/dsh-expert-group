@@ -581,15 +581,12 @@
   const PANEL_CSS_SHELL = [
     // position:relative 只为宽度拖拽手柄（.deg_expert_group_resizer）提供定位上下文，不影响既有布局。
     ".deg_expert_group{position:relative;display:flex;flex-direction:column;min-width:0;height:100%;overflow:auto;padding:8px 10px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1,transparent);font-size:12px;line-height:16px}",
-    // 标题栏允许换行（票据 13）：新增 partial 徽标 / 更新时间 / 分类错误文案之后，窄右栏
-    // 一行放不下时按行折行，绝不把标题或状态挤成不可读的一列。min-height 28px 保持既有高度。
+    // 标题栏允许换行：Auto 开关、错误槽与刷新按钮在窄右栏一行放不下时按行折行，
+    // 绝不把标题或状态挤成不可读的一列。min-height 28px 保持既有高度。
     ".deg_expert_group_header{display:flex;flex-wrap:wrap;align-items:center;min-height:28px;gap:6px;border-bottom:1px solid var(--dsw-alias-border-l2);font-weight:600}",
     ".deg_expert_group_header_title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-    // 轻量（partial）快照的可见徽标：数据不完整是一个需要用户看见的状态，不能只靠圆点颜色暗示。
-    // 与「多次重试」徽标同款描边样式，颜色沿用主题 warning，不新增视觉词汇。
-    ".deg_expert_group_partial{flex:0 0 auto;box-sizing:border-box;padding:0 4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);border-radius:4px;color:var(--dsw-alias-state-warning-primary,#f59e0b);font-size:11px;font-weight:600;line-height:14px;white-space:nowrap}",
-    // 「更新于 HH:MM:SS」：次级色、等宽数字（时间跳动时不抖），窄栏允许省略但保留 title。
-    ".deg_expert_group_updated{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px;font-weight:400;font-variant-numeric:tabular-nums}",
+    // 标题栏原有的「数据不完整」徽标与「更新于 HH:MM:SS」时间文本已按用户要求从界面移除，
+    // 它们的描边徽标样式与等宽时间样式随节点一并删除，不再保留无消费者的 CSS 规则。
     ".deg_expert_group_header_action,.deg_expert_group_chevron,.deg_expert_group_action,.deg_expert_group_sidebar_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}",
     ".deg_expert_group_header_action{width:24px;height:24px;margin-left:auto}",
     // 标题栏 Auto 开关：紧凑到与标题同一行，右对齐且不换行，绝不遮挡标题或右侧操作按钮。
