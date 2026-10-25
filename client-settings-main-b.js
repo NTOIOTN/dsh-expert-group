@@ -977,6 +977,8 @@
           host: modelConfigHost,
           roleDefaults: normalizeSettingsDraft(settingsSnapshot.value, roles).defaults,
           roleLabelOf,
+          // 仅首次挂载的默认态：左侧栏全页入口为 true；settings.section 不传该 prop，恒为 false。
+          defaultOpen: view.modelConfigDefaultOpen === true,
         });
     const modelTabRow = renderSettingsModelTabs(view);
     const modelPageDeleteDialog = renderSettingsModelDeleteDialog(view);

@@ -101,6 +101,9 @@
         modelCatalog: props.modelCatalog,
         modelConfigHost: props.modelConfigHost,
         ctx: props.ctx,
+        // 只影响首次挂载的默认态：全页入口默认展开「模型配置」，DSH 设置页不传（仍折叠）。
+        // 不持久化，也不改变用户随后手动折叠/展开的行为。
+        modelConfigDefaultOpen: true,
       }));
     }
 

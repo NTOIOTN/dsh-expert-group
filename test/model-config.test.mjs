@@ -1334,6 +1334,82 @@ test("模型配置：折叠区默认折叠，展开后才读取 provider 目录�
   }
 });
 
+/**
+ * 「模型配置」区域的默认展开态**只**由入口决定，且只影响首次挂载：
+ * - 左侧栏入口的全页设置页显式传 modelConfigDefaultOpen: true → 首次挂载就展开；
+ * - 真实 settings.section 入口不传该 prop → 仍默认折叠（既有行为不变）。
+ *
+ * 测试替身不递归渲染子组件，因此与 openModelSection 一样逐层 materialize，
+ * 并在 handle.settle() 之后再断言异步的 provider 目录读取。
+ */
+test("模型配置：默认展开只由入口决定（全页入口展开读目录 / settings.section 仍折叠）", async () => {
+  /**
+   * 把设置页渲染到模型配置区域这一层，返回首帧方向与目录读取次数。
+   *
+   * @param {object|undefined} props 传给设置页组件的额外 props（模拟两个入口的注入面差异）。
+   * @param {Function} [interact] 挂载完成后的交互回调，返回额外观测值（用于验证"只影响首帧"）。
+   */
+  async function observeEntry(props, interact) {
+    const workspace = workspacesForRender();
+    const runtime = createClientReactRuntime();
+    const harness = createHarness(workspace);
+    const handles = [];
+    try {
+      const { handle } = await openSettings(harness, runtime, { props });
+      handles.push(handle);
+      const children = Array.isArray(handle.output?.props?.children) ? handle.output.props.children : [];
+      const sectionElement = children.find((node) => node?.type?.name === "ModelConfigSection");
+      assert.ok(sectionElement, "设置页必须挂载模型配置组件");
+      const modelHandle = runtime.render(sectionElement.type, sectionElement.props);
+      handles.push(modelHandle);
+      await modelHandle.settle?.();
+      const disclosureElement = findNode(modelHandle.output, (node) => node?.type?.name === "ModelConfigDisclosure");
+      assert.ok(disclosureElement, "模型配置必须渲染 disclosure 控件");
+      const disclosureHandle = runtime.render(disclosureElement.type, disclosureElement.props);
+      handles.push(disclosureHandle);
+      await disclosureHandle.settle?.();
+      const toggle = findNode(disclosureHandle.output, (node) => node.props?.["aria-controls"] === "deg-model-config-body");
+      assert.ok(toggle, "模型配置必须渲染折叠按钮");
+      // 目录读取是异步的（load → listProviderDirectory → describeCredentials），等它结算。
+      await modelHandle.settle?.();
+      const observed = {
+        defaultOpen: sectionElement.props.defaultOpen,
+        ariaExpanded: toggle.props["aria-expanded"],
+        disclosureExpanded: disclosureElement.props.section.disclosure.expanded,
+        listConfigurable: workspace.calls.listConfigurable,
+      };
+      if (typeof interact === "function") observed.afterInteraction = await interact({ modelHandle, toggle });
+      return observed;
+    } finally {
+      for (const mounted of handles.reverse()) mounted.unmount();
+      harness.dispose();
+    }
+  }
+
+  // 方向一：左侧栏入口的全页设置页（DegSettingsPage）显式传 modelConfigDefaultOpen: true。
+  const fullPage = await observeEntry({ modelConfigDefaultOpen: true }, async ({ modelHandle, toggle }) => {
+    // 默认值只影响首次挂载：用户随即手动折叠必须照常生效（不被 props 拉回去）。
+    toggle.props.onClick();
+    await modelHandle.settle();
+    const disclosure = findNode(modelHandle.output, (node) => node?.type?.name === "ModelConfigDisclosure");
+    return disclosure?.props?.section?.disclosure?.expanded;
+  });
+  assert.equal(fullPage.defaultOpen, true,
+    "全页入口必须把「仅初始展开」的默认值传给区域组件");
+  assert.equal(fullPage.disclosureExpanded, true, "全页入口首次挂载即为展开");
+  assert.equal(fullPage.ariaExpanded, true, "披露按钮 aria-expanded 必须表达展开");
+  assert.ok(fullPage.listConfigurable > 0, "展开后必须读取 provider 目录");
+  assert.equal(fullPage.afterInteraction, false, "默认展开只影响首次挂载，用户手动折叠仍然生效");
+
+  // 方向二：真实 settings.section 入口不传该 prop，默认折叠行为逐项不变。
+  const dshSection = await observeEntry(undefined);
+  assert.equal(dshSection.defaultOpen, false,
+    "settings.section 不传该 prop 时区域组件拿到的默认值必须是 false");
+  assert.equal(dshSection.disclosureExpanded, false, "settings.section 内仍默认折叠");
+  assert.equal(dshSection.ariaExpanded, false, "披露按钮 aria-expanded 必须表达折叠");
+  assert.equal(dshSection.listConfigurable, 0, "折叠时不得读取 provider 目录");
+});
+
 test("模型配置：折叠区默认折叠、标题与动作可用性由同一份判定给出", () => {
   const collapsed = modelConfig.buildSectionModel({ open: false, status: "ready", addable: [{ provider: "fresh" }], writable: true });
   assert.equal(collapsed.title, "模型配置");

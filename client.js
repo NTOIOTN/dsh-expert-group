@@ -16501,6 +16501,7 @@ const modelConfigSection=typeof modelConfigHost==="undefined"||modelConfigHost==
 host:modelConfigHost,
 roleDefaults:normalizeSettingsDraft(settingsSnapshot.value,roles).defaults,
 roleLabelOf,
+defaultOpen:view.modelConfigDefaultOpen===true,
 });
 const modelTabRow=renderSettingsModelTabs(view);
 const modelPageDeleteDialog=renderSettingsModelDeleteDialog(view);
@@ -16989,7 +16990,7 @@ doc.removeEventListener?.("mousedown",onPointerDown);
 doc.removeEventListener?.("keydown",onKeyDown);
 };
 }
-function DshExpertGroupSettings({settingsForm,modelCatalog,modelConfigHost,ctx}){
+function DshExpertGroupSettings({settingsForm,modelCatalog,modelConfigHost,ctx,modelConfigDefaultOpen}){
 const subscribe=react.useMemo(()=>settingsForm.subscribe.bind(settingsForm),[settingsForm]);
 const getSnapshot=react.useMemo(()=>settingsForm.getSnapshot.bind(settingsForm),[settingsForm]);
 const settingsSnapshot=react.useSyncExternalStore(subscribe,getSnapshot);
@@ -17254,7 +17255,7 @@ applyPromptNavigation,authorityValue,baselineProjection,
 candidatesError,catalogAvailable,closePrompt,committedAuthorityRef,committedSnapshotLagging,
 currentModelPage,directoryState,dismissLeaveDialog,draft,editDraft,editPromptText,effectiveDraft,
 error,externalSettingsChanged,hasUnsavedChanges,hostMeta,hostMetaError,leaveCancelRef,
-leaveIntent,leaveTriggerRef,modelConfigHost,modelFieldsChanged,modelPageCount,modelPageDeleteCancelRef,
+leaveIntent,leaveTriggerRef,modelConfigHost,modelConfigDefaultOpen,modelFieldsChanged,modelPageCount,modelPageDeleteCancelRef,
 modelPageDeleteIntent,modelPageLabelOf,modelRowRoles,modelTabDrag,modelTabDragRef,modelTabRefs,modelTabSuppressClickRef,notificationEventsOpen,
 notificationEventsPanelRef,notificationEventsRootRef,notificationEventsTriggerRef,openPrompt,promptDirty,promptError,
 promptLoading,promptMaxGraphemes,promptProjection,promptRoleIds,promptTextOf,promptTouchedRoles,providerGroups,
@@ -18762,9 +18763,9 @@ react.createElement(ModelConfigDisclosure,{section,onToggle:()=>setOpen((value)=
 body,
 open?removeConfirmDialog:null);
 }
-function ModelConfigSection({host,roleDefaults,roleLabelOf}){
+function ModelConfigSection({host,roleDefaults,roleLabelOf,defaultOpen}){
 const config=host.config;
-const[open,setOpen]=react.useState(false);
+const[open,setOpen]=react.useState(defaultOpen===true);
 const[directory,setDirectory]=react.useState({status:"idle",rows:[],error:null});
 const[adding,setAdding]=react.useState(false);
 const[addChoice,setAddChoice]=react.useState("");
@@ -19856,6 +19857,7 @@ settingsForm:props.settingsForm,
 modelCatalog:props.modelCatalog,
 modelConfigHost:props.modelConfigHost,
 ctx:props.ctx,
+modelConfigDefaultOpen:true,
 }));
 }
 function readSidebarEntryEnabled(){

@@ -269,9 +269,10 @@ function renderModelConfigSection(context) {
     open ? removeConfirmDialog : null);
 }
 
-    function ModelConfigSection({ host, roleDefaults, roleLabelOf }) {
+    function ModelConfigSection({ host, roleDefaults, roleLabelOf, defaultOpen }) {
       const config = host.config;
-      const [open, setOpen] = react.useState(false);
+      // 只有首次挂载读默认态；之后完全由用户点击（setOpen）决定，不持久化、不随 props 变化重置。
+      const [open, setOpen] = react.useState(defaultOpen === true);
       const [directory, setDirectory] = react.useState({ status: "idle", rows: [], error: null });
       const [adding, setAdding] = react.useState(false);
       const [addChoice, setAddChoice] = react.useState("");

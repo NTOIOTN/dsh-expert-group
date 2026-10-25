@@ -707,7 +707,7 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
      * 角色配置的保存一律走 DEG 自有提交端点（settings-commit → Host commitSettingsCandidate），
      * 绝不调用表单的 set/unset/mutate：那会绕过 DEG 的语义校验与目录代次检测。
      */
-    function DshExpertGroupSettings({ settingsForm, modelCatalog, modelConfigHost, ctx }) {
+    function DshExpertGroupSettings({ settingsForm, modelCatalog, modelConfigHost, ctx, modelConfigDefaultOpen }) {
       const subscribe = react.useMemo(() => settingsForm.subscribe.bind(settingsForm), [settingsForm]);
       const getSnapshot = react.useMemo(() => settingsForm.getSnapshot.bind(settingsForm), [settingsForm]);
       const settingsSnapshot = react.useSyncExternalStore(subscribe, getSnapshot);
@@ -1112,7 +1112,7 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
         candidatesError, catalogAvailable, closePrompt, committedAuthorityRef, committedSnapshotLagging, 
         currentModelPage, directoryState, dismissLeaveDialog, draft, editDraft, editPromptText, effectiveDraft,
         error, externalSettingsChanged, hasUnsavedChanges, hostMeta, hostMetaError, leaveCancelRef,
-        leaveIntent, leaveTriggerRef, modelConfigHost, modelFieldsChanged, modelPageCount, modelPageDeleteCancelRef,
+        leaveIntent, leaveTriggerRef, modelConfigHost, modelConfigDefaultOpen, modelFieldsChanged, modelPageCount, modelPageDeleteCancelRef,
         modelPageDeleteIntent, modelPageLabelOf, modelRowRoles, modelTabDrag, modelTabDragRef, modelTabRefs, modelTabSuppressClickRef, notificationEventsOpen,
         notificationEventsPanelRef, notificationEventsRootRef, notificationEventsTriggerRef, openPrompt, promptDirty, promptError,
         promptLoading, promptMaxGraphemes, promptProjection, promptRoleIds, promptTextOf, promptTouchedRoles, providerGroups,
