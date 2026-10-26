@@ -111,6 +111,11 @@ window.__ModuleLoader__.load({
     const {
       installDegSidebarEntry,
     } = clientSidebarEntryModule;
+    // 「峰谷时段」判定的唯一权威实现是 shared/peak-valley-time.js。装配器把它机械投影成
+    // classic 片段、并保证在本 descriptor 之前执行；这里只从公开检查点取回同一份实现，
+    // **不内联任何时间判定**（内联即第二份实现，必然与 Host 校验各自漂移）。
+    // 检查点缺失时保持 undefined：契约外直载 client.js 的旧宿主不抛错，缺失检测留给使用方。
+    const peakValleyTime = globalThis[Symbol.for("dsh-expert-group/peak-valley-time")];
     // 样式表仍在原位置幂等注入（设置页导航与模型配置卡片共用同一份 css）。
     ensurePluginStylesheet();
     // 路由路径是插件固定接口，供 Host 与 Client 共享；纯内部标识，用户不可见。
@@ -180,6 +185,8 @@ window.__ModuleLoader__.load({
     const clientRuntimeHost = Object.freeze({
       react, primitives, requestPluginRpc, requireFreshnessSurface, createClientFreshnessBoundary,
       RPC_PATH, RPC_CHANNEL, RPC_ENDPOINT, RPC_TARGET, ModelConfigSection,
+      // 峰谷时段判定面：与 Host 校验、后续界面提示共用同一份投影实现。
+      peakValleyTime,
     });
     clientSettingsNormalizeModule.bindClientRuntime?.(clientRuntimeHost);
     clientSubagentModule.bindClientRuntime?.(clientRuntimeHost);
@@ -343,6 +350,17 @@ window.__ModuleLoader__.load({
           getAutoOpenSubagentSidebar: () => readAutoOpenSubagentSidebar(),
           /** 面板标题栏 Auto 开关的写面：必须显式提交布尔值，否则设置页会一直显示旧值。 */
           setAutoOpenSubagentSidebar: (next) => commitAutoOpenSubagentSidebar(next),
+          /**
+           * 峰谷时段标记（票据 09）的三个注入面：
+           * - getPeakValleySettings：每次现读配置表单快照里的峰谷状态（enabled/periods）；
+           * - subscribePeakValleySettings：设置页保存/外部变更后立刻刷新标记（缺失时为 null）；
+           * - peakValleyTime / settingsExtraText：判定与文案的权威实现，面板不得自带第二份。
+           */
+          getPeakValleySettings: readPeakValleySettings,
+          subscribePeakValleySettings: typeof settingsForm?.subscribe === "function" ? subscribePeakValleySettings : null,
+          // 时段判定只走 shared/peak-valley-time.js 的构建期投影，文案只走 settings/extra 表。
+          peakValleyTime,
+          settingsExtraText,
         };
         /**
          * 「自动打开运行中的子代理侧栏」读面：唯一来源是配置表单当前快照。
@@ -394,6 +412,23 @@ window.__ModuleLoader__.load({
             return true;
           }
         };
+        /**
+         * 「峰谷时段标记」的读取面（票据 09）：每次现读配置表单快照里的 peakValley 原值。
+         *
+         * 只做读取、不判定：字段缺失或读取异常返回 null，峰/谷判定由客户端 Hook 调
+         * shared/peak-valley-time.js 的权威纯函数完成（这里不复制任何时段算法）。
+         */
+        function readPeakValleySettings() {
+          try {
+            return settingsForm?.getSnapshot?.().value?.peakValley ?? null;
+          } catch {
+            return null;
+          }
+        }
+        /** 「峰谷时段标记」的订阅面（票据 09）：启用/关闭或时段变化后立刻重算标记。 */
+        function subscribePeakValleySettings(listener) {
+          return settingsForm?.subscribe?.(listener) ?? null;
+        }
         ctx.effect(() => {
           let disposer = null;
           const install = () => {
@@ -529,6 +564,14 @@ window.__ModuleLoader__.load({
      * 以及 configForms.describe()）。导出给设置页与测试共用同一实现，不复制数据流。
      */
     exports.createModelConfigHost = createModelConfigHost;
+    /**
+     * 峰谷时段判定面（票据 01 第二单元）：`{ MAX_PEAK_VALLEY_PERIODS, PEAK_VALLEY_PERIODS_INVALID,
+     * normalizePeakValleyPeriods, peakValleyAtMinutes, peakValleyAtDate, peakValleyPeriodsCoverFullDay }`。
+     *
+     * 唯一权威实现是 shared/peak-valley-time.js；构建期投影把它挂到公开检查点，本 descriptor
+     * 只转发同一份实现（供界面与测试共用），检查点缺失时为 undefined（不静默降级成第二份实现）。
+     */
+    exports.peakValleyTime = peakValleyTime;
     exports.MODEL_REASONING_EFFORTS = Object.freeze([
       "off", "minimal", "low", "medium", "high", "xhigh", "max",
     ]);

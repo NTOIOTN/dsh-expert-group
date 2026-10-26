@@ -2,7 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-import { createClientReactRuntime, createFakeDocumentEventTarget, createFakeIntervals, installFakeClock, installGlobals } from "../test-support/client-bundle.mjs";
+import {
+  createClientReactRuntime, createFakeDocumentEventTarget, createFakeIntervals, createHostContextStub, installFakeClock, installGlobals,
+  loadClientBundle,
+} from "../test-support/client-bundle.mjs";
 import { CLIENT_SOURCE_FILES } from "../scripts/client-sources.mjs";
 
 /**
@@ -32,6 +35,9 @@ await import("../client-expert-group-model-format.js");
 await import("../client-expert-group-model.js");
 await import("../client-expert-group-sidebar.js");
 const sidebar = globalThis[Symbol.for("dsh-expert-group/client-expert-group-sidebar")];
+// 票据 09：侧栏时段标记消费的两份权威实现（构建期投影 + client-text 的 extra 文案表）。
+const peakValleyTime = globalThis[Symbol.for("dsh-expert-group/peak-valley-time")];
+const { settingsExtraText } = globalThis[Symbol.for("dsh-expert-group/client-text")] ?? {};
 
 class MemoryStorage {
   constructor() { this.values = new Map(); }
@@ -173,6 +179,11 @@ function mountPanel(overrides = {}) {
     cancelSidebarSplit: overrides.cancelSidebarSplit,
     // 票据 16：tab 活跃度注入点（生产由 install 侧/宿主提供；缺省时面板退回文档可见性）。
     isTabActive: overrides.isTabActive,
+    // 票据 09：标题栏峰谷时段标记的注入面（生产由 install 侧读取配置表单快照并订阅）。
+    getPeakValleySettings: overrides.getPeakValleySettings,
+    subscribePeakValleySettings: overrides.subscribePeakValleySettings,
+    peakValleyTime: overrides.peakValleyTime,
+    settingsExtraText: overrides.settingsExtraText,
     async requestPluginRpc(_connection, request, init) {
       requests.push(request);
       if (typeof overrides.requestPluginRpc === "function") {
@@ -5162,13 +5173,15 @@ test("用量速览：任务行按 用时 · tok/s · tok · 命中 · context �
     // 专家行：五段齐全且顺序固定（context 来自 projectionsBySession 读面）。
     const expertRow = rowOfExpert(handle.output, "运行专家");
     const expertMetrics = byClass(expertRow, "deg_expert_group_metrics")[0];
-    assert.deepEqual(metricsParts(expertMetrics), ["用时1.5s", "80tok/s", "520 tok", "命中75%", "context 20%"]);
+    // 时长口径变更（2026-10-25）：1 分钟以内向下取整到秒，1500ms 从「1.5s」变成「1s」。
+    assert.deepEqual(metricsParts(expertMetrics), ["用时1s", "80tok/s", "520 tok", "命中75%", "context 20%"]);
 
-    // root：没有 durationMs/usage.runMs ⇒ 运行中时间差（DEG generatedAt - 节点 startedAt）；
-    // 没有 cacheReadTokens ⇒ 命中段整段省略。
+    // root：没有 durationMs/usage.runMs ⇒ 运行中时间差（DEG generatedAt - 节点 startedAt）。
+    // 该行严格 running 且已有 usage ⇒ 缺失段（没有 cacheReadTokens ⇒ 命中）按 0 补齐（用户要求）：
+    // 运行过程中五段不得塌成「用时 · tok」两段，否则投影陆续到达时摘要条会来回跳动。
     const rootRow = byClass(handle.output, "deg_expert_group_node_root")[0];
     const rootMetrics = byClass(byClass(rootRow, "deg_expert_group_row")[0], "deg_expert_group_metrics")[0];
-    assert.deepEqual(metricsParts(rootMetrics), ["用时5m2s", "0.5tok/s", "1.0k tok", "context 30%"]);
+    assert.deepEqual(metricsParts(rootMetrics), ["用时5m2s", "0.5tok/s", "1.0k tok", "命中0%", "context 30%"]);
 
     // 已结束会话：节点 startedAt（规范化后回退节点 createdAt）→ 会话 updatedAt；
     // 没有 usage ⇒ 只有「用时」一段。1699999950000 - 1699999200000 = 750000ms → 「12m30s」。
@@ -5211,6 +5224,184 @@ test("用量速览：任务行按 用时 · tok/s · tok · 命中 · context �
     assert.ok(fanoutFailure);
     assert.ok(textOf(fanoutFailure).length <= "EACCES · ".length + 120);
     assert.equal(textOf(handle.output).includes("完整提示词正文"), false, "侧栏绝不展示完整 prompt");
+  } finally {
+    handle.unmount();
+    restore();
+  }
+  assert.equal(intervals.active, 0);
+});
+
+/**
+ * 未开始运行的行：五段 0 占位（用户要求 2026-10-25）。
+ *
+ * 占位的前提是**有事实**——宿主已为该行投影 sessionStats/tokenUsage（全 0 投影也算），
+ * 或 DEG 侧已有明确的 0 token 事实。因此：
+ * - root 与 expert-idle 有全 0 投影 ⇒ 五段全 0 展示，且不伪造语义化 tooltip；
+ * - expert-legacy 既没有投影也没有 usage（旧快照）⇒ 仍不渲染摘要条（未知不写成 0）。
+ */
+test("用量速览：未开始运行的行在宿主投影全 0 时显示五段 0 占位，旧快照仍不渲染摘要条", async () => {
+  const createdAt = 1700000000000;
+  const zeroProjection = {
+    sessionStats: { llmMs: 0, toolMs: 0, decodeMs: 0, decodeTokens: 0 },
+    tokenUsage: { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 },
+  };
+  const hostSnapshot = {
+    schemaVersion: 1,
+    rootSessionId: "root-1",
+    generatedAt: createdAt,
+    root: {
+      id: "root-1", kind: "root", sessionId: "root-1", taskName: "根任务标题",
+      role: "orchestrator", provider: "A6", model: "gpt-5.6-sol", effort: "xhigh",
+      status: "ready", createdAt,
+      children: [
+        {
+          id: "expert-idle", kind: "expert", sessionId: "expert-idle", taskName: "未开始专家",
+          role: "fixer", model: "gpt-5.6-sol", status: "ready", createdAt,
+        },
+        {
+          id: "expert-legacy", kind: "expert", sessionId: "expert-legacy", taskName: "旧快照专家",
+          role: "explorer", model: "gpt-5.6-mini", status: "ready",
+        },
+      ],
+    },
+  };
+  const base = sessionsSnapshot();
+  const sessions = sessionsFixtureWith({
+    ...base,
+    byId: {
+      ...base.byId,
+      // createdAt === updatedAt：起止差为 0（durationOfNode 返回 null），才有「未开始」的事实。
+      "root-1": { ...base.byId["root-1"], createdAt, updatedAt: createdAt, projectionValues: zeroProjection },
+      "expert-idle": {
+        id: "expert-idle", title: "未开始专家", displayTitle: "expert-idle", running: false,
+        createdAt, updatedAt: createdAt, projectionValues: zeroProjection,
+      },
+      // expert-legacy：没有任何投影（旧快照），也没有 usage/durationMs。
+      "expert-legacy": { id: "expert-legacy", title: "旧快照专家", displayTitle: "expert-legacy", running: false },
+    },
+  });
+  const mounted = mountPanel({ hostSnapshot, sessions, storage: new MemoryStorage() });
+  const { handle, intervals, restore } = mounted;
+  const metricsParts = (node) => byClass(node, "deg_expert_group_metrics_part").map(textOf);
+  try {
+    await handle.settle();
+    const expected = ["用时0s", "0tok/s", "0 tok", "命中0%", "context 0%"];
+
+    const rootRow = byClass(handle.output, "deg_expert_group_node_root")[0];
+    const rootMetrics = byClass(byClass(rootRow, "deg_expert_group_row")[0], "deg_expert_group_metrics")[0];
+    assert.ok(rootMetrics, "主代理行必须显示五段 0 占位");
+    assert.equal(rootMetrics.props["aria-label"], "任务用量摘要");
+    assert.deepEqual(metricsParts(rootMetrics), expected);
+
+    const idleRow = rowOfExpert(handle.output, "未开始专家");
+    assert.ok(idleRow, "未开始专家行必须渲染");
+    const idleMetrics = byClass(idleRow, "deg_expert_group_metrics")[0];
+    assert.ok(idleMetrics, "子代理行必须显示五段 0 占位");
+    assert.deepEqual(metricsParts(idleMetrics), expected);
+
+    // 补齐出来的段不伪造语义化 tooltip：既不写「累计轮次用时 0s」，也不落成「已用 null / 窗口 null」。
+    // 唯一的例外是 tok 段——宿主的全 0 tokenUsage 投影给出了真实的 "0 tok" 文本（不是补齐段），
+    // 它的 tooltip 仍是 usageTitleOf 的零用量摘要（真实事实），只需保证不含 null。
+    for (const part of byClass(rootMetrics, "deg_expert_group_metrics_part")
+      .concat(byClass(idleMetrics, "deg_expert_group_metrics_part"))) {
+      const title = part.props.title;
+      const partText = textOf(part);
+      assert.equal(typeof title, "string", "每段都有 tooltip（缺失时回退为段文本）");
+      assert.equal(title.includes("累计轮次用时"), false, "占位行不得写「累计轮次用时」tooltip");
+      assert.equal(title.includes("null"), false, "占位行 tooltip 不得出现 null");
+      if (partText === "0 tok") {
+        // 真实的 0 token 事实：tooltip 是完整（且同样全 0）的用量摘要。
+        assert.ok(title.startsWith("用量："), "0 tok 段保留真实用量摘要 tooltip");
+      } else {
+        assert.equal(title, partText, "补齐段 tooltip 回退为段文本本身");
+      }
+    }
+
+    // 旧快照行（既无投影也无 usage）：未知不写成 0，整条摘要条不渲染。
+    const legacyRow = rowOfExpert(handle.output, "旧快照专家");
+    assert.ok(legacyRow, "旧快照行仍然渲染");
+    assert.equal(byClass(legacyRow, "deg_expert_group_metrics").length, 0, "旧快照行不得补 0 占位");
+  } finally {
+    handle.unmount();
+    restore();
+  }
+  assert.equal(intervals.active, 0);
+});
+
+/**
+ * 运行中补齐（用户要求，2026-10-25 第二次修正）：DSH 投影尚未加载时，摘要条不能塌成
+ * 「用时 · tok」两段——缺失段先补 0，等 sessionStats / tokenUsage / contextPressure 到达后
+ * 再替换为真实值（五段数量与顺序始终稳定，不跳动）。
+ */
+test("用量速览：运行中投影未到位时缺失段补 0，投影到达后替换为真实值", async () => {
+  const createdAt = 1700000000000;
+  const hostSnapshot = {
+    schemaVersion: 1,
+    rootSessionId: "root-1",
+    generatedAt: createdAt,
+    root: {
+      id: "root-1", kind: "root", sessionId: "root-1", taskName: "根任务标题",
+      role: "orchestrator", provider: "A6", model: "gpt-5.6-sol", effort: "xhigh",
+      status: "running", createdAt, turnDurationMs: 6000,
+      // DEG 侧只有「全 0」用量：0 tok 是有效事实，tok/s 与命中都无法证明。
+      usage: { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 },
+    },
+  };
+  const base = sessionsSnapshot();
+  const sessions = sessionsFixtureWith({
+    ...base,
+    byId: {
+      ...base.byId,
+      // 首帧：没有任何 sessionStats / tokenUsage / contextPressure 投影（DSH 尚未加载）。
+      "root-1": { ...base.byId["root-1"], createdAt, updatedAt: createdAt },
+    },
+  });
+  const mounted = mountPanel({ hostSnapshot, sessions, storage: new MemoryStorage() });
+  const { handle, intervals, restore } = mounted;
+  const metricsParts = (node) => byClass(node, "deg_expert_group_metrics_part").map(textOf);
+  const rootMetrics = () => {
+    const rootRow = byClass(handle.output, "deg_expert_group_node_root")[0];
+    return byClass(byClass(rootRow, "deg_expert_group_row")[0], "deg_expert_group_metrics")[0];
+  };
+  try {
+    await handle.settle();
+    // 首帧：运行中（约 6 秒）但投影未到 —— 五段稳定显示，缺失段补 0。
+    const before = rootMetrics();
+    assert.ok(before, "运行中的行必须渲染摘要条");
+    assert.deepEqual(metricsParts(before), ["用时6s", "0tok/s", "0 tok", "命中0%", "context 0%"]);
+    for (const part of byClass(before, "deg_expert_group_metrics_part")) {
+      const partText = textOf(part);
+      if (partText !== "0tok/s" && partText !== "命中0%" && partText !== "context 0%") continue;
+      assert.equal(part.props.title, partText, "补齐段 tooltip 回退为段文本本身");
+      assert.equal(part.props.title.includes("平均吞吐"), false, "补齐段不伪造「平均吞吐 0tok/s」");
+      assert.equal(part.props.title.includes("已用 null"), false, "补齐段不写「已用 null / 窗口 null」");
+    }
+    // 用时是真实值（turnDurationMs）：tooltip 保持常规文案，不属于补齐段。
+    const durationPart = byClass(before, "deg_expert_group_metrics_part").find((part) => textOf(part) === "用时6s");
+    assert.ok(durationPart.props.title.includes("累计轮次用时 6s"), "真实用时的 tooltip 保持常规文案");
+
+    // 投影到达：真实的 sessionStats / tokenUsage / contextPressure 进入 sessions 快照。
+    sessions.update({
+      ...base,
+      byId: {
+        ...base.byId,
+        "root-1": {
+          ...base.byId["root-1"], createdAt, updatedAt: createdAt,
+          projectionValues: {
+            sessionStats: { turns: 1, llmMs: 6000, toolMs: 0, decodeMs: 2000, decodeTokens: 100 },
+            tokenUsage: { uncachedInputTokens: 50, cacheReadTokens: 50, cacheWriteTokens: 0, outputTokens: 200 },
+            contextPressure: { projectedTokens: 30000, contextWindow: 100000 },
+          },
+        },
+      },
+    });
+    await handle.settle();
+    const after = rootMetrics();
+    assert.ok(after, "投影到达后摘要条仍在");
+    // 行内结构不变，只是把补齐的 0 换成真实值：用时仍优先 turnDurationMs（6s）；
+    // tok/s = 100 decode token ÷ 2s = 50；tok = 50+50+0+200 = 300；命中 = 50 ÷ 100 = 50%；
+    // context = 30000 ÷ 100000 = 30%。
+    assert.deepEqual(metricsParts(after), ["用时6s", "50tok/s", "300 tok", "命中50%", "context 30%"]);
   } finally {
     handle.unmount();
     restore();
@@ -6028,6 +6219,13 @@ test("票据 12：客户端本地搜索/角色/状态过滤保留祖先路径，
     const roleSelect = byAria(handle.output, "按角色筛选");
     const statusSelect = byAria(handle.output, "按状态筛选");
     assert.ok(search && roleSelect && statusSelect, "顶部工具条必须有搜索框 + 角色/状态筛选");
+    // 选项契约（需求变更）：分组选项恰好三项——运行中 / 未完成 / 已完成（空值项「全部状态」不计）。
+    const statusOptionNodes = (statusSelect.props.children ?? [])
+      .filter((node) => typeof node === "object" && node !== null && node.type === "option");
+    const groupedStatusOptions = statusOptionNodes.filter((option) => option.props.value !== "");
+    assert.equal(groupedStatusOptions.length, 3, "状态下拉只剩三个分组选项");
+    assert.deepEqual(groupedStatusOptions.map((option) => option.props.value), ["running", "incomplete", "completed"]);
+    assert.deepEqual(groupedStatusOptions.map((option) => textOf(option)), ["运行中", "未完成", "已完成"]);
 
     // 任务名搜索：命中分片时保留祖先（根 + fan-out 分支），其它节点整棵隐藏。
     search.props.onChange({ target: { value: "failed-shard" } });
@@ -6055,11 +6253,23 @@ test("票据 12：客户端本地搜索/角色/状态过滤保留祖先路径，
     byAria(handle.output, "按角色筛选").props.onChange({ target: { value: "" } });
     await handle.settle();
 
-    // 状态筛选：失败分组包含 failed/timed_out/interrupted；运行中的专家与成功分片被过滤。
-    byAria(handle.output, "按状态筛选").props.onChange({ target: { value: "failed" } });
+    // 状态筛选：「未完成」= 失败/超时/中断/取消，以及没有正常完成证据的 idle/ready/unknown；
+    // 有 succeeded 证据的成功分片与仍在跑的运行专家都不属于未完成。
+    byAria(handle.output, "按状态筛选").props.onChange({ target: { value: "incomplete" } });
     await handle.settle();
     assert.equal(textOf(handle.output).includes("失败分片"), true);
     assert.equal(textOf(handle.output).includes("成功分片"), false);
+    assert.equal(textOf(handle.output).includes("运行专家"), false);
+    // 空闲专家的协议状态是 ready：没有正常完成（succeeded）的证据，因此归入「未完成」可见。
+    assert.equal(textOf(handle.output).includes("空闲专家"), true, "ready 无正常完成证据 ⇒ 未完成");
+    byAria(handle.output, "按状态筛选").props.onChange({ target: { value: "" } });
+    await handle.settle();
+
+    // 「已完成」只认 succeeded：成功分片可见，失败分片/运行专家/空闲专家都被过滤掉。
+    byAria(handle.output, "按状态筛选").props.onChange({ target: { value: "completed" } });
+    await handle.settle();
+    assert.equal(textOf(handle.output).includes("成功分片"), true);
+    assert.equal(textOf(handle.output).includes("失败分片"), false);
     assert.equal(textOf(handle.output).includes("运行专家"), false);
     assert.equal(textOf(handle.output).includes("空闲专家"), false);
     byAria(handle.output, "按状态筛选").props.onChange({ target: { value: "" } });
@@ -7598,3 +7808,321 @@ test("续作复用：分片行不误报「多次重试」且保留行尾双箭�
     retried.restore();
   }
 });
+
+// ── 票据 09：标题栏「峰谷时段标记」与分钟级刷新 ─────────────────────────────────
+// 断言强度：
+// - 文案与「设置页入口按钮的后缀」同键同源（A5 渲染真实设置页做对照）；
+// - 60s 定时器只在启用时创建：受控 setInterval 账本记录**每一次**调用（含已清理的），
+//   因此"未启用"断言的是"一次都没创建"，而不只是"当前不存在"；
+// - 跨边界更新用受控时钟推进 + 受控 tick 驱动，不真实等待（A6）；
+// - 标记只出现在标题栏：任务行/运行摘要的渲染输出与未注入读面时逐字相同。
+
+/** 标题栏峰谷标记节点（稳定 class；缺失返回 null）。 */
+const peakValleyMarkerOf = (handle) => byClass(handle.output, "deg_expert_group_header_peak_valley")[0] ?? null;
+const peakValleyTagText = (handle) => {
+  const node = peakValleyMarkerOf(handle);
+  return node === null ? null : textOf(node);
+};
+/** 峰段夹具：08:00–10:00 为峰时（左闭右开：10:00 起即谷时）。 */
+const PEAK_PERIODS = Object.freeze([{ start: "08:00", end: "10:00" }]);
+
+/**
+ * 可控「无参 new Date()」：替换全局 Date，按当前固定时刻回答。
+ *
+ * 为什么不用 installFakeClock：那个替身只接管 Date.now，而判定函数（与设置页）都用
+ * `new Date()` 读墙钟——只改 Date.now 不会影响 new Date()。这里连构造一起接管，
+ * 用例才能用 set/advance 精确驱动"跨过峰段边界"这一时刻。
+ * 带参数的构造与静态方法原样委托给真实 Date（其余用例行为不变）。
+ */
+function installFixedDate(initial) {
+  const RealDate = globalThis.Date;
+  const state = { now: initial };
+  function FixedDate(...args) {
+    if (args.length > 0) return new RealDate(...args);
+    return new RealDate(state.now);
+  }
+  FixedDate.prototype = RealDate.prototype;
+  FixedDate.now = () => state.now;
+  FixedDate.parse = (text) => RealDate.parse(text);
+  FixedDate.UTC = (...args) => RealDate.UTC(...args);
+  globalThis.Date = FixedDate;
+  return {
+    set(next) { state.now = next; },
+    advance(ms) { state.now += ms; },
+    now: () => state.now,
+    restore() { globalThis.Date = RealDate; },
+  };
+}
+
+/**
+ * 与 install 注入面同形的峰谷读面替身：`enabled/periods` 每次现读，
+ * 因此用例可以只改 state 就让面板看到设置页保存后的新值。
+ */
+function peakValleyDeps(state, extra = {}) {
+  return {
+    peakValleyTime,
+    settingsExtraText,
+    getPeakValleySettings: () => ({
+      enabled: state.enabled === true,
+      periods: Array.isArray(state.periods) ? state.periods : [],
+    }),
+    ...extra,
+  };
+}
+
+/** 标题栏子节点的相对顺序（用于断言"Auto 右侧、错误槽左侧"）。 */
+function headerOrderOf(handle) {
+  const header = byClass(handle.output, "deg_expert_group_header")[0];
+  assert.ok(header, "标题栏必须渲染");
+  return {
+    auto: header.children.findIndex((node) => String(node?.props?.className ?? "").split(/\s+/).includes("deg_expert_group_header_auto")),
+    marker: header.children.findIndex((node) => node === peakValleyMarkerOf(handle)),
+    error: header.children.findIndex((node) => String(node?.props?.className ?? "").split(/\s+/).includes("deg_expert_group_error")),
+    refresh: header.children.findIndex((node) => String(node?.props?.className ?? "").split(/\s+/).includes("deg_expert_group_header_action")),
+  };
+}
+
+/**
+ * 渲染**真实设置页**并返回「峰谷模式」入口按钮的完整文本（A5 的对照面）。
+ *
+ * 与设置页测试同一装载路径（client.apply → settings.section 组件），后缀完全由生产实现
+ * 算出：侧栏标记只要与它的尾部一致，就证明两处对同一 enabled/periods + 同一时刻给出
+ * 同一个峰/谷结果（两处都调 01 的权威纯函数，没有第二份判定）。
+ */
+async function renderSettingsEntryText(settingsValue) {
+  const runtime = createClientReactRuntime();
+  const intervals = createFakeIntervals();
+  const restoreIntervals = installGlobals({ setInterval: intervals.setInterval, clearInterval: intervals.clearInterval });
+  const { client } = await loadClientBundle({ react: runtime.react, primitives: {} });
+  const settingsForm = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ status: "ready", value: settingsValue, revision: 1, writable: true, mode: "host" }),
+  };
+  const host = createHostContextStub({
+    connection: {
+      rpc: {
+        async call(_channel, _endpoint, body) {
+          if (body?.action === "meta") {
+            return { ok: true, value: { ok: true, activeRoles: ["fixer"], enableObserver: true } };
+          }
+          return { ok: false, error: { code: "bad-request" } };
+        },
+      },
+    },
+  });
+  client.apply(host.ctx);
+  const section = host.registrations.get("settings.section");
+  assert.ok(section, "设置页必须注册为 settings.section");
+  const modelCatalog = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ groups: [], status: "ready", error: null }),
+    load: async () => {},
+  };
+  const handle = runtime.render(section.Component, { settingsForm, modelCatalog, ctx: host.ctx });
+  try {
+    await handle.settle();
+    const entry = byClass(handle.output, "deg_settings_peak_valley_entry")[0];
+    assert.ok(entry, "设置页必须渲染峰谷入口按钮");
+    return textOf(entry);
+  } finally {
+    handle.unmount();
+    host.dispose();
+    restoreIntervals();
+  }
+}
+
+test("A4：未启用时 Auto 右侧显示「峰谷：未启用」，且绝不创建分钟定时器", async () => {
+  // 基线：同一份快照、不注入峰谷读面 ⇒ 任务树渲染输出必须与新标记无关。
+  const baseline = mountPanel({});
+  let baselineRows = [];
+  try {
+    await baseline.handle.settle();
+    baselineRows = byClass(baseline.handle.output, "deg_expert_group_row").map((row) => textOf(row));
+  } finally {
+    baseline.handle.unmount();
+    baseline.restore();
+  }
+  assert.equal(baselineRows.length > 0, true, "基线必须渲染出任务行");
+
+  const state = { enabled: false, periods: PEAK_PERIODS };
+  const mounted = mountPanel(peakValleyDeps(state));
+  const { handle, intervals, restore } = mounted;
+  try {
+    await handle.settle();
+    const marker = peakValleyMarkerOf(handle);
+    assert.ok(marker, "标题栏必须渲染峰谷时段标记（Auto 右侧）");
+    assert.equal(textOf(marker), "峰谷：未启用");
+    assert.equal(textOf(marker), settingsExtraText("zh", "settings.pv.disabled"),
+      "未启用文案必须来自 settings/extra 表（与设置页同一张表）");
+    assert.equal(marker.props["data-peak-valley"], "disabled");
+    // 位置：紧跟 Auto、位于刷新按钮之前（错误槽未出现时紧邻 Auto）。
+    const order = headerOrderOf(handle);
+    assert.equal(order.marker, order.auto + 1, "标记必须紧跟在 Auto 之后");
+    assert.ok(order.marker < order.refresh, "标记必须位于标题栏操作按钮之前");
+
+    // 未启用 ⇒ 受控账本里一次 60s 定时器都没有（不是"当前不存在"，而是"从未创建"）。
+    assert.equal(intervals.scheduled.includes(60000), false, "未启用时绝不得创建 60s 定时器");
+    assert.equal(intervals.delays.includes(60000), false);
+
+    // 标记只进标题栏：任务行/运行摘要的渲染输出与基线逐字相同。
+    const markedRows = byClass(handle.output, "deg_expert_group_row").map((row) => textOf(row));
+    assert.deepEqual(markedRows, baselineRows, "任务行与运行摘要的渲染输出不得因标记而改变");
+    assert.equal(markedRows.some((row) => row.includes("峰谷：未启用")), false, "标记不得进入任务行");
+  } finally {
+    handle.unmount();
+    restore();
+  }
+  assert.equal(intervals.active, 0, "卸载后不得留下任何定时器");
+});
+
+test("A4-补：有错误槽时标记仍在 Auto 与错误槽之间", async () => {
+  const state = { enabled: false, periods: PEAK_PERIODS };
+  const mounted = mountPanel(peakValleyDeps(state, {
+    requestPluginRpc() {
+      throw new Error("快照传输失败");
+    },
+  }));
+  const { handle, intervals, restore } = mounted;
+  try {
+    await handle.settle();
+    assert.ok(headerErrorNode(handle), "本用例必须有错误槽");
+    const order = headerOrderOf(handle);
+    assert.ok(order.error > 0, "错误槽必须渲染");
+    assert.equal(order.marker, order.auto + 1, "标记必须紧跟在 Auto 之后");
+    assert.ok(order.marker < order.error, "标记必须位于错误槽之前（错误槽右侧才是刷新按钮）");
+    assert.ok(order.error < order.refresh, "错误槽仍位于刷新按钮之前（既有顺序不变）");
+    assert.equal(peakValleyTagText(handle), "峰谷：未启用");
+  } finally {
+    handle.unmount();
+    restore();
+  }
+  assert.equal(intervals.active, 0);
+});
+
+test("A5：启用后标记显示峰时/谷时，且与设置页入口后缀对同一输入一致", async () => {
+  const state = { enabled: true, periods: PEAK_PERIODS };
+  const settingsValue = {
+    peakValley: {
+      enabled: true,
+      initialized: true,
+      periods: PEAK_PERIODS,
+      peak: { provider: "", defaults: {}, candidates: {}, fallbackLimit: 2 },
+      valley: { provider: "", defaults: {}, candidates: {}, fallbackLimit: 2 },
+    },
+  };
+  // 固定本地墙钟 09:00（峰段内）：侧栏与设置页读到的都是同一个 "now"。
+  const clock = installFixedDate(new Date(2026, 0, 15, 9, 0, 0).getTime());
+  const mounted = mountPanel(peakValleyDeps(state));
+  const { handle, intervals, restore } = mounted;
+  try {
+    await handle.settle();
+    assert.equal(peakValleyTagText(handle), "峰谷模式 峰时");
+    assert.equal(peakValleyMarkerOf(handle).props["data-peak-valley"], "peak");
+    assert.equal(peakValleyTagText(handle),
+      settingsExtraText("zh", "settings.pv.entry") + " " + settingsExtraText("zh", "settings.pv.peak"),
+      "标记文案必须复用设置页入口文案 + settings.pv.peak");
+
+    const peakEntryText = await renderSettingsEntryText(settingsValue);
+    assert.equal(peakEntryText, "峰谷模式 峰时", "设置页入口后缀（对照面）应为峰时");
+    assert.equal(peakValleyTagText(handle), peakEntryText,
+      "侧栏标记必须与设置页入口按钮同文案（同一 enabled/periods 同一结果）");
+
+    // 启用后必须启动分钟级刷新（与"未启用不创建"成对，证明定时器确实是启用态专属）。
+    assert.equal(intervals.delays.includes(60000), true, "启用后必须创建 60s 定时器");
+
+    // 跨到谷时（10:30）：受控 tick 重算后标记与设置页后缀仍一致。
+    clock.advance(90 * 60 * 1000);
+    await intervals.tick();
+    await handle.settle();
+    assert.equal(peakValleyTagText(handle), "峰谷模式 谷时");
+    assert.equal(peakValleyMarkerOf(handle).props["data-peak-valley"], "valley");
+    assert.equal(peakValleyTagText(handle),
+      settingsExtraText("zh", "settings.pv.entry") + " " + settingsExtraText("zh", "settings.pv.valley"),
+      "标记文案必须复用设置页入口文案 + settings.pv.valley");
+    const valleyEntryText = await renderSettingsEntryText(settingsValue);
+    assert.equal(valleyEntryText, "峰谷模式 谷时");
+    assert.equal(peakValleyTagText(handle), valleyEntryText,
+      "谷时同样必须与设置页入口按钮同文案");
+  } finally {
+    handle.unmount();
+    restore();
+    clock.restore();
+  }
+  assert.equal(intervals.active, 0);
+});
+
+test("A6：跨过峰段边界后标记自动更新，无需刷新面板（分钟级）", async () => {
+  const state = { enabled: true, periods: PEAK_PERIODS };
+  // 09:59 仍在峰段内；推进 2 分钟跨过 10:00 边界。
+  const clock = installFixedDate(new Date(2026, 0, 15, 9, 59, 0).getTime());
+  const mounted = mountPanel(peakValleyDeps(state));
+  const { handle, intervals, restore } = mounted;
+  try {
+    await handle.settle();
+    assert.equal(peakValleyTagText(handle), "峰谷模式 峰时");
+    // 不刷新、不重挂载：只推进受控时钟并驱动分钟级 tick。
+    clock.advance(2 * 60 * 1000);
+    await intervals.tick();
+    await handle.settle();
+    assert.equal(peakValleyTagText(handle), "峰谷模式 谷时", "跨过峰段边界后标记必须自动更新");
+    assert.equal(peakValleyMarkerOf(handle).props["data-peak-valley"], "valley");
+    // 同一时段内继续 tick 不改变结果（幂等）。
+    await intervals.tick();
+    await handle.settle();
+    assert.equal(peakValleyTagText(handle), "峰谷模式 谷时");
+  } finally {
+    handle.unmount();
+    restore();
+    clock.restore();
+  }
+  assert.equal(intervals.active, 0, "卸载后分钟级定时器必须被清理");
+  assert.equal(intervals.delays.includes(60000), false);
+});
+
+test("A6-补：设置表单变更（启用/关闭、时段变化）后标记立即更新", async () => {
+  // 受控订阅面：install 注入的 subscribePeakValleySettings 与 settingsForm.subscribe 同形。
+  const state = { enabled: false, periods: PEAK_PERIODS };
+  const listeners = new Set();
+  const clock = installFixedDate(new Date(2026, 0, 15, 9, 0, 0).getTime());
+  const mounted = mountPanel(peakValleyDeps(state, {
+    subscribePeakValleySettings(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  }));
+  const { handle, intervals, restore } = mounted;
+  const notify = async () => {
+    for (const listener of [...listeners]) listener();
+    await handle.settle();
+  };
+  try {
+    await handle.settle();
+    assert.equal(peakValleyTagText(handle), "峰谷：未启用");
+    assert.equal(intervals.delays.includes(60000), false, "未启用时不创建分钟定时器");
+
+    // ① 用户启用峰谷（同一时刻仍在峰段内）：标记立刻变成「峰时」，定时器随之启动。
+    state.enabled = true;
+    await notify();
+    assert.equal(peakValleyTagText(handle), "峰谷模式 峰时", "启用后必须立刻更新，不必等下一轮轮询");
+    assert.equal(intervals.delays.includes(60000), true, "启用后必须启动分钟级刷新");
+
+    // ② 用户把峰段改到 11:00–12:00：同一时刻 09:00 变成谷时，标记立即跟随。
+    state.periods = [{ start: "11:00", end: "12:00" }];
+    await notify();
+    assert.equal(peakValleyTagText(handle), "峰谷模式 谷时", "时段变化后必须立即按新时段重算");
+
+    // ③ 用户关闭峰谷：标记回到「峰谷：未启用」，定时器被清理。
+    state.enabled = false;
+    await notify();
+    assert.equal(peakValleyTagText(handle), "峰谷：未启用");
+    assert.equal(intervals.delays.includes(60000), false, "关闭后必须清掉分钟定时器");
+    assert.equal(listeners.size, 1, "同一 Panel 只保留一条订阅");
+  } finally {
+    handle.unmount();
+    restore();
+    clock.restore();
+  }
+  assert.equal(intervals.active, 0);
+  assert.equal(listeners.size, 0, "卸载必须取消设置订阅");
+});
+

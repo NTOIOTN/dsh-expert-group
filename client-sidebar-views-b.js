@@ -232,9 +232,21 @@
   /**
    * 任务行的用量摘要条：用时 · tok/s · tok · 命中 · context 五段（异常提示另算）。
    *
-   * 数字与文本全部由模型层 summarizeUsageMetrics 生成，这里只负责按固定顺序摆放：
-   * 缺失段整段省略（不写 0/占位词）；五段全空且没有「多次重试」/失败摘要时整行不渲染。
+   * 数字与文本全部由模型层 summarizeUsageMetrics 生成，这里只负责按固定顺序摆放。
    * 每段都带一个有界 title tooltip，tok 段复用 usageTitleOf 的完整用量摘要。
+   * 四种形态（用户要求，2026-10-25）：
+   *
+   * (a) **旧快照，毫无证据**：既没有用时，也没有 DSH 投影与 DEG usage——缺失段整段省略，
+   *     五段全空且没有「多次重试」/失败摘要时整行不渲染（未知不写成 0）。
+   * (b) **未开始运行，但有事实**：宿主已为该行投影会话统计（全 0 投影也算）或已有明确的
+   *     0 token 事实 ⇒ 五段全 0（用时0s · 0tok/s · 0 tok · 命中0% · context 0%）。
+   * (c) **已运行但投影未到**：只要已算出用时，且处于运行中 / 宿主已投影 / DEG 有 usage /
+   *     已有 0 token 事实之一 ⇒ 缺失段补 0（真实值原样保留），投影到达后自动替换为真值；
+   *     运行过程中五段不再塌成「用时 · tok」两段，也不会来回跳动。
+   * (d) 补出来的段不伪造语义 tooltip（不写「累计轮次用时 0s」「平均吞吐 0tok/s」
+   *     「已用 null / 窗口 null」），tooltip 回退为段文本本身。
+   *
+   * fan-out 父任务没有单一会话，context 段始终省略（补齐时 skipContext）。
    */
   const renderMetrics = (ctx, node, options = {}) => {
     const { react } = ctx;
@@ -272,13 +284,31 @@
     const durationMs = turnDurationMs !== null
       ? turnDurationMs + extrapolationMs
       : (dshDuration !== null ? dshDuration : durationOfNode(ctx, source, runtimeStatus, sessionId));
-    const summary = typeof api?.summarizeUsageMetrics === "function"
+    let summary = typeof api?.summarizeUsageMetrics === "function"
       ? api.summarizeUsageMetrics(usage, {
         durationMs,
         contextPressure: contextPressureOf(ctx, sessionId),
         measuredTokensPerSecond: measuredTps,
       })
       : null;
+    // 「未开始运行」的占位判定（语义不变）：只有拿到**事实**才补 0，两种证据任一即可——
+    // (a) 宿主已为这一行投影会话统计（dsh 非 null，含全 0 投影）；
+    // (b) DEG 侧已有明确的 0 token 事实（totalTokens === 0，现状就显示 "0 tok"）。
+    const idlePlaceholder = typeof api?.isEmptyUsageMetrics === "function"
+      && summary !== null
+      && (dsh !== null || summary.totalTokens === 0)
+      && api.isEmptyUsageMetrics(summary);
+    // 「运行中 / 已有事实」的缺失段补齐（用户要求）：只要已经算出用时，并且处于运行中，或
+    // 宿主已投影、DEG 有 usage、已有 0 token 事实之一，缺失段就补 0——避免运行过程中五段
+    // 塌成「用时 · tok」两段。完全没有证据的旧快照行保持原样：整条摘要条不渲染。
+    const zeroFill = summary !== null && (idlePlaceholder
+      || (summary.durationText !== null
+        && (runtimeStatus === "running" || dsh !== null || usage !== null || summary.totalTokens !== null)));
+    // 只补缺失段（浅拷贝，绝不覆盖真值）；fan-out 父任务没有单一会话，context 段不补。
+    const fill = zeroFill && typeof api?.zeroFilledUsageMetrics === "function"
+      ? api.zeroFilledUsageMetrics(summary, { skipContext: kind === "fanout" })
+      : null;
+    if (fill !== null) summary = fill.metrics;
     const segments = [];
     const pushSegment = (key, textValue, titleValue) => {
       if (typeof textValue !== "string" || textValue.length === 0) return;
@@ -295,6 +325,9 @@
         title: typeof titleValue === "string" ? titleValue : textValue,
       }, textValue));
     };
+    // 补出来的段不伪造语义化 tooltip（「累计轮次用时 0s」/「平均吞吐 0tok/s」/「窗口 null」这类
+    // 文案会把「尚未投影」写成一个测量结果）；按段判定，null 时 pushSegment 回退成段文本本身。
+    const segmentTitle = (key, value) => (fill !== null && fill.filled[key] === true ? null : value);
     if (summary !== null) {
       // 用时 tooltip：DSH 显示「模型用时」，并补充工具调用用时；回退 DEG 时仍写「运行时间」。
       const toolDurationText = dsh === null || dsh.toolMs === null ? null : formatCompactDuration(dsh.toolMs);
@@ -309,18 +342,26 @@
           : dshDuration !== null
             ? "模型用时 " + summary.durationText + (toolDurationText === null ? "" : " · 工具调用用时 " + toolDurationText)
             : "运行时间 " + summary.durationText;
-      pushSegment("duration", summary.durationText === null ? null : "用时" + summary.durationText, durationTitle);
+      pushSegment("duration", summary.durationText === null ? null : "用时" + summary.durationText,
+        segmentTitle("durationText", durationTitle));
       pushSegment("throughput", summary.throughputText,
-        summary.throughputText === null ? null : (measuredTps === null ? "平均吞吐 " : "输出速度 ") + summary.throughputText);
+        segmentTitle("throughputText", summary.throughputText === null ? null
+          : (measuredTps === null ? "平均吞吐 " : "输出速度 ") + summary.throughputText));
       // tok 段的 tooltip 用完整用量摘要（输入/输出/缓存/请求等），并做与结构化预览同级的 400 字符上限。
       const usageTitle = usage === null ? null : ctx.a.usageTitleOf(usage);
       pushSegment("tokens", summary.totalTokensText,
-        usageTitle === null ? summary.totalTokensText : usageTitle.slice(0, 400));
+        segmentTitle("totalTokensText", usageTitle === null ? summary.totalTokensText : usageTitle.slice(0, 400)));
       pushSegment("cache-hit", summary.cacheHitText,
-        summary.cacheHitPercent === null ? null : "缓存命中率 " + summary.cacheHitPercent + "%（缓存读 ÷ 计费输入）");
+        segmentTitle("cacheHitText", summary.cacheHitPercent === null ? null
+          : "缓存命中率 " + summary.cacheHitPercent + "%（缓存读 ÷ 计费输入）"));
+      // context 段只有「已用 / 窗口」都是有限数时才写完整占用说明，否则退回段文本（避免 "已用 null"）。
+      const contextDetailReady = Number.isFinite(summary.contextPercent)
+        && Number.isFinite(summary.contextUsedTokens)
+        && Number.isFinite(summary.contextWindow);
       pushSegment("context", summary.contextText,
-        summary.contextPercent === null ? null
-          : "上下文占用 " + summary.contextPercent + "%（已用 " + summary.contextUsedTokens + " / 窗口 " + summary.contextWindow + "）");
+        segmentTitle("contextText", contextDetailReady
+          ? "上下文占用 " + summary.contextPercent + "%（已用 " + summary.contextUsedTokens + " / 窗口 " + summary.contextWindow + "）"
+          : null));
     }
     const retryCount = finiteNumber(source.retryCount);
     const retryWarning = retryCount !== null && retryCount >= retryWarningThreshold()

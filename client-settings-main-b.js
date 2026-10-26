@@ -12,16 +12,20 @@
   const clientSettingsNormalizeSymbol = Symbol.for("dsh-expert-group/client-settings-normalize");
   const clientSettingsNormalize = global[clientSettingsNormalizeSymbol] || {};
   const {
-    DEFAULT_MODEL_FALLBACK_LIMIT, MAX_MODEL_CANDIDATES_PER_ROLE, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_PAGES, NOTIFICATION_EVENT_TYPES, PROMPT_WARNING_RATIO,
+    DEFAULT_MODEL_FALLBACK_LIMIT, MAX_MODEL_CANDIDATES_PER_ROLE, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_PAGES, NEXT_PEAK_VALLEY_PERIOD,
+    NOTIFICATION_EVENT_TYPES, PROMPT_WARNING_RATIO,
     clampNotificationVolume, migrateSettingsSelection, modelLayerSelectionOf, normalizeRolePromptProjection, normalizeSettingsDraft, promptEntryOf,
     setModelLayerSelection, settingsRolesForProvider, syncSettingsDefaultsProvider, validatePromptText,
   } = clientSettingsNormalize;
   // descriptor 注入的运行期依赖：本模块先于 descriptor 执行，取值只发生在运行期调用时。
   let react = null;
   let ModelConfigSection = null;
+  // 峰谷时段纯函数：与 Host 校验、保存前校验共用同一份构建期投影实现。
+  let peakValleyTime = null;
   function bindClientRuntime(host) {
     react = host.react ?? null;
     ModelConfigSection = host.ModelConfigSection ?? null;
+    peakValleyTime = host.peakValleyTime ?? null;
   }
 
   /**
@@ -66,6 +70,10 @@
     const promptEditor = renderSettingsPromptEditor(view, actions);
     const leaveDialog = renderSettingsLeaveDialog(view, actions);
     if (selectedPromptRole !== null) return react.createElement(react.Fragment, null, promptEditor, leaveDialog);
+    // 峰谷子视图（票据 07）：设置页内的第二个视图，返回后回到原模型设置页。
+    if (view.peakValleyOpen === true && typeof view.peakValleyViewOf === "function") {
+      return renderPeakValleySettings(view.peakValleyViewOf(view));
+    }
 
     return renderSettingsBody(view, actions);
   }
@@ -87,7 +95,8 @@
         const snapshot = settingsForm.getSnapshot();
         // 放弃修改要回到"已保存"的状态：快照滞后时 authorityValue 才是刚提交的 accepted。
         const refreshedProjection = normalizeRolePromptProjection(hostMeta?.rolePrompts, authorityValue, true, promptRoleIds) ?? promptProjection;
-        setDraft(normalizeSettingsDraft(authorityValue, roles));
+        // 重新建草稿 = 读取面 → 草稿的入口，同样要播种默认峰段（与 main-a 的入口同一口径）。
+        setDraft(normalizeSettingsDraft(authorityValue, roles, true, true));
         setCandidatesError(null);
         // 重新加载时清空局部草稿，让 Host 当前 effective/default 成为编辑初值。
         setPromptDrafts({});
@@ -123,7 +132,7 @@
           return;
         }
         setLocalPromptProjection(null);
-        setDraft(normalizeSettingsDraft(snapshot.value, roles));
+        setDraft(normalizeSettingsDraft(snapshot.value, roles, true, true));
         setPromptDrafts({});
         setPromptTouched({});
         setEditorBaseline({ role: selectedPromptRole, value: snapshot.value, revision: snapshot.revision, projection });
@@ -269,6 +278,28 @@
   }
 
   /**
+   * 弹窗焦点陷阱：Tab / Shift+Tab 在 [data-deg-dialog-action] 控件之间首尾相接循环。
+   *
+   * 为什么等价：离开确认弹窗与删除候选页确认框原先各写了一份逐字相同的实现（读取
+   * event.currentTarget 的 action 控件、按 activeElement 的索引前进/后退、preventDefault 后
+   * 聚焦下一个控件、无焦点环境静默兜底）。合并成一个模块级函数后，事件对象、控件选择器、
+   * 循环算法与失败兜底全部不变；两处调用点仍只在 key === "Tab" 时进入（第二个弹窗为了
+   * 容错用了 event?.key，调用前已保证 event 存在，因此行为一致）。
+   *
+   * @param {object} event 键盘事件（React 合成事件或 DOM 事件）。
+   */
+  function trapDialogTabFocus(event) {
+    const controls = Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]") ?? []);
+    if (controls.length === 0) return;
+    const current = controls.indexOf(typeof document === "undefined" ? null : document.activeElement);
+    const nextIndex = event.shiftKey
+      ? (current <= 0 ? controls.length - 1 : current - 1)
+      : (current >= controls.length - 1 ? 0 : current + 1);
+    event.preventDefault?.();
+    try { controls[nextIndex]?.focus?.(); } catch { /* 无 DOM 焦点时保持可点击按钮。 */ }
+  }
+
+  /**
    * 未保存修改的离开确认弹窗：保存并离开 / 放弃修改 / 取消。
    */
   function renderSettingsLeaveDialog(view, actions) {
@@ -290,14 +321,7 @@
               return;
             }
             if (event.key !== "Tab") return;
-            const controls = Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]") ?? []);
-            if (controls.length === 0) return;
-            const current = controls.indexOf(typeof document === "undefined" ? null : document.activeElement);
-            const nextIndex = event.shiftKey
-              ? (current <= 0 ? controls.length - 1 : current - 1)
-              : (current >= controls.length - 1 ? 0 : current + 1);
-            event.preventDefault?.();
-            try { controls[nextIndex]?.focus?.(); } catch { /* 无 DOM 焦点时保持可点击按钮。 */ }
+            trapDialogTabFocus(event);
           },
         },
           react.createElement("h3", null, "未保存的修改"),
@@ -522,12 +546,51 @@
   }
 
   /**
+   * 峰时 / 谷时切换器：两个与页签同高（28px）的小按钮，只出现在峰谷子视图的页签行末尾。
+   *
+   * 为什么放在 tablist 之外：`role="tablist"` 的语义只容纳「模型页」页签，把时段切换器塞进去
+   * 会被辅助技术读成又一个模型页，也会破坏方向键在页签间的移动模型；因此它和「峰谷模式」入口
+   * 一样与 tablist 同层，靠 `margin-left:auto` 贴在同一行的最右侧。
+   *
+   * 为什么只在峰谷子视图渲染（view.peakValleyOpen === true）：主设置页——包括启用峰谷后锁定
+   * 当前时段的主设置页——的时段由打开页面时采样并锁定（见 main-a 的 peakValleyPeriod 锁定逻辑），
+   * 在那里放一个能切换时段的控件既不会改变本页编辑的 profile，又会让用户以为切换生效；
+   * 主设置页保留「峰谷模式」入口按钮作为唯一出口，这是唯一可靠的判据。
+   *
+   * 视觉上沿用 deg_btn 的按钮外观（激活态用主色实心，与原来那一行一致），但高度与内边距
+   * 对齐页签：两者同高才不会在同一行里一高一低。
+   */
+  function renderPeakValleyPeriodToggle(view) {
+    const {
+      peakValleyPeriod, saving, setPeakValleyPeriod, tExtra,
+    } = view;
+
+    const toggleButtons = ["peak", "valley"].map((period) => react.createElement("button", {
+      key: period,
+      type: "button",
+      className: "deg_btn deg_settings_peak_valley_period" + (period === peakValleyPeriod ? " deg_btn_primary" : ""),
+      "data-deg-peak-valley-period": period,
+      "aria-pressed": period === peakValleyPeriod,
+      disabled: saving,
+      onClick: () => setPeakValleyPeriod(period),
+    }, tExtra(period === "peak" ? "settings.pv.peak" : "settings.pv.valley")));
+    // 外层容器只负责定位与间距；按钮本身继承 deg_btn 的语义（含 disabled 时的禁用样式）。
+    return react.createElement("div", {
+      // 容器 class 与「峰段区块」区分开（那是 deg_settings_peak_valley_periods）：
+      // 这里只是页签行右侧的峰时/谷时按钮组，不能继承段落式布局。
+      className: "deg_settings_pv_period_toggle",
+      "data-deg-peak-valley-periods-toggle": "true",
+    }, toggleButtons);
+  }
+
+  /**
    * 模型页签行（页签、落点竖条、× 与 +）：页签名只由位置推导，拖动只改渲染期落点提示。
    */
   function renderSettingsModelTabs(view) {
     const {
-      addModelPage, beginModelTabDrag, currentModelPage, modelPageCount, modelPageLabelOf, modelTabDrag,
-      modelTabRefs, requestModelPageDelete, saving, selectModelPage, settingsReadOnly, tExtra,
+      addModelPage, beginModelTabDrag, currentModelPage, draft, modelPageCount, modelPageLabelOf, modelTabDrag,
+      modelTabRefs, peakValleyEntry, requestModelPageDelete, saving, selectModelPage, setPeakValleyOpen,
+      settingsReadOnly, tExtra,
     } = view;
 
       /**
@@ -603,12 +666,48 @@
         disabled: saving || settingsReadOnly || modelPageCount >= MAX_MODEL_PAGES,
         onClick: () => addModelPage(),
       }, "+"));
+      /**
+       * 「峰谷模式」入口（票据 07）：与 tablist 同层、但在 role=tablist **之外**——
+       * tablist 的语义只容纳 tab，把普通按钮塞进去会让辅助技术读成页签。
+       * 未启用为普通态；启用后加启用态 class，并用权威纯函数算出的当前时段作后缀。
+       */
+      // 投影视图（峰谷子视图 / 主设置页的周期视图）里 draft 已经是「某一套 profile」，
+      // 峰谷状态在 view.peakValleyState 上；未投影时照旧从草稿读。
+      const peakValleyState = view.peakValleyState ?? draft?.peakValley ?? {};
+      const peakValleyEnabled = peakValleyState.enabled === true;
+      /**
+       * 后缀只读**已采样的时段 state**（页面打开时的锁定值 / 分钟级采样的当前时段），
+       * 渲染期间因此不再读系统时间；与主设置页的提示行同源，两者不会互相矛盾。
+       */
+      const shownPeriod = view.livePeriod ?? view.mainPeriod;
+      const peakValleySuffix = peakValleyEnabled
+        ? " " + tExtra(shownPeriod === "peak" ? "settings.pv.peak" : "settings.pv.valley")
+        : "";
+      const peakValleyEntryButton = peakValleyEntry === false ? null : react.createElement("button", {
+        type: "button",
+        className: "deg_settings_model_tab deg_settings_peak_valley_entry" + (peakValleyEnabled ? " deg_settings_peak_valley_entry_active" : ""),
+        "data-deg-peak-valley-entry": "true",
+        "data-enabled": peakValleyEnabled ? "true" : "false",
+        disabled: saving,
+        onClick: () => setPeakValleyOpen(true),
+      }, tExtra("settings.pv.entry") + peakValleySuffix);
+      /**
+       * 时段切换器插槽（峰时 / 谷时）：只在峰谷子视图里出现，且是页签行的**最后一个**子节点。
+       * 子视图里入口按钮不渲染（投影把 peakValleyEntry 置为 false），所以切换器自然落在最右；
+       * 判据只用 view.peakValleyOpen，避免主设置页（含锁定当前时段的主设置页）误渲染它。
+       */
+      const periodToggleSlot = view.peakValleyOpen === true ? renderPeakValleyPeriodToggle(view) : null;
       const modelTabRow = react.createElement("div", {
         className: "deg_settings_model_tabs",
         "data-deg-model-tabs": "true",
-        role: "tablist",
-        "aria-label": tExtra("settings.modelTabs.primary") + " / " + tExtra("settings.modelTabs.candidate", { index: MAX_MODEL_CANDIDATES_PER_ROLE }),
-      }, modelTabChildren);
+      },
+        react.createElement("div", {
+          className: "deg_settings_model_tablist",
+          role: "tablist",
+          "aria-label": tExtra("settings.modelTabs.primary") + " / " + tExtra("settings.modelTabs.candidate", { index: MAX_MODEL_CANDIDATES_PER_ROLE }),
+        }, modelTabChildren),
+        peakValleyEntryButton,
+        periodToggleSlot);
     return modelTabRow;
   }
 
@@ -639,14 +738,7 @@
               return;
             }
             if (event?.key !== "Tab") return;
-            const controls = Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]") ?? []);
-            if (controls.length === 0) return;
-            const current = controls.indexOf(typeof document === "undefined" ? null : document.activeElement);
-            const nextIndex = event.shiftKey
-              ? (current <= 0 ? controls.length - 1 : current - 1)
-              : (current >= controls.length - 1 ? 0 : current + 1);
-            event.preventDefault?.();
-            try { controls[nextIndex]?.focus?.(); } catch { /* 无 DOM 焦点时保持可点击按钮。 */ }
+            trapDialogTabFocus(event);
           },
         },
           react.createElement("h3", null, tExtra("settings.modelTabs.remove.title")),
@@ -672,6 +764,171 @@
               onClick: () => confirmModelPageDelete(),
             }, "删除"))));
     return modelPageDeleteDialog;
+  }
+
+  /**
+   * 峰谷子视图（票据 07）：启用开关、最多三段峰段、峰/谷两套模型表与一次保存。
+   *
+   * 模型区直接复用 renderSettingsUnifiedRow / renderSettingsModelTabs / renderSettingsRoleTable：
+   * 传给它们的 view 已把 draft.peakValley[period] 投影成顶层 settings 形状（见 main-a 的
+   * peakValleyViewOf），因此页签、统一供应商、降级上限与拖动排序都不存在第二份实现。
+   */
+  function renderPeakValleySettings(view) {
+    // peakValleyPeriod / setPeakValleyPeriod 不再由本函数消费：时段切换器改成在页签行里
+    // 由 renderPeakValleyPeriodToggle 渲染（那里从同一个投影视图读这两个字段）。
+    const {
+      editPeakValley, error, hasUnsavedChanges, saved, saving,
+      setPeakValleyOpen, settingsReadOnly, t, tExtra,
+    } = view;
+    const state = view.peakValleyState ?? {};
+    const periods = Array.isArray(state.periods) ? state.periods : [];
+    // 读取面 fail-closed 信号：已保存峰谷配置损坏时只能走「修复并保存」（显式 repair 意图位）。
+    // 普通保存按钮在该状态下不发 peakValley，并由 Host 侧拒绝任何无修复意图的峰谷写入。
+    const broken = typeof state.invalidCode === "string";
+    const maxPeriods = peakValleyTime?.MAX_PEAK_VALLEY_PERIODS ?? 3;
+    // 保存前校验与保存计划共用同一份权威归一：非法时段就地报错，且保存按钮/提交都被拦下。
+    const check = peakValleyTime?.normalizePeakValleyPeriods?.(periods) ?? { ok: true };
+    // 损坏态复用同一个错误横幅元素：提示"保存被阻止 + 如何修复"，不新增一块 DOM。
+    const invalidMessage = check.ok !== true
+      ? tExtra("settings.pv.invalid", { reason: check.reason })
+      : broken ? tExtra("settings.pv.repairHint") : null;
+    // 0 段 = 全天谷时、覆盖全天 = 全天峰时：两者都意味着"当前没有谷时"。
+    const noValley = periods.length === 0 || peakValleyTime?.peakValleyPeriodsCoverFullDay?.(periods) === true;
+    const editPeriod = (index, field, value) => editPeakValley((previous) => ({
+      ...previous,
+      periods: previous.periods.map((entry, position) => (position === index ? { ...entry, [field]: value } : entry)),
+    }));
+    const periodRows = periods.map((entry, index) => react.createElement("div", {
+      key: "period-" + index,
+      className: "deg_settings_task_row",
+      "data-deg-peak-valley-period-row": String(index),
+    },
+      react.createElement("span", { className: "deg_settings_label" }, String(index + 1) + ". " + tExtra("settings.pv.start")),
+      react.createElement("input", {
+        type: "time",
+        "aria-label": tExtra("settings.pv.start") + (index + 1),
+        value: typeof entry?.start === "string" ? entry.start : "",
+        disabled: saving || settingsReadOnly,
+        onChange: (event) => editPeriod(index, "start", String(event?.target?.value ?? "")),
+      }),
+      react.createElement("span", { className: "deg_settings_label" }, tExtra("settings.pv.end")),
+      react.createElement("input", {
+        type: "time",
+        "aria-label": tExtra("settings.pv.end") + (index + 1),
+        value: typeof entry?.end === "string" ? entry.end : "",
+        disabled: saving || settingsReadOnly,
+        onChange: (event) => editPeriod(index, "end", String(event?.target?.value ?? "")),
+      }),
+      react.createElement("button", {
+        type: "button",
+        className: "deg_btn",
+        // 可见文字只有「删除」（行内已按位置排序，重复「峰段」太啰嗦）；可访问名称仍带序号，
+        // 屏幕阅读器与既有自动化测试靠它定位具体行。
+        "aria-label": tExtra("settings.pv.remove.aria") + (index + 1),
+        disabled: saving || settingsReadOnly,
+        onClick: () => editPeakValley((previous) => ({
+          ...previous,
+          periods: previous.periods.filter((unused, position) => position !== index),
+        })),
+      }, tExtra("settings.pv.remove"))));
+    const enabled = state.enabled === true;
+    // 峰时 / 谷时切换器不再独占一行：它由 renderSettingsModelTabs 渲染在页签行最右侧
+    // （见 renderPeakValleyPeriodToggle 的注释），这里只保留启用开关与时段编辑。
+    return react.createElement("div", { className: "deg_settings", "data-deg-peak-valley": "true" },
+      react.createElement("div", { className: "deg_prompt_footer" },
+        // 标题已经写明「峰谷模式」，返回键只需表达动作，因此文字简化为「← 返回」；
+        // aria-label 仍是「返回模型设置」，与页脚返回按钮保持同一可访问名称。
+        react.createElement("button", {
+          type: "button",
+          className: "deg_btn deg_prompt_back",
+          "aria-label": "返回模型设置",
+          disabled: saving,
+          onClick: () => setPeakValleyOpen(false),
+        }, "← " + tExtra("settings.pv.back")),
+        react.createElement("h2", { className: "deg_settings_title" }, tExtra("settings.pv.entry"))),
+      // 只在未初始化时提示「首次启用会从普通配置复制两套模型」；已初始化后这句话不再提供
+      // 任何可操作信息（客户端本就没有改回未初始化的入口），因此整段不渲染、不占位。
+      state.initialized === true ? null : react.createElement("p", {
+        className: "deg_settings_hint",
+        "data-deg-peak-valley-uninit": "true",
+      }, tExtra("settings.pv.uninit")),
+
+      react.createElement("div", { className: "deg_settings_task_row" },
+        react.createElement("label", { className: "deg_settings_checkbox" },
+          react.createElement("input", {
+            type: "checkbox",
+            "aria-label": tExtra("settings.pv.enable"),
+            checked: enabled,
+            disabled: saving || settingsReadOnly,
+            onChange: (event) => editPeakValley((previous) => ({ ...previous, enabled: event.target.checked === true })),
+          }),
+          react.createElement("span", { className: "deg_settings_label" }, tExtra("settings.pv.enable")))),
+      /**
+       * 峰段区块（两段式）：添加按钮是**固定首行**，峰段行整体在下方列表里。
+       *
+       * 这样峰段增减只改变列表高度，添加按钮的位置与宽度（.deg_btn 的 flex:1）都不动——
+       * 原来按钮与时段行同排，峰段一多就被挤到第二行、与「当前没有谷时」提示错位。
+       * 原来行首的「峰段时段」标签按 UI 精简要求删除（区块已有启用开关作为标题语义）。
+       */
+      react.createElement("div", { className: "deg_settings_peak_valley_periods", "data-deg-peak-valley-periods": "true" },
+        react.createElement("div", { className: "deg_settings_task_row" },
+          react.createElement("button", {
+            type: "button",
+            className: "deg_btn",
+            "data-deg-peak-valley-add": "true",
+            disabled: saving || settingsReadOnly || periods.length >= maxPeriods,
+            onClick: () => editPeakValley((previous) => ({
+              ...previous,
+              periods: previous.periods.length >= maxPeriods
+                ? previous.periods
+                // 第三段默认值来自权威常量：与默认两条不重叠，否则保存前校验直接判非法。
+                : [...previous.periods, { ...NEXT_PEAK_VALLEY_PERIOD }],
+            })),
+          }, tExtra("settings.pv.add")),
+          noValley ? react.createElement("p", { className: "deg_settings_hint", role: "status" }, tExtra("settings.pv.noValley")) : null),
+        react.createElement("div", { className: "deg_settings_peak_valley_period_list" }, periodRows)),
+      renderSettingsUnifiedRow(view),
+      renderSettingsModelTabs(view),
+      renderSettingsRoleTable(view),
+      invalidMessage === null ? null : react.createElement("p", { className: "deg_settings_error", role: "alert" }, invalidMessage),
+      error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, error) : null,
+      renderSettingsModelDeleteDialog(view),
+      /**
+       * 峰谷页脚（顺序即视觉顺序）：返回 → 状态 → （损坏态的）修复 → 保存。
+       * - 左侧「返回」与左上角返回完全同一动作（setPeakValleyOpen(false)）与同一禁用语义，
+       *   长页面滚到底部时不必再滚回顶部；
+       * - 两键同宽：宽度份额由 .deg_settings_pv_footer 规则锁定（.deg_btn 本身是 flex:1，
+       *   这里必须显式覆盖，否则会被状态文本挤成不同宽度）；
+       * - 状态文本夹在两键之间用 margin-right:auto 吸收空白，保存因此恒在最右且不被遮挡。
+       */
+      react.createElement("div", { className: "deg_settings_footer deg_settings_pv_footer" },
+        react.createElement("button", {
+          type: "button",
+          className: "deg_btn",
+          "data-deg-peak-valley-back": "true",
+          "aria-label": "返回模型设置",
+          disabled: saving,
+          onClick: () => setPeakValleyOpen(false),
+        }, tExtra("settings.pv.back")),
+        react.createElement("span", { className: "deg_settings_status", role: "status" }, saved ? t("settings.saved") : hasUnsavedChanges ? t("settings.unsaved") : ""),
+        // 损坏态下普通保存被禁用：它只会把归一后的缺省值写回（Host 也会拒绝），
+        // 唯一出口是紧邻保存按钮左侧的「修复并保存」（仍保证保存按钮在最右）。
+        broken
+          ? react.createElement("button", {
+            type: "button",
+            className: "deg_btn deg_btn_primary",
+            "data-deg-peak-valley-repair": "true",
+            disabled: saving || settingsReadOnly || check.ok !== true,
+            onClick: view.saveRepair,
+          }, tExtra("settings.pv.repair"))
+          : null,
+        react.createElement("button", {
+          type: "button",
+          className: "deg_btn deg_btn_primary",
+          "data-deg-peak-valley-save": "true",
+          disabled: !hasUnsavedChanges || saving || settingsReadOnly || check.ok !== true || broken,
+          onClick: view.save,
+        }, saving ? t("settings.saving") : t("settings.save"))));
   }
 
   /**
@@ -961,6 +1218,32 @@
 
 
   /**
+   * 主设置页的时段状态行（票据 08）：锁定的编辑目标 + 跨边界常驻提示。
+   *
+   * 只读 view.mainPeriod / view.livePeriod 这两个 state，**绝不读系统时间**：跨过边界时
+   * 由分钟级定时器更新 livePeriod，这里只负责讲清「当前已进入 X，本页仍在编辑 Y」；
+   * 编辑目标与保存目标都不随之改变。
+   */
+  function renderMainPeriodHint(view, mainPeriod) {
+    const { livePeriod, tExtra } = view;
+    if (mainPeriod === null || mainPeriod === void 0) return null;
+    const labelOf = (period) => tExtra(period === "peak" ? "settings.pv.peak" : "settings.pv.valley");
+    const editing = labelOf(mainPeriod);
+    // 定时器还没采样（null）时不算跨边界，避免首帧误报。
+    const crossed = livePeriod !== null && livePeriod !== void 0 && livePeriod !== mainPeriod;
+    return react.createElement(react.Fragment, null,
+      react.createElement("p", { className: "deg_settings_hint", "data-deg-main-period": mainPeriod },
+        tExtra("settings.pv.mainScope", { period: editing })),
+      crossed
+        ? react.createElement("p", {
+          className: "deg_settings_hint",
+          role: "status",
+          "data-deg-main-period-hint": "true",
+        }, tExtra("settings.pv.boundary", { current: labelOf(livePeriod), editing }))
+        : null);
+  }
+
+  /**
    * 设置页主表单本体：按渲染顺序把各区块组装进根节点。
    * 区块顺序与拆分前的 children 顺序逐项一致（标题 / 说明 / 模型配置 / 任务行 / 通知行 /
    * 统一行 / 页签 / 角色表 / 管理行 / 三类错误行 / 删除确认框 / 页脚）。
@@ -980,18 +1263,39 @@
           // 仅首次挂载的默认态：左侧栏全页入口为 true；settings.section 不传该 prop，恒为 false。
           defaultOpen: view.modelConfigDefaultOpen === true,
         });
-    const modelTabRow = renderSettingsModelTabs(view);
-    const modelPageDeleteDialog = renderSettingsModelDeleteDialog(view);
+    /**
+     * 票据 08：启用峰谷后主设置页成为「当前时段」视图。
+     *
+     * 复用 07 的视图草稿映射，把 draft.peakValley[mainPeriod] 投影成顶层 settings 形状；
+     * 统一供应商、页签、角色表与删除确认框因此仍是同一份实现。普通配置整块不渲染、
+     * 也不可编辑：编辑目标锁定在 mainPeriod，保存只回写这一个 profile。
+     * 未启用时 mainPeriod 为 null，modelView 就是 view 本身，主设置页逐字保持旧行为。
+     */
+    const lockedPeriod = view.mainPeriod === void 0 ? null : view.mainPeriod;
+    // 草稿里已经关闭峰谷（例如在子视图里关掉后返回）时回到普通配置；锁定值本身保留，
+    // 再次启用仍复用它，绝不重新采样系统时间。
+    const mainPeriod = lockedPeriod !== null && draft?.peakValley?.enabled === true ? lockedPeriod : null;
+    const modelView = mainPeriod === null
+      ? view
+      : view.peakValleyViewOf({ ...view, peakValleyPeriod: mainPeriod, peakValleyEntry: true });
+    const modelTabRow = renderSettingsModelTabs(modelView);
+    const modelPageDeleteDialog = renderSettingsModelDeleteDialog(modelView);
 
     return react.createElement("div", { className: "deg_settings" },
       react.createElement("h2", { className: "deg_settings_title" }, t("settings.title")),
       react.createElement("p", { className: "deg_settings_hint" }, t("settings.hint")),
-      modelConfigSection,
+      renderMainPeriodHint(view, mainPeriod),
+      // 已保存峰谷配置损坏：主设置页的保存一律不携带 peakValley（Host 侧同口径拒绝），
+      // 这里把"为什么保存不生效、该去哪里修"直接讲清楚。
+      view.peakValleyBroken
+        ? react.createElement("p", { className: "deg_settings_error" }, view.tExtra("settings.pv.broken"))
+        : null,
+      mainPeriod === null ? modelConfigSection : null,
       renderSettingsTaskRow(view),
       renderSettingsNotificationRow(view),
-      renderSettingsUnifiedRow(view),
+      renderSettingsUnifiedRow(modelView),
       modelTabRow,
-      renderSettingsRoleTable(view),
+      renderSettingsRoleTable(modelView),
       renderSettingsManagementRow(view),
         candidatesError === null || candidatesError === void 0 ? null : react.createElement("p", {
           className: "deg_settings_error",

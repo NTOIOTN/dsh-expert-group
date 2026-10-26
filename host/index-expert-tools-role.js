@@ -27,7 +27,7 @@ import { buildImageContent, decideImageRoute, imageCapability } from "../image-r
 import { delegationScopeKey, delegationTaskKey } from "../shared/structured-path.js";
 import { READONLY_DENY } from "../shared/protocol.js";
 import { buildExpertTaskPrompt } from "./expert-task-prompt.js";
-import { abortErrorFor, throwIfAborted } from "./rpc-request-lifecycle.js";
+import { throwIfAborted } from "./rpc-request-lifecycle.js";
 import {
   CONTINUABLE_MARKER,
   DENY_MARKER,
@@ -40,9 +40,11 @@ import {
 import {
   EXPERT_INHERIT_CONTEXT_MARKER,
   EXPERT_ROUTE_MARKER,
+  EXPERT_ROUTE_SNAPSHOT_MARKER,
   EXPERT_SUBAGENT_PROVIDER_MARKER,
 } from "../shared/model-route.js";
 import { OUTPUT_SCHEMA_ERROR_CODES, OUTPUT_SCHEMA_REQUESTED_MARKER } from "../shared/structured.js";
+import { roleRouteReceiptFields } from "./route-receipt-fields.js";
 
 /**
  * Observer 自动图片路由：固定纯视觉任务 + 真实 PNG durable 副本 + 同一 admission 语义。
@@ -62,21 +64,19 @@ export function createRoleToolObserverRoute({ identity, models, core, storage })
       throwIfAborted(signal);
       const rootToken = identity.tokenFor(parent);
       if (!identity.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
-      const resolvedRole = models.resolveRole(parent.id, role);
-      if (resolvedRole == null) throw new Error("Observer 专家尚未配置模型，请先在设置页选择 Observer 模型");
-      const selection = await models.validateSelectionWithSignal(resolvedRole, signal);
+      /**
+       * 自动图片入口与 role tool 走**同一条**派发路由（票据 03）：
+       * - 启用峰谷时按派发时刻取该时段 profile，并把完整计划冻结成快照；
+       * - 「需要 image 输入」作为 requirements 进入候选链：能力非 supported 的候选被逐个
+       *   跳过（unknown 绝不当成支持），因此绝不会绕过候选链去另选一个 profile 之外的模型。
+       */
+      const route = await models.resolveRoleModelRoute(role, parent.id, signal, { inputModalities: ["image"] });
+      if (route === null) throw new Error("Observer 专家尚未配置模型，请先在设置页选择 Observer 模型");
+      const selection = route.selection;
       throwIfAborted(signal);
-      let targetInfo;
-      try {
-        targetInfo = await models.resolveModelInfo(selection.provider, selection.model, signal);
-      } catch (error) {
-        // 取消不能被"能力查询失败"兜底吞掉：原样上抛，由 mapRpcError 映射为 499。
-        const aborted = abortErrorFor(error, signal);
-        if (aborted !== void 0) throw aborted;
-        throw new Error("Observer 模型 image 能力查询失败，无法安全投递图片；原始输入已保留", { cause: error });
-      }
-      throwIfAborted(signal);
-      if (imageCapability(targetInfo) !== "supported") {
+      // 严格能力语义保持不变：路由层已为真实图片派发探测过能力（unsupported/unknown 都按
+      // 预检失败跳过），这里再显式断言一次；将来若有人移除 requirements，也仍然拒绝投递。
+      if (route.capabilities?.image !== "supported") {
         throw new Error("Observer 模型未明确声明 image 输入能力，无法安全投递图片；原始输入已保留");
       }
       const inputImages = Array.isArray(images) && images.length > 0 ? images : [image];
@@ -97,6 +97,8 @@ export function createRoleToolObserverRoute({ identity, models, core, storage })
       // 安全边界是“只接收视觉任务，不接收用户上下文”，即使设置被外部写成
       // inheritContext.observer=true，这里也强制 spawn，绝不继承父日志。
       const observerSubagentProvider = core.resolveSubagentProviderForRole(role, parent);
+      // 派发路由冻结快照（票据 03）：启用峰谷时随 child_models 落盘，冷恢复/运行期降级只读它。
+      const observerSnapshotMarker = models.routeSnapshotMarkerOf(route);
       const request = {
         label: "用户图片",
         prompt: promptContent,
@@ -113,6 +115,7 @@ export function createRoleToolObserverRoute({ identity, models, core, storage })
           [PERSONA_MARKER]: childPersona,
           [EXPERT_SUBAGENT_PROVIDER_MARKER]: observerSubagentProvider.provider,
           [EXPERT_INHERIT_CONTEXT_MARKER]: observerSubagentProvider.inheritContext,
+          ...(observerSnapshotMarker === undefined ? {} : { [EXPERT_ROUTE_SNAPSHOT_MARKER]: observerSnapshotMarker }),
         },
         persona: childPersona,
         toolFilter: { deny: observerDeny },
@@ -307,6 +310,8 @@ export function createRoleToolExecute({ records, identity, dispatch, core }) {
             // 的提示）必须拼接而不是互相覆盖：对象展开的后者覆盖前者会让范围软警告
             // 对模型不可见（审核发现的既有缺陷）。任一为空时保持另一段原文。
             ...(result.scopeWarning.length === 0 ? {} : { scopeWarning: result.scopeWarning }),
+            // 时段/层/跨层回退（票据 06）：仅当本次派发有冻结快照时增量出现，绝不推断。
+            ...(result.routeFields ?? {}),
           };
         records.recordRootAdmissionOutcome(admissionTicket, {
           ...outcome,
@@ -351,8 +356,11 @@ export function createRoleToolDispatch({ core, models, roles, storage, records, 
    *
    * @param {string} role - 角色 id。
    * @param {object} closure - role 闭包（serialize / delegate / 句柄校验）。
+   * 回执的时段/层/跨层回退（票据 06）：routeFields 只读本次派发结果里的冻结快照，绝不读
+   * settings 或时钟；未启用峰谷/旧路径时它是空对象，回执形状因此逐字不变。
+   *
    * @param {object} input - 一次调用的入参、ticket 与失败阶段引用。
-   * @returns {Promise<{outcome?: object, scopeWarning?: string, rejected?: object}>}
+   * @returns {Promise<{outcome?: object, scopeWarning?: string, routeFields?: object, rejected?: object}>}
    */
   async function runRoleAdmission(role, closure, { args, signal, parent, rootToken, admissionTicket, outputSchemaDeclaration, continueHandle, phase }) {
       const { resolveContinueTarget, rejectedHandleResult } = closure;
@@ -451,6 +459,7 @@ export function createRoleToolDispatch({ core, models, roles, storage, records, 
         if (outputSchemaDeclaration !== undefined) {
           core.assertOutputSchemaProviderSupport(subagentTarget.provider, role);
         }
+        const snapshotMarker = models.routeSnapshotMarkerOf(route);
         const request = {
           label: args.description,
           prompt: promptContent,
@@ -468,6 +477,7 @@ export function createRoleToolDispatch({ core, models, roles, storage, records, 
             // 实际路由（票据 24）：candidateIndex=0 表示 primary；fallbackCount 与
             // lastRouteErrorCode 随 child_models 落盘，侧栏/恢复只读该快照。
             [EXPERT_ROUTE_MARKER]: models.routeMarkerOf(route),
+            ...(snapshotMarker === undefined ? {} : { [EXPERT_ROUTE_SNAPSHOT_MARKER]: snapshotMarker }),
             // 角色/父代理 marker：agent/created 时与模型快照一同持久化，
             // 供重启后按 parentId+role+route 恢复可复用 child。
             [ROLE_MARKER]: role,
@@ -541,7 +551,6 @@ export function createRoleToolDispatch({ core, models, roles, storage, records, 
           });
           return { rejected: rejectedHandleResult("child-not-found", "CHILD_NOT_FOUND", resolvedContinue.warning) };
         }
-
         // 所有输入形态都只等待 scope/admission、必要的 child 投递和 Goal pause CAS，
         // 绝不等待 child 的最终文本、turn/end、自动恢复或 feedback。
         const outcome = await scopeAdmission.serialize(scope, () =>
@@ -551,7 +560,7 @@ export function createRoleToolDispatch({ core, models, roles, storage, records, 
             handoffExpected, rootToken,
             explicitChildId: resolvedContinue.target?.childId,
           }));
-      return { outcome, scopeWarning: core.mergeScopeWarnings(outcome.scopeWarning, ignoredImageWarning) };
+      return { outcome, scopeWarning: core.mergeScopeWarnings(outcome.scopeWarning, ignoredImageWarning), routeFields: roleRouteReceiptFields(route, role) };
   }
 
   function forRole(role, closure) {
@@ -560,6 +569,29 @@ export function createRoleToolDispatch({ core, models, roles, storage, records, 
 
   return { forRole };
 }
+
+/**
+ * 回执的时段/层/跨层回退字段（票据 06 · B 段）的 schema 片段。
+ *
+ * 提到模块级只为让 `definitionFor` 保持在函数行数硬上限内（口径与行为完全不变）：
+ * 三个字段都是可选增量——没有冻结快照时回执里不会出现它们。三者都是**只读投影**：
+ * 绝不包含计划、provider/model 候选清单或凭据；ordinaryFallback.role 是具体角色 id
+ * （快照本身不含 role）。
+ */
+const ROUTE_RECEIPT_SCHEMA_PROPERTIES = Object.freeze({
+  routePeriod: { type: "string", enum: ["peak", "valley", "none"] },
+  routeTier: { type: "string", enum: ["peak", "valley", "normal-override", "normal-fallback"] },
+  ordinaryFallback: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      fromTier: { type: "string", required: true, enum: ["peak", "valley"] },
+      toTier: { type: "string", required: true, enum: ["normal-fallback"] },
+      reasonCode: { type: "string", required: true },
+      role: { type: "string" },
+    },
+  },
+});
 
 /**
  * role-named 工具定义对象（schema / 描述 / render / execute）。
@@ -663,6 +695,8 @@ export function createRoleToolDefinition({ roles, execute }) {
                 reused: { type: "boolean" },
                 queued: { type: "boolean" },
                 scopeWarning: { type: "string" },
+                // 时段/层/跨层回退（票据 06）：可选增量，schema 片段见模块级常量。
+                ...ROUTE_RECEIPT_SCHEMA_PROPERTIES,
               },
             },
             {

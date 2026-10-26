@@ -18,6 +18,7 @@ import {
   FAILURE_SAFE_MESSAGES,
   FAILURE_STABLE_CODES,
 } from "../host/expert-group-snapshot.js";
+import { PEAK_VALLEY_ROLE_MISSING, buildRouteSnapshot } from "../shared/route-snapshot.js";
 
 test("基础投影：schemaVersion/sessionId/rootSessionId/generatedAt 与 root 节点形状", () => {
   const snapshot = buildExpertGroupSnapshot({
@@ -803,6 +804,110 @@ test("白名单出口：未知附加字段不进投影", () => {
   ]);
 });
 
+
+test("时段/层/跨层回退（票据 06）：字段存在才出现，缺失不补默认值，且绝不携带执行计划", () => {
+  /**
+   * 夹具：同一棵树里既有「带冻结快照」的节点，也有「完全没有快照」的旧记录。
+   *
+   * 断言的是**字段存在性**而不是值：旧记录不得凭空多出三个键，带快照的节点也不得
+   * 因为 Host 侧合并顺序而少键。键集仍是精确集合（不放宽成"任意子集"）。
+   */
+  const sameLayer = buildRouteSnapshot({
+    period: "peak",
+    tier: "peak",
+    plan: [{ provider: "mock", model: "peak-main" }, { provider: "mock", model: "normal-main" }],
+    tierPlanLength: 1,
+    candidateIndex: 0,
+    fallbackLimit: 0,
+    ordinaryFallbackLimit: 1,
+    ordinaryFallback: null,
+    decidedAt: 1_700_000_000_000,
+  });
+  assert.notEqual(sameLayer, null);
+  const crossLayer = buildRouteSnapshot({
+    period: "valley",
+    tier: "normal-fallback",
+    plan: [{ provider: "mock", model: "normal-only" }],
+    tierPlanLength: 0,
+    candidateIndex: 0,
+    fallbackLimit: 0,
+    ordinaryFallbackLimit: 0,
+    ordinaryFallback: { fromTier: "valley", toTier: "normal-fallback", reasonCode: PEAK_VALLEY_ROLE_MISSING },
+    decidedAt: 1_700_000_000_001,
+  });
+  assert.notEqual(crossLayer, null);
+
+  const snapshot = buildExpertGroupSnapshot({
+    sessionId: "root-route",
+    root: { id: "root-route", route: sameLayer },
+    experts: [{ sessionId: "expert-route", route: crossLayer }],
+    fanoutTasks: [{
+      parentTaskId: "fanout-route",
+      role: "fixer",
+      shards: [{
+        shardId: "s1",
+        status: "succeeded",
+        route: sameLayer,
+        attempts: [
+          { attempt: 1, status: "succeeded", route: crossLayer },
+          { attempt: 2, status: "succeeded" },
+        ],
+      }],
+    }],
+  });
+
+  const root = snapshot.root;
+  assert.equal(root.routePeriod, "peak");
+  assert.equal(root.routeTier, "peak");
+  assert.equal("ordinaryFallback" in root, false, "无跨层回退时不得凭空补一个回退对象");
+  const rootKeys = Object.keys(root).sort();
+  assert.ok(rootKeys.includes("routePeriod") && rootKeys.includes("routeTier"));
+
+  const expert = root.children.find((node) => node.kind === "expert");
+  assert.equal(expert.routePeriod, "valley");
+  assert.equal(expert.routeTier, "normal-fallback");
+  assert.deepEqual(expert.ordinaryFallback, {
+    fromTier: "valley",
+    toTier: "normal-fallback",
+    reasonCode: PEAK_VALLEY_ROLE_MISSING,
+  });
+
+  const fanout = root.children.find((node) => node.kind === "fanout");
+  // 父任务节点没有单一时段/层的权威事实：投影不猜，三个键都不出现。
+  assert.deepEqual(Object.keys(fanout).sort(), [
+    "attemptCount", "basePrompt", "counts", "createdAt", "durationMs", "failure",
+    "finishedAt", "id", "kind", "lastActivityAt", "parentTaskId", "retryCount", "role",
+    "roleLabel", "running", "shards", "startedAt", "status", "taskStatus",
+  ]);
+  const shard = fanout.shards[0];
+  assert.equal(shard.routePeriod, "peak");
+  assert.equal(shard.routeTier, "peak");
+
+  const [withSnapshot, withoutSnapshot] = shard.attempts;
+  assert.equal(withSnapshot.routePeriod, "valley");
+  assert.equal(withSnapshot.routeTier, "normal-fallback");
+  assert.deepEqual(withSnapshot.ordinaryFallback, {
+    fromTier: "valley",
+    toTier: "normal-fallback",
+    reasonCode: PEAK_VALLEY_ROLE_MISSING,
+  });
+  // 精确键集：带快照的 attempt 只多出这三个键，旧 attempt 的键集逐字不变。
+  const withKeys = Object.keys(withSnapshot).sort();
+  const withoutKeys = Object.keys(withoutSnapshot).sort();
+  assert.deepEqual(
+    withKeys.filter((key) => !withoutKeys.includes(key)),
+    ["ordinaryFallback", "routePeriod", "routeTier"],
+  );
+  assert.deepEqual(withoutKeys.filter((key) => !withKeys.includes(key)), []);
+  assert.deepEqual(withoutKeys, [
+    "attempt", "childId", "durationMs", "failure", "finishedAt", "roleLabel", "startedAt", "status",
+  ]);
+
+  // 敏感面：投影里不出现候选计划或 provider/model 名。
+  const serialized = JSON.stringify(snapshot);
+  assert.equal(serialized.includes("peak-main"), false);
+  assert.equal(serialized.includes('"plan"'), false);
+});
 
 // ── 逐动作能力投影（票据 09） ───────────────────────────────────────────────
 

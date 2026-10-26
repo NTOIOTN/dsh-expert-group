@@ -18,6 +18,36 @@
 import { DEFAULT_CONCURRENCY_LIMIT, MAX_CONCURRENCY_LIMIT, normalizeTimeoutMs } from "./contracts.js";
 import { validateConcurrencyLimit, validateProviderLimit } from "./validation.js";
 
+/**
+ * 某个任务/某次执行生效的 provider 名额上限；undefined 表示不受 provider 限流约束。
+ *
+ * 语义（票据 26 + 票据 05）：
+ * - 归属键默认取 task.provider；调度器传入**显式** provider（该 attempt 路由快照里的
+ *   归属）时以它为准——同一任务的分片因此可以分属不同 provider；
+ * - 显式 null 表示「这次执行无法归属」，必须原样视为不限制，**绝不回退** task.provider：
+ *   回退会把一个 fail-closed 的决定静默变成另一个 provider 的名额；
+ * - provider 未配置、显式 0 → undefined（不限制）；1..64 → 该 provider 的并发名额。
+ *
+ * 接收**已解析**的 provider 映射而不是自己再读一次设置：调度热路径一轮只解析一次，
+ * 避免每个候选分片都重复遍历设置对象。
+ *
+ * 放在模块级而不是工厂内：它是纯函数；工厂只保留一行转发的门面（工厂 ≤400 行的预算）。
+ *
+ * @param {object} task - 父任务（只在没有显式 provider 时读取其归属）。
+ * @param {Readonly<Record<string, number>>} resolved - 本轮解析出的 provider -> limit。
+ * @param {string|null} [provider] - 显式归属（票据 05）；undefined 走旧路径，null 不限制。
+ * @returns {number|undefined}
+ */
+function providerLimitFor(task, resolved, provider) {
+  const key = provider === undefined
+    ? (typeof task?.provider === "string" ? task.provider : "")
+    : (typeof provider === "string" ? provider : "");
+  if (key.length === 0) return undefined;
+  const configured = resolved === null || typeof resolved !== "object" ? undefined : resolved[key];
+  if (typeof configured !== "number" || configured <= 0) return undefined;
+  return configured;
+}
+
 export function createLimitResolver({ config, events }) {
   const {
     concurrencyLimit: rawConcurrencyLimit,
@@ -250,27 +280,9 @@ export function createLimitResolver({ config, events }) {
     return Object.freeze(normalized);
   }
 
-  /**
-   * 某个任务生效的 provider 名额上限；undefined 表示不受 provider 限流约束。
-   *
-   * 语义（票据 26）：
-   * - 任务没有 provider 归属（角色未配置主模型）→ undefined（不限制）；
-   * - provider 未配置、显式 0 → undefined（不限制）；
-   * - 1..64 → 该 provider 的并发名额。
-   *
-   * 接收**已解析**的 provider 映射而不是自己再读一次设置：调度热路径一轮只解析一次，
-   * 避免每个候选分片都重复遍历设置对象。
-   *
-   * @param {object} task - 父任务。
-   * @param {Readonly<Record<string, number>>} resolved - 本轮解析出的 provider -> limit。
-   * @returns {number|undefined}
-   */
-  function providerLimitOf(task, resolved) {
-    const provider = typeof task?.provider === "string" ? task.provider : "";
-    if (provider.length === 0) return undefined;
-    const configured = resolved[provider];
-    if (typeof configured !== "number" || configured <= 0) return undefined;
-    return configured;
+  /** provider 名额上限的唯一实现见 {@link providerLimitFor}（保持工厂行数预算）。 */
+  function providerLimitOf(task, resolved, provider) {
+    return providerLimitFor(task, resolved, provider);
   }
 
   /**

@@ -330,7 +330,7 @@ export const C3_FACES_REQUIRED_MIN = 6;
  *   `createSystemToastModule` 3、`createExpertGroupRuntime` 8。
  *
  * ## 超上限的 2 条（都是组合根豁免，每条必须有 reason）
- * `createFanoutRuntime`、`createFanoutRuntimeModule`（各 24）：fanout 子系统的组合根，
+ * `createFanoutRuntime`（20）、`createFanoutRuntimeModule`（25）：fanout 子系统的组合根，
  * 与 `index.js` 同类，规格书 §C3 与组合根条款明确豁免。
  *
  * 票据 33 已把此前如实登记的三个「待收窄偏差」收掉（`createFinalizeDomain` 18→7、
@@ -346,12 +346,14 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
     // 票据 36（第四轮复审）按源码实际读取重算：本函数读 **22 个 option keys**，其中
     // clock / now / setTimeout / clearTimeout 四个 key 在函数体内被折叠成**同一组**时钟能力
     // （clock 对象承载 now/setTimeout/clearTimeout），所以能力组 = 22 − 4 + 1 = **19 组**。
+    // 票据 03 增补 prepareAttempt（派发前路由冻结 seam）→ 23 个 key、**20 组**。
     // 模块侧的 24 个形参里有 5 个（createRuntime / lineage / getAgent / buildFeedback /
     // writeSnapshot / readSnapshot / getPersistenceGeneration 等）只被模块层消费，
     // 不会被转发给 runtime，因此不在本条目里计数。
-    groups: 19,
+    groups: 20,
     faces: [
       { name: "allowOverlap", capability: "并发重叠提交策略开关" },
+      { name: "prepareAttempt", capability: "派发前路由冻结：attempt 进入 running 之前同步构造快照" },
       { name: "attributionAgingMs", capability: "归属老化阈值：配置" },
       { name: "buildRequest", capability: "子 agent 请求构建" },
       { name: "clock", capability: "时间与定时器控制：Date.now / setTimeout / clearTimeout" },
@@ -371,7 +373,7 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
       { name: "startContinuable", capability: "可续作子 agent 启动" },
       { name: "writeRoles", capability: "写角色冲突策略：写角色集合" },
     ],
-    reason: "【组合根豁免】fanout 子系统的组合根（与 index.js 同类）：读 22 个 option keys，其中 clock/now/setTimeout/clearTimeout 折叠为 1 组时钟能力 → 19 个能力组（模块侧 createFanoutRuntimeModule 是 24 个形参，其中 5 个只在模块层消费、不转发给 runtime），规格书 §C3 与组合根条款明确豁免，收窄需改 fanout 子系统装配面",
+    reason: "【组合根豁免】fanout 子系统的组合根（与 index.js 同类）：读 23 个 option keys，其中 clock/now/setTimeout/clearTimeout 折叠为 1 组时钟能力 → 20 个能力组（模块侧 createFanoutRuntimeModule 是 25 个形参，其中 5 个只在模块层消费、不转发给 runtime），规格书 §C3 与组合根条款明确豁免，收窄需改 fanout 子系统装配面",
   },
   { file: "fanout/events.js", name: "createFanoutEventBus", groups: 3 },
   { file: "fanout/limits.js", name: "createLimitResolver", groups: 2 },
@@ -520,7 +522,8 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
   {
     file: "host/fanout-runtime.js",
     name: "createFanoutRuntimeModule",
-    groups: 24,
+    // 票据 03：新增 prepareAttempt（派发前路由冻结 seam）→ 25 个形参。
+    groups: 25,
     faces: [
       { name: "createRuntime", capability: "runtime 构造回调" },
       { name: "runtimeOptions", capability: "runtime 选项袋" },
@@ -535,6 +538,7 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
       { name: "resolveChildSession", capability: "子会话解析" },
       { name: "interrupt", capability: "中断请求投递" },
       { name: "onAgentCreated", capability: "agent 创建钩子" },
+      { name: "prepareAttempt", capability: "派发前路由冻结：attempt 进入 running 之前同步构造快照" },
       { name: "lineage", capability: "agent 血缘与任务记录" },
       { name: "getAgent", capability: "宿主 agent 查询" },
       { name: "buildFeedback", capability: "父任务反馈构建" },
@@ -715,13 +719,14 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
   ] },
   { file: "host/index-expert-tools-fanout.js", name: "createFanoutShardWaits", groups: 3 },
   { file: "host/index-expert-tools-fanout.js", name: "createFanoutTaskCommands", groups: 5 },
-  { file: "host/index-expert-tools-fanout.js", name: "createFanoutToolHooks", groups: 6, faces: [
+  { file: "host/index-expert-tools-fanout.js", name: "createFanoutToolHooks", groups: 7, faces: [
     { name: "identity", capability: "根/会话身份归一：lineage" },
     { name: "childIo", capability: "child 会话 IO：发送/续作" },
     { name: "core", capability: "专家工具核心域句柄" },
     { name: "waits", capability: "shard 等待登记" },
     { name: "requestBuilder", capability: "子请求构建器" },
     { name: "childHandlers", capability: "child 工具处理器集合" },
+    { name: "dispatch", capability: "派发期只读读面：设置快照 + 时钟" },
   ] },
   { file: "host/index-expert-tools-fanout.js", name: "createFanoutWaitLedger", groups: 5 },
   { file: "host/index-expert-tools-role.js", name: "createIndexExpertRoleTools", groups: 6, faces: [
@@ -1080,7 +1085,9 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
   { file: "client-sidebar-views-c.js", name: "createSidebarViewsC", groups: 3 },
   { file: "client-entry.js", name: "createClientFreshnessBoundary", groups: 2 },
   { file: "host/index-expert-tools-admission.js", name: "createNewChild", groups: 4 },
-  { file: "host/index-recovery.js", name: "createRootAdmissionBatch", groups: 0 },
+  // 票据 03：root admission 批次从 host/index-recovery.js 迁到独立模块（文件行数门禁），
+  // 工厂本身不变（0 组：批次表是本模块私有 WeakMap，没有外部协作面）。
+  { file: "host/index-admission-batches.js", name: "createRootAdmissionBatch", groups: 0 },
   // ── 票据 35/36：变量绑定声明（全深度收集后逐条分类）────────────────────────
   // 票据 35 首次把 `const/let createX = …` 纳入对账；票据 36（第四轮复审）把两种形态
   // 统一成「全深度收集 + 逐条分类」。实测产品源码共 14 条变量声明（其中 2 条模块级、

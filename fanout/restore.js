@@ -21,6 +21,7 @@
  * @module dsh-expert-group/fanout/restore
  */
 import { FANOUT_BUDGET, checkRestoreBudget, describeBudgetViolation } from "../resource-budget.js";
+import { normalizeRouteSnapshot } from "../shared/route-snapshot.js";
 import { validateRestoredStopFields, validateRestoredTimeoutMs } from "./contracts.js";
 import {
   FANOUT_TASK_STATUSES,
@@ -50,6 +51,55 @@ import {
 
 /** 预算策略：与迁移前同源，默认全部取自 resource-budget.js 的冻结值。 */
 const budgetPolicy = FANOUT_BUDGET;
+
+/**
+ * 校验并归一快照里的 attempt 路由冻结快照（票据 03）。
+ *
+ * 边界（oracle 判定）：字段**存在但非法**必须 fail-closed——绝不当成缺失后用
+ * task.provider/当前配置补齐，那会把「快照坏了」静默变成「换了一套模型」，而这正是本
+ * 票据要消除的重建面。缺失（旧快照）才是合法的「没有冻结」，恢复后走旧路径。
+ *
+ * @param {object} rawAttempt - 快照里的 attempt。
+ * @param {string} field - 诊断字段路径（tasks.shards[i].attempts[j].route）。
+ * @param {string} parentTaskId - 父任务 id（错误信息用）。
+ * @returns {object|undefined} 已归一的快照；缺失时 undefined。
+ */
+function restoredAttemptRouteOf(rawAttempt, field, parentTaskId) {
+  if (rawAttempt?.route === void 0) return undefined;
+  const verdict = normalizeRouteSnapshot(rawAttempt.route);
+  if (verdict.ok !== true) {
+    throw new FanoutValidationError(
+      "INVALID_SNAPSHOT_ROUTE",
+      "快照 attempt 路由冻结快照非法: " + parentTaskId,
+      { field, reason: verdict.reason },
+    );
+  }
+  return verdict.snapshot;
+}
+
+/** 与 restoredAttemptRouteOf 同源的可展开字段（空对象 = 没有冻结快照）。 */
+function restoredRouteFieldOf(rawAttempt, parentTaskId) {
+  const route = restoredAttemptRouteOf(rawAttempt, "attempts.route", parentTaskId);
+  return route === undefined ? {} : { route };
+}
+
+/**
+ * 恢复续跑（resume）新 attempt 要沿用的冻结快照（票据 04）。
+ *
+ * 恢复续跑创建的是一个**新** attempt 来接替被中断的同一次执行，因此它必须沿用派发时
+ * 冻结的计划——按恢复时刻的 settings/墙钟重选会让重启本身成为"换模型"的原因。
+ *
+ * 快照在 validateRestoreTasks 阶段已严格校验（存在但非法整份拒绝），这里再归一一次
+ * 只是确认形状可复制；缺失（旧快照 / 未启用峰谷）时返回 undefined，绝不补默认计划。
+ *
+ * @param {object} last - 被中断的最后一个 attempt。
+ * @returns {object|undefined} 已归一的快照副本。
+ */
+function reusedResumeRouteOf(last) {
+  if (last?.route === void 0) return undefined;
+  const verdict = normalizeRouteSnapshot(last.route);
+  return verdict.ok === true ? verdict.snapshot : undefined;
+}
 
 export function validateRestoreTasks(deps, tasks) {
   let restoredMaxGeneration = 0;
@@ -170,6 +220,9 @@ export function validateRestoreTasks(deps, tasks) {
         // 停止证据字段（票据 07）：结构非法整体拒绝，绝不静默降级。
         const stopFieldsVerdict = validateRestoredStopFields(rawAttempt, attemptField);
         if (!stopFieldsVerdict.ok) throw validationError(stopFieldsVerdict);
+        // 派发路由冻结快照（票据 03）：存在但非法 → 整份快照拒绝（在任何状态修改之前），
+        // 绝不静默丢弃后再按当前配置补齐。返回的快照在提交侧原样复用。
+        restoredAttemptRouteOf(rawAttempt, attemptField + ".route", task.parentTaskId);
         // 代次种子：即使 attemptId/generation 缺失（旧快照）也要把派生值计入上界，
         // 保证恢复后新建的 attempt 代次严格大于所有历史值。
         const candidateGeneration = Number.isSafeInteger(rawAttempt.executionGeneration)
@@ -599,13 +652,26 @@ function resumeRestoredShardAttempts(deps, task, taskRole, resume, rolesToSchedu
           });
           continue;
         }
+        /**
+         * 恢复续跑沿用被中断 attempt 的冻结路由快照（票据 04）。
+         *
+         * 新 attempt 接替的是**同一次执行**，所以它读的是上一 attempt 的派发决定，
+         * 而不是恢复这一刻的 settings 与墙钟。快照缺失时保持无快照（旧路径），
+         * 不补任何按当前配置算出来的计划。
+         */
+        const resumedRoute = reusedResumeRouteOf(last);
         // 恢复续跑的新 attempt 同样按三级优先级解析超时：快照里的分片/任务级显式值
         // 优先，否则取**当前** settings 的角色默认值（恢复不冻结角色级配置）。
-        const attempt = deps.boundScheduler.createAttempt(task, shard, last.attempt + 1);
+        const attempt = deps.boundScheduler.createAttempt(
+          task,
+          shard,
+          last.attempt + 1,
+          resumedRoute === undefined ? {} : { route: resumedRoute },
+        );
         shard.attempts.push(attempt);
         delete attempt.cancelRequested;
         shard.cancelRequested = false;
-        deps.store.setShardStatus(task, shard, "queued");
+        deps.store.setShardStatus(task, shard, "queued", attempt);
         shard.updatedAt = deps.now();
         task.updatedAt = shard.updatedAt;
         rolesToSchedule.add(taskRole);
@@ -780,6 +846,9 @@ export function commitRestorePlan(deps, plan) {
             ...(typeof rawAttempt.messageId === "string" ? { messageId: rawAttempt.messageId } : {}),
             ...(rawAttempt.result === undefined ? {} : { result: cloneJson(rawAttempt.result) }),
             ...(rawAttempt.error === undefined ? {} : { error: cloneJson(rawAttempt.error) }),
+            // 冻结快照（票据 03/04）：running→interrupted 只改状态字段，不重建对象，route 不会丢；
+            // 快照里的 provider 因此仍是该次执行的归属（票据 05 的名额计数读 attempt.route.provider）。
+            ...restoredRouteFieldOf(rawAttempt, rawTask.parentTaskId),
           };
         });
         // 恢复语义：running 的运行时句柄已经不存在，统一记为 interrupted。

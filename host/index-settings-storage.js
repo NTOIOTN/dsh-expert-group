@@ -46,6 +46,7 @@ import {
   DEFAULT_ROLE_TIMEOUT_MS,
 } from "./settings-schema.js";
 import { normalizeSnapshot } from "./settings-read-projection.js";
+import { defaultPeakValleyState } from "./peak-valley-settings.js";
 import { EXPERT_STORAGE_DOMAIN_SPEC } from "./storage-domain-schema.js";
 
 /**
@@ -81,6 +82,9 @@ export function defaultSettingsEntry() {
     modelPrices: [],
     // 上下文继承（票据 29）：旧配置/未配置 => 空映射（全部关闭）。
     inheritContext: {},
+    // 峰谷（票据 02）：旧配置/未配置 => 未启用、未初始化、0 条时段、两套空 profile。
+    // 工厂每次返回全新对象：峰/谷两份 profile 绝不能共享引用。
+    peakValley: defaultPeakValleyState(),
   };
 }
 
@@ -211,6 +215,15 @@ function installSettingsSource(deps, api) {
         // 左侧栏入口同理：漏掉它会让冷恢复/服务重载之后的读源悄悄退回默认值，
         // 设置页与侧栏注册读到的事实就会与用户已保存的开关不一致。
         sidebarEntryEnabled: settingsSnapshot.sidebarEntryEnabled,
+        /**
+         * 峰谷（票据 02）：必须随同一份快照进入 source()，否则 meta/get 与派发路径会
+         * 悄悄退回"未启用"，而设置页显示的却是已启用——两边看到的事实必须同源。
+         * 归一值里已带 invalidCode（启用但非法），票 03 的路由据此 fail-closed。
+         */
+        peakValley: settingsSnapshot.peakValley,
+        // 与 limitDiagnostics 同理：读取期丢弃诊断是"一次性事实"，必须在第二次归一前
+        // 从原始快照取出，否则合法值重新归一后诊断会被清空，meta 再也看不到哪些条目被丢弃。
+        peakValleyDiagnostics: rawSettingsSnapshot?.peakValleyDiagnostics ?? settingsSnapshot.peakValleyDiagnostics,
         // 单价（票据 25）：与 settings 同源进入运行期读源，RPC meta/get 与客户端设置页
         // 读到同一份归一值；诊断只服务 meta，不进入设置响应。
         modelPrices: settingsSnapshot.modelPrices,

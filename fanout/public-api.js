@@ -54,6 +54,8 @@ export function createFanoutManager(options = {}) {
     launcher,
     continuer,
     canceller,
+    // 派发前路由冻结 seam（票据 03）：可选；缺失时 scheduler 完全保持旧行为。
+    prepareAttempt,
     clock,
     persistence,
     conflictChecker: injectedConflictChecker,
@@ -72,6 +74,10 @@ export function createFanoutManager(options = {}) {
   }
   if (canceller !== undefined && canceller !== null && typeof canceller !== "function") {
     throw new FanoutValidationError("INVALID_CANCELLER", "canceller 必须是函数");
+  }
+  // 派发前路由冻结 seam：可选，缺失时调度器保持旧路径；形态非法必须在构造期显式失败。
+  if (prepareAttempt !== undefined && prepareAttempt !== null && typeof prepareAttempt !== "function") {
+    throw new FanoutValidationError("INVALID_PREPARE_ATTEMPT", "prepareAttempt 必须是函数");
   }
   if (persistence !== undefined && persistence !== null && typeof persistence.save !== "function") {
     throw new FanoutValidationError("INVALID_PERSISTENCE", "persistence.save 必须是函数");
@@ -172,6 +178,8 @@ export function createFanoutManager(options = {}) {
       // 只读生命周期探针：延迟到调用时求值，构造期不触碰尚未创建的 state。
       isClosed: () => state.gate.closed,
       conflictObserver,
+      // 诊断时间戳（票据 05）：只服务 providerRelease 记录，不参与任何调度判定。
+      now,
     },
   });
   const events = createFanoutEventBus({ store, clock: { now }, isClosed: () => state.gate.closed });
@@ -212,7 +220,7 @@ export function createFanoutManager(options = {}) {
     limits,
     events,
     persistence: persist,
-    agents: { launcher, continuer, canceller },
+    agents: { launcher, continuer, canceller, prepareAttempt },
     clock: clockPort,
     ownerGate: { gate: state.gate, reclaim: state.reclaim },
   });
@@ -278,6 +286,8 @@ export function createFanoutManager(options = {}) {
     eventHistoryStatus: events.eventHistoryStatus,
     concurrencyLimits: limits.concurrencyLimits,
     throttleDiagnostics: scheduler.throttleDiagnostics,
+    // provider 释放异常诊断（票据 05 · F4）：只读、进程内单值，供 meta 诊断面投影。
+    providerReleaseDiagnostics: store.providerReleaseDiagnostics,
     budget: () => Object.freeze({
       limits: Object.freeze({ ...budgetPolicy }),
       tasks: store.taskTableSize(),

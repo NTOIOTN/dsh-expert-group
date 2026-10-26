@@ -80,6 +80,10 @@ const ATTRIBUTION_AGING_DEFAULT_MS = 60000;
  *   一律失败，绝不静默新建 child；
  * - `resolveChildSession(childId)`：解析既有 child 的 session（用于把本轮 attempt 绑定到
  *   该 session，让它的 turn/end 结算本轮）。缺失时退回 runtime 内部的有界索引；
+ * - `prepareAttempt({ task, shard, attempt, round, continuation })`（可选，票据 03）：
+ *   在 attempt 进入 running **之前**同步冻结派发路由；返回 `{ok:true, snapshot, selection}`
+ *   时快照写入 `attempt.route` 并由 buildRequest 直接消费（不再重新选路），返回
+ *   `{ok:false, code}` 时该 attempt 走 queued→failed 终态，返回 null/缺省时保持旧路径；
  * - `parentAgentOf(parentTaskId)`：解析父任务所属的 exact root Agent（投递需要父权限）。
  *
  * @param {object} options - Host 注入的 fan-out 协作面（见上）。
@@ -94,6 +98,10 @@ export function createFanoutRuntime(options = {}) {
   }
   if (options.resolveChildSession !== undefined && options.resolveChildSession !== null && typeof options.resolveChildSession !== "function") {
     throw new TypeError("fan-out resolveChildSession 必须是函数");
+  }
+  // 派发前路由冻结 seam（票据 03）：可选，缺失时 manager 走旧的异步选路。
+  if (options.prepareAttempt !== undefined && options.prepareAttempt !== null && typeof options.prepareAttempt !== "function") {
+    throw new TypeError("fan-out prepareAttempt 必须是函数");
   }
   const rawAttributionAgingMs = options.attributionAgingMs;
   if (rawAttributionAgingMs !== undefined && rawAttributionAgingMs !== null
@@ -169,6 +177,8 @@ export function createFanoutRuntime(options = {}) {
     // 多轮复用走 continuer（同一 child 的新一轮 prompt），其余 attempt 仍走 launcher。
     continuer: lifecycle.continueShard,
     canceller: lifecycle.canceller,
+    // 派发前路由冻结（票据 03）：manager 在进入 running 之前同步调用它；缺失时保持旧行为。
+    ...(typeof options.prepareAttempt === "function" ? { prepareAttempt: options.prepareAttempt } : {}),
     persistence: options.persistence,
     conflictChecker: options.conflictChecker,
     writeRoles: options.writeRoles,

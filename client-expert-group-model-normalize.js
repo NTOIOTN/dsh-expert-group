@@ -59,6 +59,18 @@
   const SHARD_CAPABILITY_ACTIONS = Object.freeze(["cancel", "retry"]);
   const CAPABILITY_REASON_MAX_LENGTH = 64;
 
+  /**
+   * 时段 / 层 / 跨层回退的只读词表（票据 06）。
+   *
+   * 客户端**绝不按当前设置或当前时钟推断**这三个字段：Host 快照里存在才透传，缺失不补默认
+   * 值。词表与 shared/route-snapshot.js 的 ROUTE_PERIODS / ROUTE_TIERS 同值——浏览器侧只加载
+   * 装配后的 bundle、不能 import Helper 模块，因此与其它客户端常量一样保留同值副本；
+   * 破坏性改动必须两边同步（口径见文件头注释）。
+   */
+  const ROUTE_PERIOD_VALUES = Object.freeze(["peak", "valley", "none"]);
+  const ROUTE_TIER_VALUES = Object.freeze(["peak", "valley", "normal-override", "normal-fallback"]);
+  const ROUTE_TEXT_MAX_LENGTH = 64;
+
   const COUNT_FIELDS = Object.freeze([
     "queued", "waiting", "running", "succeeded", "failed", "cancelled", "timed_out", "interrupted", "pending",
   ]);
@@ -595,6 +607,43 @@
     };
   }
 
+  /**
+   * 跨层回退白名单归一（票据 06）：形状不完整就整字段省略，绝不补默认值。
+   *
+   * 为什么逐字段校验：Host 已经收敛过一次，但旧 Host 或手工合成的负载仍可能夹带自由文本；
+   * 客户端只承认固定枚举、稳定原因码与角色 id（均限长、去空白），不还原任何候选清单。
+   */
+  function normalizeRouteFallback(value) {
+    if (!isObject(value)) return null;
+    if (value.fromTier !== "peak" && value.fromTier !== "valley") return null;
+    if (value.toTier !== "normal-fallback") return null;
+    const reasonCode = boundedText(value.reasonCode, ROUTE_TEXT_MAX_LENGTH);
+    if (reasonCode === null) return null;
+    const role = boundedText(value.role, ROUTE_TEXT_MAX_LENGTH);
+    return {
+      fromTier: value.fromTier,
+      toTier: "normal-fallback",
+      reasonCode,
+      ...(role === null ? {} : { role }),
+    };
+  }
+
+  /**
+   * attempt / shard / fanout / 会话节点的时段·层·跨层回退字段（票据 06）。
+   *
+   * 纯只读投影：存在才透传，缺失不写默认值（旧 Host 的快照因此不会凭空多出三个键）；
+   * 客户端也不做任何「按当前时段补一个值」的推断。
+   */
+  function routeFields(value) {
+    const source = isObject(value) ? value : {};
+    const fallback = normalizeRouteFallback(source.ordinaryFallback);
+    return {
+      ...(ROUTE_PERIOD_VALUES.includes(source.routePeriod) ? { routePeriod: source.routePeriod } : {}),
+      ...(ROUTE_TIER_VALUES.includes(source.routeTier) ? { routeTier: source.routeTier } : {}),
+      ...(fallback === null ? {} : { ordinaryFallback: fallback }),
+    };
+  }
+
   function normalizeAttempt(value) {
     const source = isObject(value) ? value : {};
     const startedAt = numberOrNull(source.startedAt);
@@ -607,6 +656,8 @@
       childId: text(source.childId),
       // 角色显示名（票据 27）：Host 在 child_models/attempt 里保留 roleLabel，角色被删除后历史任务仍可读。
       roleLabel: text(source.roleLabel),
+      // 时段/层/跨层回退（票据 06）：存在才透传，缺失不补默认值。
+      ...routeFields(source),
       // 票据 25/30：attempt 级的用量与结构化结果；缺失整字段省略（不伪造 0 / 不伪造空结果）。
       ...usageFields(source),
       ...structuredFields(source),
@@ -639,6 +690,8 @@
       provider: firstText(source.provider, defaults.provider),
       model: firstText(source.model, defaults.model),
       effort: firstText(source.effort, source.reasoningEffort, defaults.effort, defaults.reasoningEffort),
+      // 时段/层/跨层回退（票据 06）：来自 Host 投影，客户端只读透传。
+      ...routeFields(source),
       status,
       // 票据 25/30：分片级用量与最新 attempt 的结构化结果（Host 已投影在分片上）。
       ...usageFields(source),
@@ -703,6 +756,8 @@
       provider: text(source.provider),
       model: text(source.model),
       effort: firstText(source.effort, source.reasoningEffort),
+      // 时段/层/跨层回退（票据 06）：父任务节点同样只读透传。
+      ...routeFields(source),
       taskStatus,
       status,
       running: runningOf(status, source.running),
@@ -780,6 +835,8 @@
       provider: text(source.provider),
       model: text(source.model),
       effort: firstText(source.effort, source.reasoningEffort),
+      // 时段/层/跨层回退（票据 06）：会话节点（root/普通专家）同样只读透传，不做推断。
+      ...routeFields(source),
       status,
       running: runningOf(status, source.running),
       runSummary: normalizeRunSummary(source.runSummary),
@@ -884,7 +941,6 @@
     normalizeFailure,
     normalizeUsage,
     normalizeStructured,
-    normalizeRoleLabels,
     roleLabelFrom,
     roleLabelOf,
     findModelPrice,

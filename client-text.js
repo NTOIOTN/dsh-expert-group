@@ -73,17 +73,27 @@
       "settings.saved": "已保存",
       "settings.unsaved": "有未保存的修改",
     });
+    /**
+     * 文案模板插值：把 `{name}` 替换为 vars 里的同名值，缺失/为 null 的占位符**原样保留**。
+     *
+     * 两个文案入口（settingsText 的 zh 回退表、settingsExtraText 的本地表）原先各写了一份
+     * 逐字相同的插值块，这里合并；正则、变量取值口径、String() 转换与"缺失保留占位符"的
+     * 语义全部原样不变。
+     */
+    function interpolateSettingsTemplate(template, vars) {
+      const values = vars !== null && typeof vars === "object" ? vars : {};
+      return template.replace(/\{([a-z][a-z0-9_]*)\}/gi, (match, name) => {
+        const value = values[name];
+        return value === void 0 || value === null ? match : String(value);
+      });
+    }
     /** 取一条设置页文案：模型可用时走权威投影；缺失时用 zh 回退表插值（绝不显示键名）。 */
     function settingsText(locale, key, vars) {
       const model = localeModelApi();
       if (typeof model?.translateMessage === "function") return model.translateMessage(locale, key, vars);
       const template = SETTINGS_ZH_FALLBACK[key];
       if (template === undefined) return "—";
-      const values = vars !== null && typeof vars === "object" ? vars : {};
-      return template.replace(/\{([a-z][a-z0-9_]*)\}/gi, (match, name) => {
-        const value = values[name];
-        return value === void 0 || value === null ? match : String(value);
-      });
+      return interpolateSettingsTemplate(template, vars);
     }
     /**
      * 票据 24 新增设置区块的**本地**文案表（zh/en 成对）。
@@ -108,17 +118,43 @@
       "settings.modelCandidates.limit": { zh: "每个角色最多 3 个候选" },
       "settings.modelCandidates.error.incomplete": { zh: "候选第 {index} 行需要同时填写供应商和模型" },
       "settings.modelCandidates.error.duplicate": { zh: "候选第 {index} 行与前面的候选重复" },
+      // 峰谷模式（票据 07）：入口按钮、设置页内子视图与时段编辑的本地文案。
+      "settings.pv.entry": { zh: "峰谷模式" },
+      "settings.pv.enable": { zh: "启用峰谷模式" },
+      // 「已初始化（只读）…」那条只读说明已按 UI 精简要求删除（initialized 时整段不渲染），
+      // 键一并移除避免留下永不命中的死文案。
+      "settings.pv.uninit": { zh: "首次启用会从普通配置复制峰、谷两套模型" },
+      // 峰谷子视图的两个返回入口（左上角「← 返回」与页脚「返回」）共用这一条。
+      "settings.pv.back": { zh: "返回" },
+      "settings.pv.peak": { zh: "峰时" },
+      "settings.pv.valley": { zh: "谷时" },
+      // 侧栏标题栏的时段标记（票据 09）：未启用态；峰/谷两态直接复用上面的两个 key，
+      // 因此「Auto 右侧的标记」与「设置页入口按钮的后缀」永远同一份文案。
+      "settings.pv.disabled": { zh: "峰谷：未启用" },
+      // 「峰段时段」标签已按 UI 精简删除（键一并移除，避免死文案）；区块语义改由启用开关承担。
+      "settings.pv.add": { zh: "添加峰段" },
+      // 可见文字只留「删除」；aria-label 由 remove.aria + 行号拼成「删除峰段N」，
+      // 屏幕阅读器与既有自动化仍能按序号定位到具体行。
+      "settings.pv.remove": { zh: "删除" },
+      "settings.pv.remove.aria": { zh: "删除峰段" },
+      "settings.pv.start": { zh: "开始" },
+      "settings.pv.end": { zh: "结束" },
+      "settings.pv.noValley": { zh: "当前没有谷时" },
+      "settings.pv.invalid": { zh: "峰谷时段不合法：{reason}" },
+      // 主设置页的「当前时段」视图（票据 08）：锁定的编辑目标与跨边界常驻提示。
+      // 损坏档案的修复路径：读取面 invalidCode 非空时只允许「修复并保存」写回峰谷字段。
+      "settings.pv.broken": { zh: "峰谷配置损坏，请到峰谷设置页修复" },
+      "settings.pv.repairHint": { zh: "峰谷配置已损坏，请修复后保存" },
+      "settings.pv.repair": { zh: "修复并保存" },
+      "settings.pv.mainScope": { zh: "本页正在编辑{period}模型（打开页面时锁定）" },
+      "settings.pv.boundary": { zh: "当前已进入{current}，本页仍在编辑{editing}模型" },
     });
     /** 取本票据新增控件的文案：locale 缺失或该语言无译文时回退 zh，绝不渲染键名。 */
     function settingsExtraText(locale, key, vars) {
       const entry = SETTINGS_EXTRA_MESSAGES[key];
       if (entry === void 0) return settingsText(locale, key, vars);
       const template = typeof entry[locale] === "string" && entry[locale].length > 0 ? entry[locale] : entry.zh;
-      const values = vars !== null && typeof vars === "object" ? vars : {};
-      return template.replace(/\{([a-z][a-z0-9_]*)\}/gi, (match, name) => {
-        const value = values[name];
-        return value === void 0 || value === null ? match : String(value);
-      });
+      return interpolateSettingsTemplate(template, vars);
     }
 
 

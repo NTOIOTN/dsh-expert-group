@@ -6,7 +6,8 @@
  */
 
 import { z as domainZ } from "zod";
-import { MODEL_ROUTE_ERROR_CODES } from "../shared/model-route.js";
+import { MAX_MODEL_FALLBACK_LIMIT, MODEL_ROUTE_ERROR_CODES } from "../shared/model-route.js";
+import { ROUTE_PERIODS, ROUTE_PLAN_LIMIT, ROUTE_TIERS } from "../shared/route-snapshot.js";
 import { STRUCTURED_RESULT_FALLBACK_REASONS } from "../shared/structured.js";
 import { defineDomain, domainTable } from "@deepseek-ai/dsh-storage-domain";
 import {
@@ -36,6 +37,33 @@ const DOMAIN_MODEL_ROUTE_FIELDS = {
   fallbackCount: domainZ.number().int().nonnegative().optional(),
   lastRouteErrorCode: domainZ.enum(Object.values(MODEL_ROUTE_ERROR_CODES)).optional(),
 };
+/**
+ * 派发路由冻结快照（票据 03）：child_models 上的**可选**只读投影字段。
+ *
+ * 形状与 shared/route-snapshot.js 严格一致，并且这里只做**有界校验**（不做归一/修复）：
+ * plan 数组 ≤ 8、period/tier 封闭枚举、tierPlanLength ≤ 8、层内索引 0..7、层预算 0..4、
+ * provider 非空、decidedAt 非负。取舍与 persona marker 相同：**写入边界先归一**
+ * （host/index-agent-snapshot.js 的 persistChildModel 只写 normalizeRouteSnapshot 通过的
+ * 快照），schema 不承担修复职责；因此任何绕过写入边界的非法值都会被 domain 拒绝，
+ * 而不是被静默截断成「看起来能跑」的第二个真相。历史记录里的 malformed route 由写入
+ * 面显式删除（removeKeys），保证一条坏字段不会永久阻塞整条记录。
+ */
+const DOMAIN_ROUTE_SNAPSHOT = domainZ.object({
+  period: domainZ.enum(ROUTE_PERIODS),
+  tier: domainZ.enum(ROUTE_TIERS),
+  plan: domainZ.array(DOMAIN_ROLE_SELECTION).min(1).max(ROUTE_PLAN_LIMIT),
+  tierPlanLength: domainZ.number().int().nonnegative().max(ROUTE_PLAN_LIMIT),
+  candidateIndex: domainZ.number().int().nonnegative().max(ROUTE_PLAN_LIMIT - 1),
+  fallbackLimit: domainZ.number().int().nonnegative().max(MAX_MODEL_FALLBACK_LIMIT),
+  ordinaryFallbackLimit: domainZ.number().int().nonnegative().max(MAX_MODEL_FALLBACK_LIMIT),
+  ordinaryFallback: domainZ.object({
+    fromTier: domainZ.enum(["peak", "valley"]),
+    toTier: domainZ.literal("normal-fallback"),
+    reasonCode: domainZ.string().min(1).max(64),
+  }).nullable(),
+  provider: domainZ.string().min(1).max(128),
+  decidedAt: domainZ.number().nonnegative(),
+}).optional();
 /** session_overrides 的 value 是“角色名 -> selection”字典，不是单个 selection。 */
 export const DOMAIN_SESSION_OVERRIDES = domainZ.record(domainZ.string(), DOMAIN_ROLE_SELECTION);
 /**
@@ -58,6 +86,9 @@ export const DOMAIN_CHILD_MODEL_RECORD = domainZ.object({
   reasoningEffort: domainZ.string().optional(),
   // 实际路由元数据（票据 24）：与 provider/model 同层持久化，冷恢复/侧栏只读。
   ...DOMAIN_MODEL_ROUTE_FIELDS,
+  // 派发路由冻结快照（票据 03）：完整计划 + 时段 + 层 + 跨层回退。缺失 = 开启峰谷前
+  // 的旧记录 / 未启用峰谷的派发；读取面据此走既有重建路径，绝不按当前 settings 补齐。
+  route: DOMAIN_ROUTE_SNAPSHOT,
   role: domainZ.string().optional(),
   parentId: domainZ.string().optional(),
   continuable: domainZ.boolean().optional(),

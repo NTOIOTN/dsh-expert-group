@@ -710,6 +710,26 @@
   }
 
   /**
+   * 复核点 "abort" 的统一收口（两处调用点此前逐字复制）：撤销在途记账，关闭意图时登记抑制；
+   * 顺序不变，写入同一个 `sidebarAutoSuppressedRef.current` Map 实例与同形状条目（等价）；
+   * deps 也是同一对象，abandon / suppressed 只是它的本地别名（同一绑定，无新语义）。
+   */
+  function settleAbortedAutoSideEffect(action, deps) {
+    const {
+      abandonAutoSidebarAction: abandon, autoTakeoverStateOf, rootSessionId,
+      sidebarAutoSuppressedRef: suppressed, sidebarSessionId, trimAutoKeyMap,
+    } = deps;
+    const { autoContext, key, resourceAddress: address } = action;
+    abandon(key, autoContext);
+    if (autoTakeoverStateOf(key) === "close") {
+      // 用户要的是关闭：立刻登记抑制，Auto 不得在下一轮同步里把它重新选成候选或重新打开。
+      suppressed.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address });
+      trimAutoKeyMap(suppressed.current);
+      writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, address, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
+    }
+  }
+
+  /**
    * 打开态：从「当前没有记录」一路走到「记录落地 + 同步一次」。
    *
    * 顺序刻意与拆分前逐字一致：先登记在途打开记录（含因果证明字段），再清手动抑制/来源，
@@ -856,11 +876,11 @@
    */
   async function completeSidebarSplitPreparation(action, deps, state) {
     const {
-      abandonAutoSidebarAction, autoTakeoverStateOf, cancelPendingSidebarSplit, rootSessionId,
-      sidebarAutoSuppressedRef, sidebarSessionId, sidebarSplitIntentRef, sidebarSurfaceStillCurrent,
-      sidebarTabOpeningRef, trimAutoKeyMap, waitForSidebarSplitLayoutCommit,
+      cancelPendingSidebarSplit, sidebarSplitIntentRef, sidebarSurfaceStillCurrent,
+      sidebarTabOpeningRef, waitForSidebarSplitLayoutCommit,
     } = deps;
-    const { autoContext, key, resourceAddress } = action;
+    // autoContext 与抑制登记的可用字段由 settleAbortedAutoSideEffect 自己从 action / deps 取。
+    const { key } = action;
     const { splitToken } = state;
     // 宽度 action 返回只代表 store 已写入；必须等宿主把新宽度提交到 DockLayout，
     // 否则 split() 仍会读到旧 room.row=false，并弹出「栏宽不足」。
@@ -879,13 +899,7 @@
      */
     const afterLayoutReview = reviewAutoSideEffect(action, deps);
     if (afterLayoutReview === "abort") {
-      abandonAutoSidebarAction(key, autoContext);
-      if (autoTakeoverStateOf(key) === "close") {
-        // 用户要的是关闭：立刻登记抑制，Auto 不得在下一轮同步里把它重新选成候选。
-        sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
-        trimAutoKeyMap(sidebarAutoSuppressedRef.current);
-        writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, resourceAddress, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
-      }
+      settleAbortedAutoSideEffect(action, deps); // 放弃 + 关闭意图登记，与 open 前的复核点共用同一段
       return null;
     }
     if (afterLayoutReview === "manual") action.effectiveOrigin = SIDEBAR_TAB_ORIGIN_MANUAL;
@@ -940,9 +954,8 @@
    */
   function issueSidebarResourceOpen(action, deps, plan) {
     const {
-      abandonAutoSidebarAction, autoTakeoverStateOf, openSidebarResource, rootSessionId,
-      sidebarAutoOriginRef, sidebarAutoSuppressedRef, sidebarResourceTabStateOf, sidebarSessionId,
-      sidebarTabOpeningRef, sidebarRight, trimAutoKeyMap,
+      openSidebarResource, rootSessionId, sidebarAutoOriginRef, sidebarResourceTabStateOf,
+      sidebarSessionId, sidebarTabOpeningRef, sidebarRight,
     } = deps;
     const { autoContext, key, resourceAddress } = action;
     const { openOptions } = plan;
@@ -953,13 +966,7 @@
      */
     const beforeOpenReview = reviewAutoSideEffect(action, deps);
     if (beforeOpenReview === "abort") {
-      abandonAutoSidebarAction(key, autoContext);
-      if (autoTakeoverStateOf(key) === "close") {
-        // 用户要的是关闭：立刻登记抑制，绝不在同一轮或下一轮同步里把这个资源重新打开。
-        sidebarAutoSuppressedRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, address: resourceAddress });
-        trimAutoKeyMap(sidebarAutoSuppressedRef.current);
-        writeSidebarAutoOwnership(sidebarSessionId, rootSessionId, resourceAddress, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, "manual-close");
-      }
+      settleAbortedAutoSideEffect(action, deps); // 同上：同一段收口，登记到同一个 ref / Map
       return false;
     }
     if (beforeOpenReview === "manual") action.effectiveOrigin = SIDEBAR_TAB_ORIGIN_MANUAL;

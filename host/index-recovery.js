@@ -31,13 +31,10 @@
  * @module dsh-expert-group/host/index-recovery
  */
 import { isFanoutAgent, isFanoutIdentity, FANOUT_PARENT_AGENT_MARKER } from "../fanout-host.js";
-import { isSubagentCapacityError } from "../shared/capacity-errors.js";
-import { createAdmissionBatchCoordinator } from "../shared/delegation-cohort.js";
 import {
-  CONTEXT_INHERITANCE_ERROR_CODES,
   DEFAULT_MODEL_FALLBACK_LIMIT,
   EXPERT_ROUTE_MARKER,
-  MODEL_CANDIDATES_EXHAUSTED,
+  EXPERT_ROUTE_SNAPSHOT_MARKER,
   buildModelRoutePlan,
   modelRouteFieldsFromRecord,
   modelRouteKeyOf,
@@ -45,7 +42,9 @@ import {
   normalizeModelRouteMarker,
   normalizeModelSelection,
 } from "../shared/model-route.js";
-import { OUTPUT_SCHEMA_ERROR_CODES } from "../shared/structured.js";
+import { snapshotFallbackChainFor, switchToOrdinaryLayer, writeModelRouteSnapshotWith } from "./model-fallback-snapshot.js";
+import { noteRouteOrdinaryFallback } from "./route-diagnostics.js";
+import { installAdmissionBatches } from "./index-admission-batches.js";
 import { sameDurableSessionId } from "../shared/structured-path.js";
 import {
   FEEDBACK_DELIVERY_LIMIT,
@@ -232,6 +231,59 @@ function pruneRecoveryRecords(store, protectedRecord, dropRecord, evictionDeps) 
   }
 }
 
+/** 从 agent.options 读取 admission/恢复写入的真实路由（含显式 effort）。 */
+function admissionModelRouteOf(agent) {
+  const provider = agent?.options?.provider;
+  const model = agent?.options?.model;
+  if (typeof provider !== "string" || provider.length === 0) return void 0;
+  if (typeof model !== "string" || model.length === 0) return void 0;
+  const effort = agent?.options?.[EFFORT_MARKER];
+  return {
+    provider,
+    model,
+    ...(typeof effort === "string" && effort.length > 0 ? { reasoningEffort: effort } : {}),
+  };
+}
+
+/**
+ * 两条路由是否指向同一个模型。
+ *
+ * effort 不参与判定：降级的目标是「换模型」，同一 provider+model 只改 effort
+ * 不构成一次降级，也不允许被候选链当成新候选重复消耗次数。
+ */
+function sameModelRoute(left, right) {
+  return left !== void 0
+    && right !== void 0
+    && left.provider === right.provider
+    && left.model === right.model;
+}
+
+/**
+ * 在候选链里定位当前路由的位置；找不到返回 -1（表示「不在链上」）。
+ *
+ * 恢复策略（cold-resume 序号可能过期）：先按 provider+model 在**新计划**里精确匹配；
+ * 匹配不到时才考虑复用持久化序号，并且必须校验该序号指向的计划项与当前路由
+ * 同 provider+model——用户在中途改过候选列表时，旧序号可能指向完全不同的模型，
+ * 直接复用会把「降级到第 2 个候选」错记成「当前就在第 2 个候选」。校验失败返回 -1
+ * 表示「明确从头开始」：nextModelCandidateOf 会从计划头扫描，并靠 triedRoutes
+ * 跳过当前路由，绝不回到同一个失败模型。
+ */
+function modelRouteIndexInPlan(plan, route, marker, recordedRoute) {
+  if (route !== void 0) {
+    for (let index = 0; index < plan.length; index += 1) {
+      if (sameModelRoute(plan[index]?.selection, route)) return index;
+    }
+  }
+  const markerIndex = Number.isSafeInteger(marker?.candidateIndex)
+    ? marker.candidateIndex
+    : Number.isSafeInteger(recordedRoute?.candidateIndex)
+      ? recordedRoute.candidateIndex
+      : void 0;
+  if (markerIndex !== void 0 && markerIndex >= 0 && markerIndex < plan.length
+    && sameModelRoute(plan[markerIndex]?.selection, route)) return markerIndex;
+  return -1;
+}
+
 /**
  * 创建恢复登记表 / 模型降级域能力面。
  *
@@ -252,7 +304,8 @@ export function createIndexRecoveryDomain(deps) {
   Object.assign(api, installRecoveryRecords(deps, api, store));
   Object.assign(api, installActivationState(deps, api, store));
   Object.assign(api, installModelFallback(deps, api));
-  Object.assign(api, installModelRoutePersistence(deps));
+  // 候选切换的 child_models 快照写入（票据 03）：写命令由本域转交，逻辑在独立模块。
+  api.writeModelRouteSnapshot = (agent, chain, next) => writeModelRouteSnapshotWith(deps.storage.writeChildModelPatch, agent, chain, next);
   Object.assign(api, installAdmissionBatches(deps, api));
   Object.assign(api, installPendingCreations(deps, api));
   return { ...api };
@@ -856,33 +909,6 @@ function installModelFallback(deps, api) {
    */
   const modelFallbackRouteDisposers = new WeakMap();
 
-  /** 从 agent.options 读取 admission/恢复写入的真实路由（含显式 effort）。 */
-  function admissionModelRouteOf(agent) {
-    const provider = agent?.options?.provider;
-    const model = agent?.options?.model;
-    if (typeof provider !== "string" || provider.length === 0) return void 0;
-    if (typeof model !== "string" || model.length === 0) return void 0;
-    const effort = agent?.options?.[EFFORT_MARKER];
-    return {
-      provider,
-      model,
-      ...(typeof effort === "string" && effort.length > 0 ? { reasoningEffort: effort } : {}),
-    };
-  }
-
-  /**
-   * 两条路由是否指向同一个模型。
-   *
-   * effort 不参与判定：降级的目标是「换模型」，同一 provider+model 只改 effort
-   * 不构成一次降级，也不允许被候选链当成新候选重复消耗次数。
-   */
-  function sameModelRoute(left, right) {
-    return left !== void 0
-      && right !== void 0
-      && left.provider === right.provider
-      && left.model === right.model;
-  }
-
   /** 当前生效路由：运行期覆盖优先，否则就是 admission/恢复写入的 options 路由。 */
   function currentModelRouteOf(agent, chain) {
     return chain?.override !== void 0 ? chain.override : admissionModelRouteOf(agent);
@@ -937,32 +963,6 @@ function installModelFallback(deps, api) {
   }
 
   /**
-   * 在候选链里定位当前路由的位置；找不到返回 -1（表示「不在链上」）。
-   *
-   * 恢复策略（cold-resume 序号可能过期）：先按 provider+model 在**新计划**里精确匹配；
-   * 匹配不到时才考虑复用持久化序号，并且必须校验该序号指向的计划项与当前路由
-   * 同 provider+model——用户在中途改过候选列表时，旧序号可能指向完全不同的模型，
-   * 直接复用会把「降级到第 2 个候选」错记成「当前就在第 2 个候选」。校验失败返回 -1
-   * 表示「明确从头开始」：nextModelCandidateOf 会从计划头扫描，并靠 triedRoutes
-   * 跳过当前路由，绝不回到同一个失败模型。
-   */
-  function modelRouteIndexInPlan(plan, route, marker, recordedRoute) {
-    if (route !== void 0) {
-      for (let index = 0; index < plan.length; index += 1) {
-        if (sameModelRoute(plan[index]?.selection, route)) return index;
-      }
-    }
-    const markerIndex = Number.isSafeInteger(marker?.candidateIndex)
-      ? marker.candidateIndex
-      : Number.isSafeInteger(recordedRoute?.candidateIndex)
-        ? recordedRoute.candidateIndex
-        : void 0;
-    if (markerIndex !== void 0 && markerIndex >= 0 && markerIndex < plan.length
-      && sameModelRoute(plan[markerIndex]?.selection, route)) return markerIndex;
-    return -1;
-  }
-
-  /**
    * 惰性构建某个 child 的候选链快照（按 Agent 缓存，只建一次）。
    *
    * 一致性边界（明确取舍，避免用户中途改配置把同一 child 的降级序列打乱）：
@@ -989,6 +989,31 @@ function installModelFallback(deps, api) {
     try { persisted = typeof agent?.id === "string" ? readSnapshot()?.childModels?.[agent.id] : void 0; } catch { persisted = void 0; }
     const marker = normalizeModelRouteMarker(agent?.options?.[EXPERT_ROUTE_MARKER]);
     const recordedRoute = modelRouteFieldsFromRecord(persisted);
+    const persistedFallbackCount = Number.isSafeInteger(marker?.fallbackCount) && marker.fallbackCount >= 0
+      ? marker.fallbackCount
+      : Number.isSafeInteger(recordedRoute?.fallbackCount) && recordedRoute.fallbackCount >= 0
+        ? recordedRoute.fallbackCount
+        : void 0;
+    /**
+     * 冻结快照优先（票据 03）：agentOptions marker 优先，cold-resume 回落到 child_models 的
+     * route 字段。**快照存在但非法 → fail-closed**（返回 undefined，不降级、不按当前配置
+     * 重建），绝不把它当成"缺失"再走一次按当前 settings 的选路。
+     */
+    const snapshotChain = snapshotFallbackChainFor(
+      role,
+      agent?.options?.[EXPERT_ROUTE_SNAPSHOT_MARKER],
+      persisted?.route,
+      admissionModelRouteOf(agent),
+      persistedFallbackCount,
+    );
+    if (snapshotChain !== null) {
+      // 快照存在但非法 → fail-closed：不降级、也绝不按当前 settings 重建计划。
+      if (snapshotChain.invalid === true) return void 0;
+      modelFallbackStates.set(agent, snapshotChain.chain);
+      return snapshotChain.chain;
+    }
+    // 快照完全缺失（开启峰谷前创建的 child / 旧记录）：保持既有重建路径，且只按**普通配置**
+    // 重建（defaults/candidates/fallbackLimit），不读峰谷 profile、不读时钟。
     const requestedPrimary = marker?.requestedPrimary ?? recordedRoute.requestedPrimary;
     const primary = requestedPrimary ?? admissionModelRouteOf(agent);
     if (primary === void 0) return void 0;
@@ -1002,11 +1027,6 @@ function installModelFallback(deps, api) {
     const planInfo = buildModelRoutePlan(primary, candidates, fallbackLimit);
     const route = admissionModelRouteOf(agent);
     const index = modelRouteIndexInPlan(planInfo.plan, route, marker, recordedRoute);
-    const persistedFallbackCount = Number.isSafeInteger(marker?.fallbackCount) && marker.fallbackCount >= 0
-      ? marker.fallbackCount
-      : Number.isSafeInteger(recordedRoute?.fallbackCount) && recordedRoute.fallbackCount >= 0
-        ? recordedRoute.fallbackCount
-        : void 0;
     const chain = {
       role,
       plan: planInfo.plan,
@@ -1021,6 +1041,13 @@ function installModelFallback(deps, api) {
       // admission 阶段（启动前预检）已经消耗的降级次数；运行期降级与它共用同一上限。
       baselineFallbacks: persistedFallbackCount ?? (index >= 0 ? index : 0),
       switches: 0,
+      // 旧重建链没有快照：层边界就是整条计划，切层能力关闭（保持既有语义）。
+      layerBegin: 0,
+      layerEnd: planInfo.plan.length,
+      ordinaryFallbackLimit: planInfo.fallbackLimit,
+      ordinaryFallback: null,
+      baseSnapshot: void 0,
+      snapshotBacked: false,
     };
     modelFallbackStates.set(agent, chain);
     return chain;
@@ -1038,8 +1065,11 @@ function installModelFallback(deps, api) {
    * @returns {{index:number, candidateIndex:number, selection:object}|undefined}
    */
   function nextModelCandidateOf(chain, currentRoute) {
+    // 层边界（票据 03）：只允许在当前活动层内前进。越界返回 undefined，由调用方决定
+    // 是否切到普通层——这样普通层候选永远不会被当成时段层的"下一个候选"。
     const start = chain.index >= 0 ? chain.index + 1 : 0;
-    for (let index = start; index < chain.plan.length; index += 1) {
+    const end = Number.isSafeInteger(chain.layerEnd) ? chain.layerEnd : chain.plan.length;
+    for (let index = start; index < end; index += 1) {
       const selection = normalizeModelSelection(chain.plan[index]?.selection);
       if (selection === void 0) continue;
       if (sameModelRoute(selection, currentRoute)) continue;
@@ -1112,7 +1142,27 @@ function installModelFallback(deps, api) {
     if (chain === void 0 || chain.plan.length <= 1) return false;
     const currentRoute = currentModelRouteOf(agent, chain);
     if (currentRoute === void 0) return false;
-    const next = nextModelCandidateOf(chain, currentRoute);
+    let next = nextModelCandidateOf(chain, currentRoute);
+    if (next === void 0 && switchToOrdinaryLayer(chain)) {
+      /**
+       * 跨层回退诊断（票据 06）：运行期「时段层耗尽 → 普通层」的写入点。
+       *
+       * 只读刚生成的新快照里的 ordinaryFallback，绝不按当前 settings/时钟重判；
+       * 无论切换后是否还找得到候选，这次「掉层」都已经发生，因此先记录再选候选。
+       */
+      const switched = chain.baseSnapshot?.ordinaryFallback;
+      if (switched !== null && switched !== undefined) {
+        noteRouteOrdinaryFallback({
+          role: chain.role,
+          fromTier: switched.fromTier,
+          toTier: switched.toTier,
+          reasonCode: switched.reasonCode,
+          at: Date.now(),
+        });
+      }
+      // 时段层耗尽：切到普通层后**同一轮**再选一次，避免多浪费一次失败事件才切换。
+      next = nextModelCandidateOf(chain, currentRoute);
+    }
     if (next === void 0) return false;
     // 覆盖必须真有落点：拿不到 scoped ctx 时拒绝切换，否则 loop 会用同一路由重发，
     // 把候选预算白白耗在同一个失败模型上。
@@ -1200,235 +1250,6 @@ function installModelFallback(deps, api) {
   };
 }
 
-
-/**
- * R3-a：候选切换的 child_models 快照旁路写入（可见性来源）。
- *
- * 与降级状态机分开成组：这里只有一个纯写入函数，依赖面仅 storage 的 child_models
- * 写命令；写入失败只由 writeChildModelPatch 内部告警，绝不让「快照没写上」把一次
- * 已经生效的降级回滚成失败。
- *
- * @param {object} deps - 窄能力面。
- * @returns {object} 快照写入能力面。
- */
-function installModelRoutePersistence(deps) {
-  const { storage } = deps;
-  const { writeChildModelPatch } = storage;
-
-  /**
-   * 把候选切换写进 child_models 快照（侧栏/用量统计的可见性来源）。
-   *
-   * 旁路持久化：写入失败只由 writeChildModelPatch 内部告警，绝不让「快照没写上」
-   * 把一次已经生效的降级回滚成失败。写入走同一串行队列，因此不会与 usage/
-   * structured 等其它 child_models patch 互相覆盖。
-   *
-   * 刻意省略 lastRouteErrorCode：运行期失败码（429/5xx/TIMEOUT/…）不在
-   * MODEL_ROUTE_ERROR_CODES 的稳定枚举里，硬塞会让投影把「限流」误读成「模型不可用」；
-   * 预检阶段写入的旧值原样保留。
-   *
-   * @param {object} agent - exact Agent。
-   * @param {object} chain - 链状态。
-   * @param {{index:number, candidateIndex:number, selection:object}} next - 选中的候选。
-   */
-  function writeModelRouteSnapshot(agent, chain, next) {
-    if (typeof agent?.id !== "string") return;
-    const effort = typeof next.selection.reasoningEffort === "string" && next.selection.reasoningEffort.length > 0
-      ? next.selection.reasoningEffort
-      : void 0;
-    void writeChildModelPatch(agent.id, {
-      provider: next.selection.provider,
-      model: next.selection.model,
-      ...(effort === void 0 ? {} : { reasoningEffort: effort }),
-      candidateIndex: next.candidateIndex,
-      fallbackCount: chain.baselineFallbacks + chain.switches,
-    }, effort === void 0
-      // 候选未声明 effort：**显式删除**旧档位（浅合并会保留主模型/上一个候选的
-      // reasoningEffort，投影就会显示「候选模型 + 主模型思考档」）。删除后运行期
-      // route 覆盖同样会清空继承 effort，由新 provider 自行解析默认档。
-      ? { remove: ["reasoningEffort"] }
-      : undefined).catch(() => { /* 旁路持久化失败已由 writeChildModelPatch 记录，绝不向上抛。 */ });
-  }
-
-  return { writeModelRouteSnapshot };
-}
-
-/**
- * R4：root admission 的显式 epoch 与批次收口判定。
- *
- * role tool 只登记并返回 token；finalize 以「当前 root 的开放批次 + epoch」
- * 定位整批并收口。pending-close 期间新接受的 admission 同步进入等待集，
- * 收口结论的 acceptedCount 因此取收口时刻的完整集合。
- *
- * @param {object} deps - 窄能力面。
- * @returns {object} admission 批次能力面。
- */
-function installAdmissionBatches(deps) {
-  const { finalize } = deps;
-  const { notePendingCloseAdmission } = finalize;
-
-  /**
-   * root admission 的显式 epoch。role tool 只负责登记并返回 token；finalize 以
-   * 「当前 root 的开放批次 + admissionEpoch」定位整批并收口后关闭当前 epoch，后续
-   * admission 会创建新 epoch，不会把迟到调用或下一轮调用并入已经收口的批次。
-   */
-  const rootAdmissionBatches = new WeakMap();
-  let rootAdmissionEpoch = 0;
-  function createRootAdmissionBatch() {
-    return {
-      epoch: ++rootAdmissionEpoch,
-      coordinator: createAdmissionBatchCoordinator(),
-      entries: new Map(),
-      sequence: 0,
-      /**
-       * 在途 ticket 计数：begin 时 +1、settle 时 -1。
-       *
-       * 只用于判定「本批是否已经只剩被丢弃的 ticket」（见 discardRootAdmission），
-       * 让「只发生过拒绝」的空批次可以被安全撤下；不参与 finalize 的凭据校验，
-       * 也不改变任何已公开的回执语义。
-       */
-      pendingTickets: 0,
-      closed: false,
-      finalizing: false,
-      /**
-       * 两阶段收口的 pending-close 登记（见 finalizeRootAdmissionBatch）。
-       *
-       * finalize 在登记完成后把本批次标为 pending-close：工具立即返回 waiting，等待
-       * 职责移交给 root turn 的 `agent/turn-stopping` serial 边界。这里保存的是
-       * **exact admission 对象**（而不是 token 或 id），因为等待账本的记录会在一次静止
-       * 收口后被销毁，后续 turn 只能靠这份精确凭据重新登记尚未结算的 work；用 id/token
-       * 猜身份会重新登记一个永远不会结算的键。
-       *
-       * `admissions` 是**批次级**闩锁的一部分，而不是冻结的快照：批次在收口前始终开放，
-       * pending-close 期间新接受的 admission 会在接受时刻被追加进来（并同步登记进等待
-       * 账本），因此「重新等待」与「收口结论的 acceptedCount」看到的都是该批次收口
-       * 时刻的完整 accepted 集。
-       */
-      pendingClose: void 0,
-      /** steer 不可用的告警只记一次（不影响批次状态）。 */
-      steerUnavailableLogged: false,
-    };
-  }
-  function beginRootAdmission(parent) {
-    if (parent === null || (typeof parent !== "object" && typeof parent !== "function")) return void 0;
-    let batch = rootAdmissionBatches.get(parent);
-    if (batch === void 0 || batch.closed === true) {
-      batch = createRootAdmissionBatch();
-      rootAdmissionBatches.set(parent, batch);
-    }
-    const ticket = batch.coordinator.begin();
-    batch.pendingTickets += 1;
-    const token = batch.epoch + ":" + (++batch.sequence);
-    const entry = { token, epoch: batch.epoch, settled: false, outcome: void 0, discarded: false, ticket };
-    batch.entries.set(token, entry);
-    return {
-      ...ticket,
-      token,
-      epoch: batch.epoch,
-      entry,
-      // outcome 记录点需要 exact root 才能把「pending-close 期间新接受的 work」写进
-      // 同一批次的等待集（见 recordRootAdmissionOutcome / notePendingCloseAdmission）。
-      parent,
-      settle() {
-        const settled = ticket.settle();
-        if (settled) {
-          entry.settled = true;
-          batch.pendingTickets -= 1;
-        }
-        return settled;
-      },
-      whenReady: () => ticket.whenReady(),
-    };
-  }
-  function recordRootAdmissionOutcome(admission, outcome) {
-    if (admission?.entry === void 0) return;
-    admission.entry.outcome = outcome;
-    admission.entry.settled = true;
-    // pending-close 批次仍开放时，新接受的 exact work 必须在**接受时刻**就进入
-    // pending-close 的 work 集与等待账本（见 notePendingCloseAdmission）：否则批次级
-    // 闩锁与「该批次的 exact 工作集」会脱节，收口等待可能少等这一项、结论里的
-    // acceptedCount 也会停在旧值。判定与 finalize 的 acceptedEntries 完全一致：
-    // reused / continueParentTurn 不产生未结算工作。
-    if (outcome?.kind === "continuable" && outcome.reused !== true && outcome.continueParentTurn !== true
-      && outcome.handoffAdmission !== void 0) {
-      notePendingCloseAdmission(admission.parent, outcome.handoffAdmission);
-    }
-  }
-  /**
-   * 丢弃一个**已经 beginRootAdmission**、但最终没有向调用方交出任何 admission 结论的 ticket。
-   *
-   * 只用于「格式合法但目标未知/越权」的拒绝路径（childId 的 CHILD_NOT_FOUND）：这次调用
-   * 没有派发、没有投递、没有 interrupt，也没有产生任何 handoff，因此：
-   * 1. 记录 rejected outcome 并 settle 协调器，让本批在途计数归位，批次不会停在
-   *    admission-outcome-pending（否则 finalize 永远收不了口）；
-   * 2. 把 entry 标记为 discarded —— 收口集合由服务端枚举，只能包含**模型真正收到凭据**
-   *    的 admission；把模型永远拿不到的 ticket 留在有效集合里，会让 expected 与
-   *    tokenDiagnostics 虚高，也会让批次停在 admission-outcome-pending（这正是
-   *    「毒化 root batch」）；
-   * 3. 若本批已无在途 ticket、且全部 entry 都是 discarded，就把整批从 map 撤下：之后
-   *    「本 turn 没有真实 admission」的 finalize(epoch 0，且不传 token) 仍然回到既有的
-   *    no-admission 幂等语义，而不是被一个空批次挡成 admission-epoch-mismatch。
-   *
-   * 撤批是精确的：只在本批仍是该 root 的当前批次、未 closed、未进入 pending-close/
-   * finalizing、且没有任何在途 ticket 时执行，绝不撤掉后续真实 admission 所属的批次。
-   */
-  function discardRootAdmission(admission, outcome) {
-    if (admission?.entry === void 0) return;
-    admission.entry.outcome = outcome;
-    admission.entry.discarded = true;
-    admission.settle();
-    admission.entry.settled = true;
-    const batch = rootAdmissionBatches.get(admission.parent);
-    if (batch === void 0 || batch.closed === true || batch.pendingClose !== void 0 || batch.finalizing === true) return;
-    if (batch.pendingTickets !== 0) return;
-    for (const entry of batch.entries.values()) {
-      if (entry.discarded !== true) return;
-    }
-    if (rootAdmissionBatches.get(admission.parent) === batch) rootAdmissionBatches.delete(admission.parent);
-  }
-  function roleAdmissionFailure(phase, error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // 上下文继承（票据 29）：显式失败必须保留稳定 code，供主代理区分“宿主没有继承
-    // provider”“父会话还没有已完成 turn”与普通 admission 失败；绝不归成泛化错误。
-    if (error?.code === CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE
-      || error?.code === CONTEXT_INHERITANCE_ERROR_CODES.EMPTY) {
-      return { reason: "context", code: error.code, message };
-    }
-    // 结构化声明（票据 30）：非法/超限/不支持都必须保留稳定 code，
-    // 不能归成泛化的 ADMISSION_FAILED；schema 原文不在 message 里。
-    if (error?.code === OUTPUT_SCHEMA_ERROR_CODES.INVALID
-      || error?.code === OUTPUT_SCHEMA_ERROR_CODES.TOO_LARGE
-      || error?.code === OUTPUT_SCHEMA_ERROR_CODES.UNSUPPORTED) {
-      return { reason: "schema", code: error.code, message };
-    }
-    if (phase === "provider") return { reason: "provider", code: "PROVIDER_UNAVAILABLE", message };
-    if (phase === "selection") {
-      // 候选耗尽保留稳定 code，便于主代理区分“没有可用候选”与普通输入错误。
-      return {
-        reason: "selection",
-        code: error?.code === MODEL_CANDIDATES_EXHAUSTED ? MODEL_CANDIDATES_EXHAUSTED : "MODEL_SELECTION_INVALID",
-        message,
-      };
-    }
-    // 容量耗尽：结构化 code 优先于文案启发式（它已由 DEG 翻译成可读提示，不再匹配
-    // steer/messageId 等英文关键词），归入可重试的 steer 失败并保留可读文案。
-    if (isSubagentCapacityError(error)) {
-      return { reason: "capacity", code: "SUBAGENT_CAPACITY_REACHED", message };
-    }
-    if (/startContinuable|child admission returned an invalid childId/i.test(message)) {
-      return { reason: "start", code: "START_FAILED", message };
-    }
-    if (/steer|followup|messageId/i.test(message)) return { reason: "steer", code: "STEER_FAILED", message };
-    return { reason: "admission", code: "ADMISSION_FAILED", message };
-  }
-
-  return {
-    beginRootAdmission,
-    recordRootAdmissionOutcome,
-    discardRootAdmission,
-    roleAdmissionFailure,
-    getAdmissionBatch: (parent) => rootAdmissionBatches.get(parent),
-  };
-}
 
 /**
  * R5：自动恢复 op 的单调 id 与新建 child 的 acceptance 预登记 FIFO。

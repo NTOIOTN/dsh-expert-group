@@ -583,17 +583,25 @@
     ".deg_expert_group{position:relative;display:flex;flex-direction:column;min-width:0;height:100%;overflow:auto;padding:8px 10px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1,transparent);font-size:12px;line-height:16px}",
     // 标题栏允许换行：Auto 开关、错误槽与刷新按钮在窄右栏一行放不下时按行折行，
     // 绝不把标题或状态挤成不可读的一列。min-height 28px 保持既有高度。
-    ".deg_expert_group_header{display:flex;flex-wrap:wrap;align-items:center;min-height:28px;gap:6px;border-bottom:1px solid var(--dsw-alias-border-l2);font-weight:600}",
+    // 标题 / Auto / 峰谷标记三者的间距由同一 gap 决定（不再给 Auto 单独 margin-left），
+    // 因此三处间距恒等；12px 比原先的 6px 略宽松，与两侧控件的高度更协调。
+    ".deg_expert_group_header{display:flex;flex-wrap:wrap;align-items:center;min-height:28px;gap:12px;border-bottom:1px solid var(--dsw-alias-border-l2);font-weight:600}",
     ".deg_expert_group_header_title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
     // 标题栏原有的「数据不完整」徽标与「更新于 HH:MM:SS」时间文本已按用户要求从界面移除，
     // 它们的描边徽标样式与等宽时间样式随节点一并删除，不再保留无消费者的 CSS 规则。
     ".deg_expert_group_header_action,.deg_expert_group_chevron,.deg_expert_group_action,.deg_expert_group_sidebar_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}",
     ".deg_expert_group_header_action{width:24px;height:24px;margin-left:auto}",
     // 标题栏 Auto 开关：紧凑到与标题同一行，右对齐且不换行，绝不遮挡标题或右侧操作按钮。
-    ".deg_expert_group_header_auto{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;margin-left:8px;font-weight:400;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
+    ".deg_expert_group_header_auto{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;font-weight:400;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
     ".deg_expert_group_header_auto_input{margin:0;cursor:pointer}",
     ".deg_expert_group_header_auto_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
     ".deg_expert_group_header_auto_label{font-size:12px;line-height:16px}",
+    // 标题栏峰谷时段标记（票据 09）：与 Auto 标签同一套文字规格（12px / 常规字重 / 次级色），
+    // 不换行、不抢标题宽度；其余排版仍由标题栏的 flex-wrap 决定。
+    // 启用时的绿色描边与文字色**与设置页入口按钮共用同一条声明**（见 client-styles.js 的
+    // .deg_settings_peak_valley_entry_active 选择器组）：两处是同一个视觉标记，只写一份配色。
+    // 未启用（disabled）匹配不到那条规则，因此保持纯文字、不画描边。
+    ".deg_expert_group_header_peak_valley{flex:0 0 auto;padding:1px 6px;border-radius:6px;font-size:12px;font-weight:400;color:var(--dsw-alias-label-secondary);white-space:nowrap}",
     // 恢复失败横幅（票据 04）：与标题栏的「快照读取失败」错误面完全独立，位于头部之下、
     // 任务树之上；失败原因码与一行 message 同排，重试按钮固定右侧。整块用 flex-wrap：
     // 窄右栏时补充行自动换到第二排，绝不挤压任务树的可点击区域。

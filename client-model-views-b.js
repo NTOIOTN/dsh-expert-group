@@ -213,6 +213,70 @@
     }
 
     /**
+     * 候选勾选/取消（纯状态变换）。
+     *
+     * 模型视图 A 与自定义 provider 卡片原本各写了一份逐字相同的 setState 更新器，这里合并成
+     * 唯一的纯变换，语义逐项不变：
+     * - 状态为 null（或 candidates 不是数组）时**返回同一个对象**，调用方 setState 不会触发
+     *   无意义的重渲染；
+     * - 只有 id 命中的候选换成浅拷贝并翻转 picked，未命中的候选保持原引用（与原 map 相同）。
+     *
+     * @param {{candidates?: Array}|null} state 当前候选状态。
+     * @param {unknown} id 要翻转的候选 id。
+     * @returns {{candidates?: Array}|null} 新状态或原状态。
+     */
+    function toggleCandidateOf(state, id) {
+      if (state === null || !Array.isArray(state.candidates)) return state;
+      return {
+        ...state,
+        candidates: state.candidates.map((candidate) => candidate.id === id
+          ? { ...candidate, picked: candidate.picked !== true }
+          : candidate),
+      };
+    }
+
+    /**
+     * 弹窗「全选/取消全选」的**状态变换**版本（判定仍走 clearsAllCandidateSelection）。
+     *
+     * 与原先两份内联实现的唯一差别是 wanted 集合在更新器内部构建：调用方传入的都是当次渲染
+     * 现算的 id 数组（visible.map(...)），不会被改写，因此"构建时机"不影响结果；其余语义
+     * （已全选则清空全部选择、否则只追加可见项、无效状态返回原对象）逐项不变。
+     *
+     * @param {{candidates?: Array}|null} state 当前候选状态。
+     * @param {Array<unknown>} ids 当前可见候选 id。
+     * @returns {{candidates?: Array}|null} 新状态或原状态。
+     */
+    function toggleVisibleCandidatesOf(state, ids) {
+      const wanted = new Set(Array.isArray(ids) ? ids : []);
+      if (state === null || !Array.isArray(state.candidates)) return state;
+      if (clearsAllCandidateSelection(state.candidates, wanted)) {
+        return { ...state, candidates: state.candidates.map((candidate) => ({ ...candidate, picked: false })) };
+      }
+      return {
+        ...state,
+        candidates: state.candidates.map((candidate) => wanted.has(candidate.id)
+          ? { ...candidate, picked: true }
+          : candidate),
+      };
+    }
+
+    /**
+     * 展开/收起某个下标的行（纯状态变换）：命中则删除、未命中则新增，返回**新的** Set。
+     *
+     * 与原先两份内联实现相同：不修改入参 Set（React 需要新引用才会重渲染），一次 delete
+     * 的返回值同时承担"是否存在"判定，避免多一次 has 查询。
+     *
+     * @param {Set<unknown>} previous 当前展开集合。
+     * @param {unknown} index 行的下标。
+     * @returns {Set<unknown>} 新的展开集合。
+     */
+    function toggleIndexInSet(previous, index) {
+      const next = new Set(previous);
+      if (!next.delete(index)) next.add(index);
+      return next;
+    }
+
+    /**
      * 自定义 provider 的可用模型选择弹窗：候选只进入当前草稿，不在探测成功时自动写 settings。
      *
      * 交互与 DSH 原生模型页保持一致：搜索当前候选、当前结果全选/取消全选、逐项勾选，
@@ -358,5 +422,6 @@
   // 只暴露被后续装配段实际消费的符号（无全量外挂）。
   global[SYMBOL] = Object.freeze({
     ModelDiscoveryDialog, clearsAllCandidateSelection, focusableDialogControls, renderModelRow, bindClientRuntime,
+    toggleCandidateOf, toggleVisibleCandidatesOf, toggleIndexInSet,
   });
 })(globalThis);

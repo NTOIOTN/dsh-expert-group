@@ -18,6 +18,12 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 import plugin from "../index.js";
+import { createRuntimeDiagnostics } from "../host/index-runtime-diagnostics.js";
+import {
+  lastOrdinaryFallbackDiagnostics,
+  noteRouteOrdinaryFallback,
+  resetRouteOrdinaryFallbackDiagnostics,
+} from "../host/route-diagnostics.js";
 import {
   createClientReactRuntime,
   createFakeNotificationApi,
@@ -156,6 +162,11 @@ test("meta 暴露只读能力矩阵与运行时诊断，且不含任何敏感字
     assert.equal(diagnostics.fanout.runningShards, 0);
     assert.equal(diagnostics.fanout.concurrency.default, 20, "默认并发布必须来自同一份归一设置");
     assert.deepEqual(diagnostics.fanout.concurrency.roles, {});
+    // provider 释放异常诊断（票据 05 · F4）：空状态下为 null（从未发生），字段面固定。
+    assert.equal(diagnostics.fanout.concurrency.providerRelease, null, "从未发生释放异常时必须为 null");
+    // 跨层回退诊断（票据 06）：本进程从未发生跨层回退时为 null，字段面固定为 route.lastOrdinaryFallback。
+    assert.deepEqual(diagnostics.fanout.route, { lastOrdinaryFallback: null });
+    assert.equal(lastOrdinaryFallbackDiagnostics(), null);
     assert.equal(diagnostics.recovery.limit, 5, "恢复次数上限必须取自运行时常量");
     assert.equal(diagnostics.recovery.disposed, false);
     assert.equal(diagnostics.settings.pendingWrites, 0);
@@ -193,6 +204,147 @@ test("meta 暴露只读能力矩阵与运行时诊断，且不含任何敏感字
   }
 });
 
+
+
+/**
+ * 最小 fanout 诊断桩：只提供 createRuntimeDiagnostics 需要的只读面。
+ *
+ * 与真实 Host 的差别仅在于 describe() 的内容，因此可以逐字段验证「诊断投影本身的归一」。
+ */
+function diagnosticsWithFanout(fanoutState) {
+  return createRuntimeDiagnostics({
+    host: {
+      lineage: { describe: () => ({}) },
+      notifications: { describe: () => ({}) },
+      handoff: { describe: () => ({}) },
+    },
+    settings: { describe: () => ({}) },
+    storage: { describe: () => ({}), readLastEventRestore: () => null },
+    recovery: { describe: () => ({}), activationCount: () => 0, recordCount: () => 0 },
+    fanout: {
+      getFanoutHost: () => ({
+        describe: () => ({
+          concurrencyLimits: { default: 20, roles: {}, providers: {}, source: "snapshot" },
+          ...fanoutState,
+        }),
+        listTasks: () => [],
+      }),
+    },
+    roles: { activeRoles: () => [] },
+    delegation: { activeTaskCounts: () => ({ total: 0, detached: 0 }), readLastRefusedScopeRelease: () => null },
+    observability: {
+      rpcErrors: () => [],
+      systemToast: () => undefined,
+      rootWait: { describeAll: () => [], diagnostics: () => ({ lastDelivery: null, abandonedCount: 0 }) },
+      imageRoutes: () => ({ claims: 0, cleanupTokens: 0, cleanupReservations: 0, claimLimit: 0, cleanupTokenLimit: 0 }),
+    },
+  }).describeRuntimeDiagnostics();
+}
+
+/**
+ * 票据 05 · F4：concurrency.providerRelease 的投影边界。
+ *
+ * 该记录由 store 在「释放了一个从未计数的桶」时写入；这里用最小 fanout 投影桩验证
+ * **诊断面本身的归一**：只输出 code/provider/at/source，provider 名去控制字符并截断，
+ * 未知 code 归一为 unknown，null 表示从未发生。
+ */
+test("meta 诊断：concurrency.providerRelease 只透出 sanitized 的 code/provider/at/source", () => {
+  const describeWith = (providerRelease) => diagnosticsWithFanout({ providerRelease });
+
+  const healthy = describeWith(null);
+  assert.equal(healthy.fanout.concurrency.providerRelease, null, "未发生异常 => null");
+
+  const dirty = describeWith({
+    code: "PROVIDER_RELEASE_MISMATCH",
+    // 控制字符 + 超长：provider 名必须被清洗并截断，绝不把伪造的多行文本带进诊断。
+    provider: "provider\u0000-a\n" + "x".repeat(80),
+    at: 12345,
+    source: "shard_status_release",
+  });
+  const record = dirty.fanout.concurrency.providerRelease;
+  assert.equal(record.code, "PROVIDER_RELEASE_MISMATCH");
+  assert.equal(record.provider.length, 64, "provider 名截断到 64 字符");
+  assert.equal(record.provider.includes("\n"), false, "控制字符必须被移除");
+  assert.equal(record.at, 12345);
+  assert.equal(record.source, "shard_status_release");
+  assert.deepEqual(Object.keys(record).sort(), ["at", "code", "provider", "source"]);
+
+  const unknown = describeWith({ code: "!!!", provider: "  ", at: -1, source: "??" });
+  const normalized = unknown.fanout.concurrency.providerRelease;
+  assert.equal(normalized.code, "unknown", "未知 code 归一为 unknown");
+  assert.equal(normalized.provider, null, "空白 provider 名归一为 null");
+  assert.equal(normalized.at, null, "非法时间戳归一为 null");
+  assert.equal(normalized.source, "unknown");
+
+  // 敏感性边界：诊断面依旧不含任何自由文本/路径/认证信息。
+  assert.deepEqual(scanSensitive(dirty), []);
+});
+
+/**
+ * 票据 06 · C：fanout.route.lastOrdinaryFallback 的投影边界。
+ *
+ * 该单值由两个**真实写入点**更新（派发期时段层缺配直接跨层、运行期时段层耗尽切普通层）；
+ * 这里用最小投影桩验证诊断面本身：null 面、字段 sanitize、最近一次覆盖，以及「非法输入
+ * 绝不写半条记录」。写入点本身由 peak-valley-fanout / runtime-model-fallback 用例覆盖。
+ */
+test("meta 诊断：fanout.route.lastOrdinaryFallback 的 null 面、sanitize 与最近一次覆盖", () => {
+  resetRouteOrdinaryFallbackDiagnostics();
+  try {
+    assert.deepEqual(diagnosticsWithFanout({}).fanout.route, { lastOrdinaryFallback: null },
+      "从未发生跨层回退 => null（不是空对象，也不补默认值）");
+
+    // 非法输入不写记录：时段层必须真是 peak/valley，目标层固定 normal-fallback。
+    assert.equal(noteRouteOrdinaryFallback(null), false);
+    assert.equal(noteRouteOrdinaryFallback({ fromTier: "none", reasonCode: "PEAK_VALLEY_ROLE_MISSING" }), false);
+    assert.equal(noteRouteOrdinaryFallback({ fromTier: "peak", toTier: "normal-override" }), false);
+    assert.equal(lastOrdinaryFallbackDiagnostics(), null, "非法输入绝不写半条记录");
+
+    // ① 派发期时段层缺配直接跨层。
+    assert.equal(noteRouteOrdinaryFallback({
+      role: "fixer",
+      fromTier: "peak",
+      toTier: "normal-fallback",
+      reasonCode: "PEAK_VALLEY_ROLE_MISSING",
+      at: 111,
+    }), true);
+    assert.deepEqual(diagnosticsWithFanout({}).fanout.route.lastOrdinaryFallback, {
+      role: "fixer",
+      fromTier: "peak",
+      toTier: "normal-fallback",
+      reasonCode: "PEAK_VALLEY_ROLE_MISSING",
+      at: 111,
+    });
+
+    // ② 运行期时段层耗尽切普通层：覆盖上一条（最近一次语义），并清洗角色与时间戳。
+    assert.equal(noteRouteOrdinaryFallback({
+      role: "  custom\u0000-role\n" + "x".repeat(80),
+      fromTier: "valley",
+      reasonCode: "MODEL_CANDIDATES_EXHAUSTED",
+      at: -1,
+    }), true);
+    const latest = diagnosticsWithFanout({}).fanout.route.lastOrdinaryFallback;
+    assert.deepEqual(Object.keys(latest).sort(), ["at", "fromTier", "reasonCode", "role", "toTier"],
+      "字段面固定：role/fromTier/toTier/reasonCode/at");
+    assert.equal(latest.fromTier, "valley", "最近一次覆盖了上一条的 fromTier");
+    assert.equal(latest.toTier, "normal-fallback");
+    assert.equal(latest.reasonCode, "MODEL_CANDIDATES_EXHAUSTED");
+    assert.equal(latest.role.includes("\n"), false, "角色里的控制字符必须移除");
+    assert.equal(latest.role.startsWith("custom-role"), true);
+    assert.equal(latest.role.length, 64, "角色长度有界");
+    assert.ok(Number.isSafeInteger(latest.at) && latest.at >= 0, "非法时间戳回落到墙钟，绝不写负数");
+
+    // 自由文本原因码不被当成稳定码（保留记录，但值显式为 null）。
+    noteRouteOrdinaryFallback({ role: "fixer", fromTier: "peak", reasonCode: "not a stable code with spaces", at: 7 });
+    const loose = diagnosticsWithFanout({}).fanout.route.lastOrdinaryFallback;
+    assert.equal(loose.reasonCode, null, "非稳定码形态归一为 null，绝不透传自由文本");
+    assert.equal(loose.role, "fixer");
+
+    // 敏感性边界：诊断面依旧不含自由文本、路径或认证信息。
+    assert.deepEqual(scanSensitive({ fanout: diagnosticsWithFanout({}).fanout }), []);
+  } finally {
+    resetRouteOrdinaryFallbackDiagnostics();
+  }
+});
 
 test("meta 诊断：notifications.systemToast 只暴露白名单字段与固定 token", async () => {
   const host = appliedHost({ goals: goalsService() });

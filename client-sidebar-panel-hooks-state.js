@@ -850,8 +850,66 @@
     });
   }
 
+  /** 标题栏峰谷标记的分钟级重算间隔（票据 09）：跨过峰段边界后无需刷新即可更新。 */
+  const PV_MARKER_MS = 60000;
+  /** 未启用（或读面缺失）时的固定标记：宁可显示「未启用」，绝不猜成峰时。 */
+  const PV_DISABLED = Object.freeze({ enabled: false, period: "valley" });
+
+  /**
+   * 读一次峰谷标记：判定**只**调 client.peakValleyTime（shared/peak-valley-time.js 的权威纯函数），
+   * 不另写时段算法，也不按当前 settings 推断回执字段。读面缺失/抛错/未显式启用一律「未启用」；
+   * 时段数组原样交给权威函数（它对非法项 fail-closed，不抛异常）。
+   */
+  function readPvMarker(config) {
+    let settings = null;
+    try { settings = config?.getPeakValleySettings?.() ?? null; } catch { return PV_DISABLED; }
+    if (settings?.enabled !== true) return PV_DISABLED;
+    const at = config?.peakValleyTime;
+    return {
+      enabled: true,
+      period: typeof at?.peakValleyAtDate === "function" && at.peakValleyAtDate(settings.periods, new Date()) === "peak" ? "peak" : "valley",
+    };
+  }
+
+  /**
+   * 标题栏「峰谷时段标记」（票据 09）：Auto 右侧显示 峰时 / 谷时 / 峰谷：未启用。
+   *
+   * - 挂载即读（useState 惰性初始化）：首帧即按当前时段渲染，不先闪一帧「未启用」；
+   * - 启用才定时：仅 enabled === true 启动 60s 重算，未启用**不创建**任何定时器；
+   * - 设置变更即时生效：有 subscribePeakValleySettings 时订阅表单，保存后立刻重算；
+   *   没有订阅能力（旧宿主/直接 createExpertGroupPanel）时降级为每次渲染现读；
+   * - 订阅与定时器都只在 effect 内创建，cleanup 统一释放；Hook 无条件调用（序列固定）。
+   */
+  function useSidebarPanelPeakValleyMarker(frame) {
+    const { config, react } = frame;
+    const pair = typeof react.useState === "function"
+      ? react.useState(() => readPvMarker(config))
+      : [readPvMarker(config), null];
+    const marker = pair[0];
+    const setMarker = pair[1];
+    const subscribe = config?.subscribePeakValleySettings ?? null;
+    // 无订阅能力时每次渲染现读（设置页保存后，面板下一次渲染即可追上）。
+    const shown = subscribe === null || setMarker === null ? readPvMarker(config) : marker;
+    if (typeof react.useEffect === "function") {
+      react.useEffect(() => {
+        const refresh = () => setMarker((previous) => {
+          const next = readPvMarker(config);
+          return previous.enabled === next.enabled && previous.period === next.period ? previous : next;
+        });
+        let release = null;
+        try { release = subscribe === null ? null : subscribe(refresh); } catch {}
+        const timer = shown.enabled === true ? globalThis.setInterval(refresh, PV_MARKER_MS) : null;
+        return () => {
+          if (typeof release === "function") release();
+          if (timer !== null) globalThis.clearInterval(timer);
+        };
+      }, [subscribe, shown.enabled, config]);
+    }
+    Object.assign(frame, { peakValleyMarker: shown });
+  }
+
   global[SYMBOL] = Object.freeze({
-    useSidebarPanelHostServices, useSidebarPanelSessionModel, useSidebarPanelSessionModelPart2,
+    useSidebarPanelHostServices, useSidebarPanelPeakValleyMarker, useSidebarPanelSessionModel, useSidebarPanelSessionModelPart2,
     useSidebarPanelSnapshotDerived, useSidebarPanelStateCore, useSidebarPanelStoreAndMeta,
     useSidebarPanelWidth,
   });

@@ -56,7 +56,7 @@
   const HOOKS_STATE_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-state");
   const HOOKS_STATE = global[HOOKS_STATE_SYMBOL] || {};
   const {
-    useSidebarPanelHostServices, useSidebarPanelSessionModel, useSidebarPanelSessionModelPart2,
+    useSidebarPanelHostServices, useSidebarPanelPeakValleyMarker, useSidebarPanelSessionModel, useSidebarPanelSessionModelPart2,
     useSidebarPanelSnapshotDerived, useSidebarPanelStateCore, useSidebarPanelStoreAndMeta,
     useSidebarPanelWidth,
   } = HOOKS_STATE;
@@ -694,9 +694,9 @@
 
   function renderSidebarPanelSection(frame) {
     const {
-      announcement, autoOpenDraft, autoOpenEnabled, body, errorLabelOf,
-      primitives, react, recoveryBanner, renderSessionModelDialog, retry,
-      t, toggleAutoOpen, version, viewState, widthResizer, writeAutoOpenSetting,
+      announcement, autoOpenDraft, autoOpenEnabled, body, config, errorLabelOf,
+      panelLocale, peakValleyMarker, primitives, react, recoveryBanner, renderSessionModelDialog,
+      retry, t, toggleAutoOpen, version, viewState, widthResizer, writeAutoOpenSetting,
     } = frame;
 
     const autoOpenChecked = autoOpenDraft === null ? autoOpenEnabled() : autoOpenDraft === true;
@@ -737,6 +737,24 @@
       "aria-label": refreshLabel,
       onClick: retry,
     }, makeIcon(primitives, "IconRefreshOutlineRegular", { size: 14 }));
+    /**
+     * 标题栏峰谷时段标记（票据 09）：Auto 右侧、错误槽之前。
+     *
+     * 文案只来自既有 settings/extra 表（zh 必填）：未启用复用 settings.pv.disabled；
+     * 启用后与设置页入口按钮完全同形——settings.pv.entry + 空格 + settings.pv.peak/valley，
+     * 因此侧栏徽标与「峰谷模式」入口按钮同文案、同配色（同一 enabled/periods ⇒ 同一结果）。
+     * 读面缺失（旧宿主 / 直接 createExpertGroupPanel）时不渲染：标题栏逐字节保持旧形状。
+     * 标记只出现在头部，不进入任务行与运行摘要。
+     */
+    const peakValleyExtra = config?.settingsExtraText;
+    const peakValleyOn = peakValleyMarker?.enabled === true;
+    const peakValleyText = typeof peakValleyExtra === "function"
+      ? (peakValleyOn
+        // 启用态与设置页入口按钮同一文案形状：「峰谷模式 峰时 / 谷时」，两处同键同源。
+        ? peakValleyExtra(panelLocale, "settings.pv.entry") + " " + peakValleyExtra(panelLocale,
+          peakValleyMarker.period === "peak" ? "settings.pv.peak" : "settings.pv.valley")
+        : peakValleyExtra(panelLocale, "settings.pv.disabled"))
+      : null;
     return react.createElement("section", { className: "deg_expert_group", "data-version": version, "aria-label": "Expert Group" },
       // 宽度拖拽手柄（票据 18）：只在 install 注入了写入能力时渲染，贴在面板左缘。
       widthResizer,
@@ -752,6 +770,10 @@
       react.createElement("header", { className: "deg_expert_group_header" },
         react.createElement("span", { className: "deg_expert_group_header_title" }, t("sidebar.title")),
         autoOpenToggle,
+        peakValleyText === null ? null : react.createElement("span", {
+          className: "deg_expert_group_header_peak_valley",
+          "data-peak-valley": peakValleyOn ? peakValleyMarker.period : "disabled",
+        }, peakValleyText),
         panelError === null
           ? null
           : react.createElement("span", {
@@ -820,6 +842,8 @@
       useSidebarPanelProjectionEffect(frame);
       useSidebarPanelRunAction(frame);
       useSidebarPanelRunActionPart2(frame);
+      // 票据 09：标题栏峰谷时段标记（无条件 Hook；未启用时不创建任何定时器）。
+      useSidebarPanelPeakValleyMarker(frame);
       assembleSidebarPanelBody(frame);
       assembleSidebarPanelBodyPart2(frame);
       return renderSidebarPanelSection(frame);

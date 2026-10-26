@@ -17,6 +17,9 @@ working:"running",pending:"queued",scheduled:"queued",wait:"waiting",
 const CAPABILITY_ACTIONS=Object.freeze(["read","cancel","retry","continue"]);
 const SHARD_CAPABILITY_ACTIONS=Object.freeze(["cancel","retry"]);
 const CAPABILITY_REASON_MAX_LENGTH=64;
+const ROUTE_PERIOD_VALUES=Object.freeze(["peak","valley","none"]);
+const ROUTE_TIER_VALUES=Object.freeze(["peak","valley","normal-override","normal-fallback"]);
+const ROUTE_TEXT_MAX_LENGTH=64;
 const COUNT_FIELDS=Object.freeze([
 "queued","waiting","running","succeeded","failed","cancelled","timed_out","interrupted","pending",
 ]);
@@ -337,6 +340,29 @@ retryCount:numberOrNull(source.retryCount)??(numberOrNull(defaults.retryCount)??
 failure:normalizeFailure(source.failure),
 };
 }
+function normalizeRouteFallback(value){
+if(!isObject(value))return null;
+if(value.fromTier!=="peak"&&value.fromTier!=="valley")return null;
+if(value.toTier!=="normal-fallback")return null;
+const reasonCode=boundedText(value.reasonCode,ROUTE_TEXT_MAX_LENGTH);
+if(reasonCode===null)return null;
+const role=boundedText(value.role,ROUTE_TEXT_MAX_LENGTH);
+return{
+fromTier:value.fromTier,
+toTier:"normal-fallback",
+reasonCode,
+...(role===null?{}:{role}),
+};
+}
+function routeFields(value){
+const source=isObject(value)?value:{};
+const fallback=normalizeRouteFallback(source.ordinaryFallback);
+return{
+...(ROUTE_PERIOD_VALUES.includes(source.routePeriod)?{routePeriod:source.routePeriod}:{}),
+...(ROUTE_TIER_VALUES.includes(source.routeTier)?{routeTier:source.routeTier}:{}),
+...(fallback===null?{}:{ordinaryFallback:fallback}),
+};
+}
 function normalizeAttempt(value){
 const source=isObject(value)?value:{};
 const startedAt=numberOrNull(source.startedAt);
@@ -347,6 +373,7 @@ attempt:numberOrNull(source.attempt),
 status:normalizeStatus(source.status),
 childId:text(source.childId),
 roleLabel:text(source.roleLabel),
+...routeFields(source),
 ...usageFields(source),
 ...structuredFields(source),
 startedAt,
@@ -371,6 +398,7 @@ roleLabel:firstText(source.roleLabel,defaults.roleLabel),
 provider:firstText(source.provider,defaults.provider),
 model:firstText(source.model,defaults.model),
 effort:firstText(source.effort,source.reasoningEffort,defaults.effort,defaults.reasoningEffort),
+...routeFields(source),
 status,
 ...usageFields(source),
 ...structuredFields(source),
@@ -424,6 +452,7 @@ roleLabel:text(source.roleLabel),
 provider:text(source.provider),
 model:text(source.model),
 effort:firstText(source.effort,source.reasoningEffort),
+...routeFields(source),
 taskStatus,
 status,
 running:runningOf(status,source.running),
@@ -484,6 +513,7 @@ roleLabel:text(source.roleLabel),
 provider:text(source.provider),
 model:text(source.model),
 effort:firstText(source.effort,source.reasoningEffort),
+...routeFields(source),
 status,
 running:runningOf(status,source.running),
 runSummary:normalizeRunSummary(source.runSummary),
@@ -562,7 +592,6 @@ normalizeStatus,
 normalizeFailure,
 normalizeUsage,
 normalizeStructured,
-normalizeRoleLabels,
 roleLabelFrom,
 roleLabelOf,
 findModelPrice,
@@ -605,10 +634,8 @@ const ATTEMPT_TIMELINE_LIMIT=5;
 const FAILURE_STATUSES=Object.freeze(["failed","timed_out","interrupted"]);
 const STATUS_FILTER_GROUPS=Object.freeze({
 running:Object.freeze(["queued","waiting","running"]),
-failed:Object.freeze(["failed","timed_out","interrupted"]),
-succeeded:Object.freeze(["succeeded"]),
-cancelled:Object.freeze(["cancelled"]),
-idle:Object.freeze(["idle","ready","unknown"]),
+incomplete:Object.freeze(["failed","timed_out","interrupted","cancelled","idle","ready","unknown"]),
+completed:Object.freeze(["succeeded"]),
 });
 const DEFAULT_COLLAPSED_STATUSES=new Set(["idle","ready","succeeded","cancelled"]);
 const FANOUT_SETTLED_STATUSES=new Set(["succeeded","failed","cancelled"]);
@@ -857,8 +884,7 @@ if(ms===null)return null;
 const clamped=Math.max(0,ms);
 if(clamped<1000)return"<1s";
 if(clamped<60000){
-const seconds=(clamped/1000).toFixed(1);
-return(seconds.endsWith(".0")?seconds.slice(0,-2):seconds)+"s";
+return Math.floor(clamped/1000)+"s";
 }
 if(clamped<3600000){
 const minutes=Math.floor(clamped/60000);
@@ -873,6 +899,13 @@ function formatThroughputText(value){
 const rounded=value>=10?String(Math.round(value)):value.toFixed(1);
 return(rounded.endsWith(".0")?rounded.slice(0,-2):rounded)+"tok/s";
 }
+const ZERO_USAGE_TEXTS=Object.freeze({
+durationText:"0s",
+throughputText:"0tok/s",
+totalTokensText:"0 tok",
+cacheHitText:"命中0%",
+contextText:"context 0%",
+});
 function summarizeUsageMetrics(usage,options){
 const source=isObject(usage)?usage:{};
 const settings=isObject(options)?options:{};
@@ -926,6 +959,37 @@ contextText,
 contextUsedTokens,
 contextWindow,
 };
+}
+function isEmptyUsageMetrics(summary){
+if(!isObject(summary))return false;
+if(summary.durationText!==null)return false;
+if(summary.throughputText!==null)return false;
+if(summary.totalTokens!==null&&summary.totalTokens!==0)return false;
+if(summary.cacheHitText!==null)return false;
+if(summary.contextPercent!==null&&summary.contextPercent!==0)return false;
+return true;
+}
+function zeroFilledUsageMetrics(summary,options){
+const source=isObject(summary)?summary:{};
+const settings=isObject(options)?options:{};
+const metrics={...source};
+const filled={
+durationText:false,
+throughputText:false,
+totalTokensText:false,
+cacheHitText:false,
+contextText:false,
+};
+for(const key of["durationText","throughputText","totalTokensText","cacheHitText","contextText"]){
+if(key==="contextText"&&settings.skipContext===true){
+if(typeof source[key]!=="string")metrics[key]=null;
+continue;
+}
+if(typeof source[key]==="string")continue;
+metrics[key]=ZERO_USAGE_TEXTS[key];
+filled[key]=true;
+}
+return{metrics,filled};
 }
 function redactDisplayText(value,maxLength){
 const raw=typeof value==="string"?value:(value instanceof Error?value.message:"");
@@ -1356,8 +1420,6 @@ return value===undefined||value===null?match:String(value);
 global[SYMBOL]=Object.freeze({
 FAILURE_MESSAGE_DISPLAY_MAX_LENGTH,
 RETRY_WARNING_THRESHOLD,
-ATTEMPT_TIMELINE_LIMIT,
-FAILURE_STATUSES,
 STATUS_FILTER_GROUPS,
 STRUCTURED_PREVIEW_MAX_CHARS,
 formatFailureSummary,
@@ -1375,6 +1437,8 @@ filterSnapshot,
 serializeSnapshot,
 formatDurationCompact,
 summarizeUsageMetrics,
+isEmptyUsageMetrics,
+zeroFilledUsageMetrics,
 formatExpertMetadata,
 defaultExpanded,
 createExpansionStore,
@@ -1383,7 +1447,6 @@ DEFAULT_LOCALE,
 MISSING_MESSAGE_TEXT,
 MESSAGE_CATALOG,
 normalizeLocale,
-resolveLocale,
 resolveClientLocale,
 translateMessage,
 });
@@ -1399,17 +1462,13 @@ if(!normalize||!format){
 throw new Error("专家组客户端模型子模块未装载：normalize / format 检查点缺失（装配顺序见 client-source-manifest.mjs）");
 }
 const{
-SCHEMA_VERSION,
 RUNTIME_STATUSES,
 UNKNOWN_RUNTIME_STATUS,
-STRUCTURED_FALLBACK_REASONS,
 normalizeExpertGroupSnapshot,
 normalizeCapabilities,
-normalizeStatus,
 normalizeFailure,
 normalizeUsage,
 normalizeStructured,
-normalizeRoleLabels,
 roleLabelFrom,
 roleLabelOf,
 findModelPrice,
@@ -1419,8 +1478,6 @@ runtimeStatusOf,
 const{
 FAILURE_MESSAGE_DISPLAY_MAX_LENGTH,
 RETRY_WARNING_THRESHOLD,
-ATTEMPT_TIMELINE_LIMIT,
-FAILURE_STATUSES,
 STATUS_FILTER_GROUPS,
 STRUCTURED_PREVIEW_MAX_CHARS,
 formatFailureSummary,
@@ -1438,6 +1495,8 @@ filterSnapshot,
 serializeSnapshot,
 formatDurationCompact,
 summarizeUsageMetrics,
+isEmptyUsageMetrics,
+zeroFilledUsageMetrics,
 formatExpertMetadata,
 defaultExpanded,
 createExpansionStore,
@@ -1446,23 +1505,18 @@ DEFAULT_LOCALE,
 MISSING_MESSAGE_TEXT,
 MESSAGE_CATALOG,
 normalizeLocale,
-resolveLocale,
 resolveClientLocale,
 translateMessage,
 }=format;
 const SYMBOL=Symbol.for("dsh-expert-group/client-expert-group-model");
 global[SYMBOL]=Object.freeze({
-SCHEMA_VERSION,
 RUNTIME_STATUSES,
 UNKNOWN_RUNTIME_STATUS,
 FAILURE_MESSAGE_DISPLAY_MAX_LENGTH,
 RETRY_WARNING_THRESHOLD,
-ATTEMPT_TIMELINE_LIMIT,
-FAILURE_STATUSES,
 STATUS_FILTER_GROUPS,
 normalizeExpertGroupSnapshot,
 normalizeCapabilities,
-normalizeStatus,
 normalizeFailure,
 formatFailureSummary,
 isFailureStatus,
@@ -1471,12 +1525,10 @@ formatClockTime,
 formatIsoTime,
 attemptTimelineOf,
 STRUCTURED_PREVIEW_MAX_CHARS,
-STRUCTURED_FALLBACK_REASONS,
 normalizeUsage,
 normalizeStructured,
 structuredFallbackText,
 structuredPreviewOf,
-normalizeRoleLabels,
 roleLabelFrom,
 roleLabelOf,
 findModelPrice,
@@ -1489,6 +1541,8 @@ serializeSnapshot,
 runtimeStatusOf,
 formatDurationCompact,
 summarizeUsageMetrics,
+isEmptyUsageMetrics,
+zeroFilledUsageMetrics,
 formatExpertMetadata,
 defaultExpanded,
 createExpansionStore,
@@ -1497,7 +1551,6 @@ DEFAULT_LOCALE,
 MISSING_MESSAGE_TEXT,
 MESSAGE_CATALOG,
 normalizeLocale,
-resolveLocale,
 resolveClientLocale,
 translateMessage,
 });
@@ -1901,10 +1954,8 @@ cancelled:"已取消",timed_out:"超时",interrupted:"已中断",idle:"空闲",r
 });
 const STATUS_FILTER_OPTIONS=Object.freeze([
 Object.freeze({value:"running",label:"运行中"}),
-Object.freeze({value:"failed",label:"失败"}),
-Object.freeze({value:"succeeded",label:"已完成"}),
-Object.freeze({value:"cancelled",label:"已取消"}),
-Object.freeze({value:"idle",label:"空闲"}),
+Object.freeze({value:"incomplete",label:"未完成"}),
+Object.freeze({value:"completed",label:"已完成"}),
 ]);
 const ACTIVE_STATUSES=new Set(["queued","waiting","running"]);
 const RETRY_STATUSES=new Set(["failed","timed_out","interrupted"]);
@@ -2587,14 +2638,15 @@ title:label,
 }
 const PANEL_CSS_SHELL=[
 ".deg_expert_group{position:relative;display:flex;flex-direction:column;min-width:0;height:100%;overflow:auto;padding:8px 10px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1,transparent);font-size:12px;line-height:16px}",
-".deg_expert_group_header{display:flex;flex-wrap:wrap;align-items:center;min-height:28px;gap:6px;border-bottom:1px solid var(--dsw-alias-border-l2);font-weight:600}",
+".deg_expert_group_header{display:flex;flex-wrap:wrap;align-items:center;min-height:28px;gap:12px;border-bottom:1px solid var(--dsw-alias-border-l2);font-weight:600}",
 ".deg_expert_group_header_title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 ".deg_expert_group_header_action,.deg_expert_group_chevron,.deg_expert_group_action,.deg_expert_group_sidebar_action{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}",
 ".deg_expert_group_header_action{width:24px;height:24px;margin-left:auto}",
-".deg_expert_group_header_auto{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;margin-left:8px;font-weight:400;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
+".deg_expert_group_header_auto{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;font-weight:400;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}",
 ".deg_expert_group_header_auto_input{margin:0;cursor:pointer}",
 ".deg_expert_group_header_auto_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
 ".deg_expert_group_header_auto_label{font-size:12px;line-height:16px}",
+".deg_expert_group_header_peak_valley{flex:0 0 auto;padding:1px 6px;border-radius:6px;font-size:12px;font-weight:400;color:var(--dsw-alias-label-secondary);white-space:nowrap}",
 ".deg_expert_group_recovery{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin:6px 0 0;padding:6px 8px;border:1px solid var(--dsw-alias-state-error-primary,var(--dsw-alias-state-warning-primary,#f59e0b));border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-primary));font-weight:600}",
 ".deg_expert_group_recovery_text{flex:1 1 140px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 ".deg_expert_group_recovery_retry_error{flex:1 1 100%;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-weight:400}",
@@ -4919,13 +4971,24 @@ const extrapolationMs=liveAge>=0&&liveAge<=LIVE_TURN_EXTRAPOLATION_MAX_AGE_MS?li
 const durationMs=turnDurationMs!==null
 ?turnDurationMs+extrapolationMs
 :(dshDuration!==null?dshDuration:durationOfNode(ctx,source,runtimeStatus,sessionId));
-const summary=typeof api?.summarizeUsageMetrics==="function"
+let summary=typeof api?.summarizeUsageMetrics==="function"
 ?api.summarizeUsageMetrics(usage,{
 durationMs,
 contextPressure:contextPressureOf(ctx,sessionId),
 measuredTokensPerSecond:measuredTps,
 })
 :null;
+const idlePlaceholder=typeof api?.isEmptyUsageMetrics==="function"
+&&summary!==null
+&&(dsh!==null||summary.totalTokens===0)
+&&api.isEmptyUsageMetrics(summary);
+const zeroFill=summary!==null&&(idlePlaceholder
+||(summary.durationText!==null
+&&(runtimeStatus==="running"||dsh!==null||usage!==null||summary.totalTokens!==null)));
+const fill=zeroFill&&typeof api?.zeroFilledUsageMetrics==="function"
+?api.zeroFilledUsageMetrics(summary,{skipContext:kind==="fanout"})
+:null;
+if(fill!==null)summary=fill.metrics;
 const segments=[];
 const pushSegment=(key,textValue,titleValue)=>{
 if(typeof textValue!=="string"||textValue.length===0)return;
@@ -4942,6 +5005,7 @@ className:"deg_expert_group_metrics_part",
 title:typeof titleValue==="string"?titleValue:textValue,
 },textValue));
 };
+const segmentTitle=(key,value)=>(fill!==null&&fill.filled[key]===true?null:value);
 if(summary!==null){
 const toolDurationText=dsh===null||dsh.toolMs===null?null:formatCompactDuration(dsh.toolMs);
 const modelDurationText=dshDuration===null?null:formatCompactDuration(dshDuration);
@@ -4953,17 +5017,24 @@ const durationTitle=summary.durationText===null?null
 :dshDuration!==null
 ?"模型用时 "+summary.durationText+(toolDurationText===null?"":" · 工具调用用时 "+toolDurationText)
 :"运行时间 "+summary.durationText;
-pushSegment("duration",summary.durationText===null?null:"用时"+summary.durationText,durationTitle);
+pushSegment("duration",summary.durationText===null?null:"用时"+summary.durationText,
+segmentTitle("durationText",durationTitle));
 pushSegment("throughput",summary.throughputText,
-summary.throughputText===null?null:(measuredTps===null?"平均吞吐 ":"输出速度 ")+summary.throughputText);
+segmentTitle("throughputText",summary.throughputText===null?null
+:(measuredTps===null?"平均吞吐 ":"输出速度 ")+summary.throughputText));
 const usageTitle=usage===null?null:ctx.a.usageTitleOf(usage);
 pushSegment("tokens",summary.totalTokensText,
-usageTitle===null?summary.totalTokensText:usageTitle.slice(0,400));
+segmentTitle("totalTokensText",usageTitle===null?summary.totalTokensText:usageTitle.slice(0,400)));
 pushSegment("cache-hit",summary.cacheHitText,
-summary.cacheHitPercent===null?null:"缓存命中率 "+summary.cacheHitPercent+"%（缓存读 ÷ 计费输入）");
+segmentTitle("cacheHitText",summary.cacheHitPercent===null?null
+:"缓存命中率 "+summary.cacheHitPercent+"%（缓存读 ÷ 计费输入）"));
+const contextDetailReady=Number.isFinite(summary.contextPercent)
+&&Number.isFinite(summary.contextUsedTokens)
+&&Number.isFinite(summary.contextWindow);
 pushSegment("context",summary.contextText,
-summary.contextPercent===null?null
-:"上下文占用 "+summary.contextPercent+"%（已用 "+summary.contextUsedTokens+" / 窗口 "+summary.contextWindow+"）");
+segmentTitle("contextText",contextDetailReady
+?"上下文占用 "+summary.contextPercent+"%（已用 "+summary.contextUsedTokens+" / 窗口 "+summary.contextWindow+"）"
+:null));
 }
 const retryCount=finiteNumber(source.retryCount);
 const retryWarning=retryCount!==null&&retryCount>=retryWarningThreshold()
@@ -8727,8 +8798,46 @@ Object.assign(frame,{
 partialSnapshot,sidebarOpenTabsAvailable,snapshot,usageFactPresent,
 });
 }
+const PV_MARKER_MS=60000;
+const PV_DISABLED=Object.freeze({enabled:false,period:"valley"});
+function readPvMarker(config){
+let settings=null;
+try{settings=config?.getPeakValleySettings?.()??null;}catch{return PV_DISABLED;}
+if(settings?.enabled!==true)return PV_DISABLED;
+const at=config?.peakValleyTime;
+return{
+enabled:true,
+period:typeof at?.peakValleyAtDate==="function"&&at.peakValleyAtDate(settings.periods,new Date())==="peak"?"peak":"valley",
+};
+}
+function useSidebarPanelPeakValleyMarker(frame){
+const{config,react}=frame;
+const pair=typeof react.useState==="function"
+?react.useState(()=>readPvMarker(config))
+:[readPvMarker(config),null];
+const marker=pair[0];
+const setMarker=pair[1];
+const subscribe=config?.subscribePeakValleySettings??null;
+const shown=subscribe===null||setMarker===null?readPvMarker(config):marker;
+if(typeof react.useEffect==="function"){
+react.useEffect(()=>{
+const refresh=()=>setMarker((previous)=>{
+const next=readPvMarker(config);
+return previous.enabled===next.enabled&&previous.period===next.period?previous:next;
+});
+let release=null;
+try{release=subscribe===null?null:subscribe(refresh);}catch{}
+const timer=shown.enabled===true?globalThis.setInterval(refresh,PV_MARKER_MS):null;
+return()=>{
+if(typeof release==="function")release();
+if(timer!==null)globalThis.clearInterval(timer);
+};
+},[subscribe,shown.enabled,config]);
+}
+Object.assign(frame,{peakValleyMarker:shown});
+}
 global[SYMBOL]=Object.freeze({
-useSidebarPanelHostServices,useSidebarPanelSessionModel,useSidebarPanelSessionModelPart2,
+useSidebarPanelHostServices,useSidebarPanelPeakValleyMarker,useSidebarPanelSessionModel,useSidebarPanelSessionModelPart2,
 useSidebarPanelSnapshotDerived,useSidebarPanelStateCore,useSidebarPanelStoreAndMeta,
 useSidebarPanelWidth,
 });
@@ -10392,6 +10501,19 @@ if(takeover==="close")return"abort";
 if(takeover==="open")return"manual";
 return"proceed";
 }
+function settleAbortedAutoSideEffect(action,deps){
+const{
+abandonAutoSidebarAction:abandon,autoTakeoverStateOf,rootSessionId,
+sidebarAutoSuppressedRef:suppressed,sidebarSessionId,trimAutoKeyMap,
+}=deps;
+const{autoContext,key,resourceAddress:address}=action;
+abandon(key,autoContext);
+if(autoTakeoverStateOf(key)==="close"){
+suppressed.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address});
+trimAutoKeyMap(suppressed.current);
+writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,address,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
+}
+}
 function runSidebarOpenAction(action,deps){
 const{
 clearAutoCloseAttempt,closeSidebarResource,existingSubagentPaneId,primitives,readActiveSidebarResource,
@@ -10487,11 +10609,10 @@ return{splitToken,tabsBeforeSplit,waitForLayout:true};
 }
 async function completeSidebarSplitPreparation(action,deps,state){
 const{
-abandonAutoSidebarAction,autoTakeoverStateOf,cancelPendingSidebarSplit,rootSessionId,
-sidebarAutoSuppressedRef,sidebarSessionId,sidebarSplitIntentRef,sidebarSurfaceStillCurrent,
-sidebarTabOpeningRef,trimAutoKeyMap,waitForSidebarSplitLayoutCommit,
+cancelPendingSidebarSplit,sidebarSplitIntentRef,sidebarSurfaceStillCurrent,
+sidebarTabOpeningRef,waitForSidebarSplitLayoutCommit,
 }=deps;
-const{autoContext,key,resourceAddress}=action;
+const{key}=action;
 const{splitToken}=state;
 await waitForSidebarSplitLayoutCommit();
 const splitStillCurrent=sidebarSurfaceStillCurrent()===true
@@ -10503,12 +10624,7 @@ return null;
 }
 const afterLayoutReview=reviewAutoSideEffect(action,deps);
 if(afterLayoutReview==="abort"){
-abandonAutoSidebarAction(key,autoContext);
-if(autoTakeoverStateOf(key)==="close"){
-sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:resourceAddress});
-trimAutoKeyMap(sidebarAutoSuppressedRef.current);
-writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,resourceAddress,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
-}
+settleAbortedAutoSideEffect(action,deps);// 放弃 + 关闭意图登记，与 open 前的复核点共用同一段
 return null;
 }
 if(afterLayoutReview==="manual")action.effectiveOrigin=SIDEBAR_TAB_ORIGIN_MANUAL;
@@ -10549,20 +10665,14 @@ return{openOptions,splitToken};
 }
 function issueSidebarResourceOpen(action,deps,plan){
 const{
-abandonAutoSidebarAction,autoTakeoverStateOf,openSidebarResource,rootSessionId,
-sidebarAutoOriginRef,sidebarAutoSuppressedRef,sidebarResourceTabStateOf,sidebarSessionId,
-sidebarTabOpeningRef,sidebarRight,trimAutoKeyMap,
+openSidebarResource,rootSessionId,sidebarAutoOriginRef,sidebarResourceTabStateOf,
+sidebarSessionId,sidebarTabOpeningRef,sidebarRight,
 }=deps;
 const{autoContext,key,resourceAddress}=action;
 const{openOptions}=plan;
 const beforeOpenReview=reviewAutoSideEffect(action,deps);
 if(beforeOpenReview==="abort"){
-abandonAutoSidebarAction(key,autoContext);
-if(autoTakeoverStateOf(key)==="close"){
-sidebarAutoSuppressedRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,address:resourceAddress});
-trimAutoKeyMap(sidebarAutoSuppressedRef.current);
-writeSidebarAutoOwnership(sidebarSessionId,rootSessionId,resourceAddress,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,"manual-close");
-}
+settleAbortedAutoSideEffect(action,deps);// 同上：同一段收口，登记到同一个 ref / Map
 return false;
 }
 if(beforeOpenReview==="manual")action.effectiveOrigin=SIDEBAR_TAB_ORIGIN_MANUAL;
@@ -10898,7 +11008,7 @@ const VIEWS_C=global[VIEWS_C_SYMBOL]||{};
 const HOOKS_STATE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-state");
 const HOOKS_STATE=global[HOOKS_STATE_SYMBOL]||{};
 const{
-useSidebarPanelHostServices,useSidebarPanelSessionModel,useSidebarPanelSessionModelPart2,
+useSidebarPanelHostServices,useSidebarPanelPeakValleyMarker,useSidebarPanelSessionModel,useSidebarPanelSessionModelPart2,
 useSidebarPanelSnapshotDerived,useSidebarPanelStateCore,useSidebarPanelStoreAndMeta,
 useSidebarPanelWidth,
 }=HOOKS_STATE;
@@ -11229,9 +11339,9 @@ body,
 }
 function renderSidebarPanelSection(frame){
 const{
-announcement,autoOpenDraft,autoOpenEnabled,body,errorLabelOf,
-primitives,react,recoveryBanner,renderSessionModelDialog,retry,
-t,toggleAutoOpen,version,viewState,widthResizer,writeAutoOpenSetting,
+announcement,autoOpenDraft,autoOpenEnabled,body,config,errorLabelOf,
+panelLocale,peakValleyMarker,primitives,react,recoveryBanner,renderSessionModelDialog,
+retry,t,toggleAutoOpen,version,viewState,widthResizer,writeAutoOpenSetting,
 }=frame;
 const autoOpenChecked=autoOpenDraft===null?autoOpenEnabled():autoOpenDraft===true;
 const autoOpenToggle=react.createElement("label",{
@@ -11259,6 +11369,14 @@ title:refreshLabel,
 "aria-label":refreshLabel,
 onClick:retry,
 },makeIcon(primitives,"IconRefreshOutlineRegular",{size:14}));
+const peakValleyExtra=config?.settingsExtraText;
+const peakValleyOn=peakValleyMarker?.enabled===true;
+const peakValleyText=typeof peakValleyExtra==="function"
+?(peakValleyOn
+?peakValleyExtra(panelLocale,"settings.pv.entry")+" "+peakValleyExtra(panelLocale,
+peakValleyMarker.period==="peak"?"settings.pv.peak":"settings.pv.valley")
+:peakValleyExtra(panelLocale,"settings.pv.disabled"))
+:null;
 return react.createElement("section",{className:"deg_expert_group","data-version":version,"aria-label":"Expert Group"},
 widthResizer,
 react.createElement("div",{
@@ -11271,6 +11389,10 @@ role:"status",
 react.createElement("header",{className:"deg_expert_group_header"},
 react.createElement("span",{className:"deg_expert_group_header_title"},t("sidebar.title")),
 autoOpenToggle,
+peakValleyText===null?null:react.createElement("span",{
+className:"deg_expert_group_header_peak_valley",
+"data-peak-valley":peakValleyOn?peakValleyMarker.period:"disabled",
+},peakValleyText),
 panelError===null
 ?null
 :react.createElement("span",{
@@ -11325,6 +11447,7 @@ useSidebarPanelProjectionRef(frame);
 useSidebarPanelProjectionEffect(frame);
 useSidebarPanelRunAction(frame);
 useSidebarPanelRunActionPart2(frame);
+useSidebarPanelPeakValleyMarker(frame);
 assembleSidebarPanelBody(frame);
 assembleSidebarPanelBodyPart2(frame);
 return renderSidebarPanelSection(frame);
@@ -11525,7 +11648,6 @@ function providerSubtreeOps(stored,draft){
 return pathOps([],stored,draft);
 }
 global[SYMBOL]=Object.freeze({
-SYMBOL,
 isBlankDraftValue,
 isPlainObject,
 isSchemaNode,
@@ -12171,6 +12293,26 @@ placeholder:writable?(configured?"已配置（留空表示不修改）":"粘贴 
 hint:ref.length===0?"未设置凭据引用":"凭据引用："+ref+"（API Key 只写入 credentials 服务，保存后不回显明文）",
 };
 }
+function modelLimitFieldsOf(model){
+const capOf=(raw)=>typeof raw==="number"?formatCapacity(raw):"";
+return{
+contextWindow:{value:capOf(model.contextWindow),placeholder:"继承适配器默认"},
+maxTokens:{value:capOf(model.maxTokens),placeholder:"继承适配器默认"},
+};
+}
+function modelReasoningFieldsOf(model,index,defaultInput,expanded){
+const levels=effortSelectionFor(model);
+const picked=modelInputOf(model,defaultInput);
+return{
+efforts:REASONING_EFFORTS.map((level)=>({level,checked:levels[level]===true})),
+inputs:INPUT_MODALITIES.map((modality)=>({
+modality,
+checked:picked.includes(modality),
+locked:picked.length===1&&picked.includes(modality),
+})),
+advancedOpen:expanded.has(index),
+};
+}
 function buildModelCardModel(input){
 const source=isPlainObject(input)?input:{};
 const row=isPlainObject(source.row)?source.row:{};
@@ -12218,32 +12360,15 @@ label:"适配器默认",
 .filter((choice)=>typeof choice==="string"&&choice.length>0)
 .map((choice)=>({value:choice,label:choice}))],
 },
-models:models.map((model,index)=>{
-const selection=effortSelectionFor(model);
-const inputSelected=modelInputOf(model,defaultInput);
-return{
+models:models.map((model,index)=>({
 index,
 position:index+1,
 id:{value:nameOf("id",model),editable:true},
 name:{value:nameOf("name",model),editable:true},
-contextWindow:{
-value:typeof model.contextWindow==="number"?formatCapacity(model.contextWindow):"",
-placeholder:"继承适配器默认",
-},
-maxTokens:{
-value:typeof model.maxTokens==="number"?formatCapacity(model.maxTokens):"",
-placeholder:"继承适配器默认",
-},
+...modelLimitFieldsOf(model),
 reasoningDefaults:{value:"模型默认",editable:false},
-efforts:REASONING_EFFORTS.map((level)=>({level,checked:selection[level]===true})),
-inputs:INPUT_MODALITIES.map((modality)=>({
-modality,
-checked:inputSelected.includes(modality),
-locked:inputSelected.length===1&&inputSelected.includes(modality),
+...modelReasoningFieldsOf(model,index,defaultInput,expanded),
 })),
-advancedOpen:expanded.has(index),
-};
-}),
 modelCatalog:{
 overridden,
 label:overridden?"已按用户覆盖":"适配器默认（首次编辑时写入用户覆盖）",
@@ -12425,7 +12550,6 @@ return draft;
 }
 const EDITABLE_PROFILE_FIELDS=Object.freeze(["displayName","apiKeyEnv","baseURL","api","models"]);
 global[SYMBOL]=Object.freeze({
-SYMBOL,
 REASONING_EFFORTS,
 REASONING_EFFORT_EMPTY,
 INPUT_MODALITIES,
@@ -12455,10 +12579,8 @@ parseCapacity,
 formatCapacity,
 validateModelRows,
 normalizeModelRows,
-modelCatalogOverridden,
 isOverridden,
 inheritedModelsOf,
-fallbackModelsOf,
 materializeOverrideOps,
 modelCatalogOps,
 modelEditableProfileOf,
@@ -12487,6 +12609,8 @@ modelCardApply,
 providerListSections,
 apiKeyField,
 buildModelCardModel,
+modelLimitFieldsOf,
+modelReasoningFieldsOf,
 createCardSession,
 });
 })(globalThis);
@@ -12518,6 +12642,7 @@ providerRemovable,providerProfileOf,apiKeyEnvOf,credentialRefOf,protocolChoices,
 createSchemaAdapter,namespaceSchemaInfo,validateProfileDraft,rolesAffectedByChange,
 reasoningGuardMessage,removedLevelsOf,namespaceViewOf,roleDefaultsOf,modelCardApply,
 providerListSections,apiKeyField,buildModelCardModel,createCardSession,
+modelLimitFieldsOf,modelReasoningFieldsOf,
 }=rows;
 function buildSectionModel(input){
 const source=isPlainObject(input)?input:{};
@@ -12819,31 +12944,14 @@ autoComplete:"off",
 disabled,
 placeholder:"粘贴 API Key（可留空，沿用 provider 原生/环境凭据）",
 },
-models:rows.map((model,index)=>{
-const selection=effortSelectionFor(model);
-const inputSelected=modelInputOf(model,defaultInput);
-return{
+models:rows.map((model,index)=>({
 index,
 position:index+1,
 id:{value:typeof model.id==="string"?model.id:""},
 name:{value:typeof model.name==="string"?model.name:""},
-contextWindow:{
-value:typeof model.contextWindow==="number"?formatCapacity(model.contextWindow):"",
-placeholder:"继承适配器默认",
-},
-maxTokens:{
-value:typeof model.maxTokens==="number"?formatCapacity(model.maxTokens):"",
-placeholder:"继承适配器默认",
-},
-efforts:REASONING_EFFORTS.map((level)=>({level,checked:selection[level]===true})),
-inputs:INPUT_MODALITIES.map((modality)=>({
-modality,
-checked:inputSelected.includes(modality),
-locked:inputSelected.length===1&&inputSelected.includes(modality),
+...modelLimitFieldsOf(model),
+...modelReasoningFieldsOf(model,index,defaultInput,expanded),
 })),
-advancedOpen:expanded.has(index),
-};
-}),
 modelsError:isNonEmptyString(errors.models)?errors.models:null,
 actions:{
 submit:disabled||routeId.length===0?"disabled":"enabled",
@@ -12993,16 +13101,19 @@ const SETTINGS_ZH_FALLBACK=Object.freeze({
 "settings.saved":"已保存",
 "settings.unsaved":"有未保存的修改",
 });
-function settingsText(locale,key,vars){
-const model=localeModelApi();
-if(typeof model?.translateMessage==="function")return model.translateMessage(locale,key,vars);
-const template=SETTINGS_ZH_FALLBACK[key];
-if(template===undefined)return"—";
+function interpolateSettingsTemplate(template,vars){
 const values=vars!==null&&typeof vars==="object"?vars:{};
 return template.replace(/\{([a-z][a-z0-9_]*)\}/gi,(match,name)=>{
 const value=values[name];
 return value===void 0||value===null?match:String(value);
 });
+}
+function settingsText(locale,key,vars){
+const model=localeModelApi();
+if(typeof model?.translateMessage==="function")return model.translateMessage(locale,key,vars);
+const template=SETTINGS_ZH_FALLBACK[key];
+if(template===undefined)return"—";
+return interpolateSettingsTemplate(template,vars);
 }
 const SETTINGS_EXTRA_MESSAGES=Object.freeze({
 "settings.modelCandidates.fallbackLimit":{zh:"自动降级上限"},
@@ -13018,16 +13129,31 @@ const SETTINGS_EXTRA_MESSAGES=Object.freeze({
 "settings.modelCandidates.limit":{zh:"每个角色最多 3 个候选"},
 "settings.modelCandidates.error.incomplete":{zh:"候选第 {index} 行需要同时填写供应商和模型"},
 "settings.modelCandidates.error.duplicate":{zh:"候选第 {index} 行与前面的候选重复"},
+"settings.pv.entry":{zh:"峰谷模式"},
+"settings.pv.enable":{zh:"启用峰谷模式"},
+"settings.pv.uninit":{zh:"首次启用会从普通配置复制峰、谷两套模型"},
+"settings.pv.back":{zh:"返回"},
+"settings.pv.peak":{zh:"峰时"},
+"settings.pv.valley":{zh:"谷时"},
+"settings.pv.disabled":{zh:"峰谷：未启用"},
+"settings.pv.add":{zh:"添加峰段"},
+"settings.pv.remove":{zh:"删除"},
+"settings.pv.remove.aria":{zh:"删除峰段"},
+"settings.pv.start":{zh:"开始"},
+"settings.pv.end":{zh:"结束"},
+"settings.pv.noValley":{zh:"当前没有谷时"},
+"settings.pv.invalid":{zh:"峰谷时段不合法：{reason}"},
+"settings.pv.broken":{zh:"峰谷配置损坏，请到峰谷设置页修复"},
+"settings.pv.repairHint":{zh:"峰谷配置已损坏，请修复后保存"},
+"settings.pv.repair":{zh:"修复并保存"},
+"settings.pv.mainScope":{zh:"本页正在编辑{period}模型（打开页面时锁定）"},
+"settings.pv.boundary":{zh:"当前已进入{current}，本页仍在编辑{editing}模型"},
 });
 function settingsExtraText(locale,key,vars){
 const entry=SETTINGS_EXTRA_MESSAGES[key];
 if(entry===void 0)return settingsText(locale,key,vars);
 const template=typeof entry[locale]==="string"&&entry[locale].length>0?entry[locale]:entry.zh;
-const values=vars!==null&&typeof vars==="object"?vars:{};
-return template.replace(/\{([a-z][a-z0-9_]*)\}/gi,(match,name)=>{
-const value=values[name];
-return value===void 0||value===null?match:String(value);
-});
+return interpolateSettingsTemplate(template,vars);
 }
 global[SYMBOL]=Object.freeze({
 SETTINGS_EXTRA_MESSAGES,SETTINGS_ZH_FALLBACK,resolveSettingsLocale,settingsExtraText,settingsText,
@@ -13037,228 +13163,37 @@ SETTINGS_EXTRA_MESSAGES,SETTINGS_ZH_FALLBACK,resolveSettingsLocale,settingsExtra
 (function installClientStyles(global){
 "use strict";
 const SYMBOL=Symbol.for("dsh-expert-group/client-styles");
-const css=""+
-".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:760px;color:var(--dsw-alias-label-primary)}"+
-".deg_main_page{height:100%;overflow:auto;padding:32px;box-sizing:border-box}"+
-".deg_main_page>.deg_settings{max-width:760px;margin:0 auto}"+
-"[data-platform=darwin] .deg_main_page{padding-top:calc(32px + var(--dsh-frame-top-clearance,0px))}"+
-".deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}"+
-".deg_settings_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}"+
-".deg_settings_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);align-items:center;gap:20px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}"+
-".deg_settings_task_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:28px;row-gap:12px;min-height:29px}"+
-".deg_settings_task_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}"+
-".deg_settings_unified_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:32px;row-gap:12px;min-width:0}"+
-".deg_settings_provider_group,.deg_settings_fallback_group{display:flex;align-items:center;gap:10px;min-width:0;flex:0 1 auto}"+
-".deg_settings_provider_group>.deg_settings_label,.deg_settings_fallback_group>.deg_settings_label{flex:0 0 auto;white-space:nowrap}"+
-".deg_settings_provider_group>.deg_settings_control{flex:0 1 auto;min-width:0}"+
-".deg_settings_provider_group select.deg_settings_provider_select{flex:0 1 176px;width:176px;min-width:0;max-width:200px}"+
+const css=".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:760px;color:var(--dsw-alias-label-primary)}"+
+".deg_main_page{height:100%;overflow:auto;padding:32px;box-sizing:border-box}.deg_main_page>.deg_settings{max-width:760px;margin:0 auto}"+
+"[data-platform=darwin] .deg_main_page{padding-top:calc(32px + var(--dsh-frame-top-clearance,0px))}.deg_settings_title{font-size:20px;font-weight:600;line-height:28px;margin:0}.deg_settings_hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}.deg_settings_row{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,280px);align-items:center;gap:20px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}"+
+".deg_settings_task_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:28px;row-gap:12px;min-height:29px}.deg_settings_task_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}"+
+".deg_settings_unified_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:32px;row-gap:12px;min-width:0}.deg_settings_provider_group,.deg_settings_fallback_group{display:flex;align-items:center;gap:10px;min-width:0;flex:0 1 auto}.deg_settings_provider_group>.deg_settings_label,.deg_settings_fallback_group>.deg_settings_label{flex:0 0 auto;white-space:nowrap}.deg_settings_provider_group>.deg_settings_control{flex:0 1 auto;min-width:0}.deg_settings_provider_group select.deg_settings_provider_select{flex:0 1 176px;width:176px;min-width:0;max-width:200px}"+
 "@media (max-width:520px){.deg_settings_unified_row{column-gap:20px;row-gap:12px}.deg_settings_provider_group{flex:1 1 100%}}"+
-".deg_settings_management_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:32px;row-gap:12px;min-width:0}"+
-".deg_settings_management_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}"+
+".deg_settings_management_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:32px;row-gap:12px;min-width:0}.deg_settings_management_row>.deg_settings_checkbox{flex:0 0 auto;white-space:nowrap;height:29px;box-sizing:border-box}"+
 ".deg_settings_management_row>.deg_settings_control{flex:0 0 auto;min-width:max-content;white-space:nowrap;height:29px;box-sizing:border-box}"+
-"@media (max-width:520px){.deg_settings_management_row{column-gap:20px;row-gap:12px}}"+
-".deg_settings_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}"+
-".deg_settings_control{display:flex;align-items:center;gap:10px;min-width:0}"+
-".deg_settings_control input[type=range]{width:100%;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}"+
-".deg_settings_control input[type=number]{width:72px;box-sizing:border-box;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}"+
-".deg_settings_control select{width:100%;min-width:0;box-sizing:border-box;padding:7px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}"+
-".deg_settings_control select:disabled,.deg_settings_control input:disabled{opacity:.5;cursor:not-allowed}"+
-".deg_settings_checkbox{display:flex;align-items:center;gap:8px;cursor:pointer}"+
-".deg_settings_checkbox input{width:16px;height:16px;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}"+
-".deg_settings_table_wrap{width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}"+
-".deg_settings_table{display:grid;min-width:540px;grid-template-columns:minmax(84px,.6fr) minmax(132px,.82fr) minmax(210px,1.5fr) minmax(96px,.62fr);border-top:1px solid var(--dsw-alias-border-l2)}"+
-".deg_settings_table_head,.deg_settings_table_cell{min-width:0;padding:10px 6px;border-bottom:1px solid var(--dsw-alias-border-l2)}"+
-".deg_settings_table_head{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);font-weight:600}"+
-".deg_settings_table_cell{display:flex;align-items:center;font-size:13px;line-height:20px}"+
-".deg_settings_table_cell select{width:100%;min-width:0;box-sizing:border-box;padding:6px 6px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}"+
-".deg_settings_table_cell select.deg_settings_provider_select{max-width:170px}"+
-".deg_settings_table_cell select.deg_settings_model_select{max-width:260px}"+
-".deg_settings_table_cell select.deg_settings_effort_select{max-width:112px}"+
-".deg_settings_table_cell select:disabled{opacity:.5;cursor:not-allowed}"+
-".deg_settings_role_cell{padding:0;align-items:center}"+
-".deg_settings_role_button{display:flex;align-items:center;justify-content:center;gap:7px;flex:0 0 74px;width:74px;height:28px;min-height:28px;padding:4px 6px;box-sizing:border-box;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;line-height:20px;cursor:pointer;text-align:center}"+
-".deg_settings_role_button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-label-secondary)}"+
-".deg_settings_role_button:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}"+
-".deg_settings_role_button[aria-pressed=true]{background:var(--dsw-alias-interactive-bg-secondary,var(--dsw-alias-bg-layer-2));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}"+
-".deg_settings_role_button:disabled{opacity:.45;cursor:not-allowed}"+
-".deg_settings_prompt_customized_dot{display:inline-block;width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}"+
-".deg_settings_prompt_editor{display:flex;flex-direction:column;gap:14px;min-width:0}"+
-".deg_prompt_header{display:flex;align-items:center;justify-content:center;min-width:0}"+
-".deg_prompt_header .deg_settings_title{margin:0;overflow-wrap:anywhere;text-align:center}"+
-".deg_prompt_back{flex:0 0 auto}"+
-".deg_prompt_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);font-weight:600}"+
-".deg_prompt_textarea{display:block;width:100%;min-height:320px;max-height:60vh;box-sizing:border-box;resize:vertical;overflow:auto;padding:12px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:13px/20px var(--ds-font-family-code,var(--ds-font-family-sans));white-space:pre-wrap}"+
-".deg_prompt_textarea:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}"+
-".deg_prompt_textarea:disabled{opacity:.55;cursor:not-allowed}"+
-".deg_prompt_counter{display:flex;justify-content:flex-end;margin-top:-8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}"+
-".deg_prompt_counter_warning{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-secondary))}"+
-".deg_prompt_counter_error{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}"+
-".deg_prompt_status{min-height:18px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}"+
-".deg_prompt_footer{display:flex;align-items:center;gap:8px;padding-top:4px}"+
-".deg_prompt_footer .deg_btn{flex:0 0 auto;min-width:88px}"+
-".deg_prompt_footer .deg_prompt_status{margin-right:auto}"+
-".deg_btn_primary{color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}"+
-".deg_btn_primary:hover:not(:disabled){filter:brightness(1.08)}"+
-".deg_settings_table_cell .deg_settings_role_button + *{min-width:0}"+
-".deg_settings_footer{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding-top:4px}"+
-".deg_settings_status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin-right:auto}"+
-".deg_settings_error{font-size:12px;line-height:18px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));white-space:pre-wrap}"+
-".deg_btn{flex:1;box-sizing:border-box;min-height:32px;padding:6px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;cursor:pointer}"+
-".deg_btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}"+
-".deg_btn:disabled{opacity:.45;cursor:not-allowed}"+
-".deg_btn.deg_btn_primary{color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}"+
-".deg_prompt_dialog_backdrop{position:fixed;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.45)}"+
-".deg_prompt_dialog{width:min(100%,440px);box-sizing:border-box;padding:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;box-shadow:0 12px 28px rgba(0,0,0,.28)}"+
-".deg_prompt_dialog h3{margin:0 0 8px;font-size:16px;line-height:24px;color:var(--dsw-alias-label-primary)}"+
-".deg_prompt_dialog p{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}"+
-".deg_prompt_dialog_actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-top:18px}"+
-".deg_settings_notification_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:24px;row-gap:12px;min-width:0;white-space:nowrap}"+
-".deg_settings_notification_row>.deg_settings_checkbox{flex:0 0 auto}"+
-".deg_settings_notification_row>.deg_settings_control{flex:1 1 220px;min-width:160px}"+
-".deg_settings_notification_row>.deg_settings_control .deg_settings_label{flex:0 0 auto;white-space:nowrap}"+
-".deg_settings_notification_row>.deg_settings_control input[type=range]{flex:1 1 auto;min-width:48px}"+
-".deg_settings_notification_row>.deg_settings_control input[type=number]{flex:0 0 72px;width:72px}"+
-".deg_settings_events_dropdown{position:relative;flex:0 0 auto;min-width:0}"+
-".deg_settings_events_trigger{display:inline-flex;align-items:center;gap:6px;height:29px;box-sizing:border-box;padding:0 10px;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:13px;line-height:20px;white-space:nowrap;cursor:pointer}"+
-".deg_settings_events_trigger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}"+
-".deg_settings_events_trigger:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}"+
-".deg_settings_events_trigger:disabled{opacity:.45;cursor:not-allowed}"+
-".deg_settings_events_count{color:var(--dsw-alias-label-secondary)}"+
-".deg_settings_events_caret{display:inline-block;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1;transform:translateY(1px)}"+
-".deg_settings_events_panel{position:absolute;top:calc(100% + 6px);right:0;z-index:20;display:flex;flex-direction:column;gap:8px;min-width:180px;box-sizing:border-box;padding:10px 12px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;box-shadow:0 8px 20px rgba(0,0,0,.16)}"+
-".deg_settings_events_panel .deg_settings_checkbox{height:20px}"+
-"@media (max-width:520px){.deg_settings_notification_row{flex-wrap:wrap;row-gap:12px}.deg_settings_notification_row>.deg_settings_control{flex-basis:100%}.deg_settings_events_dropdown{flex:1 1 100%}.deg_settings_events_panel{left:0;right:auto}}"+
-".deg_subagent_metadata{display:block;box-sizing:border-box;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary,var(--dsw-alias-label-primary));font-size:11px;line-height:16px}"+
-".deg_full_system_prompt_root[data-open]{padding-bottom:4px}"+
-".deg_full_system_prompt_chevron{color:var(--dsw-alias-label-secondary)}"+
-".deg_full_system_prompt_body{box-sizing:border-box;width:calc(100% - 22px - var(--dsh-content-font-delta, 0px));margin:4px 0 0 calc(22px + var(--dsh-content-font-delta, 0px));max-height:141px;overflow:auto;padding:10px 16px 12px 12px;border:none;border-radius:8px;background:var(--dsw-alias-markdown-code-block);color:var(--dsw-alias-label-tertiary);font:400 11px/16px var(--ds-font-family-code)}"+
-".deg_full_system_prompt{box-sizing:border-box;margin:0;white-space:pre-wrap;overflow-wrap:anywhere}"+
-".deg_mc_section{display:flex;flex-direction:column;gap:10px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}"+
-".deg_mc_header{display:flex;align-items:center;gap:8px;min-width:0}"+
-".deg_mc_toggle{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;padding:0;color:var(--dsw-alias-label-primary);background:transparent;border:none;font:inherit;font-size:13px;line-height:20px;font-weight:600;text-align:left;cursor:pointer}"+
-".deg_mc_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}"+
-".deg_mc_chevron{flex:0 0 auto;color:var(--dsw-alias-label-secondary)}"+
-".deg_mc_body{display:flex;flex-direction:column;gap:10px;min-width:0}"+
-".deg_mc_cards{display:flex;flex-direction:column;gap:8px;margin:0;padding:0;list-style:none}"+
-".deg_mc_card{display:flex;flex-direction:column;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}"+
-".deg_mc_card_head{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}"+
-".deg_mc_card_name{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}"+
-".deg_mc_card_route{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);font-family:var(--ds-font-family-code,inherit)}"+
-".deg_mc_card_actions{display:flex;align-items:center;gap:8px;margin-left:auto}"+
-".deg_mc_card_actions .deg_btn{flex:0 0 auto;min-width:64px}"+
-".deg_mc_card_actions .deg_mc_delete_btn{color:var(--dsw-alias-state-error-primary,#ef4444)}"+
-".deg_mc_dot[data-state=available]{background:var(--dsw-alias-state-success-primary,#22c55e)}"+
-".deg_mc_dot{display:inline-block;width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--dsw-alias-label-secondary)}"+
-".deg_mc_field{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,240px);align-items:center;gap:12px}"+
-".deg_mc_field_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}"+
-".deg_mc_input,.deg_mc_select{box-sizing:border-box;width:100%;min-width:0;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}"+
-".deg_mc_input:disabled,.deg_mc_select:disabled{opacity:.5;cursor:not-allowed}"+
-".deg_mc_input:focus-visible,.deg_mc_select:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}"+
-".deg_mc_models{display:flex;flex-direction:column;gap:8px;min-width:0;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2)}"+
-".deg_mc_models_head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}"+
-".deg_mc_models_title{font-size:12px;line-height:18px;font-weight:600;color:var(--dsw-alias-label-primary)}"+
-".deg_mc_models_meta{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}"+
-".deg_mc_models_head .deg_btn{margin-left:auto;flex:0 0 auto;min-width:auto}"+
-".deg_mc_model{display:flex;flex-direction:column;gap:6px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1)}"+
-".deg_mc_model_main{display:flex;align-items:center;gap:6px;min-width:0}"+
-".deg_mc_model_main .deg_mc_input{flex:1 1 0;min-width:0}"+
-".deg_mc_icon_btn{flex:0 0 auto;min-width:auto;width:26px;height:26px;padding:0;line-height:1}"+
-".deg_mc_model_advanced{display:grid;grid-template-columns:max-content minmax(64px,1fr) max-content minmax(64px,1fr);column-gap:8px;row-gap:8px;padding-top:6px;border-top:1px dashed var(--dsw-alias-border-l2)}"+
-".deg_mc_model_advanced>.deg_mc_field{display:contents}"+
-".deg_mc_model_advanced>.deg_mc_field .deg_mc_field_label{align-self:center;min-width:0}"+
-".deg_mc_model_advanced>.deg_mc_field .deg_mc_input{min-width:0;text-align:center}"+
-".deg_mc_model_advanced>.deg_mc_efforts{grid-column:1 / -1}"+
-"@media (max-width:640px){.deg_mc_model_advanced{grid-template-columns:max-content minmax(64px,1fr)}.deg_mc_model_advanced>.deg_mc_efforts{grid-column:1 / -1}}"+
-".deg_mc_efforts{margin:0;padding:0;border:none;min-width:0}"+
-".deg_mc_efforts_label{padding:0;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}"+
-".deg_mc_efforts_row{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px}"+
-".deg_mc_effort{display:inline-flex;align-items:center;gap:4px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);cursor:pointer}"+
-".deg_mc_effort input{width:14px;height:14px;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}"+
-".deg_mc_input_types{display:flex;flex-wrap:wrap;gap:10px}"+
-".deg_mc_hint{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}"+
-".deg_mc_error,.deg_remove_confirm_error{font-size:12px;line-height:18px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));white-space:pre-wrap}"+
-".deg_mc_card_footer{display:flex;align-items:center;gap:8px;padding-top:2px}"+
-".deg_mc_card_footer .deg_mc_status{margin-right:auto}"+
-".deg_mc_card_footer .deg_btn{flex:0 0 auto;min-width:76px}"+
-".deg_mc_conflict{display:flex;flex-direction:column;gap:6px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}"+
-".deg_mc_conflict_actions{display:flex;gap:8px}"+
-".deg_mc_conflict_actions .deg_btn{flex:0 0 auto;min-width:96px}"+
-".deg_mc_add{display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%}"+
-".deg_mc_add .deg_mc_select{width:auto;min-width:160px;flex:0 1 auto}"+
-".deg_mc_entries{display:flex;align-items:center;gap:8px;flex:1 1 100%;width:100%;min-width:0}"+
-".deg_mc_entries>.deg_btn{flex:1 1 0;min-width:0;border-style:dashed}"+
-".deg_mc_entries>.deg_btn::before{content:\"+\";display:inline-block;margin-right:4px;font-size:16px;line-height:1}"+
-".deg_mc_create{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}"+
-".deg_mc_create_head{display:flex;align-items:center;gap:8px;min-width:0}"+
-".deg_mc_create_title{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary)}"+
-".deg_mc_field_error{border-color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}"+
-".deg_mc_field_row{display:flex;flex-direction:column;gap:4px;min-width:0}"+
-".deg_mc_field_message{font-size:11px;line-height:16px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}"+
-".deg_mc_create_footer{display:flex;align-items:center;gap:8px;padding-top:2px}"+
-".deg_mc_create_footer .deg_mc_status{margin-right:auto}"+
-".deg_mc_create_footer .deg_btn{flex:0 0 auto;min-width:88px}"+
-".deg_mc_modal_backdrop{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.45)}"+
-".deg_mc_modal{display:flex;flex-direction:column;gap:12px;width:min(100%,380px);max-height:min(80vh,420px);box-sizing:border-box;padding:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;box-shadow:0 12px 28px rgba(0,0,0,.28)}"+
-".deg_mc_modal_header{display:flex;align-items:center;gap:8px;min-width:0}"+
-".deg_mc_modal_title{flex:1 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;color:var(--dsw-alias-label-primary)}"+
-".deg_mc_modal_close{flex:0 0 auto;width:28px;height:28px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:20px;line-height:28px;cursor:pointer}"+
-".deg_mc_modal_close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}"+
-".deg_mc_modal_description{margin:0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}"+
-".deg_mc_candidate_toolbar{display:flex;align-items:center;gap:8px;min-width:0}"+
-".deg_mc_candidate_search{flex:1 1 auto;min-width:0}"+
-".deg_mc_candidate_toolbar .deg_btn{flex:0 0 auto;min-width:auto;white-space:nowrap}"+
-".deg_mc_candidate_list{display:flex;flex-direction:column;gap:2px;max-height:240px;margin:0;overflow:auto;padding:0;list-style:none}"+
-".deg_mc_candidate_item{border-radius:6px}"+
-".deg_mc_candidate_label{display:flex;align-items:center;gap:8px;padding:6px 8px;color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px;cursor:pointer}"+
-".deg_mc_candidate_id{flex:1 1 auto;min-width:0;overflow-wrap:anywhere;font-family:var(--ds-font-family-code,inherit)}"+
-".deg_mc_candidate_empty{margin:18px 0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:center}"+
-".deg_mc_modal_footer{display:flex;justify-content:flex-end;gap:8px;padding-top:2px}"+
-".deg_mc_modal_footer .deg_btn{flex:0 0 auto;min-width:76px}"+
-"[data-deg-settings-nav-native]{display:none}"+
-"[data-deg-settings-nav-icon]{flex:none}"+
-".deg_pd{display:flex;flex-direction:column;gap:12px;width:min(100%,760px);min-width:0;box-sizing:border-box;color:var(--dsw-alias-label-primary)}"+
-".deg_pd_title{font-size:14px;line-height:22px;font-weight:600;margin:0}"+
-".deg_pd_roles{display:flex;flex-direction:column;gap:0;list-style:none;margin:0;padding:0}"+
-".deg_pd_roles_header{display:grid;grid-template-columns:minmax(84px,.7fr) minmax(0,1.6fr) auto;gap:10px;padding:6px 0 2px;border-top:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px;line-height:16px}"+
-".deg_pd_roles_header span{min-width:0}"+
-".deg_pd_roles_header span:last-child{text-align:right}"+
-".deg_pd_role{display:grid;grid-template-columns:minmax(84px,.7fr) minmax(0,1.6fr) auto;align-items:center;gap:10px;min-height:30px;padding:5px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}"+
-".deg_pd_role:last-child{border-bottom:0}"+
-".deg_pd_role_name{min-width:0;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}"+
-".deg_pd_role_value{min-width:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"+
-".deg_pd_role_value[title]{cursor:help}"+
-".deg_pd_role_state{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));white-space:nowrap;text-align:right}"+
-".deg_pd_role[data-deg-role-state=configured] .deg_pd_role_state{color:var(--dsw-alias-state-success-primary,var(--dsw-alias-label-secondary))}"+
-".deg_pd_role[data-deg-role-state=disabled] .deg_pd_role_name,.deg_pd_role[data-deg-role-state=disabled] .deg_pd_role_value{color:var(--dsw-alias-label-secondary)}"+
-".deg_pd_role[data-deg-role-state=incomplete] .deg_pd_role_state{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-secondary))}"+
-".deg_pd_providers{display:flex;align-items:flex-start;gap:10px;min-width:0;flex-wrap:wrap}"+
-".deg_pd_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);flex:0 0 auto}"+
-".deg_pd_providers_list{display:flex;align-items:flex-start;gap:6px;flex:1 1 auto;flex-wrap:wrap;min-width:0;max-width:100%}"+
-".deg_pd_tag{max-width:100%;box-sizing:border-box;font-size:11px;line-height:16px;padding:1px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}"+
-".deg_pd_tag[data-deg-provider-known=false]{border-style:dashed;color:var(--dsw-alias-label-secondary)}"+
-".deg_pd_empty{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}"+
-".deg_pd_status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0;overflow-wrap:anywhere}"+
-".deg_pd_actions{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;padding-top:2px}"+
-".deg_pd_actions .deg_pd_open{flex:0 0 auto;min-width:auto}"+
-".deg_pd_actions .deg_pd_open:hover:not(:disabled),.deg_pd_actions .deg_pd_open:focus-visible:not(:disabled){color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));filter:brightness(1.08)}"+
-".deg_pd_actions .deg_pd_open:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}"+
-".deg_pd_actions .deg_pd_open:disabled{opacity:1;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));background:transparent;border-color:var(--dsw-alias-border-l2)}"+
-".deg_pd_note{min-width:0;flex:1 1 220px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}"+
+"@media (max-width:520px){.deg_settings_management_row{column-gap:20px;row-gap:12px}}.deg_settings_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}.deg_settings_control{display:flex;align-items:center;gap:10px;min-width:0}.deg_settings_control input[type=range]{width:100%;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}.deg_settings_control input[type=number]{width:72px;box-sizing:border-box;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}.deg_settings_control select{width:100%;min-width:0;box-sizing:border-box;padding:7px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}.deg_settings_control select:disabled,.deg_settings_control input:disabled{opacity:.5;cursor:not-allowed}.deg_settings_checkbox{display:flex;align-items:center;gap:8px;cursor:pointer}.deg_settings_checkbox input{width:16px;height:16px;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}.deg_settings_table_wrap{width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}"+
+".deg_settings_table{display:grid;min-width:540px;grid-template-columns:minmax(84px,.6fr) minmax(132px,.82fr) minmax(210px,1.5fr) minmax(96px,.62fr);border-top:1px solid var(--dsw-alias-border-l2)}.deg_settings_table_head,.deg_settings_table_cell{min-width:0;padding:10px 6px;border-bottom:1px solid var(--dsw-alias-border-l2)}.deg_settings_table_head{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);font-weight:600}.deg_settings_table_cell{display:flex;align-items:center;font-size:13px;line-height:20px}.deg_settings_table_cell select{width:100%;min-width:0;box-sizing:border-box;padding:6px 6px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px}.deg_settings_table_cell select.deg_settings_provider_select{max-width:170px}.deg_settings_table_cell select.deg_settings_model_select{max-width:260px}.deg_settings_table_cell select.deg_settings_effort_select{max-width:112px}.deg_settings_table_cell select:disabled{opacity:.5;cursor:not-allowed}.deg_settings_role_cell{padding:0;align-items:center}.deg_settings_role_button{display:flex;align-items:center;justify-content:center;gap:7px;flex:0 0 74px;width:74px;height:28px;min-height:28px;padding:4px 6px;box-sizing:border-box;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;line-height:20px;cursor:pointer;text-align:center}.deg_settings_role_button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-label-secondary)}.deg_settings_role_button:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}.deg_settings_role_button[aria-pressed=true]{background:var(--dsw-alias-interactive-bg-secondary,var(--dsw-alias-bg-layer-2));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}.deg_settings_role_button:disabled{opacity:.45;cursor:not-allowed}.deg_settings_prompt_customized_dot{display:inline-block;width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}.deg_settings_prompt_editor{display:flex;flex-direction:column;gap:14px;min-width:0}.deg_prompt_header{display:flex;align-items:center;justify-content:center;min-width:0}.deg_prompt_header .deg_settings_title{margin:0;overflow-wrap:anywhere;text-align:center}.deg_prompt_back{flex:0 0 auto}.deg_prompt_label{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);font-weight:600}.deg_prompt_textarea{display:block;width:100%;min-height:320px;max-height:60vh;box-sizing:border-box;resize:vertical;overflow:auto;padding:12px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:13px/20px var(--ds-font-family-code,var(--ds-font-family-sans));white-space:pre-wrap}.deg_prompt_textarea:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}.deg_prompt_textarea:disabled{opacity:.55;cursor:not-allowed}.deg_prompt_counter{display:flex;justify-content:flex-end;margin-top:-8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}.deg_prompt_counter_warning{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-secondary))}.deg_prompt_counter_error{color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}.deg_prompt_status{min-height:18px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}.deg_prompt_footer{display:flex;align-items:center;gap:8px;padding-top:4px}.deg_prompt_footer .deg_btn{flex:0 0 auto;min-width:88px}.deg_prompt_footer .deg_prompt_status{margin-right:auto}.deg_btn_primary{color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}.deg_btn_primary:hover:not(:disabled){filter:brightness(1.08)}.deg_settings_table_cell .deg_settings_role_button + *{min-width:0}.deg_settings_footer{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding-top:4px}.deg_settings_status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin-right:auto}.deg_settings_error{font-size:12px;line-height:18px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));white-space:pre-wrap}.deg_btn{flex:1;box-sizing:border-box;min-height:32px;padding:6px 10px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;cursor:pointer}.deg_btn:hover:not(:disabled):not(.deg_btn_primary){background:var(--dsw-alias-interactive-bg-hover)}"+
+".deg_btn:disabled{opacity:.45;cursor:not-allowed}.deg_btn.deg_btn_primary{color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}.deg_prompt_dialog_backdrop{position:fixed;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.45)}.deg_prompt_dialog{width:min(100%,440px);box-sizing:border-box;padding:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;box-shadow:0 12px 28px rgba(0,0,0,.28)}.deg_prompt_dialog h3{margin:0 0 8px;font-size:16px;line-height:24px;color:var(--dsw-alias-label-primary)}.deg_prompt_dialog p{margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}.deg_prompt_dialog_actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-top:18px}"+
+".deg_settings_notification_row{display:flex;align-items:center;flex-wrap:wrap;column-gap:24px;row-gap:12px;min-width:0;white-space:nowrap}.deg_settings_notification_row>.deg_settings_checkbox{flex:0 0 auto}.deg_settings_notification_row>.deg_settings_control{flex:1 1 220px;min-width:160px}.deg_settings_notification_row>.deg_settings_control .deg_settings_label{flex:0 0 auto;white-space:nowrap}.deg_settings_notification_row>.deg_settings_control input[type=range]{flex:1 1 auto;min-width:48px}.deg_settings_notification_row>.deg_settings_control input[type=number]{flex:0 0 72px;width:72px}"+
+".deg_settings_events_dropdown{position:relative;flex:0 0 auto;min-width:0}.deg_settings_events_trigger{display:inline-flex;align-items:center;gap:6px;height:29px;box-sizing:border-box;padding:0 10px;color:var(--dsw-alias-label-primary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:13px;line-height:20px;white-space:nowrap;cursor:pointer}.deg_settings_events_trigger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.deg_settings_events_trigger:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}.deg_settings_events_trigger:disabled{opacity:.45;cursor:not-allowed}.deg_settings_events_count{color:var(--dsw-alias-label-secondary)}.deg_settings_events_caret{display:inline-block;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1;transform:translateY(1px)}"+
+".deg_settings_events_panel{position:absolute;top:calc(100% + 6px);right:0;z-index:20;display:flex;flex-direction:column;gap:8px;min-width:180px;box-sizing:border-box;padding:10px 12px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;box-shadow:0 8px 20px rgba(0,0,0,.16)}.deg_settings_events_panel .deg_settings_checkbox{height:20px}"+
+"@media (max-width:520px){.deg_settings_notification_row{flex-wrap:wrap;row-gap:12px}.deg_settings_notification_row>.deg_settings_control{flex-basis:100%}.deg_settings_events_dropdown{flex:1 1 100%}.deg_settings_events_panel{left:0;right:auto}}.deg_subagent_metadata{display:block;box-sizing:border-box;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary,var(--dsw-alias-label-primary));font-size:11px;line-height:16px}.deg_full_system_prompt_root[data-open]{padding-bottom:4px}.deg_full_system_prompt_chevron{color:var(--dsw-alias-label-secondary)}.deg_full_system_prompt_body{box-sizing:border-box;width:calc(100% - 22px - var(--dsh-content-font-delta, 0px));margin:4px 0 0 calc(22px + var(--dsh-content-font-delta, 0px));max-height:141px;overflow:auto;padding:10px 16px 12px 12px;border:none;border-radius:8px;background:var(--dsw-alias-markdown-code-block);color:var(--dsw-alias-label-tertiary);font:400 11px/16px var(--ds-font-family-code)}.deg_full_system_prompt{box-sizing:border-box;margin:0;white-space:pre-wrap;overflow-wrap:anywhere}"+
+".deg_mc_section{display:flex;flex-direction:column;gap:10px;padding:14px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}.deg_mc_header{display:flex;align-items:center;gap:8px;min-width:0}.deg_mc_toggle{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;padding:0;color:var(--dsw-alias-label-primary);background:transparent;border:none;font:inherit;font-size:13px;line-height:20px;font-weight:600;text-align:left;cursor:pointer}.deg_mc_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}.deg_mc_chevron{flex:0 0 auto;color:var(--dsw-alias-label-secondary)}.deg_mc_body{display:flex;flex-direction:column;gap:10px;min-width:0}.deg_mc_cards{display:flex;flex-direction:column;gap:8px;margin:0;padding:0;list-style:none}.deg_mc_card{display:flex;flex-direction:column;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}.deg_mc_card_head{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}.deg_mc_card_name{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}.deg_mc_card_route{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);font-family:var(--ds-font-family-code,inherit)}.deg_mc_card_actions{display:flex;align-items:center;gap:8px;margin-left:auto}.deg_mc_card_actions .deg_btn{flex:0 0 auto;min-width:64px}.deg_mc_card_actions .deg_mc_delete_btn{color:var(--dsw-alias-state-error-primary,#ef4444)}.deg_mc_dot[data-state=available]{background:var(--dsw-alias-state-success-primary,#22c55e)}.deg_mc_dot{display:inline-block;width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--dsw-alias-label-secondary)}.deg_mc_field{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,240px);align-items:center;gap:12px}.deg_mc_field_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary)}.deg_mc_input,.deg_mc_select{box-sizing:border-box;width:100%;min-width:0;padding:6px 8px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}.deg_mc_input:disabled,.deg_mc_select:disabled{opacity:.5;cursor:not-allowed}.deg_mc_input:focus-visible,.deg_mc_select:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}.deg_mc_models{display:flex;flex-direction:column;gap:8px;min-width:0;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2)}.deg_mc_models_head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}.deg_mc_models_title{font-size:12px;line-height:18px;font-weight:600;color:var(--dsw-alias-label-primary)}.deg_mc_models_meta{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}.deg_mc_models_head .deg_btn{margin-left:auto;flex:0 0 auto;min-width:auto}.deg_mc_model{display:flex;flex-direction:column;gap:6px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1)}.deg_mc_model_main{display:flex;align-items:center;gap:6px;min-width:0}.deg_mc_model_main .deg_mc_input{flex:1 1 0;min-width:0}.deg_mc_icon_btn{flex:0 0 auto;min-width:auto;width:26px;height:26px;padding:0;line-height:1}.deg_mc_model_advanced{display:grid;grid-template-columns:max-content minmax(64px,1fr) max-content minmax(64px,1fr);column-gap:8px;row-gap:8px;padding-top:6px;border-top:1px dashed var(--dsw-alias-border-l2)}.deg_mc_model_advanced>.deg_mc_field{display:contents}.deg_mc_model_advanced>.deg_mc_field .deg_mc_field_label{align-self:center;min-width:0}.deg_mc_model_advanced>.deg_mc_field .deg_mc_input{min-width:0;text-align:center}.deg_mc_model_advanced>.deg_mc_efforts{grid-column:1 / -1}@media (max-width:640px){.deg_mc_model_advanced{grid-template-columns:max-content minmax(64px,1fr)}.deg_mc_model_advanced>.deg_mc_efforts{grid-column:1 / -1}}.deg_mc_efforts{margin:0;padding:0;border:none;min-width:0}.deg_mc_efforts_label{padding:0;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}.deg_mc_efforts_row{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px}.deg_mc_effort{display:inline-flex;align-items:center;gap:4px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);cursor:pointer}.deg_mc_effort input{width:14px;height:14px;accent-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}.deg_mc_input_types{display:flex;flex-wrap:wrap;gap:10px}.deg_mc_hint{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}"+
+".deg_mc_error,.deg_remove_confirm_error{font-size:12px;line-height:18px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));white-space:pre-wrap}.deg_mc_card_footer{display:flex;align-items:center;gap:8px;padding-top:2px}.deg_mc_card_footer .deg_mc_status{margin-right:auto}.deg_mc_card_footer .deg_btn{flex:0 0 auto;min-width:76px}.deg_mc_conflict{display:flex;flex-direction:column;gap:6px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}.deg_mc_conflict_actions{display:flex;gap:8px}.deg_mc_conflict_actions .deg_btn{flex:0 0 auto;min-width:96px}.deg_mc_add{display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%}.deg_mc_add .deg_mc_select{width:auto;min-width:160px;flex:0 1 auto}"+
+".deg_mc_entries{display:flex;align-items:center;gap:8px;flex:1 1 100%;width:100%;min-width:0}.deg_mc_entries>.deg_btn{flex:1 1 0;min-width:0;border-style:dashed}.deg_mc_entries>.deg_btn::before{content:\"+\";display:inline-block;margin-right:4px;font-size:16px;line-height:1}.deg_mc_create{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-2)}.deg_mc_create_head{display:flex;align-items:center;gap:8px;min-width:0}.deg_mc_create_title{font-size:13px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary)}.deg_mc_field_error{border-color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}.deg_mc_field_row{display:flex;flex-direction:column;gap:4px;min-width:0}.deg_mc_field_message{font-size:11px;line-height:16px;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171))}.deg_mc_create_footer{display:flex;align-items:center;gap:8px;padding-top:2px}.deg_mc_create_footer .deg_mc_status{margin-right:auto}.deg_mc_create_footer .deg_btn{flex:0 0 auto;min-width:88px}.deg_mc_modal_backdrop{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.45)}.deg_mc_modal{display:flex;flex-direction:column;gap:12px;width:min(100%,380px);max-height:min(80vh,420px);box-sizing:border-box;padding:18px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px;box-shadow:0 12px 28px rgba(0,0,0,.28)}.deg_mc_modal_header{display:flex;align-items:center;gap:8px;min-width:0}.deg_mc_modal_title{flex:1 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;color:var(--dsw-alias-label-primary)}.deg_mc_modal_close{flex:0 0 auto;width:28px;height:28px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:20px;line-height:28px;cursor:pointer}.deg_mc_modal_close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.deg_mc_modal_description{margin:0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}.deg_mc_candidate_toolbar{display:flex;align-items:center;gap:8px;min-width:0}.deg_mc_candidate_search{flex:1 1 auto;min-width:0}.deg_mc_candidate_toolbar .deg_btn{flex:0 0 auto;min-width:auto;white-space:nowrap}.deg_mc_candidate_list{display:flex;flex-direction:column;gap:2px;max-height:240px;margin:0;overflow:auto;padding:0;list-style:none}.deg_mc_candidate_item{border-radius:6px}.deg_mc_candidate_label{display:flex;align-items:center;gap:8px;padding:6px 8px;color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px;cursor:pointer}.deg_mc_candidate_id{flex:1 1 auto;min-width:0;overflow-wrap:anywhere;font-family:var(--ds-font-family-code,inherit)}.deg_mc_candidate_empty{margin:18px 0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;text-align:center}.deg_mc_modal_footer{display:flex;justify-content:flex-end;gap:8px;padding-top:2px}.deg_mc_modal_footer .deg_btn{flex:0 0 auto;min-width:76px}"+
+"[data-deg-settings-nav-native]{display:none}[data-deg-settings-nav-icon]{flex:none}"+
+".deg_pd{display:flex;flex-direction:column;gap:12px;width:min(100%,760px);min-width:0;box-sizing:border-box;color:var(--dsw-alias-label-primary)}.deg_pd_title{font-size:14px;line-height:22px;font-weight:600;margin:0}.deg_pd_roles{display:flex;flex-direction:column;gap:0;list-style:none;margin:0;padding:0}.deg_pd_roles_header{display:grid;grid-template-columns:minmax(84px,.7fr) minmax(0,1.6fr) auto;gap:10px;padding:6px 0 2px;border-top:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px;line-height:16px}.deg_pd_roles_header span{min-width:0}.deg_pd_roles_header span:last-child{text-align:right}.deg_pd_role{display:grid;grid-template-columns:minmax(84px,.7fr) minmax(0,1.6fr) auto;align-items:center;gap:10px;min-height:30px;padding:5px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}.deg_pd_role:last-child{border-bottom:0}.deg_pd_role_name{min-width:0;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}.deg_pd_role_value{min-width:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.deg_pd_role_value[title]{cursor:help}.deg_pd_role_state{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));white-space:nowrap;text-align:right}.deg_pd_role[data-deg-role-state=configured] .deg_pd_role_state{color:var(--dsw-alias-state-success-primary,var(--dsw-alias-label-secondary))}.deg_pd_role[data-deg-role-state=disabled] .deg_pd_role_name,.deg_pd_role[data-deg-role-state=disabled] .deg_pd_role_value{color:var(--dsw-alias-label-secondary)}"+
+".deg_pd_role[data-deg-role-state=incomplete] .deg_pd_role_state{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-label-secondary))}.deg_pd_providers{display:flex;align-items:flex-start;gap:10px;min-width:0;flex-wrap:wrap}.deg_pd_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);flex:0 0 auto}.deg_pd_providers_list{display:flex;align-items:flex-start;gap:6px;flex:1 1 auto;flex-wrap:wrap;min-width:0;max-width:100%}.deg_pd_tag{max-width:100%;box-sizing:border-box;font-size:11px;line-height:16px;padding:1px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}.deg_pd_tag[data-deg-provider-known=false]{border-style:dashed;color:var(--dsw-alias-label-secondary)}.deg_pd_empty{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}.deg_pd_status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0;overflow-wrap:anywhere}.deg_pd_actions{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;padding-top:2px}.deg_pd_actions .deg_pd_open{flex:0 0 auto;min-width:auto}.deg_pd_actions .deg_pd_open:hover:not(:disabled),.deg_pd_actions .deg_pd_open:focus-visible:not(:disabled){color:var(--dsw-alias-label-on-primary,var(--dsw-alias-bg-layer-1));background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));filter:brightness(1.08)}.deg_pd_actions .deg_pd_open:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:2px}.deg_pd_actions .deg_pd_open:disabled{opacity:1;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));background:transparent;border-color:var(--dsw-alias-border-l2)}.deg_pd_note{min-width:0;flex:1 1 220px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}"+
 "@media (max-width:480px){.deg_pd_roles_header,.deg_pd_role{grid-template-columns:minmax(72px,auto) minmax(0,1fr);column-gap:8px}.deg_pd_roles_header{padding-top:5px}.deg_pd_roles_header span:last-child{grid-column:2;text-align:left}.deg_pd_role{align-items:start;row-gap:2px;padding:7px 0}.deg_pd_role_name{grid-row:1 / span 2;align-self:start}.deg_pd_role_value{white-space:normal;overflow-wrap:anywhere;text-overflow:clip}.deg_pd_role_state{grid-column:2;justify-self:start;text-align:left}}"+
 ".deg_settings_model_tabs{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0;padding:0 0 8px;border-bottom:1px solid var(--dsw-alias-border-l2)}"+
-".deg_settings_model_tab{display:inline-flex;align-items:center;gap:6px;height:28px;box-sizing:border-box;padding:0 10px;color:var(--dsw-alias-label-secondary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:13px;line-height:20px;cursor:pointer;user-select:none;touch-action:none}"+
-".deg_settings_model_tab:hover{background:var(--dsw-alias-interactive-bg-hover)}"+
-".deg_settings_model_tab:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}"+
-".deg_settings_model_tab[aria-selected=true]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-secondary,var(--dsw-alias-bg-layer-2));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}"+
-".deg_settings_model_tab[data-dragging=true]{opacity:.55;cursor:grabbing}"+
-".deg_settings_model_tab_remove{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:14px;line-height:1;cursor:pointer}"+
-".deg_settings_model_tab_remove:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}"+
-".deg_settings_model_tab_remove:disabled{opacity:.45;cursor:not-allowed}"+
-".deg_settings_model_tab_add{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px dashed var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:16px;line-height:1;cursor:pointer}"+
-".deg_settings_model_tab_add:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}"+
-".deg_settings_model_tab_add:disabled{opacity:.45;cursor:not-allowed}"+
-".deg_settings_model_tab_drop{flex:0 0 2px;align-self:stretch;min-height:24px;border-radius:1px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}"+
-"@media (max-width:520px){.deg_settings_model_tabs{gap:4px}}";
+".deg_settings_model_tab{display:inline-flex;align-items:center;gap:6px;height:28px;box-sizing:border-box;padding:0 10px;color:var(--dsw-alias-label-secondary);background:transparent;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:13px;line-height:20px;cursor:pointer;user-select:none;touch-action:none}.deg_settings_model_tab:hover{background:var(--dsw-alias-interactive-bg-hover)}.deg_settings_model_tab:focus-visible{outline:2px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));outline-offset:1px}.deg_settings_model_tab[aria-selected=true]{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-secondary,var(--dsw-alias-bg-layer-2));border-color:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-secondary))}"+
+".deg_settings_model_tab[data-dragging=true]{opacity:.55;cursor:grabbing}.deg_settings_model_tab_remove{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:14px;line-height:1;cursor:pointer}.deg_settings_model_tab_remove:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.deg_settings_model_tab_remove:disabled{opacity:.45;cursor:not-allowed}.deg_settings_model_tab_add{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px dashed var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:16px;line-height:1;cursor:pointer}.deg_settings_model_tab_add:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.deg_settings_model_tab_add:disabled{opacity:.45;cursor:not-allowed}"+
+".deg_settings_model_tab_drop{flex:0 0 2px;align-self:stretch;min-height:24px;border-radius:1px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}@media (max-width:520px){.deg_settings_model_tabs{gap:4px}}"+
+".deg_settings_model_tablist{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0;flex:1 1 auto}.deg_settings_peak_valley_entry{margin-left:auto;white-space:nowrap}.deg_settings_peak_valley_entry_active,.deg_expert_group_header_peak_valley:not([data-peak-valley=disabled]){border:1px solid var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}"+
+".deg_settings_pv_period_toggle{display:flex;align-items:center;gap:6px;margin-left:auto;flex:0 0 auto;min-width:0}.deg_settings_pv_period_toggle .deg_btn{flex:0 0 auto;height:28px;min-height:28px;padding:0 10px;font-size:13px;line-height:20px;white-space:nowrap}"+
+".deg_settings_peak_valley_periods,.deg_settings_peak_valley_period_list{display:flex;flex-direction:column;gap:10px;min-width:0}"+
+".deg_settings_peak_valley_period_list .deg_btn{flex:0 0 auto;margin-left:auto}"+
+".deg_settings_pv_footer{flex-wrap:wrap;row-gap:8px}.deg_settings_pv_footer .deg_btn{flex:0 0 20%}.deg_settings_pv_footer .deg_settings_status{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}@media (max-width:520px){.deg_settings_pv_footer{row-gap:6px}}";
 const cssTagId="dsh-expert-group/settings.module.css";
 const cssInjectedDocuments=typeof WeakSet==="function"?new WeakSet():null;
 function ensurePluginStylesheet(){
@@ -13557,35 +13492,33 @@ const values=nativeStatusSessionValues(node,boundary);
 const expected=String(sessionId);
 return(!requireEvidence||values.length>0)&&values.every((value)=>value===expected);
 }
+function nativeScopeExactSelection(scopes,sessionId){
+return sessionId===void 0||sessionId===null
+?[]
+:scopes.filter((scope)=>nativeStatusScopeIds(scope).includes(String(sessionId)));
+}
+function selectNativeScopeCandidate(scopes,sessionId){
+const exact=nativeScopeExactSelection(scopes,sessionId);
+const tagged=scopes.filter((scope)=>nativeStatusScopeIds(scope).length>0);
+const isVisible=(scope)=>typeof scope?.getClientRects==="function"&&scope.getClientRects().length>0;
+if(exact.length===1)return exact[0];
+if(exact.length>1){
+const visible=exact.filter(isVisible);
+return visible.length===1?visible[0]:void 0;
+}
+if(tagged.length>0)return void 0;
+if(scopes.length===1)return scopes[0];
+const visible=scopes.filter(isVisible);
+return visible.length===1?visible[0]:void 0;
+}
 function findNativeConversationScope(root,sessionId,anchor){
 const anchoredScope=anchor?.closest?.("[data-conversation-scroll]");
 if(anchoredScope!==null&&anchoredScope!==void 0)return anchoredScope;
-const scopes=[];
-if(root?.matches?.("[data-conversation-scroll]"))scopes.push(root);
-for(const scope of Array.from(root?.querySelectorAll?.("[data-conversation-scroll]")??[])){
-if(!scopes.includes(scope))scopes.push(scope);
-}
+const scopes=collectNativeConversationScopes(root);
 if(scopes.length===0){
 return root;
 }
-const scopeIds=(scope)=>nativeStatusScopeIds(scope);
-const exact=sessionId===void 0||sessionId===null
-?[]
-:scopes.filter((scope)=>scopeIds(scope).includes(String(sessionId)));
-const tagged=scopes.filter((scope)=>scopeIds(scope).length>0);
-let candidates=[];
-if(exact.length===1){
-candidates=exact;
-}else if(exact.length>1){
-const visible=exact.filter((scope)=>typeof scope?.getClientRects==="function"&&scope.getClientRects().length>0);
-if(visible.length===1)candidates=visible;
-}else if(tagged.length===0&&scopes.length===1){
-candidates=scopes;
-}else if(tagged.length===0){
-const visible=scopes.filter((scope)=>typeof scope?.getClientRects==="function"&&scope.getClientRects().length>0);
-if(visible.length===1)candidates=visible;
-}
-return candidates.length===1?candidates[0]:void 0;
+return selectNativeScopeCandidate(scopes,sessionId);
 }
 const localClassTokenPatterns=new Map();
 function hasLocalClassToken(className,localName){
@@ -13821,10 +13754,7 @@ if(scopes.length===0){
 const textNode=findNativeTurnStatusTextNode(root,sessionId,true);
 return textNode===void 0?void 0:{visibleText:textNode,shimmerAttributes:[],announcements:[]};
 }
-const exact=sessionId===void 0||sessionId===null
-?[]
-:scopes.filter((scope)=>nativeStatusScopeIds(scope).includes(String(sessionId)));
-const tagged=scopes.filter((scope)=>nativeStatusScopeIds(scope).length>0);
+const exact=nativeScopeExactSelection(scopes,sessionId);
 if(includeSameSessionScopes&&exact.length>1){
 const resolved=exact
 .filter((scope)=>nativeScopeSessionId(scope)===String(sessionId))
@@ -13837,20 +13767,9 @@ shimmerAttributes:resolved.flatMap((targets)=>targets.shimmerAttributes),
 announcements:resolved.flatMap((targets)=>targets.announcements),
 };
 }
-let candidates=[];
-if(exact.length===1){
-candidates=exact;
-}else if(exact.length>1){
-const visible=exact.filter((scope)=>typeof scope?.getClientRects==="function"&&scope.getClientRects().length>0);
-if(visible.length===1)candidates=visible;
-}else if(tagged.length===0&&scopes.length===1){
-candidates=scopes;
-}else if(tagged.length===0){
-const visible=scopes.filter((scope)=>typeof scope?.getClientRects==="function"&&scope.getClientRects().length>0);
-if(visible.length===1)candidates=visible;
-}
-if(candidates.length!==1)return void 0;
-return resolveNativeStatusScopeTargets(candidates[0],sessionId);
+const candidate=selectNativeScopeCandidate(scopes,sessionId);
+if(candidate===void 0)return void 0;
+return resolveNativeStatusScopeTargets(candidate,sessionId);
 }
 function findNativeStatusTextNode(root,sessionId){
 return resolveNativeStatusTargets(root,sessionId)?.visibleText;
@@ -14361,7 +14280,31 @@ function modelCandidatesErrorMessage(t,roleLabelOf,validation){
 if(validation.code==="limit")return t("settings.modelCandidates.limit");
 return(typeof roleLabelOf==="function"?roleLabelOf(validation.role):validation.role)+"："+t("settings.modelCandidates.error."+(validation.code??"incomplete"),{index:validation.index});
 }
-function normalizeSettingsDraft(value,roles,allowLegacyProviderFallback=true){
+const DEFAULT_PEAK_VALLEY_PERIODS=Object.freeze([
+Object.freeze({start:"08:00",end:"12:00"}),
+Object.freeze({start:"14:00",end:"18:00"}),
+]);
+const NEXT_PEAK_VALLEY_PERIOD=Object.freeze({start:"19:00",end:"22:00"});
+function normalizePeakValleyDraft(value,seedPeriods=false){
+const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
+const invalidCode=typeof source.invalidCode==="string"&&source.invalidCode.length>0
+?source.invalidCode
+:void 0;
+const periods=Array.isArray(source.periods)?source.periods:[];
+const seedDefaults=seedPeriods===true
+&&invalidCode===void 0
+&&source.enabled!==true
+&&periods.length===0;
+return JSON.parse(JSON.stringify({
+enabled:source.enabled===true,
+initialized:source.initialized===true,
+periods:seedDefaults?DEFAULT_PEAK_VALLEY_PERIODS:periods,
+peak:source.peak!==null&&typeof source.peak==="object"?source.peak:{},
+valley:source.valley!==null&&typeof source.valley==="object"?source.valley:{},
+...(invalidCode===void 0?{}:{invalidCode}),
+}));
+}
+function normalizeSettingsDraft(value,roles,allowLegacyProviderFallback=true,seedPeakValleyPeriods=false){
 const source=value&&typeof value==="object"?value:{};
 const configuredProvider=typeof source.provider==="string"?source.provider:"";
 const activeRoles=settingsRolesForProvider(roles);
@@ -14414,6 +14357,9 @@ sidebarEntryEnabled:source.sidebarEntryEnabled!==false,
 ...(Object.prototype.hasOwnProperty.call(source,"fallbackLimit")
 ?{fallbackLimit:normalizeModelFallbackLimitDraft(source.fallbackLimit)}
 :{}),
+...(Object.prototype.hasOwnProperty.call(source,"peakValley")
+?{peakValley:normalizePeakValleyDraft(source.peakValley,seedPeakValleyPeriods)}
+:{}),
 };
 }
 function settingsDraftEqual(left,right){
@@ -14433,6 +14379,7 @@ const SETTINGS_DRAFT_MERGE_FIELDS=Object.freeze([
 "sidebarEntryEnabled",
 "candidates",
 "fallbackLimit",
+"peakValley",
 ]);
 function mergeSettingsDraftOverSource(source,local,baseline){
 const merged={...source};
@@ -14702,13 +14649,14 @@ return enabled.filter((role,index)=>enabled.indexOf(role)===index);
 },[hostMeta]);
 }
 global[SYMBOL]=Object.freeze({
-DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,
+DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PEAK_VALLEY_PERIODS,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,
+NEXT_PEAK_VALLEY_PERIOD,
 NOTIFICATION_EVENT_TYPES,PROMPT_ROLE_IDS,PROMPT_WARNING_RATIO,SETTINGS_ROLE_LABELS,addModelCandidatePage,
 bindClientRuntime,clampNotificationVolume,commitSettingsCandidate,compactModelCandidatesDraft,countUnicodeGraphemes,
 createSettingsModelCatalog,mergeSettingsDraftOverSource,migrateSettingsDefaults,migrateSettingsSelection,modelCandidatesErrorMessage,
 resolveSettingsForm,
 modelLayerMapOf,modelLayerSelectionOf,modelPageCountOf,normalizeModelCandidatesDraft,normalizeModelFallbackLimitDraft,
-normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsCommitDraft,normalizeSettingsDraft,normalizeSettingsModelGroups,
+normalizePeakValleyDraft,normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsCommitDraft,normalizeSettingsDraft,normalizeSettingsModelGroups,
 promptEntryOf,promptOverridesEqual,removeModelCandidatePage,reorderModelLayers,setModelLayerSelection,
 settingsDraftEqual,settingsRolesForProvider,syncSettingsDefaultsProvider,unifiedProviderOf,updateRolePromptProjection,
 useEnabledSettingsRoles,useHostMeta,validateModelCandidateRows,validatePromptText,
@@ -15682,15 +15630,18 @@ const SYMBOL=Symbol.for("dsh-expert-group/client-settings-main-b");
 const clientSettingsNormalizeSymbol=Symbol.for("dsh-expert-group/client-settings-normalize");
 const clientSettingsNormalize=global[clientSettingsNormalizeSymbol]||{};
 const{
-DEFAULT_MODEL_FALLBACK_LIMIT,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,NOTIFICATION_EVENT_TYPES,PROMPT_WARNING_RATIO,
+DEFAULT_MODEL_FALLBACK_LIMIT,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,NEXT_PEAK_VALLEY_PERIOD,
+NOTIFICATION_EVENT_TYPES,PROMPT_WARNING_RATIO,
 clampNotificationVolume,migrateSettingsSelection,modelLayerSelectionOf,normalizeRolePromptProjection,normalizeSettingsDraft,promptEntryOf,
 setModelLayerSelection,settingsRolesForProvider,syncSettingsDefaultsProvider,validatePromptText,
 }=clientSettingsNormalize;
 let react=null;
 let ModelConfigSection=null;
+let peakValleyTime=null;
 function bindClientRuntime(host){
 react=host.react??null;
 ModelConfigSection=host.ModelConfigSection??null;
+peakValleyTime=host.peakValleyTime??null;
 }
 function renderSettingsTail(view){
 const{closePrompt,selectedPromptRole,settingsSnapshot}=view;
@@ -15718,6 +15669,9 @@ react.createElement("p",{className:"deg_settings_error",role:"status"},"设置 n
 const promptEditor=renderSettingsPromptEditor(view,actions);
 const leaveDialog=renderSettingsLeaveDialog(view,actions);
 if(selectedPromptRole!==null)return react.createElement(react.Fragment,null,promptEditor,leaveDialog);
+if(view.peakValleyOpen===true&&typeof view.peakValleyViewOf==="function"){
+return renderPeakValleySettings(view.peakValleyViewOf(view));
+}
 return renderSettingsBody(view,actions);
 }
 function createSettingsTailActions(view){
@@ -15732,7 +15686,7 @@ settingsSnapshot,
 const discard=()=>{
 const snapshot=settingsForm.getSnapshot();
 const refreshedProjection=normalizeRolePromptProjection(hostMeta?.rolePrompts,authorityValue,true,promptRoleIds)??promptProjection;
-setDraft(normalizeSettingsDraft(authorityValue,roles));
+setDraft(normalizeSettingsDraft(authorityValue,roles,true,true));
 setCandidatesError(null);
 setPromptDrafts({});
 setPromptTouched({});
@@ -15766,7 +15720,7 @@ setPromptError("最新提示词配置不可用，请稍后重试");
 return;
 }
 setLocalPromptProjection(null);
-setDraft(normalizeSettingsDraft(snapshot.value,roles));
+setDraft(normalizeSettingsDraft(snapshot.value,roles,true,true));
 setPromptDrafts({});
 setPromptTouched({});
 setEditorBaseline({role:selectedPromptRole,value:snapshot.value,revision:snapshot.revision,projection});
@@ -15899,6 +15853,16 @@ onClick:actions.restorePromptDefault,
 },"恢复默认")));
 return promptEditor;
 }
+function trapDialogTabFocus(event){
+const controls=Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]")??[]);
+if(controls.length===0)return;
+const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
+const nextIndex=event.shiftKey
+?(current<=0?controls.length-1:current-1)
+:(current>=controls.length-1?0:current+1);
+event.preventDefault?.();
+try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
+}
 function renderSettingsLeaveDialog(view,actions){
 const{
 applyPromptNavigation,baselineProjection,dismissLeaveDialog,editPromptText,leaveCancelRef,leaveIntent,
@@ -15917,14 +15881,7 @@ dismissLeaveDialog();
 return;
 }
 if(event.key!=="Tab")return;
-const controls=Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]")??[]);
-if(controls.length===0)return;
-const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
-const nextIndex=event.shiftKey
-?(current<=0?controls.length-1:current-1)
-:(current>=controls.length-1?0:current+1);
-event.preventDefault?.();
-try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
+trapDialogTabFocus(event);
 },
 },
 react.createElement("h3",null,"未保存的修改"),
@@ -16124,10 +16081,29 @@ onChange:updateReasoning,
 return react.createElement("div",{className:"deg_settings_table_wrap"},
 react.createElement("div",{className:"deg_settings_table"},header,rows));
 }
+function renderPeakValleyPeriodToggle(view){
+const{
+peakValleyPeriod,saving,setPeakValleyPeriod,tExtra,
+}=view;
+const toggleButtons=["peak","valley"].map((period)=>react.createElement("button",{
+key:period,
+type:"button",
+className:"deg_btn deg_settings_peak_valley_period"+(period===peakValleyPeriod?" deg_btn_primary":""),
+"data-deg-peak-valley-period":period,
+"aria-pressed":period===peakValleyPeriod,
+disabled:saving,
+onClick:()=>setPeakValleyPeriod(period),
+},tExtra(period==="peak"?"settings.pv.peak":"settings.pv.valley")));
+return react.createElement("div",{
+className:"deg_settings_pv_period_toggle",
+"data-deg-peak-valley-periods-toggle":"true",
+},toggleButtons);
+}
 function renderSettingsModelTabs(view){
 const{
-addModelPage,beginModelTabDrag,currentModelPage,modelPageCount,modelPageLabelOf,modelTabDrag,
-modelTabRefs,requestModelPageDelete,saving,selectModelPage,settingsReadOnly,tExtra,
+addModelPage,beginModelTabDrag,currentModelPage,draft,modelPageCount,modelPageLabelOf,modelTabDrag,
+modelTabRefs,peakValleyEntry,requestModelPageDelete,saving,selectModelPage,setPeakValleyOpen,
+settingsReadOnly,tExtra,
 }=view;
 const modelTabChildren=[];
 for(let page=0;page<modelPageCount;page+=1){
@@ -16192,12 +16168,32 @@ title:modelPageCount>=MAX_MODEL_PAGES?tExtra("settings.modelTabs.limit"):tExtra(
 disabled:saving||settingsReadOnly||modelPageCount>=MAX_MODEL_PAGES,
 onClick:()=>addModelPage(),
 },"+"));
+const peakValleyState=view.peakValleyState??draft?.peakValley??{};
+const peakValleyEnabled=peakValleyState.enabled===true;
+const shownPeriod=view.livePeriod??view.mainPeriod;
+const peakValleySuffix=peakValleyEnabled
+?" "+tExtra(shownPeriod==="peak"?"settings.pv.peak":"settings.pv.valley")
+:"";
+const peakValleyEntryButton=peakValleyEntry===false?null:react.createElement("button",{
+type:"button",
+className:"deg_settings_model_tab deg_settings_peak_valley_entry"+(peakValleyEnabled?" deg_settings_peak_valley_entry_active":""),
+"data-deg-peak-valley-entry":"true",
+"data-enabled":peakValleyEnabled?"true":"false",
+disabled:saving,
+onClick:()=>setPeakValleyOpen(true),
+},tExtra("settings.pv.entry")+peakValleySuffix);
+const periodToggleSlot=view.peakValleyOpen===true?renderPeakValleyPeriodToggle(view):null;
 const modelTabRow=react.createElement("div",{
 className:"deg_settings_model_tabs",
 "data-deg-model-tabs":"true",
+},
+react.createElement("div",{
+className:"deg_settings_model_tablist",
 role:"tablist",
 "aria-label":tExtra("settings.modelTabs.primary")+" / "+tExtra("settings.modelTabs.candidate",{index:MAX_MODEL_CANDIDATES_PER_ROLE}),
-},modelTabChildren);
+},modelTabChildren),
+peakValleyEntryButton,
+periodToggleSlot);
 return modelTabRow;
 }
 function renderSettingsModelDeleteDialog(view){
@@ -16222,14 +16218,7 @@ cancelModelPageDelete();
 return;
 }
 if(event?.key!=="Tab")return;
-const controls=Array.from(event.currentTarget?.querySelectorAll?.("[data-deg-dialog-action]")??[]);
-if(controls.length===0)return;
-const current=controls.indexOf(typeof document==="undefined"?null:document.activeElement);
-const nextIndex=event.shiftKey
-?(current<=0?controls.length-1:current-1)
-:(current>=controls.length-1?0:current+1);
-event.preventDefault?.();
-try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
+trapDialogTabFocus(event);
 },
 },
 react.createElement("h3",null,tExtra("settings.modelTabs.remove.title")),
@@ -16254,6 +16243,129 @@ disabled:saving,
 onClick:()=>confirmModelPageDelete(),
 },"删除"))));
 return modelPageDeleteDialog;
+}
+function renderPeakValleySettings(view){
+const{
+editPeakValley,error,hasUnsavedChanges,saved,saving,
+setPeakValleyOpen,settingsReadOnly,t,tExtra,
+}=view;
+const state=view.peakValleyState??{};
+const periods=Array.isArray(state.periods)?state.periods:[];
+const broken=typeof state.invalidCode==="string";
+const maxPeriods=peakValleyTime?.MAX_PEAK_VALLEY_PERIODS??3;
+const check=peakValleyTime?.normalizePeakValleyPeriods?.(periods)??{ok:true};
+const invalidMessage=check.ok!==true
+?tExtra("settings.pv.invalid",{reason:check.reason})
+:broken?tExtra("settings.pv.repairHint"):null;
+const noValley=periods.length===0||peakValleyTime?.peakValleyPeriodsCoverFullDay?.(periods)===true;
+const editPeriod=(index,field,value)=>editPeakValley((previous)=>({
+...previous,
+periods:previous.periods.map((entry,position)=>(position===index?{...entry,[field]:value}:entry)),
+}));
+const periodRows=periods.map((entry,index)=>react.createElement("div",{
+key:"period-"+index,
+className:"deg_settings_task_row",
+"data-deg-peak-valley-period-row":String(index),
+},
+react.createElement("span",{className:"deg_settings_label"},String(index+1)+". "+tExtra("settings.pv.start")),
+react.createElement("input",{
+type:"time",
+"aria-label":tExtra("settings.pv.start")+(index+1),
+value:typeof entry?.start==="string"?entry.start:"",
+disabled:saving||settingsReadOnly,
+onChange:(event)=>editPeriod(index,"start",String(event?.target?.value??"")),
+}),
+react.createElement("span",{className:"deg_settings_label"},tExtra("settings.pv.end")),
+react.createElement("input",{
+type:"time",
+"aria-label":tExtra("settings.pv.end")+(index+1),
+value:typeof entry?.end==="string"?entry.end:"",
+disabled:saving||settingsReadOnly,
+onChange:(event)=>editPeriod(index,"end",String(event?.target?.value??"")),
+}),
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+"aria-label":tExtra("settings.pv.remove.aria")+(index+1),
+disabled:saving||settingsReadOnly,
+onClick:()=>editPeakValley((previous)=>({
+...previous,
+periods:previous.periods.filter((unused,position)=>position!==index),
+})),
+},tExtra("settings.pv.remove"))));
+const enabled=state.enabled===true;
+return react.createElement("div",{className:"deg_settings","data-deg-peak-valley":"true"},
+react.createElement("div",{className:"deg_prompt_footer"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_prompt_back",
+"aria-label":"返回模型设置",
+disabled:saving,
+onClick:()=>setPeakValleyOpen(false),
+},"← "+tExtra("settings.pv.back")),
+react.createElement("h2",{className:"deg_settings_title"},tExtra("settings.pv.entry"))),
+state.initialized===true?null:react.createElement("p",{
+className:"deg_settings_hint",
+"data-deg-peak-valley-uninit":"true",
+},tExtra("settings.pv.uninit")),
+react.createElement("div",{className:"deg_settings_task_row"},
+react.createElement("label",{className:"deg_settings_checkbox"},
+react.createElement("input",{
+type:"checkbox",
+"aria-label":tExtra("settings.pv.enable"),
+checked:enabled,
+disabled:saving||settingsReadOnly,
+onChange:(event)=>editPeakValley((previous)=>({...previous,enabled:event.target.checked===true})),
+}),
+react.createElement("span",{className:"deg_settings_label"},tExtra("settings.pv.enable")))),
+react.createElement("div",{className:"deg_settings_peak_valley_periods","data-deg-peak-valley-periods":"true"},
+react.createElement("div",{className:"deg_settings_task_row"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+"data-deg-peak-valley-add":"true",
+disabled:saving||settingsReadOnly||periods.length>=maxPeriods,
+onClick:()=>editPeakValley((previous)=>({
+...previous,
+periods:previous.periods.length>=maxPeriods
+?previous.periods
+:[...previous.periods,{...NEXT_PEAK_VALLEY_PERIOD}],
+})),
+},tExtra("settings.pv.add")),
+noValley?react.createElement("p",{className:"deg_settings_hint",role:"status"},tExtra("settings.pv.noValley")):null),
+react.createElement("div",{className:"deg_settings_peak_valley_period_list"},periodRows)),
+renderSettingsUnifiedRow(view),
+renderSettingsModelTabs(view),
+renderSettingsRoleTable(view),
+invalidMessage===null?null:react.createElement("p",{className:"deg_settings_error",role:"alert"},invalidMessage),
+error?react.createElement("p",{className:"deg_settings_error",role:"status"},error):null,
+renderSettingsModelDeleteDialog(view),
+react.createElement("div",{className:"deg_settings_footer deg_settings_pv_footer"},
+react.createElement("button",{
+type:"button",
+className:"deg_btn",
+"data-deg-peak-valley-back":"true",
+"aria-label":"返回模型设置",
+disabled:saving,
+onClick:()=>setPeakValleyOpen(false),
+},tExtra("settings.pv.back")),
+react.createElement("span",{className:"deg_settings_status",role:"status"},saved?t("settings.saved"):hasUnsavedChanges?t("settings.unsaved"):""),
+broken
+?react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+"data-deg-peak-valley-repair":"true",
+disabled:saving||settingsReadOnly||check.ok!==true,
+onClick:view.saveRepair,
+},tExtra("settings.pv.repair"))
+:null,
+react.createElement("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+"data-deg-peak-valley-save":"true",
+disabled:!hasUnsavedChanges||saving||settingsReadOnly||check.ok!==true||broken,
+onClick:view.save,
+},saving?t("settings.saving"):t("settings.save"))));
 }
 function renderSettingsTaskRow(view){
 const{
@@ -16490,6 +16602,23 @@ roleTimeoutMs:raw===""
 );
 return managementRow;
 }
+function renderMainPeriodHint(view,mainPeriod){
+const{livePeriod,tExtra}=view;
+if(mainPeriod===null||mainPeriod===void 0)return null;
+const labelOf=(period)=>tExtra(period==="peak"?"settings.pv.peak":"settings.pv.valley");
+const editing=labelOf(mainPeriod);
+const crossed=livePeriod!==null&&livePeriod!==void 0&&livePeriod!==mainPeriod;
+return react.createElement(react.Fragment,null,
+react.createElement("p",{className:"deg_settings_hint","data-deg-main-period":mainPeriod},
+tExtra("settings.pv.mainScope",{period:editing})),
+crossed
+?react.createElement("p",{
+className:"deg_settings_hint",
+role:"status",
+"data-deg-main-period-hint":"true",
+},tExtra("settings.pv.boundary",{current:labelOf(livePeriod),editing}))
+:null);
+}
 function renderSettingsBody(view,actions){
 const{
 candidatesError,catalogAvailable,directoryState,draft,error,hasUnsavedChanges,modelConfigHost,modelFieldsChanged,
@@ -16503,17 +16632,26 @@ roleDefaults:normalizeSettingsDraft(settingsSnapshot.value,roles).defaults,
 roleLabelOf,
 defaultOpen:view.modelConfigDefaultOpen===true,
 });
-const modelTabRow=renderSettingsModelTabs(view);
-const modelPageDeleteDialog=renderSettingsModelDeleteDialog(view);
+const lockedPeriod=view.mainPeriod===void 0?null:view.mainPeriod;
+const mainPeriod=lockedPeriod!==null&&draft?.peakValley?.enabled===true?lockedPeriod:null;
+const modelView=mainPeriod===null
+?view
+:view.peakValleyViewOf({...view,peakValleyPeriod:mainPeriod,peakValleyEntry:true});
+const modelTabRow=renderSettingsModelTabs(modelView);
+const modelPageDeleteDialog=renderSettingsModelDeleteDialog(modelView);
 return react.createElement("div",{className:"deg_settings"},
 react.createElement("h2",{className:"deg_settings_title"},t("settings.title")),
 react.createElement("p",{className:"deg_settings_hint"},t("settings.hint")),
-modelConfigSection,
+renderMainPeriodHint(view,mainPeriod),
+view.peakValleyBroken
+?react.createElement("p",{className:"deg_settings_error"},view.tExtra("settings.pv.broken"))
+:null,
+mainPeriod===null?modelConfigSection:null,
 renderSettingsTaskRow(view),
 renderSettingsNotificationRow(view),
-renderSettingsUnifiedRow(view),
+renderSettingsUnifiedRow(modelView),
 modelTabRow,
-renderSettingsRoleTable(view),
+renderSettingsRoleTable(modelView),
 renderSettingsManagementRow(view),
 candidatesError===null||candidatesError===void 0?null:react.createElement("p",{
 className:"deg_settings_error",
@@ -16546,9 +16684,9 @@ const{
 resolveSettingsLocale,settingsExtraText,settingsText,
 }=clientText;
 const{
-DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_PAGES,PROMPT_ROLE_IDS,SETTINGS_ROLE_LABELS,addModelCandidatePage,
+DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PEAK_VALLEY_PERIODS,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_PAGES,PROMPT_ROLE_IDS,SETTINGS_ROLE_LABELS,addModelCandidatePage,
 commitSettingsCandidate,compactModelCandidatesDraft,mergeSettingsDraftOverSource,modelCandidatesErrorMessage,modelLayerMapOf,modelPageCountOf,
-normalizeModelCandidatesDraft,normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsCommitDraft,normalizeSettingsDraft,promptEntryOf,
+normalizeModelCandidatesDraft,normalizePeakValleyDraft,normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsCommitDraft,normalizeSettingsDraft,promptEntryOf,
 promptOverridesEqual,removeModelCandidatePage,reorderModelLayers,settingsDraftEqual,unifiedProviderOf,updateRolePromptProjection,
 useEnabledSettingsRoles,useHostMeta,validateModelCandidateRows,validatePromptText,
 }=clientSettingsNormalize;
@@ -16556,8 +16694,10 @@ const{
 renderSettingsTail,
 }=clientSettingsMainB;
 let react=null;
+let peakValleyTime=null;
 function bindClientRuntime(host){
 react=host.react??null;
+peakValleyTime=host.peakValleyTime??null;
 }
 function useSettingsLeaveFocus(view){
 react.useEffect(()=>{
@@ -16565,9 +16705,87 @@ if(view.leaveIntent===null)return;
 try{view.leaveCancelRef.current?.focus?.();}catch{}
 },[view.leaveIntent]);
 }
+function emptyPeakValleyDraft(){
+return{
+enabled:false,
+initialized:false,
+periods:JSON.parse(JSON.stringify(DEFAULT_PEAK_VALLEY_PERIODS)),
+peak:{provider:"",defaults:{},candidates:{},fallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT},
+valley:{provider:"",defaults:{},candidates:{},fallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT},
+};
+}
+function peakValleyViewOf(view){
+const{draft,editDraft,peakValleyPages,peakValleyPeriod,roles,setPeakValleyPages}=view;
+const state=draft.peakValley??emptyPeakValleyDraft();
+const profile=state[peakValleyPeriod]??emptyPeakValleyDraft()[peakValleyPeriod];
+const modelPageCount=modelPageCountOf(profile);
+const pages=peakValleyPages??{};
+const sub={
+...view,
+currentModelPage:Math.min(pages[peakValleyPeriod]??0,modelPageCount-1),
+draft:profile,
+modelPageCount,
+peakValleyEntry:view.peakValleyEntry===true,
+peakValleyState:state,
+unifiedProvider:unifiedProviderOf(profile.defaults,roles,profile.provider),
+};
+sub.editDraft=(update)=>editDraft((previous)=>{
+const previousState=previous.peakValley??emptyPeakValleyDraft();
+const previousProfile=previousState[peakValleyPeriod]??emptyPeakValleyDraft()[peakValleyPeriod];
+const nextProfile=update(previousProfile);
+return nextProfile===previousProfile
+?previous
+:{...previous,peakValley:{...previousState,[peakValleyPeriod]:nextProfile}};
+});
+sub.editPeakValley=(update)=>editDraft((previous)=>({
+...previous,
+peakValley:update(previous.peakValley??emptyPeakValleyDraft()),
+}));
+sub.setSelectedModelPage=(next)=>setPeakValleyPages((previous)=>({
+...previous,
+[peakValleyPeriod]:typeof next==="function"?next(previous?.[peakValleyPeriod]??0):next,
+}));
+Object.assign(sub,createModelPageActions(sub),createModelTabDragController(sub));
+return sub;
+}
+function mainEditingPeriodOf(value){
+const state=value?.peakValley;
+if(state?.enabled!==true)return null;
+return samplePeakValleyPeriod(Array.isArray(state.periods)?state.periods:[]);
+}
+function samplePeakValleyPeriod(periods){
+return peakValleyTime?.peakValleyAtDate?.(periods,new Date())==="peak"?"peak":"valley";
+}
+function startPeriodSampler(periodsRef,setLivePeriod){
+return globalThis.setInterval?.(()=>setLivePeriod(samplePeakValleyPeriod(periodsRef.current)),60000);
+}
+function stopPeriodSampler(timer){
+return()=>{if(timer!==void 0)globalThis.clearInterval?.(timer);};
+}
+function peakValleyCandidateOf(state,repair){
+const profileOf=(profile)=>{
+const value=profile!==null&&typeof profile==="object"?profile:{};
+return{
+provider:typeof value.provider==="string"?value.provider:"",
+defaults:value.defaults??{},
+candidates:compactModelCandidatesDraft(value.candidates),
+fallbackLimit:value.fallbackLimit===void 0?DEFAULT_MODEL_FALLBACK_LIMIT:value.fallbackLimit,
+};
+};
+return{
+enabled:state?.enabled===true,
+periods:Array.isArray(state?.periods)?state.periods:[],
+peak:profileOf(state?.peak),
+valley:profileOf(state?.valley),
+...(repair===true?{repair}:{}),
+};
+}
+function repairSaveActionOf(view){
+return()=>view.save({repair:true});
+}
 function createSettingsSaveAction(view){
-return async({retry=false}={})=>{
-const plan=deriveSettingsSavePlan(view,retry);
+return async({retry=false,repair=false}={})=>{
+const plan=deriveSettingsSavePlan(view,retry,repair);
 if(plan===null)return false;
 return commitSettingsSavePlan(view,plan);
 };
@@ -16604,7 +16822,7 @@ if(promptChanged){
 ops.push({op:"set",path:["promptOverrides"],value:candidatePromptOverrides});
 }
 }
-function deriveSettingsSavePlan(view,retry){
+function deriveSettingsSavePlan(view,retry,repair){
 const{
 addModelPage,applyPromptNavigation,authorityValue,baselineProjection,beginModelTabDrag,cancelModelPageDelete,ctx,
 candidatesError,catalogAvailable,closePrompt,committedAuthorityRef,committedSnapshotLagging,confirmModelPageDelete,
@@ -16621,7 +16839,9 @@ setPromptDrafts,setPromptError,setPromptTouched,setSaved,setSettingsConflict,set
 settingsForm,settingsReadOnly,settingsSnapshot,sourceDraftForSave,sourcePromptOverrides,t,tExtra,unifiedProvider,
 effectiveDraft,editorBaseline,promptTouchedRoles,setSaving,
 }=view;
-if(!hasUnsavedChanges||saving||settingsSnapshot.writable!==true)return null;
+const peakValleyBroken=typeof authorityValue?.peakValley?.invalidCode==="string";
+const repairing=repair===true&&peakValleyBroken;
+if((!hasUnsavedChanges&&!repairing)||saving||settingsSnapshot.writable!==true)return null;
 if(modelFieldsChanged&&!catalogAvailable)return null;
 const source=sourceDraftForSave;
 const normalizedDraft=effectiveDraft;
@@ -16670,6 +16890,19 @@ if(validation.ok!==true){setCandidatesError(modelCandidatesErrorMessage(tExtra,r
 const sourceFallbackLimit=source.fallbackLimit;
 const candidateFallbackLimit=normalizedDraft.fallbackLimit;
 const fallbackLimitChanged=candidateFallbackLimit!==void 0&&candidateFallbackLimit!==sourceFallbackLimit;
+const candidatePeakValley=normalizedDraft.peakValley===void 0||(peakValleyBroken&&!repairing)
+?void 0
+:peakValleyCandidateOf(normalizedDraft.peakValley,repairing);
+let peakValleyChanged=repairing;
+if(candidatePeakValley!==void 0
+&&(repairing||!settingsDraftEqual(candidatePeakValley,peakValleyCandidateOf(normalizePeakValleyDraft(source.peakValley))))){
+const periods=peakValleyTime?.normalizePeakValleyPeriods?.(candidatePeakValley.periods);
+if(periods?.ok!==true){
+setError(tExtra("settings.pv.invalid",{reason:periods?.reason??""}));
+return null;
+}
+peakValleyChanged=true;
+}
 const candidate={
 ...normalizedDraft,
 provider:modelChanged?draftProvider:sourceProvider,
@@ -16679,9 +16912,11 @@ provider:modelChanged?draftProvider:sourceProvider,
 ...(fallbackLimitChanged
 ?{fallbackLimit:typeof candidateFallbackLimit==="number"?candidateFallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT}
 :{}),
+...(peakValleyChanged?{peakValley:candidatePeakValley}:{}),
 };
 if(!candidatesChanged)delete candidate.candidates;
 if(!fallbackLimitChanged)delete candidate.fallbackLimit;
+if(!peakValleyChanged)delete candidate.peakValley;
 const ops=[];
 if(modelChanged){
 ops.push({op:"set",path:["provider"],value:candidate.provider});
@@ -16710,12 +16945,18 @@ if(!settingsDraftEqual(candidateCandidates[role]??null,sourceCandidates[role]??n
 }
 }
 if(fallbackLimitChanged)changed.push("fallbackLimit");
+if(peakValleyChanged)changed.push("peakValley","peakValley.enabled","peakValley.periods");
+if(peakValleyBroken&&!repairing&&ops.length===0
+&&!candidatesChanged&&!fallbackLimitChanged){
+setError(tExtra("settings.pv.broken"));
+return null;
+}
 const expectedRevision=retry===true||selectedPromptRole===null||!Number.isSafeInteger(editorBaseline?.revision)
 ?settingsSnapshot.revision
 :editorBaseline.revision;
 return{
 candidate,candidateCandidates,candidateFallbackLimit,candidatePromptOverrides,candidatesChanged,changed,
-expectedRevision,fallbackLimitChanged,ops,source,sourceCandidates,sourceFallbackLimit,
+expectedRevision,fallbackLimitChanged,ops,peakValleyChanged,source,sourceCandidates,sourceFallbackLimit,
 };
 }
 async function commitSettingsSavePlan(view,plan){
@@ -16737,7 +16978,7 @@ ctx,effectiveDraft,editorBaseline,promptTouchedRoles,setSaving,
 }=view;
 const{
 candidate,candidateCandidates,candidateFallbackLimit,candidatePromptOverrides,candidatesChanged,
-changed,expectedRevision,fallbackLimitChanged,ops,source,sourceCandidates,sourceFallbackLimit,
+changed,expectedRevision,fallbackLimitChanged,ops,peakValleyChanged,source,sourceCandidates,sourceFallbackLimit,
 }=plan;
 setSaving(true);
 setSaved(false);
@@ -16746,7 +16987,7 @@ setPromptError(null);
 try{
 let accepted;
 let committed=null;
-if(ops.length>0||candidatesChanged||fallbackLimitChanged){
+if(ops.length>0||candidatesChanged||fallbackLimitChanged||peakValleyChanged){
 committed=await commitSettingsCandidate(candidate,expectedRevision,globalThis.fetch,ctx?.connection,roles,changed);
 accepted=committed.settings;
 }else{
@@ -16774,6 +17015,7 @@ fallbackLimitChanged||Object.prototype.hasOwnProperty.call(source,"fallbackLimit
 fallbackLimitChanged
 ?(typeof candidateFallbackLimit==="number"?candidateFallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT)
 :sourceFallbackLimit);
+keepNewField("peakValley",Object.prototype.hasOwnProperty.call(source,"peakValley"),source.peakValley);
 }
 setDraft(acceptedDraft);
 setPromptDrafts({});
@@ -17016,7 +17258,7 @@ const hostPromptProjection=react.useMemo(
 react.useEffect(()=>{
 void modelCatalog.load();
 },[modelCatalog]);
-const[draft,setDraft]=react.useState(()=>normalizeSettingsDraft(settingsSnapshot.value,roles));
+const[draft,setDraft]=react.useState(()=>normalizeSettingsDraft(settingsSnapshot.value,roles,true,true));
 const[candidatesError,setCandidatesError]=react.useState(null);
 const[selectedModelPage,setSelectedModelPage]=react.useState(0);
 const[modelTabDrag,setModelTabDrag]=react.useState(null);
@@ -17025,6 +17267,19 @@ const modelTabRefs=react.useRef({});
 const modelTabDragRef=react.useRef(null);
 const modelTabSuppressClickRef=react.useRef(false);
 const modelPageDeleteCancelRef=react.useRef(null);
+const[peakValleyOpen,setPeakValleyOpen]=react.useState(false);
+const[peakValleyPeriod,setPeakValleyPeriod]=react.useState("peak");
+const[peakValleyPages,setPeakValleyPages]=react.useState({});
+const mainPeriodRef=react.useRef(null);
+if(mainPeriodRef.current===null)mainPeriodRef.current=mainEditingPeriodOf(settingsSnapshot.value);
+const mainPeriod=mainPeriodRef.current;
+const[livePeriod,setLivePeriod]=react.useState(mainPeriod);
+const peakValleyPeriodsRef=react.useRef(null);
+peakValleyPeriodsRef.current=draft.peakValley?.periods??[];
+react.useEffect(()=>{
+if(mainPeriod===null)return void 0;
+return stopPeriodSampler(startPeriodSampler(peakValleyPeriodsRef,setLivePeriod));
+},[mainPeriod]);
 const[dirty,setDirty]=react.useState(false);
 const[saving,setSaving]=react.useState(false);
 const[error,setError]=react.useState(null);
@@ -17070,15 +17325,15 @@ const committedSnapshotLagging=committedAuthorityRef.current!==null
 const authorityValue=committedSnapshotLagging?committedAuthorityRef.current.value:settingsSnapshot.value;
 const sourcePromptOverrides=normalizePromptOverrides(authorityValue?.promptOverrides,promptMaxGraphemes,promptRoleIds);
 const localDraft=normalizeSettingsDraft(draft,roles,false);
-const sourceDraftForDirty=normalizeSettingsDraft(authorityValue,roles,false);
+const sourceDraftForDirty=normalizeSettingsDraft(authorityValue,roles,false,true);
 const settingsDirty=!settingsDraftEqual(localDraft,sourceDraftForDirty);
 const hasUnsavedChanges=settingsDirty||promptDirty;
 const editorHasUnsavedChanges=hasUnsavedChanges;
-const sourceDraftForSave=normalizeSettingsDraft(authorityValue,roles);
+const sourceDraftForSave=normalizeSettingsDraft(authorityValue,roles,true,true);
 const editorEntryValue=selectedPromptRole!==null&&editorBaseline?.role===selectedPromptRole
 ?editorBaseline.value
 :authorityValue;
-const editorEntryDraft=normalizeSettingsDraft(editorEntryValue,roles,false);
+const editorEntryDraft=normalizeSettingsDraft(editorEntryValue,roles,false,true);
 const effectiveDraft=selectedPromptRole!==null
 ?mergeSettingsDraftOverSource(sourceDraftForSave,localDraft,editorEntryDraft)
 :localDraft;
@@ -17090,7 +17345,7 @@ return unifiedProviderOf(effectiveDraft.defaults,roles,effectiveDraft.provider)
 react.useEffect(()=>{
 if(dirty)return;
 if(committedSnapshotLagging)return;
-setDraft(normalizeSettingsDraft(authorityValue,roles));
+setDraft(normalizeSettingsDraft(authorityValue,roles,true,true));
 setPromptDrafts({});
 setPromptTouched({});
 setPromptError(null);
@@ -17125,7 +17380,7 @@ value:settingsSnapshot.value,
 revision:settingsSnapshot.revision,
 projection:refreshedProjection,
 });
-setDraft(normalizeSettingsDraft(settingsSnapshot.value,roles));
+setDraft(normalizeSettingsDraft(settingsSnapshot.value,roles,true,true));
 setPromptDrafts({});
 setPromptTouched({});
 setDirty(false);
@@ -17255,14 +17510,15 @@ applyPromptNavigation,authorityValue,baselineProjection,
 candidatesError,catalogAvailable,closePrompt,committedAuthorityRef,committedSnapshotLagging,
 currentModelPage,directoryState,dismissLeaveDialog,draft,editDraft,editPromptText,effectiveDraft,
 error,externalSettingsChanged,hasUnsavedChanges,hostMeta,hostMetaError,leaveCancelRef,
-leaveIntent,leaveTriggerRef,modelConfigHost,modelConfigDefaultOpen,modelFieldsChanged,modelPageCount,modelPageDeleteCancelRef,
+leaveIntent,leaveTriggerRef,livePeriod,mainPeriod,modelConfigHost,modelConfigDefaultOpen,modelFieldsChanged,modelPageCount,modelPageDeleteCancelRef,
 modelPageDeleteIntent,modelPageLabelOf,modelRowRoles,modelTabDrag,modelTabDragRef,modelTabRefs,modelTabSuppressClickRef,notificationEventsOpen,
-notificationEventsPanelRef,notificationEventsRootRef,notificationEventsTriggerRef,openPrompt,promptDirty,promptError,
+notificationEventsPanelRef,notificationEventsRootRef,notificationEventsTriggerRef,openPrompt,peakValleyOpen,
+peakValleyPages,peakValleyPeriod,peakValleyViewOf,promptDirty,promptError,
 promptLoading,promptMaxGraphemes,promptProjection,promptRoleIds,promptTextOf,promptTouchedRoles,providerGroups,
 refreshHostMeta,roleLabelOf,roles,saved,
 saving,selectedPromptRole,setCandidatesError,setDirty,setDraft,
 setEditorBaseline,setError,setExternalSettingsChanged,setLeaveIntent,setLocalPromptProjection,setModelPageDeleteIntent,
-setModelTabDrag,setNotificationEventsOpen,setSelectedModelPage,
+setModelTabDrag,setNotificationEventsOpen,setPeakValleyOpen,setPeakValleyPages,setPeakValleyPeriod,setSelectedModelPage,
 setPromptDrafts,setPromptError,setPromptTouched,setSaved,setSettingsConflict,settingsConflict,
 settingsForm,settingsReadOnly,settingsSnapshot,sourceDraftForSave,sourcePromptOverrides,t,tExtra,unifiedProvider,
 ctx,editorBaseline,setSaving,
@@ -17270,6 +17526,8 @@ ctx,editorBaseline,setSaving,
 Object.assign(view,createModelPageActions(view),createModelTabDragController(view));
 useSettingsLeaveFocus(view);
 view.save=createSettingsSaveAction(view);
+view.saveRepair=repairSaveActionOf(view);
+view.peakValleyBroken=typeof authorityValue?.peakValley?.invalidCode==="string";
 return renderSettingsTail(view);
 }
 global[SYMBOL]=Object.freeze({
@@ -17405,6 +17663,33 @@ const wanted=visibleIds instanceof Set?visibleIds:new Set();
 const visible=list.filter((candidate)=>wanted.has(candidate?.id));
 return visible.length>0&&visible.every((candidate)=>candidate.picked===true);
 }
+function toggleCandidateOf(state,id){
+if(state===null||!Array.isArray(state.candidates))return state;
+return{
+...state,
+candidates:state.candidates.map((candidate)=>candidate.id===id
+?{...candidate,picked:candidate.picked!==true}
+:candidate),
+};
+}
+function toggleVisibleCandidatesOf(state,ids){
+const wanted=new Set(Array.isArray(ids)?ids:[]);
+if(state===null||!Array.isArray(state.candidates))return state;
+if(clearsAllCandidateSelection(state.candidates,wanted)){
+return{...state,candidates:state.candidates.map((candidate)=>({...candidate,picked:false}))};
+}
+return{
+...state,
+candidates:state.candidates.map((candidate)=>wanted.has(candidate.id)
+?{...candidate,picked:true}
+:candidate),
+};
+}
+function toggleIndexInSet(previous,index){
+const next=new Set(previous);
+if(!next.delete(index))next.add(index);
+return next;
+}
 function ModelDiscoveryDialog({candidates,query,onQueryChange,onToggle,onToggleVisible,onClose,onAdopt}){
 const source=Array.isArray(candidates)?candidates:[];
 const[titleId]=react.useState(()=>{
@@ -17520,6 +17805,7 @@ onClick:onAdopt,
 }
 global[SYMBOL]=Object.freeze({
 ModelDiscoveryDialog,clearsAllCandidateSelection,focusableDialogControls,renderModelRow,bindClientRuntime,
+toggleCandidateOf,toggleVisibleCandidatesOf,toggleIndexInSet,
 });
 })(globalThis);
 /* source: client-model-views-a.js */
@@ -17528,7 +17814,9 @@ ModelDiscoveryDialog,clearsAllCandidateSelection,focusableDialogControls,renderM
 const SYMBOL=Symbol.for("dsh-expert-group/client-model-views-a");
 const clientModelViewsBSymbol=Symbol.for("dsh-expert-group/client-model-views-b");
 const clientModelViewsB=global[clientModelViewsBSymbol]||{};
-const{ModelDiscoveryDialog,clearsAllCandidateSelection,renderModelRow}=clientModelViewsB;
+const{
+ModelDiscoveryDialog,renderModelRow,toggleCandidateOf,toggleIndexInSet,toggleVisibleCandidatesOf,
+}=clientModelViewsB;
 let react=null;
 function bindClientRuntime(host){
 react=host.react??null;
@@ -17564,31 +17852,8 @@ react.createElement("span",null,section.title)),
 extra);
 }
 function buildCandidateControls({setFetchState,setCandidateQuery}){
-const toggleCandidate=(id)=>{
-setFetchState((previous)=>previous===null||!Array.isArray(previous.candidates)
-?previous
-:{
-...previous,
-candidates:previous.candidates.map((candidate)=>candidate.id===id
-?{...candidate,picked:candidate.picked!==true}
-:candidate),
-});
-};
-const toggleVisibleCandidates=(ids)=>{
-const wanted=new Set(Array.isArray(ids)?ids:[]);
-setFetchState((previous)=>{
-if(previous===null||!Array.isArray(previous.candidates))return previous;
-if(clearsAllCandidateSelection(previous.candidates,wanted)){
-return{...previous,candidates:previous.candidates.map((candidate)=>({...candidate,picked:false}))};
-}
-return{
-...previous,
-candidates:previous.candidates.map((candidate)=>wanted.has(candidate.id)
-?{...candidate,picked:true}
-:candidate),
-};
-});
-};
+const toggleCandidate=(id)=>setFetchState((previous)=>toggleCandidateOf(previous,id));
+const toggleVisibleCandidates=(ids)=>setFetchState((previous)=>toggleVisibleCandidatesOf(previous,ids));
 const closeModelPicker=()=>{
 setFetchState(null);
 setCandidateQuery("");
@@ -17844,13 +18109,7 @@ const next=selected.includes(modality)?selected.filter((value)=>value!==modality
 return{...draft,models:config.setModelInputSelection(rows,index,next)};
 });
 };
-const toggleRow=(index)=>{
-setExpandedRows((previous)=>{
-const next=new Set(previous);
-if(!next.delete(index))next.add(index);
-return next;
-});
-};
+const toggleRow=(index)=>setExpandedRows((previous)=>toggleIndexInSet(previous,index));
 const cancel=()=>{
 session.cancel();
 setExpandedRows(new Set());
@@ -18036,7 +18295,9 @@ const clientModelConfigHostSymbol=Symbol.for("dsh-expert-group/client-model-conf
 const clientModelConfigHost=global[clientModelConfigHostSymbol]||{};
 const clientModelViewsBSymbol=Symbol.for("dsh-expert-group/client-model-views-b");
 const clientModelViewsB=global[clientModelViewsBSymbol]||{};
-const{ModelDiscoveryDialog,clearsAllCandidateSelection,renderModelRow}=clientModelViewsB;
+const{
+ModelDiscoveryDialog,renderModelRow,toggleCandidateOf,toggleIndexInSet,toggleVisibleCandidatesOf,
+}=clientModelViewsB;
 const{CUSTOM_ROUTE_PROBE}=clientModelConfigHost;
 let react=null;
 function bindClientRuntime(host){
@@ -18266,13 +18527,7 @@ const canFetchModels=!card.readOnly&&!profileDisabled&&config.validateBaseUrl(cu
 const patchRow=(index,patch)=>setModels(modelRows.map((model,at)=>(
 at===index?config.patchModelDraft(model,patch):model
 )));
-const toggleRow=(index)=>{
-setExpandedRows((previous)=>{
-const next=new Set(previous);
-if(!next.delete(index))next.add(index);
-return next;
-});
-};
+const toggleRow=(index)=>setExpandedRows((previous)=>toggleIndexInSet(previous,index));
 const closeModelPicker=()=>{
 setFetchState(null);
 setCandidateQuery("");
@@ -18318,31 +18573,8 @@ picked:typeof model.id==="string"&&model.id.length>0&&!known.has(model.id),
 setFetching(false);
 }
 };
-const toggleCandidate=(id)=>{
-setFetchState((previous)=>previous===null||!Array.isArray(previous.candidates)
-?previous
-:{
-...previous,
-candidates:previous.candidates.map((candidate)=>candidate.id===id
-?{...candidate,picked:candidate.picked!==true}
-:candidate),
-});
-};
-const toggleVisibleCandidates=(ids)=>{
-const wanted=new Set(Array.isArray(ids)?ids:[]);
-setFetchState((previous)=>{
-if(previous===null||!Array.isArray(previous.candidates))return previous;
-if(clearsAllCandidateSelection(previous.candidates,wanted)){
-return{...previous,candidates:previous.candidates.map((candidate)=>({...candidate,picked:false}))};
-}
-return{
-...previous,
-candidates:previous.candidates.map((candidate)=>wanted.has(candidate.id)
-?{...candidate,picked:true}
-:candidate),
-};
-});
-};
+const toggleCandidate=(id)=>setFetchState((previous)=>toggleCandidateOf(previous,id));
+const toggleVisibleCandidates=(ids)=>setFetchState((previous)=>toggleVisibleCandidatesOf(previous,ids));
 const adoptFetchedModels=()=>{
 const candidates=fetchState?.candidates;
 const picked=(Array.isArray(candidates)?candidates:[]).filter((candidate)=>candidate.picked===true);
@@ -19946,6 +20178,131 @@ global[SYMBOL]=Object.freeze({
 installDegSidebarEntry,
 });
 })(globalThis);
+/* source: shared/peak-valley-time.js */
+/* classic 投影：来自 shared/peak-valley-time.js 的机械导出改写，权威实现仍是该 ESM 文件。 */
+(function installProjectedSource_shared_peak_valley_time_js(){
+"use strict";
+const MINUTES_PER_DAY=1440;
+const MAX_PEAK_VALLEY_PERIODS=3;
+const PEAK_VALLEY_PERIODS_INVALID="PEAK_VALLEY_PERIODS_INVALID";
+const HHMM_PATTERN=/^([01]\d|2[0-3]):[0-5]\d$/;
+function invalidPeriods(reason){
+return{ok:false,code:PEAK_VALLEY_PERIODS_INVALID,reason};
+}
+function parseClockMinutes(value){
+if(typeof value!=="string"||!HHMM_PATTERN.test(value))return null;
+return Number(value.slice(0,2))*60+Number(value.slice(3,5));
+}
+function normalizePeakValleyPeriods(raw){
+if(raw===void 0||raw===null)return{ok:true,periods:[]};
+if(!Array.isArray(raw))return invalidPeriods("峰谷时段必须是 {start,end} 数组");
+if(raw.length>MAX_PEAK_VALLEY_PERIODS){
+return invalidPeriods("峰谷时段最多 "+MAX_PEAK_VALLEY_PERIODS+" 条，收到 "+raw.length+" 条");
+}
+const periods=[];
+for(let index=0;index<raw.length;index+=1){
+const position="第 "+(index+1)+" 项";
+const item=raw[index];
+if(item===null||typeof item!=="object"||Array.isArray(item)){
+return invalidPeriods(position+"不是 {start,end} 对象");
+}
+const start=item.start;
+const end=item.end;
+if(typeof start!=="string"||typeof end!=="string"){
+return invalidPeriods(position+"缺少 start/end 字符串字段");
+}
+if(parseClockMinutes(start)===null){
+return invalidPeriods(position+"的 start 必须是 00:00–23:59 的 HH:mm");
+}
+if(parseClockMinutes(end)===null){
+return invalidPeriods(position+"的 end 必须是 00:00–23:59 的 HH:mm");
+}
+if(start===end){
+return invalidPeriods(position+"的 start 与 end 不能相同（空区间非法）");
+}
+periods.push({start,end});
+}
+return{ok:true,periods};
+}
+function peakValleyAtMinutes(periods,minutes){
+if(!Number.isInteger(minutes)||minutes<0||minutes>=MINUTES_PER_DAY)return"valley";
+if(!Array.isArray(periods))return"valley";
+for(const period of periods){
+if(period===null||typeof period!=="object")continue;
+const start=parseClockMinutes(period.start);
+const end=parseClockMinutes(period.end);
+if(start===null||end===null||start===end)continue;
+const hit=start<end
+?minutes>=start&&minutes<end
+:minutes>=start||minutes<end;
+if(hit)return"peak";
+}
+return"valley";
+}
+function localWallClockMinutes(date){
+try{
+if(date===null||typeof date!=="object")return null;
+if(typeof date.getTime!=="function"||typeof date.getHours!=="function"||typeof date.getMinutes!=="function"){
+return null;
+}
+if(Number.isNaN(date.getTime()))return null;
+const hours=date.getHours();
+const minutes=date.getMinutes();
+if(!Number.isInteger(hours)||hours<0||hours>23)return null;
+if(!Number.isInteger(minutes)||minutes<0||minutes>59)return null;
+return hours*60+minutes;
+}catch{
+return null;
+}
+}
+function notifyInvalidDate(options,date){
+if(options===null||typeof options!=="object")return;
+const callback=options.onInvalidDate;
+if(typeof callback!=="function")return;
+try{
+callback(date);
+}catch{
+}
+}
+function peakValleyAtDate(periods,date,options){
+const minutes=localWallClockMinutes(date);
+if(minutes===null){
+notifyInvalidDate(options,date);
+return"valley";
+}
+return peakValleyAtMinutes(periods,minutes);
+}
+function peakSpansOf(periods){
+const spans=[];
+if(!Array.isArray(periods))return spans;
+for(const period of periods){
+if(period===null||typeof period!=="object")continue;
+const start=parseClockMinutes(period.start);
+const end=parseClockMinutes(period.end);
+if(start===null||end===null||start===end)continue;
+if(start<end){
+spans.push([start,end]);
+}else{
+spans.push([start,MINUTES_PER_DAY]);
+spans.push([0,end]);
+}
+}
+return spans;
+}
+function peakValleyPeriodsCoverFullDay(periods){
+const spans=peakSpansOf(periods);
+spans.sort((left,right)=>left[0]-right[0]);
+let coveredUntil=0;
+for(const span of spans){
+if(span[0]>coveredUntil)return false;// 出现空档：0..coveredUntil 之后断开
+if(span[1]>coveredUntil)coveredUntil=span[1];
+if(coveredUntil>=MINUTES_PER_DAY)return true;
+}
+return coveredUntil>=MINUTES_PER_DAY;
+}
+/** 投影尾部（构建期生成）：公开检查点（与 ESM 导出面同形）。 */
+globalThis[Symbol.for("dsh-expert-group/peak-valley-time")]=Object.freeze({MAX_PEAK_VALLEY_PERIODS,PEAK_VALLEY_PERIODS_INVALID,normalizePeakValleyPeriods,peakValleyAtMinutes,peakValleyAtDate,peakValleyPeriodsCoverFullDay});
+})();
 /* source: client-freshness.js */
 /* classic 投影：来自源文件的机械导出改写，权威实现仍是 client-freshness.js。 */
 (function installClientFreshness(global){
@@ -20279,6 +20636,7 @@ const clientSidebarEntryModule=globalThis[Symbol.for("dsh-expert-group/client-si
 const{
 installDegSidebarEntry,
 }=clientSidebarEntryModule;
+const peakValleyTime=globalThis[Symbol.for("dsh-expert-group/peak-valley-time")];
 ensurePluginStylesheet();
 const RPC_PATH="/api/dsh-expert-group";
 const RPC_CHANNEL="/dsh-expert-group";
@@ -20314,6 +20672,7 @@ return requireFreshnessSurface().createClientFreshnessBoundary(options);
 const clientRuntimeHost=Object.freeze({
 react,primitives,requestPluginRpc,requireFreshnessSurface,createClientFreshnessBoundary,
 RPC_PATH,RPC_CHANNEL,RPC_ENDPOINT,RPC_TARGET,ModelConfigSection,
+peakValleyTime,
 });
 clientSettingsNormalizeModule.bindClientRuntime?.(clientRuntimeHost);
 clientSubagentModule.bindClientRuntime?.(clientRuntimeHost);
@@ -20404,6 +20763,10 @@ modelCatalog,
 confirm:(message)=>typeof globalThis.confirm==="function"&&globalThis.confirm(message)===true,
 getAutoOpenSubagentSidebar:()=>readAutoOpenSubagentSidebar(),
 setAutoOpenSubagentSidebar:(next)=>commitAutoOpenSubagentSidebar(next),
+getPeakValleySettings:readPeakValleySettings,
+subscribePeakValleySettings:typeof settingsForm?.subscribe==="function"?subscribePeakValleySettings:null,
+peakValleyTime,
+settingsExtraText,
 };
 const readAutoOpenSubagentSidebar=()=>{
 try{
@@ -20439,6 +20802,16 @@ return snapshot?.value?.taskManagementEnabled!==false;
 return true;
 }
 };
+function readPeakValleySettings(){
+try{
+return settingsForm?.getSnapshot?.().value?.peakValley??null;
+}catch{
+return null;
+}
+}
+function subscribePeakValleySettings(listener){
+return settingsForm?.subscribe?.(listener)??null;
+}
 ctx.effect(()=>{
 let disposer=null;
 const install=()=>{
@@ -20543,6 +20916,7 @@ exports.expertGroupModel=expertGroupModel;
 exports.expertGroupSidebar=expertGroupSidebar;
 exports.modelConfig=globalThis[Symbol.for("dsh-expert-group/client-model-config")];
 exports.createModelConfigHost=createModelConfigHost;
+exports.peakValleyTime=peakValleyTime;
 exports.MODEL_REASONING_EFFORTS=Object.freeze([
 "off","minimal","low","medium","high","xhigh","max",
 ]);

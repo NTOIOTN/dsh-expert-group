@@ -56,6 +56,7 @@ import {
   descriptorSource as MANIFEST_DESCRIPTOR_SOURCE,
   freshnessSource as MANIFEST_FRESHNESS_SOURCE,
   iifeSources as MANIFEST_IIFE_SOURCES,
+  projectedSources as MANIFEST_PROJECTED_SOURCES,
 } from "./client-source-manifest.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
@@ -76,6 +77,16 @@ const FRESHNESS_SOURCE = MANIFEST_FRESHNESS_SOURCE;
 
 /** 唯一 ModuleLoader descriptor（client.js，来自 manifest）始终最后执行，避免 HMR 留下重复子模块工厂。 */
 const DESCRIPTOR_SOURCE = MANIFEST_DESCRIPTOR_SOURCE;
+
+/**
+ * 可投影 ESM 源（来自 manifest，票据 01 第二单元）：每项 `{ source, checkpointKey, exports }`。
+ * 这些模块只有一份 ESM 权威实现，装配器按清单**逐行机械投影**成 classic 片段，
+ * 仓库里不保留、也不接受第二份手写实现。
+ */
+const PROJECTED_SOURCES = MANIFEST_PROJECTED_SOURCES;
+
+/** 源名 → 投影描述：段渲染按名字分派，避免每段线性查找。 */
+const PROJECTED_BY_SOURCE = new Map(PROJECTED_SOURCES.map((entry) => [entry.source, entry]));
 
 /** 装配顺序本身（manifest 已冻结；这里不再二次复制成新数组，保持"唯一事实源"可追溯）。 */
 const sourceNames = MANIFEST_ASSEMBLY_ORDER;
@@ -737,6 +748,115 @@ export function renderClientFreshnessSegment({ name, source }) {
   ].join("\n"));
 }
 
+/**
+ * 通用 ESM → classic 机械投影（票据 01 第二单元）。
+ *
+ * 与 {@link projectClientFreshnessSource} 的分工：那个是 freshness 的**专用**投影（尾部还要
+ * 登记 ModuleLoader，属装配契约的一部分，本函数不复用也不改写它）；本函数只处理 manifest
+ * `projectedSources` 登记的共享模块——逐行剥掉行首 `export ` 前缀，其它字节原样保留。
+ *
+ * 为什么必须"机械"：这些模块的语义由 ESM 权威实现独占（Host 校验、客户端界面、投影段
+ * 共用同一份规则）。任何"顺手优化/改写成 classic 风格"的投影都会重新制造两份实现，
+ * 而两份实现只会在后续提交里各自漂移。因此这里只做三类判定，全部失败即抛错：
+ * 1. 行首 ESM 关键字残留（`import` / `export default` / `export {}` / 缩进的 export）；
+ * 2. 无法解析的导出声明形式（只接受 `[async] function|const|let|var|class <name>`）；
+ * 3. 缺少 manifest 声明为必需的导出名。
+ *
+ * @param {string} source - 权威实现的源码文本（构建里已剥离注释并压缩空格）。
+ * @param {{ name?: string, requiredExports?: readonly string[] }} [options] - name 用于报错定位；
+ *   requiredExports 缺一即失败（由 manifest.projectedSources[].exports 决定）。
+ * @returns {{ body: string, exports: readonly string[] }} 去掉 `export ` 前缀的正文与实际导出名。
+ */
+export function projectEsmSource(source, { name, requiredExports } = {}) {
+  if (typeof source !== "string") {
+    throw new TypeError("projectEsmSource 只接受源码字符串，收到 " + typeof source);
+  }
+  const label = typeof name === "string" && name.length > 0 ? name : "<未命名源>";
+  const exported = [];
+  const lines = [];
+  for (const line of source.split("\n")) {
+    if (!line.startsWith("export ")) {
+      lines.push(line);
+      continue;
+    }
+    const declaration = line.slice("export ".length);
+    exported.push(declaredNameOf(declaration));
+    lines.push(declaration);
+  }
+  const body = lines.join("\n");
+  // 注释/字符串里出现 import/export 不算违规，所以只判定"行首 ESM 关键字"。
+  const leftover = /(?:^|\n)[ \t]*(?:import|export)\b/.exec(body);
+  if (leftover !== null) {
+    throw new Error(label + " 投影后仍残留 ESM 语法: " + leftover[0].trim());
+  }
+  for (const required of requiredExports ?? []) {
+    if (!exported.includes(required)) {
+      throw new Error(label + " 缺少必需导出 " + required + "（检查点与使用方都依赖同一份实现）");
+    }
+  }
+  return Object.freeze({ body, exports: Object.freeze(exported) });
+}
+
+/**
+ * 生成投影段尾部的检查点赋值语句。
+ *
+ * 渲染与门禁共用同一份书写形式（两侧再各自过 compactBundleFragment 收敛空白），
+ * 避免"渲染写了一种形态、门禁按另一种形态去搜"这种两边一起漂的假绿灯。
+ *
+ * @param {string} checkpointKey - `Symbol.for(<key>)` 的键（manifest.projectedSources）。
+ * @param {readonly string[]} exportNames - 检查点对象上的键（与 ESM 导出同名，简写属性）。
+ */
+function projectedCheckpointStatement(checkpointKey, exportNames) {
+  return "globalThis[Symbol.for(" + JSON.stringify(checkpointKey) + ")] = Object.freeze({ "
+    + exportNames.join(", ") + " });";
+}
+
+/**
+ * 投影源 IIFE 的安装函数名：只由源路径派生。
+ *
+ * 不引入时间/随机数/计数器，保证同一份源码每次构建得到逐字节相同的产物（SHA 可复现）。
+ *
+ * @param {string} name - 源文件仓库相对路径。
+ */
+function projectedInstallerName(name) {
+  const sanitized = String(name).replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return "installProjectedSource" + (sanitized.length > 0 ? "_" + sanitized : "");
+}
+
+/**
+ * 渲染一个"可投影 ESM 源"的 classic 投影片段。
+ *
+ * 与 freshness 投影的差别只有尾部：这里**不登记** ModuleLoader，只把同一份导出面挂到
+ * `globalThis[Symbol.for(checkpointKey)]`。因此段本身是纯赋值 IIFE，重复执行幂等
+ * （HMR 重放同一份 bundle 只会覆盖同一个 Symbol，不会像重复登记那样抛错）。
+ *
+ * @param {{ name: string, source: string, checkpointKey: string, exports: readonly string[] }} options
+ *   checkpointKey / exports 来自 manifest；source 是已剥离注释并压缩过空白的正文。
+ */
+export function renderProjectedSourceSegment({ name, source, checkpointKey, exports }) {
+  if (typeof checkpointKey !== "string" || checkpointKey.length === 0) {
+    throw new Error(name + " 缺少检查点键（必须由 manifest.projectedSources 声明）");
+  }
+  if (!Array.isArray(exports) || exports.length === 0) {
+    throw new Error(name + " 缺少导出清单（必须由 manifest.projectedSources 声明）");
+  }
+  const projection = projectEsmSource(source, { name, requiredExports: exports });
+  // 段尾的包装行与检查点语句都是装配器现场生成的：它们同样要过 compactClientCode，
+  // 否则产物会残留"可压缩但没压缩"的空白，第二次压缩就会改动写盘正文，破坏
+  // "校验对象 = 写盘内容"的不动点契约（与 freshness 段同一处理）。
+  return compactBundleFragment([
+    "/* source: " + name + " */",
+    "/* classic 投影：来自 " + name + " 的机械导出改写，权威实现仍是该 ESM 文件。 */",
+    "(function " + projectedInstallerName(name) + "() {",
+    '"use strict";',
+    projection.body.trimEnd(),
+    "/** 投影尾部（构建期生成）：公开检查点（与 ESM 导出面同形）。 */",
+    compactBundleFragment(projectedCheckpointStatement(checkpointKey, exports)),
+    "})();",
+    "",
+  ].join("\n"));
+}
+
 /** 把值收敛成可 JSON 比较的快照：undefined / 函数 / 循环引用换成显式标记，对象键排序。 */
 function freezeForCompare(value, seen = new WeakSet()) {
   if (value === undefined) return { $type: "undefined" };
@@ -1062,6 +1182,149 @@ function evaluateFreshnessSegment(segment, { globalKey, moduleId }) {
 }
 
 /**
+ * 固定探针输入：全部是不可变常量；Date 在每次运行探针时新建（不跨探针共享可变对象）。
+ * 时间段形状覆盖"单段 / 跨午夜 / 并集覆盖全天 / 中间有缺口"四类真实配置。
+ */
+const PROJECTED_PROBE_PERIODS = Object.freeze({
+  earlyPeak: Object.freeze([Object.freeze({ start: "08:00", end: "10:00" })]),
+  crossMidnight: Object.freeze([Object.freeze({ start: "23:00", end: "02:00" })]),
+  fullDay: Object.freeze([
+    Object.freeze({ start: "00:00", end: "12:00" }),
+    Object.freeze({ start: "12:00", end: "00:00" }),
+  ]),
+  gapped: Object.freeze([
+    Object.freeze({ start: "00:00", end: "11:00" }),
+    Object.freeze({ start: "12:00", end: "00:00" }),
+  ]),
+});
+
+/**
+ * 投影源行为探针（票据 01 第二单元）：输入固定、输出可 JSON 比较。
+ *
+ * 覆盖判定的全部口径：归一化的合法/非法、左闭右开（09:59 / 10:00）、跨午夜、
+ * 0 段、覆盖全天 true/false、固定 Date 的本地墙钟判定、非法 Date 的 fail-closed
+ * （含回调恰好一次）。每条探针只读导出面，确保"投影段与权威实现逐项相等"这件事
+ * 不依赖任何宿主状态。
+ */
+const PROJECTED_SOURCE_PROBES = Object.freeze([
+  Object.freeze({ label: "常量 MAX_PEAK_VALLEY_PERIODS", run: (face) => face.MAX_PEAK_VALLEY_PERIODS }),
+  Object.freeze({ label: "常量 PEAK_VALLEY_PERIODS_INVALID", run: (face) => face.PEAK_VALLEY_PERIODS_INVALID }),
+  Object.freeze({
+    label: "归一化：合法输入（含跨午夜）保持原始顺序",
+    run: (face) => face.normalizePeakValleyPeriods([
+      { start: "23:00", end: "02:00" },
+      { start: "08:00", end: "10:00" },
+      { start: "09:00", end: "11:00" },
+    ]),
+  }),
+  Object.freeze({
+    label: "归一化：任一项非法即整体拒绝",
+    run: (face) => face.normalizePeakValleyPeriods([
+      { start: "08:00", end: "10:00" },
+      { start: "8:00", end: "09:00" },
+    ]),
+  }),
+  Object.freeze({ label: "归一化：缺省表示 0 条", run: (face) => face.normalizePeakValleyPeriods(undefined) }),
+  Object.freeze({
+    label: "判定：08:00–10:00 在 09:59 与 10:00（左闭右开）",
+    run: (face) => [9 * 60 + 59, 10 * 60].map((minutes) => face.peakValleyAtMinutes(PROJECTED_PROBE_PERIODS.earlyPeak, minutes)),
+  }),
+  Object.freeze({
+    label: "判定：非法 minutes 一律 fail-closed 为谷时（不抛异常）",
+    run: (face) => [-1, 1440, 1.5, Number.NaN, "540", null].map(
+      (minutes) => face.peakValleyAtMinutes(PROJECTED_PROBE_PERIODS.earlyPeak, minutes),
+    ),
+  }),
+  Object.freeze({
+    label: "判定：23:00–02:00 跨午夜（23:30 / 01:30 / 02:00）",
+    run: (face) => [23 * 60 + 30, 60 + 30, 2 * 60].map((minutes) => face.peakValleyAtMinutes(PROJECTED_PROBE_PERIODS.crossMidnight, minutes)),
+  }),
+  Object.freeze({ label: "判定：0 条配置恒为谷时", run: (face) => face.peakValleyAtMinutes([], 9 * 60 + 30) }),
+  Object.freeze({
+    label: "覆盖全天：完整并集 true / 中间缺一段 false",
+    run: (face) => [
+      face.peakValleyPeriodsCoverFullDay(PROJECTED_PROBE_PERIODS.fullDay),
+      face.peakValleyPeriodsCoverFullDay(PROJECTED_PROBE_PERIODS.gapped),
+    ],
+  }),
+  Object.freeze({
+    label: "Date：固定本地墙钟 09:30 / 10:00",
+    run: (face) => [
+      face.peakValleyAtDate(PROJECTED_PROBE_PERIODS.earlyPeak, new Date(2026, 0, 5, 9, 30, 0)),
+      face.peakValleyAtDate(PROJECTED_PROBE_PERIODS.earlyPeak, new Date(2026, 0, 5, 10, 0, 0)),
+    ],
+  }),
+  Object.freeze({
+    label: "Date：非法 Date fail-closed 且回调恰好一次",
+    run: (face) => {
+      const calls = [];
+      const result = face.peakValleyAtDate(PROJECTED_PROBE_PERIODS.earlyPeak, new Date(Number.NaN), {
+        onInvalidDate: (value) => calls.push(Object.prototype.toString.call(value)),
+      });
+      return { result, calls };
+    },
+  }),
+]);
+
+/**
+ * 构建期行为对照：在最小 global 替身里执行刚生成的投影片段，取回检查点导出面，
+ * 与 ESM 权威实现在同一组固定探针上逐项比较，任何差异让构建失败。
+ *
+ * 与 {@link verifyFreshnessProjection} 同构：被执行的正是**要写盘的那一段**（不是重新渲染
+ * 的副本），所以"通过对照的文本"与"发布出去的文本"始终是同一份。
+ *
+ * @param {{ segment: string, authorityModule: object, checkpointKey: string }} options
+ *   authorityModule 是 ESM 权威实现的命名空间（由调用方 import；测试可注入替身）。
+ * @returns {Promise<{ steps: number, checkpointKey: string }>}
+ */
+export async function verifyProjectedSourceProjection({ segment, authorityModule, checkpointKey } = {}) {
+  if (typeof segment !== "string" || segment.length === 0) throw new Error("缺少待核对的 classic 投影片段");
+  if (authorityModule === null || typeof authorityModule !== "object") {
+    throw new Error("缺少 ESM 权威实现模块（无法做投影源对照）");
+  }
+  if (typeof checkpointKey !== "string" || checkpointKey.length === 0) throw new Error("缺少投影检查点键");
+  const face = evaluateProjectedSegment(segment, checkpointKey);
+  const differences = [];
+  for (const probe of PROJECTED_SOURCE_PROBES) {
+    // freezeForCompare：把 undefined / 函数 / 循环引用显式标记，并排序对象键，
+    // 这样"两侧是同构结果"可以被一次 JSON 比较证明，而不依赖键序运气。
+    const expected = freezeForCompare(probe.run(authorityModule));
+    const actual = freezeForCompare(probe.run(face));
+    if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+      differences.push({ label: probe.label, left: expected, right: actual });
+    }
+  }
+  if (differences.length > 0) {
+    const detail = differences.slice(0, 5).map((difference) => {
+      return "- " + difference.label + "\n  权威: " + JSON.stringify(difference.left)
+        + "\n  投影: " + JSON.stringify(difference.right);
+    }).join("\n");
+    throw new Error("投影源 " + checkpointKey + " 与 ESM 权威实现已漂移（共 " + differences.length + " 项）:\n" + detail);
+  }
+  return Object.freeze({ steps: PROJECTED_SOURCE_PROBES.length, checkpointKey });
+}
+
+/**
+ * 在最小 global 替身里执行投影片段，返回检查点导出面。
+ *
+ * 用 `new Function` 的参数遮蔽 `globalThis`：片段里的检查点赋值落在替身上，
+ * 既不污染构建进程的全局，也不影响真实装载。
+ *
+ * @param {string} segment - classic 投影片段文本。
+ * @param {string} checkpointKey - 检查点 Symbol 键。
+ */
+function evaluateProjectedSegment(segment, checkpointKey) {
+  const sandboxGlobal = {};
+  const run = new Function("globalThis", segment + "\nreturn globalThis;");
+  const executed = run(sandboxGlobal);
+  const face = executed[Symbol.for(checkpointKey)];
+  if (face === null || typeof face !== "object") {
+    throw new Error("投影片段未落地检查点（globalThis Symbol 上没有导出面）: " + checkpointKey);
+  }
+  return face;
+}
+
+/**
  * 发布 bundle 的装载契约门禁：投影位置、登记语句、client.js 的转发 seam，以及
  * "descriptor 段里不得再有第二份 freshness 实现"。
  * seam 一旦变化（不再 require 该模块、或又写回内联实现），行为核对与客户端测试都必须同步，
@@ -1099,6 +1362,38 @@ function verifyClientBundleContract(segments) {
     const compacted = compactBundleFragment(statement);
     if (!freshnessSegment.text.includes(compacted)) throw new Error("freshness 投影缺少装载语句: " + statement);
   }
+  // ── 可投影 ESM 源（票据 01 第二单元）──────────────────────────────────────
+  // 判据全部由 manifest.projectedSources 派生（不硬编码段名）：段必须存在、位于全部 IIFE 之后、
+  // freshness 与唯一 descriptor 之前，正文必须带对应检查点语句且不残留 ESM 语法。
+  // 位置判据不只是"好看"：投影段只挂检查点，descriptor 在 factory 里直接取用，
+  // 段序一旦后移，客户端只会静默拿到 undefined（缺失检测留给使用方），构建期必须拦住。
+  const lastIifeIndex = IIFE_SOURCES.reduce((last, source) => Math.max(last, names.indexOf(source)), -1);
+  const projectedIndices = [];
+  for (const projected of PROJECTED_SOURCES) {
+    const index = names.indexOf(projected.source);
+    if (index === -1) throw new Error("发布 bundle 缺少 " + projected.source + " 的 classic 投影段");
+    if (index > descriptorIndex) {
+      throw new Error(projected.source + " 的投影段必须在唯一 ModuleLoader descriptor 之前执行");
+    }
+    if (index > freshnessIndex) {
+      throw new Error(projected.source + " 的投影段必须排在 freshness 投影之前（manifest.assemblyOrder 的口径）");
+    }
+    if (index <= lastIifeIndex) {
+      throw new Error(projected.source + " 的投影段必须排在全部 IIFE 之后（检查点先由 IIFE 就位，投影再补共享实现）");
+    }
+    const projectedSegment = segments[index];
+    const checkpointStatement = compactBundleFragment(
+      projectedCheckpointStatement(projected.checkpointKey, projected.exports),
+    );
+    if (!projectedSegment.text.includes(checkpointStatement)) {
+      throw new Error(projected.source + " 的投影段缺少检查点语句: " + checkpointStatement);
+    }
+    const leftover = /(?:^|\n)[ \t]*(?:import|export)\b/.exec(projectedSegment.text);
+    if (leftover !== null) {
+      throw new Error(projected.source + " 的投影段残留 ESM 语法: " + leftover[0].trim());
+    }
+    projectedIndices.push(index);
+  }
   const descriptorMarkers = [
     "const FRESHNESS_MODULE_ID = " + JSON.stringify(FRESHNESS_MODULE_ID) + ";",
     "freshnessModule.registerClientFreshnessModule(globalThis.__ModuleLoader__);",
@@ -1116,7 +1411,7 @@ function verifyClientBundleContract(segments) {
         + "（唯一实现在 client-freshness.js，客户端只许转发；双份实现会让安装体积翻倍并重新引入漂移）");
     }
   }
-  return Object.freeze({ freshnessIndex, descriptorIndex });
+  return Object.freeze({ freshnessIndex, descriptorIndex, projectedIndices: Object.freeze(projectedIndices) });
 }
 
 /** classic script 语法门禁：浏览器按 Script 目标解析发布 bundle，残留 ESM 语法必须在这里失败。 */
@@ -1211,6 +1506,29 @@ export function assertBundleSizeGate(sizes) {
 }
 
 /**
+ * 按段名分派段渲染（段结构元数据的唯一生成处）。
+ *
+ * - freshness 源 → 专用投影：检查点 + ModuleLoader 登记（既有的装载契约，本函数不改写它）；
+ * - manifest.projectedSources 登记的源 → 通用投影：只挂检查点，不登记；
+ * - 其余（IIFE / descriptor）→ 段标记 + 已压缩正文（逐字节沿用原有形态）。
+ *
+ * @param {string} name - 段名（仓库相对路径）。
+ * @param {string} content - 已剥离注释并压缩空白的正文。
+ * @returns {string} 段文本（自带结尾换行，段之间不再插入纯空白行）。
+ */
+function renderSegmentText(name, content) {
+  if (name === FRESHNESS_SOURCE) return renderClientFreshnessSegment({ name, source: content });
+  const projected = PROJECTED_BY_SOURCE.get(name);
+  if (projected === undefined) return "/* source: " + name + " */\n" + content.trimEnd() + "\n";
+  return renderProjectedSourceSegment({
+    name,
+    source: content,
+    checkpointKey: projected.checkpointKey,
+    exports: projected.exports,
+  });
+}
+
+/**
  * 确定性装配发布 bundle。
  *
  * 流程（顺序即门禁顺序）：
@@ -1250,9 +1568,7 @@ export async function assembleClientBundle({ write = true } = {}) {
   const segments = sources.map(({ name, content }) => Object.freeze({
     name,
     marker: "/* source: " + name + " */",
-    text: name === FRESHNESS_SOURCE
-      ? renderClientFreshnessSegment({ name, source: content })
-      : "/* source: " + name + " */\n" + content.trimEnd() + "\n",
+    text: renderSegmentText(name, content),
   }));
   // 段文本自带结尾换行，这里直接首尾相接：装配器不得再插入纯空白行——否则"压缩后的段"
   // 会在拼装阶段被重新加上空白，产物就不再是压缩不动点（体积也会白白多出几个字节）。
@@ -1261,6 +1577,18 @@ export async function assembleClientBundle({ write = true } = {}) {
   verifyClassicScript(content);
   // 行为核对直接用刚生成的那一段（而不是重新渲染），确保校验对象就是要写盘的内容。
   const projection = await verifyFreshnessProjection({ segment: segments[placement.freshnessIndex].text });
+  // 投影源行为对照（票据 01 第二单元）：与 freshness 同一条纪律——每构建必跑，跑的就是待写盘
+  // 的那一段，任何差异让构建失败，而不是留到运行期由"界面提示与 Host 判定不一致"暴露。
+  const projectedProbes = [];
+  for (const projected of PROJECTED_SOURCES) {
+    const index = sourceNames.indexOf(projected.source);
+    projectedProbes.push(await verifyProjectedSourceProjection({
+      segment: segments[index].text,
+      // 权威实现按清单里的仓库相对路径动态 import：路径只由 manifest 决定，不另立映射。
+      authorityModule: await import("../" + projected.source),
+      checkpointKey: projected.checkpointKey,
+    }));
+  }
   const outputPath = join(root, outputName);
   // DSH 0.2.x 的 web boot 以固定文件名 client.js 请求插件客户端入口（combo 路由
   // /plugins/<包名>/client.js?rev=...），因此发布面同时产出两份同内容产物：
@@ -1294,6 +1622,8 @@ export async function assembleClientBundle({ write = true } = {}) {
     }),
     // 行为核对步数是"投影与权威实现逐项一致"的证据，构建日志与测试都据此断言。
     freshnessProbeSteps: projection.steps,
+    // 投影源行为对照的累计步数（每个投影源各自跑同一组固定探针）。
+    projectedProbeSteps: projectedProbes.reduce((total, probe) => total + probe.steps, 0),
   });
 }
 

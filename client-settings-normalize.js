@@ -571,7 +571,78 @@
       return (typeof roleLabelOf === "function" ? roleLabelOf(validation.role) : validation.role) + "：" + t("settings.modelCandidates.error." + (validation.code ?? "incomplete"), { index: validation.index });
     }
 
-    function normalizeSettingsDraft(value, roles, allowLegacyProviderFallback = true) {
+    /**
+     * 峰谷时段的**编辑器默认值**（唯一权威常量，客户端草稿与测试共用）。
+     *
+     * 语义取舍（主代理裁决，客户端侧）：未启用峰谷且时段为空时，编辑器一律显示这两条默认
+     * 峰段；一旦启用，时段完全以保存值为准（0 段 = 全天谷时），绝不回填。Host 的读取/写入
+     * 归一保持原样——默认值只活在客户端草稿里，保存时仍按既有 peakValleyCandidateOf 写回。
+     */
+    const DEFAULT_PEAK_VALLEY_PERIODS = Object.freeze([
+      Object.freeze({ start: "08:00", end: "12:00" }),
+      Object.freeze({ start: "14:00", end: "18:00" }),
+    ]);
+    /**
+     * 「添加峰段」追加的第三段默认值：必须与 DEFAULT_PEAK_VALLEY_PERIODS 不重叠
+     * （旧值 08:00–10:00 会落在默认峰段内部，保存前校验会直接判成非法时段）。
+     */
+    const NEXT_PEAK_VALLEY_PERIOD = Object.freeze({ start: "19:00", end: "22:00" });
+
+    /**
+     * 峰谷草稿（票据 07）：enabled / initialized / periods / peak / valley 的独立副本。
+     *
+     * 只做结构拷贝、**不做时段归一**：非法时段必须原样留在草稿里，由保存前校验拦下；
+     * 在这里静默丢弃坏时段会让用户以为改动已生效。initialized 是 Host 派生字段，
+     * 拷贝只用于显示，客户端不修改它、也不把它放进提交候选。
+     * JSON 深拷贝同时切断了草稿与快照之间的对象引用，编辑不会污染权威配置。
+     *
+     * @param {unknown} value - settings.peakValley（读取面状态）。
+     * @param {boolean} [seedPeriods] - 是否允许播种默认峰段；**只有读取面 → 草稿的入口**传 true。
+     * @returns {object} 草稿状态（缺省字段收敛为固定形状）。
+     */
+    function normalizePeakValleyDraft(value, seedPeriods = false) {
+      const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+      // 读取面的 fail-closed 信号只读携带：设置页据它显示修复提示、并禁止把归一后的
+      // 缺省值写回；它**不进提交候选**（peakValleyCandidateOf 只取五个可写字段）。
+      const invalidCode = typeof source.invalidCode === "string" && source.invalidCode.length > 0
+        ? source.invalidCode
+        : void 0;
+      const periods = Array.isArray(source.periods) ? source.periods : [];
+      /**
+       * 「编辑器默认值」播种（见 DEFAULT_PEAK_VALLEY_PERIODS 的语义取舍）。
+       *
+       * 为什么必须由调用方显式开关：本函数同时用于**重新归一正在编辑的草稿**（每帧的脏判定、
+       * 合成草稿与保存候选）。若无条件按「空数组就播种」，用户把峰段删到 0 条后下一帧就会被
+       * 填回默认两条——「0 段 = 全天谷时」与既有 B2（删到 0 段仍可保存且提交 [])立刻失效。
+       * 因此播种只发生在草稿建立/重置入口，渲染期重复归一绝不回填。
+       *
+       * 三条内容判据：损坏配置（invalidCode）必须原样保留，不能凭空造默认值；
+       * 已启用的峰谷以保存值为准；时段非空时尊重用户已保存的时段。
+       */
+      const seedDefaults = seedPeriods === true
+        && invalidCode === void 0
+        && source.enabled !== true
+        && periods.length === 0;
+      return JSON.parse(JSON.stringify({
+        enabled: source.enabled === true,
+        initialized: source.initialized === true,
+        // 常量本身是冻结的；这里与其他字段走同一趟 JSON 往返，落进草稿的必然是全新副本，
+        // 多个草稿之间绝不共享同一份时段对象。
+        periods: seedDefaults ? DEFAULT_PEAK_VALLEY_PERIODS : periods,
+        peak: source.peak !== null && typeof source.peak === "object" ? source.peak : {},
+        valley: source.valley !== null && typeof source.valley === "object" ? source.valley : {},
+        ...(invalidCode === void 0 ? {} : { invalidCode }),
+      }));
+    }
+
+    /**
+     * @param {unknown} value - 权威或草稿 settings 值。
+     * @param {Array} roles - 角色表。
+     * @param {boolean} [allowLegacyProviderFallback] - 旧文档顶层 provider 回退。
+     * @param {boolean} [seedPeakValleyPeriods] - 是否播种默认峰段（只有读取面 → 草稿的入口传 true；
+     *   渲染期重复归一一律 false，否则「删到 0 段」会被当场的归一重新填回默认值）。
+     */
+    function normalizeSettingsDraft(value, roles, allowLegacyProviderFallback = true, seedPeakValleyPeriods = false) {
       const source = value && typeof value === "object" ? value : {};
       const configuredProvider = typeof source.provider === "string" ? source.provider : "";
       const activeRoles = settingsRolesForProvider(roles);
@@ -633,6 +704,10 @@
         ...(Object.prototype.hasOwnProperty.call(source, "fallbackLimit")
           ? { fallbackLimit: normalizeModelFallbackLimitDraft(source.fallbackLimit) }
           : {}),
+        // 峰谷（票据 07）：只在源文档显式存在时进入草稿，旧文档/旧客户端形状逐字不变。
+        ...(Object.prototype.hasOwnProperty.call(source, "peakValley")
+          ? { peakValley: normalizePeakValleyDraft(source.peakValley, seedPeakValleyPeriods) }
+          : {}),
       };
     }
 
@@ -661,6 +736,8 @@
       "sidebarEntryEnabled",
       "candidates",
       "fallbackLimit",
+      // 峰谷（票据 07）：详情页保存时同样按「本地相对基线的差异」合并，不整份覆盖。
+      "peakValley",
     ]);
 
     /**
@@ -1049,13 +1126,14 @@
 
   // 只暴露被后续装配段实际消费的符号（无全量外挂）。
   global[SYMBOL] = Object.freeze({
-    DEFAULT_MODEL_FALLBACK_LIMIT, DEFAULT_PROMPT_MAX_GRAPHEMES, MAX_MODEL_CANDIDATES_PER_ROLE, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_PAGES,
+    DEFAULT_MODEL_FALLBACK_LIMIT, DEFAULT_PEAK_VALLEY_PERIODS, DEFAULT_PROMPT_MAX_GRAPHEMES, MAX_MODEL_CANDIDATES_PER_ROLE, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_PAGES,
+    NEXT_PEAK_VALLEY_PERIOD,
     NOTIFICATION_EVENT_TYPES, PROMPT_ROLE_IDS, PROMPT_WARNING_RATIO, SETTINGS_ROLE_LABELS, addModelCandidatePage,
     bindClientRuntime, clampNotificationVolume, commitSettingsCandidate, compactModelCandidatesDraft, countUnicodeGraphemes,
     createSettingsModelCatalog, mergeSettingsDraftOverSource, migrateSettingsDefaults, migrateSettingsSelection, modelCandidatesErrorMessage,
     resolveSettingsForm,
     modelLayerMapOf, modelLayerSelectionOf, modelPageCountOf, normalizeModelCandidatesDraft, normalizeModelFallbackLimitDraft,
-    normalizePromptOverrides, normalizeRolePromptProjection, normalizeSettingsCommitDraft, normalizeSettingsDraft, normalizeSettingsModelGroups,
+    normalizePeakValleyDraft, normalizePromptOverrides, normalizeRolePromptProjection, normalizeSettingsCommitDraft, normalizeSettingsDraft, normalizeSettingsModelGroups,
     promptEntryOf, promptOverridesEqual, removeModelCandidatePage, reorderModelLayers, setModelLayerSelection,
     settingsDraftEqual, settingsRolesForProvider, syncSettingsDefaultsProvider, unifiedProviderOf, updateRolePromptProjection,
     useEnabledSettingsRoles, useHostMeta, validateModelCandidateRows, validatePromptText,

@@ -80,6 +80,8 @@ import {
   validationError,
   budgetVerdict,
 } from "./validation.js";
+import { providerOfAttempt } from "./provider-attribution.js";
+import { ROUTE_SNAPSHOT_INVALID } from "../shared/route-snapshot.js";
 import {
   FANOUT_BUDGET,
   checkAttemptPayloadBudget,
@@ -142,15 +144,23 @@ function throttleDiagnostics(s, deps) {
   const queuedByRole = new Map();
   const queuedByProvider = new Map();
   const roleKeys = new Set([...deps.store.roleKeys(), ...Object.keys(roles)]);
-  const providerKeys = new Set(Object.keys(providers));
+  /**
+   * provider 行必须覆盖三类键（票据 05）：
+   * - 设置里配置了上限的 provider；
+   * - 当前**持有名额**的 provider（跨边界任务的归属可能不在 task.provider 上）；
+   * - 当前有排队分片的 provider（按各自 attempt 的归属归桶）。
+   */
+  const providerKeys = new Set([...Object.keys(providers), ...deps.store.countsByProvider().keys()]);
   // 任务数与分片数都有预算上界（resource-budget），因此这里是常数级聚合。
   for (const task of deps.store.allTasks()) {
-    const provider = typeof task.provider === "string" && task.provider.length > 0 ? task.provider : undefined;
-    if (provider !== undefined) providerKeys.add(provider);
     for (const shard of task.shards) {
       if (shard.status !== "queued") continue;
       queuedByRole.set(task.role, (queuedByRole.get(task.role) ?? 0) + 1);
-      if (provider !== undefined) queuedByProvider.set(provider, (queuedByProvider.get(provider) ?? 0) + 1);
+      // 排队分片按它当前这次执行的归属归桶：使用统一推导入口，不在诊断里另算一套。
+      const provider = providerOfAttempt(task, shard.attempts[shard.attempts.length - 1]);
+      if (provider === null) continue;
+      providerKeys.add(provider);
+      queuedByProvider.set(provider, (queuedByProvider.get(provider) ?? 0) + 1);
     }
   }
   const roleRows = {};
@@ -199,8 +209,11 @@ function dispatchAvailable(s, deps) {
   if (deps.reclaim.current !== null) return false;
   const roleActiveCounts = deps.store.activeCountsByRole();
   const taskActiveCounts = deps.store.activeCountsByTask();
-  // provider 份额同样用本轮副本：权威计数只在 setShardStatus 处更新。
-  const providerActiveCounts = deps.store.activeCountsByProvider();
+  /**
+   * provider 份额的权威计数只在 setShardStatus 处更新，而判定点已经随票据 05 下移到
+   * startShard（必须在快照冻结之后才知道归属），因此这里不再保留"本轮副本"：
+   * startShard 直接读权威计数，天然包含同一轮里刚派发的分片。
+   */
   // parentsByRole 保持首次注册 role 的顺序，避免每轮遍历整个 tasks 表。
   const roles = [...deps.store.roleKeys()];
 
@@ -245,27 +258,13 @@ function dispatchAvailable(s, deps) {
       cursor = (cursor + 1) % parents.length;
       budget -= 1;
       /**
-       * 名额判定顺序（票据 26 / 规格书 §3）：**先 provider，后 role**。
+       * provider 名额判定（票据 05）已下移到 startShard：归属键来自该次执行的派发快照，
+       * 只有在 prepareAttempt 成功冻结之后才存在。因此本处只做 role / 任务级两道闸门，
+       * 名额仍只在分片真正进入 running 时才占用——排队不占名额、不做预留。
        *
-       * 为什么顺序重要：两者都是非阻塞判定、失败都不占任何名额，但诊断需要如实反映
-       * "真正卡住这一帧的是哪个维度"。provider 是跨角色的共享资源，先判定它可以让
-       * provider 满时直接跳过该任务（不消耗、也不虚假占用 role 名额），并且不会因为
-       * role 池刚好满而把限流原因记到 role 名下。
-       *
-       * 判定通过后名额仍只在 startShard 真正把分片推进到 running 时才占用——
-       * 排队不占名额、不做预留，因此这里读到的 used/usedProvider 可以安全地只用于比较。
+       * 判定失败（provider 满）时 startShard 返回 false，本循环按"本轮无产出"处理：
+       * 绝不启动 child、绝不占 role 名额，也不把限流原因记到 role 名下。
        */
-      const providerLimit = deps.limits.providerLimitOf(task, resolvedProviderLimits);
-      if (providerLimit !== undefined) {
-        const usedProvider = providerActiveCounts.get(task.provider) ?? 0;
-        if (usedProvider >= providerLimit) {
-          // provider 满：跳过该任务并记为"本轮无产出"，绝不启动 child、绝不占 role 名额。
-          noteThrottled(s, deps, "provider", task.provider);
-          blockedInARow += 1;
-          if (blockedInARow >= parents.length) break;
-          continue;
-        }
-      }
       // role 共享池上限只看 role 级设置/默认值，不读任何任务的 concurrencyLimit，
       // 因此同一 role 下所有父任务解析出的池上限必然相同（循环内重复求值成本极低）。
       // 池子满时整个 role 都不可能再派发：直接结束本 role，避免空转一圈。
@@ -300,7 +299,9 @@ function dispatchAvailable(s, deps) {
         if (blockedInARow >= parents.length) break;
         continue;
       }
-      if (startShard(s, deps, task, shard)) {
+      // 本轮的 provider 上限映射随派发下传：startShard 在每个候选的实际归属上判定名额，
+      // 因此同一 drain 里不同 provider 的连续派发各自读权威计数，不会超发也不会串账。
+      if (startShard(s, deps, task, shard, resolvedProviderLimits)) {
         dispatched = true;
         used += 1;
         // 任务级计数必须在本轮内同步自增：入口快照只是基线（避免 running 事件
@@ -308,24 +309,12 @@ function dispatchAvailable(s, deps) {
         // 次 drain 的内层循环（budget 重置允许连续派发同一任务）会读到过期值，
         // 使任务越过自身任务级上限——快照要等下一次 dispatchAvailable 才刷新。
         taskActiveCounts.set(task, (taskActiveCounts.get(task) ?? 0) + 1);
-        // provider 份额同理必须在本轮内同步累计：否则同一 drain 里连续派发多个
-        // 同 provider 分片时会读到过期份额，直接超发。
-        if (providerLimit !== undefined) {
-          providerActiveCounts.set(task.provider, (providerActiveCounts.get(task.provider) ?? 0) + 1);
-          // 真正派发成功 = 该 provider 的限流窗口结束，采样一次等待时长（诊断用）。
-          noteDispatchReleased(s, deps, "provider", task.provider);
-        }
         noteDispatchReleased(s, deps, "role", role);
         blockedInARow = 0;
         if (deps.gate.closed) break;
         // role 共享池在派发过程中可能刚好被填满（例如另一路径同步派发），逐次复核；
         // 一旦填满就停止本 role 的派发，保证 role 全局 running 不越过池上限。
         if (used >= deps.limits.rolePoolLimitFor(task)) break;
-        // provider 名额同样逐次复核：填满后本 role 内同 provider 的任务不再尝试。
-        if (providerLimit !== undefined && (providerActiveCounts.get(task.provider) ?? 0) >= providerLimit) {
-          budget = parents.length;
-          continue;
-        }
         // 有新 shard 进入 running 后，重新评估其它父任务的排队情况。
         budget = parents.length;
       }
@@ -578,16 +567,118 @@ function requestShardCancellation(s, deps, task, shard, attempt, reason) {
   }
 }
 
-function startShard(s, deps, task, shard) {
+/**
+ * 派发前准备失败的受控收敛（票据 03）：queued → failed，且**从未**进入 running。
+ *
+ * 只复用既有唯一状态机入口 settleShard（事件/聚合/落盘通知/调度重排都不复制），额外做两件事：
+ * 1. 传 allowQueuedFailure：这是 queued→failed 的唯一受控来源；
+ * 2. 带 admission_not_created 证据：没有证据时终态 attempt 的影响范围会永远占位。
+ * 稳定 code 来自冻结入口（峰谷 invalidCode / ROUTE_SNAPSHOT_INVALID），错误体是**普通对象**
+ * （不是 Error 实例）：normalizeLaunchError 只对普通对象保留自定义 code。
+ */
+function failPreparedDispatch(s, deps, task, shard, attempt, detail) {
+  const code = typeof detail?.code === "string" && detail.code.length > 0 ? detail.code : "DISPATCH_PREPARE_FAILED";
+  deps.bound.settleShard(task, shard, attempt, "failed", {
+    error: {
+      name: "FanoutDispatchPrepareError",
+      code,
+      reason: "dispatch_prepare_failed",
+      message: "fan-out 派发前路由冻结失败（" + code + "），已拒绝启动 child",
+      retryable: false,
+    },
+    evidence: deps.bound.admissionEvidence(attempt),
+    reason: "dispatch_prepare_failed",
+    allowQueuedFailure: true,
+  });
+}
+
+/**
+ * 启动一个排队分片（票据 03 冻结 → 票据 05 名额判定 → 置 running → 调 launcher）。
+ *
+ * @param {object} task - 父任务。
+ * @param {object} shard - 排队分片。
+ * @param {Readonly<Record<string, number>>} [roundProviderLimits] - 本轮已解析的
+ *   provider -> limit 映射；缺省时现场解析一次（兼容测试/旧调用方）。
+ * @returns {boolean} true 表示本次真正进入 running（可能已同步结算）；false 表示没有派发
+ *   （准备失败或 provider 名额已满，状态与计数按各自语义保持不变）。
+ */
+function startShard(s, deps, task, shard, roundProviderLimits) {
   const attempt = shard.attempts[shard.attempts.length - 1];
   if (attempt === undefined || attempt.status !== "queued") return false;
   // 多轮 continuation：本轮 attempt 复用上一轮的 child，必须走 deps.continuer（把新 prompt
   // 投递给同一 child），不能重新走 deps.launcher 新建 child。
   const isContinuation = attempt.continuation === true;
   const launch = isContinuation ? deps.continuer : deps.launcher;
+  /**
+   * 派发期路由决定（票据 03 冻结 / 票据 04 复用）：**必须在 attempt 进入 running 之前**
+   * 同步完成。
+   *
+   * 为什么顺序不能交换：一旦先置 running 再选路，设置就在这个窗口里被改写、或时钟跨过
+   * 峰谷边界，同一次执行会用上另一套配置；而且失败时已经「计数 + 发过 running 事件」，
+   * 只能在 running 之后收敛，计数与事件轨迹都会失真。
+   *
+   * 复用优先级由 host/fanout-dispatch-route.js 决定（恢复回来的 attempt 自身快照 → 同
+   * shard 上一轮快照 → 新派发时刻冻结）；本处只负责把结果写进 attempt.route。因此恢复
+   * 与续作**不会**按当前设置或当前时钟重选：它们在第一、二层就短路了。
+   *
+   * 三种返回：
+   * - null：本次没有路由决定（峰谷未启用 / 两层都没配该角色 / 续作且上一轮也没有快照）
+   *   → 逐字保持旧路径；
+   * - {ok:false}：配置非法或复用的快照非法 → 该 attempt 直接 queued→failed，不置
+   *   running、不计数、不发 running 事件，也不调用 launcher（fail-closed，绝不回退重建）；
+   * - {ok:true}：把纯数据快照写进 attempt.route，随后 running 路径的 notifyPersistence
+   *   会把它一并落盘（不额外通知，避免一次派发两次持久化批）。
+   */
+  let frozenRoute = null;
+  if (typeof deps.prepareAttempt === "function") {
+    let prepared;
+    try {
+      prepared = deps.prepareAttempt({ task, shard, attempt, round: task.round, continuation: isContinuation });
+    } catch (error) {
+      // 冻结入口自身抛错（例如读设置失败）：同样按受控失败收敛，绝不把异常抛回调度循环。
+      prepared = { ok: false, code: error?.code, reason: error?.reason };
+    }
+    if (prepared !== null && prepared !== undefined) {
+      if (prepared.ok !== true) {
+        failPreparedDispatch(s, deps, task, shard, attempt, prepared);
+        // 没有派发成功：dispatchAvailable 不得为本分片累加 role/provider 名额。
+        return false;
+      }
+      frozenRoute = prepared;
+      attempt.route = prepared.snapshot;
+    }
+  }
+  /**
+   * provider 名额判定（票据 05）：**必须在快照冻结之后、置 running 之前**。
+   *
+   * 归属键来自这次执行的快照（providerOfAttempt），所以跨峰谷边界的相邻分片各自占用
+   * 自己 provider 的名额；父任务的单一 provider 只在没有快照时作为旧路径兼容值。
+   *
+   * 两种不派发的结果：
+   * - 快照存在却无法归属（非法 / 活动候选缺 provider）→ 走准备失败路径：queued→failed，
+   *   不置 running、不计数、不调 launcher（fail-closed，绝不回退 task.provider）；
+   * - provider 名额已满 → 保留刚冻结的 attempt.route、**保持 queued**、不计数、不调
+   *   launcher。下一轮 drain 的 prepare 在第一层直接复用该快照，不会重读时钟或设置。
+   */
+  const provider = providerOfAttempt(task, attempt);
+  if (attempt.route !== undefined && provider === null) {
+    failPreparedDispatch(s, deps, task, shard, attempt, { code: ROUTE_SNAPSHOT_INVALID });
+    return false;
+  }
+  const providerLimit = deps.limits.providerLimitOf(
+    task,
+    roundProviderLimits === undefined ? deps.limits.resolveProviderLimits() : roundProviderLimits,
+    provider,
+  );
+  if (providerLimit !== undefined && (deps.store.providerRunCount(provider) ?? 0) >= providerLimit) {
+    noteThrottled(s, deps, "provider", provider);
+    return false;
+  }
   attempt.status = "running";
   attempt.startedAt = deps.now();
-  deps.store.setShardStatus(task, shard, "running");
+  deps.store.setShardStatus(task, shard, "running", attempt);
+  // 真正派发成功 = 该 provider 的限流窗口结束，采样一次等待时长（诊断用）。
+  if (providerLimit !== undefined) noteDispatchReleased(s, deps, "provider", provider);
   shard.updatedAt = attempt.startedAt;
   task.updatedAt = attempt.startedAt;
   deps.events.emitShardStatus(task, shard, "running", attempt.attempt, {
@@ -622,6 +713,14 @@ function startShard(s, deps, task, shard) {
      * messageId 会让旧轮 turn/end 直接结算新一轮（提前 task_settled / goal release）。
      */
     ...(isContinuation ? { previousMessageIds: previousMessageIdsFor(s, deps, shard) } : {}),
+    /**
+     * 派发期冻结的完整路由快照（票据 03）：buildRequest 看到它时**不再重新选路**，
+     * 也不再跑 provider 一致性校验（逐 shard 的 provider 差异属票据 05）。
+     * selection 只是同一决定的即时读面（排障/日志），权威仍是快照本身。
+     */
+    ...(frozenRoute === null
+      ? {}
+      : { precomputedRoute: frozenRoute.snapshot, selection: frozenRoute.selection }),
   };
 
   // 0 = 显式禁用超时（票据 06）：只有真正启用的正数才挂定时器。
@@ -1069,7 +1168,9 @@ function isIdle(s, deps) {
 export function createScheduler({ store, limits, events, persistence, agents, clock, ownerGate }) {
   const { gate, reclaim } = ownerGate;
   const { now, setTimeout: setTimeoutFn, clearTimeout: clearTimeoutFn, stopGraceMs } = clock;
-  const { launcher, continuer, canceller } = agents;
+  // agents 袋里的执行 seam：启动器/续作器/取消器 + 派发前路由冻结（票据 03，可选）。
+  // prepareAttempt 缺失（旧装配/测试替身）时 startShard 完全保持旧行为。
+  const { launcher, continuer, canceller, prepareAttempt: prepareAttemptFn } = agents;
   const ledger = events;
   const limitConfig = limits.limitConfig;
   /** 本模块独占的可变绑定（唯一 owner；只在模块内以 s 形参传递）。 */
@@ -1083,7 +1184,12 @@ export function createScheduler({ store, limits, events, persistence, agents, cl
     lastAttributionAged: null,
     stopDiagnosticsState: { boundary: "unknown", boundarySource: "process-instance" },
   };
-  const deps = { now, setTimeoutFn, clearTimeoutFn, stopGraceMs, launcher, continuer, canceller, gate, reclaim, ledger, limitConfig, store, limits, events, persistence, bound: null };
+  const deps = {
+    now, setTimeoutFn, clearTimeoutFn, stopGraceMs, launcher, continuer, canceller,
+    // 派发前路由冻结（票据 03）：只在是函数时注入，其余情况一律按「未接线」处理。
+    prepareAttempt: typeof prepareAttemptFn === "function" ? prepareAttemptFn : undefined,
+    gate, reclaim, ledger, limitConfig, store, limits, events, persistence, bound: null,
+  };
   function bindCommands(commands) { deps.bound = commands; }
 
   return Object.freeze({

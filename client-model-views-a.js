@@ -11,7 +11,9 @@
   const SYMBOL = Symbol.for("dsh-expert-group/client-model-views-a");
   const clientModelViewsBSymbol = Symbol.for("dsh-expert-group/client-model-views-b");
   const clientModelViewsB = global[clientModelViewsBSymbol] || {};
-  const { ModelDiscoveryDialog, clearsAllCandidateSelection, renderModelRow } = clientModelViewsB;
+  const {
+    ModelDiscoveryDialog, renderModelRow, toggleCandidateOf, toggleIndexInSet, toggleVisibleCandidatesOf,
+  } = clientModelViewsB;
   // descriptor 注入的运行期依赖：本模块先于 descriptor 执行，取值只发生在运行期调用时。
   let react = null;
   function bindClientRuntime(host) {
@@ -69,8 +71,9 @@
 /**
  * 候选选择动作：勾选单个候选、全选/取消全选、关闭弹窗。
  *
- * 三个动作只依赖两个 setter 与纯函数 clearsAllCandidateSelection。工厂每次渲染调用一次，
- * 因此回调身份与原来的内联箭头一致（每次渲染都是新函数对象）。
+ * 两个候选动作改为复用 client-model-views-b.js 的纯状态变换（本模块与 provider 卡片原先各
+ * 写一份逐字相同的更新器）。为什么等价：这里只保留"把纯变换交给 setter"这一层包装，setter
+ * 相同、无效状态返回原对象的语义相同、回调身份仍是每次渲染新建（与原内联箭头一致）。
  *
  * @param {object} context
  * @param {Function} context.setFetchState 候选/错误状态 setter。
@@ -78,37 +81,9 @@
  * @returns {{toggleCandidate: Function, toggleVisibleCandidates: Function, closeModelPicker: Function}}
  */
 function buildCandidateControls({ setFetchState, setCandidateQuery }) {
-  const toggleCandidate = (id) => {
-    setFetchState((previous) => previous === null || !Array.isArray(previous.candidates)
-      ? previous
-      : {
-        ...previous,
-        candidates: previous.candidates.map((candidate) => candidate.id === id
-          ? { ...candidate, picked: candidate.picked !== true }
-          : candidate),
-      });
-  };
-  /**
-   * 弹窗「全选/取消全选」的唯一实现（弹窗按钮文案也走同一个纯函数判定）。
-   *
-   * - 可见项已全选 → 清空**全部**选择（含被搜索隐藏的候选），与 DSH 模型页一致；
-   * - 否则只把可见项追加为已选，隐藏候选保留原选择。
-   */
-  const toggleVisibleCandidates = (ids) => {
-    const wanted = new Set(Array.isArray(ids) ? ids : []);
-    setFetchState((previous) => {
-      if (previous === null || !Array.isArray(previous.candidates)) return previous;
-      if (clearsAllCandidateSelection(previous.candidates, wanted)) {
-        return { ...previous, candidates: previous.candidates.map((candidate) => ({ ...candidate, picked: false })) };
-      }
-      return {
-        ...previous,
-        candidates: previous.candidates.map((candidate) => wanted.has(candidate.id)
-          ? { ...candidate, picked: true }
-          : candidate),
-      };
-    });
-  };
+  const toggleCandidate = (id) => setFetchState((previous) => toggleCandidateOf(previous, id));
+  /** 弹窗「全选/取消全选」：判定与改写仍同源（clearsAllCandidateSelection 在 views-b 内）。 */
+  const toggleVisibleCandidates = (ids) => setFetchState((previous) => toggleVisibleCandidatesOf(previous, ids));
   const closeModelPicker = () => {
     setFetchState(null);
     setCandidateQuery("");
@@ -417,13 +392,8 @@ function renderProviderCardExpanded(context) {
           return { ...draft, models: config.setModelInputSelection(rows, index, next) };
         });
       };
-      const toggleRow = (index) => {
-        setExpandedRows((previous) => {
-          const next = new Set(previous);
-          if (!next.delete(index)) next.add(index);
-          return next;
-        });
-      };
+      // 展开/收起：纯变换在 views-b（与 provider 卡片共用同一份实现）。
+      const toggleRow = (index) => setExpandedRows((previous) => toggleIndexInSet(previous, index));
       const cancel = () => {
         session.cancel();
         setExpandedRows(new Set());

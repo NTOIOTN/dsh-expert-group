@@ -124,6 +124,8 @@ export function assembleExpertTools(state) {
       restoredFanoutModelRoute: state.restoredFanoutModelRoute,
       resolveRoleModelRoute: state.resolveRoleModelRoute,
       routeMarkerOf: state.routeMarkerOf,
+      // 派发路由冻结快照 marker（票据 03）：与 attempt.route 同一份数据，随 child_models 落盘。
+      routeSnapshotMarkerOf: state.routeSnapshotMarkerOf,
     },
     core: state.expertCore,
     roles: { require: (role) => roleCatalog().require(role) },
@@ -152,6 +154,15 @@ export function assembleExpertTools(state) {
     waits: state.fanoutWaits,
     requestBuilder: fanoutRequestBuilder,
     childHandlers: fanoutChildHandlers,
+    /**
+     * 派发期路由冻结 seam（票据 03）：只交出两个**只读取值函数**（同一代读的设置快照 +
+     * 只读时钟）。判定语义留在 fanout 域（host/fanout-dispatch-route.js），组合根不写
+     * 第二套选路；时钟沿用 per-apply 的只读时钟，因此测试注入假时钟即可确定性断言。
+     */
+    dispatch: {
+      readSettingsSnapshot: () => state.readSnapshot(),
+      clock: state.clock,
+    },
   });
   const fanoutRuntime = createFanoutRuntimeWiring({
     identity: expertToolsIdentity,
@@ -347,6 +358,8 @@ export function assembleRoleTools(state) {
     models: {
       resolveRoleModelRoute: state.resolveRoleModelRoute,
       routeMarkerOf: state.routeMarkerOf,
+      // 派发路由冻结快照 marker（票据 03）：启用峰谷时随 child_models 落盘。
+      routeSnapshotMarkerOf: state.routeSnapshotMarkerOf,
       resolveModelInfo: (...args) => llm.resolveModelInfo(...args),
     },
     roles: { require: (role) => roleCatalog().require(role) },
@@ -363,9 +376,10 @@ export function assembleRoleTools(state) {
   const roleToolObserverRoute = createRoleToolObserverRoute({
     identity: state.expertToolsIdentity,
     models: {
-      resolveRole: state.resolveRole,
-      validateSelectionWithSignal: state.validateSelectionWithSignal,
-      resolveModelInfo: (...args) => llm.resolveModelInfo(...args),
+      // Observer 自动图片路由复用 role tool 的**同一条**派发路由（票据 03）：
+      // 峰谷时段选择、候选链（含 image 能力要求）与快照冻结都不再有第二套实现。
+      resolveRoleModelRoute: state.resolveRoleModelRoute,
+      routeSnapshotMarkerOf: state.routeSnapshotMarkerOf,
     },
     core: state.expertCore,
     storage: { resolvePersonaForAdmission: state.resolvePersonaForAdmission },

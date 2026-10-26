@@ -23,6 +23,7 @@
 import { createHash } from "node:crypto";
 import { hasUsageMetrics, projectUsage, sumUsageByChildId } from "./usage-projection.js";
 import { projectModelRouteFields } from "../shared/model-route.js";
+import { projectRouteSnapshotFields } from "../shared/route-snapshot.js";
 import { projectStructuredResult, structuredProjectionFields } from "../shared/structured.js";
 
 /** 投影 schema 版本；客户端只接受该版本的负载。 */
@@ -797,6 +798,9 @@ function projectSessionNode(record, { kind, id, sessionId }) {
     // 实际路由（票据 24）：只有确实记录过 candidateIndex/fallbackCount/
     // lastRouteErrorCode 时才输出，缺失字段整体省略（不补 0、不猜 primary）。
     ...projectModelRouteFields(source),
+    // 时段/层/跨层回退（票据 06）：字段存在才出现（快照缺失时整组省略，不补默认值），
+    // 且绝不携带 plan/provider 等执行快照内容。
+    ...projectRouteSnapshotFields(source),
     // 目标 subagent provider / 继承开关（票据 29）：缺失省略，不伪造 false。
     ...projectSubagentContextFields(source),
     // 结构化交付（票据 30）：只读结果与“声明过 schema”的布尔；缺失整体省略。
@@ -963,6 +967,9 @@ function projectAttemptNode(attempt) {
     roleLabel: textOrNull(source?.roleLabel),
     // 每次 attempt 的实际路由（票据 24）：恢复/续作只读，不重新选择；缺失省略。
     ...projectModelRouteFields(source),
+    // 时段/层/跨层回退（票据 06）：字段存在才出现（快照缺失时整组省略，不补默认值），
+    // 且绝不携带 plan/provider 等执行快照内容。
+    ...projectRouteSnapshotFields(source),
     // 目标 subagent provider / 继承开关（票据 29）：缺失省略，不伪造 false。
     ...projectSubagentContextFields(source),
     // 单次 attempt 的用量（票据 25）：来自该 attempt.childId 的 child_models/账本；
@@ -1041,6 +1048,9 @@ function projectShardNode(shard, inherited = {}) {
     ...(turnOpenSince === null ? {} : { turnOpenSince }),
     // 分片实际路由（票据 24）：来自最新 attempt child 的 child_models 记录；缺失省略。
     ...projectModelRouteFields(source),
+    // 时段/层/跨层回退（票据 06）：字段存在才出现（快照缺失时整组省略，不补默认值），
+    // 且绝不携带 plan/provider 等执行快照内容。
+    ...projectRouteSnapshotFields(source),
     // 目标 subagent provider / 继承开关（票据 29）：来自同一 child 的 child_models；缺失省略。
     ...projectSubagentContextFields(source),
     // 分片用量（票据 25）：没有有效样本时整字段省略。

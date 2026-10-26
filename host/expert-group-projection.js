@@ -25,6 +25,7 @@ import {
   persistedModelRouteIsAuthoritative,
   projectModelRouteFields,
 } from "../shared/model-route.js";
+import { projectRouteSnapshotFields } from "../shared/route-snapshot.js";
 import { hasUsageMetrics, projectUsage } from "./usage-projection.js";
 import { projectStructuredResult } from "../shared/structured.js";
 
@@ -62,6 +63,8 @@ const PERMANENT_RESTORE_CODES = new Set([
   "INVALID_SNAPSHOT",
   "INVALID_SNAPSHOT_STATUS",
   "INVALID_SNAPSHOT_TRANSITION",
+  // 派发路由冻结快照非法（票据 03/04）：同一份磁盘数据重试也不会变好，属结构性缺陷。
+  "INVALID_SNAPSHOT_ROUTE",
   "UNSUPPORTED_SNAPSHOT_VERSION",
   "INVALID_BUDGET",
   "INVALID_CONCURRENCY_LIMIT",
@@ -526,7 +529,24 @@ export function subagentContextFields(persisted, agent, context) {
   };
 }
 
-export function modelMetadata(agent, persisted, context) {
+/**
+ * 时段/层/跨层回退的合并点（票据 06）。
+ *
+ * 冲突规则：**attempt 的冻结快照优先**。attempt.route 是「这一次执行」的决定，child_models
+ * 的 route 只是同一份决定在 child 侧的**只读投影**（运行期降级会推进它），因此它不得成为
+ * 第二事实源；只有 attempt 完全没有可读快照时（旧记录/未启用峰谷）才回退到 child 记录。
+ *
+ * @param {object|undefined} attempt - 本次 attempt 记录（可含 `route`）。
+ * @param {object|undefined} persisted - child_models 记录（可含 `route`）。
+ * @returns {object} 可展开的投影字段；两者都没有快照时为空对象。
+ */
+function routeSnapshotFieldsOf(attempt, persisted) {
+  const fromAttempt = projectRouteSnapshotFields(attempt);
+  if (Object.keys(fromAttempt).length > 0) return fromAttempt;
+  return projectRouteSnapshotFields(persisted);
+}
+
+export function modelMetadata(agent, persisted, context, attempt) {
   const header = safeCall(() => agent?.session?.requestHeader?.(), null);
   const config = header?.config ?? {};
   // 实际路由（票据 24）：持久化 child_models 是权威；live child 在持久化落地前
@@ -562,6 +582,8 @@ export function modelMetadata(agent, persisted, context) {
     // admission 时的 marker；marker 只在持久化字段缺失时（写入尚未落地/旧记录）补齐。
     ...projectModelRouteFields(marker),
     ...projectModelRouteFields(persisted),
+    // 时段/层/跨层回退（票据 06）：attempt 冻结快照优先于 child_models 缓存，缺失整体省略。
+    ...routeSnapshotFieldsOf(attempt, persisted),
     // 目标 subagent provider / 继承开关（票据 29）：缺失省略，不伪造 false。
     ...subagentContextFields(persisted, agent, context),
   };

@@ -71,16 +71,18 @@
   /**
    * 状态筛选分组：UI 的下拉选项直接用这些键。
    *
-   * 使用分组而不是逐状态，是为了不把协议词表暴露给用户：用户只关心
-   * 「还在跑 / 失败了 / 成功 / 取消 / 空闲」这五类。unknown 归入空闲组（UI 本来就把
-   * 证据不足的节点显示在空闲分组里）。
+   * 用户口径只有三类：「运行中 / 未完成 / 已完成」。分组而不是逐状态，是为了不把协议
+   * 词表暴露给用户。「未完成」= 除正常完成以外的全部已结束状态：失败/超时/中断/取消，
+   * 以及无法证明正常完成的 idle/ready/unknown（没有 succeeded 证据就仍算未完成，不猜成完成）。
+   *
+   * 这三个键对 status 词表构成**完整划分**：任何节点都恰好落在一个分组里。因此选定某个
+   * 状态筛选时，节点只会出现在它该在的分组里，绝不会因为「这个状态没有对应选项」而从
+   * 视图里凭空消失。
    */
   const STATUS_FILTER_GROUPS = Object.freeze({
     running: Object.freeze(["queued", "waiting", "running"]),
-    failed: Object.freeze(["failed", "timed_out", "interrupted"]),
-    succeeded: Object.freeze(["succeeded"]),
-    cancelled: Object.freeze(["cancelled"]),
-    idle: Object.freeze(["idle", "ready", "unknown"]),
+    incomplete: Object.freeze(["failed", "timed_out", "interrupted", "cancelled", "idle", "ready", "unknown"]),
+    completed: Object.freeze(["succeeded"]),
   });
 
   /**
@@ -400,10 +402,13 @@ const MESSAGE_CATALOG = Object.freeze({
   }
 
   /**
-   * 紧凑运行时长（用量速览行）：<1s、1.2s、1m、28m27s、1h、1h2m。
+   * 紧凑运行时长（用量速览行）：<1s、1s、52s、1m、28m27s、1h、1h2m。
    *
    * 与 formatDuration 的区别是「更短、更贴近摘要条」：不插入空格；整分不补 "0s"、
    * 整点不补 "0m"；小时级忽略秒。缺失返回 null（调用方整段省略，绝不写 0/占位词）。
+   *
+   * 精度口径（用户要求）：1 分钟以内**向下取整到秒**，与宿主状态行 "1m57s" 的秒级口径一致
+   * （52.8s → 52s、1.2s → 1s、59999ms → 59s）；1 秒以内仍是既有的 "<1s" 契约。
    */
   function formatDurationCompact(value) {
     const ms = numberOrNull(value);
@@ -411,8 +416,8 @@ const MESSAGE_CATALOG = Object.freeze({
     const clamped = Math.max(0, ms);
     if (clamped < 1000) return "<1s";
     if (clamped < 60000) {
-      const seconds = (clamped / 1000).toFixed(1);
-      return (seconds.endsWith(".0") ? seconds.slice(0, -2) : seconds) + "s";
+      // 向下取整到秒：侧栏与宿主状态行同口径，不再显示 0.1s 小数。
+      return Math.floor(clamped / 1000) + "s";
     }
     if (clamped < 3600000) {
       const minutes = Math.floor(clamped / 60000);
@@ -431,6 +436,19 @@ const MESSAGE_CATALOG = Object.freeze({
     const rounded = value >= 10 ? String(Math.round(value)) : value.toFixed(1);
     return (rounded.endsWith(".0") ? rounded.slice(0, -2) : rounded) + "tok/s";
   }
+
+  /**
+   * 「尚未投影 / 尚未开始」时五段使用的 0 占位文本（渲染层补齐用）。
+   *
+   * 与 summarizeUsageMetrics 的字段名一一对应；token 段沿用既有 "0 tok" 带空格写法。
+   */
+  const ZERO_USAGE_TEXTS = Object.freeze({
+    durationText: "0s",
+    throughputText: "0tok/s",
+    totalTokensText: "0 tok",
+    cacheHitText: "命中0%",
+    contextText: "context 0%",
+  });
 
   /**
    * 任务行「用量速览」的纯函数投影（用时 · tok/s · tok · 命中 · context）。
@@ -511,6 +529,69 @@ const MESSAGE_CATALOG = Object.freeze({
       contextUsedTokens,
       contextWindow,
     };
+  }
+
+  /**
+   * summarizeUsageMetrics 的结果是否「没有任何正用量证据」。
+   *
+   * 术语口径：只有五个维度全部缺失或为 0 时才是空——时长文本/吞吐文本为 null，
+   * 总 token 为 null 或 0，命中文本为 null，context 百分比为 null 或 0。
+   * 命中 0% 与 context 0% 本身是**有效事实**，所以它们不等于「未知」；但仍不构成正用量证据。
+   *
+   * @param {object|null} summary - summarizeUsageMetrics 的返回值。
+   * @returns {boolean}
+   */
+  function isEmptyUsageMetrics(summary) {
+    if (!isObject(summary)) return false;
+    if (summary.durationText !== null) return false;
+    if (summary.throughputText !== null) return false;
+    if (summary.totalTokens !== null && summary.totalTokens !== 0) return false;
+    if (summary.cacheHitText !== null) return false;
+    if (summary.contextPercent !== null && summary.contextPercent !== 0) return false;
+    return true;
+  }
+
+  /**
+   * 把「缺失段」的文本补成 0 占位（只补缺失，绝不覆盖已有真值）。
+   *
+   * 语义：这些 0 表示**「尚未投影」或「尚未开始」**，不是「用量就是 0」的结论——
+   * DSH 的 sessionStats / tokenUsage / contextPressure 投影稍后到达时，渲染层会用真实的
+   * summarizeUsageMetrics 结果替换它们。因此：
+   * - 入参**不被修改**，返回浅拷贝；已有文本一律原样保留（真值永不被清零）；
+   * - 「缺失」= 该字段不是 string（null / undefined / 其它类型）；
+   * - 只处理展示用文本字段（durationText / throughputText / totalTokensText /
+   *   cacheHitText / contextText），数值字段（durationMs 等）保持调用方的值；
+   * - options.skipContext === true 时不补 contextText：fan-out 父任务没有单一会话，
+   *   context 段必须保持省略。
+   *
+   * @param {object|null} summary - summarizeUsageMetrics 的返回值（可为 null）。
+   * @param {{skipContext?: boolean}} [options]
+   * @returns {{metrics: object, filled: {durationText:boolean, throughputText:boolean,
+   *   totalTokensText:boolean, cacheHitText:boolean, contextText:boolean}}}
+   */
+  function zeroFilledUsageMetrics(summary, options) {
+    const source = isObject(summary) ? summary : {};
+    const settings = isObject(options) ? options : {};
+    const metrics = { ...source };
+    const filled = {
+      durationText: false,
+      throughputText: false,
+      totalTokensText: false,
+      cacheHitText: false,
+      contextText: false,
+    };
+    for (const key of ["durationText", "throughputText", "totalTokensText", "cacheHitText", "contextText"]) {
+      // fan-out 父任务没有单一会话：context 段即使缺失也保持省略（显式 null，便于调用方判断），
+      // 避免伪造 context 0%。
+      if (key === "contextText" && settings.skipContext === true) {
+        if (typeof source[key] !== "string") metrics[key] = null;
+        continue;
+      }
+      if (typeof source[key] === "string") continue;
+      metrics[key] = ZERO_USAGE_TEXTS[key];
+      filled[key] = true;
+    }
+    return { metrics, filled };
   }
 
   /**
@@ -1052,8 +1133,6 @@ const MESSAGE_CATALOG = Object.freeze({
   global[SYMBOL] = Object.freeze({
     FAILURE_MESSAGE_DISPLAY_MAX_LENGTH,
     RETRY_WARNING_THRESHOLD,
-    ATTEMPT_TIMELINE_LIMIT,
-    FAILURE_STATUSES,
     STATUS_FILTER_GROUPS,
     STRUCTURED_PREVIEW_MAX_CHARS,
     formatFailureSummary,
@@ -1071,6 +1150,8 @@ const MESSAGE_CATALOG = Object.freeze({
     serializeSnapshot,
     formatDurationCompact,
     summarizeUsageMetrics,
+    isEmptyUsageMetrics,
+    zeroFilledUsageMetrics,
     formatExpertMetadata,
     defaultExpanded,
     createExpansionStore,
@@ -1079,7 +1160,6 @@ const MESSAGE_CATALOG = Object.freeze({
     MISSING_MESSAGE_TEXT,
     MESSAGE_CATALOG,
     normalizeLocale,
-    resolveLocale,
     resolveClientLocale,
     translateMessage,
   });

@@ -90,13 +90,20 @@ class ValidationError extends Error {}
  * - 一个进程会并发装配多个插件实例（测试 Host 并行），因此**不能用模块级 let**：那会让
  *   实例之间互相污染；
  * - 装配模块只接收这个显式状态对象与具名能力面，绝不接收 ctx。
+ *
+ * clock（票据 03）是**只读时钟能力面**：派发路径每次派发只取一次 now()，同一个时间戳
+ * 既用于判定峰谷时段、又写入快照的 decidedAt，因此不允许在其它点二次取时。宿主提供
+ * ctx.clock.now 时优先使用它（可注入假时钟的宿主），否则回落到 Date.now——回退分支
+ * 不修改任何全局状态，测试也不得 monkey-patch 全局 Date。
  */
-function createAssemblyState({ config, goals, services, logger }) {
+function createAssemblyState({ config, goals, services, logger, clock }) {
   const state = {
     config,
     goals,
     logger,
     services,
+    // 只读时钟：默认落在系统时间函数上，绝不写回 ctx 或全局。
+    clock: clock ?? { now: () => Date.now() },
     // 服务面同时平铺一份，装配段可直接解构（= 迁移前 apply 顶部的 const 别名）。
     ...services,
     // 晚绑定槽位（= 迁移前 apply 内的 let）：所有调用点都在运行期，装配顺序保证
@@ -120,6 +127,28 @@ function createAssemblyState({ config, goals, services, logger }) {
   state.settingsSource = () => state.settingsStorage.readSettingsSource();
   state.source = () => state.settingsStorage.readSnapshot();
   return state;
+}
+
+/**
+ * 读取宿主时钟能力面（票据 03）。
+ *
+ * 返回值恒为 {now: () => number}：宿主没有 clock 服务、clock 不是对象、或 now 不可调用时
+ * 退回系统时间函数。探针只读、无副作用；任何异常都按「宿主没有该能力」处理，绝不把
+ * 一个诊断探针变成装配失败。
+ *
+ * @param {object} ctx - 严格 Cordis Context。
+ * @returns {{now: () => number}} 只读时钟。
+ */
+function readHostClock(ctx) {
+  try {
+    const hostClock = ctx.clock;
+    if (hostClock !== null && typeof hostClock === "object" && typeof hostClock.now === "function") {
+      return { now: () => hostClock.now() };
+    }
+  } catch {
+    // 宿主没有 clock 服务：回落系统时间函数（与迁移前的 Date.now 取值语义一致）。
+  }
+  return { now: () => Date.now() };
 }
 
 /**
@@ -230,6 +259,10 @@ export default {
       goals,
       logger: ctx.logger,
       services: { tools, subagents, systemPrompt, llm, agents, settings, webServer },
+      // 宿主时钟探针（票据 03）：严格 Context 对未声明属性抛错，因此必须 try/catch。
+      // 只有宿主**提供了可调用的 now** 才使用它；否则退回系统时间函数。这里不缓存时间值，
+      // 也不在装配期读时钟——判定只在派发时发生一次。
+      clock: readHostClock(ctx),
     });
     state.ValidationError = ValidationError;
     // 请求取消错误构造器：上传归一与手动派发的 abort 能力面共用同一实现。

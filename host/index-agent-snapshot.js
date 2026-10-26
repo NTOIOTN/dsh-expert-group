@@ -33,13 +33,29 @@ import {
 } from "./expert-guards.js";
 import {
   EXPERT_ROUTE_MARKER,
+  EXPERT_ROUTE_SNAPSHOT_MARKER,
   EXPERT_SUBAGENT_PROVIDER_MARKER,
   EXPERT_INHERIT_CONTEXT_MARKER,
   modelRouteFieldsFromRecord,
   normalizeModelRouteMarker,
 } from "../shared/model-route.js";
+import { normalizeRouteSnapshot } from "../shared/route-snapshot.js";
 import { OUTPUT_SCHEMA_REQUESTED_MARKER } from "../shared/structured.js";
 import { shadowMarkerFields } from "./send-message-shadow.js";
+
+/**
+ * 归一派发路由快照（票据 03）；非法/缺失返回 undefined。
+ *
+ * 单点封装 normalizeRouteSnapshot(...).ok 的取值，避免调用点重复写三段判断，
+ * 也保证「非法快照」永远不会以半截对象进入 patch。
+ *
+ * @param {unknown} value - agentOptions marker 或 child_models 记录里的 route 字段。
+ * @returns {object|undefined} 冻结快照副本。
+ */
+function normalizedRouteSnapshotOf(value) {
+  const result = normalizeRouteSnapshot(value);
+  return result.ok === true ? result.snapshot : undefined;
+}
 
 /**
  * 创建专家身份解析与 child 模型快照能力面。
@@ -125,6 +141,22 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
     const recordedRouteFields = modelRouteFieldsFromRecord(recordedExpert);
     const routeMarkerSnapshot = normalizeModelRouteMarker(agent.options?.[EXPERT_ROUTE_MARKER])
       ?? (Object.keys(recordedRouteFields).length === 0 ? undefined : recordedRouteFields);
+    /**
+     * 派发路由冻结快照（票据 03）：优先本次派发写入的 agentOptions marker；cold-resume 的
+     * Host 不还原 agentOptions，因此回落到 DEG 自有 child_models 的 route 字段。
+     *
+     * malformed 快照**不写**：durable schema 对快照做有界校验，写半截会让整条记录在真实
+     * storage-domain 被拒绝（连 provider/model 一起丢）。这是既有 persona 策略的同一取舍
+     * ——写入边界先归一，历史记录里残留的 malformed 值必须显式移除（见 removeKeys）。
+     */
+    const storedRoute = recordedExpert?.route;
+    const routeSnapshot = normalizedRouteSnapshotOf(agent.options?.[EXPERT_ROUTE_SNAPSHOT_MARKER])
+      ?? normalizedRouteSnapshotOf(storedRoute);
+    // 快照同理：历史记录里的 malformed route 若不显式删除，会持续让整条 child_models
+    // 记录在严格 domain schema 上被拒绝；本次没有可写的好值时删掉该键。
+    const removeKeys = isExpertChild === true && routeSnapshot === undefined && storedRoute !== undefined
+      ? [...personaRemoveKeys, "route"]
+      : personaRemoveKeys;
     // 上下文继承快照（票据 29）：优先本次派发写入的 agentOptions marker；cold-resume
     // 的 Host 不还原 agentOptions，回落到 DEG 自有 child_models 记录，避免恢复写回
     // 把“该 child 是继承型”擦成普通 spawn。
@@ -178,6 +210,10 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
           ...(personaMarkerSnapshot === void 0 ? {} : { [PERSONA_MARKER]: personaMarkerSnapshot }),
           // 实际路由元数据（票据 24）：与 provider/model 同层落盘，恢复/续作只读不重选。
           ...(routeMarkerSnapshot === undefined ? {} : routeMarkerSnapshot),
+          // 派发路由冻结快照（票据 03）：完整计划 + 时段 + 层；child 侧只是只读投影，
+          // fanout 的权威快照在 attempt.route（本票未改造 fanout 协议时，此字段是分片
+          // child 在进程内的唯一载体，冷恢复仍能读到同一形状）。
+          ...(routeSnapshot === undefined ? {} : { route: routeSnapshot }),
           // 目标 subagent provider 与继承开关（票据 29）：恢复/重建只读这两个字段，
           // 绝不按当前设置重新选择。旧记录缺失时按 spawn/false 处理。
           ...(subagentProviderSnapshot === void 0 ? {} : { subagentProvider: subagentProviderSnapshot }),
@@ -194,7 +230,7 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
           // 因此这里能写出 verified/absent 等实际结果（foreign 会让本监听器不会被执行）。
           ...shadowMarkerFields(agent.id),
         } : {}),
-      }, personaRemoveKeys.length === 0 ? undefined : { remove: personaRemoveKeys })
+      }, removeKeys.length === 0 ? undefined : { remove: removeKeys })
         .then(() => core.flushPendingStructuredPatch(agent.id));
     }
   }

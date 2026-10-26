@@ -18,6 +18,7 @@ import {
   normalizeModelFallbackLimit,
 } from "../shared/model-route.js";
 import { normalizeModelPrices } from "./usage-projection.js";
+import { normalizePeakValleyForRead } from "./peak-valley-settings.js";
 import {
   LIMIT_DIAGNOSTIC_LIMIT,
   normalizeRoleLimitsForRead,
@@ -230,6 +231,29 @@ export function projectModelPriceDiagnostics(value) {
   return Object.freeze(projected);
 }
 
+/**
+ * 峰谷读取诊断的有界投影（票据 02，meta 用）。
+ *
+ * 只保留字段名、角色 id（截断）、稳定原因码与（时段错误的）稳定 code；
+ * 不含原始时间串、模型配置或任何会话正文。读取面已限制条数，这里再兜一次。
+ *
+ * @param {unknown} value - normalizeSnapshot 的 peakValleyDiagnostics。
+ * @returns {ReadonlyArray<object>} 冻结的只读诊断（最多 16 条）。
+ */
+export function projectPeakValleyDiagnostics(value) {
+  const projected = [];
+  for (const entry of (Array.isArray(value) ? value : []).slice(0, 16)) {
+    if (entry === null || typeof entry !== "object") continue;
+    projected.push(Object.freeze({
+      field: typeof entry.field === "string" ? entry.field.slice(0, 64) : "peakValley",
+      ...(typeof entry.role === "string" && entry.role.length > 0 ? { role: entry.role.slice(0, 64) } : {}),
+      reason: typeof entry.reason === "string" ? entry.reason.slice(0, 240) : "invalid_shape",
+      ...(typeof entry.code === "string" ? { code: entry.code.slice(0, 64) } : {}),
+    }));
+  }
+  return Object.freeze(projected);
+}
+
 /** 取第一个非空白字符串（trim 后非空），全部缺失返回 null。 */
 export function firstNonEmptyText(...values) {
   for (const value of values) {
@@ -296,6 +320,12 @@ export function normalizeSnapshot(snapshot, visibleRoles) {
   // 单价（票据 25）：读取面丢弃非法/重复/超量条目并诊断；缺字段 = 空数组（旧配置兼容）。
   // 读取面绝不因坏值阻塞设置页；保存面的严格拒绝在 assertModelPrices。
   const modelPricesRead = normalizeModelPrices(snapshot?.modelPrices);
+  /**
+   * 峰谷（票据 02）：缺字段（旧文档）=> 未启用、普通配置完全不变。
+   * 时段归一与 profile 裁剪都来自 host/peak-valley-settings 的唯一实现；
+   * 启用但非法时 invalidCode 是路由 fail-closed 的唯一信号（票 03 消费）。
+   */
+  const peakValleyRead = normalizePeakValleyForRead(snapshot?.peakValley);
   return {
     provider,
     defaults,
@@ -351,6 +381,16 @@ export function normalizeSnapshot(snapshot, visibleRoles) {
     candidates: normalizeModelCandidatesForRead(snapshot?.candidates, knownRoleIds),
     // 自动降级上限：缺失/非法回退默认 2，读取面永远给出 0..4 的合法整数。
     fallbackLimit: normalizeModelFallbackLimit(snapshot?.fallbackLimit),
+    /**
+     * 峰谷状态（票据 02）：enabled / initialized / periods / peak / valley。
+     * 只有在"启用但非法"时才附带 invalidCode（时段 → profile → 状态结构优先级），
+     * 未启用或完全合法时不出现该键，客户端据「有没有这个键」判断是否 fail-closed。
+     */
+    peakValley: peakValleyRead.invalidCode === void 0
+      ? peakValleyRead.state
+      : { ...peakValleyRead.state, invalidCode: peakValleyRead.invalidCode },
+    // 读取期被丢弃条目的只读诊断（有界；meta 投影，不是可回写配置）。
+    peakValleyDiagnostics: Object.freeze(peakValleyRead.diagnostics.map((entry) => Object.freeze({ ...entry }))),
     // 单价（票据 25）：只读归一后的数组（每项 provider/model/inputPerMillion/
     // outputPerMillion/currency）；meta 只回传原始单价，估算成本属于客户端展示层。
     modelPrices: modelPricesRead.prices,

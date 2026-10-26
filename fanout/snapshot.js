@@ -11,8 +11,25 @@
  * @module dsh-expert-group/fanout/snapshot
  */
 import { describeBudgetViolation } from "../resource-budget.js";
+import { normalizeRouteSnapshot } from "../shared/route-snapshot.js";
 import { PROCESS_INSTANCE, SNAPSHOT_VERSION, TIMEOUT_PROJECTION_VERSION } from "./errors.js";
 import { cloneJson, normalizeIdSet } from "./validation.js";
+
+/**
+ * attempt 的派发路由冻结快照字段（票据 03 的序列化白名单）。
+ *
+ * 只写**已归一**的形状：attempt.route 只可能来自 shared/route-snapshot.js 的构造入口，
+ * 这里再校验一次是防御「运行期被注入半截快照」——非法值不落盘（否则恢复侧会按 fail-closed
+ * 拒绝整份快照，反而丢掉整个任务）。缺失时返回空对象，旧快照形状逐字不变。
+ *
+ * @param {object} attempt - manager 的 attempt 对象。
+ * @returns {object} 需要展开进快照的字段（可能为空对象）。
+ */
+function attemptRouteField(attempt) {
+  if (attempt?.route === undefined) return {};
+  const normalized = normalizeRouteSnapshot(attempt.route);
+  return normalized.ok === true ? { route: normalized.snapshot } : {};
+}
 
 export function createFanoutSerializer({ store, limits, events, budget, config }) {
   const budgetPolicy = budget;
@@ -115,6 +132,9 @@ export function createFanoutSerializer({ store, limits, events, budget, config }
             // 停止证据与 attempt 身份随快照持久化（票据 07）：重启后仍能回答"哪些 attempt
             // 已逻辑终态但执行未确认"，并让恢复后的重试/续作 gate 保持同一判据。
             ...store.attemptStopSnapshot(attempt),
+            // 派发路由冻结快照（票据 03）：逐 attempt 的 durable 记录。running→interrupted
+            // 的状态重写不得丢它，恢复后的执行也不得按当前配置重选。
+            ...attemptRouteField(attempt),
           })),
         })),
       })),

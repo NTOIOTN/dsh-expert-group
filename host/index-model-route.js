@@ -58,6 +58,10 @@ import {
   normalizeRoleTimeoutMs,
 } from "./settings-schema.js";
 import { assertModelPrices } from "./usage-projection.js";
+import { mergePeakValleyDraft, peakValleyChangedRoles, resolvePeakValleyProfiles } from "./peak-valley-settings.js";
+import { routeSnapshotMarkerOf as routeSnapshotMarkerValue } from "../shared/route-snapshot.js";
+import { resolvePeakValleyRoute } from "./peak-valley-route.js";
+import { restoredFanoutModelRoute as restoredFanoutModelRouteFrom } from "./fanout-route-restore.js";
 
 /**
  * 创建会话覆盖 / 模型路由 / 设置校验域能力面。
@@ -175,8 +179,18 @@ function installSessionOverrides(deps, api) {
  * @returns {object} M2 能力面。
  */
 function installModelSelection(deps, api) {
-  const { llm, settingsRead, getFanoutHost, normalizeSubagentProvider, ValidationError } = deps;
+  const { llm, settingsRead, getFanoutHost, normalizeSubagentProvider, ValidationError, clock } = deps;
   const { readSnapshot } = settingsRead;
+  /**
+   * 只读时钟（票据 03）：派发期唯一时间来源。
+   *
+   * 每次派发只调用一次 now()（见 resolvePeakValleyRoute），同一个时间戳既判定 period
+   * 又写快照的 decidedAt。这里不做任何缓存或替换：注入的时钟必须连「跨过边界」都能被
+   * 测试确定性驱动（测试用可推进的 fake clock，不 monkey-patch 全局 Date）。
+   */
+  const hostClock = clock !== null && typeof clock === "object" && typeof clock.now === "function"
+    ? clock
+    : { now: () => Date.now() };
 
   // 跨组调用统一走域内能力面（运行期解析，构造期不依赖 install 顺序）。
   const resolveRole = (...args) => api.resolveRole(...args);
@@ -426,6 +440,9 @@ function installModelSelection(deps, api) {
             candidateIndex: item.candidateIndex,
             fallbackCount: attempts.length,
             ...(lastRouteErrorCode === undefined ? {} : { lastRouteErrorCode }),
+            // 层标（票据 03）：仅供 resolvePeakValleyRoute 组装快照时判断「实际落在哪一层」。
+            // 普通（未启用峰谷）计划没有该字段，因此未启用时的返回值形状逐字不变。
+            ...(item.tier === undefined ? {} : { tier: item.tier }),
           };
         } catch (error) {
           const abort = abortErrorFor(error, signal);
@@ -444,16 +461,35 @@ function installModelSelection(deps, api) {
 
 
     /**
-     * 解析角色实际路由：会话覆盖只替换 primary，全局候选顺序不变。
-     * 返回 null 表示该角色尚未配置主模型（调用方保留既有文案）。
+     * 解析角色实际路由（票据 03：启用峰谷时在派发时刻冻结快照）。
+     *
+     * 三条事实在这里落地（规格书决策 1）：
+     * - 未启用峰谷：完全保持迁移前行为——不生成快照、不读时钟、不碰峰谷配置；
+     * - 会话覆盖命中：tier=normal-override，直接使用普通配置候选链，period 仍记录墙钟；
+     * - 无覆盖：tier=period，使用该时段 profile 的计划，时段层之后拼接普通层作为**显式**
+     *   跨层回退源（该角色在时段层缺配时直接从普通层开始并写 PEAK_VALLEY_ROLE_MISSING）。
+     *
+     * 返回 null 表示两层都没有配置该角色主模型（调用方保留既有 NOT_CONFIGURED 文案）。
      * requirements 原样透传给 executeModelRoutePlan（fanout/纯文本派发不传）。
      */
     async function resolveRoleModelRoute(role, sessionId, signal, requirements) {
-      const primary = resolveRole(sessionId, role);
-      if (primary === null) return null;
-      return executeModelRoutePlan(buildRoleModelRoutePlan(role, primary), signal, requirements);
+      const settingsSnapshot = readSnapshot();
+      if (settingsSnapshot?.peakValley?.enabled !== true) {
+        const primary = resolveRole(sessionId, role);
+        if (primary === null) return null;
+        return executeModelRoutePlan(buildRoleModelRoutePlan(role, primary), signal, requirements);
+      }
+      return resolvePeakValleyRoute({
+        role,
+        sessionId,
+        signal,
+        requirements,
+        settingsSnapshot,
+        clock: hostClock,
+        ValidationError,
+        executeModelRoutePlan,
+      });
     }
-
 
     /**
      * 单条 selection 的只读预检（票据 24 的 model-preflight RPC）。
@@ -508,40 +544,6 @@ function installModelSelection(deps, api) {
     }
 
 
-    /**
-     * fan-out 恢复/续跑的实际路由提示（票据 24）。
-     *
-     * 只有「上一 attempt 是恢复产生的 interrupted，且 child_models 里仍有该 shard 的
-     * 实际 provider/model」时才返回持久化路由；此时 buildRequest **不得**重新跑
-     * resolveCallConfig 选择候选。普通新派发（无中断历史）继续走正常路由计划。
-     */
-    function restoredFanoutModelRoute(input) {
-      if (!Number.isSafeInteger(input?.attempt) || input.attempt <= 1) return null;
-      const task = typeof getFanoutHost()?.getTask === "function" ? getFanoutHost().getTask(input.parentTaskId) : null;
-      const shard = Array.isArray(task?.shards)
-        ? task.shards.find((entry) => entry?.shardId === input.shardId)
-        : undefined;
-      const previous = Array.isArray(shard?.attempts)
-        ? shard.attempts.find((entry) => entry?.attempt === input.attempt - 1)
-        : undefined;
-      if (previous?.status !== "interrupted" || typeof previous.childId !== "string") return null;
-      const record = readSnapshot().childModels?.[previous.childId];
-      if (record === undefined || record === null) return null;
-      // 身份反证：只有同一个父任务/分片的记录才能作为本 attempt 的路由依据。
-      if (record.fanoutParentTaskId !== input.parentTaskId || record.fanoutShardId !== input.shardId) return null;
-      const selection = normalizeModelSelection(record);
-      if (selection === undefined) return null;
-      // 目标 provider/继承开关（票据 29）同样只读快照：恢复出来的 attempt 必须延续
-      // 原 child 的通道，不能按当前设置重新选择（继承开关变化不得静默改变 seed 语义）。
-      return {
-        selection,
-        ...modelRouteFieldsFromRecord(record),
-        ...(normalizeSubagentProvider(record.subagentProvider) === void 0
-          ? {}
-          : { subagentProvider: normalizeSubagentProvider(record.subagentProvider) }),
-        ...(typeof record.inheritContext === "boolean" ? { inheritContext: record.inheritContext } : {}),
-      };
-    }
 
   return {
     validateSelection,
@@ -549,9 +551,15 @@ function installModelSelection(deps, api) {
     executeModelRoutePlan,
     resolveRoleModelRoute,
     preflightSelectionEntry,
-    restoredFanoutModelRoute,
+    restoredFanoutModelRoute: (input) => restoredFanoutModelRouteFrom(input, {
+      getFanoutHost,
+      readSnapshot,
+      normalizeSubagentProvider,
+    }),
     candidateSelectionsOfRole,
     routeMarkerOf,
+    // 路由快照 marker（票据 03）：独立于扁平 marker；非法快照返回 undefined，绝不写半截。
+    routeSnapshotMarkerOf: (route) => routeSnapshotMarkerValue(route?.snapshot),
     routeFieldsOfMarker,
   };
 }
@@ -583,6 +591,24 @@ function installSettingsValueValidation(deps, api) {
       const error = new ValidationError(message);
       error.code = code;
       error.validation = true;
+      return error;
+    }
+
+
+    /**
+     * 构造一条峰谷校验错误（票据 02）。
+     *
+     * 外层仍是 ValidationError（RPC 层保持 400），并显式带稳定 error.code；
+     * mapRpcError 对三个 PEAK_VALLEY_* 做白名单透传，其余 ValidationError 仍统一映射成
+     * invalid-selection。错误构造函数必须由组合根注入，否则 RPC 层的 instanceof 会退化成 500。
+     *
+     * @param {string} message - 用户可读的中文错误。
+     * @param {string} code - PEAK_VALLEY_* 稳定 code。
+     * @returns {Error} 带 code 的 ValidationError。
+     */
+    function peakValleyError(message, code) {
+      const error = new ValidationError(message);
+      error.code = code;
       return error;
     }
 
@@ -713,10 +739,14 @@ function installSettingsValueValidation(deps, api) {
      * - 未携带 / 非数组（旧客户端）：返回 null，调用方退回「已保存值 vs 候选」的差异推导；
      * - 字符串数组：顶层字段名、`defaults.<role>` 与 `candidates.<role>` 角色级路径；
      *   `defaults` / `candidates` 分别表示整份默认映射/整份候选映射。
+     * 峰谷（票据 02）用同一套路径语法挂在子树下：`peak.defaults.<role>`、
+     * `peak.candidates.<role>`、`valley.defaults.<role>`、`valley.candidates.<role>`；
+     * `peak` / `valley` 表示该层整份配置都变了，`peak.defaults` 表示该层整份默认映射。
      * 非字符串条目一律忽略：多版本客户端混合时，多一个未知字段不能变成保存失败。
      *
      * @param {unknown} value - RPC body.changed。
-     * @returns {{roles: Set<string>, allRoles: boolean, candidateRoles: Set<string>, allCandidates: boolean}|null}
+     * @returns {{roles: Set<string>, allRoles: boolean, candidateRoles: Set<string>, allCandidates: boolean,
+     *   peak: object, valley: object}|null} 普通配置的变更集 + 峰/谷两层的同构变更集。
      */
     function declaredChangedModelRolesOf(value) {
       if (!Array.isArray(value)) return null;
@@ -724,6 +754,8 @@ function installSettingsValueValidation(deps, api) {
       const candidateRoles = new Set();
       let allRoles = false;
       let allCandidates = false;
+      const declaredLayer = () => ({ roles: new Set(), allRoles: false, candidateRoles: new Set(), allCandidates: false });
+      const layers = { peak: declaredLayer(), valley: declaredLayer() };
       for (const entry of value) {
         if (typeof entry !== "string") continue;
         const field = entry.trim();
@@ -737,9 +769,25 @@ function installSettingsValueValidation(deps, api) {
         if (field.startsWith("candidates.")) {
           const role = field.slice("candidates.".length);
           if (role.length > 0) candidateRoles.add(role);
+          continue;
+        }
+        // 峰谷子树：peak.* / valley.* 与顶层同构；整层变更同时声明默认与候选两份。
+        const layer = field.startsWith("peak.") ? "peak" : field.startsWith("valley.") ? "valley" : void 0;
+        if (layer === void 0) continue;
+        const rest = field.slice(layer.length + 1);
+        if (rest === "defaults") { layers[layer].allRoles = true; continue; }
+        if (rest === "candidates") { layers[layer].allCandidates = true; continue; }
+        if (rest.startsWith("defaults.")) {
+          const role = rest.slice("defaults.".length);
+          if (role.length > 0) layers[layer].roles.add(role);
+          continue;
+        }
+        if (rest.startsWith("candidates.")) {
+          const role = rest.slice("candidates.".length);
+          if (role.length > 0) layers[layer].candidateRoles.add(role);
         }
       }
-      return { roles, allRoles, candidateRoles, allCandidates };
+      return { roles, allRoles, candidateRoles, allCandidates, ...layers };
     }
 
 
@@ -820,6 +868,7 @@ function installSettingsValueValidation(deps, api) {
 
   return {
     promptOverrideError,
+    peakValleyError,
     normalizePromptOverrideCandidate,
     assertPromptOverridesCandidate,
     normalizeNotificationEventCandidate,
@@ -989,10 +1038,41 @@ function installSettingsCandidateValidation(deps, api) {
   const assertProviderLimitsCandidate = (...args) => api.assertProviderLimitsCandidate(...args);
   const assertModelPricesCandidate = (...args) => api.assertModelPricesCandidate(...args);
   const readSavedSettingsValue = (...args) => api.readSavedSettingsValue(...args);
+  const peakValleyError = (...args) => api.peakValleyError(...args);
+  const declaredChangedModelRolesOf = (...args) => api.declaredChangedModelRolesOf(...args);
   const modelRolesToResolve = (...args) => api.modelRolesToResolve(...args);
   const modelCandidateRolesToResolve = (...args) => api.modelCandidateRolesToResolve(...args);
   const validateModelCandidatesCandidate = (...args) => api.validateModelCandidatesCandidate(...args);
   const validateSelectionWithSignal = (...args) => api.validateSelectionWithSignal(...args);
+
+    /**
+     * 峰谷提交的字段粒度合并（票据 02）。
+     *
+     * 克隆源取本次提交里**已归一**的普通配置（而不是上一版落盘值）：同一次保存里
+     * 用户刚改的普通配置与被克隆出的峰/谷视角必须自洽。合并规则与错误码由
+     * host/peak-valley-settings 的唯一实现负责，这里只提供上下文。
+     *
+     * @param {object} candidate - 完整 settings 候选。
+     * @param {object} savedPeakValley - 已归一的旧 peakValley 状态（合并基线）。
+     * @param {object} savedOrdinary - 已归一的旧普通配置（未显式提供的普通字段回退来源）。
+     * @param {object} rawSaved - describe() 的原始旧值（用于取旧 peakValley 原值）。
+     * @param {{candidates: boolean, fallbackLimit: boolean}} provided - 本次是否显式提供对应普通字段。
+     * @returns {object|undefined} 合并后的峰谷状态；未提交 peakValley 时返回 undefined。
+     */
+    function mergePeakValleyCandidate(candidate, savedPeakValley, savedOrdinary, rawSaved, provided) {
+      if (candidate.peakValley === void 0) return void 0;
+      return mergePeakValleyDraft({
+        draft: candidate.peakValley,
+        saved: rawSaved?.peakValley,
+        ordinary: {
+          provider: candidate.provider,
+          defaults: candidate.defaults,
+          candidates: provided.candidates ? candidate.candidates : savedOrdinary.candidates,
+          fallbackLimit: provided.fallbackLimit ? candidate.fallbackLimit : savedOrdinary.fallbackLimit,
+        },
+        makeError: peakValleyError,
+      });
+    }
 
     /**
      * 使用当前 Host 目录校验完整候选；串行提交边界负责最后的代次检查。
@@ -1110,16 +1190,32 @@ function installSettingsCandidateValidation(deps, api) {
       const rawSavedSettings = readSavedSettingsValue();
       const savedSnapshot = normalizeSnapshot(rawSavedSettings, activeRoles());
       const savedDefaults = savedSnapshot.defaults;
+      // 峰谷（票据 02）：字段粒度合并 + 首次启用克隆。基线是 describe() 的权威旧值，
+      // 只有显式提供的子字段参与合并；全部判定都在任何 await 之前完成。
+      const hasPeakValley = candidate.peakValley !== void 0;
+      const savedPeakValley = savedSnapshot.peakValley;
+      const peakValleyMerged = hasPeakValley
+        ? mergePeakValleyCandidate(candidate, savedPeakValley, savedSnapshot, rawSavedSettings, {
+            candidates: hasCandidates,
+            fallbackLimit: hasFallbackLimit,
+          })
+        : void 0;
+      // 峰/谷两层各自与已保存状态比对（∪ 客户端声明）；结果按层分组（HIGH-2：分层消费）。
+      const peakValleyChanges = peakValleyMerged === void 0
+        ? void 0
+        : peakValleyChangedRoles(peakValleyMerged, savedPeakValley, declaredChangedModelRolesOf(changed));
       const modelRoles = modelRolesToResolve(candidate, changed, savedSnapshot);
       const candidateRoles = hasCandidates
         ? modelCandidateRolesToResolve(candidate, changed, savedSnapshot, rawSavedSettings?.candidates)
         : new Set();
+      // 目录代次守卫的角色并集：峰/谷两层的 candidateRoles 同样受 generation 保护（票据 02 / D4）。
+      const allCandidateRoles = new Set([...candidateRoles,
+        ...(peakValleyChanges?.peak?.candidateRoles ?? []), ...(peakValleyChanges?.valley?.candidateRoles ?? [])]);
       // 候选逐条解析放在 defaults 之前：非法候选应在进入默认模型解析前被拒绝。
       const candidates = hasCandidates
         ? await validateModelCandidatesCandidate(candidate.candidates, candidateRoles, savedSnapshot.candidates ?? {}, signal)
         : void 0;
       const defaults = {};
-      // 启用集合来自内置目录（observer 是否启用由 Config 决定）。
       // 启用集合来自内置目录（observer 是否启用由 Config 决定）；
       // activeRoles() 与 roleCatalog().enabledIds({ enableObserver }) 是同一份投影。
       const enabledRoles = new Set(activeRoles());
@@ -1140,10 +1236,25 @@ function installSettingsCandidateValidation(deps, api) {
           ? { ...savedSelection }
           : selection;
       }
+      // 峰谷两套 profile 的目录解析在普通 defaults 之后：非法候选先行拒绝。
+      const peakValleyResolved = peakValleyMerged === void 0
+        ? void 0
+        : await resolvePeakValleyProfiles({
+            state: peakValleyMerged,
+            changes: peakValleyChanges,
+            savedState: savedPeakValley,
+            enabledRoles: activeRoles(),
+            resolveSelection: validateSelectionWithSignal,
+            resolveCandidates: validateModelCandidatesCandidate,
+            signal,
+          });
       return {
         value: {
           ...candidate,
           defaults,
+          // 峰谷状态按整份状态写入（已含合并结果与 Host 派生的 initialized）；
+          // 缺字段（旧客户端）时不出现该键，patch 里也不会写。
+          ...(hasPeakValley ? { peakValley: peakValleyResolved.state } : {}),
           ...(hasCandidates ? { candidates } : {}),
           ...(hasFallbackLimit ? { fallbackLimit } : {}),
           ...(hasNotificationEvents ? { notificationEvents } : {}),
@@ -1166,8 +1277,9 @@ function installSettingsCandidateValidation(deps, api) {
           sidebarEntryEnabled: candidate.sidebarEntryEnabled !== false,
         },
         // 本次真正调用过真实目录解析的角色（测试与诊断据此证明"只解析变更项"）。
-        modelRoles: resolvedRoles,
-        modelCandidateRoles: [...candidateRoles],
+        // 峰/谷两层的角色同样计入：目录代次守卫必须覆盖 peak/valley（票据 02 / D4）。
+        modelRoles: [...resolvedRoles, ...(peakValleyResolved?.resolvedRoles ?? [])],
+        modelCandidateRoles: [...allCandidateRoles],
       };
     }
 
@@ -1270,6 +1382,9 @@ function installSettingsCommit(deps, api) {
       // 单价（票据 25）同一规则：缺字段 = 旧客户端，不写 patch、不在响应里新增字段；
       // 显式空数组表示清空全部单价（与缺字段语义不同）。
       const hasModelPrices = candidate?.modelPrices !== void 0;
+      // 峰谷（票据 02）同一规则：缺字段 = 旧客户端，不写 patch、不在响应里新增字段；
+      // 显式提供时整值写入合并后的完整状态（含 Host 派生的 initialized）。
+      const hasPeakValley = candidate?.peakValley !== void 0;
       return settingsRuntime.enqueueCommit(async () => {
         const generation = settingsRuntime.generation;
         // 写入前的第一道语义边界：与 validateSettingsCandidate 内部同一批规则，
@@ -1295,6 +1410,9 @@ function installSettingsCommit(deps, api) {
           // 候选/降级上限只在显式提供时写入；候选按整份映射 replace（与 defaults 同语义）。
           ...(hasCandidates ? { candidates: validatedSettings.candidates } : {}),
           ...(hasFallbackLimit ? { fallbackLimit: validatedSettings.fallbackLimit } : {}),
+          // 峰谷状态是**顶层整值**：合并与克隆已在 validateSettingsCandidate 内完成，
+          // 这里只落一份完整快照，客户端原 expectedRevision 仍做同一道 CAS。
+          ...(hasPeakValley ? { peakValley: validatedSettings.peakValley } : {}),
           notificationEnabled: validatedSettings.notificationEnabled,
           notificationVolume: validatedSettings.notificationVolume,
           // 通知事件类型同样「缺字段即不覆盖」：旧客户端保存通知开关不得重置事件过滤。
@@ -1336,6 +1454,8 @@ function installSettingsCommit(deps, api) {
         if (!hasNotificationEvents) delete committedSettings.notificationEvents;
         if (!hasCandidates) delete committedSettings.candidates;
         if (!hasFallbackLimit) delete committedSettings.fallbackLimit;
+        // 峰谷同上：旧客户端不传时响应保持历史形状（不新增字段）。
+        if (!hasPeakValley) delete committedSettings.peakValley;
         // 并发映射同上：旧客户端不传时响应保持历史形状（不新增字段）。
         if (!hasRoleLimits) delete committedSettings.roleLimits;
         if (!hasProviderLimits) delete committedSettings.providerLimits;
@@ -1349,6 +1469,8 @@ function installSettingsCommit(deps, api) {
         delete committedSettings.inheritContextDiagnostics;
         // 单价读取期丢弃诊断同样只是诊断，不是可回写的配置。
         delete committedSettings.modelPriceDiagnostics;
+        // 峰谷读取期丢弃诊断同样只是诊断，不是可回写的配置。
+        delete committedSettings.peakValleyDiagnostics;
         // 迁移标记必须随响应回传：客户端据此关闭读取别名，保存 10 之后读回仍是 10。
         // 首次保存时标记刚随 patch 落盘；后续保存时文档里本来就有该标记。
         const committedMigrationVersion = descriptor?.value?.configMigrationVersion;

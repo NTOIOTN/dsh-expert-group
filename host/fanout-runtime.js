@@ -73,6 +73,10 @@ function describeRuntimeView(context) {
     throttle: typeof state.runtime?.manager?.throttleDiagnostics === "function"
       ? state.runtime.manager.throttleDiagnostics()
       : null,
+    // provider 释放异常（票据 05 · F4）：Host 只做透传，旧 manager 缺能力时为 null。
+    providerRelease: typeof state.runtime?.manager?.providerReleaseDiagnostics === "function"
+      ? state.runtime.manager.providerReleaseDiagnostics()
+      : null,
     ...(typeof state.runtime?.manager?.budget === "function" ? { budget: state.runtime.manager.budget() } : {}),
   };
 }
@@ -325,6 +329,9 @@ export function createFanoutRuntimeModule({
   resolveChildSession,
   interrupt,
   onAgentCreated,
+  // 派发前路由冻结 seam（票据 03）：manager 在 attempt 进入 running 之前同步调用；
+  // 缺失时完全保持旧行为（异步 buildRequest 里重新选路）。
+  prepareAttempt,
   lineage,
   getAgent,
   buildFeedback,
@@ -437,6 +444,7 @@ export function createFanoutRuntimeModule({
     startContinuable,
     interrupt,
     onAgentCreated,
+    ...(typeof prepareAttempt === "function" ? { prepareAttempt } : {}),
     // 多轮复用接线：两者都只在 Host 提供时透传；缺失时 runtime 侧 admission 一律
     // fail-closed（绝不静默新建 child 顶替复用）。
     ...(continueMessage === undefined ? {} : { continueMessage }),

@@ -54,6 +54,7 @@ import {
   SHARD_STATUS_KEYS,
   RETRYABLE_SHARD_STATUSES,
 } from "./errors.js";
+import { projectRouteSnapshotFields } from "../shared/route-snapshot.js";
 import {
   deriveAttemptId,
   isStopObserved,
@@ -77,6 +78,7 @@ import {
   validationError,
   budgetVerdict,
 } from "./validation.js";
+import { PROVIDER_RELEASE_MISMATCH, providerOfAttempt } from "./provider-attribution.js";
 import {
   FANOUT_BUDGET,
   checkAttemptPayloadBudget,
@@ -138,7 +140,63 @@ function activeShard(s, deps, shard) {
   return shard.attempts.find((attempt) => attempt.status === "running");
 }
 
-function addRunningCount(s, deps, task, delta) {
+/**
+ * 释放异常诊断（票据 05 · F4）：只保留**最近一条**、进程内有界。
+ *
+ * 只记稳定 code、provider 名（截断 64 字符）与释放来源；不记任务正文、prompt、凭据或任何
+ * 会话标识，因此可以安全进入 meta 诊断面（concurrency.providerRelease）。
+ */
+function noteProviderReleaseMismatch(s, deps, provider, source) {
+  s.lastProviderRelease = Object.freeze({
+    code: PROVIDER_RELEASE_MISMATCH,
+    provider: typeof provider === "string" && provider.length > 0 ? provider.slice(0, 64) : null,
+    at: deps.now(),
+    source: typeof source === "string" && source.length > 0 ? source : "unknown",
+  });
+}
+
+/**
+ * provider 名额的唯一归桶点（票据 05）：键是**这次执行**的归属，不是父任务的单一 provider。
+ *
+ * 释放方向的两条不变量：
+ * - 只有 shard 状态真正离开 running 才 -1（由 setShardStatus 的状态比较保证），重复终态
+ *   不会再次扣减；
+ * - 桶不存在或计数已为 0 时按 no-op 处理，**绝不为负**，并记录一条有界诊断——它说明某次
+ *   执行的占用与释放没有配对，是可观察的异常而不是静默泄漏。
+ */
+function adjustProviderRunCount(s, deps, task, attempt, delta, source) {
+  const provider = providerOfAttempt(task, attempt);
+  if (provider === null) {
+    // 不可归属：派发方向本就不计数（scheduler 会 fail-closed 拒绝启动），释放方向则说明
+    // 这次执行的快照已不可用——记录异常，但绝不凭空创建或扣减任何桶。
+    if (delta < 0) noteProviderReleaseMismatch(s, deps, null, source);
+    return;
+  }
+  const current = providerRunCount(s, deps, provider) ?? 0;
+  if (delta > 0) {
+    setProviderRunCount(s, deps, provider, current + 1);
+    return;
+  }
+  if (current <= 0) {
+    noteProviderReleaseMismatch(s, deps, provider, source);
+    return;
+  }
+  if (current === 1) dropProviderRunCount(s, deps, provider);
+  else setProviderRunCount(s, deps, provider, current - 1);
+}
+
+/**
+ * 三维 running 计数（role / task / provider）的唯一更新点。
+ *
+ * 前两维仍是「任务级」语义；provider 维在票据 05 下沉到 attempt：同一任务的不同分片可能
+ * 属于不同 provider（跨峰谷边界），因此必须传入**参与本次迁移的那个 attempt**。
+ *
+ * @param {object} task - 父任务。
+ * @param {object} attempt - 参与本次 +1/-1 的执行记录。
+ * @param {number} delta - +1 预占 / -1 释放。
+ * @param {string} source - 释放来源（诊断用，固定枚举）。
+ */
+function addRunningCount(s, deps, task, attempt, delta, source) {
   const role = task.role;
   const nextRoleCount = (roleRunCount(s, deps, role) ?? 0) + delta;
   if (nextRoleCount <= 0) dropRoleRunCount(s, deps, role);
@@ -146,13 +204,20 @@ function addRunningCount(s, deps, task, delta) {
   const nextTaskCount = (taskRunCount(s, deps, task) ?? 0) + delta;
   if (nextTaskCount <= 0) dropTaskRunCount(s, deps, task);
   else setTaskRunCount(s, deps, task, nextTaskCount);
-  // provider 计数（票据 26）与前两个维度同源同点更新：没有归属的任务不进入任何
-  // provider 池（provider 限流对它们不生效），因此也不会在这里凭空创建条目。
-  const provider = typeof task.provider === "string" ? task.provider : "";
-  if (provider.length === 0) return;
-  const nextProviderCount = (providerRunCount(s, deps, provider) ?? 0) + delta;
-  if (nextProviderCount <= 0) dropProviderRunCount(s, deps, provider);
-  else setProviderRunCount(s, deps, provider, nextProviderCount);
+  adjustProviderRunCount(s, deps, task, attempt, delta, source);
+}
+
+/**
+ * 参与名额计算的 attempt（票据 05）。
+ *
+ * setShardStatus 的调用点会显式传入刚迁移的 attempt；只有旧调用方不传时才回退到
+ * 「仍在 running 的 attempt → 最新 attempt」。回退不改变既有语义：一个 shard 至多有一个
+ * 真正在跑的执行。
+ */
+function countedAttemptOf(shard, attempt) {
+  if (attempt !== null && typeof attempt === "object") return attempt;
+  const attempts = Array.isArray(shard?.attempts) ? shard.attempts : [];
+  return attempts.find((entry) => entry.status === "running") ?? attempts[attempts.length - 1];
 }
 
 function addTaskToRoleIndex(s, deps, task, roleIndex) {
@@ -220,11 +285,24 @@ function syncShardScopes(s, deps, task, shard) {
   for (const attempt of shard.attempts) syncAttemptScope(s, deps, task, shard, attempt);
 }
 
-function setShardStatus(s, deps, task, shard, status) {
+/**
+ * shard 状态迁移的**唯一**计数点（票据 05 起按 attempt 归桶）。
+ *
+ * - 预占与释放使用同一个 attempt 的归属：释放方向读的就是当初 +1 的那把钥匙；
+ * - 只有 previous 真的是 running 才 -1，因此「重复终态迁移」天然是幂等的（不会重复扣减）；
+ * - queued 从未计数，所以取消 queued 不会 -1。
+ *
+ * @param {object} task - 父任务。
+ * @param {object} shard - 分片。
+ * @param {string} status - 目标状态。
+ * @param {object} [attempt] - 触发本次迁移的执行记录（缺省时按 countedAttemptOf 回退）。
+ */
+function setShardStatus(s, deps, task, shard, status, attempt) {
   const previous = shard.status;
   if (previous !== status) {
-    if (previous === "running") addRunningCount(s, deps, task, -1);
-    if (status === "running") addRunningCount(s, deps, task, 1);
+    const counted = countedAttemptOf(shard, attempt);
+    if (previous === "running") addRunningCount(s, deps, task, counted, -1, "shard_status_release");
+    if (status === "running") addRunningCount(s, deps, task, counted, 1, "shard_status_acquire");
   }
   shard.status = status;
   syncShardScopes(s, deps, task, shard);
@@ -233,7 +311,11 @@ function setShardStatus(s, deps, task, shard, status) {
 function indexTask(s, deps, task, roleIndex) {
   addTaskToRoleIndex(s, deps, task, roleIndex);
   for (const shard of task.shards) {
-    if (shard.status === "running") addRunningCount(s, deps, task, 1);
+    // 计数按 attempt 逐个归桶（票据 05）：恢复后的重建必须还原「各分片各自 provider」的
+    // 分布，而不是把它们统统算到 task.provider 名下（否则跨边界任务的释放会永远找不到桶）。
+    for (const attempt of shard.attempts) {
+      if ((attempt.status ?? "queued") === "running") addRunningCount(s, deps, task, attempt, 1, "index_build");
+    }
     syncShardScopes(s, deps, task, shard);
   }
 }
@@ -246,7 +328,10 @@ function removeTaskIndex(s, deps, task) {
     if (parents.length === 0) dropParentsForRole(s, deps, task.role);
   }
   for (const shard of task.shards) {
-    if (shard.status === "running") addRunningCount(s, deps, task, -1);
+    // 与 indexTask 对称：按 attempt 的归属逐个释放，保证移除索引后 provider 份额也归零。
+    for (const attempt of shard.attempts) {
+      if ((attempt.status ?? "queued") === "running") addRunningCount(s, deps, task, attempt, -1, "index_removal");
+    }
     for (const attempt of shard.attempts) removeAttemptScope(s, deps, attempt);
   }
   // 任务级计数以任务对象身份为 key，删除索引后必须回收该条目，否则被销毁的父子任务
@@ -398,6 +483,15 @@ function shardSnapshot(s, deps, task, shard) {
       ...(attempt.result === undefined ? {} : { result: attempt.result }),
       ...(attempt.error === undefined ? {} : { error: attempt.error }),
       ...attemptStopSnapshot(s, deps, attempt),
+      /**
+       * 时段/层/跨层回退（票据 06 · 共享路由投影）。
+       *
+       * 任务读面（getTask/listTasks → fanout-get/fanout-list 与 fanout 工具回执）原本只投影
+       * 调度需要的字段，完整计划刻意不外传。这里补上的正是**执行快照之外的三个只读事实**
+       * （时段、层、有没有跨层回退），字段存在才出现、缺失不补默认值；
+       * 绝不输出 plan / provider 候选清单或凭据（由 shared/route-snapshot.js 的白名单保证）。
+       */
+      ...projectRouteSnapshotFields(attempt),
     })),
   };
 }
@@ -508,6 +602,15 @@ function activeCountsByProvider(s, deps) {
   // provider 份额同样是派生索引：dispatch 在副本上累计本轮派发，避免边派发边改写
   // 权威计数（权威计数仍只在 setShardStatus 处更新）。
   return countsByProvider(s, deps, s, deps);
+}
+
+/**
+ * 只读投影：最近一条 provider 释放异常（票据 05 · F4）；没有异常时为 null。
+ *
+ * 进程内单值、有界，容器不出本模块；字段只有 code/provider/at/source，可直接进入 meta。
+ */
+function providerReleaseDiagnostics(s, deps) {
+  return s.lastProviderRelease === null ? null : { ...s.lastProviderRelease };
 }
 
 function taskById(s, deps, parentTaskId) { return s.tasks.get(parentTaskId); }
@@ -655,6 +758,8 @@ export function createTaskStore({ config }) {
     reclaimedTaskIds: new Set(),
     nextTaskNumber: 0,
     nextExecutionGeneration: 0,
+    // provider 释放异常诊断（票据 05 · F4）：进程内单值、只记 provider/来源/时间。
+    lastProviderRelease: null,
     writeRoles: initialWriteRoles,
     defaultAllowOverlap: allowOverlap === true,
     conflictChecker: usesDefaultConflictChecker
@@ -666,6 +771,8 @@ export function createTaskStore({ config }) {
     usesDefaultConflictChecker: config.usesDefaultConflictChecker,
     isClosed: config.isClosed,
     conflictObserver: config.conflictObserver,
+    // 诊断时间戳（票据 05）：只服务 providerRelease 记录；测试替身不注入时用墙钟兜底。
+    now: typeof config.now === "function" ? config.now : () => Date.now(),
     limits: null,
   };
   function bindLimits(limits) { deps.limits = limits; }
@@ -701,6 +808,7 @@ export function createTaskStore({ config }) {
     activeCountsByRole: activeCountsByRole.bind(null, s, deps),
     activeCountsByTask: activeCountsByTask.bind(null, s, deps),
     activeCountsByProvider: activeCountsByProvider.bind(null, s, deps),
+    providerReleaseDiagnostics: providerReleaseDiagnostics.bind(null, s, deps),
     allShardsTerminal: allShardsTerminal.bind(null, s, deps),
     taskById: taskById.bind(null, s, deps),
     hasTask: hasTask.bind(null, s, deps),

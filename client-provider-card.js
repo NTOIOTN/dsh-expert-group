@@ -13,7 +13,9 @@
   const clientModelConfigHost = global[clientModelConfigHostSymbol] || {};
   const clientModelViewsBSymbol = Symbol.for("dsh-expert-group/client-model-views-b");
   const clientModelViewsB = global[clientModelViewsBSymbol] || {};
-  const { ModelDiscoveryDialog, clearsAllCandidateSelection, renderModelRow } = clientModelViewsB;
+  const {
+    ModelDiscoveryDialog, renderModelRow, toggleCandidateOf, toggleIndexInSet, toggleVisibleCandidatesOf,
+  } = clientModelViewsB;
   const { CUSTOM_ROUTE_PROBE } = clientModelConfigHost;
   // descriptor 注入的运行期依赖：本模块先于 descriptor 执行，取值只发生在运行期调用时。
   let react = null;
@@ -311,13 +313,8 @@ function renderFieldMessage(config, card, key) {
       const patchRow = (index, patch) => setModels(modelRows.map((model, at) => (
         at === index ? config.patchModelDraft(model, patch) : model
       )));
-      const toggleRow = (index) => {
-        setExpandedRows((previous) => {
-          const next = new Set(previous);
-          if (!next.delete(index)) next.add(index);
-          return next;
-        });
-      };
+      // 展开/收起：纯变换在 views-b（与模型视图 A 共用同一份实现）。
+      const toggleRow = (index) => setExpandedRows((previous) => toggleIndexInSet(previous, index));
       const closeModelPicker = () => {
          setFetchState(null);
          setCandidateQuery("");
@@ -363,37 +360,10 @@ function renderFieldMessage(config, card, key) {
            setFetching(false);
          }
        };
-       const toggleCandidate = (id) => {
-         setFetchState((previous) => previous === null || !Array.isArray(previous.candidates)
-           ? previous
-           : {
-             ...previous,
-             candidates: previous.candidates.map((candidate) => candidate.id === id
-               ? { ...candidate, picked: candidate.picked !== true }
-               : candidate),
-           });
-       };
-       /**
-        * 弹窗「全选/取消全选」的唯一实现（弹窗按钮文案也走同一个纯函数判定）。
-        *
-        * - 可见项已全选 → 清空**全部**选择（含被搜索隐藏的候选），与 DSH 模型页一致；
-        * - 否则只把可见项追加为已选，隐藏候选保留原选择。
-        */
-       const toggleVisibleCandidates = (ids) => {
-         const wanted = new Set(Array.isArray(ids) ? ids : []);
-         setFetchState((previous) => {
-           if (previous === null || !Array.isArray(previous.candidates)) return previous;
-           if (clearsAllCandidateSelection(previous.candidates, wanted)) {
-             return { ...previous, candidates: previous.candidates.map((candidate) => ({ ...candidate, picked: false })) };
-           }
-           return {
-             ...previous,
-             candidates: previous.candidates.map((candidate) => wanted.has(candidate.id)
-               ? { ...candidate, picked: true }
-               : candidate),
-           };
-         });
-       };
+       // 两个候选动作复用 views-b 的纯状态变换（与模型视图 A 共用同一份实现，语义逐项不变）。
+       const toggleCandidate = (id) => setFetchState((previous) => toggleCandidateOf(previous, id));
+       /** 弹窗「全选/取消全选」：判定与改写仍同源（clearsAllCandidateSelection 在 views-b 内）。 */
+       const toggleVisibleCandidates = (ids) => setFetchState((previous) => toggleVisibleCandidatesOf(previous, ids));
        const adoptFetchedModels = () => {
          const candidates = fetchState?.candidates;
          const picked = (Array.isArray(candidates) ? candidates : []).filter((candidate) => candidate.picked === true);

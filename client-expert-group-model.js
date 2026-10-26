@@ -33,17 +33,13 @@
 
   // ── 归一与状态推导族（client-expert-group-model-normalize.js）────────────────
   const {
-    SCHEMA_VERSION,
     RUNTIME_STATUSES,
     UNKNOWN_RUNTIME_STATUS,
-    STRUCTURED_FALLBACK_REASONS,
     normalizeExpertGroupSnapshot,
     normalizeCapabilities,
-    normalizeStatus,
     normalizeFailure,
     normalizeUsage,
     normalizeStructured,
-    normalizeRoleLabels,
     roleLabelFrom,
     roleLabelOf,
     findModelPrice,
@@ -55,8 +51,6 @@
   const {
     FAILURE_MESSAGE_DISPLAY_MAX_LENGTH,
     RETRY_WARNING_THRESHOLD,
-    ATTEMPT_TIMELINE_LIMIT,
-    FAILURE_STATUSES,
     STATUS_FILTER_GROUPS,
     STRUCTURED_PREVIEW_MAX_CHARS,
     formatFailureSummary,
@@ -74,6 +68,8 @@
     serializeSnapshot,
     formatDurationCompact,
     summarizeUsageMetrics,
+    isEmptyUsageMetrics,
+    zeroFilledUsageMetrics,
     formatExpertMetadata,
     defaultExpanded,
     createExpansionStore,
@@ -82,28 +78,30 @@
     MISSING_MESSAGE_TEXT,
     MESSAGE_CATALOG,
     normalizeLocale,
-    resolveLocale,
     resolveClientLocale,
     translateMessage,
   } = format;
 
-  /** 公开检查点键：与拆分前完全相同（键集合与顺序都是导出契约）。 */
+  /**
+   * 公开检查点键：与拆分前相同，只**减去**审计确认零读取的死导出（SCHEMA_VERSION /
+   * ATTEMPT_TIMELINE_LIMIT / FAILURE_STATUSES / normalizeStatus / STRUCTURED_FALLBACK_REASONS /
+   * normalizeRoleLabels / resolveLocale）。为什么等价：这些键在全仓库（含 test/、test-support/）
+   * 没有任何读取点，删掉的只是对象字面量里的一行；实现在子模块内部若仍被使用则保有原实现与
+   * 子模块导出（format 仍读 SCHEMA_VERSION / normalizeStatus / STRUCTURED_FALLBACK_REASONS，
+   * 因此这些名字在子模块检查点里原样保留）。键顺序仍是导出契约。
+   */
   const SYMBOL = Symbol.for("dsh-expert-group/client-expert-group-model");
 
   global[SYMBOL] = Object.freeze({
-    SCHEMA_VERSION,
     RUNTIME_STATUSES,
     UNKNOWN_RUNTIME_STATUS,
     // 票据 12：客户端时间线/过滤/导出的公开常量与纯函数。
     // 常量供渲染层与测试共用（避免两处各存一份阈值/上限）。
     FAILURE_MESSAGE_DISPLAY_MAX_LENGTH,
     RETRY_WARNING_THRESHOLD,
-    ATTEMPT_TIMELINE_LIMIT,
-    FAILURE_STATUSES,
     STATUS_FILTER_GROUPS,
     normalizeExpertGroupSnapshot,
     normalizeCapabilities,
-    normalizeStatus,
     normalizeFailure,
     formatFailureSummary,
     isFailureStatus,
@@ -113,12 +111,10 @@
     attemptTimelineOf,
     // 票据 25 / 27 / 30：用量、结构化结果与角色显示名的纯函数与常量。
     STRUCTURED_PREVIEW_MAX_CHARS,
-    STRUCTURED_FALLBACK_REASONS,
     normalizeUsage,
     normalizeStructured,
     structuredFallbackText,
     structuredPreviewOf,
-    normalizeRoleLabels,
     roleLabelFrom,
     roleLabelOf,
     findModelPrice,
@@ -132,6 +128,9 @@
     // 用量速览行（用户要求）：紧凑时长与「用时 · tok/s · tok · 命中 · context」五段投影。
     formatDurationCompact,
     summarizeUsageMetrics,
+    // 用量速览：空摘要判定 + 「未开始 / 尚未投影」缺失段补 0（纯函数层，未知仍不写成 0）。
+    isEmptyUsageMetrics,
+    zeroFilledUsageMetrics,
     formatExpertMetadata,
     defaultExpanded,
     createExpansionStore,
@@ -141,7 +140,6 @@
     MISSING_MESSAGE_TEXT,
     MESSAGE_CATALOG,
     normalizeLocale,
-    resolveLocale,
     resolveClientLocale,
     translateMessage,
   });

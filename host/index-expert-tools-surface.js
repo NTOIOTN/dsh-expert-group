@@ -21,6 +21,29 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { buildOrchestratorPrompt, isRootAgentContext } from "../orchestrator.js";
 import { createAbortError } from "./rpc-request-lifecycle.js";
 import { OUTPUT_SCHEMA_ERROR_CODES } from "../shared/structured.js";
+import { fanoutTaskRouteReceiptFields } from "./route-receipt-fields.js";
+
+/**
+ * fanout 回执的时段/层/跨层回退 schema 片段（票据 06 · B 段）。
+ *
+ * 提到模块级只为让 `buildFanoutDefinition` 保持在函数行数硬上限内（口径与行为不变）：
+ * 三个字段都是可选增量，只在任务里已有可读且各分片一致的冻结快照时出现；
+ * 只读投影，不含计划/provider/凭据。
+ */
+const FANOUT_ROUTE_RECEIPT_SCHEMA_PROPERTIES = Object.freeze({
+  routePeriod: { type: "string", enum: ["peak", "valley", "none"] },
+  routeTier: { type: "string", enum: ["peak", "valley", "normal-override", "normal-fallback"] },
+  ordinaryFallback: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      fromTier: { type: "string", required: true, enum: ["peak", "valley"] },
+      toTier: { type: "string", required: true, enum: ["normal-fallback"] },
+      reasonCode: { type: "string", required: true },
+      role: { type: "string" },
+    },
+  },
+});
 
 /**
  * fanout 通用工具定义与挂载（role 由参数选择，单入口）。
@@ -113,6 +136,8 @@ export function createFanoutToolSurface({ commands, models, identity, core, role
             reopened: { type: "boolean" },
             round: { type: "integer" },
             shardIds: { type: "array", items: { type: "string" }, required: true },
+            // 时段/层/跨层回退（票据 06）：可选增量，schema 片段见模块级常量。
+            ...FANOUT_ROUTE_RECEIPT_SCHEMA_PROPERTIES,
             // continuation 句柄：parentTaskId/shardId/childId/attempt/父级状态/reusable 与
             // 下一轮调用字段；内容随状态机扩展，这里允许额外字段。
             continuation: { type: "object", additionalProperties: true },
@@ -187,6 +212,9 @@ export function createFanoutToolSurface({ commands, models, identity, core, role
             ...(Number.isSafeInteger(result.round) ? { round: result.round } : {}),
             shardIds: result.shardIds,
             ...(continuationHandle === void 0 ? {} : { continuation: continuationHandle }),
+            // 时段/层/跨层回退（票据 06）：续作的新 attempt 复制了上一轮冻结快照时才有值；
+            // 没有任何可读快照（峰谷未启用 / 旧任务）时整组省略，绝不按当前设置推断。
+            ...fanoutTaskRouteReceiptFields(result.task, result.role),
             task: result.task,
           };
         }
@@ -208,6 +236,9 @@ export function createFanoutToolSurface({ commands, models, identity, core, role
           ...(Number.isSafeInteger(result.task?.round) ? { round: result.task.round } : {}),
           shardIds: result.shardIds,
           ...(continuationHandle === void 0 ? {} : { continuation: continuationHandle }),
+          // 时段/层/跨层回退（票据 06）：提交那一刻 attempt 尚未派发（预检路由不是冻结快照），
+          // 因此这里通常是空对象；只有回执携带的任务已存在带快照的 attempt 时才会增量出现。
+          ...fanoutTaskRouteReceiptFields(result.task, result.role),
           task: result.task,
         };
       },

@@ -119,6 +119,46 @@
       return (!requireEvidence || values.length > 0) && values.every((value) => value === expected);
     }
 
+    /** 精确会话命中集合：会话属性里含当前 sessionId 的所有 scope（无 sessionId 时为空集合）。 */
+    function nativeScopeExactSelection(scopes, sessionId) {
+      return sessionId === void 0 || sessionId === null
+        ? []
+        : scopes.filter((scope) => nativeStatusScopeIds(scope).includes(String(sessionId)));
+    }
+
+    /**
+     * 在候选 conversation scope 中按会话身份选出**唯一**目标（两个调用点共用同一份判定）。
+     *
+     * 为什么等价：原实现在 findNativeConversationScope 与 resolveNativeStatusTargets 里各写了一份
+     * 逐字相同的四分支选择（精确会话命中 / 多命中取唯一可见 / 无标记且单 scope / 无标记取唯一
+     * 可见），这里只把两份合并成一个纯函数：分支顺序、可见性判据（getClientRects().length > 0）、
+     * "没有唯一候选就返回 undefined"的 fail-closed 语义全部原样保留。DOM 读取顺序也与原实现一致：
+     * 先算精确命中与带标记集合，再按分支判可见性。
+     *
+     * nativeStatusScopeIds / collectNativeConversationScopes 是函数声明，靠提升即可在定义之前调用。
+     *
+     * @param {Array<Element>} scopes 全部 conversation scope。
+     * @param {unknown} sessionId 期望的会话 id。
+     * @returns {Element|undefined} 唯一候选；没有或有歧义时为 undefined。
+     */
+    function selectNativeScopeCandidate(scopes, sessionId) {
+      // 会话证据与候选边界共用同一份定义：RC1 的会话标记在 scroll 的
+      // [data-conversation-content] 外层，只读 scope 自身会把当前会话判成"无标记"。
+      const exact = nativeScopeExactSelection(scopes, sessionId);
+      const tagged = scopes.filter((scope) => nativeStatusScopeIds(scope).length > 0);
+      /** 可见性判据：能力探测 + 至少一个非空 client rect（宿主/测试替身缺 API 时按不可见处理）。 */
+      const isVisible = (scope) => typeof scope?.getClientRects === "function" && scope.getClientRects().length > 0;
+      if (exact.length === 1) return exact[0];
+      if (exact.length > 1) {
+        const visible = exact.filter(isVisible);
+        return visible.length === 1 ? visible[0] : void 0;
+      }
+      if (tagged.length > 0) return void 0;
+      if (scopes.length === 1) return scopes[0];
+      const visible = scopes.filter(isVisible);
+      return visible.length === 1 ? visible[0] : void 0;
+    }
+
     /**
      * 优先使用 session-scoped bridge 自身的 DOM anchor；右侧 subagentchat 与主视图可同时存在
      * 多棵可见 conversation scope，此 anchor 是唯一不依赖可见性猜测的归属证据。
@@ -128,38 +168,15 @@
       const anchoredScope = anchor?.closest?.("[data-conversation-scroll]");
       if (anchoredScope !== null && anchoredScope !== void 0) return anchoredScope;
 
-      const scopes = [];
-      if (root?.matches?.("[data-conversation-scroll]")) scopes.push(root);
-      for (const scope of Array.from(root?.querySelectorAll?.("[data-conversation-scroll]") ?? [])) {
-        if (!scopes.includes(scope)) scopes.push(scope);
-      }
+      const scopes = collectNativeConversationScopes(root);
       if (scopes.length === 0) {
         // DSH RC1 的 ChatView 真实 DOM 没有稳定的 conversation scope marker。
         // 即使 TurnStatus 尚未创建，也必须监听 root；节点出现后 observer 才能即时接管首帧。
         // findNativeStatusTextNode 会再要求候选节点沿祖先链提供精确会话属性。
         return root;
       }
-
-      // 会话证据与候选边界共用同一份定义：RC1 的会话标记在 scroll 的
-      // [data-conversation-content] 外层，只读 scope 自身会把当前会话判成"无标记"。
-      const scopeIds = (scope) => nativeStatusScopeIds(scope);
-      const exact = sessionId === void 0 || sessionId === null
-        ? []
-        : scopes.filter((scope) => scopeIds(scope).includes(String(sessionId)));
-      const tagged = scopes.filter((scope) => scopeIds(scope).length > 0);
-      let candidates = [];
-      if (exact.length === 1) {
-        candidates = exact;
-      } else if (exact.length > 1) {
-        const visible = exact.filter((scope) => typeof scope?.getClientRects === "function" && scope.getClientRects().length > 0);
-        if (visible.length === 1) candidates = visible;
-      } else if (tagged.length === 0 && scopes.length === 1) {
-        candidates = scopes;
-      } else if (tagged.length === 0) {
-        const visible = scopes.filter((scope) => typeof scope?.getClientRects === "function" && scope.getClientRects().length > 0);
-        if (visible.length === 1) candidates = visible;
-      }
-      return candidates.length === 1 ? candidates[0] : void 0;
+      // 选择语义见 selectNativeScopeCandidate（与 resolveNativeStatusTargets 共用同一份实现）。
+      return selectNativeScopeCandidate(scopes, sessionId);
     }
 
     /**
@@ -524,10 +541,7 @@
         return textNode === void 0 ? void 0 : { visibleText: textNode, shimmerAttributes: [], announcements: [] };
       }
 
-      const exact = sessionId === void 0 || sessionId === null
-        ? []
-        : scopes.filter((scope) => nativeStatusScopeIds(scope).includes(String(sessionId)));
-      const tagged = scopes.filter((scope) => nativeStatusScopeIds(scope).length > 0);
+      const exact = nativeScopeExactSelection(scopes, sessionId);
       if (includeSameSessionScopes && exact.length > 1) {
         const resolved = exact
           .filter((scope) => nativeScopeSessionId(scope) === String(sessionId))
@@ -540,21 +554,11 @@
           announcements: resolved.flatMap((targets) => targets.announcements),
         };
       }
-      let candidates = [];
-      if (exact.length === 1) {
-        candidates = exact;
-      } else if (exact.length > 1) {
-        const visible = exact.filter((scope) => typeof scope?.getClientRects === "function" && scope.getClientRects().length > 0);
-        if (visible.length === 1) candidates = visible;
-      } else if (tagged.length === 0 && scopes.length === 1) {
-        candidates = scopes;
-      } else if (tagged.length === 0) {
-        const visible = scopes.filter((scope) => typeof scope?.getClientRects === "function" && scope.getClientRects().length > 0);
-        if (visible.length === 1) candidates = visible;
-      }
-      if (candidates.length !== 1) return void 0;
+      // 唯一候选与 findNativeConversationScope 共用同一份选择实现（分支语义见该函数）。
+      const candidate = selectNativeScopeCandidate(scopes, sessionId);
+      if (candidate === void 0) return void 0;
 
-      return resolveNativeStatusScopeTargets(candidates[0], sessionId);
+      return resolveNativeStatusScopeTargets(candidate, sessionId);
     }
 
     /**

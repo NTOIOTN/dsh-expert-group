@@ -277,6 +277,31 @@ export const Config = z.object({
   candidates: z.dict(z.array(ROLE_SELECTION)).default({}).volatile(),
   fallbackLimit: z.number().step(1).min(0).max(MAX_MODEL_FALLBACK_LIMIT).default(DEFAULT_MODEL_FALLBACK_LIMIT).volatile(),
   /**
+   * 峰谷模式（票据 02）：enabled / initialized / periods / peak / valley。
+   *
+   * 这是一组"要按时段切哪套模型"的状态，因此用嵌套对象而不是七个新的顶层字段；
+   * peak / valley 与普通配置**同构**（provider、defaults、candidates、fallbackLimit）。
+   *
+   * 这里刻意只声明外壳，periods 与两套 profile 都用 z.any()：
+   * - 时段的形状/数量/start===end 的唯一权威是 shared/peak-valley-time.js 的归一函数；
+   * - 两套 profile 的写入面校验在 DEG 自有提交端点（host/peak-valley-settings），
+   *   读取面由同一模块做宽容归一 + 有界诊断 + invalidCode；
+   * - schema 一旦收紧（例如要求 profile.defaults 里 model 必填），一份被宿主通用写入
+   *   路径或历史版本写坏的文档就会让**整份设置文档**解析失败，设置页再也打不开——这正是
+   *   读取归一要避免的失败模式。代价是坏值能进文档，但读取面对它们 fail-closed。
+   *
+   * initialized 是 **Host 派生字段**：客户端提交的值在提交端点被忽略，只由首次启用的
+   * 克隆写入 true（schema 默认 false 供旧文档/旧客户端读取）。
+   * 缺字段 = 旧文档 / 旧客户端：读取面归一为未启用，普通配置字段完全不变。
+   */
+  peakValley: z.object({
+    enabled: z.boolean().default(false),
+    initialized: z.boolean().default(false),
+    periods: z.array(z.any()).default([]),
+    peak: z.any().default({}),
+    valley: z.any().default({}),
+  }).default({}).volatile(),
+  /**
    * 每模型输入/输出单价（每百万 token，票据 25）：数组，最多 64 项。
    *
    * 这里只声明类型层（任意值数组）：字段/范围/未知键/重复条目的 fail-closed 校验由

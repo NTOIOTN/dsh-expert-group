@@ -156,6 +156,8 @@ function settleShard(s, deps, task, shard, attempt, status, {
   reason,
   watchStop = true,
   needsAttention = false,
+  /** 受控的 queued→failed 通道（票据 03 派发前准备失败）；默认关闭，沿用旧转移规则。 */
+  allowQueuedFailure = false,
 } = {}) {
   // 已回收任务：任何迟到结算/证据都只做结构化 no-op（不复活、不改统计、不写事件/快照）。
   // 判定必须在预算/证据处理之前，否则迟到负载仍可能污染诊断与持久化。
@@ -212,8 +214,12 @@ function settleShard(s, deps, task, shard, attempt, status, {
   /**
    * 合法转移：running -> 任意终态；queued -> cancelled（从未 admission）或
    * interrupted（归属老化：这一轮从未真正开始，但也无法证明启动过）。
+   *
+   * queued -> failed 只在 allowQueuedFailure（派发前准备失败）下成立，其余来源仍拒绝。
    */
-  if (preStatus !== "running" && !(preStatus === "queued" && (status === "cancelled" || status === "interrupted"))) {
+  if (preStatus !== "running"
+    && !(preStatus === "queued" && (status === "cancelled" || status === "interrupted"
+      || (status === "failed" && allowQueuedFailure === true)))) {
     return payloadViolation === null
       ? rejectSettlement(s, deps, task, shard, attempt, status, "invalid_transition")
       : rejectSettlement(s, deps, task, shard, attempt, status, "attempt_budget_exceeded");
@@ -277,7 +283,7 @@ function settleShard(s, deps, task, shard, attempt, status, {
   // 自己的 attempt 历史（审计可见）并发布 attempt 级事件，但绝不改写 shard.status，
   // 否则旧轮迟到结算会覆盖新轮状态，并可能重复发布旧轮 task_settled。
   const isLatestAttempt = shard.attempts[shard.attempts.length - 1] === attempt;
-  if (isLatestAttempt) deps.store.setShardStatus(task, shard, status);
+  if (isLatestAttempt) deps.store.setShardStatus(task, shard, status, attempt);
   // 非最新 attempt 不改变 shard.status，但它自己的范围索引仍要刷新（终态 + 证据决定释放）。
   else deps.store.syncAttemptScope(task, shard, attempt);
   shard.updatedAt = attempt.finishedAt;
@@ -1037,10 +1043,11 @@ function continueTask(s, deps, input) {
       shard,
       prompt: next.prompt,
       attempt: deps.scheduler.createAttempt(task, shard, previous.attempt + 1, {
-        // 复用标记只存在于内存 attempt：冷恢复后原 child 可能已消失，恢复派发一律
-        // 走 launcher 新建 child（既有 restore 语义）。
+        // 复用标记只存在于内存 attempt：冷恢复后原 child 可能已消失，恢复派发一律走 launcher（既有语义）。
         continuation: true,
         ...(typeof previous.childId === "string" && previous.childId.length > 0 ? { childId: previous.childId } : {}),
+        // 续作沿用上一 attempt 的冻结路由快照（票据 04，只复制不重选）：缺失不补计划，非法由派发入口 fail-closed。
+        ...(previous.route === void 0 ? {} : { route: previous.route }),
       }),
     };
   });
@@ -1051,7 +1058,7 @@ function continueTask(s, deps, input) {
     // 允许新一轮重新 admission。
     delete item.attempt.cancelRequested;
     item.shard.cancelRequested = false;
-    deps.store.setShardStatus(task, item.shard, "queued");
+    deps.store.setShardStatus(task, item.shard, "queued", item.attempt);
     item.shard.updatedAt = timestamp;
   }
   task.basePrompt = verdict.basePrompt;

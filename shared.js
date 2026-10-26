@@ -221,3 +221,26 @@ export {
   projectStructuredResult,
   structuredProjectionFields,
 } from "./shared/structured.js";
+
+export {
+  ROUTE_PERIODS,
+  ROUTE_TIERS,
+  ROUTE_PLAN_LIMIT,
+  ROUTE_SNAPSHOT_INVALID,
+  PEAK_VALLEY_ROLE_MISSING,
+  buildRouteSnapshot,
+  normalizeRouteSnapshot,
+  routeSnapshotActiveSelection,
+  routeSnapshotMarkerOf,
+  projectRouteSnapshotFields,
+  advanceRouteSnapshot,
+} from "./shared/route-snapshot.js";
+
+export {
+  MAX_PEAK_VALLEY_PERIODS,
+  PEAK_VALLEY_PERIODS_INVALID,
+  normalizePeakValleyPeriods,
+  peakValleyAtMinutes,
+  peakValleyAtDate,
+  peakValleyPeriodsCoverFullDay,
+} from "./shared/peak-valley-time.js";

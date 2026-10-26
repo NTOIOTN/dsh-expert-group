@@ -20,6 +20,7 @@
  * @module dsh-expert-group/host/expert-group-stage
  */
 import { projectModelRouteFields } from "../shared/model-route.js";
+import { projectRouteSnapshotFields } from "../shared/route-snapshot.js";
 import { hasUsageMetrics, sumUsageByChildId } from "./usage-projection.js";
 
 /**
@@ -305,6 +306,23 @@ export async function collectExperts(root, deps) {
 }
 
 /**
+ * attempt 与 child 记录之间的路由投影合并（票据 06）。
+ *
+ * 与 host/expert-group-projection.js 的 routeSnapshotFieldsOf 同一口径：attempt 的冻结快照
+ * 优先，缺失时才回退同一 child 的 child_models 缓存。两份实现各自只依赖 shared 纯函数，
+ * 因此结果逐字一致（测试对两者分别断言）。
+ *
+ * @param {object|undefined} attempt - 本次 attempt 记录（可含 `route`）。
+ * @param {object|undefined} persisted - 同一 child 的 child_models 记录。
+ * @returns {object} 可展开的投影字段；没有快照时为空对象。
+ */
+function routeSnapshotFieldsFor(attempt, persisted) {
+  const fromAttempt = projectRouteSnapshotFields(attempt);
+  if (Object.keys(fromAttempt).length > 0) return fromAttempt;
+  return projectRouteSnapshotFields(persisted);
+}
+
+/**
  * 单个 fan-out shard 的投影。
  *
  * attempt 之间彼此独立，因此先把本 shard 需要的归属证明**全部调度**（同一 child 去重），
@@ -392,6 +410,9 @@ async function projectFanoutShard(shard, task, deps) {
     const route = {
       ...projectModelRouteFields(attempt),
       ...projectModelRouteFields(persisted[childId]),
+      // 时段/层/跨层回退（票据 06）：attempt 的冻结快照是权威，child_models 只是只读投影；
+      // attempt 完全没有快照时才读 child 记录（旧记录/未启用峰谷），两者都没有就整体省略。
+      ...routeSnapshotFieldsFor(attempt, persisted[childId]),
     };
     // 角色显示名（票据 27）：attempt 自身记录优先，其次同一 child 的 child_models 快照；
     // 两者都没有时省略字段（不猜显示名）。角色删除后历史 attempt 仍保留标签。
@@ -442,7 +463,8 @@ async function projectFanoutShard(shard, task, deps) {
       firstText(shard?.role, task?.role),
       firstText(shard?.roleLabel, persisted[navigationChildId]?.roleLabel),
     ),
-    ...modelMetadata(ownedChild?.agent, ownedChild?.childSnapshot ?? null, null),
+    // 第 4 参是最新 attempt：分片的时段/层/跨层回退以 attempt 冻结快照为准（票据 06）。
+    ...modelMetadata(ownedChild?.agent, ownedChild?.childSnapshot ?? null, null, latestAttempt),
     runSummary: runSummary(ownedChild?.session, shardStatus, "continuable", sessionEvents(ownedChild?.session)),
     continuable: true,
     ...(shardUsage === null || !hasUsageMetrics(shardUsage) ? {} : { usage: shardUsage }),

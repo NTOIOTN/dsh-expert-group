@@ -46,6 +46,7 @@
     createSchemaAdapter, namespaceSchemaInfo, validateProfileDraft, rolesAffectedByChange,
     reasoningGuardMessage, removedLevelsOf, namespaceViewOf, roleDefaultsOf, modelCardApply,
     providerListSections, apiKeyField, buildModelCardModel, createCardSession,
+    modelLimitFieldsOf, modelReasoningFieldsOf,
   } = rows;
 
   /**
@@ -521,31 +522,14 @@
         disabled,
         placeholder: "粘贴 API Key（可留空，沿用 provider 原生/环境凭据）",
       },
-      models: rows.map((model, index) => {
-        const selection = effortSelectionFor(model);
-        const inputSelected = modelInputOf(model, defaultInput);
-        return {
-          index,
-          position: index + 1,
-          id: { value: typeof model.id === "string" ? model.id : "" },
-          name: { value: typeof model.name === "string" ? model.name : "" },
-          contextWindow: {
-            value: typeof model.contextWindow === "number" ? formatCapacity(model.contextWindow) : "",
-            placeholder: "继承适配器默认",
-          },
-          maxTokens: {
-            value: typeof model.maxTokens === "number" ? formatCapacity(model.maxTokens) : "",
-            placeholder: "继承适配器默认",
-          },
-          efforts: REASONING_EFFORTS.map((level) => ({ level, checked: selection[level] === true })),
-          inputs: INPUT_MODALITIES.map((modality) => ({
-            modality,
-            checked: inputSelected.includes(modality),
-            locked: inputSelected.length === 1 && inputSelected.includes(modality),
-          })),
-          advancedOpen: expanded.has(index),
-        };
-      }),
+      models: rows.map((model, index) => ({
+        index,
+        position: index + 1,
+        id: { value: typeof model.id === "string" ? model.id : "" },
+        name: { value: typeof model.name === "string" ? model.name : "" },
+        ...modelLimitFieldsOf(model),
+        ...modelReasoningFieldsOf(model, index, defaultInput, expanded),
+      })),
       modelsError: isNonEmptyString(errors.models) ? errors.models : null,
       actions: {
         // 提交后在 settings 阶段成功前仍可提交（用于重试凭据写入）；route 固定后依然满足。

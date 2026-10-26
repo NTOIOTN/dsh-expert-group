@@ -250,7 +250,6 @@
   // 只暴露被下游实际消费的符号（无全量外挂）：rows 读 13 个、client-model-config.js 读 18 个；
   // 这里把 18 个原语整体发布，避免"谁读谁"的清单随调用点漂移（模块级只读面，非可变状态）。
   global[SYMBOL] = Object.freeze({
-    SYMBOL,
     isBlankDraftValue,
     isPlainObject,
     isSchemaNode,

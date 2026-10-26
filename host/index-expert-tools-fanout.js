@@ -52,10 +52,18 @@ import {
 import {
   EXPERT_INHERIT_CONTEXT_MARKER,
   EXPERT_ROUTE_MARKER,
+  EXPERT_ROUTE_SNAPSHOT_MARKER,
   EXPERT_SUBAGENT_PROVIDER_MARKER,
   normalizeModelRouteMarker,
   normalizeModelSelection,
 } from "../shared/model-route.js";
+// 派发期路由冻结（票据 03）：fan-out 在 attempt 进入 running 之前同步冻结快照。
+// 单独成模块是为了让 scheduler 的 seam 只依赖纯函数，不再从本文件多引一条 shared 依赖。
+import {
+  fanoutRouteSnapshotRecordOf,
+  frozenFanoutRouteOf,
+  prepareFanoutAttempt,
+} from "./fanout-dispatch-route.js";
 import { OUTPUT_SCHEMA_REQUESTED_MARKER } from "../shared/structured.js";
 import { PROVIDER_ROUTE_CHANGED, SHARD_TERMINAL_STATUSES } from "../fanout.js";
 import { FANOUT_BUDGET, truncateFeedbackText } from "../resource-budget.js";
@@ -954,32 +962,50 @@ export function createFanoutTaskCommands({ core, models, runtime, waits, caches 
  * @returns {object} buildRequest 能力。
  */
 export function createFanoutRequestBuilder({ identity, models, core, roles, storage, caches }) {
-  const { restoredFanoutModelRoute, resolveRoleModelRoute, routeMarkerOf } = models;
+  const { restoredFanoutModelRoute, resolveRoleModelRoute, routeMarkerOf, routeSnapshotMarkerOf } = models;
   const { resolveSubagentProviderForRole, resolvePersistedSubagentTarget, expertDenyForAdmission, markStructuredRequest } = core;
   const { resolvePersonaForAdmission } = storage;
   const { assertFanoutProviderRouteUnchanged, fanoutOutputSchemaFor, fanoutSchemaWasRequestedBefore, fanoutRouteFor } = caches;
   async function buildRequest(input, signal) {
       const parent = identity.parentAgentOf(input.parentTaskId);
       if (parent === void 0) throw new Error("fan-out parent root is unavailable: " + input.parentTaskId);
-      // 启动前路由（票据 24）：恢复产生的 interrupted attempt 只读 child_models 里的
-      // 实际路由，不重新选择；普通新派发才执行 primary -> candidates 的 fallback 计划。
+      // 启动前路由（票据 24 × 票据 03）：恢复产生的 interrupted attempt 只读 child_models
+      // 里的实际路由；峰谷启用时则由 scheduler 在进入 running **之前**同步冻结快照
+      // （launchInput.precomputedRoute）；其余普通新派发才执行 primary -> candidates 的 fallback。
       //
-      // 优先级（票据 24 × 26 修复）：
+      // 优先级（逐级都不得越过前一层的决定）：
       // 1. restoredRoute：中断 attempt 的持久化实际路由（恢复不重选）；
-      // 2. 提交时的预检路由：同一 parentTaskId 的新 attempt/retry 复用提交时已确定的
+      // 2. 冻结快照：派发时刻已写进 attempt.route 的那份计划（不重新选路、不重查目录）；
+      // 3. 提交时的预检路由：同一 parentTaskId 的新 attempt/retry 复用提交时已确定的
       //    实际 provider，避免第二次 fallback 选到另一个 provider、把名额记错；
-      // 3. 冷恢复/旧任务：只能重新解析（随后必须通过 provider 一致性校验）。
+      // 4. 冷恢复/旧任务/峰谷未启用：只能重新解析（随后必须通过 provider 一致性校验）。
       const restoredRoute = restoredFanoutModelRoute(input);
-      const cachedRoute = restoredRoute === null ? fanoutRouteFor(input.parentTaskId) : undefined;
-      const precomputedRoute = cachedRoute === undefined
+      // 冻结快照非法即抛稳定错误（fail-closed），绝不当成缺失继续重选。
+      const frozenRoute = frozenFanoutRouteOf(input);
+      const cachedRoute = restoredRoute === null && frozenRoute === undefined
+        ? fanoutRouteFor(input.parentTaskId)
+        : undefined;
+      const cachedRouteInput = cachedRoute === undefined
         ? undefined
         : { selection: { ...cachedRoute.selection }, ...cachedRoute.marker };
-      const route = restoredRoute ?? precomputedRoute ?? await resolveRoleModelRoute(input.role, parent.id, signal);
+      const route = restoredRoute ?? frozenRoute?.route ?? cachedRouteInput
+        ?? await resolveRoleModelRoute(input.role, parent.id, signal);
       if (route === null) throw new Error(input.role + " 专家尚未配置模型");
-      // fail-closed：实际 provider 必须等于任务提交时固化的 provider 归属；否则继续
-      // 启动 child 会把 running 名额记到错误的 provider 名下（比直接失败更糟）。
-      assertFanoutProviderRouteUnchanged(input.parentTaskId, route);
+      /**
+       * provider 一致性校验的边界（票据 03）：冻结快照**不走**这条校验。
+       *
+       * 原因：任务级 provider 归属是提交时固化的单个值，而峰谷启用后同一任务的相邻分片
+       * 可能落在不同时段、因而使用不同 provider（正是本票据「逐 shard 冻结」要表达的
+       * 事实）。若沿用旧校验，跨边界的那一片会被判成「路由变化」而拒绝启动——那是把
+       * ticket 05 的「attempt 级 provider 归属」缺口误报成配置错误。enabled 路径下名额
+       * 归属的修正属于票据 05，这里先跳过、保留旧路径（未冻结）的 fail-closed 行为。
+       */
+      if (frozenRoute === undefined) assertFanoutProviderRouteUnchanged(input.parentTaskId, route);
       const validatedSelection = route.selection;
+      // 完整快照 marker（票据 03）：冻结路径必然有；其余路径只有峰谷启用时才有
+      // （resolveRoleModelRoute 返回的 route 自带 snapshot），未启用峰谷时 undefined，
+      // 因此旧路径的 agentOptions 形状逐字不变。
+      const routeSnapshotMarker = routeSnapshotMarkerOf(route);
       // 目标 subagent provider（票据 29）：新 attempt 按当前角色设置选择；恢复出来的
       // interrupted attempt 只读上一 child 的快照，绝不按当前设置重选。Observer 无论
       // 设置如何都强制非继承通道；继承型失败绝不静默回退 spawn。
@@ -1028,6 +1054,11 @@ export function createFanoutRequestBuilder({ identity, models, core, roles, stor
           // 实际路由（票据 24）：分片 child 的 candidateIndex/fallbackCount/
           // lastRouteErrorCode 随 child_models 落盘，投影与恢复只读该快照。
           [EXPERT_ROUTE_MARKER]: routeMarkerOf(route),
+          // 派发路由冻结快照（票据 03）：与 attempt.route 同一份数据，随 child_models 落盘。
+          // 未启用峰谷时 route 没有 snapshot，marker 保持缺省——旧快照形状不变。
+          ...(routeSnapshotMarker === undefined
+            ? {}
+            : { [EXPERT_ROUTE_SNAPSHOT_MARKER]: routeSnapshotMarker }),
           [ROLE_MARKER]: input.role,
           [PARENT_MARKER]: parent.id,
           [CONTINUABLE_MARKER]: true,
@@ -1096,6 +1127,14 @@ export function createFanoutChildHandlers({ childSurface, storage, core, roles, 
       // 目标 subagent provider / 继承开关（票据 29）：marker 优先；cold-resume 的
       // agent options 不还原 marker，回落到 DEG 自有 child_models 记录。
       const persistedFanoutChild = typeof childId === "string" ? storage.readSnapshot().childModels?.[childId] : void 0;
+      /**
+       * 派发路由冻结快照（票据 03）：marker 优先，cold-resume 回落到已持久化记录。
+       *
+       * 为什么必须在这里也写一次：本回调用的是**整条** writeChildModel，会把
+       * agent/created marker 监听器刚写下的 route 覆盖掉；不带回来快照就会在 fan-out
+       * child 上丢失（role 工具走的是 patch 写入，不受影响）。
+       */
+      const dispatchRouteSnapshot = fanoutRouteSnapshotRecordOf(agent.options, persistedFanoutChild);
       const subagentProviderSnapshot = validSubagentProviderName(agent.options?.[EXPERT_SUBAGENT_PROVIDER_MARKER])
         ?? validSubagentProviderName(persistedFanoutChild?.subagentProvider);
       const inheritContextSnapshot = typeof agent.options?.[EXPERT_INHERIT_CONTEXT_MARKER] === "boolean"
@@ -1106,6 +1145,8 @@ export function createFanoutChildHandlers({ childSurface, storage, core, roles, 
         model,
         ...(typeof agent.options?.[EFFORT_MARKER] === "string" ? { reasoningEffort: agent.options[EFFORT_MARKER] } : {}),
         ...(routeSnapshot === undefined ? {} : routeSnapshot),
+        // 完整冻结快照（票据 03）：与 agentOptions marker / attempt.route 同源。
+        ...(dispatchRouteSnapshot === undefined ? {} : { route: dispatchRouteSnapshot }),
         ...(subagentProviderSnapshot === void 0 ? {} : { subagentProvider: subagentProviderSnapshot }),
         ...(inheritContextSnapshot === void 0 ? {} : { inheritContext: inheritContextSnapshot }),
         // 结构化交付（票据 30）：只保留布尔与已捕获结果；schema 原文绝不落盘。
@@ -1147,11 +1188,42 @@ export function createFanoutChildHandlers({ childSurface, storage, core, roles, 
  * @param {object} deps - 窄能力面（6 组：identity / childIo / core / waits / requestBuilder / childHandlers）。
  * @returns {object} runtime seam 能力面。
  */
-export function createFanoutToolHooks({ identity, childIo, core, waits, requestBuilder, childHandlers }) {
+export function createFanoutToolHooks({ identity, childIo, core, waits, requestBuilder, childHandlers, dispatch }) {
   const { startExpertActivation } = core;
   const { handleFanoutLifecycleEvent } = waits;
   const { buildRequest } = requestBuilder;
   const { onAgentCreated } = childHandlers;
+  // 派发期路由冻结所需的两个只读取值函数（票据 03）：同一代读的设置快照 + 只读时钟。
+  // 缺失时（测试替身/旧装配）冻结 seam 返回 null，manager 保持旧路径。
+  const readSettingsSnapshot = typeof dispatch?.readSettingsSnapshot === "function"
+    ? dispatch.readSettingsSnapshot
+    : undefined;
+  const dispatchClock = dispatch?.clock;
+
+  /**
+   * 派发前路由决定 seam（票据 03 冻结 / 票据 04 复用）：scheduler 在 attempt 进入
+   * running 之前同步调用。
+   *
+   * 为什么要在这里合成而不是让 scheduler 读 settings：scheduler 属于 fanout/ 域，不得
+   * 直连宿主设置；组合根只交出**取值函数**，sessionId（会话覆盖的键）由本域从父任务
+   * 归属解析。
+   *
+   * 为什么交出函数而不是已读好的值（票据 04）：恢复回来的 queued attempt 与多轮续作
+   * 只读 attempt 记录的冻结快照，**根本不应读设置**。把读取推迟到真正需要重新冻结的
+   * 那一层，才能让「没有重新冻结 ⇒ 没有设置读」成为结构事实，而不是依靠调用顺序的约定。
+   *
+   * @param {object} input - { task, shard, attempt, round, continuation }。
+   * @returns {null|{ok:false, code:string}|{ok:true, snapshot:object, selection:object}}
+   */
+  function prepareAttempt(input) {
+    const parentAgentId = identity.parentAgentOf(input?.task?.parentTaskId)?.id;
+    return prepareFanoutAttempt({
+      ...input,
+      sessionId: typeof parentAgentId === "string" ? parentAgentId : undefined,
+      ...(typeof readSettingsSnapshot === "function" ? { readSettingsSnapshot } : {}),
+      clock: dispatchClock,
+    });
+  }
 
   function startContinuable({ request, signal }) {
     return startExpertActivation({ request, label: request.label, signal });
@@ -1212,6 +1284,9 @@ export function createFanoutToolHooks({ identity, childIo, core, waits, requestB
     resolveChildSession,
     interrupt,
     onAgentCreated,
+    // 派发前路由冻结（票据 03）：manager 的 deps.prepareAttempt。缺失/返回 null 时
+    // scheduler 走旧路径（异步 buildRequest 里重新选路）。
+    prepareAttempt,
   };
 }
 
@@ -1231,7 +1306,7 @@ export function createFanoutRuntimeWiring({ identity, roles, storage, waits, cac
   const { settleAllFanoutShardWaits, releaseFanoutGoalHandoff } = waits;
   const { clearFanoutOutputSchemas, clearFanoutRoute, clearAllFanoutOutputSchemas, clearAllFanoutRoutes } = caches;
   const { buildFanoutFeedback } = commands;
-  const { onFanoutEvent, buildRequest, startContinuable, continueMessage, resolveChildSession, interrupt, onAgentCreated } = hooks;
+  const { onFanoutEvent, buildRequest, startContinuable, continueMessage, resolveChildSession, interrupt, onAgentCreated, prepareAttempt } = hooks;
 
   /**
    * fan-out 父任务真实终态时的等待结算入口。
@@ -1314,6 +1389,8 @@ export function createFanoutRuntimeWiring({ identity, roles, storage, waits, cac
     resolveChildSession,
     interrupt,
     onAgentCreated,
+    // 派发前路由冻结（票据 03）：缺失时 manager 完全保持旧行为（异步 buildRequest 选路）。
+    ...(typeof prepareAttempt === "function" ? { prepareAttempt } : {}),
     lineage,
     getAgent,
     buildFeedback: buildFanoutFeedback,

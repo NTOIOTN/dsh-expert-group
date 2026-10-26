@@ -31,6 +31,9 @@ export function assembleModelRoute(state) {
   const modelRoute = createIndexModelRouteDomain({
     llm,
     settings,
+    // 只读时钟（票据 03）：派发期唯一的时间来源。域内每次派发只调一次 now()，同一时间戳
+    // 既判定峰谷时段、又写快照 decidedAt；运行期降级与恢复绝不二次取时。
+    clock: state.clock,
     settingsRuntime,
     updateSettingsAtGeneration,
     configMigrationPending,

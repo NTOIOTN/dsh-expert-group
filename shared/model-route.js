@@ -197,6 +197,17 @@ export function isNonDegradableModelFailure(failure) {
 export const EXPERT_ROUTE_MARKER = "__degExpertRoute";
 
 /**
+ * agentOptions 上的**派发路由冻结快照** marker（票据 03）。
+ *
+ * 为什么与 EXPERT_ROUTE_MARKER 分开：后者只保存扁平的 candidateIndex/fallbackCount/
+ * lastRouteErrorCode，其归一函数是**封闭形状**（未知键在归一化时被丢弃），把完整计划塞
+ * 进去会静默丢失。快照因此使用独立 marker，形状由 shared/route-snapshot.js 严格校验；
+ * 它同样只存在于 agent options / child_models，不进入任务 prompt，冷恢复时回落到
+ * child_models 的 `route` 字段。**只在这里定义一次**（expert-guards 与其它模块从这里取）。
+ */
+export const EXPERT_ROUTE_SNAPSHOT_MARKER = "__degRouteSnapshot";
+
+/**
  * agentOptions 上的目标 subagent provider marker（票据 29）。
  *
  * 记录本次 child 实际使用的 subagent provider 名（"spawn" 或继承型 fork provider）。

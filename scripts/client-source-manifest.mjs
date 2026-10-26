@@ -4,7 +4,7 @@
  * ## 为什么需要这份清单
  * 一次客户端装配涉及四种"文件集合"，它们过去散落在四个不同位置，各自维护：
  * 1. **装配顺序**：`scripts/assemble-client.mjs` 的模块局部常量（IIFE_SOURCES /
- *    FRESHNESS_SOURCE / DESCRIPTOR_SOURCE）；
+ *    FRESHNESS_SOURCE / DESCRIPTOR_SOURCE）与"可投影 ESM 源"清单（projectedSources）；
  * 2. **语法检查集合**：`scripts/build.mjs` 的 `node --check` 名单（来自 client-sources.mjs）；
  * 3. **通知 marker 扫描集合**：`test/notification-popup-channel.test.mjs` 的 CLIENT_FILES；
  * 4. **IIFE 依赖边**：`scripts/check-dependency-graph.mjs` 只能靠扫描源码反推。
@@ -21,7 +21,9 @@
  * ## 新增客户端模块时的登记顺序（plan §10.2）
  * 1. `assemblyOrder` 按**执行顺序**插入（descriptor 恒为最后一项）；
  * 2. `syntaxCheckSources` / `scanSources` 同步（前者复用 client-sources.mjs，会自动跟随）；
- * 3. `iifeDependencies` 声明它 provides/requires 的 `Symbol.for("dsh-expert-group/<name>")` 边。
+ * 3. `iifeDependencies` 声明它 provides/requires 的 `Symbol.for("dsh-expert-group/<name>")` 边；
+ * 4. 需要进 bundle、但只保留 ESM 权威实现的**共享**模块：登记到 `projectedSources`
+ *    （source / checkpointKey / exports），由装配器机械投影，不要手抄第二份实现。
  */
 import { CLIENT_SOURCE_FILES } from "./client-sources.mjs";
 
@@ -139,11 +141,45 @@ const IIFE_EXECUTION_ORDER = Object.freeze([
 ]);
 
 /**
+ * 「可投影 ESM 源」清单（票据 01 第二单元）：需要进入 classic bundle、但**只保留一份 ESM
+ * 权威实现**的共享模块。
+ *
+ * 每个条目只描述三件事，装配器据此做纯机械投影，仓库里不再出现第二份手抄实现：
+ * - `source`：权威实现的仓库相对路径。构建期逐行剥掉行首 `export ` 前缀后原样嵌入
+ *   classic 片段；出现其它 ESM 语法（`import` / `export default` / `export {}`）即构建失败。
+ * - `checkpointKey`：投影段尾部挂到 `globalThis[Symbol.for(<key>)]` 的公开检查点键。
+ *   descriptor 与测试只从这里取回同一份实现（缺失时调用方自行判断，不由装配器替它降级）。
+ * - `exports`：投影必须提供的导出名。缺一个即构建失败；同时决定检查点对象的键集合与顺序
+ *   （检查点与 ESM 模块命名空间同形，`test-support` 的 source 模式直接挂命名空间）。
+ *
+ * 顺序即装配顺序：**全部 IIFE 之后、freshness 投影之前**。投影段只负责"挂检查点"，不登记
+ * ModuleLoader，因此不必抢在 descriptor 的 require 之前登记，但必须早于 descriptor 取用；
+ * 放在 IIFE 之后是为了让"侧车先执行、投影再补共享实现、descriptor 最后"这条装载链保持
+ * 与既有段序一致（见 assemblyOrder 的说明）。
+ */
+export const projectedSources = Object.freeze([
+  Object.freeze({
+    source: "shared/peak-valley-time.js",
+    checkpointKey: "dsh-expert-group/peak-valley-time",
+    exports: Object.freeze([
+      "MAX_PEAK_VALLEY_PERIODS",
+      "PEAK_VALLEY_PERIODS_INVALID",
+      "normalizePeakValleyPeriods",
+      "peakValleyAtMinutes",
+      "peakValleyAtDate",
+      "peakValleyPeriodsCoverFullDay",
+    ]),
+  }),
+]);
+
+/**
  * freshness/RPC 的 ESM 权威实现。构建期投影成 classic 片段（去 `export` 前缀 + 追加
  * "检查点 + ModuleLoader 登记"尾部），必须排在唯一 descriptor 之前，登记才来得及生效。
  *
  * 注意它不是 IIFE：`test-support/client-bundle.mjs` 的 source 模式由 client.js 的 require
  * 取回同一份 ESM 模块，**不得**再当 IIFE 执行第二遍（否则同一实现被求值/登记两次）。
+ * 它也不走 {@link projectedSources} 的通用投影：freshness 的尾部还要登记 ModuleLoader，
+ * 是专用投影（票据 13 起由装配器单独维护，本清单不复用、不改写它）。
  */
 const FRESHNESS_EXECUTION_SOURCE = "client-freshness.js";
 
@@ -151,18 +187,23 @@ const FRESHNESS_EXECUTION_SOURCE = "client-freshness.js";
 const DESCRIPTOR_EXECUTION_SOURCE = "client-entry.js";
 
 /**
- * ① 装配顺序：52 个 IIFE → freshness 投影 → 唯一 descriptor。
+ * ① 装配顺序：N 个 IIFE → 可投影 ESM 源（逐段投影）→ freshness 投影 → 唯一 descriptor。
  *
  * 消费者：`scripts/assemble-client.mjs`（决定段序与 sourceNames）、
  * `test/bundle-size-gate.test.mjs`（段序断言的期望值）、
- * `test-support/client-bundle.mjs` 的 source 模式（按此顺序依次加载各 IIFE）。
+ * `test-support/client-bundle.mjs` 的 source 模式（按此顺序依次加载各 IIFE、并为投影源
+ * 预装同名检查点）。
  *
- * 为什么固定成"完整数组"而不是"三份局部常量"：装配顺序是**唯一**的装载契约，
+ * 为什么固定成"完整数组"而不是"几份局部常量"：装配顺序是**唯一**的装载契约，
  * 任何一处局部重排都会让产物与 source 模式替身分叉，而分叉只会在后续批次里以
  * "某个模块的 globalThis 检查点不存在"这种间接症状暴露。
+ *
+ * 投影源的位置由 {@link projectedSources} 的语义固定：全部 IIFE 之后（侧车检查点先就位）、
+ * freshness 与 descriptor 之前（descriptor 取用前必须已经挂上）。
  */
 export const assemblyOrder = Object.freeze([
   ...IIFE_EXECUTION_ORDER,
+  ...projectedSources.map((entry) => entry.source),
   FRESHNESS_EXECUTION_SOURCE,
   DESCRIPTOR_EXECUTION_SOURCE,
 ]);

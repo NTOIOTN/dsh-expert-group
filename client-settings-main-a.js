@@ -19,9 +19,9 @@
     resolveSettingsLocale, settingsExtraText, settingsText,
   } = clientText;
   const {
-    DEFAULT_MODEL_FALLBACK_LIMIT, DEFAULT_PROMPT_MAX_GRAPHEMES, MAX_MODEL_PAGES, PROMPT_ROLE_IDS, SETTINGS_ROLE_LABELS, addModelCandidatePage,
+    DEFAULT_MODEL_FALLBACK_LIMIT, DEFAULT_PEAK_VALLEY_PERIODS, DEFAULT_PROMPT_MAX_GRAPHEMES, MAX_MODEL_PAGES, PROMPT_ROLE_IDS, SETTINGS_ROLE_LABELS, addModelCandidatePage,
     commitSettingsCandidate, compactModelCandidatesDraft, mergeSettingsDraftOverSource, modelCandidatesErrorMessage, modelLayerMapOf, modelPageCountOf,
-    normalizeModelCandidatesDraft, normalizePromptOverrides, normalizeRolePromptProjection, normalizeSettingsCommitDraft, normalizeSettingsDraft, promptEntryOf,
+    normalizeModelCandidatesDraft, normalizePeakValleyDraft, normalizePromptOverrides, normalizeRolePromptProjection, normalizeSettingsCommitDraft, normalizeSettingsDraft, promptEntryOf,
     promptOverridesEqual, removeModelCandidatePage, reorderModelLayers, settingsDraftEqual, unifiedProviderOf, updateRolePromptProjection,
     useEnabledSettingsRoles, useHostMeta, validateModelCandidateRows, validatePromptText,
   } = clientSettingsNormalize;
@@ -30,8 +30,12 @@
   } = clientSettingsMainB;
   // descriptor 注入的运行期依赖：本模块先于 descriptor 执行，取值只发生在运行期调用时。
   let react = null;
+  // 峰谷时段的权威纯函数（shared/peak-valley-time.js 的构建期投影）。
+  // 客户端只消费它做展示与保存前校验，绝不另写一份判定/归一实现。
+  let peakValleyTime = null;
   function bindClientRuntime(host) {
     react = host.react ?? null;
+    peakValleyTime = host.peakValleyTime ?? null;
   }
 
   /**
@@ -59,6 +63,170 @@
   }
 
   /**
+   * 峰谷草稿的缺省形状：快照缺少 peakValley（旧文档）时子视图仍可渲染与编辑。
+   *
+   * periods 与归一入口的播种保持同一份常量（深拷贝）：缺字段兜底与「未启用 + 空时段」
+   * 必须显示同样的默认两条，否则旧文档打开子视图会看到 0 条、而新读面看到 2 条。
+   */
+  function emptyPeakValleyDraft() {
+    return {
+      enabled: false,
+      initialized: false,
+      periods: JSON.parse(JSON.stringify(DEFAULT_PEAK_VALLEY_PERIODS)),
+      peak: { provider: "", defaults: {}, candidates: {}, fallbackLimit: DEFAULT_MODEL_FALLBACK_LIMIT },
+      valley: { provider: "", defaults: {}, candidates: {}, fallbackLimit: DEFAULT_MODEL_FALLBACK_LIMIT },
+    };
+  }
+
+  /**
+   * 峰谷周期视图投影（票据 07；票据 08 起主设置页也复用它）。
+   *
+   * 把 draft.peakValley[period] 投影成与顶层 settings 同形的视图草稿。
+   *
+   * 模型表、页签、统一供应商、降级上限与拖动排序仍然只有一份实现（renderSettings* 与
+   * createModelPageActions / createModelTabDragController）：视图只是换掉 view.draft 与
+   * view.editDraft 的落点，所有写入都经本工厂回写 draft.peakValley[period]。
+   * 峰谷子视图与「主设置页锁定当前时段」两处共用它；未启用峰谷时主设置页完全不走这条投影。
+   */
+  function peakValleyViewOf(view) {
+    const { draft, editDraft, peakValleyPages, peakValleyPeriod, roles, setPeakValleyPages } = view;
+    const state = draft.peakValley ?? emptyPeakValleyDraft();
+    const profile = state[peakValleyPeriod] ?? emptyPeakValleyDraft()[peakValleyPeriod];
+    const modelPageCount = modelPageCountOf(profile);
+    const pages = peakValleyPages ?? {};
+    const sub = {
+      ...view,
+      currentModelPage: Math.min(pages[peakValleyPeriod] ?? 0, modelPageCount - 1),
+      draft: profile,
+      modelPageCount,
+      // 入口按钮在子视图里没有意义（已经在里面了）；主设置页的周期视图要保留它。
+      peakValleyEntry: view.peakValleyEntry === true,
+      peakValleyState: state,
+      unifiedProvider: unifiedProviderOf(profile.defaults, roles, profile.provider),
+    };
+    sub.editDraft = (update) => editDraft((previous) => {
+      const previousState = previous.peakValley ?? emptyPeakValleyDraft();
+      const previousProfile = previousState[peakValleyPeriod] ?? emptyPeakValleyDraft()[peakValleyPeriod];
+      const nextProfile = update(previousProfile);
+      return nextProfile === previousProfile
+        ? previous
+        : { ...previous, peakValley: { ...previousState, [peakValleyPeriod]: nextProfile } };
+    });
+    // 开关与时段不是「当前 profile」的字段，单独走整份峰谷状态的写入口。
+    sub.editPeakValley = (update) => editDraft((previous) => ({
+      ...previous,
+      peakValley: update(previous.peakValley ?? emptyPeakValleyDraft()),
+    }));
+    // 峰、谷各自记住候选页位置：切换视图只换渲染，不串页。
+    sub.setSelectedModelPage = (next) => setPeakValleyPages((previous) => ({
+      ...previous,
+      [peakValleyPeriod]: typeof next === "function" ? next(previous?.[peakValleyPeriod] ?? 0) : next,
+    }));
+    Object.assign(sub, createModelPageActions(sub), createModelTabDragController(sub));
+    return sub;
+  }
+
+  /**
+   * 主设置页的编辑目标（票据 08）：**只采样一次系统时间**。
+   *
+   * 启用峰谷时锁定「页面第一次看到启用状态」那一刻所属的时段（peak/valley），此后整个
+   * 会话固定：跨过峰谷边界只更新提示，绝不改编辑目标，也不改保存目标。未启用返回 null，
+   * 主设置页因此逐字保持旧行为（普通配置）。判定调用 01 的权威纯函数，不另写一份。
+   *
+   * @param {unknown} value - 读取面 settings.value（权威配置）。
+   * @returns {"peak"|"valley"|null} 锁定的编辑目标；未启用为 null。
+   */
+  function mainEditingPeriodOf(value) {
+    const state = value?.peakValley;
+    if (state?.enabled !== true) return null;
+    return samplePeakValleyPeriod(Array.isArray(state.periods) ? state.periods : []);
+  }
+
+  /**
+   * 采样一次「当前时段」：只读本地墙钟，判定走 01 的权威纯函数。
+   *
+   * 只有两处调用：页面打开时的编辑目标锁定、分钟级提示定时器。渲染路径绝不调用它。
+   *
+   * @param {unknown} periods - 峰段数组（原始值也安全：非法段按不生效处理）。
+   * @returns {"peak"|"valley"} 当前时段。
+   */
+  function samplePeakValleyPeriod(periods) {
+    return peakValleyTime?.peakValleyAtDate?.(periods, new Date()) === "peak" ? "peak" : "valley";
+  }
+
+  /**
+   * 启动「当前时段」采样定时器（分钟级）。
+   *
+   * 回调总是读 ref 里的**当前生效**峰段（保存新时段后提示立刻按新时段生效），
+   * 并且只更新 livePeriod 这个提示用的 state，绝不触碰锁定的编辑目标。
+   *
+   * @param {object} periodsRef - 持有当前峰段数组的 ref。
+   * @param {Function} setLivePeriod - livePeriod 的 setter。
+   * @returns {number|undefined} 定时器句柄。
+   */
+  function startPeriodSampler(periodsRef, setLivePeriod) {
+    return globalThis.setInterval?.(() => setLivePeriod(samplePeakValleyPeriod(periodsRef.current)), 60000);
+  }
+
+  /** 生成定时器清理函数（组件 effect 里因此不必再写一个箭头函数）。 */
+  function stopPeriodSampler(timer) {
+    return () => { if (timer !== void 0) globalThis.clearInterval?.(timer); };
+  }
+
+  /**
+   * 提交候选里的峰谷状态：只带 enabled / periods / 两套 profile。
+   *
+   * initialized 是 Host 派生字段（读取面只读），客户端提交时省略；profile 的候选层
+   * 与普通配置同一口径裁剪掉「全空行」，否则 Host 会把空 selection 当成非法候选整次拒绝。
+   */
+  function peakValleyCandidateOf(state, repair) {
+    const profileOf = (profile) => {
+      const value = profile !== null && typeof profile === "object" ? profile : {};
+      return {
+        provider: typeof value.provider === "string" ? value.provider : "",
+        defaults: value.defaults ?? {},
+        candidates: compactModelCandidatesDraft(value.candidates),
+        fallbackLimit: value.fallbackLimit === void 0 ? DEFAULT_MODEL_FALLBACK_LIMIT : value.fallbackLimit,
+      };
+    };
+    return {
+      enabled: state?.enabled === true,
+      periods: Array.isArray(state?.periods) ? state.periods : [],
+      peak: profileOf(state?.peak),
+      valley: profileOf(state?.valley),
+      // 修复意图位（只存在于**提交候选**）：只有峰谷设置页的「修复并保存」会带上它。
+      // 已保存状态损坏时，Host 只接受带该位的提交（否则普通保存不得写回峰谷字段）。
+      ...(repair === true ? { repair } : {}),
+    };
+  }
+
+  /**
+   * 已保存峰谷状态的 fail-closed 信号（读取面 invalidCode）：非空即表示坏档案。
+   *
+   * 保存路径**只读这个信号**（权威值的读取面投影），绝不从草稿推断：草稿里的
+   * invalidCode 只是只读携带，用户无法编辑它。
+   *
+   * @param {unknown} value - 权威 settings.value。
+   * @returns {string|null} 稳定错误码；正常状态返回 null。
+   */
+
+
+
+
+  /**
+   * 「修复并保存」动作：调用同一次保存，但带上 repair 意图位。
+   *
+   * 独立成模块级函数（不写在组件闭包里）以保持组件内函数计数不变，并让修复与普通保存
+   * 共用同一份保存计划/提交路径——不存在第二条写回通道。
+   *
+   * @param {object} view - 设置页 view（含 save）。
+   * @returns {Function} 无参动作。
+   */
+  function repairSaveActionOf(view) {
+    return () => view.save({ repair: true });
+  }
+
+  /**
    * 设置页的保存动作（票据 31 从组件作用域外移）。
    *
    * view 就是组件每轮渲染交给渲染尾段的同一份读面/写面，因此这里读到的状态、回调和引用
@@ -73,8 +241,10 @@
    * 提交与回执归一；阶段顺序与拆分前逐字相同，只是把「计算」与「提交」分成了两个函数。
    */
   function createSettingsSaveAction(view) {
-    return async ({ retry = false } = {}) => {
-      const plan = deriveSettingsSavePlan(view, retry);
+    return async ({ retry = false, repair = false } = {}) => {
+      // repair 是**修复意图位**：只有峰谷设置页的「修复并保存」会传 true；普通保存
+      // （包括 onClick 直接把事件对象传进来）一律按 false 处理，绝不隐式修复坏档案。
+      const plan = deriveSettingsSavePlan(view, retry, repair);
       if (plan === null) return false;
       return commitSettingsSavePlan(view, plan);
     };
@@ -139,8 +309,20 @@
 
   /**
    * 保存的「守卫 + 组装候选 + 变更集」阶段；返回 null 表示被守卫或校验拦下（调用方直接返回 false）。
+   *
+   * 峰谷损坏态（读取面 invalidCode 非空）的三条规则——读取归一会把非法时段变成 0 条、
+   * 丢弃坏条目，把 periods/peak/valley 组装成"看起来合法"的缺省状态，因此：
+   * 1. 普通保存（无 repair 意图）一律不提交 peakValley：写回残缺归一结果 = 坏档案被
+   *    静默"修复"成全天谷时；
+   * 2. 只有显式 repair 意图（峰谷设置页「修复并保存」）才提交 peakValley，且即使内容
+   *    看起来没变也必须提交（残缺归一的结果本身就是需要被覆盖的坏档案）；
+   * 3. 损坏态 + 无其它可提交项时给出阻塞提示后返回 null，绝不静默返回。
+   *
+   * 峰谷比较的基线必须与草稿**同源归一**：编辑器默认峰段（DEFAULT_PEAK_VALLEY_PERIODS）
+   * 在 normalizePeakValleyDraft 的播种入口写入，若基线直接拿读取面原值算候选，默认两条会
+   * 被算成「看起来变了」，主设置页一次无关保存就会把默认时段写回（并把自己判成有未保存修改）。
    */
-  function deriveSettingsSavePlan(view, retry) {
+  function deriveSettingsSavePlan(view, retry, repair) {
     const {
       addModelPage, applyPromptNavigation, authorityValue, baselineProjection, beginModelTabDrag, cancelModelPageDelete, ctx,
       candidatesError, catalogAvailable, closePrompt, committedAuthorityRef, committedSnapshotLagging, confirmModelPageDelete,
@@ -157,7 +339,12 @@
       settingsForm, settingsReadOnly, settingsSnapshot, sourceDraftForSave, sourcePromptOverrides, t, tExtra, unifiedProvider,
       effectiveDraft, editorBaseline, promptTouchedRoles, setSaving,
     } = view;
-        if (!hasUnsavedChanges || saving || settingsSnapshot.writable !== true) return null;
+        // 损坏态只看权威读取面（invalidCode 只有非空字符串才会被投影出来）。
+        const peakValleyBroken = typeof authorityValue?.peakValley?.invalidCode === "string";
+        // 修复意图必须能绕过「没有未保存修改」的守卫：坏档案的读取归一本身就是残缺的，
+        // 用户点「修复并保存」时草稿看起来可能与坏档案"一样"，但那正是要被覆盖的对象。
+        const repairing = repair === true && peakValleyBroken;
+        if ((!hasUnsavedChanges && !repairing) || saving || settingsSnapshot.writable !== true) return null;
         // 票据 20：模型目录不可用只阻断「这次确实要改模型字段」的保存。与模型无关的
         // 字段（通知、任务开关、提示词、并发/超时）不依赖目录，必须照常保存——否则一次
         // 目录刷新失败就会让整页设置不可写。
@@ -237,6 +424,23 @@
         const sourceFallbackLimit = source.fallbackLimit;
         const candidateFallbackLimit = normalizedDraft.fallbackLimit;
         const fallbackLimitChanged = candidateFallbackLimit !== void 0 && candidateFallbackLimit !== sourceFallbackLimit;
+        // 峰谷（票据 07）：损坏态下普通保存不提交（只有修复意图才写回）；其余与基线比较。
+        // 比较两侧都走 peakValleyCandidateOf（裁剪空候选、省略 initialized），因此只翻页签/
+        // 只加空候选页不会产生"看起来变了"的提交，未改动的一套 profile 原值仍进入候选。
+        const candidatePeakValley = normalizedDraft.peakValley === void 0 || (peakValleyBroken && !repairing)
+          ? void 0
+          : peakValleyCandidateOf(normalizedDraft.peakValley, repairing);
+        // 修复动作必须真的提交：坏档案的读取归一是残缺的，"内容看起来没变"也算一次修复。
+        let peakValleyChanged = repairing;
+        if (candidatePeakValley !== void 0
+          && (repairing || !settingsDraftEqual(candidatePeakValley, peakValleyCandidateOf(normalizePeakValleyDraft(source.peakValley))))) {
+          const periods = peakValleyTime?.normalizePeakValleyPeriods?.(candidatePeakValley.periods);
+          if (periods?.ok !== true) {
+            setError(tExtra("settings.pv.invalid", { reason: periods?.reason ?? "" }));
+            return null;
+          }
+          peakValleyChanged = true;
+        }
         const candidate = {
           ...normalizedDraft,
           provider: modelChanged ? draftProvider : sourceProvider,
@@ -247,9 +451,11 @@
           ...(fallbackLimitChanged
             ? { fallbackLimit: typeof candidateFallbackLimit === "number" ? candidateFallbackLimit : DEFAULT_MODEL_FALLBACK_LIMIT }
             : {}),
+          ...(peakValleyChanged ? { peakValley: candidatePeakValley } : {}),
         };
         if (!candidatesChanged) delete candidate.candidates;
         if (!fallbackLimitChanged) delete candidate.fallbackLimit;
+        if (!peakValleyChanged) delete candidate.peakValley;
         const ops = [];
         if (modelChanged) {
           ops.push({ op: "set", path: ["provider"], value: candidate.provider });
@@ -293,6 +499,15 @@
           }
         }
         if (fallbackLimitChanged) changed.push("fallbackLimit");
+        // 峰谷：至少覆盖 enabled / periods；两套 profile 的角色级差异由 Host 与已保存状态比对。
+        if (peakValleyChanged) changed.push("peakValley", "peakValley.enabled", "peakValley.periods");
+        // 坏档案 + 没有修复意图 + 没有其它可提交项：明确说明"保存被阻止"的原因，
+        // 而不是静默返回（按钮看起来可点却什么都不发生最糟）。
+        if (peakValleyBroken && !repairing && ops.length === 0
+          && !candidatesChanged && !fallbackLimitChanged) {
+          setError(tExtra("settings.pv.broken"));
+          return null;
+        }
         /**
          * 详情页的首次提交固定使用进入编辑器的 revision（审查修复 P1），不再只对提示词生效。
          *
@@ -304,7 +519,7 @@
           : editorBaseline.revision;
     return {
       candidate, candidateCandidates, candidateFallbackLimit, candidatePromptOverrides, candidatesChanged, changed,
-      expectedRevision, fallbackLimitChanged, ops, source, sourceCandidates, sourceFallbackLimit,
+      expectedRevision, fallbackLimitChanged, ops, peakValleyChanged, source, sourceCandidates, sourceFallbackLimit,
     };
   }
 
@@ -330,7 +545,7 @@
     } = view;
     const {
       candidate, candidateCandidates, candidateFallbackLimit, candidatePromptOverrides, candidatesChanged,
-      changed, expectedRevision, fallbackLimitChanged, ops, source, sourceCandidates, sourceFallbackLimit,
+      changed, expectedRevision, fallbackLimitChanged, ops, peakValleyChanged, source, sourceCandidates, sourceFallbackLimit,
     } = plan;
 
         setSaving(true);
@@ -342,7 +557,7 @@
           let committed = null;
           // 票据 24：候选/降级不在 ops 里（它们不是默认值 op），但同样需要真实提交；
           // 任一特殊字段变化都必须走 settings-commit，而不是只把快照当成已保存。
-          if (ops.length > 0 || candidatesChanged || fallbackLimitChanged) {
+          if (ops.length > 0 || candidatesChanged || fallbackLimitChanged || peakValleyChanged) {
             // 角色配置唯一写入路径：DEG 自有提交端点（Host commitSettingsCandidate 完成
             // schema、语义与 revision CAS 校验）。绝不调用配置表单的 set/unset/mutate：
             // 那会绕过 DEG 的提示词语义校验与模型目录代次检测。
@@ -385,6 +600,8 @@
               fallbackLimitChanged
                 ? (typeof candidateFallbackLimit === "number" ? candidateFallbackLimit : DEFAULT_MODEL_FALLBACK_LIMIT)
                 : sourceFallbackLimit);
+            // 峰谷（票据 07）：一次无关字段的保存不应让已打开的峰谷子视图短暂变空。
+            keepNewField("peakValley", Object.prototype.hasOwnProperty.call(source, "peakValley"), source.peakValley);
           }
           setDraft(acceptedDraft);
           setPromptDrafts({});
@@ -742,7 +959,8 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
       react.useEffect(() => {
         void modelCatalog.load();
       }, [modelCatalog]);
-      const [draft, setDraft] = react.useState(() => normalizeSettingsDraft(settingsSnapshot.value, roles));
+      // 草稿只在这里（以及下面的重置入口）播种默认峰段：读取面 → 编辑器草稿是唯一的播种点。
+      const [draft, setDraft] = react.useState(() => normalizeSettingsDraft(settingsSnapshot.value, roles, true, true));
       const [candidatesError, setCandidatesError] = react.useState(null);
       /**
        * 模型页签的纯 UI 状态（绝不落盘）。
@@ -760,6 +978,36 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
       const modelTabDragRef = react.useRef(null);
       const modelTabSuppressClickRef = react.useRef(false);
       const modelPageDeleteCancelRef = react.useRef(null);
+      /**
+       * 峰谷子视图的纯 UI 状态（票据 07）：
+       * - peakValleyOpen：设置页在「模型设置」与「峰谷模式」之间切换的唯一开关；
+       * - peakValleyPeriod：当前编辑峰还是谷（只换视图，不改草稿）；
+       * - peakValleyPages：峰/谷各自停在第几个候选页，切换视图不串页。
+       * 三者都不落盘；主设置页在未打开子视图时完全不读它们。
+       */
+      const [peakValleyOpen, setPeakValleyOpen] = react.useState(false);
+      const [peakValleyPeriod, setPeakValleyPeriod] = react.useState("peak");
+      const [peakValleyPages, setPeakValleyPages] = react.useState({});
+      /**
+       * 主设置页的编辑目标（票据 08）：惰性锁定 = **只在页面打开时读一次**系统时间。
+       *
+       * 用 ref 惰性初始化而不是每轮渲染重算：一旦写入就永不再采样，渲染与保存计划都只读
+       * 这个固定值。放在首次渲染而不是 mount effect 里，是为了首帧就按锁定目标渲染，
+       * 不会先闪一帧普通配置；快照此刻仍是 loading 时留到下一轮再锁，仍然只锁一次。
+       */
+      const mainPeriodRef = react.useRef(null);
+      if (mainPeriodRef.current === null) mainPeriodRef.current = mainEditingPeriodOf(settingsSnapshot.value);
+      const mainPeriod = mainPeriodRef.current;
+      // 「当前时段」只服务跨边界提示：分钟级定时器重新采样，绝不影响编辑目标。
+      const [livePeriod, setLivePeriod] = react.useState(mainPeriod);
+      // 定时器回调读**当前生效**的峰段（保存后立刻按新时段提示），不读挂载时的旧快照。
+      const peakValleyPeriodsRef = react.useRef(null);
+      peakValleyPeriodsRef.current = draft.peakValley?.periods ?? [];
+      react.useEffect(() => {
+        if (mainPeriod === null) return void 0;
+        // 除上面的锁定与这个定时器回调，渲染路径上不再有任何系统时间读取。
+        return stopPeriodSampler(startPeriodSampler(peakValleyPeriodsRef, setLivePeriod));
+      }, [mainPeriod]);
       const [dirty, setDirty] = react.useState(false);
       const [saving, setSaving] = react.useState(false);
       const [error, setError] = react.useState(null);
@@ -831,8 +1079,11 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
       // 不把“曾经编辑过”误判为仍需提交，也不影响任务管理等历史控件的保存语义。
       // 比较对象是 authorityValue：刚提交而快照滞后时，用 accepted 草稿而不是旧快照，
       // 否则保存成功后会立刻被判成"仍有未保存修改"。
+      // localDraft 来自**正在编辑的草稿**，绝不播种（seedPeakValleyPeriods 省略 = false）：
+      // 用户把峰段删到 0 条后，这一帧的重复归一不能把默认两条塞回去。
+      // 其余三处来自读取面，必须播种，否则「空时段 = 默认两条」只存在于草稿一侧。
       const localDraft = normalizeSettingsDraft(draft, roles, false);
-      const sourceDraftForDirty = normalizeSettingsDraft(authorityValue, roles, false);
+      const sourceDraftForDirty = normalizeSettingsDraft(authorityValue, roles, false, true);
       const settingsDirty = !settingsDraftEqual(localDraft, sourceDraftForDirty);
       const hasUnsavedChanges = settingsDirty || promptDirty;
       /**
@@ -849,11 +1100,11 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
        * （或上次成功保存）确实变化的字段才覆盖到最新 source，外部已改、本次未动的字段
        * 一律沿用 source。列表页保持既有整份草稿语义不变。
        */
-      const sourceDraftForSave = normalizeSettingsDraft(authorityValue, roles);
+      const sourceDraftForSave = normalizeSettingsDraft(authorityValue, roles, true, true);
       const editorEntryValue = selectedPromptRole !== null && editorBaseline?.role === selectedPromptRole
         ? editorBaseline.value
         : authorityValue;
-      const editorEntryDraft = normalizeSettingsDraft(editorEntryValue, roles, false);
+      const editorEntryDraft = normalizeSettingsDraft(editorEntryValue, roles, false, true);
       // 详情页保存用「最新 source + 本地相对编辑基线的差异」合成草稿；列表页保持整份草稿语义。
       const effectiveDraft = selectedPromptRole !== null
         ? mergeSettingsDraftOverSource(sourceDraftForSave, localDraft, editorEntryDraft)
@@ -883,7 +1134,7 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
         // 已提交但共享镜像尚未追上：accepted 草稿才是权威，绝不用旧 snapshot 覆盖它
         // （否则候选会短暂消失、通知/降级等刚保存的值也会回退）。
         if (committedSnapshotLagging) return;
-        setDraft(normalizeSettingsDraft(authorityValue, roles));
+        setDraft(normalizeSettingsDraft(authorityValue, roles, true, true));
         // 未编辑角色必须继续从 Host rolePrompts 读 effective 值；不能仅按 settings
         // snapshot 填空对象，否则无覆盖时会把默认 persona 显示成空文本。
         setPromptDrafts({});
@@ -929,7 +1180,7 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
           revision: settingsSnapshot.revision,
           projection: refreshedProjection,
         });
-        setDraft(normalizeSettingsDraft(settingsSnapshot.value, roles));
+        setDraft(normalizeSettingsDraft(settingsSnapshot.value, roles, true, true));
         setPromptDrafts({});
         setPromptTouched({});
         setDirty(false);
@@ -1112,14 +1363,15 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
         candidatesError, catalogAvailable, closePrompt, committedAuthorityRef, committedSnapshotLagging, 
         currentModelPage, directoryState, dismissLeaveDialog, draft, editDraft, editPromptText, effectiveDraft,
         error, externalSettingsChanged, hasUnsavedChanges, hostMeta, hostMetaError, leaveCancelRef,
-        leaveIntent, leaveTriggerRef, modelConfigHost, modelConfigDefaultOpen, modelFieldsChanged, modelPageCount, modelPageDeleteCancelRef,
+        leaveIntent, leaveTriggerRef, livePeriod, mainPeriod, modelConfigHost, modelConfigDefaultOpen, modelFieldsChanged, modelPageCount, modelPageDeleteCancelRef,
         modelPageDeleteIntent, modelPageLabelOf, modelRowRoles, modelTabDrag, modelTabDragRef, modelTabRefs, modelTabSuppressClickRef, notificationEventsOpen,
-        notificationEventsPanelRef, notificationEventsRootRef, notificationEventsTriggerRef, openPrompt, promptDirty, promptError,
+        notificationEventsPanelRef, notificationEventsRootRef, notificationEventsTriggerRef, openPrompt, peakValleyOpen,
+        peakValleyPages, peakValleyPeriod, peakValleyViewOf, promptDirty, promptError,
         promptLoading, promptMaxGraphemes, promptProjection, promptRoleIds, promptTextOf, promptTouchedRoles, providerGroups,
         refreshHostMeta,  roleLabelOf, roles, saved,
         saving,  selectedPromptRole, setCandidatesError, setDirty, setDraft,
         setEditorBaseline, setError, setExternalSettingsChanged, setLeaveIntent, setLocalPromptProjection, setModelPageDeleteIntent,
-        setModelTabDrag, setNotificationEventsOpen, setSelectedModelPage,
+        setModelTabDrag, setNotificationEventsOpen, setPeakValleyOpen, setPeakValleyPages, setPeakValleyPeriod, setSelectedModelPage,
         setPromptDrafts, setPromptError, setPromptTouched, setSaved, setSettingsConflict, settingsConflict,
         settingsForm, settingsReadOnly, settingsSnapshot, sourceDraftForSave, sourcePromptOverrides, t, tExtra, unifiedProvider,
         ctx, editorBaseline, setSaving,
@@ -1128,6 +1380,10 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
       // 离开确认的焦点 Hook（票据 35）：在**所有条件返回之前**无条件调用一次。
       useSettingsLeaveFocus(view);
       view.save = createSettingsSaveAction(view);
+      // 修复动作与普通保存共用同一份保存计划/提交路径；损坏态由 view.peakValleyBroken
+      // 驱动渲染（只读信号，绝不写回草稿）。
+      view.saveRepair = repairSaveActionOf(view);
+      view.peakValleyBroken = typeof authorityValue?.peakValley?.invalidCode === "string";
       return renderSettingsTail(view);
     }
 

@@ -1021,6 +1021,46 @@
   }
 
   /**
+   * 模型行的「容量字段」共享段：provider 卡片与自定义 provider 卡片此前**逐字**重复这一块。
+   *
+   * 为什么等价：两处调用点都把这一段展开在 name 之后，字段顺序（contextWindow → maxTokens）、
+   * 取值判据（只有 `typeof … === "number"` 才 formatCapacity）、空串回退与占位文案完全相同；
+   * 每次调用都新建字面量对象，因此与内联写法一样**不共享引用**（每行、每次调用各一份）。
+   */
+  function modelLimitFieldsOf(model) {
+    // 两个容量字段的取值判据完全相同（数字才格式化、其余回退空串），这里只保留一处口径。
+    const capOf = (raw) => typeof raw === "number" ? formatCapacity(raw) : "";
+    return {
+      contextWindow: { value: capOf(model.contextWindow), placeholder: "继承适配器默认" },
+      maxTokens: { value: capOf(model.maxTokens), placeholder: "继承适配器默认" },
+    };
+  }
+
+  /**
+   * 模型行的「推理档位 + 输入类型 + 展开态」共享段（与 modelLimitFieldsOf 同源去重）。
+   *
+   * 为什么等价：档位选择 / 输入类型的推导（`effortSelectionFor` / `modelInputOf`）与三个字段
+   * 的构造逐字相同；参数只是把调用点自己的 index / defaultInput / expanded 传进来，取值口径
+   * 不变。返回**新的**字面量对象（efforts / inputs 数组与每个数组项都是新建），引用语义与内联
+   * 写法一致。调用点负责把结果展开在原来的位置（provider 卡片在 reasoningDefaults 之后、自定义
+   * 卡片紧随 maxTokens），因此上层字段顺序不变。
+   */
+  function modelReasoningFieldsOf(model, index, defaultInput, expanded) {
+    const levels = effortSelectionFor(model);
+    const picked = modelInputOf(model, defaultInput);
+    return {
+      efforts: REASONING_EFFORTS.map((level) => ({ level, checked: levels[level] === true })),
+      inputs: INPUT_MODALITIES.map((modality) => ({
+        modality,
+        checked: picked.includes(modality),
+        // 至少保留一个输入类型：只剩一个已勾选项时该项不可再取消。
+        locked: picked.length === 1 && picked.includes(modality),
+      })),
+      advancedOpen: expanded.has(index),
+    };
+  }
+
+  /**
    * provider 卡片的渲染面：把"卡片看到的数据 + 可执行动作"收敛成一个可断言的对象。
    *
    * 界面按它渲染，测试按它断言，因此"模型配置区有哪些控件、哪些默认值、哪些禁用条件"
@@ -1089,33 +1129,15 @@
           .filter((choice) => typeof choice === "string" && choice.length > 0)
           .map((choice) => ({ value: choice, label: choice }))],
       },
-      models: models.map((model, index) => {
-        const selection = effortSelectionFor(model);
-        const inputSelected = modelInputOf(model, defaultInput);
-        return {
-          index,
-          position: index + 1,
-          id: { value: nameOf("id", model), editable: true },
-          name: { value: nameOf("name", model), editable: true },
-          contextWindow: {
-            value: typeof model.contextWindow === "number" ? formatCapacity(model.contextWindow) : "",
-            placeholder: "继承适配器默认",
-          },
-          maxTokens: {
-            value: typeof model.maxTokens === "number" ? formatCapacity(model.maxTokens) : "",
-            placeholder: "继承适配器默认",
-          },
-          reasoningDefaults: { value: "模型默认", editable: false },
-          efforts: REASONING_EFFORTS.map((level) => ({ level, checked: selection[level] === true })),
-          inputs: INPUT_MODALITIES.map((modality) => ({
-            modality,
-            checked: inputSelected.includes(modality),
-            // 至少保留一个输入类型：只剩一个已勾选项时该项不可再取消。
-            locked: inputSelected.length === 1 && inputSelected.includes(modality),
-          })),
-          advancedOpen: expanded.has(index),
-        };
-      }),
+      models: models.map((model, index) => ({
+        index,
+        position: index + 1,
+        id: { value: nameOf("id", model), editable: true },
+        name: { value: nameOf("name", model), editable: true },
+        ...modelLimitFieldsOf(model),
+        reasoningDefaults: { value: "模型默认", editable: false },
+        ...modelReasoningFieldsOf(model, index, defaultInput, expanded),
+      })),
       modelCatalog: {
         overridden,
         label: overridden ? "已按用户覆盖" : "适配器默认（首次编辑时写入用户覆盖）",
@@ -1336,7 +1358,6 @@
   // 导出面覆盖模型行族 + 覆盖/catalog/目录/schema 族；`modelRowOf` 只在本模块内部使用，
   // 因此不发布（原模块也从未导出它）。常量顺序沿用 client-model-config.js 的原始字面量顺序。
   global[SYMBOL] = Object.freeze({
-    SYMBOL,
     REASONING_EFFORTS,
     REASONING_EFFORT_EMPTY,
     INPUT_MODALITIES,
@@ -1366,10 +1387,8 @@
     formatCapacity,
     validateModelRows,
     normalizeModelRows,
-    modelCatalogOverridden,
     isOverridden,
     inheritedModelsOf,
-    fallbackModelsOf,
     materializeOverrideOps,
     modelCatalogOps,
     modelEditableProfileOf,
@@ -1398,6 +1417,9 @@
     providerListSections,
     apiKeyField,
     buildModelCardModel,
+    // 两张卡片共用的模型行字段段（去重时不新增依赖边：读取方 model-config 已读本检查点）。
+    modelLimitFieldsOf,
+    modelReasoningFieldsOf,
     createCardSession,
   });
 })(globalThis);

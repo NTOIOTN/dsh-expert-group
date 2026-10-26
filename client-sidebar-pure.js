@@ -53,15 +53,16 @@
     cancelled: "已取消", timed_out: "超时", interrupted: "已中断", idle: "空闲", ready: "就绪", unknown: "未知",
   });
   /**
-   * 状态筛选下拉的选项。value 必须与 model.STATUS_FILTER_GROUPS 的键一致；
-   * 渲染层不解析协议状态，只把分组键交给模型过滤器。
+   * 状态筛选下拉的选项：**恰好三项**——运行中 / 未完成 / 已完成。
+   * value 必须与 model.STATUS_FILTER_GROUPS 的（同样是三个）键一致；
+   * 渲染层不解析协议状态，只把分组键交给模型过滤器。三组对协议状态词表构成完整划分，
+   * 因此任何节点都不会在某个状态筛选下从视图里消失（失败/超时/中断/取消与证据不足的
+   * idle/ready/unknown 统一归入「未完成」）。
    */
   const STATUS_FILTER_OPTIONS = Object.freeze([
     Object.freeze({ value: "running", label: "运行中" }),
-    Object.freeze({ value: "failed", label: "失败" }),
-    Object.freeze({ value: "succeeded", label: "已完成" }),
-    Object.freeze({ value: "cancelled", label: "已取消" }),
-    Object.freeze({ value: "idle", label: "空闲" }),
+    Object.freeze({ value: "incomplete", label: "未完成" }),
+    Object.freeze({ value: "completed", label: "已完成" }),
   ]);
   // ACTIVE_STATUSES / RETRY_STATUSES 只服务于 fan-out 管理语义（取消/重试判定），不是展示状态词表。
   const ACTIVE_STATUSES = new Set(["queued", "waiting", "running"]);

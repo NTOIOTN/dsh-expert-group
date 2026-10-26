@@ -27,6 +27,7 @@ import {
   projectThrottleDiagnostics,
 } from "./runtime-diagnostics.js";
 import { AUTO_RECOVERY_LIMIT } from "../shared/recovery-ledger.js";
+import { lastOrdinaryFallbackDiagnostics } from "./route-diagnostics.js";
 
 /**
  * 创建运行时诊断投影能力面。
@@ -170,6 +171,18 @@ function describeRootTurnWaitDiagnostics(rootWait) {
 }
 
 /**
+ * provider 名的安全投影（票据 05 · F4）。
+ *
+ * provider 名是用户在设置里写的公开配置（不是会话数据），但仍做两步归一：去掉控制字符
+ * 并截断到 64 字符，保证诊断面不会被伪造的多行文本或超长配置污染。
+ */
+function diagnosticProviderName(value) {
+  if (typeof value !== "string") return null;
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]+/g, "").trim();
+  return cleaned.length === 0 ? null : cleaned.slice(0, 64);
+}
+
+/**
  * fan-out 段投影（队列/事件/停止边界/并发与限流）。
  * @param {object} diagnosticsState - describeRuntimeDiagnostics 已计算的只读局部量。
  * @returns {object} fanout 投影。
@@ -184,6 +197,7 @@ function projectFanoutDiagnostics(diagnosticsState) {
     concurrency,
     roleOverrides,
     providerOverrides,
+    providerRelease,
     stopState,
     stopAging,
   } = diagnosticsState;
@@ -275,6 +289,21 @@ function projectFanoutDiagnostics(diagnosticsState) {
       throttle: fanoutState.throttle === null || fanoutState.throttle === undefined
         ? null
         : projectThrottleDiagnostics(fanoutState.throttle),
+      /**
+       * provider 名额释放异常（票据 05 · F4）：最近一条 `PROVIDER_RELEASE_MISMATCH`。
+       *
+       * 只在「释放了一个从未计数的桶」（桶缺失或计数已为 0）时出现，回答"某次执行的名额
+       * 为什么没有归还"。字段只有稳定 code / provider 名 / 时间戳 / 释放来源，null 表示
+       * 本进程内从未发生——不记任务正文、prompt 或任何凭据。
+       */
+      providerRelease: providerRelease === null || providerRelease === undefined
+        ? null
+        : {
+          code: diagnosticToken(providerRelease.code, "unknown"),
+          provider: diagnosticProviderName(providerRelease.provider),
+          at: diagnosticTime(providerRelease.at),
+          source: diagnosticToken(providerRelease.source, "unknown"),
+        },
       // 解析来源（live / snapshot / fallback）与最近一次非法上限只保留固定
       // 枚举/类型；message 是插件内部固定文案（不含设置原文或原始返回值），
       // 经长度与控制字符归一再透出，让用户能解释"设置页=3、实际并发=20"。
@@ -284,6 +313,19 @@ function projectFanoutDiagnostics(diagnosticsState) {
         ? null
         : diagnosticToken(concurrency.invalid.valueType, "unknown"),
       invalidMessage: diagnosticMessage(concurrency?.invalid?.message),
+    },
+    /**
+     * 时段/层/跨层回退诊断（票据 06）：只投影「最近一次跨层回退」的稳定事实。
+     *
+     * 数据源是 host/route-diagnostics.js 的进程内单值——派发期「时段层缺该角色 → 直接跨层」
+     * 与运行期「时段层耗尽 → 切普通层」都会写它；本投影只读副本，不读 settings、不读时钟，
+     * 因此诊断面永远不会按当前配置推断一次历史回退。
+     *
+     * 字段只有 role / fromTier / toTier / reasonCode / at（角色与原因码都经过长度与字符面
+     * 归一），null 表示本进程从未发生；不含候选清单、prompt 或任何凭据。
+     */
+    route: {
+      lastOrdinaryFallback: lastOrdinaryFallbackDiagnostics(),
     },
   };
 }
@@ -454,6 +496,7 @@ export function createRuntimeDiagnostics({ host, settings, storage, recovery, fa
       concurrency,
       roleOverrides,
       providerOverrides,
+      providerRelease: fanoutState.providerRelease ?? null,
       stopState,
       stopAging,
       primaryPersist,

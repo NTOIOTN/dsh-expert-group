@@ -19,6 +19,7 @@ import {
   modelRouteErrorCodeOf,
   modelRouteErrorMessage,
 } from "../shared/model-route.js";
+import { fanoutTaskRouteReceiptFields } from "./route-receipt-fields.js";
 
 /**
  * 创建手动派发提交能力面。
@@ -121,6 +122,9 @@ export function createManualFanoutDispatch({ failures, routing, commands, core, 
         ...(Number.isSafeInteger(result.task?.round) ? { round: result.task.round } : {}),
         shardIds: result.shardIds,
         ...(continuation === void 0 ? {} : { continuation }),
+        // 时段/层/跨层回退（票据 06）：与 fanout 工具同一口径——只读任务里已有的一致快照；
+        // 手动派发提交时 attempt 尚未派发，因此正常情况下不会新增这些键。
+        ...fanoutTaskRouteReceiptFields(result.task, result.role),
         task: result.task,
       },
     };

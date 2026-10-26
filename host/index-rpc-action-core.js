@@ -17,7 +17,13 @@
 import { MAX_RECLAIM_BATCH } from "../fanout.js";
 import { restoreFailureRetryable } from "./expert-group-runtime.js";
 import { abortErrorFor, createAbortError, throwIfAborted } from "./rpc-request-lifecycle.js";
-import { projectInheritContextDiagnostics, projectLimitDiagnostics, projectModelPriceDiagnostics } from "./settings-read-projection.js";
+import {
+  projectInheritContextDiagnostics,
+  projectLimitDiagnostics,
+  projectModelPriceDiagnostics,
+  projectPeakValleyDiagnostics,
+} from "./settings-read-projection.js";
+import { PEAK_VALLEY_ERROR_CODES } from "./peak-valley-settings.js";
 import { decideImageRoute, imageCapability } from "../image-routing.js";
 import { roleDescriptionsOf } from "../shared/protocol.js";
 import { utf8ByteLength } from "../shared/structured.js";
@@ -211,6 +217,12 @@ export function mapRpcError(deps, error, signal) {
   }
   if (error?.name === "FanoutValidationError") {
     return { status: 400, code: typeof error.code === "string" ? error.code : "invalid-fanout", message: error.message };
+  }
+  if (typeof error?.code === "string" && PEAK_VALLEY_ERROR_CODES.includes(error.code)) {
+    // 峰谷（票据 02）：三个稳定错误码必须**原值直达**客户端，客户端据此区分
+    // 「时段非法 / profile 非法 / 状态非法」并就地提示；状态仍是 400（客户端输入问题），
+    // message 只含原因、不回显原始配置。白名单之外的一切 ValidationError 行为不变。
+    return { status: 400, code: error.code, message: error.message };
   }
   if (error instanceof ValidationError) {
     // 角色/模型目录校验失败是客户端输入问题，返回 400 而非 500。
@@ -672,6 +684,13 @@ async function handleMeta(deps, req) {
        */
       modelPrices: Array.isArray(snap.modelPrices) ? snap.modelPrices : [],
       modelPriceDiagnostics: projectModelPriceDiagnostics(snap.modelPriceDiagnostics),
+      /**
+       * 峰谷（票据 02）：只回传归一后的状态（enabled/initialized/periods/peak/valley），
+       * 启用但非法时另带 invalidCode 供设置页提示与派发路径 fail-closed。
+       * 诊断与其它读取期丢弃诊断同款：有界、只读、不是可回写配置。
+       */
+      peakValley: snap.peakValley,
+      peakValleyDiagnostics: projectPeakValleyDiagnostics(snap.peakValleyDiagnostics),
       /**
        * 用量聚合（票据 25，全局只读）：totals / byRole / byProvider / byModel /
        * recentTasks（≤16）。只由 child_models.usage 与 live 账本投影，不含
