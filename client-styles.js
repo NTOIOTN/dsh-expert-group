@@ -79,6 +79,10 @@
       // 页签行外层继续承担下边框，内层 tablist 只负责页签排列；入口按钮在同一 flex 行、
       // 但在 tablist 语义之外，靠 margin-left:auto 贴右。启用态只用主题成功色描边。
       ".deg_settings_model_tablist{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0;flex:1 1 auto}.deg_settings_peak_valley_entry{margin-left:auto;white-space:nowrap}.deg_settings_peak_valley_entry_active,.deg_expert_group_header_peak_valley:not([data-peak-valley=disabled]){border:1px solid var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}" +
+      // 峰谷子视图标题行右侧的「当前时段」徽标：与入口按钮、侧栏徽标同一主题成功色描边，
+      // 视觉上同款。.deg_prompt_footer 是 flex 行，margin-left:auto 让徽标贴到最右，
+      // 不改动标题行已有的对齐与间距。规则写在本文件里，不依赖侧栏样式是否已注入。
+      ".deg_settings_peak_valley_state{margin-left:auto;padding:1px 8px;border-radius:6px;border:1px solid var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary);font-size:12px;line-height:18px;white-space:nowrap}" +
       // ── 峰谷子视图的时段切换器与页脚（UI 精简）────────────────────────────────
       // 时段切换器（峰时/谷时）贴在页签行最右，高度与内边距刻意对齐 .deg_settings_model_tab
       // （28px / 0 10px），两者同高才不会在同一行里一高一低；它**不在** tablist 里，

@@ -300,6 +300,29 @@
   }
 
   /**
+   * 点时间输入框本身也唤出原生时间选择器（需求 2）。
+   *
+   * 宿主对 `<input type="time">` 的原生热区只覆盖钟表图案那块：点文本框其余部分只把焦点
+   * 移进去，面板不会弹出，用户因此以为"必须点小图标"才能改时间。这里在 click 时显式调用
+   * showPicker()，让输入框整块都是可点开的。
+   *
+   * 必须 try/catch，且失败一律忽略：
+   * - 点钟表图案时原生已经打开/切换了选择器，再调一次会抛 InvalidStateError；
+   * - 旧宿主没有 showPicker（或它要求更强的用户激活）同样可能抛错；
+   * - 任何一种情况都只回到原生行为（点图案仍能打开），绝不让宿主差异冒泡成页面错误。
+   * 用 onClick 而不是 onFocus + setTimeout：click 才是真实用户激活（showPicker 的准入条件），
+   * 也不会在键盘 Tab 进入输入框时抢走焦点、打断键入。
+   *
+   * @param {object} event 输入框的 click 事件（React 合成事件或 DOM 事件）。
+   */
+  function showTimePickerOf(event) {
+    const input = event?.currentTarget;
+    // disabled 的输入框本身不会派发 click；这里只防御宿主/测试替身直接调用。
+    if (input?.disabled === true || typeof input?.showPicker !== "function") return;
+    try { input.showPicker(); } catch { /* 原生选择器已打开或该宿主不允许：保持原生行为。 */ }
+  }
+
+  /**
    * 未保存修改的离开确认弹窗：保存并离开 / 放弃修改 / 取消。
    */
   function renderSettingsLeaveDialog(view, actions) {
@@ -589,7 +612,7 @@
   function renderSettingsModelTabs(view) {
     const {
       addModelPage, beginModelTabDrag, currentModelPage, draft, modelPageCount, modelPageLabelOf, modelTabDrag,
-      modelTabRefs, peakValleyEntry, requestModelPageDelete, saving, selectModelPage, setPeakValleyOpen,
+      modelTabRefs, openPeakValley, peakValleyEntry, requestModelPageDelete, saving, selectModelPage,
       settingsReadOnly, tExtra,
     } = view;
 
@@ -689,7 +712,9 @@
         "data-deg-peak-valley-entry": "true",
         "data-enabled": peakValleyEnabled ? "true" : "false",
         disabled: saving,
-        onClick: () => setPeakValleyOpen(true),
+        // 需求 3：打开动作由 view.openPeakValley 提供——每次进入都按草稿启用态与墙钟
+        // 重算默认时段（未启用 → 峰时；已启用 → 当前时段），见 main-a 的同名工厂。
+        onClick: () => openPeakValley(),
       }, tExtra("settings.pv.entry") + peakValleySuffix);
       /**
        * 时段切换器插槽（峰时 / 谷时）：只在峰谷子视图里出现，且是页签行的**最后一个**子节点。
@@ -809,6 +834,8 @@
         "aria-label": tExtra("settings.pv.start") + (index + 1),
         value: typeof entry?.start === "string" ? entry.start : "",
         disabled: saving || settingsReadOnly,
+        // 需求 2：点输入框本身也能唤出时间选择器（不只是点钟表图案），见 showTimePickerOf。
+        onClick: showTimePickerOf,
         onChange: (event) => editPeriod(index, "start", String(event?.target?.value ?? "")),
       }),
       react.createElement("span", { className: "deg_settings_label" }, tExtra("settings.pv.end")),
@@ -817,6 +844,8 @@
         "aria-label": tExtra("settings.pv.end") + (index + 1),
         value: typeof entry?.end === "string" ? entry.end : "",
         disabled: saving || settingsReadOnly,
+        // 需求 2：结束时间与开始时间同一交互（点输入框即唤出选择器）。
+        onClick: showTimePickerOf,
         onChange: (event) => editPeriod(index, "end", String(event?.target?.value ?? "")),
       }),
       react.createElement("button", {
@@ -832,6 +861,27 @@
         })),
       }, tExtra("settings.pv.remove"))));
     const enabled = state.enabled === true;
+    /**
+     * 标题行右侧的当前时段徽标（需求 1）：只在峰谷**已启用**时渲染「峰时」或「谷时」。
+     *
+     * - 未启用时整块不渲染（而不是显示「未启用」）：那样会暗示峰谷已经生效，而这一页的
+     *   启用开关就在下方，用户在标题行读到「未启用」纯属误导；
+     * - 时段来源与入口按钮同一口径：优先实时采样值 livePeriod（跨过峰谷边界随分钟级采样
+     *   更新），其次页面打开时锁定的 mainPeriod，最后才回退到在编辑的 peakValleyPeriod
+     *   （前两者都还没产生时的兜底）；都不是合法值时按峰时显示，徽标因此永远有确定文案。
+     *   注意它**不跟随**峰时/谷时切换器：徽标表达"现在真实处于哪个时段"，切换器表达
+     *   "本页正在编辑哪一套"，两者点在同一个页签行里却语义不同。
+     * - data 属性刻意用新名字 data-deg-peak-valley-state：切换器用的是
+     *   data-deg-peak-valley-period，主设置页的契约用例断言那里不得出现切换器控件，
+     *   徽标绝不能复用那个属性——它只是只读状态标记，不表达任何可切换语义。
+     */
+    const statePeriod = view.livePeriod ?? view.mainPeriod ?? view.peakValleyPeriod;
+    const stateBadge = enabled
+      ? react.createElement("span", {
+        className: "deg_settings_peak_valley_state",
+        "data-deg-peak-valley-state": statePeriod === "valley" ? "valley" : "peak",
+      }, tExtra(statePeriod === "valley" ? "settings.pv.valley" : "settings.pv.peak"))
+      : null;
     // 峰时 / 谷时切换器不再独占一行：它由 renderSettingsModelTabs 渲染在页签行最右侧
     // （见 renderPeakValleyPeriodToggle 的注释），这里只保留启用开关与时段编辑。
     return react.createElement("div", { className: "deg_settings", "data-deg-peak-valley": "true" },
@@ -845,7 +895,9 @@
           disabled: saving,
           onClick: () => setPeakValleyOpen(false),
         }, "← " + tExtra("settings.pv.back")),
-        react.createElement("h2", { className: "deg_settings_title" }, tExtra("settings.pv.entry"))),
+        react.createElement("h2", { className: "deg_settings_title" }, tExtra("settings.pv.entry")),
+        // 需求 1：标题右侧的当前时段徽标（未启用时为 null，不占位）。
+        stateBadge),
       // 只在未初始化时提示「首次启用会从普通配置复制两套模型」；已初始化后这句话不再提供
       // 任何可操作信息（客户端本就没有改回未初始化的入口），因此整段不渲染、不占位。
       state.initialized === true ? null : react.createElement("p", {

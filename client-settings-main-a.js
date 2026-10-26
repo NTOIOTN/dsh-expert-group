@@ -127,6 +127,40 @@
   }
 
   /**
+   * 「打开峰谷子视图」动作（需求 3：切换器的默认时段每次进入都重算）。
+   *
+   * 默认时段的口径：
+   * - 草稿里**未启用**峰谷 → 恒为峰时。此时峰谷并未生效，「当前时段」对用户没有意义；
+   *   固定回到峰时模型，入口的行为才是可预测的（每次进入都从同一个起点开始）；
+   * - 草稿里**已启用** → 用权威纯函数 samplePeakValleyPeriod 按此刻的本地墙钟采一次真实
+   *   时段，于是"打开页面时"看到的就是当下真正生效的那一套（谷时进谷时、峰时进峰时）。
+   *
+   * 为什么只在"打开"这一个明确动作里重算，而不监听 enabled 变化、也不挂定时器：
+   * 用户完全可能在子视图里停留很久、跨过峰谷边界并正在编辑某一套模型；若切换器跟着
+   * 时间或开关自动跳，就会把用户正在编辑的那一套换掉（编辑目标漂移）。「打开」是一次
+   * 明确的"我进来了"，此时重算既满足需求（每次进入默认落在正确时段），又不会在停留
+   * 期间打断编辑。跨边界的提示仍由 main-a 的分钟级采样负责，两者互不越界。
+   *
+   * 两个 setter 的先后顺序是刻意的：先定时段、再打开视图，子视图的第一帧就按新时段渲染，
+   * 不会先闪一帧旧时段（两者在同一批 state 更新里生效）。不传参数是刻意的——会话里
+   * 残留的时段一律不参与，默认值只由草稿与墙钟决定。
+   *
+   * @param {object} view - 设置页组件 view（提供 draft 与两个 setter）。
+   * @returns {() => void} 无参打开动作（入口按钮直接绑定它）。
+   */
+  function openPeakValleyActionOf(view) {
+    return () => {
+      const state = view.draft?.peakValley;
+      // 非法/缺失 periods 时把空数组交给纯函数：非法段按"不生效"处理，采样结果仍确定。
+      const period = state?.enabled === true
+        ? samplePeakValleyPeriod(Array.isArray(state.periods) ? state.periods : [])
+        : "peak";
+      view.setPeakValleyPeriod(period);
+      view.setPeakValleyOpen(true);
+    };
+  }
+
+  /**
    * 主设置页的编辑目标（票据 08）：**只采样一次系统时间**。
    *
    * 启用峰谷时锁定「页面第一次看到启用状态」那一刻所属的时段（peak/valley），此后整个
@@ -998,16 +1032,31 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
       const mainPeriodRef = react.useRef(null);
       if (mainPeriodRef.current === null) mainPeriodRef.current = mainEditingPeriodOf(settingsSnapshot.value);
       const mainPeriod = mainPeriodRef.current;
-      // 「当前时段」只服务跨边界提示：分钟级定时器重新采样，绝不影响编辑目标。
+      // 「当前时段」服务跨边界提示与峰谷子视图标题行的时段徽标：分钟级定时器重新采样，
+      // 绝不影响编辑目标（mainPeriod 仍然只锁一次）。
       const [livePeriod, setLivePeriod] = react.useState(mainPeriod);
       // 定时器回调读**当前生效**的峰段（保存后立刻按新时段提示），不读挂载时的旧快照。
       const peakValleyPeriodsRef = react.useRef(null);
       peakValleyPeriodsRef.current = draft.peakValley?.periods ?? [];
+      /**
+       * 草稿里峰谷是否启用：决定「当前时段」要不要采样。
+       *
+       * 与锁定用的 settingsSnapshot 不同，这里读**草稿**——用户在峰谷子视图里勾选/取消
+       * 启用时，提示与徽标必须立刻跟上，而不是等保存。
+       */
+      const peakValleyEnabledDraft = draft.peakValley?.enabled === true;
       react.useEffect(() => {
-        if (mainPeriod === null) return void 0;
-        // 除上面的锁定与这个定时器回调，渲染路径上不再有任何系统时间读取。
+        // 未启用：主设置页逐字保持普通配置，没有「当前时段」可言，也绝不读系统时间。
+        if (!peakValleyEnabledDraft) return void 0;
+        /**
+         * 页面打开时未启用、之后才勾选启用：mainPeriod 早已锁定为 null 且永不再采样，
+         * 提示/徽标因此会一直停在初始值。这里在"启用后"立刻补采一次真实时段，让当前时段
+         * 从勾选那一刻起就是对的；分钟级定时器此后只负责跨边界的推进。
+         */
+        if (mainPeriod === null) setLivePeriod(samplePeakValleyPeriod(peakValleyPeriodsRef.current));
+        // 除上面的锁定、这一次补采与定时器回调，渲染路径上不再有任何系统时间读取。
         return stopPeriodSampler(startPeriodSampler(peakValleyPeriodsRef, setLivePeriod));
-      }, [mainPeriod]);
+      }, [mainPeriod, peakValleyEnabledDraft]);
       const [dirty, setDirty] = react.useState(false);
       const [saving, setSaving] = react.useState(false);
       const [error, setError] = react.useState(null);
@@ -1377,6 +1426,8 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
         ctx, editorBaseline, setSaving,
       };
       Object.assign(view, createModelPageActions(view), createModelTabDragController(view));
+      // 入口按钮的打开动作（需求 3）：每次进入峰谷子视图都按草稿启用态与墙钟重算默认时段。
+      view.openPeakValley = openPeakValleyActionOf(view);
       // 离开确认的焦点 Hook（票据 35）：在**所有条件返回之前**无条件调用一次。
       useSettingsLeaveFocus(view);
       view.save = createSettingsSaveAction(view);

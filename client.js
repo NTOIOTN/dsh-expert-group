@@ -13277,6 +13277,7 @@ const css=".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:7
 ".deg_settings_model_tab[data-dragging=true]{opacity:.55;cursor:grabbing}.deg_settings_model_tab_remove{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:14px;line-height:1;cursor:pointer}.deg_settings_model_tab_remove:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.deg_settings_model_tab_remove:disabled{opacity:.45;cursor:not-allowed}.deg_settings_model_tab_add{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:1px dashed var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:16px;line-height:1;cursor:pointer}.deg_settings_model_tab_add:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.deg_settings_model_tab_add:disabled{opacity:.45;cursor:not-allowed}"+
 ".deg_settings_model_tab_drop{flex:0 0 2px;align-self:stretch;min-height:24px;border-radius:1px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary))}@media (max-width:520px){.deg_settings_model_tabs{gap:4px}}"+
 ".deg_settings_model_tablist{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0;flex:1 1 auto}.deg_settings_peak_valley_entry{margin-left:auto;white-space:nowrap}.deg_settings_peak_valley_entry_active,.deg_expert_group_header_peak_valley:not([data-peak-valley=disabled]){border:1px solid var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}"+
+".deg_settings_peak_valley_state{margin-left:auto;padding:1px 8px;border-radius:6px;border:1px solid var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary);font-size:12px;line-height:18px;white-space:nowrap}"+
 ".deg_settings_pv_period_toggle{display:flex;align-items:center;gap:6px;margin-left:auto;flex:0 0 auto;min-width:0}.deg_settings_pv_period_toggle .deg_btn{flex:0 0 auto;height:28px;min-height:28px;padding:0 10px;font-size:13px;line-height:20px;white-space:nowrap}"+
 ".deg_settings_peak_valley_periods,.deg_settings_peak_valley_period_list{display:flex;flex-direction:column;gap:10px;min-width:0}"+
 ".deg_settings_peak_valley_period_list .deg_btn{flex:0 0 auto;margin-left:auto}"+
@@ -15950,6 +15951,11 @@ const nextIndex=event.shiftKey
 event.preventDefault?.();
 try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
 }
+function showTimePickerOf(event){
+const input=event?.currentTarget;
+if(input?.disabled===true||typeof input?.showPicker!=="function")return;
+try{input.showPicker();}catch{/* 原生选择器已打开或该宿主不允许：保持原生行为。 */}
+}
 function renderSettingsLeaveDialog(view,actions){
 const{
 applyPromptNavigation,baselineProjection,dismissLeaveDialog,editPromptText,leaveCancelRef,leaveIntent,
@@ -16189,7 +16195,7 @@ className:"deg_settings_pv_period_toggle",
 function renderSettingsModelTabs(view){
 const{
 addModelPage,beginModelTabDrag,currentModelPage,draft,modelPageCount,modelPageLabelOf,modelTabDrag,
-modelTabRefs,peakValleyEntry,requestModelPageDelete,saving,selectModelPage,setPeakValleyOpen,
+modelTabRefs,openPeakValley,peakValleyEntry,requestModelPageDelete,saving,selectModelPage,
 settingsReadOnly,tExtra,
 }=view;
 const modelTabChildren=[];
@@ -16267,7 +16273,7 @@ className:"deg_settings_model_tab deg_settings_peak_valley_entry"+(peakValleyEna
 "data-deg-peak-valley-entry":"true",
 "data-enabled":peakValleyEnabled?"true":"false",
 disabled:saving,
-onClick:()=>setPeakValleyOpen(true),
+onClick:()=>openPeakValley(),
 },tExtra("settings.pv.entry")+peakValleySuffix);
 const periodToggleSlot=view.peakValleyOpen===true?renderPeakValleyPeriodToggle(view):null;
 const modelTabRow=react.createElement("div",{
@@ -16360,6 +16366,7 @@ type:"time",
 "aria-label":tExtra("settings.pv.start")+(index+1),
 value:typeof entry?.start==="string"?entry.start:"",
 disabled:saving||settingsReadOnly,
+onClick:showTimePickerOf,
 onChange:(event)=>editPeriod(index,"start",String(event?.target?.value??"")),
 }),
 react.createElement("span",{className:"deg_settings_label"},tExtra("settings.pv.end")),
@@ -16368,6 +16375,7 @@ type:"time",
 "aria-label":tExtra("settings.pv.end")+(index+1),
 value:typeof entry?.end==="string"?entry.end:"",
 disabled:saving||settingsReadOnly,
+onClick:showTimePickerOf,
 onChange:(event)=>editPeriod(index,"end",String(event?.target?.value??"")),
 }),
 react.createElement("button",{
@@ -16381,6 +16389,13 @@ periods:previous.periods.filter((unused,position)=>position!==index),
 })),
 },tExtra("settings.pv.remove"))));
 const enabled=state.enabled===true;
+const statePeriod=view.livePeriod??view.mainPeriod??view.peakValleyPeriod;
+const stateBadge=enabled
+?react.createElement("span",{
+className:"deg_settings_peak_valley_state",
+"data-deg-peak-valley-state":statePeriod==="valley"?"valley":"peak",
+},tExtra(statePeriod==="valley"?"settings.pv.valley":"settings.pv.peak"))
+:null;
 return react.createElement("div",{className:"deg_settings","data-deg-peak-valley":"true"},
 react.createElement("div",{className:"deg_prompt_footer"},
 react.createElement("button",{
@@ -16390,7 +16405,8 @@ className:"deg_btn deg_prompt_back",
 disabled:saving,
 onClick:()=>setPeakValleyOpen(false),
 },"← "+tExtra("settings.pv.back")),
-react.createElement("h2",{className:"deg_settings_title"},tExtra("settings.pv.entry"))),
+react.createElement("h2",{className:"deg_settings_title"},tExtra("settings.pv.entry")),
+stateBadge),
 state.initialized===true?null:react.createElement("p",{
 className:"deg_settings_hint",
 "data-deg-peak-valley-uninit":"true",
@@ -16840,6 +16856,16 @@ sub.setSelectedModelPage=(next)=>setPeakValleyPages((previous)=>({
 }));
 Object.assign(sub,createModelPageActions(sub),createModelTabDragController(sub));
 return sub;
+}
+function openPeakValleyActionOf(view){
+return()=>{
+const state=view.draft?.peakValley;
+const period=state?.enabled===true
+?samplePeakValleyPeriod(Array.isArray(state.periods)?state.periods:[])
+:"peak";
+view.setPeakValleyPeriod(period);
+view.setPeakValleyOpen(true);
+};
 }
 function mainEditingPeriodOf(value){
 const state=value?.peakValley;
@@ -17369,10 +17395,12 @@ const mainPeriod=mainPeriodRef.current;
 const[livePeriod,setLivePeriod]=react.useState(mainPeriod);
 const peakValleyPeriodsRef=react.useRef(null);
 peakValleyPeriodsRef.current=draft.peakValley?.periods??[];
+const peakValleyEnabledDraft=draft.peakValley?.enabled===true;
 react.useEffect(()=>{
-if(mainPeriod===null)return void 0;
+if(!peakValleyEnabledDraft)return void 0;
+if(mainPeriod===null)setLivePeriod(samplePeakValleyPeriod(peakValleyPeriodsRef.current));
 return stopPeriodSampler(startPeriodSampler(peakValleyPeriodsRef,setLivePeriod));
-},[mainPeriod]);
+},[mainPeriod,peakValleyEnabledDraft]);
 const[dirty,setDirty]=react.useState(false);
 const[saving,setSaving]=react.useState(false);
 const[error,setError]=react.useState(null);
@@ -17617,6 +17645,7 @@ settingsForm,settingsReadOnly,settingsSnapshot,sourceDraftForSave,sourcePromptOv
 ctx,editorBaseline,setSaving,
 };
 Object.assign(view,createModelPageActions(view),createModelTabDragController(view));
+view.openPeakValley=openPeakValleyActionOf(view);
 useSettingsLeaveFocus(view);
 view.save=createSettingsSaveAction(view);
 view.saveRepair=repairSaveActionOf(view);
