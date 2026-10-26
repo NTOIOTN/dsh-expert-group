@@ -1217,30 +1217,42 @@
   }
 
 
+  /** 「峰时 / 谷时」标签：副标题后缀与跨边界提示共用这一份口径，避免两处三目各写一遍。 */
+  function periodLabelOf(view, period) {
+    return view.tExtra(period === "peak" ? "settings.pv.peak" : "settings.pv.valley");
+  }
+
   /**
-   * 主设置页的时段状态行（票据 08）：锁定的编辑目标 + 跨边界常驻提示。
+   * 主设置页副标题里的时段后缀（票据 08）：锁定的编辑目标紧跟副标题句末、同一行显示。
    *
-   * 只读 view.mainPeriod / view.livePeriod 这两个 state，**绝不读系统时间**：跨过边界时
-   * 由分钟级定时器更新 livePeriod，这里只负责讲清「当前已进入 X，本页仍在编辑 Y」；
-   * 编辑目标与保存目标都不随之改变。
+   * 返回 null 表示当前不在峰谷时段视图（mainPeriod 为 null），此时副标题逐字保持旧行为。
+   * 只读 view.mainPeriod：编辑目标在打开页面时锁定，不随系统时间变化。
+   */
+  function mainPeriodScopeOf(view, mainPeriod) {
+    if (mainPeriod === null || mainPeriod === void 0) return null;
+    // 前缀空格是句号之后的分隔；文案本体来自 i18n 的 settings.pv.mainScope。
+    return " " + view.tExtra("settings.pv.mainScope", { period: periodLabelOf(view, mainPeriod) });
+  }
+
+  /**
+   * 主设置页的跨边界常驻提示（票据 08）：进入另一个时段时补一句「当前已进入 X，本页仍在编辑 Y」。
+   *
+   * 只读 view.livePeriod 这个 state，**绝不读系统时间**：跨过边界时由分钟级定时器更新
+   * livePeriod，这里只负责提示；编辑目标与保存目标都不随之改变。
    */
   function renderMainPeriodHint(view, mainPeriod) {
-    const { livePeriod, tExtra } = view;
+    const { livePeriod } = view;
     if (mainPeriod === null || mainPeriod === void 0) return null;
-    const labelOf = (period) => tExtra(period === "peak" ? "settings.pv.peak" : "settings.pv.valley");
-    const editing = labelOf(mainPeriod);
     // 定时器还没采样（null）时不算跨边界，避免首帧误报。
-    const crossed = livePeriod !== null && livePeriod !== void 0 && livePeriod !== mainPeriod;
-    return react.createElement(react.Fragment, null,
-      react.createElement("p", { className: "deg_settings_hint", "data-deg-main-period": mainPeriod },
-        tExtra("settings.pv.mainScope", { period: editing })),
-      crossed
-        ? react.createElement("p", {
-          className: "deg_settings_hint",
-          role: "status",
-          "data-deg-main-period-hint": "true",
-        }, tExtra("settings.pv.boundary", { current: labelOf(livePeriod), editing }))
-        : null);
+    if (livePeriod === null || livePeriod === void 0 || livePeriod === mainPeriod) return null;
+    return react.createElement("p", {
+      className: "deg_settings_hint",
+      role: "status",
+      "data-deg-main-period-hint": "true",
+    }, view.tExtra("settings.pv.boundary", {
+      current: periodLabelOf(view, livePeriod),
+      editing: periodLabelOf(view, mainPeriod),
+    }));
   }
 
   /**
@@ -1283,7 +1295,13 @@
 
     return react.createElement("div", { className: "deg_settings" },
       react.createElement("h2", { className: "deg_settings_title" }, t("settings.title")),
-      react.createElement("p", { className: "deg_settings_hint" }, t("settings.hint")),
+      // 峰谷视图里「本页正在编辑 X 模型（打开页面时锁定）」拼在副标题句末，与副标题同一行；
+      // 普通配置既不追加后缀也不渲染 data-deg-main-period，DOM 与旧行为逐字一致。
+      react.createElement("p", {
+        className: "deg_settings_hint",
+        ...(mainPeriod === null ? {} : { "data-deg-main-period": mainPeriod }),
+      }, t("settings.hint"), mainPeriodScopeOf(view, mainPeriod)),
+      // 跨边界提示保持独立一行，只在打开页面期间真的跨过时段时才出现。
       renderMainPeriodHint(view, mainPeriod),
       // 已保存峰谷配置损坏：主设置页的保存一律不携带 peakValley（Host 侧同口径拒绝），
       // 这里把"为什么保存不生效、该去哪里修"直接讲清楚。

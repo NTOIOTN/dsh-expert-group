@@ -16689,22 +16689,25 @@ roleTimeoutMs:raw===""
 );
 return managementRow;
 }
-function renderMainPeriodHint(view,mainPeriod){
-const{livePeriod,tExtra}=view;
+function periodLabelOf(view,period){
+return view.tExtra(period==="peak"?"settings.pv.peak":"settings.pv.valley");
+}
+function mainPeriodScopeOf(view,mainPeriod){
 if(mainPeriod===null||mainPeriod===void 0)return null;
-const labelOf=(period)=>tExtra(period==="peak"?"settings.pv.peak":"settings.pv.valley");
-const editing=labelOf(mainPeriod);
-const crossed=livePeriod!==null&&livePeriod!==void 0&&livePeriod!==mainPeriod;
-return react.createElement(react.Fragment,null,
-react.createElement("p",{className:"deg_settings_hint","data-deg-main-period":mainPeriod},
-tExtra("settings.pv.mainScope",{period:editing})),
-crossed
-?react.createElement("p",{
+return" "+view.tExtra("settings.pv.mainScope",{period:periodLabelOf(view,mainPeriod)});
+}
+function renderMainPeriodHint(view,mainPeriod){
+const{livePeriod}=view;
+if(mainPeriod===null||mainPeriod===void 0)return null;
+if(livePeriod===null||livePeriod===void 0||livePeriod===mainPeriod)return null;
+return react.createElement("p",{
 className:"deg_settings_hint",
 role:"status",
 "data-deg-main-period-hint":"true",
-},tExtra("settings.pv.boundary",{current:labelOf(livePeriod),editing}))
-:null);
+},view.tExtra("settings.pv.boundary",{
+current:periodLabelOf(view,livePeriod),
+editing:periodLabelOf(view,mainPeriod),
+}));
 }
 function renderSettingsBody(view,actions){
 const{
@@ -16728,7 +16731,10 @@ const modelTabRow=renderSettingsModelTabs(modelView);
 const modelPageDeleteDialog=renderSettingsModelDeleteDialog(modelView);
 return react.createElement("div",{className:"deg_settings"},
 react.createElement("h2",{className:"deg_settings_title"},t("settings.title")),
-react.createElement("p",{className:"deg_settings_hint"},t("settings.hint")),
+react.createElement("p",{
+className:"deg_settings_hint",
+...(mainPeriod===null?{}:{"data-deg-main-period":mainPeriod}),
+},t("settings.hint"),mainPeriodScopeOf(view,mainPeriod)),
 renderMainPeriodHint(view,mainPeriod),
 view.peakValleyBroken
 ?react.createElement("p",{className:"deg_settings_error"},view.tExtra("settings.pv.broken"))
