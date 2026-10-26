@@ -452,6 +452,67 @@
     });
   }
 
+  /**
+   * 「恢复默认」的唯一实现：清除本会话**全部角色**覆盖并立即保存（不是把当前值写成覆盖）。
+   *
+   * 为什么必须串行：session-override-clear 一次只处理一个角色，每次写入都推进代次，
+   * 因此每个请求的 expectedRevision 只能用上一次响应的 revision（首个用当前投影的代次）。
+   * 任何一次冲突/失败都立刻停止后续请求：剩余角色仍保持原覆盖，绝不半途改成另一种口径。
+   * 全部成功才清空草稿——宿主侧已无覆盖，草稿既没有基线也没有可提交的差异。
+   *
+   * surface 闸门与批量保存一致：旧 surface 的迟到回执只丢弃本地写入，
+   * 宿主写入仍按 CAS 落库，重新打开时以权威读取为准。
+   * 放在模块级而不是 Hook 内：Hook 已贴近「单函数 ≤200 行」门禁，40 多行异步流程
+   * 留在这里既不影响 Hook 的调用顺序，也不改变任何语义。
+   */
+  async function restoreSessionModelDefaultsOf(deps) {
+    const {
+      applySessionModelView, config, contextRef, metaStateRef, rootSessionId, sessionModelState,
+      sessionModelWriteReady, setSessionModelDrafts, setSessionModelNotice, setSessionModelSaving,
+      settleSessionModelFailure, sidebarSurfaceStillCurrent, t,
+    } = deps;
+    if (sessionModelWriteReady() !== true) return;
+    const rolesToClear = Object.keys(object(sessionModelState.overrides));
+    if (rolesToClear.length === 0) {
+      // 没有可清除的覆盖：不产生任何写入，只把本地草稿收敛回空（按钮此时本身也是禁用的）。
+      setSessionModelDrafts({});
+      return;
+    }
+    const targetSessionId = rootSessionId;
+    const roles = sessionModelRolesOf(metaStateRef.current);
+    setSessionModelSaving(true);
+    setSessionModelNotice(null);
+    let revision = sessionModelState.revision;
+    try {
+      for (const role of rolesToClear) {
+        const body = await callRpc(
+          config,
+          contextRef.current,
+          { action: "session-override-clear", sessionId: targetSessionId, role, expectedRevision: revision },
+          {},
+          (value) => object(value),
+        );
+        if (sidebarSurfaceStillCurrent() !== true) return;
+        const view = normalizeSessionModelView(body, roles);
+        if (view === null) {
+          setSessionModelNotice({ kind: "error", role, text: t("sidebar.sessionModel.unavailable") });
+          return;
+        }
+        revision = view.revision;
+        applySessionModelView(view, role);
+      }
+      if (sidebarSurfaceStillCurrent() !== true) return;
+      setSessionModelDrafts({});
+      setSessionModelNotice({ kind: "cleared", revision });
+    } catch (error) {
+      // 失败/冲突回执走的仍是保存那条收口：只提示、推进基线、绝不清空用户输入。
+      if (sidebarSurfaceStillCurrent() !== true) return;
+      settleSessionModelFailure(error, null);
+    } finally {
+      if (sidebarSurfaceStillCurrent() === true) setSessionModelSaving(false);
+    }
+  }
+
   /** 会话模型草稿 / 提交 / 清除与 surface 身份令牌。 */
   function useSidebarPanelSessionModel(frame) {
     const {
@@ -630,9 +691,20 @@
       }
     };
 
+    /**
+     * 底部「恢复默认」：清除本会话全部角色覆盖并立即保存。
+     * 语义（串行 CAS、surface 闸门、失败收口）全在模块级 restoreSessionModelDefaultsOf，
+     * 本闭包只交出本帧的读写面，避免把 50 多行异步流程塞进本 Hook 撞函数行数门禁。
+     */
+    const restoreSessionModelDefaults = () => restoreSessionModelDefaultsOf({
+      applySessionModelView, config, contextRef, metaStateRef, rootSessionId, sessionModelState,
+      sessionModelWriteReady, setSessionModelDrafts, setSessionModelNotice, setSessionModelSaving,
+      settleSessionModelFailure, sidebarSurfaceStillCurrent, t,
+    });
+
     Object.assign(frame, {
-      clearSessionModelRole, commitSessionModelChanges, sessionModelBaselineOf, sessionModelHasInvalidDraft, sessionModelPendingChanges,
-      updateSessionModelDraft,
+      clearSessionModelRole, commitSessionModelChanges, restoreSessionModelDefaults, sessionModelBaselineOf,
+      sessionModelHasInvalidDraft, sessionModelPendingChanges, updateSessionModelDraft,
     });
   }
 

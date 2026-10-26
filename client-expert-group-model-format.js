@@ -141,14 +141,16 @@ const MESSAGE_CATALOG = Object.freeze({
   "sidebar.sessionModel.open": { zh: "会话模型", en: "Session models" },
   "sidebar.sessionModel.title": { zh: "会话模型", en: "Session models" },
   "sidebar.sessionModel.hint": {
-    zh: "只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
-    en: "Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the global default again.",
+    zh: "只影响本会话的专家派发，不改变全局默认；清除后恢复跟随当前默认。",
+    en: "Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the current default again.",
   },
   "sidebar.sessionModel.openTitle": {
     zh: "按会话修改专家模型，不影响全局默认",
     en: "Change expert models for this session; global defaults are unchanged",
   },
-  "sidebar.sessionModel.close": { zh: "关闭会话模型", en: "Close session models" },
+  "sidebar.sessionModel.close": { zh: "关闭", en: "Close" },
+  // 底部「恢复默认」：清除本会话全部角色覆盖（不是把当前值写成覆盖），左邻「关闭」。
+  "sidebar.sessionModel.restore": { zh: "恢复默认", en: "Restore defaults" },
   "sidebar.sessionModel.noSession": {
     zh: "未打开会话：打开一个会话后可在此临时覆盖角色模型。",
     en: "No open session: open a session to temporarily override role models here.",

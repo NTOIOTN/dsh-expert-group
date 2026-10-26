@@ -25,6 +25,7 @@
  */
 import {
   normalizePeakValleyPeriods,
+  peakValleyAtDate,
   PEAK_VALLEY_PERIODS_INVALID,
 } from "../shared/peak-valley-time.js";
 import {
@@ -396,6 +397,39 @@ export function normalizePeakValleyForRead(value) {
     }
   }
   return { state, diagnostics, invalidCode };
+}
+
+/** 普通记录判定：null / 数组 / 非对象一律 false（读面只需「能安全展开」这一条判据）。 */
+function isPlainRecordOf(value) {
+  return value !== null && typeof value === "object" && Array.isArray(value) !== true;
+}
+
+/**
+ * 「会话模型」弹窗读面的角色默认：返回**当前生效**的逐角色默认（普通层 + 时段层合并）。
+ *
+ * 与派发路径的跨层回退同口径（见 host/peak-valley-route.js 的 resolvePeakValleyRoute）：
+ * 峰谷启用且合法时，时段层（peakValley[period].defaults）里有的角色用时段层，
+ * 缺的角色回退普通层 defaults —— 因此这里必须**逐角色合并**，不能二选一，
+ * 否则弹窗会显示一个派发时根本不会用的默认。
+ *
+ * 边界：读面永不抛错。配置损坏（invalidCode 非空）、未启用、结构不是对象时直接返回普通层；
+ * 派发侧仍由 resolvePeakValleyRoute 对同一 invalidCode fail-closed，两处职责不重叠。
+ *
+ * 放在本模块而不是 meta handler 内：时段判定与「当前生效」的归一口径归峰谷模块所有；
+ * meta handler 所在文件已贴「本地 import ≤12」门禁，无法再新增一条 shared 依赖。
+ *
+ * @param {object} snap - 设置快照（只需要 defaults 与 peakValley 两个字段）。
+ * @returns {Record<string, object>} 角色 → 当前生效的模型选择。
+ */
+export function effectiveRoleDefaultsOf(snap) {
+  const defaults = isPlainRecordOf(snap?.defaults) ? snap.defaults : {};
+  const pv = snap?.peakValley;
+  if (!isPlainRecordOf(pv) || pv.enabled !== true) return defaults;
+  if (typeof pv.invalidCode === "string" && pv.invalidCode.length > 0) return defaults;
+  const period = peakValleyAtDate(pv.periods, new Date());
+  const profileDefaults = isPlainRecordOf(pv[period]?.defaults) ? pv[period].defaults : null;
+  if (profileDefaults === null) return defaults;
+  return { ...defaults, ...profileDefaults };
 }
 
 /** 稳定错误码对应的用户可读文案（只写原因，不回显原始值）。 */

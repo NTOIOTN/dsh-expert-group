@@ -668,14 +668,15 @@ const MESSAGE_CATALOG=Object.freeze({
 "sidebar.sessionModel.open":{zh:"会话模型",en:"Session models"},
 "sidebar.sessionModel.title":{zh:"会话模型",en:"Session models"},
 "sidebar.sessionModel.hint":{
-zh:"只影响本会话的专家派发，不改变全局默认；清除后恢复跟随全局默认。",
-en:"Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the global default again.",
+zh:"只影响本会话的专家派发，不改变全局默认；清除后恢复跟随当前默认。",
+en:"Affects expert dispatch in this session only; global defaults are unchanged. Clear an override to follow the current default again.",
 },
 "sidebar.sessionModel.openTitle":{
 zh:"按会话修改专家模型，不影响全局默认",
 en:"Change expert models for this session; global defaults are unchanged",
 },
-"sidebar.sessionModel.close":{zh:"关闭会话模型",en:"Close session models"},
+"sidebar.sessionModel.close":{zh:"关闭",en:"Close"},
+"sidebar.sessionModel.restore":{zh:"恢复默认",en:"Restore defaults"},
 "sidebar.sessionModel.noSession":{
 zh:"未打开会话：打开一个会话后可在此临时覆盖角色模型。",
 en:"No open session: open a session to temporarily override role models here.",
@@ -2750,7 +2751,8 @@ const PANEL_CSS_SESSION_MODEL=[
 ".deg_expert_group_session_model_dialog[open]{display:flex;flex-direction:column}",
 ".deg_expert_group_session_model_dialog::backdrop{background:rgba(0,0,0,.42)}",
 ".deg_expert_group_session_model_header{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:0 0 auto;padding:12px 14px 6px;font-weight:600}",
-".deg_expert_group_session_model_title{flex:1 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;font-weight:600}",
+".deg_expert_group_session_model_heading{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;overflow:hidden}",
+".deg_expert_group_session_model_title{flex:0 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 ".deg_expert_group_session_model_body{flex:1 1 auto;min-height:0;overflow:auto;padding:0 14px 8px}",
 ".deg_expert_group_session_model_hint{margin:0 0 8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}",
 ".deg_expert_group_session_model_notice{margin:0 0 8px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
@@ -2774,7 +2776,10 @@ const PANEL_CSS_SESSION_MODEL=[
 ".deg_expert_group_session_model_invalid{flex:1 1 160px;min-width:0;color:var(--dsw-alias-label-error,var(--dsw-alias-state-error-primary,#f87171));font-size:12px;line-height:18px;overflow-wrap:anywhere}",
 ".deg_expert_group_session_model_spacer{flex:1 1 auto}",
 ".deg_expert_group_session_model_primary{box-sizing:border-box;height:28px;padding:0 12px;border:1px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-radius:6px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));color:var(--dsw-alias-bg-layer-1,#fff);font:inherit;font-size:12px;font-weight:600;cursor:pointer}",
-".deg_expert_group_session_model_primary:disabled{opacity:.45;cursor:not-allowed}",
+".deg_expert_group_session_model_primary:disabled,.deg_expert_group_session_model_secondary:disabled{opacity:.45;cursor:not-allowed}",
+".deg_expert_group_session_model_secondary{box-sizing:border-box;height:28px;padding:0 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}",
+".deg_expert_group_session_model_secondary:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+".deg_expert_group_session_model_secondary:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
 ].join("");
 const PANEL_CSS_TIMELINE=[
 ".deg_expert_group_attempt_index{flex:0 0 auto;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-variant-numeric:tabular-nums}",
@@ -5473,8 +5478,8 @@ onChange:(event)=>updateSessionModelDraft(role,"reasoningEffort",event?.target?.
 ]));
 };
 const renderSessionModelFooter=(ctx,options)=>{
-const{react,t,sessionModelState,commitSessionModelChanges}=ctx;
-const{canSave,invalidDraft,closeDialog}=options;
+const{react,t,sessionModelState,commitSessionModelChanges,restoreSessionModelDefaults}=ctx;
+const{canSave,canRestore,invalidDraft,closeDialog}=options;
 const footer=react.createElement("footer",{
 key:"footer",
 className:"deg_expert_group_session_model_footer",
@@ -5494,9 +5499,22 @@ role:"status",
 :null,
 react.createElement("span",{key:"spacer",className:"deg_expert_group_session_model_spacer"}),
 react.createElement("button",{
+key:"restore",
+type:"button",
+className:"deg_expert_group_session_model_secondary",
+"data-deg-session-model-restore":"true",
+"aria-label":t("sidebar.sessionModel.restore"),
+disabled:canRestore!==true,
+onClick:(event)=>{
+event?.preventDefault?.();
+event?.stopPropagation?.();
+void restoreSessionModelDefaults();
+},
+},t("sidebar.sessionModel.restore")),
+react.createElement("button",{
 key:"close",
 type:"button",
-className:"deg_expert_group_export_button",
+className:"deg_expert_group_session_model_secondary",
 "data-deg-session-model-close":"footer",
 onClick:closeDialog,
 },t("sidebar.sessionModel.close")),
@@ -5549,6 +5567,7 @@ const noticeError=sessionModelNotice?.kind==="error"||sessionModelNotice?.kind==
 const changes=status==="ready"?sessionModelPendingChanges():[];
 const invalidDraft=status==="ready"&&sessionModelHasInvalidDraft();
 const canSave=writable===true&&changes.length>0&&invalidDraft!==true;
+const canRestore=writable===true&&Object.keys(sessionModelState.overrides).length>0;
 const closeDialog=(event)=>{
 event?.preventDefault?.();
 event?.stopPropagation?.();
@@ -5638,7 +5657,14 @@ role:"table",
 className:"deg_expert_group_session_model_table",
 },[headRow,...rows])));
 }
-const footer=renderSessionModelFooter(ctx,{canSave,invalidDraft,closeDialog});
+const footer=renderSessionModelFooter(ctx,{canSave,canRestore,invalidDraft,closeDialog});
+const peakValleyMarker=typeof ctx.getPeakValleyMarker==="function"?ctx.getPeakValleyMarker():null;
+const peakValleyLabel=typeof ctx.peakValleyLabelOf==="function"?ctx.peakValleyLabelOf(peakValleyMarker):null;
+const peakValleyBadge=peakValleyLabel===null?null:react.createElement("span",{
+key:"peakValley",
+className:"deg_expert_group_header_peak_valley",
+"data-peak-valley":peakValleyMarker?.period==="peak"?"peak":"valley",
+},peakValleyLabel);
 return react.createElement("dialog",{
 id:"deg-session-model-dialog",
 className:"deg_expert_group_session_model_dialog",
@@ -5656,10 +5682,14 @@ closeSessionModelDialog();
 },
 },
 react.createElement("header",{className:"deg_expert_group_session_model_header"},
+react.createElement("div",{className:"deg_expert_group_session_model_heading"},[
 react.createElement("h2",{
+key:"title",
 id:"deg-session-model-title",
 className:"deg_expert_group_session_model_title",
 },t("sidebar.sessionModel.title")),
+peakValleyBadge,
+]),
 react.createElement("button",{
 type:"button",
 className:"deg_expert_group_export_button",
@@ -8547,6 +8577,51 @@ contextRef,currentRootRef,currentSidebarSessionRef,loadMeta,metaAutoAttemptRef,
 metaRefreshRef,mountedRef,requestSequenceRef,store,
 });
 }
+async function restoreSessionModelDefaultsOf(deps){
+const{
+applySessionModelView,config,contextRef,metaStateRef,rootSessionId,sessionModelState,
+sessionModelWriteReady,setSessionModelDrafts,setSessionModelNotice,setSessionModelSaving,
+settleSessionModelFailure,sidebarSurfaceStillCurrent,t,
+}=deps;
+if(sessionModelWriteReady()!==true)return;
+const rolesToClear=Object.keys(object(sessionModelState.overrides));
+if(rolesToClear.length===0){
+setSessionModelDrafts({});
+return;
+}
+const targetSessionId=rootSessionId;
+const roles=sessionModelRolesOf(metaStateRef.current);
+setSessionModelSaving(true);
+setSessionModelNotice(null);
+let revision=sessionModelState.revision;
+try{
+for(const role of rolesToClear){
+const body=await callRpc(
+config,
+contextRef.current,
+{action:"session-override-clear",sessionId:targetSessionId,role,expectedRevision:revision},
+{},
+(value)=>object(value),
+);
+if(sidebarSurfaceStillCurrent()!==true)return;
+const view=normalizeSessionModelView(body,roles);
+if(view===null){
+setSessionModelNotice({kind:"error",role,text:t("sidebar.sessionModel.unavailable")});
+return;
+}
+revision=view.revision;
+applySessionModelView(view,role);
+}
+if(sidebarSurfaceStillCurrent()!==true)return;
+setSessionModelDrafts({});
+setSessionModelNotice({kind:"cleared",revision});
+}catch(error){
+if(sidebarSurfaceStillCurrent()!==true)return;
+settleSessionModelFailure(error,null);
+}finally{
+if(sidebarSurfaceStillCurrent()===true)setSessionModelSaving(false);
+}
+}
 function useSidebarPanelSessionModel(frame){
 const{
 config,contextRef,metaStateRef,mountedRef,rootSessionId,sessionModelCatalog,
@@ -8683,9 +8758,14 @@ settleSessionModelFailure(error,role);
 if(sidebarSurfaceStillCurrent()===true)setSessionModelSaving(false);
 }
 };
+const restoreSessionModelDefaults=()=>restoreSessionModelDefaultsOf({
+applySessionModelView,config,contextRef,metaStateRef,rootSessionId,sessionModelState,
+sessionModelWriteReady,setSessionModelDrafts,setSessionModelNotice,setSessionModelSaving,
+settleSessionModelFailure,sidebarSurfaceStillCurrent,t,
+});
 Object.assign(frame,{
-clearSessionModelRole,commitSessionModelChanges,sessionModelBaselineOf,sessionModelHasInvalidDraft,sessionModelPendingChanges,
-updateSessionModelDraft,
+clearSessionModelRole,commitSessionModelChanges,restoreSessionModelDefaults,sessionModelBaselineOf,
+sessionModelHasInvalidDraft,sessionModelPendingChanges,updateSessionModelDraft,
 });
 }
 function useSidebarPanelSessionModelPart2(frame){
@@ -11129,12 +11209,18 @@ openSidebarResource,
 });
 return frame;
 }
+function peakValleyLabelTextOf(config,panelLocale,marker){
+const extra=config?.settingsExtraText;
+if(typeof extra!=="function"||marker?.enabled!==true)return null;
+return extra(panelLocale,"settings.pv.entry")+" "+extra(panelLocale,
+marker.period==="peak"?"settings.pv.peak":"settings.pv.valley");
+}
 function useSidebarPanelViews(frame){
 const{
 bump,catalogEntryOf,clearSessionModelRole,closeSidebarResource,commitSessionModelChanges,config,
 expand,handleOpen,handleSidebarAction,handleSidebarBatchClose,meta,model,
 navigation,neutralRuntimeStatus,openSidebarResource,partialSnapshot,primitives,react,
-readActiveSidebarResource,rootSessionId,sessionId,sessionModelCatalog,sessionModelDialogRef,sessionModelDrafts,
+readActiveSidebarResource,restoreSessionModelDefaults,rootSessionId,sessionId,sessionModelCatalog,sessionModelDialogRef,sessionModelDrafts,
 sessionModelHasInvalidDraft,sessionModelNotice,sessionModelOpen,sessionModelPendingChanges,sessionModelSaving,sessionModelState,
 sessionsSnapshot,sidebarBatchPendingRef,sidebarBatchScopeKey,sidebarBatchStateFor,sidebarOpenTabsAvailable,sidebarSessionId,
 sidebarTabRecordsRef,snapshot,subagentAddressOfChild,t,timelineExpandedRef,toggle,
@@ -11158,6 +11244,8 @@ const isBatchPending=()=>sidebarBatchPendingRef.current.has(
 sidebarBatchScopeKey(sidebarSessionId,rootSessionId),
 )===true;
 const isTabOpen=(key)=>sidebarTabRecordsRef.current.get(key)!==undefined;
+const getPeakValleyMarker=()=>frame.peakValleyMarker??null;
+const peakValleyLabelOf=(marker)=>peakValleyLabelTextOf(config,frame.panelLocale,marker);
 const viewCtx={
 react,primitives,t,model,meta,snapshot,sessionsSnapshot,config,
 sessionId,sidebarSessionId,rootSessionId,catalogEntryOf,
@@ -11168,7 +11256,8 @@ isBatchPending,isTabOpen,isTimelineExpanded,toggleTimelineExpanded,
 partialSnapshot,neutralRuntimeStatus,
 sessionModelOpen,sessionModelState,sessionModelCatalog,sessionModelSaving,sessionModelNotice,
 sessionModelDrafts,sessionModelHasInvalidDraft,sessionModelPendingChanges,sessionModelDialogRef,
-updateSessionModelDraft,clearSessionModelRole,commitSessionModelChanges,
+updateSessionModelDraft,clearSessionModelRole,commitSessionModelChanges,restoreSessionModelDefaults,
+getPeakValleyMarker,peakValleyLabelOf,
 };
 const viewsA=VIEWS_A.createSidebarViewsA(viewCtx);
 const{renderChevron,renderSidebarBatchSlot}=viewsA;
@@ -11369,14 +11458,12 @@ title:refreshLabel,
 "aria-label":refreshLabel,
 onClick:retry,
 },makeIcon(primitives,"IconRefreshOutlineRegular",{size:14}));
-const peakValleyExtra=config?.settingsExtraText;
 const peakValleyOn=peakValleyMarker?.enabled===true;
-const peakValleyText=typeof peakValleyExtra==="function"
-?(peakValleyOn
-?peakValleyExtra(panelLocale,"settings.pv.entry")+" "+peakValleyExtra(panelLocale,
-peakValleyMarker.period==="peak"?"settings.pv.peak":"settings.pv.valley")
-:peakValleyExtra(panelLocale,"settings.pv.disabled"))
-:null;
+const enabledLabel=peakValleyLabelTextOf(config,panelLocale,peakValleyMarker);
+const peakValleyExtra=config?.settingsExtraText;
+const peakValleyText=enabledLabel!==null
+?enabledLabel
+:typeof peakValleyExtra==="function"?peakValleyExtra(panelLocale,"settings.pv.disabled"):null;
 return react.createElement("section",{className:"deg_expert_group","data-version":version,"aria-label":"Expert Group"},
 widthResizer,
 react.createElement("div",{

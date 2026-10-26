@@ -496,10 +496,10 @@
     ]));
   };
 
-  /** 弹窗底部：revision、草稿校验提示、关闭与整批保存。 */
+  /** 弹窗底部：revision、草稿校验提示、恢复默认、关闭与整批保存。 */
   const renderSessionModelFooter = (ctx, options) => {
-    const { react, t, sessionModelState, commitSessionModelChanges } = ctx;
-    const { canSave, invalidDraft, closeDialog } = options;
+    const { react, t, sessionModelState, commitSessionModelChanges, restoreSessionModelDefaults } = ctx;
+    const { canSave, canRestore, invalidDraft, closeDialog } = options;
     const footer = react.createElement("footer", {
       key: "footer",
       className: "deg_expert_group_session_model_footer",
@@ -518,10 +518,26 @@
         }, t("sidebar.sessionModel.invalidDraft"))
         : null,
       react.createElement("span", { key: "spacer", className: "deg_expert_group_session_model_spacer" }),
+      // 「恢复默认」：清除本会话全部角色覆盖并立即保存（不是把当前值写成覆盖）。
+      // 没有可清除的覆盖、会话不可写或在途保存时禁用，避免一个点了没有任何效果的按钮。
+      react.createElement("button", {
+        key: "restore",
+        type: "button",
+        className: "deg_expert_group_session_model_secondary",
+        "data-deg-session-model-restore": "true",
+        "aria-label": t("sidebar.sessionModel.restore"),
+        disabled: canRestore !== true,
+        onClick: (event) => {
+          event?.preventDefault?.();
+          event?.stopPropagation?.();
+          void restoreSessionModelDefaults();
+        },
+      }, t("sidebar.sessionModel.restore")),
+      // 底部「关闭」与「保存」同高（secondary 28px）；标题栏的「×」仍用工具条小按钮样式。
       react.createElement("button", {
         key: "close",
         type: "button",
-        className: "deg_expert_group_export_button",
+        className: "deg_expert_group_session_model_secondary",
         "data-deg-session-model-close": "footer",
         onClick: closeDialog,
       }, t("sidebar.sessionModel.close")),
@@ -579,6 +595,8 @@
     const changes = status === "ready" ? sessionModelPendingChanges() : [];
     const invalidDraft = status === "ready" && sessionModelHasInvalidDraft();
     const canSave = writable === true && changes.length > 0 && invalidDraft !== true;
+    // 「恢复默认」的可点条件：可写 + 至少还有一个角色带着本会话覆盖（否则没有可清除的东西）。
+    const canRestore = writable === true && Object.keys(sessionModelState.overrides).length > 0;
     const closeDialog = (event) => {
       event?.preventDefault?.();
       event?.stopPropagation?.();
@@ -669,7 +687,20 @@
         className: "deg_expert_group_session_model_table",
       }, [headRow, ...rows])));
     }
-    const footer = renderSessionModelFooter(ctx, { canSave, invalidDraft, closeDialog });
+    const footer = renderSessionModelFooter(ctx, { canSave, canRestore, invalidDraft, closeDialog });
+    /**
+     * 标题右侧的峰谷时段徽标（复用侧栏标题栏同款 class 与配色）：只在峰谷启用时渲染。
+     *
+     * 读面缺失（旧宿主 / 直接 createSidebarViewsC）时两个入口都不存在，徽标不渲染，
+     * 弹窗 DOM 逐字保持旧形状。marker 由 Panel 的 useState 持有，这里只在渲染期纯读。
+     */
+    const peakValleyMarker = typeof ctx.getPeakValleyMarker === "function" ? ctx.getPeakValleyMarker() : null;
+    const peakValleyLabel = typeof ctx.peakValleyLabelOf === "function" ? ctx.peakValleyLabelOf(peakValleyMarker) : null;
+    const peakValleyBadge = peakValleyLabel === null ? null : react.createElement("span", {
+      key: "peakValley",
+      className: "deg_expert_group_header_peak_valley",
+      "data-peak-valley": peakValleyMarker?.period === "peak" ? "peak" : "valley",
+    }, peakValleyLabel);
     return react.createElement("dialog", {
       id: "deg-session-model-dialog",
       className: "deg_expert_group_session_model_dialog",
@@ -690,10 +721,15 @@
       },
     },
       react.createElement("header", { className: "deg_expert_group_session_model_header" },
-        react.createElement("h2", {
-          id: "deg-session-model-title",
-          className: "deg_expert_group_session_model_title",
-        }, t("sidebar.sessionModel.title")),
+        // 标题与峰谷徽标同在一个左组里：徽标紧跟标题文字，关闭按钮仍贴右端。
+        react.createElement("div", { className: "deg_expert_group_session_model_heading" }, [
+          react.createElement("h2", {
+            key: "title",
+            id: "deg-session-model-title",
+            className: "deg_expert_group_session_model_title",
+          }, t("sidebar.sessionModel.title")),
+          peakValleyBadge,
+        ]),
         react.createElement("button", {
           type: "button",
           className: "deg_expert_group_export_button",

@@ -365,12 +365,26 @@
 
 
 
+  /**
+   * 峰谷启用态的徽标文案（侧栏标题栏与「会话模型」弹窗共用**同一份**拼装逻辑）。
+   *
+   * 文案只来自既有 settings/extra 表：settings.pv.entry + 空格 + settings.pv.peak/valley，
+   * 与设置页「峰谷模式」入口按钮同形同源；未启用或读面缺失返回 null，调用方自行决定
+   * 是否回退到 settings.pv.disabled（标题栏）或干脆不渲染（弹窗）。
+   */
+  function peakValleyLabelTextOf(config, panelLocale, marker) {
+    const extra = config?.settingsExtraText;
+    if (typeof extra !== "function" || marker?.enabled !== true) return null;
+    return extra(panelLocale, "settings.pv.entry") + " " + extra(panelLocale,
+      marker.period === "peak" ? "settings.pv.peak" : "settings.pv.valley");
+  }
+
   function useSidebarPanelViews(frame) {
     const {
       bump, catalogEntryOf, clearSessionModelRole, closeSidebarResource, commitSessionModelChanges, config,
       expand, handleOpen, handleSidebarAction, handleSidebarBatchClose, meta, model,
       navigation, neutralRuntimeStatus, openSidebarResource, partialSnapshot, primitives, react,
-      readActiveSidebarResource, rootSessionId, sessionId, sessionModelCatalog, sessionModelDialogRef, sessionModelDrafts,
+      readActiveSidebarResource, restoreSessionModelDefaults, rootSessionId, sessionId, sessionModelCatalog, sessionModelDialogRef, sessionModelDrafts,
       sessionModelHasInvalidDraft, sessionModelNotice, sessionModelOpen, sessionModelPendingChanges, sessionModelSaving, sessionModelState,
       sessionsSnapshot, sidebarBatchPendingRef, sidebarBatchScopeKey, sidebarBatchStateFor, sidebarOpenTabsAvailable, sidebarSessionId,
       sidebarTabRecordsRef, snapshot, subagentAddressOfChild, t, timelineExpandedRef, toggle,
@@ -410,6 +424,16 @@
     /** 右栏 tab 记录的只读投影（可写 Map 归 Panel）。 */
     const isTabOpen = (key) => sidebarTabRecordsRef.current.get(key) !== undefined;
     /**
+     * 峰谷读面的惰性入口（票据 09 / 会话模型弹窗标题徽标）。
+     *
+     * 本 Hook 排在 useSidebarPanelPeakValleyMarker **之前**（Hook 顺序锁定，不得调整），
+     * 那时 frame.peakValleyMarker 还没写入。因此这里只交出「调用时现读 frame」的薄闭包：
+     * 视图层真正渲染弹窗时（renderSidebarPanelSection 里）标记已经就位。
+     */
+    const getPeakValleyMarker = () => frame.peakValleyMarker ?? null;
+    /** 启用态徽标文案（未启用返回 null）；拼装逻辑与标题栏共用 peakValleyLabelTextOf。 */
+    const peakValleyLabelOf = (marker) => peakValleyLabelTextOf(config, frame.panelLocale, marker);
+    /**
      * 视图上下文（第一、二组）：本帧只读投影 + 窄命令。
      *
      * 每次渲染重建一份并交给 createSidebarViewsA/B；它们返回的渲染函数与拆分前 Panel 内的
@@ -425,7 +449,8 @@
       partialSnapshot, neutralRuntimeStatus,
       sessionModelOpen, sessionModelState, sessionModelCatalog, sessionModelSaving, sessionModelNotice,
       sessionModelDrafts, sessionModelHasInvalidDraft, sessionModelPendingChanges, sessionModelDialogRef,
-      updateSessionModelDraft, clearSessionModelRole, commitSessionModelChanges,
+      updateSessionModelDraft, clearSessionModelRole, commitSessionModelChanges, restoreSessionModelDefaults,
+      getPeakValleyMarker, peakValleyLabelOf,
     };
     const viewsA = VIEWS_A.createSidebarViewsA(viewCtx);
     const { renderChevron, renderSidebarBatchSlot } = viewsA;
@@ -746,15 +771,14 @@
      * 读面缺失（旧宿主 / 直接 createExpertGroupPanel）时不渲染：标题栏逐字节保持旧形状。
      * 标记只出现在头部，不进入任务行与运行摘要。
      */
-    const peakValleyExtra = config?.settingsExtraText;
     const peakValleyOn = peakValleyMarker?.enabled === true;
-    const peakValleyText = typeof peakValleyExtra === "function"
-      ? (peakValleyOn
-        // 启用态与设置页入口按钮同一文案形状：「峰谷模式 峰时 / 谷时」，两处同键同源。
-        ? peakValleyExtra(panelLocale, "settings.pv.entry") + " " + peakValleyExtra(panelLocale,
-          peakValleyMarker.period === "peak" ? "settings.pv.peak" : "settings.pv.valley")
-        : peakValleyExtra(panelLocale, "settings.pv.disabled"))
-      : null;
+    // 启用态复用 peakValleyLabelTextOf（与「会话模型」弹窗标题徽标同一份拼装）；
+    // 未启用仍显示 settings.pv.disabled，读面缺失仍整体不渲染——行为逐字不变。
+    const enabledLabel = peakValleyLabelTextOf(config, panelLocale, peakValleyMarker);
+    const peakValleyExtra = config?.settingsExtraText;
+    const peakValleyText = enabledLabel !== null
+      ? enabledLabel
+      : typeof peakValleyExtra === "function" ? peakValleyExtra(panelLocale, "settings.pv.disabled") : null;
     return react.createElement("section", { className: "deg_expert_group", "data-version": version, "aria-label": "Expert Group" },
       // 宽度拖拽手柄（票据 18）：只在 install 注入了写入能力时渲染，贴在面板左缘。
       widthResizer,

@@ -23,7 +23,7 @@ import {
   projectModelPriceDiagnostics,
   projectPeakValleyDiagnostics,
 } from "./settings-read-projection.js";
-import { PEAK_VALLEY_ERROR_CODES } from "./peak-valley-settings.js";
+import { effectiveRoleDefaultsOf, PEAK_VALLEY_ERROR_CODES } from "./peak-valley-settings.js";
 import { decideImageRoute, imageCapability } from "../image-routing.js";
 import { roleDescriptionsOf } from "../shared/protocol.js";
 import { utf8ByteLength } from "../shared/structured.js";
@@ -654,9 +654,10 @@ async function handleMeta(deps, req) {
       // 角色只读投影：客户端据此渲染设置页角色表与侧栏标签；
       // roleLabels 是显示名（英文，与角色状态标签一致），roleDescriptions 是职责摘要（设置页提示）。
       roleLabels: roleLabelsProjection(),
-      // 「会话模型」的全局默认读面：与 resolveRole 同源（snap.defaults），侧边栏据此显示
-      // 「跟随全局默认」。这里只是只读投影，不改 get/session-override-* 的任何行为。
-      roleDefaults: snap.defaults ?? {},
+      // 「会话模型」的默认读面：峰谷启用时返回**当前时段**生效的逐角色默认（时段层优先、
+      // 缺角色回退普通层），未启用/配置损坏时就是普通层 snap.defaults。侧边栏据此显示
+      // 「跟随默认」。这里只是只读投影，不改 get/session-override-* 的任何行为。
+      roleDefaults: effectiveRoleDefaultsOf(snap),
       roleDescriptions: roleDescriptionsOf(roleCatalog().records()),
       enableObserver: config.enableObserver === true,
       observerPreferred: snap.observerPreferred === true,

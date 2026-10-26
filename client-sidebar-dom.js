@@ -780,7 +780,13 @@
     ".deg_expert_group_session_model_dialog::backdrop{background:rgba(0,0,0,.42)}",
     // 头/体/脚三段：体是唯一滚动区，头脚常驻（窄屏也不会把保存按钮挤出视口）。
     ".deg_expert_group_session_model_header{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:0 0 auto;padding:12px 14px 6px;font-weight:600}",
-    ".deg_expert_group_session_model_title{flex:1 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;font-weight:600}",
+    // 标题行左组：标题 + 峰谷徽标同处一个 flex 容器，徽标紧跟标题文字；
+    // 容器 flex:1 1 auto 吃掉剩余宽度，关闭按钮因此仍贴在右端（标题自身只占内容宽度）。
+    // 标题可省略、右组按钮不被挤压：标题自身单行省略（省略号收束），左组整体 overflow:hidden
+    // 兜底裁掉任何溢出；徽标仍按自身 flex 宽度参与布局，因此窄屏下先压标题、不压徽标，
+    // 头部的关闭「×」也不会被挤到换行。
+    ".deg_expert_group_session_model_heading{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;overflow:hidden}",
+    ".deg_expert_group_session_model_title{flex:0 1 auto;min-width:0;margin:0;font-size:15px;line-height:22px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
     ".deg_expert_group_session_model_body{flex:1 1 auto;min-height:0;overflow:auto;padding:0 14px 8px}",
     ".deg_expert_group_session_model_hint{margin:0 0 8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;overflow-wrap:anywhere}",
     ".deg_expert_group_session_model_notice{margin:0 0 8px;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}",
@@ -809,7 +815,13 @@
     ".deg_expert_group_session_model_spacer{flex:1 1 auto}",
     // 主按钮（保存）：只在这个弹窗里使用，比工具条小按钮稍大、强调色跟随主题。
     ".deg_expert_group_session_model_primary{box-sizing:border-box;height:28px;padding:0 12px;border:1px solid var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));border-radius:6px;background:var(--dsw-alias-interactive-bg-primary,var(--dsw-alias-label-primary));color:var(--dsw-alias-bg-layer-1,#fff);font:inherit;font-size:12px;font-weight:600;cursor:pointer}",
-    ".deg_expert_group_session_model_primary:disabled{opacity:.45;cursor:not-allowed}",
+    // 主/次按钮共用同一条禁用样式（与上面的 focus 分组同款：同一视觉语义只写一次）。
+    ".deg_expert_group_session_model_primary:disabled,.deg_expert_group_session_model_secondary:disabled{opacity:.45;cursor:not-allowed}",
+    // 次按钮（底部「恢复默认」与「关闭」）：与主按钮同高 28px，视觉上弱于主按钮。
+    // 不接管全局 .deg_expert_group_export_button（工具条与弹窗标题栏的「×」仍用它）。
+    ".deg_expert_group_session_model_secondary{box-sizing:border-box;height:28px;padding:0 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}",
+    ".deg_expert_group_session_model_secondary:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+    ".deg_expert_group_session_model_secondary:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
   ].join("");
 
   /**
