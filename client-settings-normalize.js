@@ -35,6 +35,13 @@
      */
     const SETTINGS_ROLE_IDS = STATUS_ROLE_IDS;
     const SETTINGS_ROLE_LABELS = STATUS_ROLE_LABELS;
+    /**
+     * 主代理（Orchestrator）在设置文档里的**保留键**（与 Host 的 ORCHESTRATOR_SELECTION_KEY 同值）。
+     *
+     * 它不是一个专家角色：绝不进入 defaults/candidates 这两张角色映射，也不参与 meta.roles /
+     * activeRoles；模型表把它当成「一份独立的 profile」来读写（settings.orchestrator）。
+     */
+    const ORCHESTRATOR_ID = "orchestrator";
     // meta 尚未返回时的初始行：只含默认角色，可选角色（observer）由 meta 决定是否展示。
     const SETTINGS_REQUIRED_ROLE_IDS = SETTINGS_ROLE_IDS.filter((role) => role !== "observer");
 
@@ -346,6 +353,39 @@
       return { provider: entry.provider, model: entry.model, ...(reasoningEffort.length > 0 ? { reasoningEffort } : {}) };
     }
     /**
+     * 主代理配置归一：`{ defaults: selection|null, candidates: selection[], fallbackLimit }`。
+     *
+     * 旧文档缺字段 / 坏值一律收敛成「未配置」而不是抛错：设置页必须能打开并把坏值改回来。
+     * 候选**保留空行**（与角色候选同一口径）：页签里的候选层在填写前就是 {provider:"",model:""}，
+     * 读取归一若丢掉它页数就会塌陷、保存按钮也会错误保持禁用；提交前由 compactOrchestratorDraft 裁掉。
+     */
+    function normalizeOrchestratorDraft(value) {
+      const source = value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const defaults = normalizeModelCandidateSelection(source.defaults);
+      return {
+        // defaults 必须具备 provider 与 model 才是「已配置」；半填行按未配置处理（提交前不写入）。
+        defaults: defaults !== null && defaults.provider.length > 0 && defaults.model.length > 0 ? defaults : null,
+        // 候选逐条归一与上限同角色候选；这里不能复用 normalizeModelCandidatesDraft——它按角色白名单
+        // 过滤键，会把保留键 orchestRATOR 整个丢掉。
+        candidates: (Array.isArray(source.candidates) ? source.candidates : [])
+          .slice(0, MAX_MODEL_CANDIDATES_PER_ROLE)
+          .map(normalizeModelCandidateSelection)
+          .filter((entry) => entry !== null),
+        fallbackLimit: normalizeModelFallbackLimitDraft(source.fallbackLimit),
+      };
+    }
+    /**
+     * 主代理的**提交候选**：与角色候选同一套裁剪口径（全空行不写入），字段形状与 Host 契约一致。
+     */
+    function compactOrchestratorDraft(value) {
+      const profile = normalizeOrchestratorDraft(value);
+      return {
+        ...profile,
+        // 「全空行不写入」复用角色候选的裁剪口径，主代理不另写一份。
+        candidates: compactModelCandidatesDraft({ [ORCHESTRATOR_ID]: profile.candidates })[ORCHESTRATOR_ID] ?? [],
+      };
+    }
+    /**
      * 角色 -> 有序候选映射归一；只保留内置角色键，每角色最多 3 条（与页签上限一致）。
      *
      * 旧文档里可能残留已删除的自定义角色键；Host 的 settings-commit 对未知角色键严格
@@ -379,7 +419,9 @@
      * - 页签名称只由位置推导，拖动重排改变的是「整层」的顺序，不是某一行的数据。
      */
     function modelPageCountOf(draft) {
-      let longest = 0;
+      // 主代理也是一行：它的候选层同样决定页数，否则第 2..N 页会漏掉这一行。
+      const orchestratorCandidates = draft?.orchestrator?.candidates;
+      let longest = Array.isArray(orchestratorCandidates) ? orchestratorCandidates.length : 0;
       for (const role of SETTINGS_ROLE_IDS) {
         const list = draft?.candidates?.[role];
         if (Array.isArray(list)) longest = Math.max(longest, list.length);
@@ -400,12 +442,29 @@
       }
       return roles;
     }
-    /** 读某一层某角色的选择：页 0 读 defaults，页 i 读 candidates[i - 1]；未配置返回 null。 */
+    /**
+     * 参与层重排/建页的**行集合**：角色映射里的角色 + 主代理。
+     *
+     * 主代理单独存放（settings.orchestrator），但层语义与角色完全一致：拖动页签必须把它
+     * 一起搬走，否则「候选页」的层顺序只对专家成立、主代理会停在旧层上。
+     */
+    function modelLayerRowKeysOf(draft) {
+      return [...modelLayerRolesOf(draft), ORCHESTRATOR_ID];
+    }
+    /** 读某一层某行的选择：页 0 读 defaults，页 i 读 candidates[i - 1]；未配置返回 null。 */
     function modelLayerSelectionOf(draft, role, page) {
       if (!Number.isSafeInteger(page) || page < 0) return null;
-      const source = page === 0
-        ? draft?.defaults?.[role]
-        : (Array.isArray(draft?.candidates?.[role]) ? draft.candidates[role][page - 1] : void 0);
+      let source;
+      if (role === ORCHESTRATOR_ID) {
+        const profile = draft?.orchestrator;
+        source = page === 0
+          ? profile?.defaults
+          : (Array.isArray(profile?.candidates) ? profile.candidates[page - 1] : void 0);
+      } else {
+        source = page === 0
+          ? draft?.defaults?.[role]
+          : (Array.isArray(draft?.candidates?.[role]) ? draft.candidates[role][page - 1] : void 0);
+      }
       return source !== null && source !== void 0 && typeof source === "object" && !Array.isArray(source) ? source : null;
     }
     /**
@@ -418,6 +477,15 @@
     function setModelLayerSelection(draft, role, page, selection) {
       if (!Number.isSafeInteger(page) || page < 0) return draft;
       const normalized = selection !== null && typeof selection === "object" && !Array.isArray(selection) ? selection : null;
+      if (role === ORCHESTRATOR_ID) {
+        // 主代理：空值 = 显式清空主选择（defaults: null =「不干预主代理模型」），不删掉整份配置。
+        const profile = normalizeOrchestratorDraft(draft?.orchestrator);
+        if (page === 0) return { ...draft, orchestrator: { ...profile, defaults: normalized } };
+        const list = profile.candidates.slice();
+        while (list.length < page - 1) list.push({ provider: "", model: "" });
+        list[page - 1] = normalized === null ? { provider: "", model: "" } : normalized;
+        return { ...draft, orchestrator: { ...profile, candidates: list } };
+      }
       if (page === 0) {
         const defaults = { ...(draft?.defaults ?? {}) };
         if (normalized === null) delete defaults[role];
@@ -434,7 +502,7 @@
     /** 当前层的「角色 → 选择」映射：统一供应商与整层重排都基于它计算。 */
     function modelLayerMapOf(draft, page) {
       const map = {};
-      for (const role of modelLayerRolesOf(draft)) {
+      for (const role of modelLayerRowKeysOf(draft)) {
         const selection = modelLayerSelectionOf(draft, role, page);
         if (selection !== null) map[role] = selection;
       }
@@ -447,26 +515,17 @@
      * 中间缺口用空行占位（提交前再裁剪）。写入的都是深拷贝，避免新旧层共享同一个对象。
      */
     function writeModelLayers(draft, layers) {
-      const defaults = {};
-      const candidates = {};
-      for (const role of modelLayerRolesOf(draft)) {
-        const primary = layers[0]?.[role] ?? null;
-        if (primary !== null && primary !== void 0) defaults[role] = { ...primary };
-        let last = 0;
-        for (let page = 1; page < layers.length; page += 1) {
+      // 逐行逐层经 setModelLayerSelection 写回：角色映射与主代理 profile 只有同一份搬家逻辑。
+      let next = { ...draft, defaults: {}, candidates: {} };
+      for (const role of modelLayerRowKeysOf(draft)) {
+        for (let page = 0; page < layers.length; page += 1) {
           const selection = layers[page]?.[role];
-          if (selection !== null && selection !== void 0) last = page;
-        }
-        if (last >= 1) {
-          const list = [];
-          for (let page = 1; page <= last; page += 1) {
-            const selection = layers[page]?.[role] ?? null;
-            list.push(selection === null ? { provider: "", model: "" } : { ...selection });
+          if (selection !== null && selection !== void 0) {
+            next = setModelLayerSelection(next, role, page, { ...selection });
           }
-          candidates[role] = list;
         }
       }
-      return { ...draft, defaults, candidates };
+      return next;
     }
     /** 拖动页签：把 from 层整层移动到 to 位置，其余层顺移（主模型页也可以移动）。 */
     function reorderModelLayers(draft, from, to) {
@@ -488,15 +547,14 @@
     function addModelCandidatePage(draft) {
       const count = modelPageCountOf(draft);
       if (count >= MAX_MODEL_PAGES) return draft;
-      const candidates = { ...(draft?.candidates ?? {}) };
-      for (const role of modelLayerRolesOf(draft)) {
+      // 逐行经 setModelLayerSelection 写入：主代理与角色共用同一套「页 → 层」语义，
+      // 不必为独立 profile 再写一份建页逻辑。
+      let next = draft;
+      for (const role of modelLayerRowKeysOf(draft)) {
         const primary = modelLayerSelectionOf(draft, role, 0);
-        const list = Array.isArray(candidates[role]) ? candidates[role].slice() : [];
-        while (list.length < count - 1) list.push({ provider: "", model: "" });
-        list[count - 1] = primary === null ? { provider: "", model: "" } : { ...primary };
-        candidates[role] = list;
+        next = setModelLayerSelection(next, role, count, primary === null ? null : { ...primary });
       }
-      return { ...draft, candidates };
+      return next;
     }
     /**
      * 删除一个候选页：所有角色同步删掉该索引项（页与层始终一一对应）。
@@ -513,7 +571,12 @@
         if (list.length > 0) candidates[role] = list;
         else delete candidates[role];
       }
-      return { ...draft, candidates };
+      // 主代理候选同步删除该索引项（页与层始终一一对应）。
+      const profile = draft?.orchestrator;
+      if (profile === null || typeof profile !== "object") return { ...draft, candidates };
+      const orchestratorList = Array.isArray(profile.candidates) ? profile.candidates.slice() : [];
+      if (orchestratorList.length >= page) orchestratorList.splice(page - 1, 1);
+      return { ...draft, candidates, orchestrator: { ...profile, candidates: orchestratorList } };
     }
     /**
      * 提交前裁剪候选：provider 与 model 皆空的行 = 该层该角色未配置，整行不写入。
@@ -704,6 +767,9 @@
         ...(Object.prototype.hasOwnProperty.call(source, "fallbackLimit")
           ? { fallbackLimit: normalizeModelFallbackLimitDraft(source.fallbackLimit) }
           : {}),
+        // 主代理（保留键）：恒在草稿里，旧文档缺字段时归一为「未配置」（null / [] / 默认上限），
+        // 因此模型表第一行永远有确定的空态，不需要在渲染期再补一次兜底。
+        orchestrator: normalizeOrchestratorDraft(source.orchestrator),
         // 峰谷（票据 07）：只在源文档显式存在时进入草稿，旧文档/旧客户端形状逐字不变。
         ...(Object.prototype.hasOwnProperty.call(source, "peakValley")
           ? { peakValley: normalizePeakValleyDraft(source.peakValley, seedPeakValleyPeriods) }
@@ -736,6 +802,8 @@
       "sidebarEntryEnabled",
       "candidates",
       "fallbackLimit",
+      // 主代理（保留键）：详情页保存同样按「本地相对基线的差异」合并，否则这一行的改动会丢。
+      "orchestrator",
       // 峰谷（票据 07）：详情页保存时同样按「本地相对基线的差异」合并，不整份覆盖。
       "peakValley",
     ]);
@@ -1128,11 +1196,11 @@
   global[SYMBOL] = Object.freeze({
     DEFAULT_MODEL_FALLBACK_LIMIT, DEFAULT_PEAK_VALLEY_PERIODS, DEFAULT_PROMPT_MAX_GRAPHEMES, MAX_MODEL_CANDIDATES_PER_ROLE, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_PAGES,
     NEXT_PEAK_VALLEY_PERIOD,
-    NOTIFICATION_EVENT_TYPES, PROMPT_ROLE_IDS, PROMPT_WARNING_RATIO, SETTINGS_ROLE_LABELS, addModelCandidatePage,
-    bindClientRuntime, clampNotificationVolume, commitSettingsCandidate, compactModelCandidatesDraft, countUnicodeGraphemes,
+    NOTIFICATION_EVENT_TYPES, ORCHESTRATOR_ID, PROMPT_ROLE_IDS, PROMPT_WARNING_RATIO, SETTINGS_ROLE_LABELS, addModelCandidatePage,
+    bindClientRuntime, clampNotificationVolume, commitSettingsCandidate, compactModelCandidatesDraft, compactOrchestratorDraft, countUnicodeGraphemes,
     createSettingsModelCatalog, mergeSettingsDraftOverSource, migrateSettingsDefaults, migrateSettingsSelection, modelCandidatesErrorMessage,
     resolveSettingsForm,
-    modelLayerMapOf, modelLayerSelectionOf, modelPageCountOf, normalizeModelCandidatesDraft, normalizeModelFallbackLimitDraft,
+    modelLayerMapOf, modelLayerSelectionOf, modelPageCountOf, normalizeModelCandidatesDraft, normalizeModelFallbackLimitDraft, normalizeOrchestratorDraft,
     normalizePeakValleyDraft, normalizePromptOverrides, normalizeRolePromptProjection, normalizeSettingsCommitDraft, normalizeSettingsDraft, normalizeSettingsModelGroups,
     promptEntryOf, promptOverridesEqual, removeModelCandidatePage, reorderModelLayers, setModelLayerSelection,
     settingsDraftEqual, settingsRolesForProvider, syncSettingsDefaultsProvider, unifiedProviderOf, updateRolePromptProjection,

@@ -245,6 +245,35 @@ Six rows in a fixed order: **Explorer, Librarian, Oracle, Designer, Fixer, Obser
 - **Saved separately from role configuration**: each provider card holds its own draft with its own "Apply / Cancel", and the section itself has no save button; the save button and behaviour of the role table above are completely unchanged. A submission is fenced by the namespace revision read when the card was opened: if the revision has already moved on outside (another session or page), the overwrite is refused, and the card shows a conflict notice together with a "Reopen" entry point.
 - **Seven reasoning efforts (multi-select)**: the advanced settings of every model entry contain seven checkboxes `off / minimal / low / medium / high / xhigh / max`, in the same order as DSH's pi-ai effort vocabulary, and they are always shown regardless of whether the current catalog declares support. Existing models restore their checks from `reasoningEfforts`; new models start with all seven unchecked. On save, `off` writes an empty string value and the other levels write the same lowercase string; only these seven visible keys are added or removed, while unknown keys that are not displayed are preserved; when none of the seven is checked and there are no unknown keys, the `reasoningEfforts` field is deleted.
 
+### Parent Agent (Orchestrator) Model
+
+The parent-agent model only affects the **root session** (the layer that breaks down tasks, chooses experts, integrates results, and verifies); subagents and experts keep using the models in their own role table.
+
+**Three configuration entry points, all reading and writing the same configuration**:
+
+- **The fixed first row of the "Model configuration" section on the settings page** (row name `Orchestrator`): maintains the global parent-agent model and candidate order with exactly the same row structure as expert roles (primary / candidate tabs, reasoning depth, automatic fallback limit).
+- **The same table inside the peak/valley configuration**: peak and valley each own a parent-agent configuration, sharing the same rows and candidate tabs as the global one, and saving one never overwrites the other.
+- **The fixed first row of the sidebar "会话模型"(Session models) dialog**: writes **per-session overrides only** (`session-override-set`) and never touches global settings; this is also where you can see which parent-agent model the current session is actually using.
+
+**Precedence (highest first)**: session override > current period > global configuration > no intervention. When none of the four layers is configured the plugin **does nothing** and never picks a default model for you; with peak/valley disabled the "current period" layer does not exist, and resolution falls straight through to the global configuration.
+
+**Peak/valley coupling**: while a session is under automatic management, a peak/valley switch re-applies the new period's configuration once; sessions that were manually taken over are never rewritten by a period switch.
+
+**Candidates and preflight switching**: before applying to a new session the plugin runs one model-catalog preflight; if the primary model is unavailable it walks the candidate tabs in order and takes the first usable one, and the dialog marks "degraded to candidate N". When every candidate is unavailable the **configuration is kept and the status quo is preserved** — this feature has no runtime fallback and never swaps models because a request failed; switching only happens in the preflight before applying.
+
+**States of the dialog's first row**:
+
+- **Effective: provider / model (session override / current period / global config)**: the parent-agent model this session is using, plus the layer it came from;
+- **Not configured**: none of the four layers is configured, so the plugin leaves this session's parent-agent model untouched;
+- **degraded to candidate N**: the primary model failed preflight, so candidate N is what is actually in effect;
+- **manually locked in this session**: you changed the model manually in this session, so neither period switches nor automatic application will rewrite it anymore;
+- **host not ready**: the current DSH host does not provide the session-model service, so the plugin only displays the configuration and never writes.
+
+**Two explicit limits**:
+
+1. **Existing sessions and restored historical sessions are never applied to**: after saving the configuration or restarting DSH, historical sessions keep their models; only a root session that was newly created in this run and has never issued a request is applied once at creation.
+2. **Manual changes only affect the current session**: switching models in "Session models" writes a per-session override only — it does not change global settings and does not affect other sessions; clearing that override returns to the "period > global" resolution result.
+
 ## Expert Group Task Sidebar
 
 Expert Group is the task view that DEG registers in the right sidebar: it draws the complete task tree of **the root session the current session belongs to** — the parent agent is the root node, and ordinary experts, fan-out shards, and live run state all hang below it. It is a read-only view, and the only operations that write state are cancelling and retrying fan-out tasks.
@@ -351,6 +380,17 @@ After every task name there is a 30×20px arrow button, and **the same button ha
 - When splitting for the first time from a single pane holding only Expert Group, the open transaction first temporarily widens the right sidebar to about 50%, and once the target tab is confirmed to have landed in the returned pane it keeps the 50% adjustable mode; if the split fails it restores the original 20% locked width.
 - Day-to-day opening / closing of tabs inside an existing subagent pane does not change the width.
 - After the first two panes form: Expert Group takes 40% of the right sidebar (about 20% of the viewport) and the subagent pane takes 60% of the right sidebar (about 30% of the viewport); once the last tracked pane closes, the default width of about 20% is restored.
+
+## Session Deletion
+
+DEG adds permanent deletion to the DSH session list: the session, its logs, and DEG's derived data are removed together — not merely hidden from the list.
+
+- **Two entry points, one confirmation**: the hover button at the end of a session row (trash icon, ordered after archive and pin) and the last row of the session "⋯" menu ("Delete session") share one destructive confirmation — focus defaults to Cancel, Esc / backdrop click / Cancel all dismiss it, "This cannot be undone." is always shown, and the confirm button is disabled with "Deleting…" while the request is in flight.
+- **Multi-select deletion**: "Select sessions" in the same "⋯" menu enters multi-select mode. A checkbox appears at the start of each row and clicking anywhere in the row toggles it (in-row buttons, workspace headers, and the search box are not intercepted); the action bar shows "N selected" and "K in use" live, and "Select all" only selects currently actionable sessions — the same range regardless of the active filter. Esc closes the confirmation first and exits multi-select second.
+- **Only unoccupied sessions are deleted**: a session still in use by DSH (running itself, or with a running sub-session) is not deleted; the row explains why — "In use by DSH; restart DSH to delete." When the previous deletion's cleanup has not converged yet, the row also asks for a restart.
+- **Rows disappear immediately**: the session list refreshes as soon as settlement lands — no manual page switch or panel reopen. Skipped sessions stay untouched, and a session reopened during a race is reported as "not deleted (reopened, kept)".
+- **Derived data converges on the next start**: only the targeted sessions' DEG-side data (usage ledger, archive / pin registrations, local expansion state and ownership ledger) is cleared; quarantined old logs and leftover entries are handled by the convergence pass on the next DSH start. Corrupt or incomplete records are kept fail-closed with diagnostics, other sessions are never touched, and shared attachments are never deleted.
+- **Occupied sessions need a restart first**: "in use" is judged from DSH's runtime state; after a DSH restart the occupancy is released and the same deletion can be retried.
 
 ## Runtime Protection, Reclaim, and Waiting
 

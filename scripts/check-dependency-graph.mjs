@@ -787,6 +787,25 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
     { name: "identity", capability: "根/会话身份归一：lineage" },
     { name: "reads", capability: "RPC 只读投影" },
   ] },
+  // 主代理（Orchestrator）模型配置运行期（批次 A）：6 个能力组
+  // （settings 快照读面 / 根会话判定与 sessionController 读取 / catalog 预检 / 时钟 / logger /
+  // DEG 持久化域）。时钟组按仓接口径把 now + setTimeout + clearTimeout 折叠成 1 组
+  // （与 createFanoutRuntime 同款）；持久化组把"功能启用切点"与"手动接管的会话覆盖写入"
+  // 折叠成 1 组，因为它们同属 DEG 自己的 storage domain。
+  { file: "host/orchestrator-model.js", name: "createOrchestratorModelManager", groups: 6, faces: [
+    { name: "settings", capability: "设置快照读取" },
+    { name: "host", capability: "根 agent 判定与宿主服务读取" },
+    { name: "models", capability: "模型目录预检" },
+    { name: "clock", capability: "时钟能力：now 与边界定时器" },
+    { name: "logger", capability: "日志器" },
+    { name: "persistence", capability: "持久化域：功能启用切点与会话覆盖写入" },
+  ] },
+  // 主代理写入管线（批次 A）：设置快照 / catalog 预检 / 时钟 / logger / 持久化域（手动接管写入）。
+  { file: "host/orchestrator-write.js", name: "createOrchestratorWriter", groups: 5 },
+  // 主代理功能启用切点（B3）：storage binding 读面 + 持久化原语（+ 只记类别的 logger）。
+  { file: "host/orchestrator-epoch.js", name: "createOrchestratorEpochStore", groups: 3 },
+  // 会话覆盖的 durable 写入（RPC 与运行期共用）：存储写面 / 读投影 / 冲突构造器。
+  { file: "host/session-override-store.js", name: "createSessionOverrideStore", groups: 3 },
   { file: "host/index-model-route.js", name: "createIndexModelRouteDomain", groups: 8, faces: [
     { name: "settings", capability: "设置读写服务" },
     { name: "settingsRuntime", capability: "设置运行期：派生/缓存" },

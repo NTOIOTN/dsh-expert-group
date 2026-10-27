@@ -31,16 +31,22 @@ import {
   routeSnapshotActiveSelection,
 } from "../shared/route-snapshot.js";
 import { PEAK_VALLEY_ERROR_CODES, PEAK_VALLEY_STATE_INVALID } from "./peak-valley-settings.js";
+import { normalizeOrchestratorForRead } from "./orchestrator-settings.js";
 import { noteRouteOrdinaryFallback } from "./route-diagnostics.js";
 
 /**
- * 峰谷 profile 的只读内部视图（provider / defaults / candidates / fallbackLimit）。
+ * 峰谷 profile 的只读内部视图（provider / defaults / candidates / fallbackLimit / orchestrator）。
  *
  * 与普通配置的读取面同形，因此计划构造可以复用同一个 buildModelRoutePlan——**不复制**
  * 候选链语义（去重、effort-only 跳过、candidateIndex 原始位置都由它决定）。
  *
+ * `orchestrator`（批次 A 主代理模型配置）在这里只做**只读投影**：它不是专家角色，
+ * 不参与 profileModelPlanOf 的角色计划构造（主代理的候选链由 host/orchestrator-settings 的
+ * orchestratorPlanOf 单独构造），但从视图里丢掉它会让"这一层到底配了什么"无法诊断。
+ *
  * @param {unknown} profile - settings.peakValley.peak / .valley。
- * @returns {{provider:string, defaults:object, candidates:object, fallbackLimit:number}}
+ * @returns {{provider:string, defaults:object, candidates:object, fallbackLimit:number,
+ *   orchestrator:{defaults:object|null, candidates:object[], fallbackLimit:number}}}
  */
 function profileRouteViewOf(profile) {
   const source = profile !== null && typeof profile === "object" && !Array.isArray(profile) ? profile : {};
@@ -50,6 +56,7 @@ function profileRouteViewOf(profile) {
     defaults: isMap(source.defaults) ? source.defaults : {},
     candidates: isMap(source.candidates) ? source.candidates : {},
     fallbackLimit: normalizeModelFallbackLimit(source.fallbackLimit),
+    orchestrator: normalizeOrchestratorForRead(source.orchestrator).config,
   };
 }
 

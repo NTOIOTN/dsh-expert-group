@@ -29,7 +29,7 @@
   const PURE = global[PURE_SYMBOL] || {};
   const {
     ACTIVE_STATUSES, RETRY_STATUSES, RUNTIME_STATUS_LABELS, STATUS_FILTER_OPTIONS,
-    normalizeSessionModelSelection, object, sessionModelModelOptions, sessionModelRolesOf, statusOf, text,
+    normalizeSessionModelSelection, object, sessionModelModelOptions, sessionModelOrchestratorOf, sessionModelRolesOf, statusOf, text,
   } = PURE;
   const DOM_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-dom");
   const DOM = global[DOM_SYMBOL] || {};
@@ -325,16 +325,56 @@
   };
 
   /**
+   * 主代理行的读面投影（纯读）：显示值与状态标记全部来自 Host 的 applyState **六态**。
+   *
+   * 客户端**不再**用 effective 猜测「是否实际生效」：旧判据把「配置存在但尚未应用」
+   * 显示成「实际生效」，有旧 applied 时又会掩盖新配置未应用，stale 分支实际不可达。
+   * 显示值语义见 PURE.sessionModelOrchestratorOf（applied / manual 显示实际套用值，
+   * 其余显示期望配置）。marker 值就是六态本身，测试与样式都按它断言。
+   */
+  const sessionModelOrchestratorViewOf = (ctx) => {
+    const { t } = ctx;
+    const status = object(ctx.sessionModelState?.orchestrator);
+    const { state, selection } = sessionModelOrchestratorOf(status, ctx.meta);
+    const degraded = Number.isSafeInteger(status.degradedCandidate) && status.degradedCandidate > 0
+      ? status.degradedCandidate
+      : 0;
+    const source = ["override", "period", "global"].includes(status.source) ? status.source : "none";
+    // 文案键后缀 = applyState 取值（见 shared/i18n.js 的 sidebar.sessionModel.orchestrator.*）。
+    const line = t("sidebar.sessionModel.orchestrator." + state, {
+      value: selection === null
+        ? ""
+        : selection.provider + " / " + selection.model + (selection.reasoningEffort ? " · " + selection.reasoningEffort : ""),
+      source: t("sidebar.sessionModel.orchestrator.source." + source),
+    });
+    return {
+      // 下拉的可编辑基线：主代理自己的显示值（与其它行的「覆盖 ?? 全局默认」同构）。
+      selection,
+      // 宿主未就绪时该行只读：三个下拉统一按这一个判据禁用。
+      hostReady: state !== "host-not-ready",
+      // 降级位置只在「已实际生效」时追加：未生效的配置没有"降级到候选"这回事。
+      text: degraded > 0 && state === "applied"
+        ? line + " · " + t("sidebar.sessionModel.orchestrator.degraded", { index: degraded })
+        : line,
+      state,
+    };
+  };
+
+  /**
    * 单个角色行的「显示值 + 三段选项」计算（纯读）。
    *
    * 只读本帧 state/meta/目录与草稿表；不写任何状态，也不发起 RPC。
    * 返回值里的 providerGroup 只在「当前 provider 不在目录里」时为 undefined，
    * 与拆分前逐字一致（JSX 用它决定 model 下拉是否禁用 + 是否插入 disabled 占位）。
+   * 主代理行复用同一实现：只有基线（fallback）与显示名由调用方注入。
    */
-  const sessionModelRowOf = (ctx, role, groups) => {
+  const sessionModelRowOf = (ctx, role, groups, fallback, label) => {
     const { t, meta, sessionModelState, sessionModelDrafts } = ctx;
     const current = sessionModelState.overrides[role] ?? null;
-    const globalDefault = normalizeSessionModelSelection(object(meta?.roleDefaults)[role]);
+    // fallback 只由主代理行传入（它的基线来自 get().orchestrator，不在 meta.roleDefaults 里）。
+    const globalDefault = fallback !== void 0
+      ? fallback
+      : normalizeSessionModelSelection(object(meta?.roleDefaults)[role]);
     const hasDraft = Object.prototype.hasOwnProperty.call(sessionModelDrafts, role);
     const baseline = current ?? globalDefault;
     const editable = hasDraft
@@ -347,7 +387,7 @@
     const providerValue = typeof editable.provider === "string" ? editable.provider : "";
     const modelValue = typeof editable.model === "string" ? editable.model : "";
     const effortValue = typeof editable.reasoningEffort === "string" ? editable.reasoningEffort : "";
-    const roleLabel = ctx.a.roleLabelFor(role, null) ?? role;
+    const roleLabel = label ?? ctx.a.roleLabelFor(role, null) ?? role;
     const providerGroup = groups.find((group) => text(object(group).id, null) === providerValue);
     const models = sessionModelModelOptions(providerValue, groups);
     const modelEntry = models.find((candidate) => text(object(candidate).id, null) === modelValue);
@@ -414,7 +454,8 @@
   const renderSessionModelRow = (ctx, role, options) => {
     const { react, t, updateSessionModelDraft, clearSessionModelRole } = ctx;
     const writable = options.writable;
-    const row = sessionModelRowOf(ctx, role, options.groups);
+    const orchestrator = options.orchestrator === true;
+    const row = sessionModelRowOf(ctx, role, options.groups, options.fallback, options.label);
     const {
       current, roleLabel, providerValue, modelValue, effortValue,
       providerOptions, modelOptions, effortOptions, reasoning, providerGroup,
@@ -493,7 +534,11 @@
         disabled: writable !== true || reasoning === null || modelValue === "",
         onChange: (event) => updateSessionModelDraft(role, "reasoningEffort", event?.target?.value ?? ""),
       }, effortOptions)),
-    ]));
+      // 主代理行多一行跨列状态说明（display:contents 的 grid 子项，grid-column 跨满整行）。
+    ].concat(orchestrator && options.status ? [react.createElement("div", {
+      className: "deg_expert_group_session_model_orchestrator",
+      "data-deg-session-model-orchestrator": options.status.state,
+    }, options.status.text)] : [])));
   };
 
   /** 弹窗底部：revision、草稿校验提示、恢复默认、关闭与整批保存。 */
@@ -586,7 +631,7 @@
     const noticeText = sessionModelNotice === null
       ? null
       : sessionModelNotice.kind === "saved"
-        ? t("sidebar.sessionModel.saved")
+        ? (sessionModelNotice.text ?? t("sidebar.sessionModel.saved"))
         : sessionModelNotice.kind === "cleared"
           ? t("sidebar.sessionModel.cleared")
           : sessionModelNotice.text;
@@ -631,6 +676,17 @@
     ]);
     const rows = [];
     if (status === "ready") {
+      // 主代理固定第一行、常驻：它不在 meta.roles 里（未启用的角色不会出现在其它行），
+      // 因此绝不能靠角色清单"顺带"渲染。hostReady=false 时该行只读（Host 尚未绑定服务）。
+      const orchestratorView = sessionModelOrchestratorViewOf(ctx);
+      rows.push(renderSessionModelRow(ctx, "orchestrator", {
+        writable: writable === true && orchestratorView.hostReady === true,
+        groups,
+        fallback: orchestratorView.selection,
+        label: "Orchestrator",
+        status: orchestratorView,
+        orchestrator: true,
+      }));
       for (const role of roles) {
         rows.push(renderSessionModelRow(ctx, role, { writable, groups }));
       }

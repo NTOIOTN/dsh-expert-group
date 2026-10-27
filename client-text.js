@@ -63,6 +63,7 @@
       "settings.unifiedProvider": "统一供应商",
       "settings.noProvider": "无",
       "settings.observerPreferred": "Observer优先",
+      "settings.orchestrator.empty": "未配置（不干预主代理模型）",
       "settings.concurrencyLimit": "单个角色并发上限",
       "settings.concurrencyLimit.title": "取值范围 1–64 的整数；默认 20；保存后生效",
       "settings.roleTimeout": "角色默认超时 (s)",

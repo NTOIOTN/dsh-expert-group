@@ -277,6 +277,24 @@ export const Config = z.object({
   candidates: z.dict(z.array(ROLE_SELECTION)).default({}).volatile(),
   fallbackLimit: z.number().step(1).min(0).max(MAX_MODEL_FALLBACK_LIMIT).default(DEFAULT_MODEL_FALLBACK_LIMIT).volatile(),
   /**
+   * 主代理（Orchestrator）模型配置（批次 A）：**独立对象**，刻意不放进 defaults 映射，
+   * 也不进 activeRoles —— 它不是专家角色，只是根会话的 DSH 原生模型选择。
+   *
+   * 形状：`{ defaults: ROLE_SELECTION|null, candidates: ROLE_SELECTION[], fallbackLimit }`
+   * - defaults 为 null = 用户没有配置主代理模型 => 不干预（绝不回填任何"默认模型"）；
+   * - **读取侧 schema 对整个字段一律宽容**（z.any()）：字段语义、逐条/去重/上限/越界
+   *   校验属于读取归一（host/orchestrator-settings 的 normalizeOrchestratorForRead）与
+   *   DEG 自有提交端点（mergeOrchestratorDraft）。schema 一旦收紧（例如把 candidates
+   *   声明成 z.array(...)、给 fallbackLimit 加 .min/.max、或要求整个值是对象），一份被
+   *   宿主通用写入路径或历史版本写坏的文档就会让**整份设置文档**解析失败，设置页再也
+   *   打不开——这正是读取归一要避免的失败模式（B7：严格拒绝只放在提交端点）。
+   * - 读取归一保证"缺字段 / null / 非对象 => 空配置 + 诊断"，fallbackLimit 越界回退默认 2。
+   *
+   * 峰谷 profile 内的两份独立配置（peakValley.peak.orchestrator / .valley.orchestrator）
+   * 走 z.any()，由 host/peak-valley-settings 的归一与合并负责（与本字段同一套语义）。
+   */
+  orchestrator: z.any().default({}).volatile(),
+  /**
    * 峰谷模式（票据 02）：enabled / initialized / periods / peak / valley。
    *
    * 这是一组"要按时段切哪套模型"的状态，因此用嵌套对象而不是七个新的顶层字段；

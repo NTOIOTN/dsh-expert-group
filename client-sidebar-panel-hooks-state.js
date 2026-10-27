@@ -13,7 +13,7 @@
   const PURE = global[PURE_SYMBOL] || {};
   const {
     RIGHTBAR_WIDTH_RATIO, RIGHTBAR_WIDTH_RATIO_MAX, RIGHTBAR_WIDTH_RATIO_MIN, clampRightbarWidthRatio, normalizeHostMeta, normalizeSessionModelView,
-    object, sessionModelRolesOf, snapshotHasUsageFact,
+    object, sessionModelOrchestratorOf, sessionModelRowKeysOf, snapshotHasUsageFact,
   } = PURE;
   const DOM_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-dom");
   const DOM = global[DOM_SYMBOL] || {};
@@ -205,7 +205,8 @@
       sessionModelLoadedRootRef, sessionModelNotice, sessionModelOpen,
       sessionModelReloadToken, sessionModelRequestSerialRef, sessionModelSaving, sessionModelState,
       sessionModelSurfaceRef, sessionModelWasOpenRef, setAnnouncement, setAutoOpenDraft, setFilterState, setMeta,
-      setSessionModelCatalog, setSessionModelDrafts, setSessionModelNotice, setSessionModelOpen, setSessionModelReloadToken, setSessionModelSaving,
+      setSessionModelCatalog, setSessionModelDrafts, setSessionModelNotice, setSessionModelOpen,
+      setSessionModelReloadToken, setSessionModelSaving,
       setSessionModelState, setState, state, timelineExpandedRef, version,
       viewState,
     });
@@ -479,7 +480,7 @@
       return;
     }
     const targetSessionId = rootSessionId;
-    const roles = sessionModelRolesOf(metaStateRef.current);
+    const roles = sessionModelRowKeysOf(metaStateRef.current);
     setSessionModelSaving(true);
     setSessionModelNotice(null);
     let revision = sessionModelState.revision;
@@ -513,12 +514,24 @@
     }
   }
 
+  /**
+   * 某个角色行的权威基线（草稿起点与「可提交改动」共用同一份判据）。
+   *
+   * 主代理是覆盖表里的保留键、不在 meta.roleDefaults 里：它的显示值只能按读面 applyState
+   * 语义取（applied / manual 为实际套用值，其余为期望配置），否则「只改思考深度」就成了
+   * 缺 provider/model 的非法草稿（E3）；其余角色仍跟随全局默认。
+   */
+  function sessionModelBaselineOfFrame(sessionModelState, meta, role) {
+    return PANEL_STATE_B.sessionModelBaselineOf(sessionModelState.overrides, meta?.roleDefaults, role,
+      sessionModelOrchestratorOf(sessionModelState.orchestrator, meta).selection);
+  }
+
   /** 会话模型草稿 / 提交 / 清除与 surface 身份令牌。 */
   function useSidebarPanelSessionModel(frame) {
     const {
       config, contextRef, metaStateRef, mountedRef, rootSessionId, sessionModelCatalog,
-      sessionModelDrafts, sessionModelSaving, sessionModelState, setSessionModelDrafts, setSessionModelNotice, setSessionModelSaving,
-      setSessionModelState, sidebarSessionId, t,
+      sessionModelDrafts, sessionModelSaving, sessionModelState, setSessionModelDrafts, setSessionModelNotice,
+      setSessionModelReloadToken, setSessionModelSaving, setSessionModelState, sidebarSessionId, t,
     } = frame;
     // 跨 Hook 前向引用的晚绑定包装：这些函数由后续 Hook 声明并登记到 frame.late；
     // 本 Hook 里的调用全部发生在渲染之后的异步 / 事件路径，因此转发保持原来的调用时机与顺序。
@@ -535,24 +548,19 @@
         role,
         field,
         value,
-        overrides: sessionModelState.overrides,
-        roleDefaults: metaStateRef.current?.roleDefaults,
+        // 草稿起点与**显示值**同源（判据见 sessionModelBaselineOfFrame），否则只改思考深度
+        // 会因缺 provider/model 被判成非法草稿而无法保存（E3）。
+        baseline: sessionModelBaselineOfFrame(sessionModelState, metaStateRef.current, role),
         groups: sessionModelCatalog.groups,
       }));
       setSessionModelNotice(null);
     };
 
-    const sessionModelBaselineOf = (role) => PANEL_STATE_B.sessionModelBaselineOf(
-      sessionModelState.overrides,
-      metaStateRef.current?.roleDefaults,
-      role,
-    );
-
     /** 当前可提交的改动（只算确有草稿、字段完整、且与权威基线不同的角色）。 */
     const sessionModelPendingChanges = () => PANEL_STATE_B.sessionModelPendingChangesOf({
       drafts: sessionModelDrafts,
       meta: metaStateRef.current,
-      baselineOf: sessionModelBaselineOf,
+      baselineOf: (role) => sessionModelBaselineOfFrame(sessionModelState, metaStateRef.current, role),
     });
 
     /** 本地校验：任一草稿缺 provider/model 就不允许保存（按钮禁用 + 底部提示）。 */
@@ -561,10 +569,14 @@
       meta: metaStateRef.current,
     });
 
-    /** 写成功后的统一收口：刷新权威投影 + 删除该角色草稿（只有成功路径删除）。 */
+    /** 写成功后**合并**权威投影（替换会丢掉只由 get 提供的主代理读面，C1）+ 删除该角色草稿。 */
     const applySessionModelView = (view, role) => {
-      setSessionModelState({ status: "ready", overrides: view.overrides, revision: view.revision, live: view.live });
+      setSessionModelState((previous) => ({ ...previous, status: "ready", overrides: view.overrides, revision: view.revision, live: view.live }));
       setSessionModelDrafts((previous) => PANEL_STATE_B.withoutRoleDraft(previous, role));
+      // 主代理写入成功后 Host 才排队 apply（此刻读面必为 pending）：800ms 后复用「重新读取」同一入口
+      // 做一次收敛读取，把 pending 落到 applied / unapplied（失败走既有失败分支，不再静默留旧值）；
+      // 每次写入至多排一次、重读不再排 ⇒ 不新增 RPC 入口、不常驻轮询。
+      if (role === "orchestrator") setTimeout(() => setSessionModelReloadToken((value) => value + 1), 800);
     };
 
     /**
@@ -572,7 +584,7 @@
      * 这里只把描述写进两个 state（保留未提交草稿的语义原样不变）。
      */
     const settleSessionModelFailure = (error, role) => {
-      const roles = sessionModelRolesOf(metaStateRef.current);
+      const roles = sessionModelRowKeysOf(metaStateRef.current);
       const outcome = PANEL_STATE_B.describeSessionModelFailure({ error, role, roles, t });
       if (outcome.statePatch !== null) {
         const patch = outcome.statePatch;
@@ -609,7 +621,7 @@
       const changes = sessionModelPendingChanges();
       if (changes.length === 0) return;
       const targetSessionId = rootSessionId;
-      const roles = sessionModelRolesOf(metaStateRef.current);
+      const roles = sessionModelRowKeysOf(metaStateRef.current);
       setSessionModelSaving(true);
       setSessionModelNotice(null);
       let revision = sessionModelState.revision;
@@ -638,7 +650,14 @@
           applySessionModelView(view, change.role);
         }
         if (sidebarSurfaceStillCurrent() !== true) return;
-        setSessionModelNotice({ kind: "saved", revision });
+        // 主代理的覆盖只在下一次派发时套用：保存提示必须写明「下一轮生效」，不能只说"已保存"。
+        setSessionModelNotice({
+          kind: "saved",
+          ...(changes.some((change) => change.role === "orchestrator")
+            ? { text: t("sidebar.sessionModel.orchestrator.saved") }
+            : {}),
+          revision,
+        });
       } catch (error) {
         // 失败/冲突回执走同一道 surface 闸门：旧 surface 的错误绝不写进新 surface 的提示槽。
         if (sidebarSurfaceStillCurrent() !== true) return;
@@ -659,7 +678,7 @@
       if (sessionModelWriteReady() !== true) return;
       if (sessionModelState.overrides[role] === undefined) return;
       const targetSessionId = rootSessionId;
-      const roles = sessionModelRolesOf(metaStateRef.current);
+      const roles = sessionModelRowKeysOf(metaStateRef.current);
       setSessionModelSaving(true);
       setSessionModelNotice(null);
       try {
@@ -703,7 +722,7 @@
     });
 
     Object.assign(frame, {
-      clearSessionModelRole, commitSessionModelChanges, restoreSessionModelDefaults, sessionModelBaselineOf,
+      clearSessionModelRole, commitSessionModelChanges, restoreSessionModelDefaults,
       sessionModelHasInvalidDraft, sessionModelPendingChanges, updateSessionModelDraft,
     });
   }

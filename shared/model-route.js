@@ -33,6 +33,18 @@ export const MAX_MODEL_FALLBACK_LIMIT = 4;
  */
 export const MAX_MODEL_CANDIDATES_PER_ROLE = 3;
 
+/**
+ * 主代理（Orchestrator）在设置文档里的**保留键**。
+ *
+ * 它不是专家角色 id：不加入 STATUS_ROLE_IDS / activeRoles()，也**不得**作为 defaults /
+ * candidates 这两个「角色 -> 值」映射的键；它在 settings 顶层与峰谷 profile 内各是一个
+ * 独立对象 `{ defaults, candidates, fallbackLimit }`。
+ *
+ * 放在 shared 层是因为 Host 的读取投影、写入校验、峰谷 profile 归一与运行期都要用同一个
+ * 字面量：任何一端手写 "orchestrator" 都会给协议面漂移留下缝。
+ */
+export const ORCHESTRATOR_SELECTION_KEY = "orchestrator";
+
 /** 全部候选都不可用时使用的稳定错误码（ValidationError.code）。 */
 export const MODEL_CANDIDATES_EXHAUSTED = "MODEL_CANDIDATES_EXHAUSTED";
 /** 预检成功的稳定状态码（只用于 RPC 投影，不写入子代理快照）。 */

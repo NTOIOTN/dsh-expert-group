@@ -37,9 +37,9 @@ export const ORCHESTRATOR_ROLES = Object.freeze(listRoles().map((entry) => entry
  */
 const ROLE_LANES = {
   explorer: [
-    "- Lane: read-only reconnaissance; hunt symbols, callers, patterns, or tests across directories and return file locations with each fact, separating facts from inferences",
-    "- Delegate when: locating facts takes repeated search you would otherwise perform, or several searches can run in parallel; state the question and scope, not a complete solution",
-    "- Do not delegate when: it is a single lookup at a known location or already in working context",
+    "- Lane: read-only reconnaissance; hunt symbols, callers, patterns or tests across directories; return file locations, separating facts from inferences",
+    "- Delegate when: repeated search you would otherwise do, or several searches in parallel; state the question and scope, not a solution",
+    "- Do not delegate when: a single lookup at a known location or already in context",
   ],
   librarian: [
     "- Lane: read-only external evidence; verify current APIs, version-specific behavior, official docs, and upstream fixes; cite sources and versions",
@@ -47,32 +47,31 @@ const ROLE_LANES = {
     "- Do not delegate when: the answer is already established here or the fact is stable and local",
   ],
   oracle: [
-    "- Lane: read-only architecture, risk, debugging strategy, and code review; give judgment, weigh tradeoffs, and assess security, scalability, and simplification",
-    "- Delegate when: the earliest architecture, high-risk, or difficult-debugging judgment can steer the work, on a user-asked code review, or after a large or high-risk implementation; the question need not be resolved first, and a user-requested review keeps this trigger even when the change itself looks routine",
-    "- Do not delegate when: a change is routine and the correct approach is already clear but none of the triggers above applies; a user-requested review or the other triggers above win over this routine exclusion",
+    "- Lane: read-only architecture, risk, debugging strategy and code review; weigh tradeoffs, security, scalability, simplification",
+    "- Delegate when: early architecture, high-risk or hard-debugging judgment can steer the work; a user-asked review always triggers it, even for a routine change; a large or high-risk implementation is finished",
+    "- Do not delegate when: the change is routine and the approach is clear, unless a review was asked",
   ],
   designer: [
-    "- Lane: UI/UX and visual implementation: layout, interaction, hierarchy, spacing, responsive behavior, and accessibility",
-    "- Delegate when: layout, interaction, hierarchy, responsive behavior, or accessibility involves a design choice, or users see the result; give constraints, not the finished design",
-    "- Do not delegate when: the work is headless logic, or a small copy or token change with an already-fixed design",
+    "- Lane: frontend, UI/UX and visual implementation: layout, interaction, hierarchy, spacing, responsive behavior, accessibility, web UI and user-visible deliverables (HTML, PPT/decks, charts, diagrams)",
+    "- Delegate when: users see or feel the result — layout, interaction, hierarchy, spacing, responsive behavior, accessibility, styling, UI copy, web UI/HTML, or any visual deliverable; mandatory for frontend work, with no size or already-specified exception",
+    "- Do not delegate when: headless logic or non-visual backend work; small or already-specified frontend work is still designer's, never fixer's",
   ],
   fixer: [
-    "- Lane: implementation of an agreed approach: implement, repeat mechanical edits, migrate, and complete tests from a decided direction, including one large single-file change, then report validation evidence",
-    "- Delegate when: an agreed approach is already fixed and the implementation labor is time-consuming, repeatable, or mechanical, including one large single-file change",
-    "- Do not delegate when: requirements, public behavior, or architecture constraints still need decisions, or it needs root permission, user confirmation, or further delegation",
+    "- Lane: implementation of an agreed non-frontend approach: implement, repeat mechanical edits, migrate and complete tests from a decided direction, including one large single-file change, then report validation evidence",
+    "- Delegate when: an agreed approach is already fixed and the labor is backend, tooling, data, docs or test-only, including one large single-file change",
+    "- Do not delegate when: the change is frontend or user-visible (designer's job), or requirements, public behavior or architecture still need decisions, or it needs root permission, user confirmation or further delegation",
   ],
   observer: [
-    "- Lane: read-only visual analysis of a Host-owned durable image attachment (screenshot, chart, or diagram) returning structured facts; PDF pages only when a legal image form already presents them",
-    "- Delegate when: the visual facts of a real durable image attachment are needed, only when the current image-routing policy permits; only a Host-created durable attachment is valid input and never accept a client-supplied path. Automatic image routing uses its fixed visual task without user text or the general task-context template",
-    "- Do not delegate when: plain text inspection is sufficient, or there is no real durable image attachment",
+    "- Lane: read-only visual analysis of a Host-owned durable image attachment (screenshot, chart, diagram), returning structured facts; PDFs only when already a legal image form",
+    "- Delegate when: visual facts of a real durable image attachment are needed and the image-routing policy permits it; automatic routing uses its fixed visual-only task; a client-supplied path is never valid input",
+    "- Do not delegate when: plain text inspection suffices, or there is no real durable image attachment",
   ],
 };
 
 const FANOUT_DESCRIPTION = [
   "fanout",
-  "- Generic same-role fan-out: one role plus an ordered shards array; each shard is an independent child attempt with bounded per-role concurrency, wait-all aggregation, cancellation, and manual retry.",
-  "- Use unique shardIds and affectedPaths for conflict checks; the call returns a parentTaskId immediately.",
-  "- Use fan-out for genuinely independent same-role work: declare each unit one shard instead of repeating the same role call, and give truthful affectedPaths that cover what each shard reads and writes.",
+  "- Generic same-role fan-out: one role plus an ordered shards array; each shard is an independent child attempt with bounded concurrency, wait-all, cancellation and manual retry; the call returns a parentTaskId immediately.",
+  "- Use unique shardIds and truthful affectedPaths for conflict checks; declare each genuinely independent unit one shard instead of repeating role calls.",
 ];
 
 for (const entry of listRoles()) {
@@ -331,11 +330,12 @@ function buildOrchestratorPromptTemplate(enabledRoles, providerReady, observerPr
   const role = [
     "<Role>",
     "You are the primary workflow manager for coding work: own requirements, decomposition, key judgment calls, integration, and final acceptance.",
-    "Delegate clear, time-consuming, repeatable, or independently verifiable labor to the enabled role that fits: explorer and librarian for evidence, fixer for implementation, oracle or designer early for judgment. The root retains cross-task decisions.",
+    "Delegate to the enabled role that fits: explorer or librarian for evidence, oracle for architecture, risk, debugging and review, designer for frontend work, fixer for non-frontend implementation. The root retains cross-task decisions.",
+    "Frontend and user-visible work is ALWAYS designer's, never the root's or fixer's: UI/UX, interaction, layout, styling, responsive/accessibility behavior, web UI/HTML, and visual deliverables such as PPT/decks, charts and diagrams. Split mixed work and route its frontend part to designer. Give designer constraints plus acceptance criteria, never a finished component spec (no exact CSS, classes, JSX or file:line). Overrides the tiny-work exception: no user-visible change is too small for designer.",
     "Your own ability, a single file, or an already-clear approach is not by itself a reason to skip delegation; dispatch it before completing that same labor yourself.",
     "Work directly only for a genuinely tiny work unit: context here, a single known lookup, a terse edit, or necessary integration. Judge the whole work unit, not action by action, and do not break work into repeated tiny actions to avoid delegation. Line or file counts are not evidence of low risk.",
-    "Integration means assembling expert results, not taking over the implementation; verification of expert output means checking the acceptance criteria, not redoing the whole body of labor.",
-    "Beyond these root responsibilities and tiny direct-work exceptions: only fall back to doing it yourself when no enabled, available role fits the work. Do not treat a busy role or overlapping scope as role unavailability. No fallback bypasses permission, scope, or required professional judgment.",
+    "Integration means assembling expert results, not redoing their work; verify acceptance criteria, not the whole body of labor.",
+    "Otherwise fall back to doing it yourself only when no enabled, available role fits; a busy role or overlapping scope is not unavailability, and no fallback bypasses permission, scope, or required professional judgment.",
     "Skills define the method; delegate suitable work units within that method. Keep stages needing root permissions, user confirmation, or further delegation with the root.",
     "</Role>",
   ].join("\n");

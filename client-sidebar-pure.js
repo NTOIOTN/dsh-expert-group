@@ -441,6 +441,13 @@
        * 原样保留映射形状，逐角色合法性由 normalizeSessionModelSelection 在消费点再校验。
        */
       roleDefaults: object(source.roleDefaults),
+      /**
+       * 全局主代理配置（{ defaults, candidates, fallbackLimit }，批次 A 读面）。
+       *
+       * 只在 get().orchestrator 读不到时用作「已配置值」的兜底展示；优先级判定（覆盖 > 时段 >
+       * 全局）仍由 Host 读面给出，客户端绝不自己重算一套。
+       */
+      orchestrator: object(source.orchestrator),
       modelPrices: Array.isArray(source.modelPrices) ? source.modelPrices : [],
       usage: object(source.usage),
       throttle: Object.keys(concurrency.throttle === undefined ? {} : object(concurrency.throttle)).length === 0
@@ -455,6 +462,9 @@
   // 侧边栏与设置页是两个独立客户端组件（classic bundle，无法互相 import），因此这里保留
   // 一组**形状收敛**的纯函数：不发 RPC、不读写宿主状态，只把注入值收敛成有界结构。
   // 所有读写仍走 callRpc 这唯一入口，语义与设置页 useSessionOverrideSection 逐条对齐。
+
+  /** 主代理在会话覆盖表里的保留键（与 Host 的 ORCHESTRATOR_SELECTION_KEY 同值）。 */
+  const ORCHESTRATOR_ROW_KEY = "orchestrator";
 
   /** meta.roles 缺失/为空时的回退角色表（与 Host 内置角色同源，顺序即展示顺序）。 */
   const SESSION_MODEL_ROLE_FALLBACK = Object.freeze(["explorer", "librarian", "oracle", "designer", "fixer", "observer"]);
@@ -504,6 +514,33 @@
     };
   }
 
+  /** applyState 的六个稳定取值（Host 契约，见 host/orchestrator-model.js）；读面出现别的值按缺失降级。 */
+  const ORCHESTRATOR_APPLY_STATES = ["applied", "pending", "unapplied", "manual", "none", "host-not-ready"];
+
+  /**
+   * 主代理行的读面投影：applyState 六态 + 按状态选出的「显示值」。
+   *
+   * 六态判定表在 Host（host/orchestrator-model.js）：客户端**不得**再用 effective 猜测
+   * 「是否实际生效」。这里只按状态选显示值——applied / manual 显示实际套用值，其余
+   * （pending / unapplied / host-not-ready / none）显示期望配置。
+   * 读面缺失（旧宿主 / get 失败）时按 hostReady 归到 host-not-ready 或 none。
+   */
+  function sessionModelOrchestratorOf(statusValue, metaValue) {
+    const status = object(statusValue);
+    const raw = text(status.applyState, null);
+    const state = ORCHESTRATOR_APPLY_STATES.includes(raw) === true
+      ? raw
+      : (status.hostReady === false ? "host-not-ready" : "none");
+    const applied = normalizeSessionModelSelection(status.applied);
+    // effective 已含「覆盖 > 时段 > 全局」的层级解析，因此不再单独读 configured（同一事实的重复来源）。
+    const expected = normalizeSessionModelSelection(status.effective)
+      ?? normalizeSessionModelSelection(object(object(metaValue).orchestrator).defaults);
+    return {
+      state,
+      selection: (state === "applied" || state === "manual" ? applied : null) ?? expected,
+    };
+  }
+
   /** 草稿 -> 可提交 selection：effort 为空表示「模型默认」，请求里不携带该字段。 */
   function sessionModelSelectionOfDraft(draft) {
     const provider = typeof draft?.provider === "string" ? draft.provider : "";
@@ -538,6 +575,16 @@
       models.push(item);
     }
     return models;
+  }
+
+  /**
+   * 「会话模型」的**行键**：固定第一行主代理（保留键，不是角色）+ meta 角色清单。
+   *
+   * 只用于覆盖归一 / 待提交改动 / 本地校验：这些判据必须认识主代理的那条覆盖，
+   * 但渲染角色行仍然只用 sessionModelRolesOf（主代理另有固定行）。
+   */
+  function sessionModelRowKeysOf(metaValue) {
+    return [ORCHESTRATOR_ROW_KEY, ...sessionModelRolesOf(metaValue)];
   }
 
   /** 角色清单：meta.roles 优先（保持 Host 顺序、去重），缺失/为空时回退内置角色表。 */
@@ -834,7 +881,7 @@
     latestShardChildIdOf, mergedRoleLabelsOf, modelApi, modelFunction,
     normalizeHostMeta, normalizeSessionModelOverrides, normalizeSessionModelSelection, normalizeSessionModelView,
     object, resolveExpertRightbarWidthRatio, retryWarningThreshold, roleLabelFor,
-    safeNormalize, sessionModelModelOptions, sessionModelRolesOf, sessionModelSelectionEquals,
+    safeNormalize, sessionModelModelOptions, sessionModelOrchestratorOf, sessionModelRolesOf, sessionModelRowKeysOf, sessionModelSelectionEquals,
     sessionModelSelectionOfDraft, snapshotHasUsageFact, statusOf, storeRightbarWidthRatio,
     text,
   });

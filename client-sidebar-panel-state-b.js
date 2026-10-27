@@ -27,21 +27,23 @@
   const PURE = global[PURE_SYMBOL] || {};
   const {
     normalizeSessionModelOverrides, normalizeSessionModelSelection, object,
-    sessionModelModelOptions, sessionModelRolesOf, sessionModelSelectionEquals,
+    sessionModelModelOptions, sessionModelRowKeysOf, sessionModelSelectionEquals,
     sessionModelSelectionOfDraft, text,
   } = PURE;
 
   /**
-   * 某个角色草稿的 base：已有草稿优先；否则取「本会话覆盖 ?? 全局默认」，再归一成三个字段。
+   * 某个角色草稿的 base：已有草稿优先；否则用调用方算好的**权威基线**归一成三个字段。
+   *
+   * 基线必须由调用方按「本会话覆盖 ?? 显示值 ?? 全局默认」算好再交进来：主代理的显示值
+   * 来自读面（applyState 语义），不在 roleDefaults 里，本层无法自行拼出两层来源。
    * 只记录用户实际改过的字段，未改过的行始终跟随权威值。
    */
-  function draftBaseOf(previous, role, overrides, roleDefaults) {
+  function draftBaseOf(previous, role, baseline) {
     if (Object.prototype.hasOwnProperty.call(previous, role)) return previous[role];
-    const effective = overrides?.[role] ?? normalizeSessionModelSelection(roleDefaults?.[role]);
     return {
-      provider: effective?.provider ?? "",
-      model: effective?.model ?? "",
-      reasoningEffort: effective?.reasoningEffort ?? "",
+      provider: baseline?.provider ?? "",
+      model: baseline?.model ?? "",
+      reasoningEffort: baseline?.reasoningEffort ?? "",
     };
   }
 
@@ -60,7 +62,7 @@
     const field = options?.field;
     const value = options?.value;
     const groups = options?.groups;
-    const base = draftBaseOf(previous, role, options?.overrides, options?.roleDefaults);
+    const base = draftBaseOf(previous, role, options?.baseline);
     const next = { ...base, [field]: value };
     if (field === "provider") {
       const models = value === "" ? [] : sessionModelModelOptions(value, groups);
@@ -84,9 +86,16 @@
     return { ...previous, [role]: next };
   }
 
-  /** 某个角色的「权威基线」：本会话覆盖优先，否则全局默认（都没有则空选择）。 */
-  function sessionModelBaselineOf(overrides, roleDefaults, role) {
-    return overrides?.[role] ?? normalizeSessionModelSelection(object(roleDefaults)[role]);
+  /**
+   * 某个角色的「权威基线」：本会话覆盖优先，否则它的显示默认值（都没有则空选择）。
+   *
+   * 主代理是覆盖表里的保留键（与 Host 的 ORCHESTRATOR_SELECTION_KEY 同值），它不在
+   * meta.roleDefaults 里：显示值由调用方按读面 applyState 语义取好后作为 orchestrator
+   * 传入，因此「只改思考深度」这类部分字段编辑能保存（E3）。
+   */
+  function sessionModelBaselineOf(overrides, roleDefaults, role, orchestrator) {
+    return overrides?.[role]
+      ?? (role === "orchestrator" ? orchestrator ?? null : normalizeSessionModelSelection(object(roleDefaults)[role]));
   }
 
   /**
@@ -99,7 +108,7 @@
     const drafts = object(options?.drafts);
     const baselineOf = options?.baselineOf;
     const changes = [];
-    for (const role of sessionModelRolesOf(options?.meta)) {
+    for (const role of sessionModelRowKeysOf(options?.meta)) {
       if (Object.prototype.hasOwnProperty.call(drafts, role) !== true) continue;
       const selection = sessionModelSelectionOfDraft(drafts[role]);
       if (selection.provider.length === 0 || selection.model.length === 0) continue;
@@ -112,7 +121,7 @@
   /** 本地校验：任一草稿缺 provider/model 就不允许保存（按钮禁用 + 底部提示）。 */
   function sessionModelHasInvalidDraftOf(options) {
     const drafts = object(options?.drafts);
-    for (const role of sessionModelRolesOf(options?.meta)) {
+    for (const role of sessionModelRowKeysOf(options?.meta)) {
       if (Object.prototype.hasOwnProperty.call(drafts, role) !== true) continue;
       const selection = sessionModelSelectionOfDraft(drafts[role]);
       if (selection.provider.length === 0 || selection.model.length === 0) return true;
@@ -152,7 +161,7 @@
   function describeSessionModelFailure(options) {
     const error = options?.error;
     const role = options?.role;
-    const roles = Array.isArray(options?.roles) ? options.roles : sessionModelRolesOf(options?.meta);
+    const roles = Array.isArray(options?.roles) ? options.roles : sessionModelRowKeysOf(options?.meta);
     const t = options?.t;
     const code = text(object(error).code, null);
     const details = object(object(error).details);

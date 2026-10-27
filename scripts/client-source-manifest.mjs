@@ -138,6 +138,19 @@ const IIFE_EXECUTION_ORDER = Object.freeze([
   // 左侧栏入口 + 同名 main 面板：不读任何兄弟 IIFE 检查点（react 与设置依赖由 descriptor
   // 在运行期传入），因此排在同类 R8 客户端模块之后、唯一 descriptor 之前即可。
   "client-sidebar-entry.js",
+  // ── 会话删除（票据 05）：多选状态机与 RPC 封装 ─────────────────────────────────
+  // 不读任何兄弟 IIFE 检查点（RPC 端口由渲染层注入），因此没有依赖边，位置只需满足
+  // 「先于唯一 descriptor」；票据 06/07 从这里取回纯函数与异步编排。
+  "client-session-delete-selection.js",
+  // ── 会话删除（票据 08）：结算后的本地键清理与列表对账 ───────────────────────────
+  // 读归属账本检查点（client-sidebar-auto-ledger.js）做 scope 清理，因此必须晚于账本、
+  // 且早于交互层（ui 在结算后调用它）。它不读 selection / view，没有其它依赖边。
+  "client-session-delete-local-keys.js",
+  // ── 会话删除（票据 06/07）：可见层 → 交互层 ─────────────────────────────────
+  // 依赖方向固定：view 只读模型（文案）与 views-b（焦点环）检查点；ui 读 selection / view /
+  // sidebar-poll（唯一 RPC 入口）并把装配函数提供给 descriptor。view 必须先执行。
+  "client-session-delete-view.js",
+  "client-session-delete-ui.js",
 ]);
 
 /**
@@ -1001,6 +1014,59 @@ export const iifeDependencies = Object.freeze([
     from: "client-plugin-detail.js",
     to: "client-entry.js",
     symbols: Object.freeze(["dsh-expert-group/client-plugin-detail"]),
+    via: "iife-symbol",
+  }),
+  // 会话删除（票据 06/07）：可见层读模型（文案）与 views-b（焦点环）检查点；交互层读
+  // selection（状态机）、view（渲染）与 sidebar-poll（唯一 RPC 入口）；descriptor 从
+  // 交互层取回安装函数。方向仍是「提供方 -> 读取方」，图中无环。
+  Object.freeze({
+    from: "client-session-delete-selection.js",
+    to: "client-session-delete-ui.js",
+    symbols: Object.freeze(["dsh-expert-group/client-session-delete-selection"]),
+    via: "iife-symbol",
+  }),
+  Object.freeze({
+    from: "client-session-delete-view.js",
+    to: "client-session-delete-ui.js",
+    symbols: Object.freeze(["dsh-expert-group/client-session-delete-view"]),
+    via: "iife-symbol",
+  }),
+  // 票据 08：本地键清理读归属账本检查点的清理命令（账本是归属表的唯一 owner），交互层则在
+  // 结算后调用清理模块。两条边都保持「提供方 -> 读取方」方向，图中无环。
+  Object.freeze({
+    from: "client-sidebar-auto-ledger.js",
+    to: "client-session-delete-local-keys.js",
+    symbols: Object.freeze(["dsh-expert-group/client-sidebar-auto-ledger"]),
+    via: "iife-symbol",
+  }),
+  Object.freeze({
+    from: "client-session-delete-local-keys.js",
+    to: "client-session-delete-ui.js",
+    symbols: Object.freeze(["dsh-expert-group/client-session-delete-local-keys"]),
+    via: "iife-symbol",
+  }),
+  Object.freeze({
+    from: "client-sidebar-poll.js",
+    to: "client-session-delete-ui.js",
+    symbols: Object.freeze(["dsh-expert-group/client-sidebar-poll"]),
+    via: "iife-symbol",
+  }),
+  Object.freeze({
+    from: "client-expert-group-model.js",
+    to: "client-session-delete-view.js",
+    symbols: Object.freeze(["dsh-expert-group/client-expert-group-model"]),
+    via: "iife-symbol",
+  }),
+  Object.freeze({
+    from: "client-model-views-b.js",
+    to: "client-session-delete-view.js",
+    symbols: Object.freeze(["dsh-expert-group/client-model-views-b"]),
+    via: "iife-symbol",
+  }),
+  Object.freeze({
+    from: "client-session-delete-ui.js",
+    to: "client-entry.js",
+    symbols: Object.freeze(["dsh-expert-group/client-session-delete-ui"]),
     via: "iife-symbol",
   }),
 ]);

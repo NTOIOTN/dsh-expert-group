@@ -725,6 +725,34 @@ en:"Choose a provider and model for every edited role.",
 zh:"清除{role}的本会话覆盖",
 en:"Clear the session override for {role}",
 },
+"sidebar.sessionModel.orchestrator.applied":{
+zh:"实际生效：{value}（{source}）",
+en:"Applied: {value} ({source})",
+},
+"sidebar.sessionModel.orchestrator.pending":{
+zh:"正在应用：{value}（{source}）",
+en:"Applying: {value} ({source})",
+},
+"sidebar.sessionModel.orchestrator.unapplied":{
+zh:"配置未生效：{value}（{source}）",
+en:"Not applied: {value} ({source})",
+},
+"sidebar.sessionModel.orchestrator.manual":{zh:"本会话已手动接管",en:"Manually taken over in this session"},
+"sidebar.sessionModel.orchestrator.none":{zh:"不干预",en:"Not configured"},
+"sidebar.sessionModel.orchestrator.host-not-ready":{zh:"宿主未就绪",en:"Host not ready"},
+"sidebar.sessionModel.orchestrator.degraded":{zh:"已降级到候选 {index}",en:"Degraded to candidate {index}"},
+"sidebar.sessionModel.orchestrator.saved":{
+zh:"已保存，主代理模型下一轮生效",
+en:"Saved; the orchestrator model applies from the next turn",
+},
+"sidebar.sessionModel.orchestrator.source.override":{zh:"会话覆盖",en:"Session override"},
+"sidebar.sessionModel.orchestrator.source.period":{zh:"当前时段",en:"Current period"},
+"sidebar.sessionModel.orchestrator.source.global":{zh:"全局配置",en:"Global config"},
+"sidebar.sessionModel.orchestrator.source.none":{zh:"不干预",en:"Not configured"},
+"settings.orchestrator.empty":{
+zh:"未配置（不干预主代理模型）",
+en:"Not configured (orchestrator model untouched)",
+},
 "settings.title":{zh:"dsh-expert-group",en:"dsh-expert-group"},
 "settings.hint":{
 zh:"专家模型使用 DSH 当前已配置的 provider 和模型目录。",
@@ -791,6 +819,39 @@ en:"Test notification: the system notification channel is available.",
 zh:"专家批次已静止，但收口结论投递失败；批次保持待收口，插件会在后续 root turn 重试。",
 en:"The expert batch is quiescent but delivering the finalization result failed; the batch remains pending and the plugin retries on later root turns.",
 },
+"sidebar.sessionDelete.row.aria":{zh:"删除「{title}」",en:"Delete \"{title}\""},
+"sidebar.sessionDelete.menu":{zh:"删除会话",en:"Delete session"},
+"sidebar.sessionDelete.multi":{zh:"删除多选会话",en:"Delete multiple sessions"},
+"sidebar.sessionDelete.bar.selectAll":{zh:"全选",en:"Select all"},
+"sidebar.sessionDelete.bar.deselectAll":{zh:"取消全选",en:"Deselect all"},
+"sidebar.sessionDelete.bar.selected":{zh:"已选 {count}",en:"{count} selected"},
+"sidebar.sessionDelete.bar.blocked":{zh:"{count} 个被占用",en:"{count} in use"},
+"sidebar.sessionDelete.checkbox.aria":{zh:"选择「{title}」",en:"Select \"{title}\""},
+"sidebar.sessionDelete.dialog.cancel":{zh:"取消",en:"Cancel"},
+"sidebar.sessionDelete.dialog.confirm":{zh:"删除",en:"Delete"},
+"sidebar.sessionDelete.dialog.running":{zh:"删除中…",en:"Deleting…"},
+"sidebar.sessionDelete.dialog.title":{zh:"删除会话",en:"Delete session"},
+"sidebar.sessionDelete.dialog.single":{zh:"确定删除「{title}」？",en:"Delete \"{title}\"?"},
+"sidebar.sessionDelete.dialog.batch":{zh:"将处理 {count} 个会话。",en:"Processes {count} sessions."},
+"sidebar.sessionDelete.dialog.absent":{zh:"其中 {count} 个仅清理残留配置。",en:"{count} are leftover-only."},
+"sidebar.sessionDelete.dialog.blocked":{zh:"另有 {count} 个被占用，不会删除。",en:"{count} are in use and skipped."},
+"sidebar.sessionDelete.dialog.first":{zh:"前 {count} 个：{titles}",en:"First {count}: {titles}"},
+"sidebar.sessionDelete.dialog.irreversible":{zh:"此操作不可恢复。",en:"This cannot be undone."},
+"sidebar.sessionDelete.blocked.title":{zh:"不可删除",en:"Cannot delete"},
+"sidebar.sessionDelete.blocked.live":{zh:"该会话仍被 DSH 占用，重启 DSH 后可删除。",en:"In use by DSH; restart DSH to delete."},
+"sidebar.sessionDelete.blocked.liveDescendant":{zh:"子会话「{title}」仍被占用，重启 DSH 后可删除。",en:"Sub-session \"{title}\" is in use; restart DSH."},
+"sidebar.sessionDelete.blocked.pending":{zh:"上次删除的清理未完成，重启 DSH 后再试。",en:"Previous cleanup unfinished; restart DSH."},
+"sidebar.sessionDelete.blocked.missing":{zh:"该会话不在本工作区可删除范围内。",en:"Not in this workspace's deletable set."},
+"sidebar.sessionDelete.reason.skipped":{zh:"仍被占用",en:"still in use"},
+"sidebar.sessionDelete.reason.failed":{zh:"删除失败",en:"delete failed"},
+"sidebar.sessionDelete.reason.raced":{zh:"未完成（会话被重新打开，内容已保留）",en:"not deleted (reopened, kept)"},
+"sidebar.sessionDelete.outcome.deleted":{zh:"已删除 {count} 个",en:"{count} deleted"},
+"sidebar.sessionDelete.outcome.absent":{zh:"清理残留 {count} 个",en:"{count} leftover cleaned"},
+"sidebar.sessionDelete.outcome.kept":{zh:"{count} 个未删除：{reasons}",en:"{count} not deleted: {reasons}"},
+"sidebar.sessionDelete.outcome.join":{zh:"，",en:", "},
+"sidebar.sessionDelete.outcome.reasonJoin":{zh:"、",en:", "},
+"sidebar.sessionDelete.error.candidates":{zh:"读取可删除会话失败：{message}",en:"Cannot list deletable sessions: {message}"},
+"sidebar.sessionDelete.error.delete":{zh:"删除失败：{message}",en:"Delete failed: {message}"},
 });
 function pad2(value){
 return value<10?"0"+value:String(value);
@@ -1915,6 +1976,35 @@ return keys.length;
 return 0;
 }
 };
+const purgeSidebarAutoOwnershipForSessions=(sessionIds)=>{
+try{
+const ids=new Set();
+for(const entry of Array.isArray(sessionIds)?sessionIds:[]){
+if(typeof entry==="string"&&entry.length>0)ids.add(entry);
+}
+if(ids.size===0)return{ok:true,removed:0};
+const entries=sidebarOwnershipEntries();
+if(entries===null)return{ok:false,removed:0};
+const keys=[];
+for(const key of entries.keys()){
+if(typeof key!=="string")continue;
+for(const id of ids){
+if(key.startsWith(id+"|")||key.includes("|"+id+"|")===true){
+keys.push(key);
+break;
+}
+}
+}
+for(const key of keys){
+entries.delete(key);
+sidebarOwnershipMemory()?.unpersisted?.delete(key);
+}
+if(keys.length>0)persistSidebarOwnership(entries);
+return{ok:true,removed:keys.length};
+}catch{
+return{ok:false,removed:0};
+}
+};
 const recordSidebarAutoDecision=(event,candidate,verdict,reason)=>{
 recordSidebarAutoDiag({
 kind:"decision",
@@ -1927,7 +2017,7 @@ key:candidate==null?undefined:sidebarAutoKeyDigest(candidate.key),
 };
 global[SYMBOL]=Object.freeze({
 SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO,SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,clearSidebarAutoManualSuppressions,
-deleteSidebarAutoOwnership,readSidebarAutoOwnershipEntry,
+deleteSidebarAutoOwnership,purgeSidebarAutoOwnershipForSessions,readSidebarAutoOwnershipEntry,
 recordSidebarAutoDecision,recordSidebarAutoDiag,resolveSidebarSharedAutoLedger,sidebarAutoKeyDigest,
 sidebarAutoOriginEntry,sidebarAutoOriginTabIdOf,sidebarAutoOriginWrittenAtOf,sidebarBoundedText,
 sidebarLocalStorage,sidebarOwnershipAcceptsNewAuto,sidebarSharedAutoLedgerSizes,sidebarSharedAutoLedgerTotal,
@@ -2070,6 +2160,7 @@ return{
 roles,
 roleLabels:object(source.roleLabels),
 roleDefaults:object(source.roleDefaults),
+orchestrator:object(source.orchestrator),
 modelPrices:Array.isArray(source.modelPrices)?source.modelPrices:[],
 usage:object(source.usage),
 throttle:Object.keys(concurrency.throttle===undefined?{}:object(concurrency.throttle)).length===0
@@ -2078,6 +2169,7 @@ throttle:Object.keys(concurrency.throttle===undefined?{}:object(concurrency.thro
 capabilities:object(source.capabilities),
 };
 }
+const ORCHESTRATOR_ROW_KEY="orchestrator";
 const SESSION_MODEL_ROLE_FALLBACK=Object.freeze(["explorer","librarian","oracle","designer","fixer","observer"]);
 function normalizeSessionModelSelection(selection){
 if(selection===null||typeof selection!=="object"||Array.isArray(selection))return null;
@@ -2109,6 +2201,21 @@ revision:source.revision,
 live:source.live===true,
 };
 }
+const ORCHESTRATOR_APPLY_STATES=["applied","pending","unapplied","manual","none","host-not-ready"];
+function sessionModelOrchestratorOf(statusValue,metaValue){
+const status=object(statusValue);
+const raw=text(status.applyState,null);
+const state=ORCHESTRATOR_APPLY_STATES.includes(raw)===true
+?raw
+:(status.hostReady===false?"host-not-ready":"none");
+const applied=normalizeSessionModelSelection(status.applied);
+const expected=normalizeSessionModelSelection(status.effective)
+??normalizeSessionModelSelection(object(object(metaValue).orchestrator).defaults);
+return{
+state,
+selection:(state==="applied"||state==="manual"?applied:null)??expected,
+};
+}
 function sessionModelSelectionOfDraft(draft){
 const provider=typeof draft?.provider==="string"?draft.provider:"";
 const model=typeof draft?.model==="string"?draft.model:"";
@@ -2134,6 +2241,9 @@ if(id===null||models.some((existing)=>existing.id===id))continue;
 models.push(item);
 }
 return models;
+}
+function sessionModelRowKeysOf(metaValue){
+return[ORCHESTRATOR_ROW_KEY,...sessionModelRolesOf(metaValue)];
 }
 function sessionModelRolesOf(metaValue){
 const source=metaValue===null||metaValue===undefined?{}:object(metaValue);
@@ -2332,7 +2442,7 @@ formatDurationText,formatIsoText,isFailureStatusOf,isGeneratedExpertGroupTabId,
 latestShardChildIdOf,mergedRoleLabelsOf,modelApi,modelFunction,
 normalizeHostMeta,normalizeSessionModelOverrides,normalizeSessionModelSelection,normalizeSessionModelView,
 object,resolveExpertRightbarWidthRatio,retryWarningThreshold,roleLabelFor,
-safeNormalize,sessionModelModelOptions,sessionModelRolesOf,sessionModelSelectionEquals,
+safeNormalize,sessionModelModelOptions,sessionModelOrchestratorOf,sessionModelRolesOf,sessionModelRowKeysOf,sessionModelSelectionEquals,
 sessionModelSelectionOfDraft,snapshotHasUsageFact,statusOf,storeRightbarWidthRatio,
 text,
 });
@@ -2760,6 +2870,7 @@ const PANEL_CSS_SESSION_MODEL=[
 ".deg_expert_group_session_model_scroll{overflow-x:auto}",
 ".deg_expert_group_session_model_table{display:grid;grid-template-columns:minmax(84px,.6fr) minmax(132px,.82fr) minmax(210px,1.5fr) minmax(96px,.62fr);min-width:540px;align-items:center}",
 ".deg_expert_group_session_model_row{display:contents}",
+".deg_expert_group_session_model_orchestrator{grid-column:1/-1;padding:0 6px 6px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;overflow-wrap:anywhere}",
 ".deg_expert_group_session_model_head_cell{min-width:0;padding:8px 6px 6px;border-bottom:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;font-weight:600}",
 ".deg_expert_group_session_model_cell{display:flex;align-items:center;min-width:0;padding:8px 6px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
 ".deg_expert_group_session_model_cell select{width:100%;min-width:0;box-sizing:border-box;padding:5px 6px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2,transparent);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}",
@@ -3344,7 +3455,6 @@ response=await fn(...rpcAdapterArguments(protocol,ctx,request,init));
 }catch(error){
 throw markRpcTransportFailure(error);
 }
-if(response?.ok===false)throw rpcBusinessError(response.error);
 if(typeof response?.json==="function"){
 let payload;
 try{
@@ -3356,6 +3466,7 @@ if(payload?.ok===false)throw rpcBusinessError(payload.error);
 const body=payload?.value??payload;
 return typeof select==="function"?select(body):(body?.snapshot??body);
 }
+if(response?.ok===false)throw rpcBusinessError(response.error);
 if(response?.value!==undefined){
 if(typeof select==="function")return select(response.value);
 return response.value?.snapshot??response.value;
@@ -4340,16 +4451,15 @@ const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
 const PURE=global[PURE_SYMBOL]||{};
 const{
 normalizeSessionModelOverrides,normalizeSessionModelSelection,object,
-sessionModelModelOptions,sessionModelRolesOf,sessionModelSelectionEquals,
+sessionModelModelOptions,sessionModelRowKeysOf,sessionModelSelectionEquals,
 sessionModelSelectionOfDraft,text,
 }=PURE;
-function draftBaseOf(previous,role,overrides,roleDefaults){
+function draftBaseOf(previous,role,baseline){
 if(Object.prototype.hasOwnProperty.call(previous,role))return previous[role];
-const effective=overrides?.[role]??normalizeSessionModelSelection(roleDefaults?.[role]);
 return{
-provider:effective?.provider??"",
-model:effective?.model??"",
-reasoningEffort:effective?.reasoningEffort??"",
+provider:baseline?.provider??"",
+model:baseline?.model??"",
+reasoningEffort:baseline?.reasoningEffort??"",
 };
 }
 function nextSessionModelDrafts(options){
@@ -4358,7 +4468,7 @@ const role=options?.role;
 const field=options?.field;
 const value=options?.value;
 const groups=options?.groups;
-const base=draftBaseOf(previous,role,options?.overrides,options?.roleDefaults);
+const base=draftBaseOf(previous,role,options?.baseline);
 const next={...base,[field]:value};
 if(field==="provider"){
 const models=value===""?[]:sessionModelModelOptions(value,groups);
@@ -4381,14 +4491,15 @@ next.reasoningEffort="";
 }
 return{...previous,[role]:next};
 }
-function sessionModelBaselineOf(overrides,roleDefaults,role){
-return overrides?.[role]??normalizeSessionModelSelection(object(roleDefaults)[role]);
+function sessionModelBaselineOf(overrides,roleDefaults,role,orchestrator){
+return overrides?.[role]
+??(role==="orchestrator"?orchestrator??null:normalizeSessionModelSelection(object(roleDefaults)[role]));
 }
 function sessionModelPendingChangesOf(options){
 const drafts=object(options?.drafts);
 const baselineOf=options?.baselineOf;
 const changes=[];
-for(const role of sessionModelRolesOf(options?.meta)){
+for(const role of sessionModelRowKeysOf(options?.meta)){
 if(Object.prototype.hasOwnProperty.call(drafts,role)!==true)continue;
 const selection=sessionModelSelectionOfDraft(drafts[role]);
 if(selection.provider.length===0||selection.model.length===0)continue;
@@ -4399,7 +4510,7 @@ return changes;
 }
 function sessionModelHasInvalidDraftOf(options){
 const drafts=object(options?.drafts);
-for(const role of sessionModelRolesOf(options?.meta)){
+for(const role of sessionModelRowKeysOf(options?.meta)){
 if(Object.prototype.hasOwnProperty.call(drafts,role)!==true)continue;
 const selection=sessionModelSelectionOfDraft(drafts[role]);
 if(selection.provider.length===0||selection.model.length===0)return true;
@@ -4425,7 +4536,7 @@ return options?.mounted===true
 function describeSessionModelFailure(options){
 const error=options?.error;
 const role=options?.role;
-const roles=Array.isArray(options?.roles)?options.roles:sessionModelRolesOf(options?.meta);
+const roles=Array.isArray(options?.roles)?options.roles:sessionModelRowKeysOf(options?.meta);
 const t=options?.t;
 const code=text(object(error).code,null);
 const details=object(object(error).details);
@@ -5124,7 +5235,7 @@ const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
 const PURE=global[PURE_SYMBOL]||{};
 const{
 ACTIVE_STATUSES,RETRY_STATUSES,RUNTIME_STATUS_LABELS,STATUS_FILTER_OPTIONS,
-normalizeSessionModelSelection,object,sessionModelModelOptions,sessionModelRolesOf,statusOf,text,
+normalizeSessionModelSelection,object,sessionModelModelOptions,sessionModelOrchestratorOf,sessionModelRolesOf,statusOf,text,
 }=PURE;
 const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
 const DOM=global[DOM_SYMBOL]||{};
@@ -5328,10 +5439,35 @@ value,
 ...(disabled===true?{disabled:true}:{}),
 },label);
 };
-const sessionModelRowOf=(ctx,role,groups)=>{
+const sessionModelOrchestratorViewOf=(ctx)=>{
+const{t}=ctx;
+const status=object(ctx.sessionModelState?.orchestrator);
+const{state,selection}=sessionModelOrchestratorOf(status,ctx.meta);
+const degraded=Number.isSafeInteger(status.degradedCandidate)&&status.degradedCandidate>0
+?status.degradedCandidate
+:0;
+const source=["override","period","global"].includes(status.source)?status.source:"none";
+const line=t("sidebar.sessionModel.orchestrator."+state,{
+value:selection===null
+?""
+:selection.provider+" / "+selection.model+(selection.reasoningEffort?" · "+selection.reasoningEffort:""),
+source:t("sidebar.sessionModel.orchestrator.source."+source),
+});
+return{
+selection,
+hostReady:state!=="host-not-ready",
+text:degraded>0&&state==="applied"
+?line+" · "+t("sidebar.sessionModel.orchestrator.degraded",{index:degraded})
+:line,
+state,
+};
+};
+const sessionModelRowOf=(ctx,role,groups,fallback,label)=>{
 const{t,meta,sessionModelState,sessionModelDrafts}=ctx;
 const current=sessionModelState.overrides[role]??null;
-const globalDefault=normalizeSessionModelSelection(object(meta?.roleDefaults)[role]);
+const globalDefault=fallback!==void 0
+?fallback
+:normalizeSessionModelSelection(object(meta?.roleDefaults)[role]);
 const hasDraft=Object.prototype.hasOwnProperty.call(sessionModelDrafts,role);
 const baseline=current??globalDefault;
 const editable=hasDraft
@@ -5344,7 +5480,7 @@ reasoningEffort:baseline?.reasoningEffort??"",
 const providerValue=typeof editable.provider==="string"?editable.provider:"";
 const modelValue=typeof editable.model==="string"?editable.model:"";
 const effortValue=typeof editable.reasoningEffort==="string"?editable.reasoningEffort:"";
-const roleLabel=ctx.a.roleLabelFor(role,null)??role;
+const roleLabel=label??ctx.a.roleLabelFor(role,null)??role;
 const providerGroup=groups.find((group)=>text(object(group).id,null)===providerValue);
 const models=sessionModelModelOptions(providerValue,groups);
 const modelEntry=models.find((candidate)=>text(object(candidate).id,null)===modelValue);
@@ -5399,7 +5535,8 @@ providerOptions,modelOptions,effortOptions,reasoning,providerGroup,
 const renderSessionModelRow=(ctx,role,options)=>{
 const{react,t,updateSessionModelDraft,clearSessionModelRole}=ctx;
 const writable=options.writable;
-const row=sessionModelRowOf(ctx,role,options.groups);
+const orchestrator=options.orchestrator===true;
+const row=sessionModelRowOf(ctx,role,options.groups,options.fallback,options.label);
 const{
 current,roleLabel,providerValue,modelValue,effortValue,
 providerOptions,modelOptions,effortOptions,reasoning,providerGroup,
@@ -5475,7 +5612,10 @@ value:effortValue,
 disabled:writable!==true||reasoning===null||modelValue==="",
 onChange:(event)=>updateSessionModelDraft(role,"reasoningEffort",event?.target?.value??""),
 },effortOptions)),
-]));
+].concat(orchestrator&&options.status?[react.createElement("div",{
+className:"deg_expert_group_session_model_orchestrator",
+"data-deg-session-model-orchestrator":options.status.state,
+},options.status.text)]:[])));
 };
 const renderSessionModelFooter=(ctx,options)=>{
 const{react,t,sessionModelState,commitSessionModelChanges,restoreSessionModelDefaults}=ctx;
@@ -5559,7 +5699,7 @@ const readOnlyHint=status==="ready"
 const noticeText=sessionModelNotice===null
 ?null
 :sessionModelNotice.kind==="saved"
-?t("sidebar.sessionModel.saved")
+?(sessionModelNotice.text??t("sidebar.sessionModel.saved"))
 :sessionModelNotice.kind==="cleared"
 ?t("sidebar.sessionModel.cleared")
 :sessionModelNotice.text;
@@ -5602,6 +5742,15 @@ className:"deg_expert_group_session_model_head_cell",
 ]);
 const rows=[];
 if(status==="ready"){
+const orchestratorView=sessionModelOrchestratorViewOf(ctx);
+rows.push(renderSessionModelRow(ctx,"orchestrator",{
+writable:writable===true&&orchestratorView.hostReady===true,
+groups,
+fallback:orchestratorView.selection,
+label:"Orchestrator",
+status:orchestratorView,
+orchestrator:true,
+}));
 for(const role of roles){
 rows.push(renderSessionModelRow(ctx,role,{writable,groups}));
 }
@@ -8315,7 +8464,7 @@ const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
 const PURE=global[PURE_SYMBOL]||{};
 const{
 RIGHTBAR_WIDTH_RATIO,RIGHTBAR_WIDTH_RATIO_MAX,RIGHTBAR_WIDTH_RATIO_MIN,clampRightbarWidthRatio,normalizeHostMeta,normalizeSessionModelView,
-object,sessionModelRolesOf,snapshotHasUsageFact,
+object,sessionModelOrchestratorOf,sessionModelRowKeysOf,snapshotHasUsageFact,
 }=PURE;
 const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
 const DOM=global[DOM_SYMBOL]||{};
@@ -8405,7 +8554,8 @@ sessionModelCatalog,sessionModelDialogRef,sessionModelDrafts,sessionModelEntryRe
 sessionModelLoadedRootRef,sessionModelNotice,sessionModelOpen,
 sessionModelReloadToken,sessionModelRequestSerialRef,sessionModelSaving,sessionModelState,
 sessionModelSurfaceRef,sessionModelWasOpenRef,setAnnouncement,setAutoOpenDraft,setFilterState,setMeta,
-setSessionModelCatalog,setSessionModelDrafts,setSessionModelNotice,setSessionModelOpen,setSessionModelReloadToken,setSessionModelSaving,
+setSessionModelCatalog,setSessionModelDrafts,setSessionModelNotice,setSessionModelOpen,
+setSessionModelReloadToken,setSessionModelSaving,
 setSessionModelState,setState,state,timelineExpandedRef,version,
 viewState,
 });
@@ -8590,7 +8740,7 @@ setSessionModelDrafts({});
 return;
 }
 const targetSessionId=rootSessionId;
-const roles=sessionModelRolesOf(metaStateRef.current);
+const roles=sessionModelRowKeysOf(metaStateRef.current);
 setSessionModelSaving(true);
 setSessionModelNotice(null);
 let revision=sessionModelState.revision;
@@ -8622,11 +8772,15 @@ settleSessionModelFailure(error,null);
 if(sidebarSurfaceStillCurrent()===true)setSessionModelSaving(false);
 }
 }
+function sessionModelBaselineOfFrame(sessionModelState,meta,role){
+return PANEL_STATE_B.sessionModelBaselineOf(sessionModelState.overrides,meta?.roleDefaults,role,
+sessionModelOrchestratorOf(sessionModelState.orchestrator,meta).selection);
+}
 function useSidebarPanelSessionModel(frame){
 const{
 config,contextRef,metaStateRef,mountedRef,rootSessionId,sessionModelCatalog,
-sessionModelDrafts,sessionModelSaving,sessionModelState,setSessionModelDrafts,setSessionModelNotice,setSessionModelSaving,
-setSessionModelState,sidebarSessionId,t,
+sessionModelDrafts,sessionModelSaving,sessionModelState,setSessionModelDrafts,setSessionModelNotice,
+setSessionModelReloadToken,setSessionModelSaving,setSessionModelState,sidebarSessionId,t,
 }=frame;
 const sidebarSurfaceStillCurrent=(...args)=>frame.late.sidebarSurfaceStillCurrent(...args);
 const updateSessionModelDraft=(role,field,value)=>{
@@ -8635,32 +8789,27 @@ previous,
 role,
 field,
 value,
-overrides:sessionModelState.overrides,
-roleDefaults:metaStateRef.current?.roleDefaults,
+baseline:sessionModelBaselineOfFrame(sessionModelState,metaStateRef.current,role),
 groups:sessionModelCatalog.groups,
 }));
 setSessionModelNotice(null);
 };
-const sessionModelBaselineOf=(role)=>PANEL_STATE_B.sessionModelBaselineOf(
-sessionModelState.overrides,
-metaStateRef.current?.roleDefaults,
-role,
-);
 const sessionModelPendingChanges=()=>PANEL_STATE_B.sessionModelPendingChangesOf({
 drafts:sessionModelDrafts,
 meta:metaStateRef.current,
-baselineOf:sessionModelBaselineOf,
+baselineOf:(role)=>sessionModelBaselineOfFrame(sessionModelState,metaStateRef.current,role),
 });
 const sessionModelHasInvalidDraft=()=>PANEL_STATE_B.sessionModelHasInvalidDraftOf({
 drafts:sessionModelDrafts,
 meta:metaStateRef.current,
 });
 const applySessionModelView=(view,role)=>{
-setSessionModelState({status:"ready",overrides:view.overrides,revision:view.revision,live:view.live});
+setSessionModelState((previous)=>({...previous,status:"ready",overrides:view.overrides,revision:view.revision,live:view.live}));
 setSessionModelDrafts((previous)=>PANEL_STATE_B.withoutRoleDraft(previous,role));
+if(role==="orchestrator")setTimeout(()=>setSessionModelReloadToken((value)=>value+1),800);
 };
 const settleSessionModelFailure=(error,role)=>{
-const roles=sessionModelRolesOf(metaStateRef.current);
+const roles=sessionModelRowKeysOf(metaStateRef.current);
 const outcome=PANEL_STATE_B.describeSessionModelFailure({error,role,roles,t});
 if(outcome.statePatch!==null){
 const patch=outcome.statePatch;
@@ -8686,7 +8835,7 @@ if(sessionModelHasInvalidDraft())return;
 const changes=sessionModelPendingChanges();
 if(changes.length===0)return;
 const targetSessionId=rootSessionId;
-const roles=sessionModelRolesOf(metaStateRef.current);
+const roles=sessionModelRowKeysOf(metaStateRef.current);
 setSessionModelSaving(true);
 setSessionModelNotice(null);
 let revision=sessionModelState.revision;
@@ -8715,7 +8864,13 @@ revision=view.revision;
 applySessionModelView(view,change.role);
 }
 if(sidebarSurfaceStillCurrent()!==true)return;
-setSessionModelNotice({kind:"saved",revision});
+setSessionModelNotice({
+kind:"saved",
+...(changes.some((change)=>change.role==="orchestrator")
+?{text:t("sidebar.sessionModel.orchestrator.saved")}
+:{}),
+revision,
+});
 }catch(error){
 if(sidebarSurfaceStillCurrent()!==true)return;
 settleSessionModelFailure(error,changes[changes.length-1]?.role??null);
@@ -8727,7 +8882,7 @@ const clearSessionModelRole=async(role)=>{
 if(sessionModelWriteReady()!==true)return;
 if(sessionModelState.overrides[role]===undefined)return;
 const targetSessionId=rootSessionId;
-const roles=sessionModelRolesOf(metaStateRef.current);
+const roles=sessionModelRowKeysOf(metaStateRef.current);
 setSessionModelSaving(true);
 setSessionModelNotice(null);
 try{
@@ -8764,7 +8919,7 @@ sessionModelWriteReady,setSessionModelDrafts,setSessionModelNotice,setSessionMod
 settleSessionModelFailure,sidebarSurfaceStillCurrent,t,
 });
 Object.assign(frame,{
-clearSessionModelRole,commitSessionModelChanges,restoreSessionModelDefaults,sessionModelBaselineOf,
+clearSessionModelRole,commitSessionModelChanges,restoreSessionModelDefaults,
 sessionModelHasInvalidDraft,sessionModelPendingChanges,updateSessionModelDraft,
 });
 }
@@ -8930,7 +9085,7 @@ const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
 const PURE=global[PURE_SYMBOL]||{};
 const{
 ANNOUNCEMENT_MAX_ITEMS,collectAnnouncementTasks,collectSnapshotSessionIds,normalizeSessionModelView,object,safeNormalize,
-sessionModelRolesOf,text,
+sessionModelRowKeysOf,text,
 }=PURE;
 const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
 const DOM=global[DOM_SYMBOL]||{};
@@ -8964,6 +9119,15 @@ locale:panelLocale,
 maxItems:ANNOUNCEMENT_MAX_ITEMS,
 }));
 },[state.snapshot,rootSessionId]);
+}
+}
+async function readOrchestratorStatusOf(config,contextRef,sessionId){
+try{
+const body=await callRpc(config,contextRef.current,{action:"get",sessionId},{},(value)=>object(value));
+const status=object(object(body).orchestrator);
+return Object.keys(status).length===0?null:status;
+}catch{
+return null;
 }
 }
 function useSidebarPanelSessionModelEffects(frame){
@@ -9036,7 +9200,7 @@ live:false,
 return;
 }
 if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
-const roles=sessionModelRolesOf(effectiveMeta);
+const roles=sessionModelRowKeysOf(effectiveMeta);
 const view=normalizeSessionModelView(body,roles);
 if(view===null){
 setSessionModelState({status:"error",overrides:{},revision:0,live:false});
@@ -9045,6 +9209,9 @@ return;
 if(sessionModelLoadedRootRef.current!==targetSessionId)setSessionModelDrafts({});
 sessionModelLoadedRootRef.current=targetSessionId;
 setSessionModelState({status:"ready",overrides:view.overrides,revision:view.revision,live:view.live});
+const orchestratorStatus=await readOrchestratorStatusOf(config,contextRef,targetSessionId);
+if(cancelled===true||serial!==sessionModelRequestSerialRef.current)return;
+setSessionModelState((previous)=>({...previous,orchestrator:orchestratorStatus}));
 })();
 return()=>{cancelled=true;};
 },[sessionModelOpen,rootSessionId,sidebarSessionId,sessionModelReloadToken,config]);
@@ -11221,7 +11388,8 @@ bump,catalogEntryOf,clearSessionModelRole,closeSidebarResource,commitSessionMode
 expand,handleOpen,handleSidebarAction,handleSidebarBatchClose,meta,model,
 navigation,neutralRuntimeStatus,openSidebarResource,partialSnapshot,primitives,react,
 readActiveSidebarResource,restoreSessionModelDefaults,rootSessionId,sessionId,sessionModelCatalog,sessionModelDialogRef,sessionModelDrafts,
-sessionModelHasInvalidDraft,sessionModelNotice,sessionModelOpen,sessionModelPendingChanges,sessionModelSaving,sessionModelState,
+sessionModelHasInvalidDraft,sessionModelNotice,sessionModelOpen,sessionModelPendingChanges,
+sessionModelSaving,sessionModelState,
 sessionsSnapshot,sidebarBatchPendingRef,sidebarBatchScopeKey,sidebarBatchStateFor,sidebarOpenTabsAvailable,sidebarSessionId,
 sidebarTabRecordsRef,snapshot,subagentAddressOfChild,t,timelineExpandedRef,toggle,
 updateSessionModelDraft,
@@ -13178,6 +13346,7 @@ const SETTINGS_ZH_FALLBACK=Object.freeze({
 "settings.unifiedProvider":"统一供应商",
 "settings.noProvider":"无",
 "settings.observerPreferred":"Observer优先",
+"settings.orchestrator.empty":"未配置（不干预主代理模型）",
 "settings.concurrencyLimit":"单个角色并发上限",
 "settings.concurrencyLimit.title":"取值范围 1–64 的整数；默认 20；保存后生效",
 "settings.roleTimeout":"角色默认超时 (s)",
@@ -13281,7 +13450,19 @@ const css=".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:7
 ".deg_settings_pv_period_toggle{display:flex;align-items:center;gap:6px;margin-left:auto;flex:0 0 auto;min-width:0}.deg_settings_pv_period_toggle .deg_btn{flex:0 0 auto;height:28px;min-height:28px;padding:0 10px;font-size:13px;line-height:20px;white-space:nowrap}"+
 ".deg_settings_peak_valley_periods,.deg_settings_peak_valley_period_list{display:flex;flex-direction:column;gap:10px;min-width:0}"+
 ".deg_settings_peak_valley_period_list .deg_btn{flex:0 0 auto;margin-left:auto}"+
-".deg_settings_pv_footer{flex-wrap:wrap;row-gap:8px}.deg_settings_pv_footer .deg_btn{flex:0 0 20%}.deg_settings_pv_footer .deg_settings_status{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}@media (max-width:520px){.deg_settings_pv_footer{row-gap:6px}}";
+".deg_settings_pv_footer{flex-wrap:wrap;row-gap:8px}.deg_settings_pv_footer .deg_btn{flex:0 0 20%}.deg_settings_pv_footer .deg_settings_status{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}@media (max-width:520px){.deg_settings_pv_footer{row-gap:6px}}"+
+".deg_sd_row_action{display:inline-flex;align-items:center;justify-content:center;flex:none;width:20px;height:20px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-state-error-primary,#ef4444);cursor:pointer}.deg_sd_row_action:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.deg_sd_row_action:disabled{opacity:.45;cursor:not-allowed}.deg_sd_icon{display:block;width:16px;height:16px}"+
+".deg_sd_menu_item{display:flex;align-items:center;gap:6px;width:100%;box-sizing:border-box;padding:6px 10px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}.deg_sd_menu_item.deg_sd_danger{color:var(--dsw-alias-state-error-primary,#ef4444)}"+
+".deg_sd_check{flex:none;width:14px;height:14px;margin:0;cursor:pointer;accent-color:var(--dsw-alias-state-error-primary,#ef4444)}"+
+"body.deg_sd_selecting{--deg-sd-reserve:48px}body.deg_sd_selecting [class*=regionArea]{padding-bottom:var(--deg-sd-reserve)}"+
+".deg_sd_bar{display:flex;align-items:center;flex-wrap:wrap;gap:4px;box-sizing:border-box;max-height:min(30vh,152px);overflow:auto;padding:3px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);box-shadow:0 -4px 16px rgba(0,0,0,.16);color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px}"+
+".deg_sd_btn{display:inline-flex;align-items:center;justify-content:center;flex:none;height:22px;padding:0 5px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer}.deg_sd_btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.deg_sd_btn:disabled,.deg_sd_check:disabled{opacity:.45;cursor:not-allowed}.deg_sd_danger{color:var(--dsw-alias-state-error-primary,#ef4444)}"+
+".deg_sd_selectall{width:22px;height:22px;padding:0;margin-left:auto;border:1px dashed var(--dsw-alias-border-l2);border-radius:4px}.deg_sd_selectall .deg_sd_icon{width:13px;height:13px}"+
+".deg_sd_selectall:hover:not(:disabled){border-style:solid;border-color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.deg_sd_selectall:active:not(:disabled){transform:scale(.9)}"+
+".deg_sd_selectall[data-deg-session-delete-selectall-state=all]{border-style:solid;border-color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}"+
+".deg_sd_selectall:disabled{border-style:dashed;border-color:var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-secondary)}"+
+".deg_sd_count{flex:0 0 auto;white-space:nowrap}.deg_sd_blocked{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}"+
+".deg_sd_dialog_line{white-space:pre-wrap}";
 const cssTagId="dsh-expert-group/settings.module.css";
 const cssInjectedDocuments=typeof WeakSet==="function"?new WeakSet():null;
 function ensurePluginStylesheet(){
@@ -14020,6 +14201,7 @@ RPC_TARGET=host.RPC_TARGET??null;
 }
 const SETTINGS_ROLE_IDS=STATUS_ROLE_IDS;
 const SETTINGS_ROLE_LABELS=STATUS_ROLE_LABELS;
+const ORCHESTRATOR_ID="orchestrator";
 const SETTINGS_REQUIRED_ROLE_IDS=SETTINGS_ROLE_IDS.filter((role)=>role!=="observer");
 const PROMPT_ROLE_IDS=SETTINGS_ROLE_IDS;
 const DEFAULT_PROMPT_MAX_GRAPHEMES=32000;
@@ -14208,6 +14390,25 @@ if(typeof entry.provider!=="string"||typeof entry.model!=="string")return null;
 const reasoningEffort=typeof entry.reasoningEffort==="string"?entry.reasoningEffort:"";
 return{provider:entry.provider,model:entry.model,...(reasoningEffort.length>0?{reasoningEffort}:{})};
 }
+function normalizeOrchestratorDraft(value){
+const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
+const defaults=normalizeModelCandidateSelection(source.defaults);
+return{
+defaults:defaults!==null&&defaults.provider.length>0&&defaults.model.length>0?defaults:null,
+candidates:(Array.isArray(source.candidates)?source.candidates:[])
+.slice(0,MAX_MODEL_CANDIDATES_PER_ROLE)
+.map(normalizeModelCandidateSelection)
+.filter((entry)=>entry!==null),
+fallbackLimit:normalizeModelFallbackLimitDraft(source.fallbackLimit),
+};
+}
+function compactOrchestratorDraft(value){
+const profile=normalizeOrchestratorDraft(value);
+return{
+...profile,
+candidates:compactModelCandidatesDraft({[ORCHESTRATOR_ID]:profile.candidates})[ORCHESTRATOR_ID]??[],
+};
+}
 function normalizeModelCandidatesDraft(value){
 const source=value!==null&&typeof value==="object"&&!Array.isArray(value)?value:{};
 const candidates={};
@@ -14227,7 +14428,8 @@ function modelCandidateKeyOf(selection){
 return(selection?.provider??"")+"\u0000"+(selection?.model??"")+"\u0000"+(typeof selection?.reasoningEffort==="string"?selection.reasoningEffort:"");
 }
 function modelPageCountOf(draft){
-let longest=0;
+const orchestratorCandidates=draft?.orchestrator?.candidates;
+let longest=Array.isArray(orchestratorCandidates)?orchestratorCandidates.length:0;
 for(const role of SETTINGS_ROLE_IDS){
 const list=draft?.candidates?.[role];
 if(Array.isArray(list))longest=Math.max(longest,list.length);
@@ -14242,16 +14444,35 @@ for(const role of Object.keys(source))if(!roles.includes(role))roles.push(role);
 }
 return roles;
 }
+function modelLayerRowKeysOf(draft){
+return[...modelLayerRolesOf(draft),ORCHESTRATOR_ID];
+}
 function modelLayerSelectionOf(draft,role,page){
 if(!Number.isSafeInteger(page)||page<0)return null;
-const source=page===0
+let source;
+if(role===ORCHESTRATOR_ID){
+const profile=draft?.orchestrator;
+source=page===0
+?profile?.defaults
+:(Array.isArray(profile?.candidates)?profile.candidates[page-1]:void 0);
+}else{
+source=page===0
 ?draft?.defaults?.[role]
 :(Array.isArray(draft?.candidates?.[role])?draft.candidates[role][page-1]:void 0);
+}
 return source!==null&&source!==void 0&&typeof source==="object"&&!Array.isArray(source)?source:null;
 }
 function setModelLayerSelection(draft,role,page,selection){
 if(!Number.isSafeInteger(page)||page<0)return draft;
 const normalized=selection!==null&&typeof selection==="object"&&!Array.isArray(selection)?selection:null;
+if(role===ORCHESTRATOR_ID){
+const profile=normalizeOrchestratorDraft(draft?.orchestrator);
+if(page===0)return{...draft,orchestrator:{...profile,defaults:normalized}};
+const list=profile.candidates.slice();
+while(list.length<page-1)list.push({provider:"",model:""});
+list[page-1]=normalized===null?{provider:"",model:""}:normalized;
+return{...draft,orchestrator:{...profile,candidates:list}};
+}
 if(page===0){
 const defaults={...(draft?.defaults??{})};
 if(normalized===null)delete defaults[role];
@@ -14267,33 +14488,23 @@ return{...draft,candidates};
 }
 function modelLayerMapOf(draft,page){
 const map={};
-for(const role of modelLayerRolesOf(draft)){
+for(const role of modelLayerRowKeysOf(draft)){
 const selection=modelLayerSelectionOf(draft,role,page);
 if(selection!==null)map[role]=selection;
 }
 return map;
 }
 function writeModelLayers(draft,layers){
-const defaults={};
-const candidates={};
-for(const role of modelLayerRolesOf(draft)){
-const primary=layers[0]?.[role]??null;
-if(primary!==null&&primary!==void 0)defaults[role]={...primary};
-let last=0;
-for(let page=1;page<layers.length;page+=1){
+let next={...draft,defaults:{},candidates:{}};
+for(const role of modelLayerRowKeysOf(draft)){
+for(let page=0;page<layers.length;page+=1){
 const selection=layers[page]?.[role];
-if(selection!==null&&selection!==void 0)last=page;
-}
-if(last>=1){
-const list=[];
-for(let page=1;page<=last;page+=1){
-const selection=layers[page]?.[role]??null;
-list.push(selection===null?{provider:"",model:""}:{...selection});
-}
-candidates[role]=list;
+if(selection!==null&&selection!==void 0){
+next=setModelLayerSelection(next,role,page,{...selection});
 }
 }
-return{...draft,defaults,candidates};
+}
+return next;
 }
 function reorderModelLayers(draft,from,to){
 const count=modelPageCountOf(draft);
@@ -14308,15 +14519,12 @@ return writeModelLayers(draft,layers);
 function addModelCandidatePage(draft){
 const count=modelPageCountOf(draft);
 if(count>=MAX_MODEL_PAGES)return draft;
-const candidates={...(draft?.candidates??{})};
-for(const role of modelLayerRolesOf(draft)){
+let next=draft;
+for(const role of modelLayerRowKeysOf(draft)){
 const primary=modelLayerSelectionOf(draft,role,0);
-const list=Array.isArray(candidates[role])?candidates[role].slice():[];
-while(list.length<count-1)list.push({provider:"",model:""});
-list[count-1]=primary===null?{provider:"",model:""}:{...primary};
-candidates[role]=list;
+next=setModelLayerSelection(next,role,count,primary===null?null:{...primary});
 }
-return{...draft,candidates};
+return next;
 }
 function removeModelCandidatePage(draft,page){
 if(!Number.isSafeInteger(page)||page<1)return draft;
@@ -14328,7 +14536,11 @@ if(list.length>=page)list.splice(page-1,1);
 if(list.length>0)candidates[role]=list;
 else delete candidates[role];
 }
-return{...draft,candidates};
+const profile=draft?.orchestrator;
+if(profile===null||typeof profile!=="object")return{...draft,candidates};
+const orchestratorList=Array.isArray(profile.candidates)?profile.candidates.slice():[];
+if(orchestratorList.length>=page)orchestratorList.splice(page-1,1);
+return{...draft,candidates,orchestrator:{...profile,candidates:orchestratorList}};
 }
 function compactModelCandidatesDraft(candidates){
 const source=candidates!==null&&typeof candidates==="object"&&!Array.isArray(candidates)?candidates:{};
@@ -14445,6 +14657,7 @@ sidebarEntryEnabled:source.sidebarEntryEnabled!==false,
 ...(Object.prototype.hasOwnProperty.call(source,"fallbackLimit")
 ?{fallbackLimit:normalizeModelFallbackLimitDraft(source.fallbackLimit)}
 :{}),
+orchestrator:normalizeOrchestratorDraft(source.orchestrator),
 ...(Object.prototype.hasOwnProperty.call(source,"peakValley")
 ?{peakValley:normalizePeakValleyDraft(source.peakValley,seedPeakValleyPeriods)}
 :{}),
@@ -14467,6 +14680,7 @@ const SETTINGS_DRAFT_MERGE_FIELDS=Object.freeze([
 "sidebarEntryEnabled",
 "candidates",
 "fallbackLimit",
+"orchestrator",
 "peakValley",
 ]);
 function mergeSettingsDraftOverSource(source,local,baseline){
@@ -14739,11 +14953,11 @@ return enabled.filter((role,index)=>enabled.indexOf(role)===index);
 global[SYMBOL]=Object.freeze({
 DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PEAK_VALLEY_PERIODS,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,
 NEXT_PEAK_VALLEY_PERIOD,
-NOTIFICATION_EVENT_TYPES,PROMPT_ROLE_IDS,PROMPT_WARNING_RATIO,SETTINGS_ROLE_LABELS,addModelCandidatePage,
-bindClientRuntime,clampNotificationVolume,commitSettingsCandidate,compactModelCandidatesDraft,countUnicodeGraphemes,
+NOTIFICATION_EVENT_TYPES,ORCHESTRATOR_ID,PROMPT_ROLE_IDS,PROMPT_WARNING_RATIO,SETTINGS_ROLE_LABELS,addModelCandidatePage,
+bindClientRuntime,clampNotificationVolume,commitSettingsCandidate,compactModelCandidatesDraft,compactOrchestratorDraft,countUnicodeGraphemes,
 createSettingsModelCatalog,mergeSettingsDraftOverSource,migrateSettingsDefaults,migrateSettingsSelection,modelCandidatesErrorMessage,
 resolveSettingsForm,
-modelLayerMapOf,modelLayerSelectionOf,modelPageCountOf,normalizeModelCandidatesDraft,normalizeModelFallbackLimitDraft,
+modelLayerMapOf,modelLayerSelectionOf,modelPageCountOf,normalizeModelCandidatesDraft,normalizeModelFallbackLimitDraft,normalizeOrchestratorDraft,
 normalizePeakValleyDraft,normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsCommitDraft,normalizeSettingsDraft,normalizeSettingsModelGroups,
 promptEntryOf,promptOverridesEqual,removeModelCandidatePage,reorderModelLayers,setModelLayerSelection,
 settingsDraftEqual,settingsRolesForProvider,syncSettingsDefaultsProvider,unifiedProviderOf,updateRolePromptProjection,
@@ -15719,12 +15933,13 @@ const clientSettingsNormalizeSymbol=Symbol.for("dsh-expert-group/client-settings
 const clientSettingsNormalize=global[clientSettingsNormalizeSymbol]||{};
 const{
 DEFAULT_MODEL_FALLBACK_LIMIT,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,NEXT_PEAK_VALLEY_PERIOD,
-NOTIFICATION_EVENT_TYPES,PROMPT_WARNING_RATIO,
+NOTIFICATION_EVENT_TYPES,ORCHESTRATOR_ID,PROMPT_WARNING_RATIO,
 clampNotificationVolume,migrateSettingsSelection,modelLayerSelectionOf,normalizeRolePromptProjection,normalizeSettingsDraft,promptEntryOf,
 setModelLayerSelection,settingsRolesForProvider,syncSettingsDefaultsProvider,validatePromptText,
 }=clientSettingsNormalize;
 let react=null;
 let ModelConfigSection=null;
+const ORCHESTRATOR_ROW_LABEL="Orchestrator";
 let peakValleyTime=null;
 function bindClientRuntime(host){
 react=host.react??null;
@@ -16032,7 +16247,7 @@ function renderSettingsRoleTable(view){
 const{
 catalogAvailable,currentModelPage,draft,editDraft,error,modelRowRoles,
 openPrompt,promptProjection,promptRoleIds,providerGroups,roleLabelOf,roles,
-saving,selectedPromptRole,
+saving,selectedPromptRole,tExtra,
 }=view;
 const header=react.createElement(react.Fragment,null,
 react.createElement("span",{className:"deg_settings_table_head"},"专家"),
@@ -16040,15 +16255,17 @@ react.createElement("span",{className:"deg_settings_table_head"},"供应商"),
 react.createElement("span",{className:"deg_settings_table_head"},"模型选择"),
 react.createElement("span",{className:"deg_settings_table_head"},"思考深度"));
 const rows=modelRowRoles.map((role)=>{
-const roleLabel=roleLabelOf(role);
-const roleEnabled=roles.includes(role);
+const isOrchestrator=role===ORCHESTRATOR_ID;
+const roleLabel=isOrchestrator?ORCHESTRATOR_ROW_LABEL:roleLabelOf(role);
+const roleEnabled=isOrchestrator||roles.includes(role);
 const selection=modelLayerSelectionOf(draft,role,currentModelPage);
 const rowProvider=typeof selection?.provider==="string"?selection.provider:"";
 const rowProviderGroup=providerGroups.find((group)=>group.id===rowProvider);
 const rowModels=rowProviderGroup?.models??[];
 const currentModel=rowModels.find((model)=>model.id===selection?.model);
 const providerOptions=[
-react.createElement("option",{key:"__empty-provider",value:""},"未选择供应商"),
+react.createElement("option",{key:"__empty-provider",value:""},
+isOrchestrator?tExtra("settings.orchestrator.empty"):"未选择供应商"),
 ...(rowProvider&&rowProviderGroup===undefined
 ?[react.createElement("option",{key:"__unavailable-provider",value:rowProvider,disabled:true},rowProvider+"（不可用）")]
 :[]),
@@ -16086,7 +16303,8 @@ if(currentModelPage===0){
 const next=!provider
 ?null
 :(migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""});
-return{...setModelLayerSelection(previous,role,0,next),provider:""};
+const written=setModelLayerSelection(previous,role,0,next);
+return isOrchestrator?written:{...written,provider:""};
 }
 const next=!provider
 ?{provider:"",model:""}
@@ -16793,8 +17011,8 @@ const{
 resolveSettingsLocale,settingsExtraText,settingsText,
 }=clientText;
 const{
-DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PEAK_VALLEY_PERIODS,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_PAGES,PROMPT_ROLE_IDS,SETTINGS_ROLE_LABELS,addModelCandidatePage,
-commitSettingsCandidate,compactModelCandidatesDraft,mergeSettingsDraftOverSource,modelCandidatesErrorMessage,modelLayerMapOf,modelPageCountOf,
+DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PEAK_VALLEY_PERIODS,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_PAGES,ORCHESTRATOR_ID,PROMPT_ROLE_IDS,SETTINGS_ROLE_LABELS,addModelCandidatePage,
+commitSettingsCandidate,compactModelCandidatesDraft,compactOrchestratorDraft,mergeSettingsDraftOverSource,modelCandidatesErrorMessage,modelLayerMapOf,modelPageCountOf,
 normalizeModelCandidatesDraft,normalizePeakValleyDraft,normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsCommitDraft,normalizeSettingsDraft,promptEntryOf,
 promptOverridesEqual,removeModelCandidatePage,reorderModelLayers,settingsDraftEqual,unifiedProviderOf,updateRolePromptProjection,
 useEnabledSettingsRoles,useHostMeta,validateModelCandidateRows,validatePromptText,
@@ -16889,6 +17107,7 @@ provider:typeof value.provider==="string"?value.provider:"",
 defaults:value.defaults??{},
 candidates:compactModelCandidatesDraft(value.candidates),
 fallbackLimit:value.fallbackLimit===void 0?DEFAULT_MODEL_FALLBACK_LIMIT:value.fallbackLimit,
+orchestrator:compactOrchestratorDraft(value.orchestrator),
 };
 };
 return{
@@ -16940,6 +17159,33 @@ ops.push({op:"set",path:["sidebarEntryEnabled"],value:candidate.sidebarEntryEnab
 if(promptChanged){
 ops.push({op:"set",path:["promptOverrides"],value:candidatePromptOverrides});
 }
+}
+function orchestratorSaveChangeOf(authorityValue,normalizedDraft,tExtra,roleLabelOf,setCandidatesError){
+const source=compactOrchestratorDraft(authorityValue?.orchestrator);
+const candidate=compactOrchestratorDraft(normalizedDraft.orchestrator);
+if(settingsDraftEqual(candidate,source))return{candidate,changed:false,source};
+const validation=validateModelCandidateRows({Orchestrator:candidate.candidates});
+if(validation.ok!==true){
+setCandidatesError(modelCandidatesErrorMessage(tExtra,roleLabelOf,validation));
+return null;
+}
+return{candidate,changed:true,source};
+}
+function peakValleySaveChangeOf(normalizedDraft,source,peakValleyBroken,repairing,tExtra,setError){
+const candidate=normalizedDraft.peakValley===void 0||(peakValleyBroken&&!repairing)
+?void 0
+:peakValleyCandidateOf(normalizedDraft.peakValley,repairing);
+if(candidate===void 0)return{candidate,changed:repairing};
+if(repairing!==true
+&&settingsDraftEqual(candidate,peakValleyCandidateOf(normalizePeakValleyDraft(source.peakValley)))){
+return{candidate,changed:false};
+}
+const periods=peakValleyTime?.normalizePeakValleyPeriods?.(candidate.periods);
+if(periods?.ok!==true){
+setError(tExtra("settings.pv.invalid",{reason:periods?.reason??""}));
+return null;
+}
+return{candidate,changed:true};
 }
 function deriveSettingsSavePlan(view,retry,repair){
 const{
@@ -17009,19 +17255,12 @@ if(validation.ok!==true){setCandidatesError(modelCandidatesErrorMessage(tExtra,r
 const sourceFallbackLimit=source.fallbackLimit;
 const candidateFallbackLimit=normalizedDraft.fallbackLimit;
 const fallbackLimitChanged=candidateFallbackLimit!==void 0&&candidateFallbackLimit!==sourceFallbackLimit;
-const candidatePeakValley=normalizedDraft.peakValley===void 0||(peakValleyBroken&&!repairing)
-?void 0
-:peakValleyCandidateOf(normalizedDraft.peakValley,repairing);
-let peakValleyChanged=repairing;
-if(candidatePeakValley!==void 0
-&&(repairing||!settingsDraftEqual(candidatePeakValley,peakValleyCandidateOf(normalizePeakValleyDraft(source.peakValley))))){
-const periods=peakValleyTime?.normalizePeakValleyPeriods?.(candidatePeakValley.periods);
-if(periods?.ok!==true){
-setError(tExtra("settings.pv.invalid",{reason:periods?.reason??""}));
-return null;
-}
-peakValleyChanged=true;
-}
+const orchestratorChange=orchestratorSaveChangeOf(authorityValue,normalizedDraft,tExtra,roleLabelOf,setCandidatesError);
+if(orchestratorChange===null)return null;
+const{candidate:candidateOrchestrator,changed:orchestratorChanged,source:sourceOrchestrator}=orchestratorChange;
+const peakValleyChange=peakValleySaveChangeOf(normalizedDraft,source,peakValleyBroken,repairing,tExtra,setError);
+if(peakValleyChange===null)return null;
+const{candidate:candidatePeakValley,changed:peakValleyChanged}=peakValleyChange;
 const candidate={
 ...normalizedDraft,
 provider:modelChanged?draftProvider:sourceProvider,
@@ -17031,10 +17270,12 @@ provider:modelChanged?draftProvider:sourceProvider,
 ...(fallbackLimitChanged
 ?{fallbackLimit:typeof candidateFallbackLimit==="number"?candidateFallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT}
 :{}),
+...(orchestratorChanged?{orchestrator:candidateOrchestrator}:{}),
 ...(peakValleyChanged?{peakValley:candidatePeakValley}:{}),
 };
 if(!candidatesChanged)delete candidate.candidates;
 if(!fallbackLimitChanged)delete candidate.fallbackLimit;
+if(!orchestratorChanged)delete candidate.orchestrator;
 if(!peakValleyChanged)delete candidate.peakValley;
 const ops=[];
 if(modelChanged){
@@ -17064,9 +17305,10 @@ if(!settingsDraftEqual(candidateCandidates[role]??null,sourceCandidates[role]??n
 }
 }
 if(fallbackLimitChanged)changed.push("fallbackLimit");
+if(orchestratorChanged)changed.push("orchestrator");
 if(peakValleyChanged)changed.push("peakValley","peakValley.enabled","peakValley.periods");
 if(peakValleyBroken&&!repairing&&ops.length===0
-&&!candidatesChanged&&!fallbackLimitChanged){
+&&!candidatesChanged&&!fallbackLimitChanged&&!orchestratorChanged){
 setError(tExtra("settings.pv.broken"));
 return null;
 }
@@ -17074,8 +17316,9 @@ const expectedRevision=retry===true||selectedPromptRole===null||!Number.isSafeIn
 ?settingsSnapshot.revision
 :editorBaseline.revision;
 return{
-candidate,candidateCandidates,candidateFallbackLimit,candidatePromptOverrides,candidatesChanged,changed,
-expectedRevision,fallbackLimitChanged,ops,peakValleyChanged,source,sourceCandidates,sourceFallbackLimit,
+candidate,candidateCandidates,candidateFallbackLimit,candidateOrchestrator,candidatePromptOverrides,
+candidatesChanged,changed,expectedRevision,fallbackLimitChanged,ops,orchestratorChanged,
+peakValleyChanged,source,sourceCandidates,sourceFallbackLimit,sourceOrchestrator,
 };
 }
 async function commitSettingsSavePlan(view,plan){
@@ -17096,8 +17339,9 @@ settingsForm,settingsReadOnly,settingsSnapshot,sourceDraftForSave,sourcePromptOv
 ctx,effectiveDraft,editorBaseline,promptTouchedRoles,setSaving,
 }=view;
 const{
-candidate,candidateCandidates,candidateFallbackLimit,candidatePromptOverrides,candidatesChanged,
-changed,expectedRevision,fallbackLimitChanged,ops,peakValleyChanged,source,sourceCandidates,sourceFallbackLimit,
+candidate,candidateCandidates,candidateFallbackLimit,candidateOrchestrator,candidatePromptOverrides,
+candidatesChanged,changed,expectedRevision,fallbackLimitChanged,ops,orchestratorChanged,
+peakValleyChanged,source,sourceCandidates,sourceFallbackLimit,sourceOrchestrator,
 }=plan;
 setSaving(true);
 setSaved(false);
@@ -17106,7 +17350,7 @@ setPromptError(null);
 try{
 let accepted;
 let committed=null;
-if(ops.length>0||candidatesChanged||fallbackLimitChanged||peakValleyChanged){
+if(ops.length>0||candidatesChanged||fallbackLimitChanged||peakValleyChanged||orchestratorChanged){
 committed=await commitSettingsCandidate(candidate,expectedRevision,globalThis.fetch,ctx?.connection,roles,changed);
 accepted=committed.settings;
 }else{
@@ -17134,6 +17378,9 @@ fallbackLimitChanged||Object.prototype.hasOwnProperty.call(source,"fallbackLimit
 fallbackLimitChanged
 ?(typeof candidateFallbackLimit==="number"?candidateFallbackLimit:DEFAULT_MODEL_FALLBACK_LIMIT)
 :sourceFallbackLimit);
+keepNewField("orchestrator",
+orchestratorChanged||Object.prototype.hasOwnProperty.call(source,"orchestrator"),
+orchestratorChanged?candidateOrchestrator:sourceOrchestrator);
 keepNewField("peakValley",Object.prototype.hasOwnProperty.call(source,"peakValley"),source.peakValley);
 }
 setDraft(acceptedDraft);
@@ -17460,6 +17707,7 @@ const effectiveDraft=selectedPromptRole!==null
 :localDraft;
 const modelFieldsChanged=react.useMemo(()=>{
 if(!settingsDraftEqual(effectiveDraft.defaults,sourceDraftForSave.defaults))return true;
+if(!settingsDraftEqual(effectiveDraft.orchestrator,sourceDraftForSave.orchestrator))return true;
 return unifiedProviderOf(effectiveDraft.defaults,roles,effectiveDraft.provider)
 !==unifiedProviderOf(sourceDraftForSave.defaults,roles,sourceDraftForSave.provider);
 },[effectiveDraft,sourceDraftForSave,roles]);
@@ -17607,7 +17855,7 @@ setPromptError(null);
 const groups=Array.isArray(directoryState.groups)?directoryState.groups:[];
 const providerGroups=groups.filter((group)=>group&&typeof group.id==="string");
 const modelRowRoles=react.useMemo(()=>{
-const next=[...PROMPT_ROLE_IDS];
+const next=[ORCHESTRATOR_ID,...PROMPT_ROLE_IDS];
 for(const role of roles)if(!next.includes(role))next.push(role);
 return next;
 },[roles]);
@@ -20300,6 +20548,1504 @@ global[SYMBOL]=Object.freeze({
 installDegSidebarEntry,
 });
 })(globalThis);
+/* source: client-session-delete-selection.js */
+(function installClientSessionDeleteSelection(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-session-delete-selection");
+const ACTION_CANDIDATES="session-delete-candidates";
+const ACTION_REMOVE="session-delete";
+const UNGROUPED_SCOPE="ungrouped";
+const TARGETS_LIMIT=200;
+const RESULT_STATES=Object.freeze(["deleted","raced","failed","skipped","absent"]);
+const RESULT_STATE_ALIASES=Object.freeze({deletedWithWarnings:"deleted"});
+const ERROR_KINDS=Object.freeze({
+"workspace-not-found":"not-found",
+"delete-job-busy":"busy",
+"delete-candidates-unavailable":"unavailable",
+"delete-unavailable":"unavailable",
+"delete-targets-invalid":"invalid",
+"delete-targets-outside-ungrouped":"invalid",
+"bad-request":"invalid",
+});
+const ERROR_MESSAGES=Object.freeze({
+"not-found":"工作区不存在或已移除",
+busy:"已有删除作业正在执行，请稍后再试",
+unavailable:"会话删除能力暂不可用，请重启 DSH 后再试",
+invalid:"请求无效，本次没有删除任何会话",
+transport:"请求失败，请检查连接后重试",
+unknown:"会话删除失败",
+});
+function isObject(value){
+return value!==null&&typeof value==="object"&&!Array.isArray(value);
+}
+function readId(value){
+return typeof value==="string"&&value.length>0?value:null;
+}
+function readTitle(value){
+if(typeof value!=="string")return null;
+const title=value.trim();
+return title.length>0?title:null;
+}
+function scopeRequestFields(scopeKey){
+return scopeKey===UNGROUPED_SCOPE?{scope:UNGROUPED_SCOPE}:{workspaceId:scopeKey};
+}
+function readSnapshotScopeKey(snapshot){
+if(!isObject(snapshot))return null;
+const stamped=readId(snapshot.scopeKey);
+if(stamped!==null)return stamped;
+if(snapshot.scope===UNGROUPED_SCOPE)return UNGROUPED_SCOPE;
+return readId(snapshot.workspaceId);
+}
+function normalizeBlockedBy(raw){
+if(!isObject(raw))return null;
+return{
+kind:typeof raw.kind==="string"&&raw.kind.length>0?raw.kind:"live",
+sessionId:readId(raw.sessionId),
+title:readTitle(raw.title),
+};
+}
+function normalizeCandidate(raw){
+if(!isObject(raw))return null;
+const sessionId=readId(raw.sessionId);
+if(sessionId===null)return null;
+return{
+sessionId,
+title:readTitle(raw.title),
+actionable:raw.actionable===true,
+absent:raw.absent===true,
+blockedBy:normalizeBlockedBy(raw.blockedBy),
+};
+}
+function groupCandidates(snapshot){
+const items=[];
+const seen=new Set();
+const raw=isObject(snapshot)&&Array.isArray(snapshot.candidates)?snapshot.candidates:[];
+for(const entry of raw){
+const candidate=normalizeCandidate(entry);
+if(candidate===null||seen.has(candidate.sessionId))continue;
+seen.add(candidate.sessionId);
+items.push(candidate);
+}
+const actionable=[];
+const blocked=[];
+const absent=[];
+for(const candidate of items){
+if(candidate.actionable!==true){
+blocked.push(candidate);
+continue;
+}
+actionable.push(candidate);
+if(candidate.absent===true)absent.push(candidate);
+}
+return{items,actionable,blocked,absent};
+}
+function findCandidate(list,sessionId){
+if(!Array.isArray(list)||sessionId===null)return null;
+for(const candidate of list){
+if(candidate.sessionId===sessionId)return candidate;
+}
+return null;
+}
+function initialSelectionState(){
+return{
+open:false,
+workspaceId:null,
+candidates:{items:[],actionable:[],blocked:[],absent:[]},
+selected:[],
+settling:false,
+result:null,
+};
+}
+function enterSelection(snapshot,preselectSessionId){
+const scopeKey=readSnapshotScopeKey(snapshot);
+if(scopeKey===null)return initialSelectionState();
+const candidates=groupCandidates(snapshot);
+const preselect=readId(preselectSessionId);
+const selected=preselect!==null&&findCandidate(candidates.actionable,preselect)!==null
+?[preselect]
+:[];
+return{open:true,workspaceId:scopeKey,candidates,selected,settling:false,result:null};
+}
+function exitSelection(){
+return initialSelectionState();
+}
+function toggleSelection(state,sessionId){
+if(!isObject(state)||state.open!==true||state.settling===true)return state;
+const id=readId(sessionId);
+if(id===null||findCandidate(state.candidates?.actionable,id)===null)return state;
+const selected=state.selected.includes(id)
+?state.selected.filter((entry)=>entry!==id)
+:[...state.selected,id];
+return{...state,selected};
+}
+function selectAllActionable(state){
+if(!isObject(state)||state.open!==true||state.settling===true)return state;
+return{...state,selected:(state.candidates?.actionable??[]).map((candidate)=>candidate.sessionId)};
+}
+function toggleSelectAllActionable(state){
+if(!isObject(state)||state.open!==true||state.settling===true)return state;
+if(selectionCounts(state).allSelected===true)return{...state,selected:[]};
+return selectAllActionable(state);
+}
+function markSettling(state,settling){
+if(!isObject(state)||state.open!==true)return state;
+const next=settling===true;
+return state.settling===next?state:{...state,settling:next};
+}
+function refreshSelectionCandidates(state,snapshot){
+if(!isObject(state)||state.open!==true)return state;
+if(readSnapshotScopeKey(snapshot)!==state.workspaceId)return state;
+const candidates=groupCandidates(snapshot);
+const selected=state.selected.filter((sessionId)=>findCandidate(candidates.actionable,sessionId)!==null);
+return{...state,candidates,selected};
+}
+function selectionTargets(state){
+if(!isObject(state)||state.open!==true)return[];
+const targets=[];
+for(const candidate of state.candidates?.actionable??[]){
+if(state.selected.includes(candidate.sessionId))targets.push(candidate);
+}
+return targets;
+}
+function selectionCounts(state){
+const targets=selectionTargets(state);
+const candidates=isObject(state)?state.candidates:null;
+const blocked=Array.isArray(candidates?.blocked)?candidates.blocked.length:0;
+const actionable=Array.isArray(candidates?.actionable)?candidates.actionable.length:0;
+const absent=Array.isArray(candidates?.absent)?candidates.absent.length:0;
+return{
+selected:Array.isArray(state?.selected)?state.selected.length:0,
+targets:targets.length,
+actionable,
+blocked,
+absent,
+total:Array.isArray(candidates?.items)?candidates.items.length:actionable+blocked,
+deletable:targets.length>0&&isObject(state)&&state.settling!==true,
+allSelected:actionable>0&&targets.length===actionable,
+};
+}
+function isSelectionOpen(state){
+return isObject(state)&&state.open===true;
+}
+function isSessionSelected(state,sessionId){
+const id=readId(sessionId);
+return id!==null&&isObject(state)&&Array.isArray(state.selected)&&state.selected.includes(id);
+}
+function isSessionActionable(state,sessionId){
+return findCandidate(isObject(state)?state.candidates?.actionable:null,readId(sessionId))!==null;
+}
+function selectionCandidateOf(state,sessionId){
+return findCandidate(isObject(state)?state.candidates?.items:null,readId(sessionId));
+}
+function escapeAction(state,input){
+if(isObject(input)&&input.confirmOpen===true)return"close-confirm";
+return isSelectionOpen(state)?"exit-selection":"none";
+}
+function zeroCounts(){
+const counts={};
+for(const state of RESULT_STATES)counts[state]=0;
+return counts;
+}
+function normalizeResultState(value){
+const alias=typeof value==="string"?RESULT_STATE_ALIASES[value]:undefined;
+const state=alias===undefined?value:alias;
+return typeof state==="string"&&RESULT_STATES.includes(state)?state:null;
+}
+function normalizeSettlement(summary){
+const source=isObject(summary)?summary:{};
+const counts=zeroCounts();
+const results=[];
+const unknown=[];
+for(const entry of Array.isArray(source.results)?source.results:[]){
+const raw=isObject(entry)?entry:{};
+const state=normalizeResultState(raw.state);
+if(state===null)unknown.push(readId(raw.sessionId)??"<unknown>");
+else counts[state]+=1;
+results.push(state===null?raw:{...raw,state});
+}
+const total=RESULT_STATES.reduce((sum,state)=>sum+counts[state],0);
+const targetCount=Number.isSafeInteger(source.targetCount)&&source.targetCount>=0
+?source.targetCount
+:total;
+const note=isObject(source.note)?source.note:{};
+const batches=Number.isSafeInteger(source.batches)&&source.batches>0?source.batches:1;
+return{
+counts,
+total,
+targetCount,
+conserved:total===targetCount&&unknown.length===0,
+results,
+unknown,
+blocked:Array.isArray(source.blocked)?source.blocked:[],
+collateral:Array.isArray(source.collateral)?source.collateral:[],
+diagnostics:Array.isArray(source.diagnostics)?source.diagnostics:[],
+note:{
+newDescendants:Number.isSafeInteger(note.newDescendants)?note.newDescendants:0,
+...(note.degraded===true?{degraded:true}:{}),
+},
+batches,
+};
+}
+function mergeDeleteSettlements(settlements){
+const counts=zeroCounts();
+const merged={
+counts,
+total:0,
+targetCount:0,
+conserved:true,
+results:[],
+unknown:[],
+blocked:[],
+collateral:[],
+diagnostics:[],
+note:{newDescendants:0},
+batches:0,
+};
+for(const entry of Array.isArray(settlements)?settlements:[]){
+const batch=normalizeSettlement(entry);
+for(const state of RESULT_STATES)counts[state]+=batch.counts[state];
+merged.total+=batch.total;
+merged.targetCount+=batch.targetCount;
+merged.conserved=merged.conserved&&batch.conserved;
+merged.batches+=batch.batches;
+merged.results.push(...batch.results);
+merged.unknown.push(...batch.unknown);
+merged.blocked.push(...batch.blocked);
+merged.collateral.push(...batch.collateral);
+merged.diagnostics.push(...batch.diagnostics);
+merged.note.newDescendants+=batch.note.newDescendants;
+if(batch.note.degraded===true)merged.note.degraded=true;
+}
+merged.conserved=merged.conserved&&merged.total===merged.targetCount&&merged.unknown.length===0;
+return merged;
+}
+function applySettlement(state,settlement){
+if(!isObject(state)||state.open!==true)return state;
+if(!isObject(settlement))return state;
+const merged=mergeDeleteSettlements([settlement]);
+const submitted=selectionTargets(state).length;
+const retained=[];
+for(const result of merged.results){
+if(normalizeResultState(result?.state)!=="failed")continue;
+const sessionId=readId(result?.sessionId);
+if(sessionId===null||retained.includes(sessionId))continue;
+if(findCandidate(state.candidates?.actionable,sessionId)===null)continue;
+retained.push(sessionId);
+}
+const settledEveryTarget=merged.total>0
+&&merged.total===submitted
+&&merged.counts.deleted+merged.counts.absent===merged.total;
+if(settledEveryTarget)return initialSelectionState();
+return{...state,selected:retained,settling:false,result:merged};
+}
+function chunkDeleteTargets(targets,limit){
+const size=Number.isSafeInteger(limit)&&limit>0?limit:TARGETS_LIMIT;
+const list=Array.isArray(targets)?targets.filter((entry)=>readId(entry)!==null):[];
+const chunks=[];
+for(let index=0;index<list.length;index+=size)chunks.push(list.slice(index,index+size));
+return chunks;
+}
+function deleteFailure(kind,code,message){
+return{code:code??null,kind,message:message??ERROR_MESSAGES[kind]??ERROR_MESSAGES.unknown};
+}
+function emptyTargetsFailure(){
+return deleteFailure("invalid",null,"没有可处理的目标");
+}
+function normalizeDeleteFailure(error){
+const code=isObject(error)&&typeof error.code==="string"&&error.code.length>0?error.code:null;
+const message=isObject(error)&&typeof error.message==="string"&&error.message.length>0
+?error.message
+:undefined;
+if(code===null)return deleteFailure("transport",null,message);
+if(Object.prototype.hasOwnProperty.call(ERROR_KINDS,code))return deleteFailure(ERROR_KINDS[code],code,message);
+return deleteFailure("unknown",code,message);
+}
+function readPort(port){
+if(isObject(port)&&typeof port.call==="function")return port;
+if(typeof port==="function")return{call:port};
+return null;
+}
+async function callAction(port,request){
+const rpc=readPort(port);
+if(rpc===null)return{ok:false,error:deleteFailure("transport",null,"当前 DSH 未提供插件 RPC")};
+try{
+return{ok:true,value:await rpc.call(request)};
+}catch(error){
+return{ok:false,error:normalizeDeleteFailure(error)};
+}
+}
+async function requestDeleteCandidates(port,workspaceId){
+const scopeKey=readId(workspaceId);
+if(scopeKey===null)return{ok:false,error:deleteFailure("invalid","bad-request")};
+const scopeFields=scopeRequestFields(scopeKey);
+const outcome=await callAction(port,{action:ACTION_CANDIDATES,...scopeFields});
+if(outcome.ok!==true)return outcome;
+const snapshot=outcome.value;
+if(!isObject(snapshot)||!Array.isArray(snapshot.candidates)){
+return{ok:false,error:deleteFailure("unknown",null)};
+}
+return{ok:true,snapshot:{...snapshot,...scopeFields,scopeKey}};
+}
+function titlesOfCandidates(targets){
+const titles=Object.create(null);
+let count=0;
+for(const candidate of targets){
+if(candidate.title===null)continue;
+titles[candidate.sessionId]=candidate.title;
+count+=1;
+}
+return count>0?titles:null;
+}
+async function requestDeleteBatch(port,options){
+const scopeKey=readId(isObject(options)?options.workspaceId:null);
+const targets=Array.isArray(options?.targets)
+?options.targets.filter((entry)=>readId(entry)!==null)
+:[];
+if(scopeKey===null||targets.length===0){
+return{ok:false,error:deleteFailure("invalid","delete-targets-invalid")};
+}
+const request={action:ACTION_REMOVE,...scopeRequestFields(scopeKey),targets};
+if(isObject(options?.titles))request.titles=options.titles;
+const outcome=await callAction(port,request);
+if(outcome.ok!==true)return outcome;
+const summary=outcome.value;
+if(!isObject(summary)||!Array.isArray(summary.results)){
+return{ok:false,error:deleteFailure("unknown",null)};
+}
+return{ok:true,settlement:normalizeSettlement(summary)};
+}
+async function requestDeleteAll(port,options){
+const scopeKey=readId(isObject(options)?options.workspaceId:null);
+const targets=Array.isArray(options?.targets)
+?options.targets.filter((entry)=>readId(entry)!==null)
+:[];
+if(scopeKey===null||targets.length===0){
+return{ok:false,error:deleteFailure("invalid","delete-targets-invalid"),settlement:null,batches:0,total:targets.length};
+}
+const chunks=chunkDeleteTargets(targets,options?.limit);
+const settlements=[];
+for(const chunk of chunks){
+const outcome=await requestDeleteBatch(port,{workspaceId:scopeKey,targets:chunk,titles:options?.titles});
+if(outcome.ok!==true){
+return{
+ok:false,
+error:outcome.error,
+settlement:settlements.length===0?null:mergeDeleteSettlements(settlements),
+batches:settlements.length,
+total:targets.length,
+};
+}
+settlements.push(outcome.settlement);
+}
+return{
+ok:true,
+error:null,
+settlement:mergeDeleteSettlements(settlements),
+batches:settlements.length,
+total:targets.length,
+};
+}
+async function runSelectionRound(port,state,options){
+const targets=selectionTargets(state);
+if(targets.length===0)return{ok:false,state,settlement:null,error:emptyTargetsFailure()};
+const outcome=await requestDeleteAll(port,{
+workspaceId:state.workspaceId,
+targets:targets.map((candidate)=>candidate.sessionId),
+titles:titlesOfCandidates(targets),
+limit:options?.limit,
+});
+const settlement=outcome.settlement;
+let next=settlement===null?markSettling(state,false):applySettlement(state,settlement);
+if(outcome.ok!==true)return{ok:false,state:next,settlement,error:outcome.error};
+if(isSelectionOpen(next)!==true)return{ok:true,state:next,settlement,error:null,refreshError:null};
+const refreshed=await requestDeleteCandidates(port,next.workspaceId);
+if(refreshed.ok===true)next=refreshSelectionCandidates(next,refreshed.snapshot);
+return{ok:true,state:next,settlement,error:null,refreshError:refreshed.ok===true?null:refreshed.error};
+}
+async function openSelection(port,scopeKey,preselectSessionId){
+const loaded=await requestDeleteCandidates(port,scopeKey);
+if(loaded.ok!==true)return{ok:false,state:initialSelectionState(),error:loaded.error};
+return{ok:true,state:enterSelection(loaded.snapshot,preselectSessionId),error:null};
+}
+async function submitSelection(port,state,options){
+if(!isSelectionOpen(state))return{ok:false,state,settlement:null,error:emptyTargetsFailure()};
+return await runSelectionRound(port,state,options);
+}
+async function retrySelection(port,state,options){
+if(!isSelectionOpen(state))return{ok:false,state,settlement:null,error:emptyTargetsFailure()};
+const refreshed=await requestDeleteCandidates(port,state.workspaceId);
+if(refreshed.ok!==true)return{ok:false,state,settlement:null,error:refreshed.error};
+const next=refreshSelectionCandidates(state,refreshed.snapshot);
+if(selectionTargets(next).length===0){
+return{ok:false,state:markSettling(next,false),settlement:null,error:emptyTargetsFailure()};
+}
+return await runSelectionRound(port,next,options);
+}
+global[SYMBOL]=Object.freeze({
+SESSION_DELETE_TARGETS_LIMIT:TARGETS_LIMIT,
+ACTION_CANDIDATES,
+ACTION_REMOVE,
+UNGROUPED_SCOPE,
+ERROR_KINDS,
+RESULT_STATES,
+applySettlement,
+chunkDeleteTargets,
+enterSelection,
+escapeAction,
+exitSelection,
+initialSelectionState,
+isSelectionOpen,
+isSessionActionable,
+isSessionSelected,
+markSettling,
+mergeDeleteSettlements,
+normalizeDeleteFailure,
+openSelection,
+refreshSelectionCandidates,
+requestDeleteAll,
+requestDeleteBatch,
+requestDeleteCandidates,
+retrySelection,
+selectAllActionable,
+selectionCandidateOf,
+selectionCounts,
+selectionTargets,
+submitSelection,
+toggleSelectAllActionable,
+toggleSelection,
+});
+})(globalThis);
+/* source: client-session-delete-local-keys.js */
+(function installClientSessionDeleteLocalKeys(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-session-delete-local-keys");
+const LEDGER=global[Symbol.for("dsh-expert-group/client-sidebar-auto-ledger")]??{};
+const STATES=Object.freeze(["deleted","absent"]);
+const EXPANSION_KEY_PREFIX="dsh-expert-group:expansion:v";
+const PENDING_CLEANUP_KEY="dsh-expert-group:session-delete-cleanup:v1";
+const LIMIT=16;
+const IDS_LIMIT=200;
+const TTL_MS=7*24*60*60*1000;
+function isObject(value){
+return value!==null&&typeof value==="object"&&!Array.isArray(value);
+}
+function readId(value){
+return typeof value==="string"&&value.length>0?value:null;
+}
+function storageOf(name){
+try{
+const storage=name==="sessionStorage"?global.sessionStorage:global.localStorage;
+if(storage===null||storage===undefined)return null;
+return typeof storage.getItem==="function"&&typeof storage.removeItem==="function"?storage:null;
+}catch{
+return null;
+}
+}
+function idsOf(value){
+const ids=[];
+for(const entry of Array.isArray(value)?value:[]){
+const id=readId(entry);
+if(id===null||ids.includes(id))continue;
+ids.push(id);
+if(ids.length>=IDS_LIMIT)break;
+}
+return ids;
+}
+function processedSessionIds(settlement){
+const ids=[];
+const results=Array.isArray(settlement?.results)?settlement.results:[];
+for(const result of results){
+const raw=typeof result?.state==="string"?result.state:"";
+const state=raw==="deletedWithWarnings"?"deleted":raw;
+const sessionId=readId(result?.sessionId);
+if(sessionId===null||STATES.includes(state)!==true||ids.includes(sessionId))continue;
+ids.push(sessionId);
+}
+return ids;
+}
+function expansionRootOf(key){
+if(typeof key!=="string"||key.startsWith(EXPANSION_KEY_PREFIX)!==true)return null;
+const rest=key.slice(EXPANSION_KEY_PREFIX.length);
+const versionEnd=rest.indexOf(":");
+if(versionEnd<=0||/^[0-9]+$/.test(rest.slice(0,versionEnd))!==true)return null;
+const afterVersion=rest.slice(versionEnd+1);
+const taskEnd=afterVersion.indexOf(":");
+return taskEnd>0?afterVersion.slice(0,taskEnd):null;
+}
+function cleanExpansionKeys(sessionIds){
+const ids=idsOf(sessionIds);
+const storage=ids.length===0?null:storageOf("sessionStorage");
+if(storage===null)return{ok:true,removed:0};
+let removed=0;
+try{
+const roots=ids.map(encodeURIComponent);
+const total=Number(storage.length);
+if(Number.isFinite(total)!==true||typeof storage.key!=="function")return{ok:false,removed:0};
+const keys=[];
+for(let index=0;index<total;index+=1){
+const key=storage.key(index);
+const root=expansionRootOf(key);
+if(root!==null&&roots.includes(root))keys.push(key);
+}
+for(const key of keys){
+storage.removeItem(key);
+removed+=1;
+}
+return{ok:true,removed};
+}catch{
+return{ok:false,removed};
+}
+}
+function cleanOwnershipLedger(sessionIds){
+const ids=idsOf(sessionIds);
+const purge=LEDGER.purgeSidebarAutoOwnershipForSessions;
+if(ids.length===0)return{ok:true,removed:0};
+if(typeof purge!=="function")return{ok:false,removed:0};
+try{
+const outcome=purge(ids);
+const removed=Number(outcome?.removed);
+return{ok:outcome?.ok===true,removed:Number.isFinite(removed)?removed:0};
+}catch{
+return{ok:false,removed:0};
+}
+}
+function readPendingMarkers(storage,now){
+const markers=[];
+try{
+const raw=storage.getItem(PENDING_CLEANUP_KEY);
+const parsed=typeof raw==="string"&&raw.length>0?JSON.parse(raw):[];
+if(Array.isArray(parsed)!==true)return markers;
+for(const entry of parsed.slice(-LIMIT)){
+const ids=isObject(entry)?idsOf(entry.ids):[];
+const at=Number(entry?.at);
+if(ids.length===0||Number.isFinite(at)!==true||now-at>TTL_MS)continue;
+markers.push({ids,at});
+}
+}catch{
+}
+return markers;
+}
+function writePendingMarkers(storage,markers){
+if(markers.length===0)storage.removeItem(PENDING_CLEANUP_KEY);
+else storage.setItem(PENDING_CLEANUP_KEY,JSON.stringify(markers.slice(-LIMIT)));
+}
+function addPendingCleanup(sessionIds,options){
+const ids=idsOf(sessionIds);
+const storage=storageOf("localStorage");
+if(ids.length===0)return{ok:true,written:false};
+if(storage===null)return{ok:false,written:false};
+const now=Number.isFinite(Number(options?.now))?Number(options.now):Date.now();
+try{
+const markers=readPendingMarkers(storage,now);
+markers.push({ids,at:now});
+writePendingMarkers(storage,markers);
+return{ok:true,written:true};
+}catch{
+return{ok:false,written:false};
+}
+}
+function sweepPendingLocalKeys(options){
+const storage=storageOf("localStorage");
+const report={ok:true,batches:0,expansionKeys:0,ownershipEntries:0,failed:0};
+if(storage===null)return{...report,ok:false};
+const now=Number.isFinite(Number(options?.now))?Number(options.now):Date.now();
+try{
+const markers=readPendingMarkers(storage,now);
+if(markers.length===0)return report;
+const remaining=[];
+for(const marker of markers){
+const expansion=cleanExpansionKeys(marker.ids);
+const ownership=cleanOwnershipLedger(marker.ids);
+report.expansionKeys+=expansion.removed;
+report.ownershipEntries+=ownership.removed;
+if(expansion.ok===true&&ownership.ok===true){
+report.batches+=1;
+continue;
+}
+remaining.push(marker);
+report.failed+=1;
+}
+writePendingMarkers(storage,remaining);
+return{...report,ok:report.failed===0};
+}catch{
+return{...report,ok:false};
+}
+}
+function readSessionRefresh(ctx){
+try{
+const sessions=ctx?.sessions;
+if(sessions===null||sessions===undefined)return null;
+return typeof sessions.refresh==="function"?sessions:null;
+}catch{
+return null;
+}
+}
+async function convergeAfterSettlement(ctx,settlement,options){
+const now=Number.isFinite(Number(options?.now))?Number(options.now):Date.now();
+const ids=processedSessionIds(settlement);
+if(ids.length===0){
+return{applied:false,ids,marked:false,refreshed:false,refreshError:null,batches:0,expansionKeys:0,ownershipEntries:0};
+}
+const marked=addPendingCleanup(ids,{now});
+const sessions=readSessionRefresh(ctx);
+let refreshed=false;
+let refreshError=null;
+if(sessions===null){
+refreshError="sessions-unavailable";
+}else{
+try{
+await sessions.refresh();
+refreshed=true;
+}catch(error){
+refreshError=error instanceof Error&&error.message.length>0?error.message:"refresh-failed";
+}
+}
+const swept=sweepPendingLocalKeys({now});
+return{
+applied:true,ids,marked:marked.written===true,refreshed,refreshError,
+batches:swept.batches,expansionKeys:swept.expansionKeys,ownershipEntries:swept.ownershipEntries,
+};
+}
+global[SYMBOL]=Object.freeze({
+EXPANSION_KEY_PREFIX,
+PENDING_CLEANUP_KEY,
+PROCESSED_STATES:STATES,
+addPendingCleanup,
+cleanExpansionKeys,
+cleanOwnershipLedger,
+convergeAfterSettlement,
+expansionRootOf,
+processedSessionIds,
+readPendingMarkers,
+sweepPendingLocalKeys,
+});
+})(globalThis);
+/* source: client-session-delete-view.js */
+(function installSessionDeleteView(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-session-delete-view");
+const MODEL_SYMBOL=Symbol.for("dsh-expert-group/client-expert-group-model");
+const FOCUS_SYMBOL=Symbol.for("dsh-expert-group/client-model-views-b");
+const DIALOG_TITLE_ID="deg_session_delete_dialog_title";
+const BLOCK_KEYS=Object.freeze({
+live:"sidebar.sessionDelete.blocked.live",
+"live-descendant":"sidebar.sessionDelete.blocked.liveDescendant",
+"pending-cleanup":"sidebar.sessionDelete.blocked.pending",
+missing:"sidebar.sessionDelete.blocked.missing",
+});
+const ROW_REASON_KEYS=Object.freeze({
+skipped:"sidebar.sessionDelete.reason.skipped",
+failed:"sidebar.sessionDelete.reason.failed",
+raced:"sidebar.sessionDelete.reason.raced",
+});
+function modelApi(){
+return global[MODEL_SYMBOL]??{};
+}
+function focusApi(){
+return global[FOCUS_SYMBOL]??{};
+}
+function resolveLocale(ctx){
+const model=modelApi();
+const sources={
+ctxLocale:(()=>{try{return ctx?.locale;}catch{return undefined;}})(),
+i18nLocale:(()=>{try{return ctx?.i18n?.locale;}catch{return undefined;}})(),
+documentLang:(()=>{try{return globalThis.document?.documentElement?.lang;}catch{return undefined;}})(),
+navigatorLanguage:(()=>{try{return globalThis.navigator?.language;}catch{return undefined;}})(),
+};
+if(typeof model.resolveClientLocale==="function")return model.resolveClientLocale(sources);
+return"zh";
+}
+function deleteTranslator(ctx){
+return function translate(key,vars){
+const model=modelApi();
+if(typeof model.translateMessage!=="function")return"—";
+return model.translateMessage(resolveLocale(ctx),key,vars);
+};
+}
+function blockedReasonText(t,blockedBy){
+const kind=typeof blockedBy?.kind==="string"?blockedBy.kind:"missing";
+const key=BLOCK_KEYS[kind]??BLOCK_KEYS.missing;
+if(kind==="live-descendant"){
+const name=typeof blockedBy?.title==="string"&&blockedBy.title.length>0
+?blockedBy.title
+:(typeof blockedBy?.sessionId==="string"?blockedBy.sessionId:"");
+return t(key,{title:name.length>0?name:"—"});
+}
+return t(key);
+}
+function outcomeSentence(t,counts){
+const parts=[];
+const deleted=Number.isFinite(counts?.deleted)?counts.deleted:0;
+const absent=Number.isFinite(counts?.absent)?counts.absent:0;
+const reasons=[];
+let kept=0;
+for(const stateName of["skipped","failed","raced"]){
+const count=Number.isFinite(counts?.[stateName])?counts[stateName]:0;
+if(count<=0)continue;
+kept+=count;
+reasons.push(t(ROW_REASON_KEYS[stateName]));
+}
+if(deleted>0)parts.push(t("sidebar.sessionDelete.outcome.deleted",{count:deleted}));
+if(absent>0)parts.push(t("sidebar.sessionDelete.outcome.absent",{count:absent}));
+if(kept>0){
+parts.push(t("sidebar.sessionDelete.outcome.kept",{
+count:kept,
+reasons:reasons.join(t("sidebar.sessionDelete.outcome.reasonJoin")),
+}));
+}
+return parts.join(t("sidebar.sessionDelete.outcome.join"));
+}
+function trashIcon(create,primitives){
+const Icon=primitives?.IconTrashOutlineRegular;
+return typeof Icon==="function"?create(Icon,{className:"deg_sd_icon"}):null;
+}
+function selectAllIcon(create){
+return create("svg",{
+className:"deg_sd_icon",viewBox:"0 0 16 16","aria-hidden":"true",focusable:"false",
+fill:"none",stroke:"currentColor",strokeWidth:1.5,strokeLinecap:"round",strokeLinejoin:"round",
+},
+create("path",{d:"M2.6 8.4 6.2 12 13.4 3.6"}));
+}
+function selectAllActiveIcon(create){
+return create("svg",{
+className:"deg_sd_icon",viewBox:"0 0 16 16","aria-hidden":"true",focusable:"false",
+fill:"none",
+},
+create("rect",{x:2.2,y:2.2,width:11.6,height:11.6,rx:2.4,fill:"currentColor"}),
+create("path",{
+d:"M5 8.2 7 10.2 11 5.8",fill:"none",
+stroke:"var(--dsw-alias-bg-layer-1)",strokeWidth:1.7,strokeLinecap:"round",strokeLinejoin:"round",
+}));
+}
+function closeIcon(create,primitives){
+const Icon=primitives?.IconCloseOutlineRegular;
+return typeof Icon==="function"?create(Icon,{className:"deg_sd_icon"}):create("span",{"aria-hidden":"true"},"\u2715");
+}
+function renderRowActionButton(create,primitives,t,options){
+const label=t("sidebar.sessionDelete.row.aria",{title:options.title});
+return create("button",{
+type:"button",
+className:"deg_sd_row_action",
+title:label,
+"aria-label":label,
+disabled:options.disabled===true,
+"data-deg-session-delete-row":"true",
+onClick:options.onClick,
+},trashIcon(create,primitives));
+}
+function renderMenuItem(create,primitives,t,options){
+const MenuItemButton=primitives?.MenuItemButton;
+if(typeof MenuItemButton==="function"){
+return create(MenuItemButton,{
+...(options.danger===true?{danger:true,icon:trashIcon(create,primitives)}:{}),
+disabled:options.disabled===true,
+onSelect:options.onSelect,
+},options.label);
+}
+return create("button",{
+type:"button",
+role:"menuitem",
+className:options.danger===true?"deg_sd_menu_item deg_sd_danger":"deg_sd_menu_item",
+disabled:options.disabled===true,
+[options.attribute]:"true",
+onClick:options.onSelect,
+},options.danger===true?trashIcon(create,primitives):null,options.label);
+}
+function renderLeadingCheckbox(create,t,options){
+const label=t("sidebar.sessionDelete.checkbox.aria",{title:options.title??"—"});
+return create("input",{
+type:"checkbox",
+className:"deg_sd_check",
+checked:options.checked===true,
+disabled:options.disabled===true,
+"aria-label":label,
+title:label,
+"data-deg-session-delete-check":"true",
+onClick:(event)=>{event?.stopPropagation?.();},
+onKeyDown:(event)=>{event?.stopPropagation?.();},
+onChange:options.onToggle,
+});
+}
+function renderBar(create,primitives,t,view){
+const counts=view.counts??{};
+const blocked=Number.isFinite(counts.blocked)?counts.blocked:0;
+const busy=view.busy===true;
+const allSelected=counts.allSelected===true;
+const selectAllLabel=t(allSelected
+?"sidebar.sessionDelete.bar.deselectAll"
+:"sidebar.sessionDelete.bar.selectAll");
+const deleteLabel=t("sidebar.sessionDelete.menu");
+const exitLabel=t("sidebar.sessionModel.close");
+return create("div",{
+className:"deg_sd_bar",
+role:"toolbar",
+"aria-label":t("sidebar.sessionDelete.menu"),
+"data-deg-session-delete-bar":"true",
+style:view.style,
+},
+create("span",{
+className:"deg_sd_count","aria-live":"polite","data-deg-session-delete-count":"true",
+},t("sidebar.sessionDelete.bar.selected",{count:Number.isFinite(counts.selected)?counts.selected:0})),
+blocked>0?create("span",{
+className:"deg_sd_blocked",
+"data-deg-session-delete-blocked":"true",
+},t("sidebar.sessionDelete.bar.blocked",{count:blocked})):null,
+create("button",{
+type:"button",
+className:"deg_sd_btn deg_sd_selectall",
+title:selectAllLabel,
+"aria-label":selectAllLabel,
+"data-deg-session-delete-selectall":"true",
+"data-deg-session-delete-selectall-state":allSelected?"all":"idle",
+disabled:busy||!(counts.actionable>0),
+onClick:view.onSelectAll,
+},allSelected?selectAllActiveIcon(create):selectAllIcon(create)),
+create("button",{
+type:"button",className:"deg_sd_btn deg_sd_danger","aria-label":deleteLabel,
+"data-deg-session-delete-delete":"true",
+disabled:busy||counts.deletable!==true,
+onClick:view.onDelete,
+},trashIcon(create,primitives)),
+create("button",{
+type:"button",className:"deg_sd_btn","aria-label":exitLabel,
+"data-deg-session-delete-exit":"true",
+onClick:view.onExit,
+},closeIcon(create,primitives)));
+}
+function renderDialog(create,t,view,handlers){
+if(view===null)return null;
+const running=view.running===true;
+const onCancel=()=>{if(running!==true)handlers.onCancel();};
+return create("div",{
+className:"deg_prompt_dialog_backdrop",
+onClick:onCancel,
+},
+create("div",{
+className:"deg_prompt_dialog",
+role:"dialog",
+"aria-modal":"true",
+"aria-labelledby":DIALOG_TITLE_ID,
+"data-deg-session-delete-dialog":view.kind,
+ref:handlers.dialogRef,
+onClick:(event)=>event?.stopPropagation?.(),
+onKeyDown:(event)=>handleDialogKeyDown(event,view,handlers),
+},
+create("h3",{id:DIALOG_TITLE_ID},view.title),
+create("p",{className:"deg_sd_dialog_line"},view.lines.join("\n")),
+view.error===null||view.error===undefined?null:create("p",{
+className:"deg_remove_confirm_error",role:"alert","aria-live":"assertive",
+},view.error),
+create("div",{className:"deg_prompt_dialog_actions"},
+create("button",{
+type:"button",
+className:"deg_btn",
+"data-deg-dialog-action":"cancel",
+"data-deg-session-delete-cancel":"true",
+autoFocus:true,
+disabled:running,
+onClick:onCancel,
+},view.kind==="confirm"?t("sidebar.sessionDelete.dialog.cancel"):t("sidebar.sessionModel.close")),
+view.kind==="confirm"?create("button",{
+type:"button",
+className:"deg_btn deg_btn_primary",
+"data-deg-dialog-action":"confirm",
+"data-deg-session-delete-confirm":"true",
+disabled:running,
+onClick:()=>{void handlers.onConfirm();},
+},running?t("sidebar.sessionDelete.dialog.running"):t("sidebar.sessionDelete.dialog.confirm")):null)));
+}
+function handleDialogKeyDown(event,view,handlers){
+if(view.running===true)return;
+if(event?.key==="Escape"){
+event.preventDefault?.();
+event.stopPropagation?.();
+handlers.onCancel();
+return;
+}
+if(event?.key!=="Tab")return;
+const focusable=focusApi().focusableDialogControls;
+const controls=typeof focusable==="function"
+?focusable(handlers.dialogRef?.current??event?.currentTarget??null)
+:[];
+if(!Array.isArray(controls)||controls.length===0)return;
+const active=typeof document==="undefined"?null:document.activeElement;
+const current=controls.indexOf(active);
+const nextIndex=event.shiftKey
+?(current<=0?controls.length-1:current-1)
+:(current>=controls.length-1?0:current+1);
+event.preventDefault?.();
+try{controls[nextIndex]?.focus?.();}catch{/* 无 DOM 焦点时保持可点击按钮。 */}
+}
+global[SYMBOL]=Object.freeze({
+DIALOG_TITLE_ID,
+blockedReasonText,
+deleteTranslator,
+outcomeSentence,
+renderBar,
+renderDialog,
+renderLeadingCheckbox,
+renderMenuItem,
+renderRowActionButton,
+});
+})(globalThis);
+/* source: client-session-delete-ui.js */
+(function installSessionDeleteUiModule(global){
+"use strict";
+const SYMBOL=Symbol.for("dsh-expert-group/client-session-delete-ui");
+const SELECTION=global[Symbol.for("dsh-expert-group/client-session-delete-selection")]??{};
+const VIEW=global[Symbol.for("dsh-expert-group/client-session-delete-view")]??{};
+const POLL=global[Symbol.for("dsh-expert-group/client-sidebar-poll")]??{};
+const LOCAL_KEYS=global[Symbol.for("dsh-expert-group/client-session-delete-local-keys")]??{};
+const{
+escapeAction,exitSelection,initialSelectionState,isSelectionOpen,isSessionActionable,
+isSessionSelected,markSettling,openSelection,
+requestDeleteAll,requestDeleteCandidates,selectionCandidateOf,selectionCounts,
+selectionTargets,submitSelection,toggleSelectAllActionable,toggleSelection,
+UNGROUPED_SCOPE,
+}=SELECTION;
+const NOOP=function noop(){};
+const ROW_KEY_PREFIX="session:";
+const DOCK_GAP=8;
+const RESERVE_CLASS="deg_sd_selecting";
+const RPC_DIAGNOSTIC_KEY="dsh-expert-group:session-delete:last-rpc-error";
+const RPC_DIAGNOSTIC_MESSAGE_LIMIT=300;
+const CONTROL_SELECTOR='button,a,input,select,textarea,[role="menuitem"],[role="checkbox"],[contenteditable="true"]';
+function readId(value){
+return typeof value==="string"&&value.length>0?value:null;
+}
+function scopeKeyOf(items,sessionId){
+if(!Array.isArray(items)||readId(sessionId)===null)return"";
+for(const item of items){
+const sessionIds=Array.isArray(item)?null:item?.sessionIds;
+if(!Array.isArray(sessionIds))return"";
+if(sessionIds.includes(sessionId)!==true)continue;
+return readId(item.workspaceId)??"";
+}
+return typeof UNGROUPED_SCOPE==="string"?UNGROUPED_SCOPE:"";
+}
+async function convergeSettlement(ctx,settlement){
+const converge=LOCAL_KEYS.convergeAfterSettlement;
+if(typeof converge!=="function"||settlement===null||settlement===undefined)return;
+try{
+await converge(ctx,settlement);
+}catch{
+}
+}
+function sweepStartupLocalKeys(){
+const sweep=LOCAL_KEYS.sweepPendingLocalKeys;
+if(typeof sweep!=="function")return;
+try{
+sweep();
+}catch{
+}
+}
+function resolveConnection(ctx){
+try{
+if(ctx?.connection)return ctx.connection;
+}catch{
+}
+try{
+return typeof ctx?.get==="function"?ctx.get("connection"):undefined;
+}catch{
+return undefined;
+}
+}
+function missingConnectionError(){
+return new Error("当前 DSH 未提供 Connection");
+}
+function recordRpcFailure(error,request,connectionMissing){
+try{
+const storage=global.localStorage;
+if(storage===null||storage===undefined||typeof storage.setItem!=="function")return;
+const message=typeof error?.message==="string"
+?error.message
+:(error===undefined||error===null?"":String(error));
+const stack=typeof error?.stack==="string"?error.stack.split("\n"):[];
+storage.setItem(RPC_DIAGNOSTIC_KEY,JSON.stringify({
+at:Date.now(),
+action:request?.action??null,
+connection:connectionMissing?"missing":"resolved",
+requestKeys:Object.keys(request!==null&&typeof request==="object"?request:{}),
+errorName:error?.name??null,
+errorCode:error?.code??null,
+errorMessage:message.slice(0,RPC_DIAGNOSTIC_MESSAGE_LIMIT),
+errorStack:stack.length===0?null:stack.slice(0,2).join("\n"),
+}));
+}catch{
+}
+}
+function makePort(ctx,deps){
+const requestPluginRpc=deps?.requestPluginRpc;
+const callRpc=POLL.callRpc;
+const connection=resolveConnection(ctx);
+const connectionMissing=connection===undefined||connection===null;
+return{
+call:async(request)=>{
+try{
+if(typeof callRpc!=="function")throw new Error("当前 DSH 未提供插件 RPC");
+if(connectionMissing)throw missingConnectionError();
+return await callRpc({requestPluginRpc},{connection},request);
+}catch(error){
+recordRpcFailure(error,request,connectionMissing);
+throw error;
+}
+},
+};
+}
+function outcomeDialogOf(counts,message){
+return{kind:"outcome",counts:counts??null,message:message??null};
+}
+function keptCountOf(counts){
+if(counts===null||typeof counts!=="object")return 0;
+return(Number(counts.failed)||0)+(Number(counts.skipped)||0)+(Number(counts.raced)||0);
+}
+function candidatesFailureText(t,error){
+return t("sidebar.sessionDelete.error.candidates",{
+message:error===null||error===undefined?"":error.message,
+});
+}
+function deleteFailureText(t,error){
+return t("sidebar.sessionDelete.error.delete",{
+message:error===null||error===undefined?"":error.message,
+});
+}
+function outcomeDialogOfSettlement(t,outcome){
+const failed=outcome?.ok!==true;
+const settlement=outcome?.settlement??null;
+const counts=settlement===null?null:settlement.counts;
+if(failed!==true&&keptCountOf(counts)===0)return null;
+return outcomeDialogOf(counts,failed===true?deleteFailureText(t,outcome?.error):null);
+}
+function makeDeleteUiStore(deps){
+const port=deps.port;
+const t=deps.t;
+const ctx=deps.ctx;
+const listeners=new Set();
+let state={
+selection:initialSelectionState(),
+busy:false,
+dialog:null,
+anchor:null,
+};
+function emit(next){
+state=next;
+for(const listener of Array.from(listeners)){
+try{listener();}catch{/* 订阅者异常与状态推进无关 */}
+}
+}
+function patch(next){
+emit({...state,...next});
+}
+function getSnapshot(){
+return state;
+}
+function subscribe(listener){
+if(typeof listener!=="function")return NOOP;
+listeners.add(listener);
+return listeners.delete.bind(listeners,listener);
+}
+const handle={port,t,get:getSnapshot,patch};
+async function dispatch(action,payload){
+if(action==="toggle"){
+const next=toggleSelection(state.selection,payload?.sessionId);
+if(next!==state.selection)patch({selection:next});
+return;
+}
+if(action==="select-all"){
+const next=toggleSelectAllActionable(state.selection);
+if(next!==state.selection)patch({selection:next});
+return;
+}
+if(action==="cancel"){
+if(state.dialog!==null&&state.dialog.phase!=="running")patch({dialog:null});
+return;
+}
+if(action==="exit"){
+patch({selection:exitSelection(),dialog:null});
+return;
+}
+if(action==="anchor"){
+const next=payload??null;
+if(next===null)return;
+const current=state.anchor;
+if(current!==null&&current.left===next.left&&current.bottom===next.bottom&&current.width===next.width)return;
+patch({anchor:next});
+return;
+}
+if(action==="open-single"){
+await openSingleAction(handle,payload);
+return;
+}
+if(action==="open-multi"){
+const scopeKey=readId(payload?.workspaceId);
+if(scopeKey===null)return;
+if(state.busy===true)return;
+patch({busy:true});
+const opened=await openSelection(port,scopeKey,readId(payload?.sessionId));
+if(opened.ok!==true){
+patch({busy:false,dialog:outcomeDialogOf(null,candidatesFailureText(t,opened.error))});
+return;
+}
+patch({busy:false,selection:opened.state});
+return;
+}
+if(action==="delete-selected"){
+await startBatchAction(handle);
+return;
+}
+if(action==="confirm"){
+const dialog=state.dialog;
+if(dialog===null||dialog.kind!=="confirm"||dialog.phase==="running")return;
+patch({dialog:{...dialog,phase:"running",error:null}});
+if(dialog.scope==="single"){
+const outcome=await requestDeleteAll(port,{
+workspaceId:dialog.workspaceId,
+targets:[dialog.targets[0].sessionId],
+});
+patch({dialog:outcomeDialogOfSettlement(t,outcome)});
+await convergeSettlement(ctx,outcome.settlement);
+return;
+}
+const settled=await submitSelection(port,markSettling(state.selection,true));
+patch({dialog:outcomeDialogOfSettlement(t,settled),selection:exitSelection()});
+await convergeSettlement(ctx,settled.settlement);
+}
+}
+return Object.freeze({dispatch,getSnapshot,subscribe});
+}
+async function startBatchAction(handle){
+const state=handle.get();
+if(isSelectionOpen(state.selection)!==true||state.busy===true)return;
+const selection=state.selection;
+const targets=selectionTargets(selection);
+if(targets.length===0)return;
+const counts=selectionCounts(selection);
+let absent=0;
+for(const target of targets)if(target.absent===true)absent+=1;
+handle.patch({
+dialog:{
+kind:"confirm",
+scope:"batch",
+workspaceId:selection.workspaceId,
+targets,
+absent,
+blocked:counts.blocked,
+phase:"idle",
+error:null,
+},
+});
+}
+async function openSingleAction(handle,payload){
+const scopeKey=readId(payload?.workspaceId);
+const sessionId=readId(payload?.sessionId);
+const state=handle.get();
+if(scopeKey===null||sessionId===null)return;
+if(state.busy===true||isSelectionOpen(state.selection)===true)return;
+handle.patch({busy:true});
+const loaded=await requestDeleteCandidates(handle.port,scopeKey);
+if(loaded.ok!==true){
+handle.patch({busy:false,dialog:outcomeDialogOf(null,candidatesFailureText(handle.t,loaded.error))});
+return;
+}
+let candidate=null;
+for(const entry of Array.isArray(loaded.snapshot?.candidates)?loaded.snapshot.candidates:[]){
+if(entry?.sessionId===sessionId){candidate=entry;break;}
+}
+if(candidate===null||candidate.actionable!==true){
+handle.patch({busy:false,dialog:{kind:"blocked",blockedBy:candidate===null?null:candidate.blockedBy}});
+return;
+}
+const title=readId(payload?.title)??candidate.title;
+handle.patch({
+busy:false,
+dialog:{kind:"confirm",scope:"single",workspaceId:scopeKey,targets:[{...candidate,title}],absent:0,blocked:0,phase:"idle",error:null},
+});
+}
+function handleRowClickEvent(event,dispatch){
+const target=event?.target;
+if(target===null||target===undefined||typeof target.closest!=="function")return;
+const row=target.closest('[data-row-key^="session:"]');
+if(row===null||row===undefined||typeof row.getAttribute!=="function")return;
+const control=target.closest(CONTROL_SELECTOR);
+if(control!==null&&control!==undefined)return;
+const key=row.getAttribute("data-row-key");
+if(typeof key!=="string"||key.length<=ROW_KEY_PREFIX.length)return;
+event.preventDefault?.();
+event.stopPropagation?.();
+void dispatch("toggle",{sessionId:key.slice(ROW_KEY_PREFIX.length)});
+}
+function handleDocumentKeyDown(event,ui){
+if(event?.key!=="Escape")return;
+const state=ui.getSnapshot();
+const next=escapeAction(state.selection,{confirmOpen:state.dialog!==null});
+if(next==="none")return;
+event.preventDefault?.();
+event.stopPropagation?.();
+void ui.dispatch(next==="close-confirm"?"cancel":"exit");
+}
+function anchorStyle(){
+let anchor=null;
+try{
+const doc=globalThis.document;
+const row=typeof doc?.querySelector==="function"?doc.querySelector('[data-row-key^="session:"]'):null;
+const tree=typeof row?.closest==="function"?row.closest('[role="tree"]'):null;
+const rect=typeof tree?.getBoundingClientRect==="function"?tree.getBoundingClientRect():null;
+const width=Number(rect?.width);
+if(Number.isFinite(width)&&width>0){
+const region=typeof tree?.closest==="function"?tree.closest('[class*="regionArea"]'):null;
+const regionRect=typeof region?.getBoundingClientRect==="function"?region.getBoundingClientRect():null;
+const regionBottom=Number(regionRect?.bottom);
+const dock=Number.isFinite(regionBottom)?regionBottom:Number(rect?.bottom);
+if(Number.isFinite(dock)){
+const viewportHeight=Number(globalThis.innerHeight);
+const base=Number.isFinite(viewportHeight)?viewportHeight:dock;
+anchor={
+left:Math.round(Number(rect.left)),
+bottom:Math.max(DOCK_GAP,Math.round(base-dock+DOCK_GAP)),
+width:Math.round(width),
+};
+}
+}
+}catch{
+anchor=null;
+}
+const box=anchor??{left:8,bottom:DOCK_GAP+4,width:264};
+return{position:"fixed",left:box.left+"px",bottom:box.bottom+"px",width:box.width+"px"};
+}
+function useReserveClass(react,state){
+const visible=isSelectionOpen(state.selection)===true;
+react.useEffect(()=>{
+const list=globalThis.document?.body?.classList;
+if(typeof list?.add!=="function"||typeof list.remove!=="function")return undefined;
+if(visible===true)list.add(RESERVE_CLASS);else list.remove(RESERVE_CLASS);
+return()=>{list.remove(RESERVE_CLASS);};
+},[visible]);
+}
+function dialogViewOf(ui,state){
+const dialog=state.dialog;
+if(dialog===null)return null;
+const t=ui.text;
+if(dialog.kind==="outcome"){
+const lines=[];
+const sentence=VIEW.outcomeSentence(t,dialog.counts);
+if(sentence.length>0)lines.push(sentence);
+if(typeof dialog.message==="string"&&dialog.message.length>0)lines.push(dialog.message);
+return{
+kind:"outcome",
+title:t("sidebar.sessionDelete.dialog.title"),
+lines,
+error:null,
+running:false,
+};
+}
+if(dialog.kind==="blocked"){
+return{
+kind:"blocked",
+title:t("sidebar.sessionDelete.blocked.title"),
+lines:[VIEW.blockedReasonText(t,dialog.blockedBy)],
+error:null,
+running:false,
+};
+}
+const targets=Array.isArray(dialog.targets)?dialog.targets:[];
+const lines=[];
+if(dialog.scope==="single"){
+lines.push(t("sidebar.sessionDelete.dialog.single",{title:targets.length>0?(targets[0].title??""):""}));
+}else{
+lines.push(t("sidebar.sessionDelete.dialog.batch",{count:targets.length}));
+if(dialog.absent>0)lines.push(t("sidebar.sessionDelete.dialog.absent",{count:dialog.absent}));
+if(dialog.blocked>0)lines.push(t("sidebar.sessionDelete.dialog.blocked",{count:dialog.blocked}));
+const first=[];
+for(let index=0;index<targets.length&&index<5;index+=1){
+first.push(targets[index].title??targets[index].sessionId);
+}
+lines.push(t("sidebar.sessionDelete.dialog.first",{count:first.length,titles:first.join(", ")}));
+}
+lines.push(t("sidebar.sessionDelete.dialog.irreversible"));
+return{
+kind:"confirm",
+title:t("sidebar.sessionDelete.dialog.title"),
+lines,
+error:dialog.error,
+running:dialog.phase==="running",
+};
+}
+function useSessionScope(props,sessionId){
+const selector=props?.useWorkspaces;
+if(typeof selector!=="function")return"";
+const value=selector((snapshot)=>scopeKeyOf(snapshot?.items,sessionId));
+return typeof value==="string"?value:"";
+}
+function useDocumentWiring(react,props,state){
+const open=isSelectionOpen(state.selection);
+const visible=open===true||state.dialog!==null;
+react.useEffect(()=>{
+const doc=globalThis.document;
+if(visible!==true||typeof doc?.addEventListener!=="function")return undefined;
+const ui=props.ui;
+const sync=()=>{void ui.dispatch("anchor",anchorStyle());};
+const onClick=(event)=>{if(open===true)handleRowClickEvent(event,ui.dispatch);};
+const onKeyDown=(event)=>handleDocumentKeyDown(event,ui);
+doc.addEventListener("click",onClick,true);
+doc.addEventListener("keydown",onKeyDown,true);
+sync();
+const view=globalThis.window;
+if(typeof view?.addEventListener==="function")view.addEventListener("resize",sync);
+return()=>{
+try{doc.removeEventListener("click",onClick,true);}catch{/* 摘不掉就放弃这条监听 */}
+try{doc.removeEventListener("keydown",onKeyDown,true);}catch{/* 同上 */}
+if(typeof view?.removeEventListener==="function"){
+try{view.removeEventListener("resize",sync);}catch{/* 同上 */}
+}
+};
+},[open,visible]);
+}
+function SessionDeleteRowAction(props){
+const react=props.react;
+const state=react.useSyncExternalStore(props.ui.subscribe,props.ui.getSnapshot);
+const scopeKey=useSessionScope(props,props.sessionId);
+const title=typeof props.displayTitle==="string"?props.displayTitle.trim():"";
+if(title==="")return null;
+const locked=scopeKey===""||state.busy===true;
+return VIEW.renderRowActionButton(react.createElement,props.primitives,props.ui.text,{
+title,
+disabled:locked,
+onClick:props.ui.dispatch.bind(null,"open-single",{workspaceId:scopeKey,sessionId:props.sessionId,title}),
+});
+}
+function SessionDeleteMenuDelete(props){
+const react=props.react;
+const state=react.useSyncExternalStore(props.ui.subscribe,props.ui.getSnapshot);
+const scopeKey=useSessionScope(props,props.sessionId);
+const menu=typeof props.useMenuOpenState==="function"?props.useMenuOpenState():null;
+const closeMenu=typeof menu?.[1]==="function"?menu[1]:NOOP;
+const title=typeof props.displayTitle==="string"?props.displayTitle.trim():"";
+if(title==="")return null;
+const locked=scopeKey===""||state.busy===true;
+const run=props.ui.dispatch.bind(null,"open-single",{workspaceId:scopeKey,sessionId:props.sessionId,title});
+return VIEW.renderMenuItem(react.createElement,props.primitives,props.ui.text,{
+label:props.ui.text("sidebar.sessionDelete.menu"),
+danger:true,
+attribute:"data-deg-session-delete-menu",
+disabled:locked,
+onSelect:()=>{closeMenu(false);void run();},
+});
+}
+function SessionDeleteMenuMulti(props){
+const react=props.react;
+const state=react.useSyncExternalStore(props.ui.subscribe,props.ui.getSnapshot);
+const scopeKey=useSessionScope(props,props.sessionId);
+const menu=typeof props.useMenuOpenState==="function"?props.useMenuOpenState():null;
+const closeMenu=typeof menu?.[1]==="function"?menu[1]:NOOP;
+if(scopeKey==="")return null;
+const locked=state.busy===true||isSelectionOpen(state.selection)===true;
+const run=props.ui.dispatch.bind(null,"open-multi",{workspaceId:scopeKey,sessionId:props.sessionId});
+return VIEW.renderMenuItem(react.createElement,props.primitives,props.ui.text,{
+label:props.ui.text("sidebar.sessionDelete.multi"),
+danger:true,
+attribute:"data-deg-session-delete-multi",
+disabled:locked,
+onSelect:()=>{closeMenu(false);void run();},
+});
+}
+function SessionDeleteLeadingCheck(props){
+const react=props.react;
+const state=react.useSyncExternalStore(props.ui.subscribe,props.ui.getSnapshot);
+if(isSelectionOpen(state.selection)!==true)return null;
+if(isSessionActionable(state.selection,props.sessionId)!==true)return null;
+const candidate=selectionCandidateOf?.(state.selection,props.sessionId)??null;
+return VIEW.renderLeadingCheckbox(react.createElement,props.ui.text,{
+title:candidate===null?null:candidate.title,
+checked:isSessionSelected(state.selection,props.sessionId)===true,
+disabled:state.busy===true||state.selection.settling===true,
+onToggle:props.ui.dispatch.bind(null,"toggle",{sessionId:props.sessionId}),
+});
+}
+function SessionDeleteOverlay(props){
+const react=props.react;
+const ui=props.ui;
+const state=react.useSyncExternalStore(ui.subscribe,ui.getSnapshot);
+const dialogRef=react.useRef(null);
+useDocumentWiring(react,props,state);
+useReserveClass(react,state);
+const t=ui.text;
+const bar=isSelectionOpen(state.selection)===true
+?VIEW.renderBar(react.createElement,props.primitives,t,{
+counts:selectionCounts(state.selection),
+busy:state.busy===true||state.selection.settling===true,
+style:state.anchor??undefined,
+onSelectAll:ui.dispatch.bind(null,"select-all"),
+onDelete:ui.dispatch.bind(null,"delete-selected"),
+onExit:ui.dispatch.bind(null,"exit"),
+})
+:null;
+return react.createElement(react.Fragment,null,
+bar,
+VIEW.renderDialog(react.createElement,t,dialogViewOf(ui,state),{
+dialogRef,
+onCancel:ui.dispatch.bind(null,"cancel"),
+onConfirm:ui.dispatch.bind(null,"confirm"),
+}));
+}
+function installSessionDeleteUi(ctx,deps){
+sweepStartupLocalKeys();
+const slots=ctx?.slots;
+const react=deps?.react;
+if(slots===null||slots===undefined||typeof slots.inject!=="function"||typeof slots.register!=="function")return NOOP;
+if(react===null||react===undefined||typeof react.createElement!=="function")return NOOP;
+const t=VIEW.deleteTranslator(ctx);
+const ui=Object.freeze({...makeDeleteUiStore({port:makePort(ctx,deps),t,ctx}),text:t});
+const primitives=deps?.primitives??{};
+const injected=()=>({ui,react,primitives});
+slots.inject("sidebar.workspaces.session.row.action",()=>slots.register({
+name:"sidebar.workspaces.session.row.action",
+id:"dsh-expert-group-session-delete",
+order:300,
+inject:injected,
+},SessionDeleteRowAction));
+slots.inject("sidebar.workspaces.session.menu.item",()=>slots.register({
+name:"sidebar.workspaces.session.menu.item",
+id:"dsh-expert-group-session-delete",
+order:460,
+inject:injected,
+},SessionDeleteMenuDelete));
+slots.inject("sidebar.workspaces.session.menu.item",()=>slots.register({
+name:"sidebar.workspaces.session.menu.item",
+id:"dsh-expert-group-session-delete-multi",
+order:470,
+inject:injected,
+},SessionDeleteMenuMulti));
+slots.inject("sidebar.session.row.leading",()=>slots.register({
+name:"sidebar.session.row.leading",
+id:"dsh-expert-group-session-delete",
+inject:injected,
+},SessionDeleteLeadingCheck));
+slots.inject("shell.overlay",()=>slots.register({
+name:"shell.overlay",
+id:"dsh-expert-group-session-delete",
+order:10,
+inject:injected,
+},SessionDeleteOverlay));
+return NOOP;
+}
+global[SYMBOL]=Object.freeze({
+ROW_KEY_PREFIX,
+RESERVE_CLASS,
+anchorStyle,
+convergeSettlement,
+sweepStartupLocalKeys,
+handleDocumentKeyDown,
+handleRowClickEvent,
+installSessionDeleteUi,
+makeDeleteUiStore,
+SessionDeleteLeadingCheck,
+SessionDeleteMenuDelete,
+SessionDeleteMenuMulti,
+SessionDeleteOverlay,
+SessionDeleteRowAction,
+scopeKeyOf,
+});
+})(globalThis);
 /* source: shared/peak-valley-time.js */
 /* classic 投影：来自 shared/peak-valley-time.js 的机械导出改写，权威实现仍是该 ESM 文件。 */
 (function installProjectedSource_shared_peak_valley_time_js(){
@@ -20758,6 +22504,10 @@ const clientSidebarEntryModule=globalThis[Symbol.for("dsh-expert-group/client-si
 const{
 installDegSidebarEntry,
 }=clientSidebarEntryModule;
+const clientSessionDeleteUiModule=globalThis[Symbol.for("dsh-expert-group/client-session-delete-ui")]||{};
+const{
+installSessionDeleteUi,
+}=clientSessionDeleteUiModule;
 const peakValleyTime=globalThis[Symbol.for("dsh-expert-group/peak-valley-time")];
 ensurePluginStylesheet();
 const RPC_PATH="/api/dsh-expert-group";
@@ -20871,6 +22621,9 @@ null,
 react.createElement(SubagentMetadataBridge,{...props,ctx}),
 )));
 installSettingsBoundSidebar(ctx,{settingsForm,modelCatalog});
+if(typeof installSessionDeleteUi==="function"){
+installSessionDeleteUi(ctx,{react,primitives,requestPluginRpc});
+}
 }
 function installSettingsBoundSidebar(ctx,{settingsForm,modelCatalog}){
 if(typeof expertGroupSidebar?.installExpertGroupSidebar!=="function")return;

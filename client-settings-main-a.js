@@ -19,8 +19,8 @@
     resolveSettingsLocale, settingsExtraText, settingsText,
   } = clientText;
   const {
-    DEFAULT_MODEL_FALLBACK_LIMIT, DEFAULT_PEAK_VALLEY_PERIODS, DEFAULT_PROMPT_MAX_GRAPHEMES, MAX_MODEL_PAGES, PROMPT_ROLE_IDS, SETTINGS_ROLE_LABELS, addModelCandidatePage,
-    commitSettingsCandidate, compactModelCandidatesDraft, mergeSettingsDraftOverSource, modelCandidatesErrorMessage, modelLayerMapOf, modelPageCountOf,
+    DEFAULT_MODEL_FALLBACK_LIMIT, DEFAULT_PEAK_VALLEY_PERIODS, DEFAULT_PROMPT_MAX_GRAPHEMES, MAX_MODEL_PAGES, ORCHESTRATOR_ID, PROMPT_ROLE_IDS, SETTINGS_ROLE_LABELS, addModelCandidatePage,
+    commitSettingsCandidate, compactModelCandidatesDraft, compactOrchestratorDraft, mergeSettingsDraftOverSource, modelCandidatesErrorMessage, modelLayerMapOf, modelPageCountOf,
     normalizeModelCandidatesDraft, normalizePeakValleyDraft, normalizePromptOverrides, normalizeRolePromptProjection, normalizeSettingsCommitDraft, normalizeSettingsDraft, promptEntryOf,
     promptOverridesEqual, removeModelCandidatePage, reorderModelLayers, settingsDraftEqual, unifiedProviderOf, updateRolePromptProjection,
     useEnabledSettingsRoles, useHostMeta, validateModelCandidateRows, validatePromptText,
@@ -221,6 +221,8 @@
         defaults: value.defaults ?? {},
         candidates: compactModelCandidatesDraft(value.candidates),
         fallbackLimit: value.fallbackLimit === void 0 ? DEFAULT_MODEL_FALLBACK_LIMIT : value.fallbackLimit,
+        // 时段层的主代理配置与全局层同形（Host 契约），随 profile 一起提交。
+        orchestrator: compactOrchestratorDraft(value.orchestrator),
       };
     };
     return {
@@ -260,13 +262,6 @@
     return () => view.save({ repair: true });
   }
 
-  /**
-   * 设置页的保存动作（票据 31 从组件作用域外移）。
-   *
-   * view 就是组件每轮渲染交给渲染尾段的同一份读面/写面，因此这里读到的状态、回调和引用
-   * 与渲染完全同源，不存在第二份草稿或第二套判定。保存分四个语义阶段：守卫 → 组装候选 →
-   * 计算变更集 → 提交与回执归一，阶段顺序与拆分前逐字相同。
-   */
   /**
    * 设置页的保存动作（票据 31 从组件作用域外移并按语义阶段拆分）。
    *
@@ -339,6 +334,53 @@
         if (promptChanged) {
           ops.push({ op: "set", path: ["promptOverrides"], value: candidatePromptOverrides });
         }
+  }
+
+  /**
+   * 主代理（保留键）的保存判定：归一 → 与权威值比较 → 候选行校验。
+   *
+   * 提取成模块级函数（与 pushScalarChangeOps 同一理由）：deriveSettingsSavePlan 贴近 200 行门禁，
+   * 这段判定自成一体，搬出去不改变执行顺序与任何语义。
+   *
+   * @returns {{candidate: object, changed: boolean, source: object}|null} null = 候选校验失败。
+   */
+  function orchestratorSaveChangeOf(authorityValue, normalizedDraft, tExtra, roleLabelOf, setCandidatesError) {
+    const source = compactOrchestratorDraft(authorityValue?.orchestrator);
+    const candidate = compactOrchestratorDraft(normalizedDraft.orchestrator);
+    if (settingsDraftEqual(candidate, source)) return { candidate, changed: false, source };
+    // 校验借用角色候选的同一实现：把主代理当成一张单行映射，失败提示以 Orchestrator 开头。
+    const validation = validateModelCandidateRows({ Orchestrator: candidate.candidates });
+    if (validation.ok !== true) {
+      setCandidatesError(modelCandidatesErrorMessage(tExtra, roleLabelOf, validation));
+      return null;
+    }
+    return { candidate, changed: true, source };
+  }
+
+  /**
+   * 峰谷（票据 07）的保存判定：损坏态下普通保存不提交、修复必须真的提交、时段先本地校验。
+   *
+   * 比较两侧都走 peakValleyCandidateOf（裁剪空候选、省略 initialized），因此只翻页签/只加空
+   * 候选页不会产生"看起来变了"的提交；未改动的一套 profile 原值仍进入候选。
+   *
+   * @returns {{candidate: (object|undefined), changed: boolean}|null} null = 时段非法。
+   */
+  function peakValleySaveChangeOf(normalizedDraft, source, peakValleyBroken, repairing, tExtra, setError) {
+    const candidate = normalizedDraft.peakValley === void 0 || (peakValleyBroken && !repairing)
+      ? void 0
+      : peakValleyCandidateOf(normalizedDraft.peakValley, repairing);
+    if (candidate === void 0) return { candidate, changed: repairing };
+    // 修复动作必须真的提交：坏档案的读取归一是残缺的，"内容看起来没变"也算一次修复。
+    if (repairing !== true
+      && settingsDraftEqual(candidate, peakValleyCandidateOf(normalizePeakValleyDraft(source.peakValley)))) {
+      return { candidate, changed: false };
+    }
+    const periods = peakValleyTime?.normalizePeakValleyPeriods?.(candidate.periods);
+    if (periods?.ok !== true) {
+      setError(tExtra("settings.pv.invalid", { reason: periods?.reason ?? "" }));
+      return null;
+    }
+    return { candidate, changed: true };
   }
 
   /**
@@ -458,23 +500,13 @@
         const sourceFallbackLimit = source.fallbackLimit;
         const candidateFallbackLimit = normalizedDraft.fallbackLimit;
         const fallbackLimitChanged = candidateFallbackLimit !== void 0 && candidateFallbackLimit !== sourceFallbackLimit;
-        // 峰谷（票据 07）：损坏态下普通保存不提交（只有修复意图才写回）；其余与基线比较。
-        // 比较两侧都走 peakValleyCandidateOf（裁剪空候选、省略 initialized），因此只翻页签/
-        // 只加空候选页不会产生"看起来变了"的提交，未改动的一套 profile 原值仍进入候选。
-        const candidatePeakValley = normalizedDraft.peakValley === void 0 || (peakValleyBroken && !repairing)
-          ? void 0
-          : peakValleyCandidateOf(normalizedDraft.peakValley, repairing);
-        // 修复动作必须真的提交：坏档案的读取归一是残缺的，"内容看起来没变"也算一次修复。
-        let peakValleyChanged = repairing;
-        if (candidatePeakValley !== void 0
-          && (repairing || !settingsDraftEqual(candidatePeakValley, peakValleyCandidateOf(normalizePeakValleyDraft(source.peakValley))))) {
-          const periods = peakValleyTime?.normalizePeakValleyPeriods?.(candidatePeakValley.periods);
-          if (periods?.ok !== true) {
-            setError(tExtra("settings.pv.invalid", { reason: periods?.reason ?? "" }));
-            return null;
-          }
-          peakValleyChanged = true;
-        }
+        // 主代理（保留键）与峰谷的判定各自归模块级纯函数，语义见它们的说明。
+        const orchestratorChange = orchestratorSaveChangeOf(authorityValue, normalizedDraft, tExtra, roleLabelOf, setCandidatesError);
+        if (orchestratorChange === null) return null;
+        const { candidate: candidateOrchestrator, changed: orchestratorChanged, source: sourceOrchestrator } = orchestratorChange;
+        const peakValleyChange = peakValleySaveChangeOf(normalizedDraft, source, peakValleyBroken, repairing, tExtra, setError);
+        if (peakValleyChange === null) return null;
+        const { candidate: candidatePeakValley, changed: peakValleyChanged } = peakValleyChange;
         const candidate = {
           ...normalizedDraft,
           provider: modelChanged ? draftProvider : sourceProvider,
@@ -485,10 +517,12 @@
           ...(fallbackLimitChanged
             ? { fallbackLimit: typeof candidateFallbackLimit === "number" ? candidateFallbackLimit : DEFAULT_MODEL_FALLBACK_LIMIT }
             : {}),
+          ...(orchestratorChanged ? { orchestrator: candidateOrchestrator } : {}),
           ...(peakValleyChanged ? { peakValley: candidatePeakValley } : {}),
         };
         if (!candidatesChanged) delete candidate.candidates;
         if (!fallbackLimitChanged) delete candidate.fallbackLimit;
+        if (!orchestratorChanged) delete candidate.orchestrator;
         if (!peakValleyChanged) delete candidate.peakValley;
         const ops = [];
         if (modelChanged) {
@@ -533,12 +567,15 @@
           }
         }
         if (fallbackLimitChanged) changed.push("fallbackLimit");
+        // 主代理是独立保留字段（不进 defaults/candidates 的粒度上报）。
+        if (orchestratorChanged) changed.push("orchestrator");
         // 峰谷：至少覆盖 enabled / periods；两套 profile 的角色级差异由 Host 与已保存状态比对。
         if (peakValleyChanged) changed.push("peakValley", "peakValley.enabled", "peakValley.periods");
         // 坏档案 + 没有修复意图 + 没有其它可提交项：明确说明"保存被阻止"的原因，
         // 而不是静默返回（按钮看起来可点却什么都不发生最糟）。
+        // 主代理是独立保留字段（不在 ops / candidates / fallbackLimit 里）：只改它也算可提交项（E1）。
         if (peakValleyBroken && !repairing && ops.length === 0
-          && !candidatesChanged && !fallbackLimitChanged) {
+          && !candidatesChanged && !fallbackLimitChanged && !orchestratorChanged) {
           setError(tExtra("settings.pv.broken"));
           return null;
         }
@@ -552,8 +589,9 @@
           ? settingsSnapshot.revision
           : editorBaseline.revision;
     return {
-      candidate, candidateCandidates, candidateFallbackLimit, candidatePromptOverrides, candidatesChanged, changed,
-      expectedRevision, fallbackLimitChanged, ops, peakValleyChanged, source, sourceCandidates, sourceFallbackLimit,
+      candidate, candidateCandidates, candidateFallbackLimit, candidateOrchestrator, candidatePromptOverrides,
+      candidatesChanged, changed, expectedRevision, fallbackLimitChanged, ops, orchestratorChanged,
+      peakValleyChanged, source, sourceCandidates, sourceFallbackLimit, sourceOrchestrator,
     };
   }
 
@@ -578,8 +616,9 @@
       ctx, effectiveDraft, editorBaseline, promptTouchedRoles, setSaving,
     } = view;
     const {
-      candidate, candidateCandidates, candidateFallbackLimit, candidatePromptOverrides, candidatesChanged,
-      changed, expectedRevision, fallbackLimitChanged, ops, peakValleyChanged, source, sourceCandidates, sourceFallbackLimit,
+      candidate, candidateCandidates, candidateFallbackLimit, candidateOrchestrator, candidatePromptOverrides,
+      candidatesChanged, changed, expectedRevision, fallbackLimitChanged, ops, orchestratorChanged,
+      peakValleyChanged, source, sourceCandidates, sourceFallbackLimit, sourceOrchestrator,
     } = plan;
 
         setSaving(true);
@@ -591,7 +630,8 @@
           let committed = null;
           // 票据 24：候选/降级不在 ops 里（它们不是默认值 op），但同样需要真实提交；
           // 任一特殊字段变化都必须走 settings-commit，而不是只把快照当成已保存。
-          if (ops.length > 0 || candidatesChanged || fallbackLimitChanged || peakValleyChanged) {
+          // 主代理（E1）与它们同类：不在 ops 里，却真的有保留字段要写，漏掉它就会"看起来保存成功"。
+          if (ops.length > 0 || candidatesChanged || fallbackLimitChanged || peakValleyChanged || orchestratorChanged) {
             // 角色配置唯一写入路径：DEG 自有提交端点（Host commitSettingsCandidate 完成
             // schema、语义与 revision CAS 校验）。绝不调用配置表单的 set/unset/mutate：
             // 那会绕过 DEG 的提示词语义校验与模型目录代次检测。
@@ -634,6 +674,11 @@
               fallbackLimitChanged
                 ? (typeof candidateFallbackLimit === "number" ? candidateFallbackLimit : DEFAULT_MODEL_FALLBACK_LIMIT)
                 : sourceFallbackLimit);
+            // 主代理（保留键）：Host 只回显本次真正写入的字段，模型表第一行不能在快照
+            // 追上之前短暂变回「未配置」。
+            keepNewField("orchestrator",
+              orchestratorChanged || Object.prototype.hasOwnProperty.call(source, "orchestrator"),
+              orchestratorChanged ? candidateOrchestrator : sourceOrchestrator);
             // 峰谷（票据 07）：一次无关字段的保存不应让已打开的峰谷子视图短暂变空。
             keepNewField("peakValley", Object.prototype.hasOwnProperty.call(source, "peakValley"), source.peakValley);
           }
@@ -1172,6 +1217,8 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
        */
       const modelFieldsChanged = react.useMemo(() => {
         if (!settingsDraftEqual(effectiveDraft.defaults, sourceDraftForSave.defaults)) return true;
+        // 主代理也是模型字段：目录不可用时同样必须阻断这一次保存（与角色行同一判据）。
+        if (!settingsDraftEqual(effectiveDraft.orchestrator, sourceDraftForSave.orchestrator)) return true;
         // 两侧都用各自草稿里的顶层 provider 作遗留回退，避免"本地未改 provider"被
         // 误判成模型字段变更（详情页合并后 effectiveDraft.provider 就是最新 source 的值）。
         return unifiedProviderOf(effectiveDraft.defaults, roles, effectiveDraft.provider)
@@ -1354,11 +1401,14 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
       const groups = Array.isArray(directoryState.groups) ? directoryState.groups : [];
       const providerGroups = groups.filter((group) => group && typeof group.id === "string");
       /**
-       * 角色模型表的行集合：内置六角色（含未启用的 Observer，提示词入口历史行为）
-       * + meta.activeRoles 里启用的内置角色。
+       * 角色模型表的行集合：主代理（固定第一行，保留键）+ 内置六角色（含未启用的
+       * Observer，提示词入口历史行为）+ meta.activeRoles 里启用的内置角色。
+       *
+       * 主代理只进这张**行表**，绝不进 meta.roles / activeRoles / 专家启用列表：
+       * 它没有启用开关，也不是被派发的专家角色。
        */
       const modelRowRoles = react.useMemo(() => {
-        const next = [...PROMPT_ROLE_IDS];
+        const next = [ORCHESTRATOR_ID, ...PROMPT_ROLE_IDS];
         for (const role of roles) if (!next.includes(role)) next.push(role);
         return next;
       }, [roles]);

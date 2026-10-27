@@ -796,6 +796,9 @@
     ".deg_expert_group_session_model_scroll{overflow-x:auto}",
     ".deg_expert_group_session_model_table{display:grid;grid-template-columns:minmax(84px,.6fr) minmax(132px,.82fr) minmax(210px,1.5fr) minmax(96px,.62fr);min-width:540px;align-items:center}",
     ".deg_expert_group_session_model_row{display:contents}",
+    // 主代理行的状态说明：跨满整行（row 是 display:contents，子项直接参与同一套 grid），
+    // 视觉上与行内下拉的说明文字同款（11px、次级色），不新造一套徽标语言。
+    ".deg_expert_group_session_model_orchestrator{grid-column:1/-1;padding:0 6px 6px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;overflow-wrap:anywhere}",
     ".deg_expert_group_session_model_head_cell{min-width:0;padding:8px 6px 6px;border-bottom:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;font-weight:600}",
     ".deg_expert_group_session_model_cell{display:flex;align-items:center;min-width:0;padding:8px 6px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
     ".deg_expert_group_session_model_cell select{width:100%;min-width:0;box-sizing:border-box;padding:5px 6px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2,transparent);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;font:inherit;font-size:12px;line-height:18px}",

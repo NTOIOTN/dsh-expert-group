@@ -100,7 +100,34 @@
       // 峰谷页脚：返回与保存同宽（各占页脚 20%，与「保存约为容器 1/5」的视觉要求一致），
       // 状态文本夹在中间用 flex:1 吸收剩余空白，所以保存恒在最右且不会被文字遮挡；
       // flex-wrap 是窄屏兜底：允许换行，绝不把这一行撑出横向滚动。
-      ".deg_settings_pv_footer{flex-wrap:wrap;row-gap:8px}.deg_settings_pv_footer .deg_btn{flex:0 0 20%}.deg_settings_pv_footer .deg_settings_status{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}@media (max-width:520px){.deg_settings_pv_footer{row-gap:6px}}";
+      ".deg_settings_pv_footer{flex-wrap:wrap;row-gap:8px}.deg_settings_pv_footer .deg_btn{flex:0 0 20%}.deg_settings_pv_footer .deg_settings_status{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}@media (max-width:520px){.deg_settings_pv_footer{row-gap:6px}}" +
+      // ── 会话删除（票据 06/07）：行尾悬停按钮 / 行首勾选框 / 侧栏顶部操作条 ──
+      // 全部规则以 deg_sd_ 前缀命名，只用宿主既有 CSS 变量：不依赖宿主 CSS module 的哈希类名，
+      // 也不改写宿主行的任何样式（行的悬停显隐仍由宿主 rowActions 负责）。
+      ".deg_sd_row_action{display:inline-flex;align-items:center;justify-content:center;flex:none;width:20px;height:20px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-state-error-primary,#ef4444);cursor:pointer}.deg_sd_row_action:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.deg_sd_row_action:disabled{opacity:.45;cursor:not-allowed}.deg_sd_icon{display:block;width:16px;height:16px}" +
+      ".deg_sd_menu_item{display:flex;align-items:center;gap:6px;width:100%;box-sizing:border-box;padding:6px 10px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}.deg_sd_menu_item.deg_sd_danger{color:var(--dsw-alias-state-error-primary,#ef4444)}" +
+      ".deg_sd_check{flex:none;width:14px;height:14px;margin:0;cursor:pointer;accent-color:var(--dsw-alias-state-error-primary,#ef4444)}" +
+      // 多选期间的「预留留白」：body 标记类把侧栏列表容器（宿主 regionArea）的底部内边距撑开，
+      // 列表被顶上去、footer（头像/设置）保持原位，操作条落在留白条里 —— 零覆盖。操作条只有
+      // 一行，因此只有一个预留高度（票据 09 删掉了结算条专用的加高预留与它的标记类）。
+      "body.deg_sd_selecting{--deg-sd-reserve:48px}body.deg_sd_selecting [class*=regionArea]{padding-bottom:var(--deg-sd-reserve)}" +
+      ".deg_sd_bar{display:flex;align-items:center;flex-wrap:wrap;gap:4px;box-sizing:border-box;max-height:min(30vh,152px);overflow:auto;padding:3px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);box-shadow:0 -4px 16px rgba(0,0,0,.16);color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px}" +
+      ".deg_sd_btn{display:inline-flex;align-items:center;justify-content:center;flex:none;height:22px;padding:0 5px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer}.deg_sd_btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.deg_sd_btn:disabled,.deg_sd_check:disabled{opacity:.45;cursor:not-allowed}.deg_sd_danger{color:var(--dsw-alias-state-error-primary,#ef4444)}" +
+      // 全选按钮（用户要求：移到删除左侧、正方形、虚线边框，一眼看出是可点的按钮）：
+      // 22px 与操作条控件行同高、宽高相等；虚线边框用宿主 --dsw-alias-border-l2，不写死颜色。
+      // margin-left:auto 把「全选·删除·退出」整组推到行尾（有被占用文案时那片空白由它吸收），
+      // 于是「计数 / 被占用」与「动作」成为左右两个分组，全选也不再是文字旁的小图标。
+      ".deg_sd_selectall{width:22px;height:22px;padding:0;margin-left:auto;border:1px dashed var(--dsw-alias-border-l2);border-radius:4px}.deg_sd_selectall .deg_sd_icon{width:13px;height:13px}" +
+      // 悬停/按下：描边转实线 + 浅底 + 图标提到主文字色（三处同时变化，弱视也能感知）；
+      // :active 再叠一个轻微缩放作为「按下去了」的触感反馈（不动颜色 token）。
+      ".deg_sd_selectall:hover:not(:disabled){border-style:solid;border-color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.deg_sd_selectall:active:not(:disabled){transform:scale(.9)}" +
+      // 已全选（此刻点击 = 取消全选）：常驻实线描边 + 浅底 + 主文字色，与「未全选」一眼可分。
+      ".deg_sd_selectall[data-deg-session-delete-selectall-state=all]{border-style:solid;border-color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}" +
+      // 禁用（结算中 / 可处理目标为 0）：必须排在状态规则之后 —— 同权重靠顺序复位成「虚线空态」，
+      // 再叠加 .deg_sd_btn:disabled 的 0.45 透明度，既明显又明确不可点。
+      ".deg_sd_selectall:disabled{border-style:dashed;border-color:var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_sd_count{flex:0 0 auto;white-space:nowrap}.deg_sd_blocked{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}" +
+      ".deg_sd_dialog_line{white-space:pre-wrap}";
 
 
     const cssTagId = "dsh-expert-group/settings.module.css";

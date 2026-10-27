@@ -35,6 +35,8 @@ import {
   assembleModelRoute,
   assembleAgentHandlers,
 } from "./host/index-assembly-agents.js";
+// 主代理模型配置（批次 A）：sessionController 以**可选注入**晚绑定，绝不进必需服务列表。
+import { assembleOrchestratorModel } from "./host/index-assembly-orchestrator.js";
 import {
   assembleExpertTools,
   assembleExpertGroupRuntime,
@@ -47,6 +49,10 @@ import {
   assembleRpcActions,
   assembleDiagnosticsAndRoute,
 } from "./host/index-assembly-wire.js";
+// 会话删除 host 基础设施（票据 01）：实例锁 + 启动探测两个启动 effect。
+import { assembleSessionDelete } from "./host/index-assembly-session-delete.js";
+import { assembleSessionDeleteJob } from "./host/index-assembly-session-delete-job.js";
+import { assembleSessionDeleteRpc } from "./host/index-assembly-session-delete-rpc.js";
 
 export {
   buildTerminationNotificationText,
@@ -143,7 +149,20 @@ function readHostClock(ctx) {
   try {
     const hostClock = ctx.clock;
     if (hostClock !== null && typeof hostClock === "object" && typeof hostClock.now === "function") {
-      return { now: () => hostClock.now() };
+      // 定时器能力是**可选**的（主代理模型的峰谷边界需要它）：宿主 clock 同时提供
+      // setTimeout/clearTimeout 时才转发，否则返回只有 now 的能力面——调用方（
+      // host/orchestrator-model）据此降级成"只在新建会话/设置保存时判定时段"，
+      // 绝不回落到全局 setTimeout（那会让测试与宿主失去对时间推进的控制）。
+      const hasTimers = typeof hostClock.setTimeout === "function" && typeof hostClock.clearTimeout === "function";
+      return {
+        now: () => hostClock.now(),
+        ...(hasTimers
+          ? {
+            setTimeout: (callback, delayMs) => hostClock.setTimeout(callback, delayMs),
+            clearTimeout: (handle) => hostClock.clearTimeout(handle),
+          }
+          : {}),
+      };
     }
   } catch {
     // 宿主没有 clock 服务：回落系统时间函数（与迁移前的 Date.now 取值语义一致）。
@@ -269,6 +288,29 @@ export default {
     state.createAbortError = createAbortError;
     const caps = createAssemblyCapabilities(ctx, tools);
     const register = (entries) => applyAssemblyRegistrations(ctx, tools, entries);
+    /**
+     * 宿主服务读取器（票据 01）：会话删除要消费 sessionPersistence / workspaceRegistry /
+     * dshHomePath 三个可选服务。它们可能在 apply 之后才提供、或在重载时被替换，因此只在
+     * **调用期**解析；读取失败一律等价于「宿主没有该服务」，删除能力据此 fail-closed。
+     * ctx 本体不出入口（与 caps 的具名能力面同一约束）。
+     */
+    const readHostService = (serviceName) => {
+      try { return ctx.get(serviceName); } catch { return void 0; }
+    };
+    /**
+     * 会话移除事件发布器（票据 08）：删除作业对 `deleted` / `absent` 的目标逐个发布宿主
+     * 已白名单化的 `api-session/removed`（客户端据此重拉会话列表）。
+     *
+     * 只交出具名回调、ctx 本体不出入口（与 caps 的约束一致）。事件只是「列表该对账了」的
+     * 通知：发布失败一律静默，绝不把一次已经落盘的删除改成失败结果。
+     */
+    const publishSessionRemoved = (event, sessionId) => {
+      try {
+        if (typeof ctx.emit === "function") ctx.emit(event, sessionId);
+      } catch {
+        // 严格 Context / 旧宿主没有事件通道：删除结果不受影响。
+      }
+    };
 
     // 装配顺序 = 迁移前 apply 的语句顺序。每段装配完成后立即登记该段的注册描述，
     // 因此「域构造」与「注册点」的交替次序也与迁移前一致。
@@ -299,6 +341,9 @@ export default {
     register(assembleUsage(state));
     assembleModelRoute(state);
     register(assembleAgentHandlers(state));
+    // ── 4b. 主代理模型配置运行期（新建会话 / 峰谷边界 / 设置保存三个触发点）────────
+    // 必须在会话 RPC 装配之前挂上：root get 的 orchestrator 读面从 state.orchestratorModel 取。
+    register(assembleOrchestratorModel(state, caps));
     // ── 5. 自动恢复执行（票据 17）──────────────────────────────────────────
     register(assembleAutoRecovery(state));
     // ── 6. 专家委派工具域 + 工具面挂载（票据 18）──────────────────────────
@@ -311,5 +356,16 @@ export default {
     register(assembleRpcSurface(state));
     register(assembleRpcActions(state, caps));
     register(assembleDiagnosticsAndRoute(state, caps));
+    // ── 8. 会话删除 host 基础设施（票据 01）────────────────────────────────
+    // 追加在既有段**之后**：不改变任何既有段的相对顺序（宿主按这段顺序做激活与回滚）。
+    // 本段只注册两个启动 effect（实例锁 → 启动探测），RPC/作业/收敛分别属于票据 02/03/04。
+    register(assembleSessionDelete(state, { readHostService }));
+    // 删除作业（票据 02）：纯按需能力，没有启动期副作用；仍以 effect 登记以获得卸载清理。
+    // 追加在该段之后，既有段的相对顺序不变。
+    // 会话移除事件（票据 08）由本段收尾处逐个发布（只对 deleted / absent）。
+    register(assembleSessionDeleteJob(state, { readHostService, publishSessionRemoved }));
+    // 候选查询与删除执行的 RPC 命令面（票据 04）：需要上面两段的能力面，因此排在它们之后；
+    // RPC 分发表（第 7 段）只持有调用期解析的窄命令，不受这里的段序影响。
+    register(assembleSessionDeleteRpc(state, { readHostService }));
   },
 };

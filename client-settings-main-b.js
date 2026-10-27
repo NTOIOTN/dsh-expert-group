@@ -13,13 +13,19 @@
   const clientSettingsNormalize = global[clientSettingsNormalizeSymbol] || {};
   const {
     DEFAULT_MODEL_FALLBACK_LIMIT, MAX_MODEL_CANDIDATES_PER_ROLE, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_PAGES, NEXT_PEAK_VALLEY_PERIOD,
-    NOTIFICATION_EVENT_TYPES, PROMPT_WARNING_RATIO,
+    NOTIFICATION_EVENT_TYPES, ORCHESTRATOR_ID, PROMPT_WARNING_RATIO,
     clampNotificationVolume, migrateSettingsSelection, modelLayerSelectionOf, normalizeRolePromptProjection, normalizeSettingsDraft, promptEntryOf,
     setModelLayerSelection, settingsRolesForProvider, syncSettingsDefaultsProvider, validatePromptText,
   } = clientSettingsNormalize;
   // descriptor 注入的运行期依赖：本模块先于 descriptor 执行，取值只发生在运行期调用时。
   let react = null;
   let ModelConfigSection = null;
+  /**
+   * 主代理行的显示名：语言中性的专有名词，与侧栏「会话模型」弹窗第一行同一文案。
+   *
+   * 它不来自 roleLabelOf：那个映射只认识专家角色，未知键会回落成小写 id（orchestrator）。
+   */
+  const ORCHESTRATOR_ROW_LABEL = "Orchestrator";
   // 峰谷时段纯函数：与 Host 校验、保存前校验共用同一份构建期投影实现。
   let peakValleyTime = null;
   function bindClientRuntime(host) {
@@ -407,7 +413,7 @@
     const {
       catalogAvailable, currentModelPage, draft, editDraft, error, modelRowRoles,
       openPrompt, promptProjection, promptRoleIds, providerGroups, roleLabelOf, roles,
-      saving, selectedPromptRole,
+      saving, selectedPromptRole, tExtra,
     } = view;
 
       const header = react.createElement(react.Fragment, null,
@@ -422,8 +428,15 @@
       // catalogAvailable 为 false，三个下拉和保存按钮一并禁用。
       // 业务禁用条件（saving / roleEnabled / 没有 provider、model、reasoning）保持不变。
       const rows = modelRowRoles.map((role) => {
-        const roleLabel = roleLabelOf(role);
-        const roleEnabled = roles.includes(role);
+        /**
+         * 主代理（保留键）与专家行走同一套渲染，但有三处刻意不同：
+         * - 没有启用开关（不在 activeRoles 里，也不是被派发的角色）；
+         * - 没有提示词入口（不是专家 persona 的承载者）；
+         * - 空态文案写明「不干预主代理模型」，而不是留一个看起来坏掉的下拉。
+         */
+        const isOrchestrator = role === ORCHESTRATOR_ID;
+        const roleLabel = isOrchestrator ? ORCHESTRATOR_ROW_LABEL : roleLabelOf(role);
+        const roleEnabled = isOrchestrator || roles.includes(role);
         // 单元格一律读写**当前页**对应的层：主模型页 → defaults，候选页 → candidates[i - 1]。
         const selection = modelLayerSelectionOf(draft, role, currentModelPage);
         const rowProvider = typeof selection?.provider === "string" ? selection.provider : "";
@@ -431,7 +444,8 @@
         const rowModels = rowProviderGroup?.models ?? [];
         const currentModel = rowModels.find((model) => model.id === selection?.model);
         const providerOptions = [
-          react.createElement("option", { key: "__empty-provider", value: "" }, "未选择供应商"),
+          react.createElement("option", { key: "__empty-provider", value: "" },
+            isOrchestrator ? tExtra("settings.orchestrator.empty") : "未选择供应商"),
           ...(rowProvider && rowProviderGroup === undefined
             ? [react.createElement("option", { key: "__unavailable-provider", value: rowProvider, disabled: true }, rowProvider + "（不可用）")]
             : []),
@@ -471,8 +485,10 @@
               const next = !provider
                 ? null
                 : (migrateSettingsSelection(current, provider, providerGroups) ?? { provider, model: "" });
-              // 行级 provider 一旦存在就拥有优先权，顶层统一值顺带清空。
-              return { ...setModelLayerSelection(previous, role, 0, next), provider: "" };
+              const written = setModelLayerSelection(previous, role, 0, next);
+              // 行级 provider 一旦存在就拥有优先权，顶层统一值顺带清空；主代理是独立配置，
+              // 不参与统一供应商，绝不能顺带清掉专家的顶层 provider。
+              return isOrchestrator ? written : { ...written, provider: "" };
             }
             // 候选页：与主模型页同一套联动，只作用于当前层；空值 = 清空该层该角色。
             const next = !provider

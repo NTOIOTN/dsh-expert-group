@@ -15,10 +15,10 @@ import { EFFORT_MARKER, ROLE_MARKER } from "./expert-guards.js";
 import { SettingsDirectoryChangedError } from "./settings-runtime.js";
 import { SETTINGS_NAMESPACE } from "./settings-schema.js";
 import { hasUsageMetrics, projectUsage } from "./usage-projection.js";
-import { EXPERT_ROUTE_MARKER, MAX_MODEL_CANDIDATES_PER_ROLE, MODEL_ROUTE_NOT_CONFIGURED, modelRouteErrorMessage, modelRouteFieldsFromRecord, persistedModelRouteIsAuthoritative } from "../shared/model-route.js";
+import { EXPERT_ROUTE_MARKER, MAX_MODEL_CANDIDATES_PER_ROLE, MODEL_ROUTE_NOT_CONFIGURED, ORCHESTRATOR_SELECTION_KEY, modelRouteErrorMessage, modelRouteFieldsFromRecord, persistedModelRouteIsAuthoritative } from "../shared/model-route.js";
 import { PROMPT_OVERRIDES_SETTINGS_KEY, promptOverrideFor } from "../shared/prompts.js";
 import { projectStructuredResult } from "../shared/structured.js";
-import { persistDomainEntry, removeDomainEntry } from "../storage.js";
+import { persistDomainEntry } from "../storage.js";
 
 /**
  * 会话域 action → handler 的显式分发表（与核心模块的分发表互补，无重叠、无前缀匹配）。
@@ -103,8 +103,8 @@ async function handleNotificationSnapshot(deps, req) {
  */
 async function handleGet(deps, req) {
   const {
-    activeRoles, describeRolePrompts, roleCatalog, roleLabelsProjection, routeFieldsOfMarker,
-    sessionOverrideProjectionOf, source, usageFor, usageSummaryFor
+    activeRoles, describeRolePrompts, orchestratorStatusOf, roleCatalog, roleLabelsProjection,
+    routeFieldsOfMarker, sessionOverrideProjectionOf, source, usageFor, usageSummaryFor
   } = deps.reads;
   // config 在外层被子分支的 `const config = header?.config` 遮蔽：这里先解构「全局配置」，
   // 子分支仍按原语义使用请求头里的 config（块级遮蔽与迁移前完全一致）。
@@ -225,6 +225,20 @@ async function handleGet(deps, req) {
         model: rootConfig?.model ?? agent?.options?.model ?? "",
         reasoningEffort: rootConfig?.reasoningEffort ?? agent?.options?.[EFFORT_MARKER],
       },
+      /**
+       * 主代理（Orchestrator）模型配置读面（批次 A）。
+       *
+       * 字段是后续 UI 批次与运行期的读写契约，**不要改名**：
+       * configured / period / effective / source / applied / appliedAt /
+       * degradedCandidate / manualLocked / hostReady，以及本期新增的第十个字段
+       * applyState（applied / pending / unapplied / manual / none / host-not-ready，
+       * 由 host 判定；客户端**不得**用 effective 自己猜状态）。旧字段的形状与语义不变。
+       *
+       * 全部取自运行期 manager（唯一事实源）：configured 是全局配置主选择，
+       * effective 是"当前应生效值（未考虑手动）"，applied 是本进程内实际写入过的值。
+       * 服务缺失时 hostReady=false，其余字段仍按配置如实投影（不伪造已套用）。
+       */
+      orchestrator: orchestratorStatusOf(sessionId),
     });
     return;
   }
@@ -253,9 +267,12 @@ async function handleSessionOverrideGet(deps, req) {
  * 「session-override-set」 / 「session-override-clear」 的 handler（原始源行归属 3128–3244）。
  */
 async function handleSessionOverrideSet(deps, req) {
-  const { sessionOverrideConflictError, validateSelectionWithSignal } = deps.models;
-  const { fanoutRpcRootSession, isActiveRole, sessionOverrideProjectionOf, source } = deps.reads;
-  const { enqueueWrite, host, observeStorageWrite, storageBinding } = deps.storage;
+  const { validateSelectionWithSignal } = deps.models;
+  const {
+    fanoutRpcRootSession, isActiveRole, orchestratorApplyOverride, orchestratorApplyOverrideCleared,
+    sessionOverrideProjectionOf, source,
+  } = deps.reads;
+  const { sessionOverrideStore } = deps.storage;
   const { body, signal, send, fail, sessionId, isChild } = req;
 
   if (body.action === "session-override-set" || body.action === "session-override-clear") {
@@ -273,7 +290,13 @@ async function handleSessionOverrideSet(deps, req) {
       return;
     }
     const role = typeof body.role === "string" ? body.role.trim() : "";
-    if (!isActiveRole(role)) { fail(400, "invalid-role", "未启用的角色: " + role); return; }
+    // 保留键 orchestrator（主代理模型配置）与启用角色二选一放行：**只**在这个边界按
+    // "键恰好等于保留键"通行，绝不把 orchestrator 加进 activeRoles()/STATUS_ROLE_IDS
+    // （否则并发限额、提示词覆盖、角色工具等按角色枚举的地方会多出第七个"角色"）。
+    if (role !== ORCHESTRATOR_SELECTION_KEY && !isActiveRole(role)) {
+      fail(400, "invalid-role", "未启用的角色: " + role);
+      return;
+    }
     /**
      * 选择校验在写临界区之外完成（与既有 session commit 一致）：目录解析可能是
      * 异步的，放进临界区只会拉长串行链；非法模型因此不会产生任何 domain 写入。
@@ -283,89 +306,33 @@ async function handleSessionOverrideSet(deps, req) {
     if (!clearOnly) {
       selection = await validateSelectionWithSignal(body.selection, signal);
     }
-    await enqueueWrite(async () => {
-      const binding = host.storage.active();
-      if (binding?.sessionAuthoritative !== true
-        || binding?.sessionOverrideMetaAuthoritative !== true
-        || binding.sessionOverrideMetaTable === void 0) {
-        throw new Error("storage domain is not ready for session override write");
-      }
-      if (!storageBinding.isCurrent(binding)) throw new Error("storage domain binding was replaced");
-      // CAS 读与写必须落在同一个串行临界区：前一批写完成后这里才是权威代次。
-      const current = source();
-      const view = sessionOverrideProjectionOf(current, sessionId);
-      if (view.revision !== expectedRevision) {
-        throw sessionOverrideConflictError(view.revision, view.overrides);
-      }
-      const next = { ...(current.sessionOverrides?.[sessionId] ?? {}) };
-      if (clearOnly) delete next[role];
-      else next[role] = selection;
-      const nextRevision = view.revision + 1;
-      const isCurrent = () => storageBinding.isCurrent(binding);
-      /**
-       * 先写代次、再写内容：反过来的话，内容成功而代次失败会留下"覆盖已变但
-       * revision 未前进"的状态，下一个持旧代次的写入会静默覆盖这次结果。
-       * 内容写失败时尽力把代次回滚到旧值（回滚失败也只会多一次冲突提示，
-       * 不会造成丢失更新）。
-       */
-      const metaWrite = await persistDomainEntry({
-        table: binding.sessionOverrideMetaTable,
-        key: sessionId,
-        value: { revision: nextRevision },
-        isCurrent,
-      });
-      if (metaWrite.detached) {
-        // binding 在代次写入后被替换：不再写内容，让调用方显式重试。
-        const detached = new Error("storage domain binding was replaced");
-        detached.code = "PERSISTENCE_GENERATION_STALE";
-        detached.category = "generation-stale";
-        throw detached;
-      }
-      try {
-        if (Object.keys(next).length > 0) {
-          const result = await persistDomainEntry({
-            table: binding.sessionTable,
-            key: sessionId,
-            value: next,
-            isCurrent,
-          });
-          if (result.detached) {
-            const detached = new Error("storage domain binding was replaced");
-            detached.code = "PERSISTENCE_GENERATION_STALE";
-            detached.category = "generation-stale";
-            throw detached;
-          }
-        } else {
-          // 清掉最后一个角色后删除整行：读取面继续把"没有覆盖"表达为缺行，
-          // 旧读者看到的形状与从未写过完全一致（不留下空对象）。
-          const removed = await removeDomainEntry({ table: binding.sessionTable, key: sessionId, isCurrent });
-          if (removed.detached) {
-            const detached = new Error("storage domain binding was replaced");
-            detached.code = "PERSISTENCE_GENERATION_STALE";
-            detached.category = "generation-stale";
-            throw detached;
-          }
-        }
-      } catch (error) {
-        // 内容写失败：尽力回滚代次，避免"内容没变、代次却前进"的无谓冲突。
-        try {
-          await persistDomainEntry({
-            table: binding.sessionOverrideMetaTable,
-            key: sessionId,
-            value: { revision: view.revision },
-            isCurrent,
-          });
-        } catch { /* 回滚是尽力而为：失败也只是多一次可重试的冲突提示。 */ }
-        throw error;
-      }
-    }).then(() => {
-      observeStorageWrite(true, void 0, "session_overrides");
-    }, (error) => {
-      // 冲突不是存储故障：只在真正的写入失败上记录健康状态。
-      if (error?.code !== "SESSION_OVERRIDE_CONFLICT") observeStorageWrite(false, error, "session_overrides");
-      throw error;
+    // durable 写入复用 DEG 唯一的会话覆盖实现（host/session-override-store）：
+    // 先代次、后内容、失败回滚、清空后删行——与主代理运行期的内部写入是同一份代码。
+    await sessionOverrideStore.writeRole({
+      sessionId,
+      role,
+      selection,
+      clear: clearOnly,
+      expectedRevision,
     });
     const view = sessionOverrideProjectionOf(source(), sessionId);
+    /**
+     * 主代理（B2）：持久化成功后必须把这次选择**真正应用到根会话的原生模型**——
+     * 只落 DEG 的覆盖表、界面变了而会话实际模型没变，是本批次要修的缺陷。
+     *
+     * 只对保留键 orchestrator 触发；角色覆盖仍走既有路径（角色模型只在派发时使用）。
+     * 应用是运行期动作：交给 manager 的显式入口排队（同一套预检 + 自写令牌），
+     * 失败不影响本次 RPC（覆盖已 durable 保存，读面 applyState 会如实显示未生效）。
+     */
+    if (role === ORCHESTRATOR_SELECTION_KEY) {
+      if (clearOnly) {
+        // 清除后按优先级重算 effective：有可用目标（时段/全局）就套用；
+        // 没有目标（不干预）由 manager 保持现状不写。
+        orchestratorApplyOverrideCleared(sessionId);
+      } else {
+        orchestratorApplyOverride(sessionId);
+      }
+    }
     send(200, {
       ok: true,
       sessionId,
@@ -390,9 +357,23 @@ async function handleModelPreflight(deps, req) {
     // （目录/凭据/能力解析）并复用同一错误分类。
     if (isChild) { fail(400, "read-only", "model-preflight 只能查询根会话"); return; }
     const role = typeof body.role === "string" ? body.role.trim() : "";
-    if (!isActiveRole(role)) { fail(400, "invalid-role", "未启用的角色: " + role); return; }
+    /**
+     * 主代理（Orchestrator）专用分支（批次 A）：保留键 `orchestrator` 与启用角色二选一。
+     *
+     * 配置来源不同——角色是 `defaults[role]` / `candidates[role]` / 顶层 fallbackLimit，
+     * 主代理是**独立对象** `orchestrator.defaults` / `orchestrator.candidates` /
+     * `orchestrator.fallbackLimit`。因此这里只放行不扩角色表：STATUS_ROLE_IDS / activeRoles()
+     * 保持不变，其余角色枚举（工具、限额、提示词）不会受影响。
+     */
+    const orchestratorRole = role === ORCHESTRATOR_SELECTION_KEY;
+    if (!orchestratorRole && !isActiveRole(role)) { fail(400, "invalid-role", "未启用的角色: " + role); return; }
     const snap = source();
-    const primarySelection = snap.defaults?.[role];
+    const orchestratorConfig = orchestratorRole && snap.orchestrator !== null && typeof snap.orchestrator === "object"
+      ? snap.orchestrator
+      : null;
+    const primarySelection = orchestratorRole
+      ? (orchestratorConfig?.defaults ?? null)
+      : snap.defaults?.[role];
     const primary = primarySelection === undefined || primarySelection === null
       ? {
         provider: "",
@@ -415,7 +396,10 @@ async function handleModelPreflight(deps, req) {
       }
       candidateSelections = body.candidates;
     } else {
-      candidateSelections = candidateSelectionsOfRole(role);
+      // 主代理的候选来自它自己的对象；角色仍走全局 candidates 映射。
+      candidateSelections = orchestratorRole && Array.isArray(orchestratorConfig?.candidates)
+        ? orchestratorConfig.candidates
+        : (orchestratorRole ? [] : candidateSelectionsOfRole(role));
     }
     const candidates = [];
     for (const selection of candidateSelections) {
@@ -426,7 +410,8 @@ async function handleModelPreflight(deps, req) {
       role,
       primary,
       candidates,
-      fallbackLimit: snap.fallbackLimit,
+      // 主代理的降级上限来自它自己的对象（读取面已归一为 0..4）；角色仍取顶层值。
+      fallbackLimit: orchestratorRole ? orchestratorConfig.fallbackLimit : snap.fallbackLimit,
     });
     return;
   }

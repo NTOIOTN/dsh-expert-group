@@ -633,6 +633,61 @@
     }
   };
 
+  /**
+   * 清除「以某个会话为 scope」的全部归属条目（票据 08：永久删除会话后的本地键清理）。
+   *
+   * ## 为什么由账本自己提供
+   * 归属表的内存索引是 realm 级缓存（write-through 的来源），外部模块直接改 localStorage 会被
+   * 下一次 persistSidebarOwnership 用内存里的旧 Map 覆盖回来。清理必须走**同一个 owner**，
+   * 否则「清掉了」只是这一帧的假象（漏清的典型形态）。
+   *
+   * ## 口径（逐条固定）
+   * - **只按 scope 两段匹配**（见 sidebarOwnershipScopeMatches）：sessionId 段或 rootId 段命中目标
+   *   会话即整条删除；地址段命中不算；
+   * - **manual 与 auto 一起删**：会话已经被永久删除，它名下的归属与用户抑制都失去了主语，
+   *   留着既不能恢复也只会占用容量（这与「Auto 自己的收口不许删 manual」不是同一条判据：
+   *   那条判据保护的是**仍然存在**的会话上的用户意图）；
+   * - 调用方只对 `deleted` / `absent` 目标调用；`failed` / `skipped` / `raced` 绝不清；
+   * - `removed === 0` 时不落盘（没有变化就不制造写放大），重复调用幂等；
+   * - 持久层不可读（entries 为 null）→ `ok:false`，调用方保留待清理标记下次重试；
+   * - 落盘失败仍算 `ok:true`：内存索引已经干净，下一次归属写入会用同一份内存覆盖持久层，
+   *   因此不会留下第二份真相（只是这一轮刷新后持久层暂时落后）。
+   *
+   * @param {string[]} sessionIds - 已被永久删除的会话 ID（deleted / absent）。
+   * @returns {{ok: boolean, removed: number}} 清理结论。
+   */
+  const purgeSidebarAutoOwnershipForSessions = (sessionIds) => {
+    try {
+      const ids = new Set();
+      for (const entry of Array.isArray(sessionIds) ? sessionIds : []) {
+        if (typeof entry === "string" && entry.length > 0) ids.add(entry);
+      }
+      if (ids.size === 0) return { ok: true, removed: 0 };
+      const entries = sidebarOwnershipEntries();
+      if (entries === null) return { ok: false, removed: 0 };
+      // scope 只按**段**匹配（第一段 sidebar session、第二段 root session）：地址段里恰好出现
+      // 同一串 ID 的条目属于别的会话资源，那条归属仍然有效（误删就是让那个资源永久漏收）。
+      const keys = [];
+      for (const key of entries.keys()) {
+        if (typeof key !== "string") continue;
+        for (const id of ids) {
+          if (key.startsWith(id + "|") || key.includes("|" + id + "|") === true) {
+            keys.push(key);
+            break;
+          }
+        }
+      }
+      for (const key of keys) {
+        entries.delete(key);
+        sidebarOwnershipMemory()?.unpersisted?.delete(key);
+      }
+      if (keys.length > 0) persistSidebarOwnership(entries);
+      return { ok: true, removed: keys.length };
+    } catch {
+      return { ok: false, removed: 0 };
+    }
+  };
+
   /** 记录一次自动打开/自动关闭决策（候选 + 结算），失败原因只留截断后的一行。 */
   const recordSidebarAutoDecision = (event, candidate, verdict, reason) => {
     recordSidebarAutoDiag({
@@ -649,7 +704,7 @@
   // 只暴露兄弟模块与主 IIFE 实际消费的符号（无全量外挂）。
   global[SYMBOL] = Object.freeze({
     SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, clearSidebarAutoManualSuppressions,
-    deleteSidebarAutoOwnership, readSidebarAutoOwnershipEntry,
+    deleteSidebarAutoOwnership, purgeSidebarAutoOwnershipForSessions, readSidebarAutoOwnershipEntry,
     recordSidebarAutoDecision, recordSidebarAutoDiag, resolveSidebarSharedAutoLedger, sidebarAutoKeyDigest,
     sidebarAutoOriginEntry, sidebarAutoOriginTabIdOf, sidebarAutoOriginWrittenAtOf, sidebarBoundedText,
     sidebarLocalStorage, sidebarOwnershipAcceptsNewAuto, sidebarSharedAutoLedgerSizes, sidebarSharedAutoLedgerTotal,

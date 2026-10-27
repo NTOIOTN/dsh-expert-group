@@ -199,6 +199,37 @@ const MESSAGE_CATALOG = Object.freeze({
     zh: "清除{role}的本会话覆盖",
     en: "Clear the session override for {role}",
   },
+  // 主代理（Orchestrator）行（侧栏「会话模型」弹窗第一行）：值、来源与状态标记。
+  // 状态键名与 Host 的 get().orchestrator.applyState **六态一一对应**：判定在 Host
+  // （host/orchestrator-model.js 的判定表），客户端只按状态选文案，绝不用 effective 猜。
+  "sidebar.sessionModel.orchestrator.applied": {
+    zh: "实际生效：{value}（{source}）",
+    en: "Applied: {value} ({source})",
+  },
+  "sidebar.sessionModel.orchestrator.pending": {
+    zh: "正在应用：{value}（{source}）",
+    en: "Applying: {value} ({source})",
+  },
+  "sidebar.sessionModel.orchestrator.unapplied": {
+    zh: "配置未生效：{value}（{source}）",
+    en: "Not applied: {value} ({source})",
+  },
+  "sidebar.sessionModel.orchestrator.manual": { zh: "本会话已手动接管", en: "Manually taken over in this session" },
+  "sidebar.sessionModel.orchestrator.none": { zh: "不干预", en: "Not configured" },
+  "sidebar.sessionModel.orchestrator.host-not-ready": { zh: "宿主未就绪", en: "Host not ready" },
+  "sidebar.sessionModel.orchestrator.degraded": { zh: "已降级到候选 {index}", en: "Degraded to candidate {index}" },
+  "sidebar.sessionModel.orchestrator.saved": {
+    zh: "已保存，主代理模型下一轮生效",
+    en: "Saved; the orchestrator model applies from the next turn",
+  },
+  "sidebar.sessionModel.orchestrator.source.override": { zh: "会话覆盖", en: "Session override" },
+  "sidebar.sessionModel.orchestrator.source.period": { zh: "当前时段", en: "Current period" },
+  "sidebar.sessionModel.orchestrator.source.global": { zh: "全局配置", en: "Global config" },
+  "sidebar.sessionModel.orchestrator.source.none": { zh: "不干预", en: "Not configured" },
+  "settings.orchestrator.empty": {
+    zh: "未配置（不干预主代理模型）",
+    en: "Not configured (orchestrator model untouched)",
+  },
   "settings.title": { zh: "dsh-expert-group", en: "dsh-expert-group" },
   "settings.hint": {
     zh: "专家模型使用 DSH 当前已配置的 provider 和模型目录。",
@@ -269,7 +300,48 @@ const MESSAGE_CATALOG = Object.freeze({
     zh: "专家批次已静止，但收口结论投递失败；批次保持待收口，插件会在后续 root turn 重试。",
     en: "The expert batch is quiescent but delivering the finalization result failed; the batch remains pending and the plugin retries on later root turns.",
   },
+  // ── 会话删除（票据 06/07）──────────────────────────────────────────────────
+  // 键前缀统一为 sidebar.sessionDelete.*：两个删除入口、多选操作条、确认框、「不可删除」
+  // 说明、一次性结果弹窗与入口级失败。中英双语成对，客户端字典逐键同值。
+  // 取消/删除/关闭直接复用既有 sidebar.* 键，不新增同义文案。
+  "sidebar.sessionDelete.row.aria": { zh: "删除「{title}」", en: "Delete \"{title}\"" },
+  "sidebar.sessionDelete.menu": { zh: "删除会话", en: "Delete session" },
+  "sidebar.sessionDelete.multi": { zh: "删除多选会话", en: "Delete multiple sessions" },
+  // 全选按钮是开关：未全选说「全选」，已全选时同一按钮的点击语义是「取消全选」，
+  // 文案（aria-label / title）必须跟着状态换，否则读屏与悬浮提示会指向相反的动作。
+  "sidebar.sessionDelete.bar.selectAll": { zh: "全选", en: "Select all" },
+  "sidebar.sessionDelete.bar.deselectAll": { zh: "取消全选", en: "Deselect all" },
+  "sidebar.sessionDelete.bar.selected": { zh: "已选 {count}", en: "{count} selected" },
+  "sidebar.sessionDelete.bar.blocked": { zh: "{count} 个被占用", en: "{count} in use" },
+  "sidebar.sessionDelete.checkbox.aria": { zh: "选择「{title}」", en: "Select \"{title}\"" },
+  "sidebar.sessionDelete.dialog.cancel": { zh: "取消", en: "Cancel" },
+  "sidebar.sessionDelete.dialog.confirm": { zh: "删除", en: "Delete" },
+  "sidebar.sessionDelete.dialog.running": { zh: "删除中…", en: "Deleting…" },
+  "sidebar.sessionDelete.dialog.title": { zh: "删除会话", en: "Delete session" },
+  "sidebar.sessionDelete.dialog.single": { zh: "确定删除「{title}」？", en: "Delete \"{title}\"?" },
+  "sidebar.sessionDelete.dialog.batch": { zh: "将处理 {count} 个会话。", en: "Processes {count} sessions." },
+  "sidebar.sessionDelete.dialog.absent": { zh: "其中 {count} 个仅清理残留配置。", en: "{count} are leftover-only." },
+  "sidebar.sessionDelete.dialog.blocked": { zh: "另有 {count} 个被占用，不会删除。", en: "{count} are in use and skipped." },
+  "sidebar.sessionDelete.dialog.first": { zh: "前 {count} 个：{titles}", en: "First {count}: {titles}" },
+  "sidebar.sessionDelete.dialog.irreversible": { zh: "此操作不可恢复。", en: "This cannot be undone." },
+  "sidebar.sessionDelete.blocked.title": { zh: "不可删除", en: "Cannot delete" },
+  "sidebar.sessionDelete.blocked.live": { zh: "该会话仍被 DSH 占用，重启 DSH 后可删除。", en: "In use by DSH; restart DSH to delete." },
+  "sidebar.sessionDelete.blocked.liveDescendant": { zh: "子会话「{title}」仍被占用，重启 DSH 后可删除。", en: "Sub-session \"{title}\" is in use; restart DSH." },
+  "sidebar.sessionDelete.blocked.pending": { zh: "上次删除的清理未完成，重启 DSH 后再试。", en: "Previous cleanup unfinished; restart DSH." },
+  "sidebar.sessionDelete.blocked.missing": { zh: "该会话不在本工作区可删除范围内。", en: "Not in this workspace's deletable set." },
+  // 原因文案（skipped / failed / raced）与结果弹窗的一句话共用同一批短句。
+  "sidebar.sessionDelete.reason.skipped": { zh: "仍被占用", en: "still in use" },
+  "sidebar.sessionDelete.reason.failed": { zh: "删除失败", en: "delete failed" },
+  "sidebar.sessionDelete.reason.raced": { zh: "未完成（会话被重新打开，内容已保留）", en: "not deleted (reopened, kept)" },
+  "sidebar.sessionDelete.outcome.deleted": { zh: "已删除 {count} 个", en: "{count} deleted" },
+  "sidebar.sessionDelete.outcome.absent": { zh: "清理残留 {count} 个", en: "{count} leftover cleaned" },
+  "sidebar.sessionDelete.outcome.kept": { zh: "{count} 个未删除：{reasons}", en: "{count} not deleted: {reasons}" },
+  "sidebar.sessionDelete.outcome.join": { zh: "，", en: ", " },
+  "sidebar.sessionDelete.outcome.reasonJoin": { zh: "、", en: ", " },
+  "sidebar.sessionDelete.error.candidates": { zh: "读取可删除会话失败：{message}", en: "Cannot list deletable sessions: {message}" },
+  "sidebar.sessionDelete.error.delete": { zh: "删除失败：{message}", en: "Delete failed: {message}" },
 });
+
 
   /** 两位补零：本地墙钟时间（formatClockTime）的分钟/秒格式化。 */
   function pad2(value) {

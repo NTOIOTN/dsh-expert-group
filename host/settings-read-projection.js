@@ -19,6 +19,7 @@ import {
 } from "../shared/model-route.js";
 import { normalizeModelPrices } from "./usage-projection.js";
 import { normalizePeakValleyForRead } from "./peak-valley-settings.js";
+import { mergeOrchestratorDraft, normalizeOrchestratorForRead } from "./orchestrator-settings.js";
 import {
   LIMIT_DIAGNOSTIC_LIMIT,
   normalizeRoleLimitsForRead,
@@ -179,6 +180,27 @@ export function assertInheritContextCandidate(value) {
 }
 
 /**
+ * 主代理（Orchestrator）模型配置的写入面合并（批次 A）。
+ *
+ * settings-commit 的语义边界：缺字段（旧客户端）=> undefined（不写 patch、响应不新增字段）；
+ * 显式提供 => 与已保存值做**字段粒度**合并，非法条目整次保存拒绝（fail-closed）。
+ * 这里**不做模型目录预检**：保存只影响之后新建的会话，可用性在真正套用时按候选链预检
+ * （失败切下一个，全部失败则维持现状），因此一次保存不会被某个暂时不在目录里的候选阻塞。
+ *
+ * 放在本模块是为了让 settings-commit 能沿用既有 import（host/index-model-route 的本地
+ * import 已到 C8 上限）；规则本体仍在 host/orchestrator-settings（mergeOrchestratorDraft）。
+ *
+ * @param {object} candidate - 完整 settings 候选。
+ * @param {object} savedSnapshot - 已归一的旧设置快照（提供合并基线 orchestrator）。
+ * @param {(message: string) => Error} makeError - ValidationError 构造器（保持类身份）。
+ * @returns {object|undefined} 合并后的 { defaults, candidates, fallbackLimit }；未提交时 undefined。
+ */
+export function mergeOrchestratorSettingsCandidate(candidate, savedSnapshot, makeError) {
+  if (candidate?.orchestrator === void 0) return void 0;
+  return mergeOrchestratorDraft({ base: savedSnapshot?.orchestrator, draft: candidate.orchestrator, makeError });
+}
+
+/**
  * 读取期并发映射诊断的有界投影（meta 用，票据 26）。
  *
  * 只保留字段名、角色/provider 键（截断）与稳定原因码：不包含原始值、用户正文或
@@ -326,6 +348,16 @@ export function normalizeSnapshot(snapshot, visibleRoles) {
    * 启用但非法时 invalidCode 是路由 fail-closed 的唯一信号（票 03 消费）。
    */
   const peakValleyRead = normalizePeakValleyForRead(snapshot?.peakValley);
+  /**
+   * 主代理模型配置（批次 A）：**独立归一**，绝不并入 defaults 映射。
+   *
+   * 旧配置（没有该字段）/ 外部写入的坏值都必须归一出固定形状
+   * （defaults|null、candidates[]、fallbackLimit），因此设置页与运行期读面永远拿到
+   * 可直接展开的对象；坏值只产生有界诊断，绝不让整份配置解析失败。
+   * 时段层的两份配置（peakValley.peak/valley.orchestrator）由 normalizePeakValleyForRead 一并归一，
+   * 这里不再重复处理。
+   */
+  const orchestratorRead = normalizeOrchestratorForRead(snapshot?.orchestrator);
   return {
     provider,
     defaults,
@@ -381,6 +413,13 @@ export function normalizeSnapshot(snapshot, visibleRoles) {
     candidates: normalizeModelCandidatesForRead(snapshot?.candidates, knownRoleIds),
     // 自动降级上限：缺失/非法回退默认 2，读取面永远给出 0..4 的合法整数。
     fallbackLimit: normalizeModelFallbackLimit(snapshot?.fallbackLimit),
+    /**
+     * 主代理模型配置（批次 A）：全局层配置，形状 { defaults, candidates, fallbackLimit }。
+     * defaults 为 null 表示"没有配置"（不干预），绝不是"用某个默认模型"。
+     * 读取期被丢弃条目另给出有界诊断（meta 投影，不是可回写配置）。
+     */
+    orchestrator: orchestratorRead.config,
+    orchestratorDiagnostics: Object.freeze(orchestratorRead.diagnostics.map((entry) => Object.freeze({ ...entry }))),
     /**
      * 峰谷状态（票据 02）：enabled / initialized / periods / peak / valley。
      * 只有在"启用但非法"时才附带 invalidCode（时段 → profile → 状态结构优先级），

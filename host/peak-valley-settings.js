@@ -36,6 +36,21 @@ import {
   normalizeModelSelection,
 } from "../shared/model-route.js";
 import { STATUS_ROLE_IDS } from "../shared/prompts.js";
+import {
+  defaultOrchestratorConfig,
+  mergeOrchestratorDraft,
+  normalizeOrchestratorForRead,
+} from "./orchestrator-settings.js";
+
+/**
+ * 主代理配置的写入面合并（`{ base, draft, makeError }` → 归一配置）。
+ *
+ * 这里**再导出**同一个实现（不是第二份）：settings-commit 的全局 orchestrator 合并与峰谷
+ * profile 内的合并必须逐字同源，否则同一份草稿在两个入口会得到不同结果。
+ * 之所以从这里交出：settings-commit 所在模块（host/index-model-route）的本地 import 数已
+ * 到 C8 上限（12），只能搭已有的 import 语句；语义归属仍是 host/orchestrator-settings。
+ */
+export { mergeOrchestratorDraft };
 
 /** 某套 profile 的模型配置不完整/重复/越界时的稳定错误码（fail-closed，400）。 */
 export const PEAK_VALLEY_PROFILE_INVALID = "PEAK_VALLEY_PROFILE_INVALID";
@@ -107,20 +122,31 @@ function isPlainObject(value) {
 }
 
 /**
- * 构造一份空的峰谷 profile（provider/defaults/candidates/fallbackLimit）。
+ * 构造一份空的峰谷 profile（provider/defaults/candidates/fallbackLimit/orchestrator）。
  *
  * 每次都返回新对象：profile 会被克隆成峰、谷两份，共享引用会让「改一份影响另一份」
- * 直接出现在用户设置里（票据 02 明确禁止）。
+ * 直接出现在用户设置里（票据 02 明确禁止）。`orchestrator` 是**批次 A 新增的独立子对象**
+ * （主代理模型配置），它与 defaults/candidates 这两个「角色 -> 值」映射并列，而不是其中
+ * 的一条：orchestrator 不是专家角色，绝不出现在 defaults/candidates 的键里。
  */
 function emptyPeakValleyProfile() {
-  return { provider: "", defaults: {}, candidates: {}, fallbackLimit: DEFAULT_MODEL_FALLBACK_LIMIT };
+  return {
+    provider: "",
+    defaults: {},
+    candidates: {},
+    fallbackLimit: DEFAULT_MODEL_FALLBACK_LIMIT,
+    orchestrator: defaultOrchestratorConfig(),
+  };
 }
 
 /**
- * 深拷贝一份 profile（只保留四个白名单字段）。
+ * 深拷贝一份 profile（只保留四个角色层白名单字段 + 主代理子对象）。
  *
  * 刻意**不复制未知字段**：历史文档里可能残留旧版本字段，克隆与合并都不能把它们带进
  * 新写入的状态，否则「一份配置」会随保存次数不断漂移。
+ *
+ * 主代理子对象也走白名单归一：首次启用克隆时从**已归一的普通配置**拿到同一份
+ * { defaults, candidates, fallbackLimit }，坏值在这里被丢弃而不会随克隆扩散。
  */
 function clonePeakValleyProfile(profile) {
   const source = isPlainObject(profile) ? profile : {};
@@ -129,6 +155,8 @@ function clonePeakValleyProfile(profile) {
     defaults: cloneSelectionMap(source.defaults),
     candidates: cloneCandidateMap(source.candidates),
     fallbackLimit: normalizeModelFallbackLimit(source.fallbackLimit),
+    // 宽容归一（读取面语义）：外部坏值只降级成"未配置"，不抛错。
+    orchestrator: normalizeOrchestratorForRead(source.orchestrator).config,
   };
 }
 
@@ -257,6 +285,23 @@ function readPeakValleyProfile(value, layer, report) {
       report({ field: "peakValley." + layer + ".fallbackLimit", reason: "invalid_fallback_limit" });
     }
     profile.fallbackLimit = limit;
+  }
+  /**
+   * 主代理（Orchestrator）配置（批次 A）：与本层的角色映射并列的独立子对象。
+   *
+   * 刻意**不**把它的坏值折算成 valid=false：valid 驱动的是"启用但非法 => 整个派发 fail-closed"
+   * （PEAK_VALLEY_PROFILE_INVALID 会让所有专家角色的派发直接失败）。主代理是新增功能，它的
+   * 一条坏配置不该把既有专家派发整体打死——读取面因此只丢弃坏条目并诊断，写面仍然严格拒绝。
+   */
+  if (value.orchestrator !== void 0) {
+    const read = normalizeOrchestratorForRead(value.orchestrator);
+    profile.orchestrator = read.config;
+    for (const entry of read.diagnostics) {
+      report({
+        field: "peakValley." + layer + "." + (typeof entry.field === "string" ? entry.field : "orchestrator"),
+        reason: entry.reason,
+      });
+    }
   }
   if (profile.provider.length === 0) profile.provider = inferProfileProvider(profile.defaults);
   return { profile, valid, container: true };
@@ -462,6 +507,12 @@ function profileIsValid(profile) {
       seen.add(key);
     }
   }
+  /**
+   * 主代理子对象（批次 A）：写面同样要求"已归一"——读取归一产生任何诊断就说明这份值
+   * 不是规范形状（例如主选择缺 model、候选超限/重复）。合流点只有两处（首次启用克隆与
+   * 显式草稿的严格合并），两处都产出规范值，因此这里只是防守分支。
+   */
+  if (normalizeOrchestratorForRead(profile.orchestrator).diagnostics.length > 0) return false;
   return true;
 }
 
@@ -572,6 +623,20 @@ function applyProfileDraft(base, draft, makeError, label) {
     if (limit !== draft.fallbackLimit) fail(makeError, label + "配置的降级上限无效", PEAK_VALLEY_PROFILE_INVALID);
     profile.fallbackLimit = limit;
   }
+  /**
+   * 主代理子对象（批次 A）：字段粒度合并（base = 已归一的旧值）。
+   *
+   * 它**不是** defaults/candidates 里的一条角色键，因此上面两个角色白名单校验不覆盖它；
+   * 这里的严格校验由 host/orchestrator-settings 的 mergeOrchestratorDraft 唯一负责
+   * （缺 provider/model、候选超限/重复、fallbackLimit 越界都会整次拒绝）。
+   */
+  if (draft.orchestrator !== void 0) {
+    profile.orchestrator = mergeOrchestratorDraft({
+      base: profile.orchestrator,
+      draft: draft.orchestrator,
+      makeError,
+    });
+  }
   return profile;
 }
 
@@ -668,6 +733,39 @@ export function mergePeakValleyDraft(options) {
 }
 
 /**
+ * settings 提交端点的峰谷合并入口（字段粒度 + 首次启用克隆）。
+ *
+ * 为什么把「从候选里取哪些字段、未显式提供的字段回退到哪里」也放在本模块：
+ * 这是峰谷配置的领域决定（普通层 provider/defaults/candidates/fallbackLimit 与主代理配置
+ * 都是克隆来源），放在写面这里比留在提交端点更不易与读取面漂移；提交端点因此只剩一行调用。
+ *
+ * @param {object} options - 提交入参。
+ * @param {object} options.candidate - 完整 settings 候选。
+ * @param {object} options.savedOrdinary - 已归一的旧普通配置（未显式提供字段的回退来源）。
+ * @param {object} options.rawSaved - describe() 的原始旧值（取旧 peakValley 原值）。
+ * @param {{candidates: boolean, fallbackLimit: boolean, orchestrator: object}} options.provided -
+ *   本次显式提供了哪些普通字段；orchestrator 是**已归一**的主代理配置（克隆来源）。
+ * @param {Function} options.makeError - ValidationError 构造器。
+ * @returns {object|undefined} 合并后的峰谷状态；未提交 peakValley 时 undefined。
+ */
+export function mergePeakValleySubmission({ candidate, savedOrdinary, rawSaved, provided, makeError }) {
+  if (candidate?.peakValley === void 0) return void 0;
+  return mergePeakValleyDraft({
+    draft: candidate.peakValley,
+    saved: rawSaved?.peakValley,
+    ordinary: {
+      provider: candidate.provider,
+      defaults: candidate.defaults,
+      candidates: provided?.candidates ? candidate.candidates : savedOrdinary.candidates,
+      fallbackLimit: provided?.fallbackLimit ? candidate.fallbackLimit : savedOrdinary.fallbackLimit,
+      // 主代理配置（批次 A）：首次启用克隆时峰/谷各拿一份独立副本（值取本次已归一的全局配置）。
+      orchestrator: provided?.orchestrator ?? savedOrdinary.orchestrator,
+    },
+    makeError,
+  });
+}
+
+/**
  * 解析峰谷两套 profile 里**变更中**的模型字段（票据 02）。
  *
  * 与普通 defaults 完全同一套规则：只有变更集（声明 ∪ 实际差异）内的启用角色走真实目录
@@ -701,6 +799,13 @@ export async function resolvePeakValleyProfiles(options) {
     defaults: { ...profile.defaults },
     candidates: { ...profile.candidates },
     fallbackLimit: profile.fallbackLimit,
+    // 主代理配置（批次 A）随层一起复制（深一层副本：候选数组不共享引用）。
+    // 不复制它会让"目录解析"这一步把 orchestrator 静默丢掉——落盘状态与回包都会少一个键。
+    orchestrator: {
+      defaults: profile.orchestrator?.defaults ?? null,
+      candidates: Array.isArray(profile.orchestrator?.candidates) ? [...profile.orchestrator.candidates] : [],
+      fallbackLimit: normalizeModelFallbackLimit(profile.orchestrator?.fallbackLimit),
+    },
   });
   const resolved = { ...state, peak: cloneLayer(state.peak), valley: cloneLayer(state.valley) };
   const resolvedRoles = [];

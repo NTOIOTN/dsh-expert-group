@@ -26,6 +26,7 @@ import { MAX_CONCURRENCY_LIMIT, MAX_PROVIDER_LIMIT, MIN_CONCURRENCY_LIMIT, MIN_P
 import {
   MAX_MODEL_CANDIDATES_PER_ROLE,
   MODEL_CANDIDATES_EXHAUSTED,
+  ORCHESTRATOR_SELECTION_KEY,
   MODEL_ROUTE_ERROR_CODES,
   MODEL_ROUTE_OK,
   buildModelRoutePlan,
@@ -48,7 +49,7 @@ import {
   countPromptGraphemes,
 } from "../shared/prompts.js";
 import { abortErrorFor, createAbortError } from "./rpc-request-lifecycle.js";
-import { assertInheritContextCandidate, normalizeSnapshot } from "./settings-read-projection.js";
+import { assertInheritContextCandidate, mergeOrchestratorSettingsCandidate, normalizeSnapshot } from "./settings-read-projection.js";
 import {
   CONFIG_MIGRATION_VERSION,
   NOTIFICATION_EVENT_TYPES,
@@ -58,7 +59,7 @@ import {
   normalizeRoleTimeoutMs,
 } from "./settings-schema.js";
 import { assertModelPrices } from "./usage-projection.js";
-import { mergePeakValleyDraft, peakValleyChangedRoles, resolvePeakValleyProfiles } from "./peak-valley-settings.js";
+import { mergePeakValleySubmission, peakValleyChangedRoles, resolvePeakValleyProfiles } from "./peak-valley-settings.js";
 import { routeSnapshotMarkerOf as routeSnapshotMarkerValue } from "../shared/route-snapshot.js";
 import { resolvePeakValleyRoute } from "./peak-valley-route.js";
 import { restoredFanoutModelRoute as restoredFanoutModelRouteFrom } from "./fanout-route-restore.js";
@@ -121,6 +122,9 @@ function installSessionOverrides(deps, api) {
      */
     function sessionOverrideProjectionOf(snap, sessionId, allowedRoles = activeRoles()) {
       const allowed = new Set(allowedRoles);
+      // 保留键 orchestrator（主代理配置）复用同一张覆盖表，但**不是**角色：只按键放行，
+      // 绝不进入 activeRoles()/STATUS_ROLE_IDS（否则角色枚举面会多出第七个角色）。
+      allowed.add(ORCHESTRATOR_SELECTION_KEY);
       const overrides = {};
       for (const [role, selection] of Object.entries(snap?.sessionOverrides?.[sessionId] ?? {})) {
         if (!allowed.has(role)) continue;
@@ -1046,35 +1050,6 @@ function installSettingsCandidateValidation(deps, api) {
   const validateSelectionWithSignal = (...args) => api.validateSelectionWithSignal(...args);
 
     /**
-     * 峰谷提交的字段粒度合并（票据 02）。
-     *
-     * 克隆源取本次提交里**已归一**的普通配置（而不是上一版落盘值）：同一次保存里
-     * 用户刚改的普通配置与被克隆出的峰/谷视角必须自洽。合并规则与错误码由
-     * host/peak-valley-settings 的唯一实现负责，这里只提供上下文。
-     *
-     * @param {object} candidate - 完整 settings 候选。
-     * @param {object} savedPeakValley - 已归一的旧 peakValley 状态（合并基线）。
-     * @param {object} savedOrdinary - 已归一的旧普通配置（未显式提供的普通字段回退来源）。
-     * @param {object} rawSaved - describe() 的原始旧值（用于取旧 peakValley 原值）。
-     * @param {{candidates: boolean, fallbackLimit: boolean}} provided - 本次是否显式提供对应普通字段。
-     * @returns {object|undefined} 合并后的峰谷状态；未提交 peakValley 时返回 undefined。
-     */
-    function mergePeakValleyCandidate(candidate, savedPeakValley, savedOrdinary, rawSaved, provided) {
-      if (candidate.peakValley === void 0) return void 0;
-      return mergePeakValleyDraft({
-        draft: candidate.peakValley,
-        saved: rawSaved?.peakValley,
-        ordinary: {
-          provider: candidate.provider,
-          defaults: candidate.defaults,
-          candidates: provided.candidates ? candidate.candidates : savedOrdinary.candidates,
-          fallbackLimit: provided.fallbackLimit ? candidate.fallbackLimit : savedOrdinary.fallbackLimit,
-        },
-        makeError: peakValleyError,
-      });
-    }
-
-    /**
      * 使用当前 Host 目录校验完整候选；串行提交边界负责最后的代次检查。
      *
      * 模型解析只覆盖变更集（票据 20）：未变更角色沿用已保存值，绝不再用真实目录
@@ -1190,16 +1165,19 @@ function installSettingsCandidateValidation(deps, api) {
       const rawSavedSettings = readSavedSettingsValue();
       const savedSnapshot = normalizeSnapshot(rawSavedSettings, activeRoles());
       const savedDefaults = savedSnapshot.defaults;
+      // 主代理配置（批次 A）：独立分支，不做目录预检（套用时才按候选链预检）。
+      const hasOrchestrator = candidate.orchestrator !== void 0;
+      const orchestrator = mergeOrchestratorSettingsCandidate(candidate, savedSnapshot, (message) => new ValidationError(message));
       // 峰谷（票据 02）：字段粒度合并 + 首次启用克隆。基线是 describe() 的权威旧值，
       // 只有显式提供的子字段参与合并；全部判定都在任何 await 之前完成。
       const hasPeakValley = candidate.peakValley !== void 0;
       const savedPeakValley = savedSnapshot.peakValley;
-      const peakValleyMerged = hasPeakValley
-        ? mergePeakValleyCandidate(candidate, savedPeakValley, savedSnapshot, rawSavedSettings, {
-            candidates: hasCandidates,
-            fallbackLimit: hasFallbackLimit,
-          })
-        : void 0;
+      const peakValleyMerged = mergePeakValleySubmission({
+        candidate, savedOrdinary: savedSnapshot, rawSaved: rawSavedSettings,
+        provided: { candidates: hasCandidates, fallbackLimit: hasFallbackLimit,
+          orchestrator: hasOrchestrator ? orchestrator : savedSnapshot.orchestrator },
+        makeError: peakValleyError,
+      });
       // 峰/谷两层各自与已保存状态比对（∪ 客户端声明）；结果按层分组（HIGH-2：分层消费）。
       const peakValleyChanges = peakValleyMerged === void 0
         ? void 0
@@ -1255,6 +1233,7 @@ function installSettingsCandidateValidation(deps, api) {
           // 峰谷状态按整份状态写入（已含合并结果与 Host 派生的 initialized）；
           // 缺字段（旧客户端）时不出现该键，patch 里也不会写。
           ...(hasPeakValley ? { peakValley: peakValleyResolved.state } : {}),
+          ...(hasOrchestrator ? { orchestrator } : {}),
           ...(hasCandidates ? { candidates } : {}),
           ...(hasFallbackLimit ? { fallbackLimit } : {}),
           ...(hasNotificationEvents ? { notificationEvents } : {}),
@@ -1385,6 +1364,8 @@ function installSettingsCommit(deps, api) {
       // 峰谷（票据 02）同一规则：缺字段 = 旧客户端，不写 patch、不在响应里新增字段；
       // 显式提供时整值写入合并后的完整状态（含 Host 派生的 initialized）。
       const hasPeakValley = candidate?.peakValley !== void 0;
+      // 主代理配置（批次 A）同一规则：缺字段不写 patch、不在响应新增字段（值已在 M5 合并）。
+      const hasOrchestrator = candidate?.orchestrator !== void 0;
       return settingsRuntime.enqueueCommit(async () => {
         const generation = settingsRuntime.generation;
         // 写入前的第一道语义边界：与 validateSettingsCandidate 内部同一批规则，
@@ -1413,6 +1394,7 @@ function installSettingsCommit(deps, api) {
           // 峰谷状态是**顶层整值**：合并与克隆已在 validateSettingsCandidate 内完成，
           // 这里只落一份完整快照，客户端原 expectedRevision 仍做同一道 CAS。
           ...(hasPeakValley ? { peakValley: validatedSettings.peakValley } : {}),
+          ...(hasOrchestrator ? { orchestrator: validatedSettings.orchestrator } : {}),
           notificationEnabled: validatedSettings.notificationEnabled,
           notificationVolume: validatedSettings.notificationVolume,
           // 通知事件类型同样「缺字段即不覆盖」：旧客户端保存通知开关不得重置事件过滤。
@@ -1456,6 +1438,7 @@ function installSettingsCommit(deps, api) {
         if (!hasFallbackLimit) delete committedSettings.fallbackLimit;
         // 峰谷同上：旧客户端不传时响应保持历史形状（不新增字段）。
         if (!hasPeakValley) delete committedSettings.peakValley;
+        if (!hasOrchestrator) delete committedSettings.orchestrator;
         // 并发映射同上：旧客户端不传时响应保持历史形状（不新增字段）。
         if (!hasRoleLimits) delete committedSettings.roleLimits;
         if (!hasProviderLimits) delete committedSettings.providerLimits;
@@ -1471,6 +1454,7 @@ function installSettingsCommit(deps, api) {
         delete committedSettings.modelPriceDiagnostics;
         // 峰谷读取期丢弃诊断同样只是诊断，不是可回写的配置。
         delete committedSettings.peakValleyDiagnostics;
+        delete committedSettings.orchestratorDiagnostics;
         // 迁移标记必须随响应回传：客户端据此关闭读取别名，保存 10 之后读回仍是 10。
         // 首次保存时标记刚随 patch 落盘；后续保存时文档里本来就有该标记。
         const committedMigrationVersion = descriptor?.value?.configMigrationVersion;

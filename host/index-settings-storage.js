@@ -48,6 +48,7 @@ import {
 import { normalizeSnapshot } from "./settings-read-projection.js";
 import { defaultPeakValleyState } from "./peak-valley-settings.js";
 import { EXPERT_STORAGE_DOMAIN_SPEC } from "./storage-domain-schema.js";
+import { ORCHESTRATOR_STATE_TABLE } from "./orchestrator-epoch.js";
 
 /**
  * 插件 settings 条目的默认值（= Config 投影的初值）。
@@ -224,6 +225,14 @@ function installSettingsSource(deps, api) {
         // 与 limitDiagnostics 同理：读取期丢弃诊断是"一次性事实"，必须在第二次归一前
         // 从原始快照取出，否则合法值重新归一后诊断会被清空，meta 再也看不到哪些条目被丢弃。
         peakValleyDiagnostics: rawSettingsSnapshot?.peakValleyDiagnostics ?? settingsSnapshot.peakValleyDiagnostics,
+        /**
+         * 主代理（Orchestrator）模型配置（批次 A）：必须随同一份快照进入 source()，
+         * 否则运行期会读成"未配置"（不干预），meta/get 与真实配置脱节；峰/谷两份
+         * 主代理配置随 peakValley 一起进入快照，不需要单独字段。
+         * 诊断同样是一次性事实：第二次归一会清空合法值上的诊断，所以优先取原始快照。
+         */
+        orchestrator: settingsSnapshot.orchestrator,
+        orchestratorDiagnostics: rawSettingsSnapshot?.orchestratorDiagnostics ?? settingsSnapshot.orchestratorDiagnostics,
         // 单价（票据 25）：与 settings 同源进入运行期读源，RPC meta/get 与客户端设置页
         // 读到同一份归一值；诊断只服务 meta，不进入设置响应。
         modelPrices: settingsSnapshot.modelPrices,
@@ -538,23 +547,32 @@ function installStorageDomainBinding(deps, api) {
         const fanoutTable = domain.table("fanout_tasks");
         // 手动派发模板（票据 28）：与运行数据同域、独立表；domain version 保持 1。
         const fanoutTemplateTable = domain.table("fanout_templates");
+        // 主代理模型配置的功能启用切点（B3）：与运行数据同域、独立表、固定一行。
+        // 读取面不参与 readSnapshot 投影（切点不是设置，也不进 RPC 契约），只供
+        // host/orchestrator-epoch 从 binding 直接读写；表缺失时该模块按"还没有切点"
+        // 重新初始化，不会影响设置读取。
+        const orchestratorStateTable = domain.table(ORCHESTRATOR_STATE_TABLE);
         const sessionEntries = tableEntries(sessionTable);
         const sessionOverrideMetaEntries = tableEntries(sessionOverrideMetaTable);
         const childEntries = tableEntries(childTable);
         const fanoutEntries = tableEntries(fanoutTable);
         const templateEntries = tableEntries(fanoutTemplateTable);
+        const orchestratorStateEntries = tableEntries(orchestratorStateTable);
         if (sessionEntries === void 0 || sessionOverrideMetaEntries === void 0
           || childEntries === void 0 || fanoutEntries === void 0
-          || templateEntries === void 0) throw new Error("storage domain table read failed");
+          || templateEntries === void 0 || orchestratorStateEntries === void 0) {
+          throw new Error("storage domain table read failed");
+        }
         if (!storageBinding.isCurrent(binding)) {
           await closeOpened();
           throw new Error("storage domain binding was replaced before ready");
         }
         const installed = storageBinding.install(binding, {
           domain, sessionTable, sessionOverrideMetaTable, childTable, fanoutTable, fanoutTemplateTable,
+          orchestratorStateTable,
           sessionAuthoritative: true, sessionOverrideMetaAuthoritative: true,
           childAuthoritative: true, fanoutAuthoritative: true,
-          fanoutTemplateAuthoritative: true,
+          fanoutTemplateAuthoritative: true, orchestratorStateAuthoritative: true,
         });
         if (!installed) {
           await closeOpened();

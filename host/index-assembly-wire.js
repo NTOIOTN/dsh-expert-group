@@ -16,6 +16,7 @@ import { createIndexRpcActionSession } from "./index-rpc-action-session.js";
 import { createConnectionChannel } from "./index-connection-channel.js";
 import { createHostCapabilityReport } from "./index-capability-report.js";
 import { createRuntimeDiagnostics } from "./index-runtime-diagnostics.js";
+import { installSessionDeleteCommandFace } from "./session-delete-rpc.js";
 
 /**
  * RPC action 分发（票据 20）：分发器按 action 域拆成两个模块——核心域（共享响应适配器 +
@@ -51,12 +52,20 @@ export function assembleRpcActions(state, caps) {
       sessionOverrideProjectionOf: state.sessionOverrideProjectionOf,
       fanoutRpcRootSession: state.fanoutRpcRootSession,
       isActiveRole: state.isActiveRole,
+      // 主代理模型配置读面（批次 A）：调用期解析运行期 manager，避免装配顺序耦合。
+      orchestratorStatusOf: (sessionId) => state.orchestratorModel.getStatus(sessionId),
+      // 主代理模型配置的**显式写入**入口（B2）：会话覆盖 set/clear 落盘成功后，
+      // 由 manager 用同一套预检 + 自写令牌把选择真正应用到根会话原生模型。
+      orchestratorApplyOverride: (sessionId) => state.orchestratorModel?.applyOverride(sessionId) === true,
+      orchestratorApplyOverrideCleared: (sessionId) => state.orchestratorModel?.applyOverrideCleared(sessionId) === true,
     },
     storage: {
       host,
       storageBinding: state.storageBinding,
       enqueueWrite: state.enqueueWrite,
       observeStorageWrite: state.observeStorageWrite,
+      // 会话覆盖的唯一 durable 写入实现（RPC 端点与主代理运行期共用，B2）。
+      sessionOverrideStore: state.sessionOverrideStore,
     },
     models: {
       settingsRuntime: state.settingsRuntime,
@@ -66,6 +75,15 @@ export function assembleRpcActions(state, caps) {
       validateSelectionWithSignal: state.validateSelectionWithSignal,
     },
   });
+
+  /**
+   * 会话删除的无会话域命令面（票据 04）。
+   *
+   * 命令面在更后段（会话删除 RPC 装配段）才创建，因此这里只交出**调用期解析**的窄命令，
+   * 与 noteOrchestratorSettingsCommit 等晚绑定写法一致；段缺失/已卸载时该窄面按
+   * `delete-unavailable` fail-closed（实现与测试共用同一个 installSessionDeleteCommandFace）。
+   */
+  const sessionDeleteCommands = installSessionDeleteCommandFace({ readCommands: () => state.sessionDeleteRpc });
 
   // 注意 capabilityReport / runtimeDiagnostics / systemToastDiagnosticToken 在更后段才装配：
   // 这里只交出调用期解析的窄命令（与其它域服务的晚绑定写法一致），绝不在装配期提前求值。
@@ -89,6 +107,9 @@ export function assembleRpcActions(state, caps) {
       expertGroupRuntime: state.expertGroupRuntime,
       fanoutHost: state.fanoutHost,
       isActiveRole: state.isActiveRole,
+      // 设置页保存成功后的「未来新会话配置修订」：只重排边界定时器，绝不遍历会话。
+      // 调用期解析：装配顺序不保证该域已经构造完成。
+      noteOrchestratorSettingsCommit: () => state.orchestratorModel?.noteSettingsCommit(),
     },
     image: {
       resolveMainImageRoute: state.resolveMainImageRoute,
@@ -158,7 +179,11 @@ export function assembleRpcActions(state, caps) {
       describeRuntimeDiagnostics: (...args) => state.runtimeDiagnostics.describeRuntimeDiagnostics(...args),
     },
     // 会话域分发表：核心模块只读取，不复制共享适配器。
-    session: rpcSessionActions,
+    //
+    // 会话删除（票据 04）的两个 action 不需要 sessionId，但语义属于「删会话」，因此与会话域
+    // 动作共用同一个 deps 命名空间：这样 RPC 核心的能力组仍是已签核的 8 组，不新增第 9 个
+    // 协作方。命令面由后段（assembleSessionDeleteRpc）晚绑定，这里只在**调用期**解析。
+    session: { ...rpcSessionActions, sessionDelete: sessionDeleteCommands },
   });
   // legacy HTTP adapter（handleRpc）与 Connection 通道都调用这两个绑定：
   // 它们与迁移前同为一个实例，只是定义从 index.js 搬到了 host/index-rpc-action-core.js。

@@ -99,9 +99,9 @@ test("主代理提示词覆盖全部专家职责和 DSH 工具名", () => {
 
 test("主代理提示词按判断需求、劳动量与可验证性默认派发", () => {
   const prompt = buildOrchestratorPrompt();
-  // 分工口径：判断留在主代理，可验证的劳动优先派发；旧的"非平凡或不确定才委派 /
+  // 分工口径：按角色适配面派发，判断留在主代理；旧的"非平凡或不确定才委派 /
   // isolated clear low-risk 可直做"只拿任务属性当开关，必须整体替换。
-  assert.match(prompt, /Delegate clear, time-consuming, repeatable, or independently verifiable labor to the enabled role that fits/);
+  assert.match(prompt, /Delegate to the enabled role that fits: explorer or librarian for evidence, oracle for architecture, risk, debugging and review, designer for frontend work, fixer for non-frontend implementation\. The root retains cross-task decisions\./);
   assert.doesNotMatch(prompt, /non-trivial or uncertain work, default to delegating/);
   assert.doesNotMatch(prompt, /default to delegating a bounded lane/);
   assert.doesNotMatch(prompt, /Handle work directly only when it is isolated, clear, low-risk/);
@@ -114,13 +114,13 @@ test("主代理提示词按判断需求、劳动量与可验证性默认派发",
   assert.match(prompt, /Line or file counts are not evidence of low risk/);
 
   // 整合与验收有明确边界：不得借整合接管实现，也不得借验收重做全部劳动。
-  assert.match(prompt, /Integration means assembling expert results, not taking over the implementation/);
-  assert.match(prompt, /verification of expert output means checking the acceptance criteria, not redoing the whole body of labor/);
+  assert.match(prompt, /Integration means assembling expert results, not redoing their work/);
+  assert.match(prompt, /verify acceptance criteria, not the whole body of labor/);
 
   // 兜底：只在确无合适启用角色时直做；角色忙碌/范围冲突不算不可用，且不得绕过权限与专业判断。
-  assert.match(prompt, /Beyond these root responsibilities and tiny direct-work exceptions: only fall back to doing it yourself when no enabled, available role fits the work/);
-  assert.match(prompt, /Do not treat a busy role or overlapping scope as role unavailability/);
-  assert.match(prompt, /No fallback bypasses permission, scope, or required professional judgment/);
+  assert.match(prompt, /Otherwise fall back to doing it yourself only when no enabled, available role fits/);
+  assert.match(prompt, /a busy role or overlapping scope is not unavailability/);
+  assert.match(prompt, /no fallback bypasses permission, scope, or required professional judgment/);
 
   // 先派发纪律：最小必要检查足以划定任务就先派发，不先完成同类劳动。
   assert.match(prompt, /dispatch it before completing that same labor yourself/);
@@ -144,11 +144,11 @@ test("主代理提示词规定独立可验收工作单元与验证证据的复�
 
 test("fanout 指引要求真实 affectedPaths，且不把重复 role 调用当并行", () => {
   const prompt = buildOrchestratorPrompt();
-  assert.match(prompt, /Use fan-out for genuinely independent same-role work: declare each unit one shard instead of repeating the same role call/);
-  assert.match(prompt, /truthful affectedPaths that cover what each shard reads and writes/);
+  assert.match(prompt, /declare each genuinely independent unit one shard instead of repeating role calls/);
+  assert.match(prompt, /truthful affectedPaths for conflict checks/);
   // 既有 fanout 事实（parentTaskId、并发、wait-all）保持不变。
   assert.match(prompt, /the call returns a parentTaskId immediately/);
-  assert.match(prompt, /bounded per-role concurrency, wait-all aggregation, cancellation, and manual retry/);
+  assert.match(prompt, /bounded concurrency, wait-all, cancellation and manual retry/);
 });
 
 test("角色 lane 契约：事实搜集、专业判断与实施各自有默认触发面", () => {
@@ -165,27 +165,50 @@ test("角色 lane 契约：事实搜集、专业判断与实施各自有默认�
     assert.match(lane, /Delegate when:/, role + " 必须有默认触发条件");
     assert.doesNotMatch(lane, /write the complete solution|resolve the answer first/, role + " 不得要求主代理先给出完整解决方案");
   }
-  assert.match(laneOf("explorer"), /symbols, callers, patterns, or tests/);
-  assert.match(laneOf("explorer"), /return file locations with each fact/);
+  assert.match(laneOf("explorer"), /symbols, callers, patterns or tests/);
+  assert.match(laneOf("explorer"), /return file locations, separating facts from inferences/);
   assert.match(laneOf("librarian"), /official docs|upstream evidence/);
   assert.match(laneOf("librarian"), /cite sources and versions/);
 
-  // fixer：已定方案的实现劳动，单文件的大量工作同样适合。
+  // fixer：已定方案的非前端实现劳动，单文件的大量工作同样适合。
   assert.match(laneOf("fixer"), /an agreed approach is already fixed/);
   assert.match(laneOf("fixer"), /one large single-file change/);
+  assert.match(laneOf("fixer"), /non-frontend approach/);
 
   // oracle：高风险决策与疑难调试要提前参与，不只等"普通诊断失败之后"。
-  assert.match(laneOf("oracle"), /earliest architecture, high-risk, or difficult-debugging judgment/);
-  assert.match(laneOf("oracle"), /user-asked code review, or after a large or high-risk implementation/);
+  assert.match(laneOf("oracle"), /early architecture, high-risk or hard-debugging judgment can steer the work/);
+  assert.match(laneOf("oracle"), /a user-asked review always triggers it, even for a routine change; a large or high-risk implementation is finished/);
   // 负面 lane 必须限定在"未命中上述触发条件的常规工作"：用户明确要求审查时，即使改动
   // 常规也必须优先满足，不能被"改动常规且方案清楚"反过来压过。
-  assert.match(laneOf("oracle"), /Do not delegate when: a change is routine and the correct approach is already clear but none of the triggers above applies; a user-requested review or the other triggers above win over this routine exclusion/);
-  assert.match(laneOf("oracle"), /a user-requested review keeps this trigger even when the change itself looks routine/);
-  assert.doesNotMatch(laneOf("oracle"), /- Do not delegate when: the change is routine and the correct approach is already clear/);
+  assert.match(laneOf("oracle"), /Do not delegate when: the change is routine and the approach is clear, unless a review was asked/);
+  assert.doesNotMatch(laneOf("oracle"), /- Do not delegate when: a change is routine and the correct approach is already clear/);
 
-  // designer：设计选择时提前参与，已定微小文案可直做。
-  assert.match(laneOf("designer"), /layout, interaction, hierarchy, responsive behavior, or accessibility/);
-  assert.match(laneOf("designer"), /small copy or token change with an already-fixed design/);
+  // designer：前端/用户可见实现一律由 designer 承接，不再有「已定设计的微小文案」豁免。
+  assert.match(laneOf("designer"), /layout, interaction, hierarchy, spacing, responsive behavior, accessibility, web UI/);
+  assert.match(laneOf("designer"), /mandatory for frontend work, with no size or already-specified exception/);
+  assert.doesNotMatch(laneOf("designer"), /already-fixed design/);
+});
+
+test("root prompt 强制前端路由：前端/用户可见实现只能由 designer 承接", () => {
+  const prompt = buildOrchestratorPrompt({
+    roles: ORCHESTRATOR_ROLES,
+    providerReady: true,
+    observerPreferred: false,
+    rootSessionId: "root-session-routing",
+  });
+  // 1) 顶层强制规则存在，且覆盖 UI/UX、交互、web、PPT 等用户可见产物
+  assert.ok(prompt.includes("Frontend and user-visible work is ALWAYS designer's, never the root's or fixer's"));
+  assert.ok(prompt.includes("web UI/HTML"));
+  assert.ok(prompt.includes("PPT/decks"));
+  // 2) 旧的两条逃生门必须消失：不再把 designer 归为「早期判断」、不再有「已定设计可豁免」
+  assert.ok(!prompt.includes("designer early for judgment"));
+  assert.ok(!prompt.includes("already-fixed design"));
+  // 3) fixer lane 明确排除前端，并在 Do not delegate 里点名 designer
+  assert.ok(prompt.includes("non-frontend approach"));
+  assert.ok(prompt.includes("the change is frontend or user-visible (designer's job)"));
+  // 4) designer lane 明确「无尺寸/无已定设计豁免」
+  assert.ok(prompt.includes("no size or already-specified exception"));
+  assert.ok(prompt.includes("never fixer's"));
 });
 
 test("Observer lane 与真实附件事实一致，不提供本地路径读取入口", async () => {
@@ -195,11 +218,11 @@ test("Observer lane 与真实附件事实一致，不提供本地路径读取入
   assert.doesNotMatch(lane, /read_image/);
   assert.doesNotMatch(lane, /full workspace file path/);
   assert.match(lane, /Host-owned durable image attachment/);
-  assert.match(lane, /never accept a client-supplied path/);
-  assert.match(lane, /only when the current image-routing policy permits/);
-  assert.match(lane, /Automatic image routing uses its fixed visual task without user text or the general task-context template/);
+  assert.match(lane, /a client-supplied path is never valid input/);
+  assert.match(lane, /the image-routing policy permits it/);
+  assert.match(lane, /automatic routing uses its fixed visual-only task/);
   // PDF 只能在已按合法图片形式呈现时分析，不新增任意 PDF/本地路径入口。
-  assert.match(lane, /PDF pages only when a legal image form/);
+  assert.match(lane, /PDFs only when already a legal image form/);
 
   // 真实 plugin.apply 注册出的 routing section 不得再提供客户端文件路径 / read_image 入口：
   // 它与 root prompt 的 Observer lane 必须同时只承认 Host 提供的真实 durable 图片附件。

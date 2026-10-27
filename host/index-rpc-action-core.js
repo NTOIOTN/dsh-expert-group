@@ -62,6 +62,10 @@ const GLOBAL_ROUTES = new Map([
   ["fanout-retry", handleFanoutTaskActions],
   ["settings-commit", handleSettingsCommit],
   ["notification-test", handleNotificationTest],
+  // 会话删除（票据 04）：两个 action 都**不要求 sessionId**，因此属于无会话域分发表。
+  // 命令面（校验/编排/错误码）在 host/session-delete-rpc，这里的 handler 只做 envelope。
+  ["session-delete-candidates", handleSessionDeleteAction],
+  ["session-delete", handleSessionDeleteAction],
 ]);
 
 /**
@@ -181,6 +185,10 @@ export function mapRpcError(deps, error, signal) {
   if (error instanceof BadJsonError) {
     return { status: 400, code: "bad-request", message: error.message };
   }
+  // 会话删除（票据 04）：候选查询/删除执行的稳定错误码（400/404/409/503）由该域自己映射一次，
+  // 这里只负责采纳——错误映射仍然只有这一条路径，不产生第二份副本。
+  const sessionDeleteMapped = deps.session?.sessionDelete?.mapError?.(error);
+  if (sessionDeleteMapped !== undefined) return sessionDeleteMapped;
   if (error?.code === "MODEL_DIRECTORY_CHANGED") {
     // 写入边界发现目录已变化：让客户端保留 dirty 草稿并重新校验。
     return { status: 400, code: "invalid-selection", message: error.message };
@@ -692,6 +700,14 @@ async function handleMeta(deps, req) {
        */
       peakValley: snap.peakValley,
       peakValleyDiagnostics: projectPeakValleyDiagnostics(snap.peakValleyDiagnostics),
+      /**
+       * 主代理模型配置（批次 A）：全局层 `{ defaults, candidates, fallbackLimit }`。
+       * defaults 为 null = 未配置（不干预）；峰/谷两层的对应配置随
+       * peakValley.peak/valley 一起回传（shape 相同，不再额外投影一份）。
+       * 诊断与其它读取期丢弃诊断同款：有界、只读、不是可回写配置。
+       */
+      orchestrator: snap.orchestrator,
+      orchestratorDiagnostics: Array.isArray(snap.orchestratorDiagnostics) ? snap.orchestratorDiagnostics : [],
       /**
        * 用量聚合（票据 25，全局只读）：totals / byRole / byProvider / byModel /
        * recentTasks（≤16）。只由 child_models.usage 与 live 账本投影，不含
@@ -1357,10 +1373,24 @@ async function handleFanoutTaskActions(deps, req) {
 }
 
 /**
+ * 「session-delete-candidates」 / 「session-delete」 的 handler（票据 04）。
+ *
+ * 两个 action 都不要求 sessionId，因此登记在无会话域分发表；输入校验、五态聚合与稳定错误码
+ * 都在 `host/session-delete-rpc`（由 `deps.session.sessionDelete` 提供）。这里只把解码后的
+ * body 交给命令面，并在成功时补上共享 envelope 的 `ok:true`——分发表里不写业务。
+ */
+async function handleSessionDeleteAction(deps, req) {
+  const { body, send } = req;
+  const result = await deps.session.sessionDelete.handle(body.action, body);
+  send(200, { ok: true, ...result });
+}
+
+/**
  * 「settings-commit」 的 handler（原始源行归属 2903–2916）。
  */
 async function handleSettingsCommit(deps, req) {
   const { commitSettingsCandidate } = deps.services;
+  const { noteOrchestratorSettingsCommit } = deps.reads;
   const { body, signal, send, fail } = req;
 
   if (body.action === "settings-commit") {
@@ -1374,6 +1404,17 @@ async function handleSettingsCommit(deps, req) {
     // Host 会按「已保存值 vs 候选」的差异自行推导）。候选本身仍是完整值，
     // replace 语义与 revision 栅栏完全不变。
     const committed = await commitSettingsCandidate(body.settings, expectedRevision, signal, body.changed);
+    /**
+     * 主代理模型配置（批次 A）：保存成功后的**唯一**动作是推进"未来新会话的配置修订"
+     * 并重排峰谷边界定时器。刻意不遍历已存在会话、不重新套用任何模型——
+     * 产品语义是"保存只影响之后新建的会话"。失败也不影响保存结果（它只是诊断+定时器），
+     * 因此这里吞掉异常并保持响应形状不变。
+     */
+    try {
+      noteOrchestratorSettingsCommit?.();
+    } catch {
+      // 定时器/统计失败不能把一次已经落盘的保存变成 500。
+    }
     send(200, { ok: true, ...committed });
     return;
   }

@@ -13,7 +13,7 @@
   const PURE = global[PURE_SYMBOL] || {};
   const {
     ANNOUNCEMENT_MAX_ITEMS, collectAnnouncementTasks, collectSnapshotSessionIds, normalizeSessionModelView, object, safeNormalize,
-    sessionModelRolesOf, text,
+    sessionModelRowKeysOf, text,
   } = PURE;
   const DOM_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-dom");
   const DOM = global[DOM_SYMBOL] || {};
@@ -53,6 +53,23 @@
       }, [state.snapshot, rootSessionId]);
     }
 
+  }
+
+  /**
+   * 读取根会话的 `get().orchestrator` 读面（只读，失败一律返回 null）。
+   *
+   * 旧宿主 / 子会话的响应里没有该字段：返回 null 而不是空对象，界面因此能把"读不到"
+   * 与"读到了但未配置"分开表达。主代理的编辑能力仍由 session-override-* 决定，
+   * 这条读面失败不阻断覆盖编辑。
+   */
+  async function readOrchestratorStatusOf(config, contextRef, sessionId) {
+    try {
+      const body = await callRpc(config, contextRef.current, { action: "get", sessionId }, {}, (value) => object(value));
+      const status = object(object(body).orchestrator);
+      return Object.keys(status).length === 0 ? null : status;
+    } catch {
+      return null;
+    }
   }
 
   /** 「会话模型」读取、目录订阅、原生 dialog 与焦点归还四条 effect。 */
@@ -147,7 +164,7 @@
             return;
           }
           if (cancelled === true || serial !== sessionModelRequestSerialRef.current) return;
-          const roles = sessionModelRolesOf(effectiveMeta);
+          const roles = sessionModelRowKeysOf(effectiveMeta);
           const view = normalizeSessionModelView(body, roles);
           if (view === null) {
             setSessionModelState({ status: "error", overrides: {}, revision: 0, live: false });
@@ -157,6 +174,12 @@
           if (sessionModelLoadedRootRef.current !== targetSessionId) setSessionModelDrafts({});
           sessionModelLoadedRootRef.current = targetSessionId;
           setSessionModelState({ status: "ready", overrides: view.overrides, revision: view.revision, live: view.live });
+          // 主代理读面（get().orchestrator）：与覆盖同一轮读取；失败返回 null，行按「不干预」降级，
+          // 但绝不影响覆盖本身的读写能力。读面挂在同一份 sessionModelState 上——不新增 Hook
+          // （侧栏 Hook 顺序是 golden 基线），复位路径各自新建对象字面量，天然丢掉旧读面。
+          const orchestratorStatus = await readOrchestratorStatusOf(config, contextRef, targetSessionId);
+          if (cancelled === true || serial !== sessionModelRequestSerialRef.current) return;
+          setSessionModelState((previous) => ({ ...previous, orchestrator: orchestratorStatus }));
         })();
         return () => { cancelled = true; };
       }, [sessionModelOpen, rootSessionId, sidebarSessionId, sessionModelReloadToken, config]);

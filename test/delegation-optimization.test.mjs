@@ -2952,6 +2952,10 @@ test("client：公开 apply 注册设置页、插件详情摘要、chat node、s
       "shell.overlay",
       "sidebar.panellist",
       "sidebar.right.pane.tab",
+      // 会话删除（票据 06/07）：行尾按钮、会话菜单两行、行首勾选框（shell.overlay 已有注册项）。
+      "sidebar.session.row.leading",
+      "sidebar.workspaces.session.menu.item",
+      "sidebar.workspaces.session.row.action",
     ]);
   const section = host.registrations.get("settings.section");
   assert.equal(section.descriptor.id, "dsh-expert-group");

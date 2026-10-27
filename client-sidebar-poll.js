@@ -440,6 +440,9 @@
    * 所有既有语义逐字保留：错误 message 仍是 adapter / Host 给出的原文，AbortError 仍是同名错误
    * （快照路径的可取消判定不依赖 instanceof），成功 envelope 的三种形状照旧解包。
    *
+   * 拒绝判定顺序（真机缺陷回归）：只要有 `json()` 就先消费它、按 `payload.ok === false`
+   * 取宿主错误块；只有适配器直接返回 `{ ok:false, error }`（无 `json`）时才读 `response.error`。
+   *
    * 可选的 select 参数（票据 15）：默认解包仍返回「快照本体」。快照增量同步需要读到与快照**同级**
    * 的 cursor（若 Host 将来在响应顶层提供），而默认解包会把同级字段丢掉，因此这条路径传入 select
    * 拿到未收窄的 envelope。不传 select 时三种 envelope 形状的返回值逐字不变（既有调用方零影响）。
@@ -461,7 +464,11 @@
       // adapter 同步抛错 / Promise reject / 取消：全都是传输层失败（标记不改 name，取消判定照旧）。
       throw markRpcTransportFailure(error);
     }
-    if (response?.ok === false) throw rpcBusinessError(response.error);
+    // 归一化后的 Response（Connection 通道的 normalizePluginRpcResult 与 fetch Response）把
+    // 错误块放在 json() 的 payload 里，自身**没有 error 字段**：因此必须先消费 json()，
+    // 再判 payload.ok === false，才能拿到宿主真实的 message/code/details。
+    // 旧实现先判 response.ok === false 就 rpcBusinessError(response.error)，此时 error 恒为
+    // undefined，所有宿主拒绝都退化成通用文案「RPC 请求失败」（真机缺陷）。
     if (typeof response?.json === "function") {
       let payload;
       try {
@@ -474,6 +481,9 @@
       const body = payload?.value ?? payload;
       return typeof select === "function" ? select(body) : (body?.snapshot ?? body);
     }
+    // 兼容边界：适配器直接返回 { ok:false, error }（没有 json 可读）时仍按旧分支归类，
+    // 从 response.error 取宿主文案；标记语义与 json 分支完全一致（不打传输标记）。
+    if (response?.ok === false) throw rpcBusinessError(response.error);
     if (response?.value !== undefined) {
       if (typeof select === "function") return select(response.value);
       return response.value?.snapshot ?? response.value;

@@ -111,6 +111,12 @@ window.__ModuleLoader__.load({
     const {
       installDegSidebarEntry,
     } = clientSidebarEntryModule;
+    // 会话删除（票据 06/07）：交互层提供唯一安装函数，插槽注册与文档级守卫都在它内部完成；
+    // RPC 端口由 apply 注入（与其余模块共用同一条 callRpc 通道，不新建传输实现）。
+    const clientSessionDeleteUiModule = globalThis[Symbol.for("dsh-expert-group/client-session-delete-ui")] || {};
+    const {
+      installSessionDeleteUi,
+    } = clientSessionDeleteUiModule;
     // 「峰谷时段」判定的唯一权威实现是 shared/peak-valley-time.js。装配器把它机械投影成
     // classic 片段、并保证在本 descriptor 之前执行；这里只从公开检查点取回同一份实现，
     // **不内联任何时间判定**（内联即第二份实现，必然与 Host 校验各自漂移）。
@@ -303,6 +309,11 @@ window.__ModuleLoader__.load({
       )));
 
       installSettingsBoundSidebar(ctx, { settingsForm, modelCatalog });
+      // 会话删除的两个入口 + 多选界面：宿主缺少插槽面时安装函数自身降级为 no-op，
+      // 因此这里不需要额外的能力探测，也不改变既有的注册顺序（它排在所有既有注册之后）。
+      if (typeof installSessionDeleteUi === "function") {
+        installSessionDeleteUi(ctx, { react, primitives, requestPluginRpc });
+      }
     }
 
     /**

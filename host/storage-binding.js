@@ -83,7 +83,7 @@ export function createStorageBindingModule({ bindingController = createBindingCo
           ? []
           // 票据 28：模板表与运行数据同域、独立表。诊断只投影“有哪些表”，
           // 不暴露表内容；旧 binding 缺该表时如实少一项（= 写路径会显式拒绝）。
-          : ["session_overrides", "session_override_meta", "child_models", "fanout_tasks", "fanout_templates"]
+          : ["session_overrides", "session_override_meta", "child_models", "fanout_tasks", "fanout_templates", "orchestrator_state"]
             .filter((name) => binding[tableKeyOf(name)] !== undefined),
       };
     },
@@ -99,5 +99,7 @@ function tableKeyOf(tableName) {
   if (tableName === "session_override_meta") return "sessionOverrideMetaTable";
   if (tableName === "child_models") return "childTable";
   if (tableName === "fanout_templates") return "fanoutTemplateTable";
+  // 主代理功能启用切点（B3）：与运行数据同域的独立表，诊断面同样如实列出。
+  if (tableName === "orchestrator_state") return "orchestratorStateTable";
   return "fanoutTable";
 }

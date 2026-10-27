@@ -17,6 +17,12 @@ import {
   MAX_EXPERT_PERSONA_MARKER_CHARS,
 } from "./expert-guards.js";
 import { SHADOW_MARKER, SHADOW_STATUS } from "./send-message-shadow.js";
+import { ORCHESTRATOR_STATE_TABLE } from "./orchestrator-epoch.js";
+import {
+  DOMAIN_SESSION_DELETE_RECORD,
+  SESSION_DELETE_QUEUE_TABLE,
+  SESSION_DELETE_RESIDUE_TABLE,
+} from "./session-delete-contract.js";
 
 /** domain child record 保留恢复字段；缺失的 lruSequence 由稳定 key 规则兼容。 */
 export const DOMAIN_ROLE_SELECTION = domainZ.object({
@@ -202,6 +208,19 @@ const DOMAIN_FANOUT_TEMPLATES = domainZ.object({
   version: domainZ.number().int().nonnegative(),
   templates: domainZ.array(domainZ.unknown()),
 }).passthrough();
+/**
+ * 主代理模型配置的功能启用切点（B3）。
+ *
+ * 形状刻意最小：只有一行、只有一个可选的非负毫秒数。切点是**运行期事实**（"本功能
+ * 从什么时候开始生效"），不是用户偏好，因此绝不放进 settings，也不新增文件格式——
+ * 就在既有 storage domain 里多一张表（与票据 28 的模板表同一处理方式，domain 仍是 1）。
+ *
+ * epoch 允许非整数：宿主时钟给出的是毫秒数，但历史手工写入可能带小数；读取面只接受
+ * 有限正数，非法值由 host/orchestrator-epoch 当作"还没有切点"重新初始化。
+ */
+const DOMAIN_ORCHESTRATOR_STATE = domainZ.object({
+  epoch: domainZ.number().nonnegative().optional(),
+});
 export const EXPERT_STORAGE_DOMAIN_SPEC = defineDomain({
   // storage-domain 0.1.0-rc.8 的 unit 名称约束使用下划线；domain 格式保持 version 1。
   name: "dsh_expert_group",
@@ -215,6 +234,24 @@ export const EXPERT_STORAGE_DOMAIN_SPEC = defineDomain({
     // 手动派发模板（票据 28）：与运行数据同域、独立表，绝不把模板塞进 settings
     // 或 fanout_tasks 快照。domain version 保持 1（新增表不是破坏性变更）。
     fanout_templates: domainTable(DOMAIN_FANOUT_TEMPLATES),
+    // 主代理模型配置的功能启用切点（B3）：独立表、固定一行 key="epoch"。
+    // 与模板表同理——新增表不是破坏性变更，domain version 仍为 1。
+    [ORCHESTRATOR_STATE_TABLE]: domainTable(DOMAIN_ORCHESTRATOR_STATE),
+    /**
+     * 会话删除（票据 01）的两张表：删除收敛日志与删除残渣。
+     *
+     * 键都是会话 ID（身份永远取自键，绝不信任记录体内的 ID 字段），值是 JSON 对象。
+     * **表值 schema 刻意只约束「JSON 对象」**：宿主的 storage domain 在 open() 时会校验每
+     * 一条存储记录，任何一条非法都会让整个 domain（连同 settings、child 模型等无关表）打不开；
+     * 而会话删除规格要求严格区分「整份文档不可解析」（整体暂停收敛）与「记录体非法但键可读」
+     * （按 intent 处理、其余条目照常）。严格形状由写入边界（host/session-delete-store 的
+     * zod 校验）承担，读取面负责显式降级，理由详见 host/session-delete-contract 的模块头注释。
+     *
+     * 新增表不是破坏性变更：domain version 仍为 1（与 fanout_templates / orchestrator_state
+     * 同一处理方式）。
+     */
+    [SESSION_DELETE_QUEUE_TABLE]: domainTable(DOMAIN_SESSION_DELETE_RECORD),
+    [SESSION_DELETE_RESIDUE_TABLE]: domainTable(DOMAIN_SESSION_DELETE_RECORD),
   },
 });
 

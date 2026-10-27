@@ -95,6 +95,14 @@ export const CLIENT_SOURCE_FILES = Object.freeze([
   "client-plugin-detail.js",
   // 左侧栏入口 + 同名 main 面板（全页设置页）：装配输入，既过 node --check 也进行数门禁。
   "client-sidebar-entry.js",
+  // 票据 05：会话删除的多选状态机与 RPC 封装（纯函数 + 注入式端口，无渲染）。
+  // 同样是装配输入：既要有 node --check，也要进入行数门禁的统计范围。
+  "client-session-delete-selection.js",
+  // 票据 08：会话删除结算后的列表对账与本地键清理（展开态 + 归属账本 + 跨标签页待清理标记）。
+  "client-session-delete-local-keys.js",
+  // 票据 06/07：会话删除的可见层（纯渲染）与交互层（状态、插槽注册、文档级守卫）。
+  "client-session-delete-view.js",
+  "client-session-delete-ui.js",
   // client-freshness.js 仍是公开导出的运行时模块（exports["./client-freshness"]），
   // 出现在这里是为了让"装配源全集"只有一处清单，避免再按 files 推断。
   "client-freshness.js",
