@@ -280,6 +280,77 @@
   }
 
   /**
+   * 从打开记录的复合键里取回资源地址。
+   *
+   * 键由 sidebarTabKey 构造：`sessionId ␀ rootSessionId ␀ 资源地址`（分隔符见 SIDEBAR_TAB_KEY_SEPARATOR）。
+   * 只按前两个分隔符定位地址的起点、其余部分整体还原：地址本身由 subagentChatAddress 生成、不含
+   * 分隔符；即使将来出现了，这样切分也只会得到一个更长的地址（判定随之退化为「inventory 里没有」
+   * 即读面不可用），而绝不会把它截断成**另一个**资源的地址去误判。取不到地址时返回 null，调用方
+   * 按「inventory 不可读」处理（见 sidebarTabVerdictOf）。
+   */
+  function sidebarTabKeyAddress(key) {
+    if (typeof key !== "string") return null;
+    const cut = key.lastIndexOf(SIDEBAR_TAB_KEY_SEPARATOR);
+    // 至少两个分隔符才可能是记录键（session ␀ root ␀ 地址）；否则按「取不到地址」处理。
+    if (cut <= 0 || key.indexOf(SIDEBAR_TAB_KEY_SEPARATOR) === cut) return null;
+    return key.slice(cut + 1) || null;
+  }
+
+  /**
+   * 记录此刻在右栏里是否**可见 / 可关闭**（箭头方向与点击分支共用的**唯一**判据）。
+   *
+   * 与「记录是否存在」刻意分开：auto 来源的记录必须留在 Map 里给 Auto 归属账本按两次可读采样
+   * 结算（撤销归属、清理 tabMisses / 预算 / 持久 ownership），但用户可见状态与点击语义必须立刻
+   * 与已被关闭的 tab 一致——否则就是用户报的「箭头停在 <<、点了还会去关一个已经不存在的 tab」。
+   *
+   * record.absent 由记录同步器按公开 inventory 的**权威缺席**写入、按下一次**权威在场**清除；
+   * inventory 不可读时一律不推断（旧宿主的降级语义逐字不变）。
+   */
+  function sidebarTabVisible(record) {
+    return record !== undefined && !record.absent;
+  }
+
+  /**
+   * 单条打开记录的在场判定（记录同步器的**唯一**判据，四态）。
+   *
+   * 正向证据优先，任一条成立即视为还开着（顺序有实质意义）：
+   * 1. DOM 芯片在场（tabId 命中）；
+   * 2. active() 就是它；
+   * 3. 浮窗标题命中（浮窗在宿主里没有 tabId 标记，只能按打开时的标题保守匹配）。
+   * 这三条都是既有判据，本函数一行未放宽——它们同时是旧宿主（没有 inventory）与「浮窗不进入
+   * inventory」这类宿主形状的安全网。
+   *
+   * 之后才是 inventory 权威通道（宿主 0.2.1-rc.3 的 openTabs 是每次布局提交同步更新的已提交投影，
+   * 覆盖 dock 与 float，不依赖面板是否可见）：
+   * - "present"：该地址仍有已提交 tab ⇒ 还开着（哪怕 DOM / active / 面板一时读不到、右栏折叠）；
+   * - "absent"：可读的 inventory 确认该地址没有已提交 tab ⇒ **一次观测即成立的关闭**，不必再等
+   *   第二次 DOM 缺失（「箭头停在 << 约 9.6 秒」的根因正是这条通道缺失）。
+   *
+   * inventory 不可读（旧宿主 / getSnapshot 缺失、返回 null 或抛错）时完全保留既有降级语义：
+   * - "missing"：本轮观测确实缺证据，由调用方累计一次缺失（仍需连续 N 次才收口）；
+   * - "undecidable"：DOM 读面也不可读（面板折叠 / 归属不明 / 查询抛错）⇒ 保持现状、绝不猜测。
+   *
+   * 纯判定：不写任何账本，删除记录与清零 misses 一律由调用方执行。
+   */
+  function sidebarTabVerdictOf(inventory, sidebarSessionId, present, floatingTitles, activeTabId, key, record) {
+    const tabId = text(record.tabId, null);
+    // 正向证据：DOM 芯片命中 / active() 就是它（tabId 非空才可能与 active 相等）/ 浮窗标题命中。
+    if (present?.has(tabId) || (tabId !== null && tabId === activeTabId)) return "present";
+    if (floatingTitles?.has(text(record.title, null))) return "present";
+    const address = sidebarTabKeyAddress(key);
+    /**
+     * 取不到地址时按「inventory 不可读」处理：绝不能拿一个空地址去查询——那会命中「没有任何条目
+     * 匹配」并得出 readable=true / tabId=null，把读面故障伪装成权威关闭（sidebarResourceTabStateOf
+     * 对 null inventory 本身已返回 readable=false，这里只需挡住空地址）。
+     */
+    if (address !== null) {
+      const state = sidebarResourceTabStateOf(inventory, text(sidebarSessionId, null), address);
+      if (state.readable) return state.tabId === null ? "absent" : "present";
+    }
+    return present === null || floatingTitles === null ? "undecidable" : "missing";
+  }
+
+  /**
    * active() 是否已经是这个资源（kind 与 contentId 同时匹配）。
    *
    * inventory 不可读或提交延迟时，它仍能证明「这个资源已经开着」：这样的 tab 只算手动/未知
@@ -536,6 +607,8 @@
     sidebarNodeIsIdleMembership,
     sidebarNodeIsIdleReady,
     sidebarResourceTabStateOf,
+    sidebarTabVerdictOf,
+    sidebarTabVisible,
     trimAutoKeyMap,
   });
 })(globalThis);

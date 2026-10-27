@@ -388,7 +388,7 @@
       sessionModelHasInvalidDraft, sessionModelNotice, sessionModelOpen, sessionModelPendingChanges,
       sessionModelSaving, sessionModelState,
       sessionsSnapshot, sidebarBatchPendingRef, sidebarBatchScopeKey, sidebarBatchStateFor, sidebarOpenTabsAvailable, sidebarSessionId,
-      sidebarTabRecordsRef, snapshot, subagentAddressOfChild, t, timelineExpandedRef, toggle,
+      sidebarTabVisible, sidebarTabRecordsRef, snapshot, subagentAddressOfChild, t, timelineExpandedRef, toggle,
       updateSessionModelDraft,
     } = frame;
 
@@ -422,8 +422,13 @@
     const isBatchPending = () => sidebarBatchPendingRef.current.has(
       sidebarBatchScopeKey(sidebarSessionId, rootSessionId),
     ) === true;
-    /** 右栏 tab 记录的只读投影（可写 Map 归 Panel）。 */
-    const isTabOpen = (key) => sidebarTabRecordsRef.current.get(key) !== undefined;
+    /**
+     * 右栏 tab 记录的只读投影（可写 Map 归 Panel）。
+     *
+     * 判据是「记录仍**可见**」而不是「记录存在」：auto 来源的记录会带着权威缺席标记留在 Map 里给
+     * Auto 归属账本结算，箭头与点击方向必须与真实右栏一致（见 sidebarTabVisible）。
+     */
+    const isTabOpen = (key) => sidebarTabVisible(sidebarTabRecordsRef.current.get(key));
     /**
      * 峰谷读面的惰性入口（票据 09 / 会话模型弹窗标题徽标）。
      *

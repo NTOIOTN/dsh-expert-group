@@ -179,6 +179,9 @@ function mountPanel(overrides = {}) {
     cancelSidebarSplit: overrides.cancelSidebarSplit,
     // 票据 16：tab 活跃度注入点（生产由 install 侧/宿主提供；缺省时面板退回文档可见性）。
     isTabActive: overrides.isTabActive,
+    // Auto 开关读面（生产由 install 侧注入）。缺省 = 关闭，与多数用例的历史形状一致；
+    // 需要构造「auto 来源记录」的用例显式传 () => true，由真实 Auto 候选路径打开该资源。
+    getAutoOpenSubagentSidebar: overrides.getAutoOpenSubagentSidebar,
     // 票据 09：标题栏峰谷时段标记的注入面（生产由 install 侧读取配置表单快照并订阅）。
     getPeakValleySettings: overrides.getPeakValleySettings,
     subscribePeakValleySettings: overrides.subscribePeakValleySettings,
@@ -2012,6 +2015,7 @@ function mountContractPanel(options = {}) {
     markSidebarSplitOpen: options.markSidebarSplitOpen,
     commitSidebarSplit: options.commitSidebarSplit,
     cancelSidebarSplit: options.cancelSidebarSplit,
+    getAutoOpenSubagentSidebar: options.getAutoOpenSubagentSidebar,
   });
   return { ...mounted, navTargets, resourceCalls };
 }
@@ -2473,6 +2477,51 @@ const TOGGLE_ADDRESS = "dsh-resource://subagentchat/session/expert-running?paren
 const TOGGLE_ADDRESSES = {
   "expert-running": { parentSessionId: "root-1", childSessionId: "expert-running", mode: "continuable" },
 };
+/**
+ * 空闲（ready）子代理的规范地址表：右侧栏「权威一次观测即复位」类用例都挂在这一行上。
+ *
+ * 为什么用空闲行：产品规则里「运行中的资源被用户手动打开」会当场把归属交回 Auto（见
+ * clearManualSuppressionOfIdleResources 的 manual-open 分支），那条记录因此属于 Auto 归属账本，
+ * 由候选路径按两次可读采样收口；而用户报告的形状正是**空闲子代理**，它的记录保持手动来源，
+ * 走「inventory 权威确认 ⇒ 一次观测即收口」的新通道。
+ */
+const IDLE_TOGGLE_ADDRESS = "dsh-resource://subagentchat/session/expert-ready?parent=root-1&mode=continuable";
+const IDLE_TOGGLE_ADDRESSES = {
+  ...TOGGLE_ADDRESSES,
+  "expert-ready": { parentSessionId: "root-1", childSessionId: "expert-ready", mode: "continuable" },
+};
+const IDLE_ROW_LABEL = "空闲专家";
+
+/**
+ * 读取 realm 级 Auto 归属账本里某个资源地址的条目（只读；不写、不重置）。
+ *
+ * 用途：把「这条记录属于 auto 来源」变成可断言的事实，而不是靠私有 Map 或时日已久的状态猜测。
+ * 槽位名是插件的 realm 契约（见 client-sidebar-auto-ledger.js），contract 夹具同样按它观察账本。
+ */
+/**
+ * 清掉 realm 级 Auto 账本与内存持久表（等价于一次全新页面）。
+ *
+ * 只有「需要自己决定 Auto 起点」的用例调用它：同一进程里前面的用例会留下 manual 关闭抑制 /
+ * 归属条目，那些状态会让 Auto 候选直接跳过本用例的资源（表现就是「Auto 没有自动打开」）。
+ * 真实页面生命周期同样不会把上一个页面的账本带进来。
+ */
+function resetAutoRealm() {
+  for (const symbol of [
+    Symbol.for("dsh-expert-group/sidebar#shared-auto-ledger"),
+    Symbol.for("dsh-expert-group/sidebar#auto-ownership-memory"),
+  ]) {
+    try { delete globalThis[symbol]; } catch { /* 冻结时无处可删。 */ }
+  }
+}
+
+function autoOwnershipOf(address) {
+  const ledger = globalThis[Symbol.for("dsh-expert-group/sidebar#shared-auto-ledger")];
+  if (ledger?.origin === undefined) return undefined;
+  for (const [, entry] of ledger.origin) {
+    if (entry?.address === address) return entry;
+  }
+  return undefined;
+}
 
 /**
  * 完整右栏能力替身：openResource + active + close（paneId 非 null 时还有 split）。
@@ -2923,16 +2972,16 @@ test("侧栏箭头 toggle：外部关闭最后一个 pane 时复位状态（宽�
     dom,
     fixture,
     layout: { panels: { setRightbar(width) { widthCalls.push(width); } } },
-    panel: { addresses: TOGGLE_ADDRESSES },
+    panel: { addresses: IDLE_TOGGLE_ADDRESSES },
   });
   const { handle, intervals, navTargets } = mounted;
   try {
     await handle.settle();
     // 宿主证据：openResource 之后 active() 立刻读到该地址的 tab。
-    fixture.setActive({ id: "tab-a", kind: "subagentchat", contentId: TOGGLE_ADDRESS, title: "子代理会话" });
-    sidebarActionOf(rowByText(handle, "运行专家")).props.onClick(recordingEvent());
+    fixture.setActive({ id: "tab-a", kind: "subagentchat", contentId: IDLE_TOGGLE_ADDRESS, title: "子代理会话" });
+    sidebarActionOf(rowByText(handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
     await handle.settle();
-    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "true");
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "true");
     assert.deepEqual(widthCalls, [], "确认打开 pane 时不得改写右栏宽度");
     assert.equal(mounted.observer.instances.length, 1, "document + MutationObserver 可用时必须挂一个观察器");
     assert.deepEqual(mounted.observer.instances[0].options, { childList: true, subtree: true }, "观察面固定为 body 子树的 childList 变更");
@@ -2943,19 +2992,18 @@ test("侧栏箭头 toggle：外部关闭最后一个 pane 时复位状态（宽�
     mounted.observer.fire();
     mounted.observer.fire();
     await handle.settle();
-    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "true", "active() 仍是目标 tab 时不得仅凭 DOM 缺失复位");
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "true", "active() 仍是目标 tab 时不得仅凭 DOM 缺失复位");
 
-    // 2) 用户切到别的 tab/pane：正向证据消失，但一次缺失可能正是宿主提交窗口的中间态。
+    // 2) 用户切到别的 tab/pane 并关掉这个 tab：真实宿主的关闭会同时把这条 tab 从公开 inventory
+    //    移除并通知订阅者，因此权威读面一次观测即成立（「只改 DOM、inventory 仍在」的形状由
+    //    「只改 DOM 时绝不复位」的用例单独锁定）。
     fixture.setActive({ id: "tab-other", kind: "file", contentId: "dsh-resource://file/other", title: "别的 tab" });
-    mounted.observer.fire();
+    fixture.forgetOpenTab("tab-a");
     await handle.settle();
-    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "true", "一次缺失不足以判定用户关掉了 tab");
-    mounted.observer.fire();
-    await handle.settle();
-    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "false", "连续两次观察到缺失后必须复位成 >>");
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "false", "inventory 确认关闭后必须复位成 >>");
     assert.deepEqual(widthCalls, [], "外部关闭同步只改插件状态，绝不改写右栏宽度");
-    assert.equal(sidebarActionOf(rowByText(handle, "运行专家")).props["aria-label"], "在侧边栏打开 运行专家");
-    assertArrowDirection(handle, "运行专家", "chevron-right", "复位后必须恢复两个右箭头");
+    assert.equal(sidebarActionOf(rowByText(handle, IDLE_ROW_LABEL)).props["aria-label"], "在侧边栏打开 空闲专家");
+    assertArrowDirection(handle, IDLE_ROW_LABEL, "chevron-right", "复位后必须恢复两个右箭头");
     assert.deepEqual(fixture.closed, [], "外部关闭同步只能改插件状态，绝不调用 close()");
     assert.deepEqual(navTargets, [], "复位过程绝不触发主视图导航");
   } finally {
@@ -3072,8 +3120,10 @@ test("侧栏箭头 toggle：subagentchat 浮动到面板外时保持打开，浮
     await mounted.handle.settle();
     assert.equal(sidebarOpenStateOf(mounted.handle, "运行专家"), "true", "浮动 tab 仍存在时不得误复位");
 
+    // 真实宿主关闭浮窗时，同一轮里也会把它从公开 inventory 移除（两条证据一起消失）：
+    // 权威读面因此一次观测即成立，不再需要第二次 DOM 缺失采样。
     dom.removeFloatingTab("子代理会话");
-    mounted.observer.fire();
+    fixture.forgetOpenTab("tab-a");
     mounted.observer.fire();
     await mounted.handle.settle();
     assert.equal(sidebarOpenStateOf(mounted.handle, "运行专家"), "false", "浮动 tab 消失后必须复位");
@@ -3084,9 +3134,406 @@ test("侧栏箭头 toggle：subagentchat 浮动到面板外时保持打开，浮
   assert.equal(mounted.intervals.active, 0, "卸载后不得遗留轮询定时器");
 });
 
+/**
+ * 回归（外部关闭后箭头停在 << 约 9.6 秒）：外部关闭缺少「第二次缺失观测」。
+ *
+ * 真实宿主（0.2.1-rc.3）的 openTabs inventory 是布局提交的权威投影：用户从 tab 自带关闭按钮关掉
+ * 它时，inventory 先发布（订阅回调在 React 提交之前同步重入本插件的同步器，此时 DOM 芯片还在），
+ * 随后 React 才删除 DOM。旧判据因此只读到一次缺失，第二次要等下一次空闲轮询（5/10/20/30 秒退避，
+ * 空闲态实测 9.6 秒）。定稿判据：inventory 可读且确认该地址没有已提交 tab ⇒ 一次观测即成立。
+ */
+test("侧栏箭头 toggle：inventory 权威确认关闭后一次观测即复位（不等第二次 DOM 缺失）", async () => {
+  const widthCalls = [];
+  const restoreViewport = installGlobals({ window: { innerWidth: 1600 } });
+  const fixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a" });
+  const dom = rightbarDomStub();
+  dom.mountPanel();
+  dom.addTab("tab-a");
+  const mounted = mountTogglePanel({
+    dom,
+    fixture,
+    layout: { panels: { setRightbar(width) { widthCalls.push(width); } } },
+    panel: { addresses: IDLE_TOGGLE_ADDRESSES },
+  });
+  const { handle, intervals } = mounted;
+  try {
+    await handle.settle();
+    sidebarActionOf(rowByText(handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
+    await handle.settle();
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "true", "打开后必须进入 <<");
+    assert.equal(fixture.openTabs.some((tab) => tab.tabId === "tab-a"), true, "宿主 inventory 必须先有这条 tab");
+    const timersBefore = intervals.active;
+
+    // 真实关闭时序：宿主先提交 inventory（publish 同步重入插件的同步器），React 随后才删 DOM 芯片。
+    dom.removeTab("tab-a");
+    fixture.setActive(null);
+    fixture.forgetOpenTab("tab-a");
+    // 不派发 observer、不推进轮询：权威读面单独就足以复位。
+    await handle.settle();
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "false", "inventory 确认该地址已无已提交 tab ⇒ 一次观测即复位");
+    assert.equal(sidebarActionOf(rowByText(handle, IDLE_ROW_LABEL)).props["aria-label"], "在侧边栏打开 空闲专家");
+    assertArrowDirection(handle, IDLE_ROW_LABEL, "chevron-right", "复位后必须恢复两个右箭头");
+    assert.deepEqual(fixture.closed, [], "外部关闭同步绝不调用 close()");
+    assert.deepEqual(widthCalls, [], "外部关闭同步绝不改写右栏宽度");
+    assert.equal(fixture.opened.length, 1, "复位过程不得重新打开资源");
+    assert.equal(intervals.active, timersBefore, "权威判据不得新增定时器（轮询节奏逐字不变）");
+  } finally {
+    mounted.unmountAll();
+    restoreViewport();
+  }
+  assert.equal(intervals.active, 0, "卸载后不得遗留轮询定时器");
+});
+
+/**
+ * 回归（auto 来源）：真机复测里仍然停在 << 的正是这一类记录。
+ *
+ * 为什么上一轮没覆盖：产品规则规定「运行中的子代理被用户手动打开」会当场把归属交回 Auto
+ * （clearManualSuppressionOfIdleResources 的 manual-open 分支），因此真实行绝大多数是 origin=auto；
+ * 上一轮为保住 Auto 归属账本的两次可读采样闸门，让 auto 记录继续走「两次 DOM 缺失」路径，
+ * 箭头于是仍要等第二次观测/轮询。定稿判据：记录本身留给 Auto 账本结算，但**可见性**由公开
+ * inventory 的权威缺席立刻决定——箭头与点击分支读同一份判据。
+ */
+test("侧栏箭头 toggle：auto 来源记录被外部关闭后同样一次同步即复位，点击走打开语义", async () => {
+  resetAutoRealm();
+  // 只保留运行中的那一个子代理：本用例要盯的是「这一行」，Auto 顺手打开别的运行中资源会干扰计数。
+  const fullSnapshot = snapshot();
+  const hostSnapshot = { ...fullSnapshot, root: { ...fullSnapshot.root, children: [fullSnapshot.root.children[0]] } };
+  // 目录投影（byId.running）是行内活动证据的来源，也是 Auto「谁在运行」的唯一依据：本用例要把它一起改。
+  const sessions = addressedSessionsFixture(TOGGLE_ADDRESSES);
+  const fixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a" });
+  const dom = rightbarDomStub();
+  dom.mountPanel();
+  // 宿主每次打开都会渲染出对应芯片：DEG 依据它判断 tab 是否还在。
+  fixture.hooks.onOpen = () => dom.addTab("tab-a");
+  const mounted = mountTogglePanel({
+    dom,
+    fixture,
+    layout: { panels: { setRightbar() {} } },
+    panel: {
+      addresses: TOGGLE_ADDRESSES,
+      hostSnapshot,
+      sessions,
+      // Auto 打开运行中的子代理：这条记录因此是 auto 来源（不是手动夹具）。
+      getAutoOpenSubagentSidebar: () => true,
+    },
+  });
+  const { handle, intervals } = mounted;
+  try {
+    await handle.settle();
+    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "true", "Auto 必须为运行中的子代理自动打开右栏");
+    assert.equal(fixture.opened.length, 1, "Auto 只打开一次");
+    assert.equal(autoOwnershipOf(TOGGLE_ADDRESS)?.tabId, "tab-a", "前提：这条 tab 属于 Auto 归属账本（origin=auto）");
+    const timersBefore = intervals.active;
+
+    // 真实外部关闭：inventory 发布 + DOM 芯片消失 + active 移走（不经过插件任何关闭路径）。
+    dom.removeTab("tab-a");
+    fixture.setActive(null);
+    fixture.forgetOpenTab("tab-a");
+    await handle.settle();
+    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "false", "auto 记录同样必须在下一次同步内复位成 >>");
+    assertArrowDirection(handle, "运行专家", "chevron-right", "复位后必须恢复两个右箭头");
+    assert.deepEqual(fixture.closed, [], "外部关闭同步绝不调用 close()");
+    assert.equal(fixture.opened.length, 1, "复位过程不得重新打开资源");
+    assert.equal(intervals.active, timersBefore, "权威判据不得新增定时器（轮询节奏逐字不变）");
+    assert.equal(autoOwnershipOf(TOGGLE_ADDRESS)?.tabId, "tab-a", "记录必须留给 Auto 账本结算，不能被绕过直接删");
+
+    // 资源变空闲：Auto 的两次可读采样收口必须照旧完成（撤销归属），箭头保持 >> 不复活。
+    // 目录投影与树状态必须一起变：行内活动证据来自 byId.running，只改树会让 Auto 仍认为它在运行。
+    const idleSessions = sessionsSnapshot();
+    idleSessions.byId["expert-running"].running = false;
+    sessions.update(idleSessions);
+    hostSnapshot.root.children[0].status = "ready";
+    for (let round = 0; round < 3; round += 1) {
+      await intervals.tick();
+      await handle.settle();
+    }
+    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "false", "Auto 结算之后箭头必须保持 >>");
+    assert.equal(autoOwnershipOf(TOGGLE_ADDRESS), undefined, "Auto 归属必须按既有两次可读采样被清理");
+    assert.deepEqual(fixture.closed, [], "记录已经不在宿主里：Auto 绝不需要再 close 任何 tab");
+
+    // 此时点击箭头必须走「打开」语义（绝不能拿已经不在的 tabId 去 close）。
+    sidebarActionOf(rowByText(handle, "运行专家")).props.onClick(recordingEvent());
+    await handle.settle();
+    assert.equal(fixture.opened.length, 2, "箭头是 >> 时点击必须调用 openResource");
+    assert.deepEqual(fixture.closed, [], "绝不 close 一个已经不存在的 tabId");
+    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "true", "重新打开后必须回到 <<");
+  } finally {
+    mounted.unmountAll();
+  }
+  assert.equal(intervals.active, 0, "卸载后不得遗留轮询定时器");
+});
+
+/**
+ * 负向契约（不得放松）：只改 DOM、inventory 仍含该地址时绝不复位。
+ *
+ * 覆盖宿主提交窗口、浮窗、右栏折叠与 active 切到别处这几种形状：DOM 读不到都不等于关闭，
+ * 只要公开 inventory 仍以该地址承载一个已提交 tab，箭头就必须保持 <<。旧实现只按 DOM 在场集合
+ * 累计缺失，连续两次就删记录，会把仍然存在的 tab 判成已关闭。
+ */
+test("侧栏箭头 toggle：只改 DOM、inventory 仍含该地址时连续缺失也不复位", async () => {
+  const fixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a" });
+  const dom = rightbarDomStub();
+  dom.mountPanel();
+  dom.addTab("tab-a");
+  const mounted = mountTogglePanel({ dom, fixture, panel: { addresses: IDLE_TOGGLE_ADDRESSES } });
+  try {
+    await mounted.handle.settle();
+    sidebarActionOf(rowByText(mounted.handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
+    await mounted.handle.settle();
+    assert.equal(sidebarOpenStateOf(mounted.handle, IDLE_ROW_LABEL), "true");
+
+    dom.removeTab("tab-a");
+    fixture.setActive({ id: "tab-other", kind: "file", contentId: "dsh-resource://file/other", title: "别的 tab" });
+    for (let index = 0; index < 3; index += 1) {
+      mounted.observer.fire();
+      await mounted.handle.settle();
+    }
+    await mounted.intervals.tick();
+    await mounted.handle.settle();
+    assert.equal(fixture.openTabs.some((tab) => tab.tabId === "tab-a"), true, "本用例前提：inventory 仍含该地址");
+    assert.equal(sidebarOpenStateOf(mounted.handle, IDLE_ROW_LABEL), "true", "inventory 仍有已提交 tab 时连续缺失也不得复位");
+    assert.deepEqual(fixture.closed, [], "绝不以 DOM 缺失为由调用 close()");
+
+    // 真正的关闭：inventory 移除并通知订阅者 ⇒ 同一轮复位（与上一条用例互补）。
+    fixture.forgetOpenTab("tab-a");
+    await mounted.handle.settle();
+    assert.equal(sidebarOpenStateOf(mounted.handle, IDLE_ROW_LABEL), "false", "inventory 缺席的同一轮必须复位");
+  } finally {
+    mounted.unmountAll();
+  }
+  assert.equal(mounted.intervals.active, 0, "卸载后不得遗留轮询定时器");
+});
+
+/**
+ * 读面组合的两条边界：
+ * A) 面板暂时不可解析（折叠 / surface 过渡 / 归属不明确）但 inventory 可读且已移除 ⇒ 仍必须复位；
+ * B) 面板与 inventory 两处读面都不可读 ⇒ 既证明不了打开、也证明不了关闭，保持现状（fail-closed）。
+ */
+test("侧栏箭头 toggle：面板不可解析时按 inventory 判定；读面全缺时保持现状", async () => {
+  // A) 从不 mountPanel：presentSidebarTabIds() 恒为 null。
+  const fixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a" });
+  const dom = rightbarDomStub();
+  const mounted = mountTogglePanel({ dom, fixture, panel: { addresses: IDLE_TOGGLE_ADDRESSES } });
+  try {
+    await mounted.handle.settle();
+    sidebarActionOf(rowByText(mounted.handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
+    await mounted.handle.settle();
+    assert.equal(sidebarOpenStateOf(mounted.handle, IDLE_ROW_LABEL), "true", "inventory 证据足以进入 <<");
+    fixture.setActive(null);
+    fixture.forgetOpenTab("tab-a");
+    await mounted.handle.settle();
+    assert.equal(sidebarOpenStateOf(mounted.handle, IDLE_ROW_LABEL), "false", "面板不可解析也必须按 inventory 复位");
+    assert.deepEqual(fixture.closed, [], "不得调用 close()");
+  } finally {
+    mounted.unmountAll();
+  }
+  assert.equal(mounted.intervals.active, 0, "卸载后不得遗留轮询定时器");
+
+  // B) 旧宿主：inventory 读面缺失；面板也读不到 ⇒ 保持现状。
+  const legacyFixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a", openTabs: false });
+  const legacyDom = rightbarDomStub();
+  legacyDom.mountPanel();
+  legacyDom.addTab("tab-a");
+  const legacy = mountTogglePanel({ dom: legacyDom, fixture: legacyFixture, panel: { addresses: IDLE_TOGGLE_ADDRESSES } });
+  try {
+    await legacy.handle.settle();
+    sidebarActionOf(rowByText(legacy.handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
+    await legacy.handle.settle();
+    assert.equal(sidebarOpenStateOf(legacy.handle, IDLE_ROW_LABEL), "true");
+    legacyDom.unmountPanel();
+    legacyFixture.setActive(null);
+    legacy.observer.fire();
+    legacy.observer.fire();
+    await legacy.intervals.tick();
+    await legacy.handle.settle();
+    assert.equal(sidebarOpenStateOf(legacy.handle, IDLE_ROW_LABEL), "true", "读面全缺时绝不猜测关闭");
+    assert.deepEqual(legacyFixture.closed, [], "读面全缺时绝不调用 close()");
+  } finally {
+    legacy.unmountAll();
+  }
+  assert.equal(legacy.intervals.active, 0, "卸载后不得遗留轮询定时器");
+});
+
+/**
+ * 插件自身关闭（用户点行内 <<）：第一次权威缺席即复位，账本仍由验证链两次采样收口。
+ *
+ * 关闭链路：handleSidebarAction → closeSidebarActionWithLease → closeSidebarTabWithLease 调宿主 close()
+ * 并 resolve 后只登记 beginSidebarCloseVerification（返回 request-resolved-unverified），记录与箭头都
+ * 不在这里收口；verifyPendingSidebarCloses 要求连续 SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS 次 absent
+ * 才 finishVerifiedSidebarClose。旧行为下第二次采样要等下一次同步/轮询（空闲退避 2.5→30 秒），用户
+ * 看到 << 停很久。定稿判据：租约在途时记录同步照旧跑四态判定，但只写「权威缺席」标记（箭头/点击
+ * 立即按 sidebarTabVisible 走）；删除记录、清理来源/抑制/冷却与采样计数仍归既有验证链。
+ */
+test("侧栏箭头 toggle：点 << 后第一次权威缺席即复位，账本仍由验证链两次采样收口", async () => {
+  resetAutoRealm();
+  const fullSnapshot = snapshot();
+  const hostSnapshot = { ...fullSnapshot, root: { ...fullSnapshot.root, children: [fullSnapshot.root.children[0]] } };
+  const sessions = addressedSessionsFixture(TOGGLE_ADDRESSES);
+  const fixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a" });
+  const dom = rightbarDomStub();
+  dom.mountPanel();
+  fixture.hooks.onOpen = () => dom.addTab("tab-a");
+  // 宿主 close() 提交的那一刻：芯片消失（等价于 React 删除 tab 节点）。
+  fixture.hooks.onClose = () => dom.removeTab("tab-a");
+  const mounted = mountTogglePanel({
+    dom,
+    fixture,
+    panel: { addresses: TOGGLE_ADDRESSES, hostSnapshot, sessions, getAutoOpenSubagentSidebar: () => true },
+  });
+  const { handle, intervals } = mounted;
+  try {
+    await handle.settle();
+    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "true", "Auto 必须先打开右栏");
+    assert.equal(autoOwnershipOf(TOGGLE_ADDRESS)?.tabId, "tab-a", "前提：这条 tab 属于 Auto 归属账本");
+    const timersBefore = intervals.active;
+
+    // 用户点 <<：插件自己发起关闭（走 closeSidebarTabWithLease + 关闭租约）。
+    sidebarActionOf(rowByText(handle, "运行专家")).props.onClick(recordingEvent());
+    await handle.settle();
+    assert.deepEqual(fixture.closed, ["tab-a"], "必须用记录里的精确 tabId 调一次 close()");
+    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "false", "第一次权威缺席后箭头必须立刻是 >>");
+    assert.equal(autoOwnershipOf(TOGGLE_ADDRESS)?.tabId, "tab-a", "账本不能被绕过：记录与归属留给验证链");
+    assert.equal(fixture.opened.length, 1, "关闭过程不得重新打开资源");
+
+    // 验证链仍按两次可读采样收口（记录删除 / 归属清理），箭头保持 >>。
+    await intervals.tick();
+    await handle.settle();
+    await intervals.tick();
+    await handle.settle();
+    assert.equal(autoOwnershipOf(TOGGLE_ADDRESS), undefined, "验证链收口后 Auto 归属必须被清理");
+    assert.equal(sidebarOpenStateOf(handle, "运行专家"), "false", "收口之后箭头保持 >>，不复活");
+    assert.deepEqual(fixture.closed, ["tab-a"], "绝不重复 close 同一个 tab");
+    assert.equal(intervals.active, timersBefore, "不得新增定时器");
+  } finally {
+    mounted.unmountAll();
+  }
+  assert.equal(intervals.active, 0, "卸载后不得遗留轮询定时器");
+});
+
+/**
+ * 空闲会话形状：close resolve 之后**没有任何同步事件**（无 publish、无 observer、不推进轮询）。
+ *
+ * 这是用户真机上的形状：空闲轮询已退避到 30 秒，而 close() 的 DOM 移除与 inventory 变更都可能发生在
+ * beginSidebarCloseVerification 登记之前——验证链因此看不到那次关闭，第一次 absent 采样只能等下一次
+ * 轮询。修复点在关闭链内部：拿到 request-resolved-unverified 后立即同步一次（可见性标记 + 验证链的
+ * 第一次采样），空闲会话也能在同一次 close 内把箭头复位。
+ */
+test("侧栏箭头 toggle：空闲形状（close 后无任何同步事件）也必须同一次 close 内复位", async () => {
+  let hideCommittedTab = false;
+  const fixture = sidebarRightToggleFixture({
+    tabIdFor: () => "tab-a",
+    mintOnOpen: false,
+    // 宿主静默提交：读面里这个 tab 消失，但**不发** inventory 通知（空闲会话没有观察者叫醒）。
+    snapshotOpenTabs: (snapshot) => (hideCommittedTab ? snapshot.filter((tab) => tab.tabId !== "tab-a") : snapshot),
+  });
+  const dom = rightbarDomStub();
+  dom.mountPanel();
+  dom.addTab("tab-a");
+  /**
+   * 真正的「静默提交」宿主：关掉 tab、移走 active、inventory 读面里也没了，但**一次通知都不发**
+   * （空闲会话没有观察者叫醒，这正是用户看到的形状）。这个替身只替换 service.close，不动夹具其它契约。
+   */
+  fixture.service.close = (tabId) => {
+    fixture.closed.push(tabId);
+    dom.removeTab(tabId);
+    fixture.setActive(null);
+    hideCommittedTab = true;
+  };
+  // observer: false —— 不提供 MutationObserver，模拟「关闭后没有任何同步事件」。
+  const mounted = mountTogglePanel({ dom, fixture, observer: false, panel: { addresses: IDLE_TOGGLE_ADDRESSES } });
+  const { handle, intervals } = mounted;
+  try {
+    await handle.settle();
+    fixture.setActive({ id: "tab-a", kind: "subagentchat", contentId: IDLE_TOGGLE_ADDRESS, title: "子代理会话" });
+    sidebarActionOf(rowByText(handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
+    await handle.settle();
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "true");
+    const timersBefore = intervals.active;
+
+    // 点 <<：宿主 close 静默移除 tab；随后**不 tick、不 fire observer**，只等 settle。
+    sidebarActionOf(rowByText(handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
+    await handle.settle();
+    assert.deepEqual(fixture.closed, ["tab-a"], "必须用记录里的精确 tabId 关闭");
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "false", "空闲形状也必须同一次 close 内复位成 >>");
+    assert.equal(fixture.opened.length, 1, "复位过程不得重新打开资源");
+
+    // 验证链的收口仍要两次采样：一次轮询 tick 即可完成第二次，记录被删除、箭头保持 >>。
+    await intervals.tick();
+    await handle.settle();
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "false", "收口之后箭头保持 >>");
+    assert.equal(intervals.active, timersBefore, "不得新增定时器");
+
+    // 记录确实已被验证链删除：此时点击走「打开」（不是再一次 close）。
+    sidebarActionOf(rowByText(handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
+    await handle.settle();
+    assert.deepEqual(fixture.closed, ["tab-a"], "收口后绝不再 close 一次");
+    assert.equal(fixture.opened.length, 2, "记录已删除 ⇒ 点击必须走打开语义");
+  } finally {
+    mounted.unmountAll();
+  }
+  assert.equal(intervals.active, 0, "卸载后不得遗留轮询定时器");
+});
+
+/**
+ * 插件关闭失败 / 未落地（tab 还在）时，权威缺席标记必须被清掉，箭头回到 <<。
+ *
+ * 现实形状：close() 已 resolve 但宿主其实没关（或很快又提交了同一个 tab）。验证链在 absent 上采样
+ * 一次之后遇到 present 就会清零重来；可见性标记同样必须在 present 观测里被清掉，否则这一行会永远
+ * 显示 >>、把用户的下一次点击变成「打开」而不是「关闭」。
+ */
+test("侧栏箭头 toggle：插件关闭未落地（tab 仍在）时标记被清掉，箭头回到 <<", async () => {
+  /**
+   * 独立 tabId：本用例故意让验证链停在 present 上（entry 与关闭租约要等 10 秒 deadline 才释放），
+   * 而 realm 级关闭租约的键是 session + root + tabId（与地址无关）。复用 tab-a 会污染后续用例。
+   */
+  const STILL_TAB = "tab-still";
+  const fixture = sidebarRightToggleFixture({ tabIdFor: () => STILL_TAB, mintOnOpen: false });
+  const dom = rightbarDomStub();
+  dom.mountPanel();
+  dom.addTab(STILL_TAB);
+  // 宿主 close() 提交时移除芯片 / 移走 active / 移除 inventory（标记因此被置上）——随后宿主又把
+  // 同一个 tab 提交回来，模拟「close 其实没有落地」。
+  fixture.hooks.onClose = () => {
+    dom.removeTab(STILL_TAB);
+    fixture.setActive(null);
+    fixture.forgetOpenTab(STILL_TAB);
+  };
+  const mounted = mountTogglePanel({ dom, fixture, panel: { addresses: IDLE_TOGGLE_ADDRESSES } });
+  const { handle, intervals } = mounted;
+  try {
+    await handle.settle();
+    fixture.setActive({ id: STILL_TAB, kind: "subagentchat", contentId: IDLE_TOGGLE_ADDRESS, title: "子代理会话" });
+    sidebarActionOf(rowByText(handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
+    await handle.settle();
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "true");
+
+    sidebarActionOf(rowByText(handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
+    await handle.settle();
+    assert.deepEqual(fixture.closed, [STILL_TAB], "关闭必须真的发出去");
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "false", "第一次权威缺席后箭头立刻是 >>");
+
+    // 宿主其实没有关掉：同一个 tab 又被提交（inventory + 芯片都回来）。
+    dom.addTab(STILL_TAB);
+    fixture.addOpenTab({ id: STILL_TAB, kind: "subagentchat", contentId: IDLE_TOGGLE_ADDRESS, title: "子代理会话" });
+    await handle.settle();
+    assert.equal(sidebarOpenStateOf(handle, IDLE_ROW_LABEL), "true", "tab 仍在 ⇒ 标记必须清掉、箭头回到 <<");
+
+    // 记录没有被误删：箭头重新声明的是「在侧边栏关闭」而不是「打开」，点击语义因此仍是关闭。
+    const restoredArrow = sidebarActionOf(rowByText(handle, IDLE_ROW_LABEL));
+    assert.equal(restoredArrow.props["aria-label"], "在侧边栏关闭 空闲专家");
+    assert.equal(restoredArrow.props["aria-pressed"], true);
+    assertArrowDirection(handle, IDLE_ROW_LABEL, "chevron-left", "tab 仍在时必须是 <<（不是 >>）");
+  } finally {
+    mounted.unmountAll();
+  }
+  assert.equal(intervals.active, 0, "卸载后不得遗留轮询定时器");
+});
+
 test("侧栏箭头 toggle：没有 observer 时轮询兜底复位；面板或 DOM 能力缺失时保持状态不猜测", async () => {
   // A) 有 document、有面板，但宿主没有 MutationObserver：2.5 秒轮询与 visibilitychange 是唯一兜底。
-  const noObserverFixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a" });
+  // 旧宿主形状：没有 inventory 读面（openTabs 缺失），因此这一段锁定的正是**降级的 DOM 证据**
+  // 语义——「连续两次缺失」不变；权威 inventory 的即时复位由独立用例覆盖。
+  const noObserverFixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a", openTabs: false });
   const noObserverDom = rightbarDomStub();
   noObserverDom.mountPanel();
   noObserverDom.addTab("tab-a");
@@ -3115,25 +3562,31 @@ test("侧栏箭头 toggle：没有 observer 时轮询兜底复位；面板或 DO
   // B) 面板不在 DOM 里（右栏折叠 / surface 切换中）：读不到面板不是「tab 没了」的证据。
   const foldedFixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a" });
   const foldedDom = rightbarDomStub();
-  const folded = mountTogglePanel({ dom: foldedDom, fixture: foldedFixture, panel: { addresses: TOGGLE_ADDRESSES } });
+  // 折叠形状挂在空闲行上（手动来源）：这里要验证的是「DOM 读面不可读时以 inventory 为准」。
+  const folded = mountTogglePanel({ dom: foldedDom, fixture: foldedFixture, panel: { addresses: IDLE_TOGGLE_ADDRESSES } });
   try {
     await folded.handle.settle();
-    sidebarActionOf(rowByText(folded.handle, "运行专家")).props.onClick(recordingEvent());
+    sidebarActionOf(rowByText(folded.handle, IDLE_ROW_LABEL)).props.onClick(recordingEvent());
     await folded.handle.settle();
-    assert.equal(sidebarOpenStateOf(folded.handle, "运行专家"), "true");
+    assert.equal(sidebarOpenStateOf(folded.handle, IDLE_ROW_LABEL), "true");
 
     foldedFixture.setActive(null);
     folded.observer.fire();
     folded.observer.fire();
     await folded.intervals.tick();
-    assert.equal(sidebarOpenStateOf(folded.handle, "运行专家"), "true", "宿主 panel 不存在时必须保持现有状态，不做猜测");
+    assert.equal(sidebarOpenStateOf(folded.handle, IDLE_ROW_LABEL), "true", "面板不可解析但 inventory 仍证明该地址有 tab 时必须保持 <<");
 
-    // 面板回来（这次真的没有该 tab）：证据恢复后连续两次缺失才复位。
-    foldedDom.mountPanel();
-    folded.observer.fire();
+    // 折叠期间宿主真的关掉了这个 tab：inventory 已确认缺席，即使面板仍不可解析也必须复位。
+    foldedFixture.forgetOpenTab("tab-a");
     folded.observer.fire();
     await folded.handle.settle();
-    assert.equal(sidebarOpenStateOf(folded.handle, "运行专家"), "false", "面板重新出现且确实没有该 tab 时必须复位");
+    assert.equal(sidebarOpenStateOf(folded.handle, IDLE_ROW_LABEL), "false", "inventory 权威缺席时不再等待面板重新出现");
+
+    // 面板回来也不会让已经关掉的 tab 复活。
+    foldedDom.mountPanel();
+    folded.observer.fire();
+    await folded.handle.settle();
+    assert.equal(sidebarOpenStateOf(folded.handle, IDLE_ROW_LABEL), "false", "面板重新出现后绝不能让已关闭的 tab 复活");
   } finally {
     folded.unmountAll();
   }
@@ -3158,7 +3611,8 @@ test("侧栏箭头 toggle：没有 observer 时轮询兜底复位；面板或 DO
   assert.equal(bare.intervals.active, 0, "卸载后不得遗留轮询定时器");
 
   // D) 回到前台（visibilitychange）同样补一次同步：后台期间观察器可能被浏览器节流。
-  const visibilityFixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a" });
+  // 同样按旧宿主形状（没有 inventory 读面）锁定「一次可见性观测不足以复位」的降级语义。
+  const visibilityFixture = sidebarRightToggleFixture({ tabIdFor: () => "tab-a", openTabs: false });
   const visibilityDom = rightbarDomStub();
   visibilityDom.mountPanel();
   visibilityDom.addTab("tab-a");

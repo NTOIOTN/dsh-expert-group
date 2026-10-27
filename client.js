@@ -4160,6 +4160,26 @@ const state=sidebarResourceTabStateOf(inventory,sidebarSessionId,resourceAddress
 if(state.readable!==true)return true;
 return state.tabId!==null;
 }
+function sidebarTabKeyAddress(key){
+if(typeof key!=="string")return null;
+const cut=key.lastIndexOf(SIDEBAR_TAB_KEY_SEPARATOR);
+if(cut<=0||key.indexOf(SIDEBAR_TAB_KEY_SEPARATOR)===cut)return null;
+return key.slice(cut+1)||null;
+}
+function sidebarTabVisible(record){
+return record!==undefined&&!record.absent;
+}
+function sidebarTabVerdictOf(inventory,sidebarSessionId,present,floatingTitles,activeTabId,key,record){
+const tabId=text(record.tabId,null);
+if(present?.has(tabId)||(tabId!==null&&tabId===activeTabId))return"present";
+if(floatingTitles?.has(text(record.title,null)))return"present";
+const address=sidebarTabKeyAddress(key);
+if(address!==null){
+const state=sidebarResourceTabStateOf(inventory,text(sidebarSessionId,null),address);
+if(state.readable)return state.tabId===null?"absent":"present";
+}
+return present===null||floatingTitles===null?"undecidable":"missing";
+}
 function sidebarActiveResourceMatches(activeTab,resourceAddress){
 if(activeTab===null||activeTab===undefined)return false;
 const tab=object(activeTab);
@@ -4311,6 +4331,8 @@ sidebarManualIntentOf,
 sidebarNodeIsIdleMembership,
 sidebarNodeIsIdleReady,
 sidebarResourceTabStateOf,
+sidebarTabVerdictOf,
+sidebarTabVisible,
 trimAutoKeyMap,
 });
 })(globalThis);
@@ -9884,12 +9906,12 @@ const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-tabs");
 const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
 const PURE=global[PURE_SYMBOL]||{};
 const{
-SIDEBAR_AUTO_KEY_LIMIT,SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS,SIDEBAR_TAB_KEY_SEPARATOR,object,text,
+SIDEBAR_AUTO_KEY_LIMIT,SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS,SIDEBAR_TAB_KEY_SEPARATOR,SIDEBAR_TAB_ORIGIN_AUTO,object,text,
 }=PURE;
 const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
 const DOM=global[DOM_SYMBOL]||{};
 const{
-methodOf,normalizeSubagentAddress,sidebarTabKey,
+methodOf,normalizeSubagentAddress,sidebarTabCloseKey,sidebarTabKey,
 }=DOM;
 const TAB_STATE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-tab-state");
 const TAB_STATE=global[TAB_STATE_SYMBOL]||{};
@@ -10070,8 +10092,8 @@ addresses,
 inventory,
 sidebarSessionId,
 );
-const sidebarBatchStateFor=(addresses)=>TAB_STATE.sidebarBatchStateFor(addresses,{
-inventory:readSidebarOpenTabs(),
+const sidebarBatchStateFor=(addresses,inventoryNow)=>TAB_STATE.sidebarBatchStateFor(addresses,{
+inventory:inventoryNow??readSidebarOpenTabs(),
 sidebarSessionId,
 closeAvailable:closeSidebarResource!==null,
 });
@@ -10161,23 +10183,24 @@ sidebarSplitIntentRef.current=null;
 }
 };
 Object.assign(frame,{
-tryCommitSidebarSplit,
+sidebarTabVisible:TAB_STATE.sidebarTabVisible,tryCommitSidebarSplit,
 });
 }
 function useSidebarPanelTabSync(frame){
 const{
 activeSidebarTabId,bump,cancelPendingSidebarSplit,idleSidebarResourceAddresses,knownSidebarResourceAddresses,presentFloatingSubagentTitles,
-presentSidebarTabIds,requestRightbarDragSync,rootSessionId,runningSidebarResourceAddresses,sidebarAdoptionEvidenceAvailable,sidebarBatchSignatureOf,
-sidebarBatchSignatureRef,sidebarBatchStateFor,sidebarIdleChildren,sidebarManualIntentRef,sidebarSessionId,sidebarSplitIntentRef,
-sidebarTabOpeningRef,sidebarTabRecordsRef,tryCommitSidebarSplit,
+presentSidebarTabIds,readSidebarOpenTabs,requestRightbarDragSync,rootSessionId,runningSidebarResourceAddresses,sharedSidebarTabCloseInFlight,
+sidebarAdoptionEvidenceAvailable,sidebarBatchSignatureOf,sidebarBatchSignatureRef,sidebarBatchStateFor,sidebarIdleChildren,sidebarManualIntentRef,
+sidebarSessionId,sidebarSplitIntentRef,sidebarTabOpeningRef,sidebarTabRecordsRef,tryCommitSidebarSplit,
 }=frame;
 const applyPendingManualIntent=(...args)=>frame.late.applyPendingManualIntent(...args);
 const recordSidebarTab=(...args)=>frame.late.recordSidebarTab(...args);
 const syncSidebarTabRecords=()=>{
 try{requestRightbarDragSync?.();}catch{/* 手柄锁只是体验优化，绝不影响面板。 */}
+const inventory=readSidebarOpenTabs();
 const batchSignatureNow=sidebarBatchSignatureOf(
-sidebarBatchStateFor(runningSidebarResourceAddresses()),
-sidebarBatchStateFor(idleSidebarResourceAddresses(sidebarIdleChildren())),
+sidebarBatchStateFor(runningSidebarResourceAddresses(),inventory),
+sidebarBatchStateFor(idleSidebarResourceAddresses(sidebarIdleChildren()),inventory),
 );
 if(sidebarBatchSignatureRef.current!==batchSignatureNow){
 sidebarBatchSignatureRef.current=batchSignatureNow;
@@ -10225,26 +10248,42 @@ applyPendingManualIntent(key);
 }
 if(records.size===0)return;
 const present=presentSidebarTabIds();
-if(present===null)return;
 const floatingTitles=presentFloatingSubagentTitles();
-if(floatingTitles===null)return;
 const activeTabId=activeSidebarTabId();
-const stale=[];
+let changed=0;
 for(const[key,record]of records){
 if(record.sessionId!==sidebarSessionId||record.rootSessionId!==rootSessionId)continue;
-if(present.has(record.tabId)===true
-||record.tabId===activeTabId
-||(text(record.title,null)!==null&&floatingTitles.has(record.title))){
+const leased=sharedSidebarTabCloseInFlight?.has(sidebarTabCloseKey(sidebarSessionId,rootSessionId,record.tabId));
+const verdict=TAB_STATE.sidebarTabVerdictOf(inventory,sidebarSessionId,present,floatingTitles,activeTabId,key,record);
+if(verdict==="undecidable")continue;
+if(verdict==="present"){
 record.misses=0;
+if(record.absent){
+record.absent=false;
+changed+=1;
+}
 continue;
 }
-record.misses+=1;
-if(record.misses>=SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS)stale.push(key);
-}
-if(stale.length===0)return;
-for(const key of stale){
+if(verdict==="absent"){
+if(!leased&&record.origin!==SIDEBAR_TAB_ORIGIN_AUTO){
 records.delete(key);
+changed+=1;
+continue;
 }
+if(!record.absent){
+record.absent=true;
+changed+=1;
+}
+continue;
+}
+if(leased||present===null||floatingTitles===null)continue;
+record.misses+=1;
+if(record.misses>=SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS){
+records.delete(key);
+changed+=1;
+}
+}
+if(changed===0)return;
 bump((value)=>value+1);
 };
 Object.assign(frame,{
@@ -10597,7 +10636,7 @@ if(previous!==undefined&&previous.sessionId===sidebarSessionId
 &&previous.rootSessionId===rootSessionId&&previous.tabId===tabId){
 previous.title=tabTitle??previous.title;
 previous.misses=0;
-previous.origin=recordOrigin;
+previous.origin=recordOrigin;previous.absent=false;// 落地证据齐备：清掉权威缺席标记
 return true;
 }
 sidebarTabRecordsRef.current.set(key,{sessionId:sidebarSessionId,rootSessionId,tabId,title:tabTitle,misses:0,origin:recordOrigin});
@@ -10626,7 +10665,7 @@ sidebarSessionId,
 rootSessionId,
 resourceAddress,
 SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,
-manualRecord===undefined?"manual-open":"manual-close",
+deps.sidebarTabVisible(manualRecord)?"manual-close":"manual-open",
 );
 }
 const autoContext=origin===SIDEBAR_TAB_ORIGIN_AUTO&&autoAction!==null&&typeof autoAction==="object"
@@ -10703,6 +10742,7 @@ sidebarAutoFailedKeysRef.current.add(key);
 return;
 }
 if(closeOutcome.status==="request-resolved-unverified"){
+deps.syncSidebarTabs();
 return;
 }
 settleVerifiedSidebarClose(action,deps,record,closeOutcome,closeSplitIntentToken);
@@ -10991,9 +11031,8 @@ if(sidebarSurfaceStillCurrent()===true)syncSidebarTabs();
 }
 function useSidebarPanelActionHandlersPart2(frame){
 const{
-abandonAutoSidebarAction,autoActionStillValid,cancelPendingSidebarSplit,closeSidebarResource,
-openSidebarResource,recordSidebarManualIntent,sidebarSplitIntentRef,sidebarTabOpeningRef,
-sidebarTabPendingRef,sidebarTabRecordsRef,
+abandonAutoSidebarAction,autoActionStillValid,cancelPendingSidebarSplit,closeSidebarResource,openSidebarResource,
+recordSidebarManualIntent,sidebarSplitIntentRef,sidebarTabOpeningRef,sidebarTabPendingRef,sidebarTabVisible,sidebarTabRecordsRef,
 }=frame;
 const handleSidebarAction=async(key,resourceAddress,actionOrigin,autoAction)=>{
 const action=createSidebarActionContext(frame,key,resourceAddress,actionOrigin,autoAction);
@@ -11014,7 +11053,7 @@ if(record===undefined&&sidebarTabOpeningRef.current.has(key)){
 if(action.origin===SIDEBAR_TAB_ORIGIN_MANUAL)recordSidebarManualIntent(key,resourceAddress);
 return;
 }
-if(record!==undefined&&closeSidebarResource!==null){
+if(record!==undefined&&closeSidebarResource!==null&&(sidebarTabVisible(record)||action.autoContext!==null)){
 await closeSidebarActionWithLease(action,frame,record);
 return;
 }
@@ -11391,7 +11430,7 @@ readActiveSidebarResource,restoreSessionModelDefaults,rootSessionId,sessionId,se
 sessionModelHasInvalidDraft,sessionModelNotice,sessionModelOpen,sessionModelPendingChanges,
 sessionModelSaving,sessionModelState,
 sessionsSnapshot,sidebarBatchPendingRef,sidebarBatchScopeKey,sidebarBatchStateFor,sidebarOpenTabsAvailable,sidebarSessionId,
-sidebarTabRecordsRef,snapshot,subagentAddressOfChild,t,timelineExpandedRef,toggle,
+sidebarTabVisible,sidebarTabRecordsRef,snapshot,subagentAddressOfChild,t,timelineExpandedRef,toggle,
 updateSessionModelDraft,
 }=frame;
 const isTimelineExpanded=(key)=>timelineExpandedRef.current.has(key)===true;
@@ -11411,7 +11450,7 @@ bump((value)=>value+1);
 const isBatchPending=()=>sidebarBatchPendingRef.current.has(
 sidebarBatchScopeKey(sidebarSessionId,rootSessionId),
 )===true;
-const isTabOpen=(key)=>sidebarTabRecordsRef.current.get(key)!==undefined;
+const isTabOpen=(key)=>sidebarTabVisible(sidebarTabRecordsRef.current.get(key));
 const getPeakValleyMarker=()=>frame.peakValleyMarker??null;
 const peakValleyLabelOf=(marker)=>peakValleyLabelTextOf(config,frame.panelLocale,marker);
 const viewCtx={

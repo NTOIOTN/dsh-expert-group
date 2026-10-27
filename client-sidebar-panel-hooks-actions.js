@@ -380,7 +380,7 @@
       && previous.rootSessionId === rootSessionId && previous.tabId === tabId) {
       previous.title = tabTitle ?? previous.title;
       previous.misses = 0;
-      previous.origin = recordOrigin;
+      previous.origin = recordOrigin; previous.absent = false; // 落地证据齐备：清掉权威缺席标记
       return true;
     }
     sidebarTabRecordsRef.current.set(key, { sessionId: sidebarSessionId, rootSessionId, tabId, title: tabTitle, misses: 0, origin: recordOrigin });
@@ -446,7 +446,7 @@
         rootSessionId,
         resourceAddress,
         SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL,
-        manualRecord === undefined ? "manual-open" : "manual-close",
+        deps.sidebarTabVisible(manualRecord) ? "manual-close" : "manual-open",
       );
     }
     const autoContext = origin === SIDEBAR_TAB_ORIGIN_AUTO && autoAction !== null && typeof autoAction === "object"
@@ -583,10 +583,10 @@
         return;
       }
       if (closeOutcome.status === "request-resolved-unverified") {
-        /**
-         * resolve 只代表请求完成：验证链已经登记在共享账本里，record / origin / attempt 全部保留。
-         * 这里直接返回，绝不落到下面的 openResource 分支，也绝不当成「已经关掉」收口。
-         */
+        // resolve 只代表请求完成：记录 / 归属 / 预算一律留给验证链。但必须立刻推一次同步——宿主的
+        // DOM 移除与 inventory publish 通常发生在验证链登记之前，空闲会话又没有观察者/轮询叫醒它，
+        // 第一次 absent 采样否则要等 30 秒。这次同步只更新可见性标记 + 完成第一次采样（门槛仍是两次）。
+        deps.syncSidebarTabs();
         return;
       }
     settleVerifiedSidebarClose(action, deps, record, closeOutcome, closeSplitIntentToken);
@@ -1099,9 +1099,8 @@
   /** undefined */
   function useSidebarPanelActionHandlersPart2(frame) {
     const {
-      abandonAutoSidebarAction, autoActionStillValid, cancelPendingSidebarSplit, closeSidebarResource,
-      openSidebarResource, recordSidebarManualIntent, sidebarSplitIntentRef, sidebarTabOpeningRef,
-      sidebarTabPendingRef, sidebarTabRecordsRef,
+      abandonAutoSidebarAction, autoActionStillValid, cancelPendingSidebarSplit, closeSidebarResource, openSidebarResource,
+      recordSidebarManualIntent, sidebarSplitIntentRef, sidebarTabOpeningRef, sidebarTabPendingRef, sidebarTabVisible, sidebarTabRecordsRef,
     } = frame;
 
     /**
@@ -1143,8 +1142,8 @@
           if (action.origin === SIDEBAR_TAB_ORIGIN_MANUAL) recordSidebarManualIntent(key, resourceAddress);
           return;
         }
-        // 关闭态：只调用记录里的精确 tabId。绝不根据 active() 当前是谁来决定关哪个 tab。
-        if (record !== undefined && closeSidebarResource !== null) {
+        // 关闭态：精确 tabId + 与渲染层同一份可见性判据（权威缺席 ⇒ 打开）；自动关闭动作例外。
+        if (record !== undefined && closeSidebarResource !== null && (sidebarTabVisible(record) || action.autoContext !== null)) {
           await closeSidebarActionWithLease(action, frame, record);
           return;
         }

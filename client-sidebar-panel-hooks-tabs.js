@@ -12,12 +12,12 @@
   const PURE_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-pure");
   const PURE = global[PURE_SYMBOL] || {};
   const {
-    SIDEBAR_AUTO_KEY_LIMIT, SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS, SIDEBAR_TAB_KEY_SEPARATOR, object, text,
+    SIDEBAR_AUTO_KEY_LIMIT, SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS, SIDEBAR_TAB_KEY_SEPARATOR, SIDEBAR_TAB_ORIGIN_AUTO, object, text,
   } = PURE;
   const DOM_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-dom");
   const DOM = global[DOM_SYMBOL] || {};
   const {
-    methodOf, normalizeSubagentAddress, sidebarTabKey,
+    methodOf, normalizeSubagentAddress, sidebarTabCloseKey, sidebarTabKey,
   } = DOM;
   const TAB_STATE_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-tab-state");
   const TAB_STATE = global[TAB_STATE_SYMBOL] || {};
@@ -429,8 +429,9 @@
       inventory,
       sidebarSessionId,
     );
-    const sidebarBatchStateFor = (addresses) => TAB_STATE.sidebarBatchStateFor(addresses, {
-      inventory: readSidebarOpenTabs(),
+    /** 第二参数是本轮已读到的 inventory（可选）：记录同步一次读取、两处共用，读面代价 1 次/轮。 */
+    const sidebarBatchStateFor = (addresses, inventoryNow) => TAB_STATE.sidebarBatchStateFor(addresses, {
+      inventory: inventoryNow ?? readSidebarOpenTabs(),
       sidebarSessionId,
       closeAvailable: closeSidebarResource !== null,
     });
@@ -573,8 +574,12 @@
      * 独立的第二阶段（syncSidebarTabs），那些短路不会再吞掉自动打开/关闭。
      */
 
+    /**
+     * 箭头方向与点击分支共享的**同一份**可见性判据（唯一实现在 client-sidebar-tab-state.js）。
+     * 这里直接登记那个纯函数：本 Hook 早于动作层与视图层执行，登记后两处读到的就是同一个实现。
+     */
     Object.assign(frame, {
-      tryCommitSidebarSplit,
+      sidebarTabVisible: TAB_STATE.sidebarTabVisible, tryCommitSidebarSplit,
     });
   }
 
@@ -582,9 +587,9 @@
   function useSidebarPanelTabSync(frame) {
     const {
       activeSidebarTabId, bump, cancelPendingSidebarSplit, idleSidebarResourceAddresses, knownSidebarResourceAddresses, presentFloatingSubagentTitles,
-      presentSidebarTabIds, requestRightbarDragSync, rootSessionId, runningSidebarResourceAddresses, sidebarAdoptionEvidenceAvailable, sidebarBatchSignatureOf,
-      sidebarBatchSignatureRef, sidebarBatchStateFor, sidebarIdleChildren, sidebarManualIntentRef, sidebarSessionId, sidebarSplitIntentRef,
-      sidebarTabOpeningRef, sidebarTabRecordsRef, tryCommitSidebarSplit,
+      presentSidebarTabIds, readSidebarOpenTabs, requestRightbarDragSync, rootSessionId, runningSidebarResourceAddresses, sharedSidebarTabCloseInFlight,
+      sidebarAdoptionEvidenceAvailable, sidebarBatchSignatureOf, sidebarBatchSignatureRef, sidebarBatchStateFor, sidebarIdleChildren, sidebarManualIntentRef,
+      sidebarSessionId, sidebarSplitIntentRef, sidebarTabOpeningRef, sidebarTabRecordsRef, tryCommitSidebarSplit,
     } = frame;
     // 跨 Hook 前向引用的晚绑定包装：这些函数由后续 Hook 声明并登记到 frame.late；
     // 本 Hook 里的调用全部发生在渲染之后的异步 / 事件路径，因此转发保持原来的调用时机与顺序。
@@ -599,12 +604,15 @@
        * 标题行批量控件/零圆点由渲染期现读的 openTabs inventory 决定，因此这里必须在**任何提前 return
        * 之前**比较一次候选签名：records 为空时旧实现会直接返回，inventory 变化就再也不会被反映，
        * 用户手动打开的 tab（没有本插件的打开记录）也会永远看不到可关闭的批量按钮。
-       *
        * 只有签名真的变化才 bump：2.5 秒轮询在没有变化时绝不产生重渲染。
+       *
+       * 本轮只读一次公开 inventory：批量签名与后面的记录在场判定共用同一份提交视图（读面代价因此
+       * 从每轮两次降到一次）。
        */
+      const inventory = readSidebarOpenTabs();
       const batchSignatureNow = sidebarBatchSignatureOf(
-        sidebarBatchStateFor(runningSidebarResourceAddresses()),
-        sidebarBatchStateFor(idleSidebarResourceAddresses(sidebarIdleChildren())),
+        sidebarBatchStateFor(runningSidebarResourceAddresses(), inventory),
+        sidebarBatchStateFor(idleSidebarResourceAddresses(sidebarIdleChildren()), inventory),
       );
       if (sidebarBatchSignatureRef.current !== batchSignatureNow) {
         sidebarBatchSignatureRef.current = batchSignatureNow;
@@ -673,28 +681,81 @@
        // 批量控件的聚合状态更新已经在**这个短路之前**完成，因此 records 为空时 inventory 的变化
        // 照旧能被反映，而用户手动打开的 tab 也不再依赖本插件的打开记录。
        if (records.size === 0) return;
+      /**
+       * 本节不再因为「面板 / DOM 读面不可读」就整体提前 return：宿主 0.2.1-rc.3 的公开 openTabs
+       * inventory 是每次布局提交同步更新的**权威已提交投影**（覆盖 dock 与 float，不依赖面板可见性），
+       * 它可读时单独就能回答「这条 tab 还在不在」——右栏折叠或 surface 过渡期间也必须能复位。
+       * 四态判定（present / absent / missing / undecidable）的唯一实现在 client-sidebar-tab-state.js。
+       */
       const present = presentSidebarTabIds();
-      if (present === null) return;
       const floatingTitles = presentFloatingSubagentTitles();
-       if (floatingTitles === null) return;
        const activeTabId = activeSidebarTabId();
-      const stale = [];
+      /** 本轮账本真的变过几次（删记录 / 可见性标记翻转）：只有变化才 bump，空闲轮询不空转重渲染。 */
+      let changed = 0;
       for (const [key, record] of records) {
         if (record.sessionId !== sidebarSessionId || record.rootSessionId !== rootSessionId) continue;
-        if (present.has(record.tabId) === true
-           || record.tabId === activeTabId
-           || (text(record.title, null) !== null && floatingTitles.has(record.title))) {
+        /**
+         * 插件自己发出的关闭仍在途（realm 级租约，键含 tabId）。
+         *
+         * 宿主 close() 的 inventory publish 会在 settleVerifiedSidebarClose 之前同步重入本函数，而那次
+         * 结算只有「记录仍是同一个 tabId」时才会清理来源 / 抑制 / 冷却：因此租约在途时**不删记录、
+         * 不碰来源**。但「可见性」必须照常维护——第一次权威缺席就要让箭头/点击立刻按 sidebarTabVisible
+         * 走（用户点 << 后不必再等验证链的第二次采样或轮询），删除与采样收口仍归验证链。
+         */
+        const leased = sharedSidebarTabCloseInFlight?.has(sidebarTabCloseKey(sidebarSessionId, rootSessionId, record.tabId));
+        const verdict = TAB_STATE.sidebarTabVerdictOf(inventory, sidebarSessionId, present, floatingTitles, activeTabId, key, record);
+        // 读面全缺：既证明不了还在、也证明不了没了，保持现状且不推进缺失计数。
+        if (verdict === "undecidable") continue;
+        /**
+         * 任一正向证据（DOM 芯片 / active / 浮窗标题 / inventory 仍承载该地址）都清零缺失计数，
+         * 并清掉「权威缺席」标记——宿主/用户重新打开了同一地址，这一行必须立刻回到 <<。
+         */
+        if (verdict === "present") {
           record.misses = 0;
+          if (record.absent) {
+            record.absent = false;
+            changed += 1;
+          }
           continue;
         }
+        if (verdict === "absent") {
+          /**
+           * 外部关闭 + 手动 / 外部来源：没有账本要留，直接收口（一次观测即成立）。
+           */
+          if (!leased && record.origin !== SIDEBAR_TAB_ORIGIN_AUTO) {
+            // 外部关闭同步只维护「这个 tab 还在不在」的记录：宽度不再随 tab 开关变化。
+            records.delete(key);
+            changed += 1;
+            continue;
+          }
+          /**
+           * 其余两种情形**只打「权威缺席」标记**，记录一律不删：
+           * - auto 来源：Auto 归属账本仍要按两次可读采样撤销归属、清理 tabMisses / 预算 / 持久
+           *   ownership（autoCloseCandidate 的既有闸门）；
+           * - 关闭租约在途（插件自己发的 <<）：删除、来源 / 抑制 / 冷却清理与采样收口都归验证链
+           *   （finishVerifiedSidebarClose 的 (key, tabId) 闸门），这里抢先删会让它跳过清理。
+           * 箭头与点击分支读 sidebarTabVisible，因此标记一变就立即是 >>；标记变化才 bump 一次。
+           * 也不在这里累计 DOM 缺失次数：删除权归账本/验证链，两条路径同时删除会抢走它们的采样。
+           */
+          if (!record.absent) {
+            record.absent = true;
+            changed += 1;
+          }
+          continue;
+        }
+        /**
+         * 降级路径（inventory 不可读）：DOM 读面也不可读时保持现状、绝不猜测；读得到时才累计一次
+         * 缺失，达到 SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS 次才收口——旧宿主语义逐字不变。
+         * 租约在途时同样不推进（删除权归验证链）。
+         */
+        if (leased || present === null || floatingTitles === null) continue;
         record.misses += 1;
-        if (record.misses >= SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS) stale.push(key);
+        if (record.misses >= SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS) {
+          records.delete(key);
+          changed += 1;
+        }
       }
-      if (stale.length === 0) return;
-      for (const key of stale) {
-        // 外部关闭同步只维护「这个 tab 还在不在」的记录：宽度不再随 tab 开关变化。
-        records.delete(key);
-      }
+      if (changed === 0) return;
       bump((value) => value + 1);
     };
 
