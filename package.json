@@ -1,6 +1,6 @@
 {
   "name": "dsh-expert-group",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "6个可单独设置模型的专家子代理，侧边栏任务展示，弹窗通知",
   "icon": "./icon.svg",
   "type": "module",
@@ -170,6 +170,8 @@
     "host/plugin-identity.js",
     "host/rpc-request-lifecycle.js",
     "host/runtime-diagnostics.js",
+    "host/route-diagnostics.js",
+    "host/route-receipt-fields.js",
     "host/send-message-shadow.js",
     "host/peak-valley-settings.js",
     "host/peak-valley-route.js",
@@ -215,6 +217,7 @@
     "fanout/events.js",
     "fanout/persistence.js",
     "fanout/public-api.js",
+    "fanout/provider-attribution.js",
     "fanout/reclaim.js",
     "fanout/restore.js",
     "fanout/snapshot.js",
@@ -298,10 +301,12 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "check-package": "node scripts/check-package-closure.mjs",
+    "prepublishOnly": "node scripts/check-package-closure.mjs",
     "prepare": "npm run build",
     "test": "node --test \"test/*.test.mjs\"",
     "release-gate": "node --test test/release-gate.test.mjs test/package-portability.test.mjs test/client-shared-boundary.test.mjs test/model-config.test.mjs",
-    "release": "node scripts/sync-dsh-version.mjs && pnpm run build && pnpm run test && pnpm run release-gate"
+    "release": "node scripts/sync-dsh-version.mjs && node scripts/check-package-closure.mjs && pnpm run build && pnpm run test && pnpm run release-gate"
   },
   "license": "MIT",
   "repository": {
