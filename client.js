@@ -14369,18 +14369,24 @@ function settingsRolesForProvider(roles){
 const candidates=Array.isArray(roles)?roles:SETTINGS_REQUIRED_ROLE_IDS;
 return[...new Set(candidates.filter((role)=>typeof role==="string"&&role.length>0))];
 }
-function unifiedProviderOf(defaults,roles,legacyProvider=""){
+function unifiedProviderOf(defaults,roles,legacyProvider="",orchestratorProvider=""){
 const activeRoles=settingsRolesForProvider(roles);
-if(activeRoles.length===0)return"";
 const providers=activeRoles.map((role)=>{
 const provider=defaults?.[role]?.provider;
 return typeof provider==="string"&&provider.length>0?provider:"";
 });
 const configured=providers.filter((provider)=>provider.length>0);
-if(configured.length===0)return typeof legacyProvider==="string"?legacyProvider:"";
-if(configured.length!==activeRoles.length)return"";
+let unified="";
+if(activeRoles.length>0){
+if(configured.length===0)unified=typeof legacyProvider==="string"?legacyProvider:"";
+else if(configured.length===activeRoles.length){
 const first=configured[0];
-return configured.every((provider)=>provider===first)?first:"";
+unified=configured.every((provider)=>provider===first)?first:"";
+}
+}
+return typeof orchestratorProvider==="string"&&orchestratorProvider.length>0&&orchestratorProvider!==unified
+?""
+:unified;
 }
 const NOTIFICATION_EVENT_TYPES=Object.freeze(["completed","waiting","failed"]);
 function normalizeNotificationEvents(value){
@@ -14924,16 +14930,6 @@ next[role]=migrated??{provider,model:""};
 }
 return next;
 }
-function applyUnifiedProviderToOrchestrator(draft,page,provider,groups){
-if(typeof provider!=="string"||provider.length===0)return draft;
-const selection=modelLayerSelectionOf(draft,ORCHESTRATOR_ID,page);
-if(typeof selection?.provider!=="string"||selection.provider.length===0
-||typeof selection.model!=="string"||selection.model.length===0)return draft;
-const migrated=migrateSettingsSelection(selection,provider,groups)??{provider,model:""};
-return settingsDraftEqual(migrated,selection)
-?draft
-:setModelLayerSelection(draft,ORCHESTRATOR_ID,page,migrated);
-}
 function normalizeSettingsCommitDraft(value,roles){
 const normalized=normalizeSettingsDraft(value,roles);
 if(value!==null&&typeof value==="object"
@@ -15003,7 +14999,6 @@ global[SYMBOL]=Object.freeze({
 DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PEAK_VALLEY_PERIODS,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,
 NEXT_PEAK_VALLEY_PERIOD,
 NOTIFICATION_EVENT_TYPES,ORCHESTRATOR_ID,PROMPT_ROLE_IDS,PROMPT_WARNING_RATIO,SETTINGS_ROLE_LABELS,addModelCandidatePage,
-applyUnifiedProviderToOrchestrator,
 bindClientRuntime,clampNotificationVolume,commitSettingsCandidate,compactModelCandidatesDraft,compactOrchestratorDraft,countUnicodeGraphemes,
 createSettingsModelCatalog,mergeSettingsDraftOverSource,migrateSettingsDefaults,migrateSettingsSelection,modelCandidatesErrorMessage,
 resolveSettingsForm,
@@ -15984,8 +15979,8 @@ const clientSettingsNormalize=global[clientSettingsNormalizeSymbol]||{};
 const{
 DEFAULT_MODEL_FALLBACK_LIMIT,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,NEXT_PEAK_VALLEY_PERIOD,
 NOTIFICATION_EVENT_TYPES,ORCHESTRATOR_ID,PROMPT_WARNING_RATIO,
-applyUnifiedProviderToOrchestrator,clampNotificationVolume,migrateSettingsSelection,modelLayerSelectionOf,normalizeRolePromptProjection,normalizeSettingsDraft,promptEntryOf,
-setModelLayerSelection,settingsRolesForProvider,syncSettingsDefaultsProvider,validatePromptText,
+clampNotificationVolume,migrateSettingsSelection,modelLayerSelectionOf,normalizeRolePromptProjection,normalizeSettingsDraft,promptEntryOf,
+setModelLayerSelection,settingsRolesForProvider,validatePromptText,
 }=clientSettingsNormalize;
 let react=null;
 let ModelConfigSection=null;
@@ -16354,7 +16349,7 @@ const next=!provider
 ?null
 :(migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""});
 const written=setModelLayerSelection(previous,role,0,next);
-return isOrchestrator?written:{...written,provider:""};
+return{...written,provider:""};
 }
 const next=!provider
 ?{provider:"",model:""}
@@ -16868,28 +16863,22 @@ value:unifiedProvider,
 disabled:saving||!catalogAvailable,
 onChange:(event)=>editDraft((previous)=>{
 const provider=event.target.value;
-if(currentModelPage!==0){
-if(!provider)return previous;
-let next=previous;
-for(const role of settingsRolesForProvider(roles)){
-const current=modelLayerSelectionOf(next,role,currentModelPage);
-const migrated=migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""};
-next=setModelLayerSelection(next,role,currentModelPage,migrated);
-}
-return applyUnifiedProviderToOrchestrator(next,currentModelPage,provider,providerGroups);
-}
+const providerRoles=settingsRolesForProvider(roles);
 if(!provider){
-const hasVisibleProvider=settingsRolesForProvider(roles).some((role)=>{
+if(currentModelPage!==0)return previous;
+const hasVisibleProvider=providerRoles.some((role)=>{
 const value=previous.defaults?.[role]?.provider;
 return typeof value==="string"&&value.length>0;
 });
 return hasVisibleProvider?{...previous,provider:""}:previous;
 }
-return applyUnifiedProviderToOrchestrator({
-...previous,
-provider,
-defaults:syncSettingsDefaultsProvider(previous.defaults,provider,providerGroups,roles),
-},0,provider,providerGroups);
+let next=currentModelPage===0?{...previous,provider}:previous;
+for(const role of[...providerRoles,ORCHESTRATOR_ID]){
+const current=modelLayerSelectionOf(next,role,currentModelPage);
+const migrated=migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""};
+next=setModelLayerSelection(next,role,currentModelPage,migrated);
+}
+return next;
 }),
 },
 react.createElement("option",{value:""},t("settings.noProvider")),
@@ -17062,7 +17051,7 @@ resolveSettingsLocale,settingsExtraText,settingsText,
 }=clientText;
 const{
 DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PEAK_VALLEY_PERIODS,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_PAGES,ORCHESTRATOR_ID,PROMPT_ROLE_IDS,SETTINGS_ROLE_LABELS,addModelCandidatePage,
-commitSettingsCandidate,compactModelCandidatesDraft,compactOrchestratorDraft,mergeSettingsDraftOverSource,modelCandidatesErrorMessage,modelLayerMapOf,modelPageCountOf,
+commitSettingsCandidate,compactModelCandidatesDraft,compactOrchestratorDraft,mergeSettingsDraftOverSource,modelCandidatesErrorMessage,modelLayerMapOf,modelLayerSelectionOf,modelPageCountOf,
 normalizeModelCandidatesDraft,normalizePeakValleyDraft,normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsCommitDraft,normalizeSettingsDraft,promptEntryOf,
 promptOverridesEqual,removeModelCandidatePage,reorderModelLayers,settingsDraftEqual,unifiedProviderOf,updateRolePromptProjection,
 useEnabledSettingsRoles,useHostMeta,validateModelCandidateRows,validatePromptText,
@@ -17097,14 +17086,16 @@ const state=draft.peakValley??emptyPeakValleyDraft();
 const profile=state[peakValleyPeriod]??emptyPeakValleyDraft()[peakValleyPeriod];
 const modelPageCount=modelPageCountOf(profile);
 const pages=peakValleyPages??{};
+const currentModelPage=Math.min(pages[peakValleyPeriod]??0,modelPageCount-1);
 const sub={
 ...view,
-currentModelPage:Math.min(pages[peakValleyPeriod]??0,modelPageCount-1),
+currentModelPage,
 draft:profile,
 modelPageCount,
 peakValleyEntry:view.peakValleyEntry===true,
 peakValleyState:state,
-unifiedProvider:unifiedProviderOf(profile.defaults,roles,profile.provider),
+unifiedProvider:unifiedProviderOf(profile.defaults,roles,profile.provider,
+modelLayerSelectionOf(profile,ORCHESTRATOR_ID,currentModelPage)?.provider),
 };
 sub.editDraft=(update)=>editDraft((previous)=>{
 const previousState=previous.peakValley??emptyPeakValleyDraft();
@@ -17913,7 +17904,8 @@ const catalogAvailable=directoryState.status==="ready"||groups.length>0;
 const modelPageCount=modelPageCountOf(draft);
 const currentModelPage=Math.min(selectedModelPage,modelPageCount-1);
 const currentModelLayer=modelLayerMapOf(draft,currentModelPage);
-const unifiedProvider=unifiedProviderOf(currentModelLayer,roles,currentModelPage===0?draft.provider:"");
+const unifiedProvider=unifiedProviderOf(currentModelLayer,roles,currentModelPage===0?draft.provider:"",
+currentModelLayer[ORCHESTRATOR_ID]?.provider);
 const modelPageLabelOf=bindModelPageLabelOf(tExtra);
 react.useEffect(()=>()=>{
 const session=modelTabDragRef.current;
@@ -22514,7 +22506,7 @@ findNativeStatusTextNode,replaceNativeStatusPrefix,resolveRunningStatusText,
 }=clientNativeStatusModule;
 const clientSettingsNormalizeModule=globalThis[Symbol.for("dsh-expert-group/client-settings-normalize")]||{};
 const{
-PROMPT_ROLE_IDS,addModelCandidatePage,applyUnifiedProviderToOrchestrator,commitSettingsCandidate,compactModelCandidatesDraft,countUnicodeGraphemes,createSettingsModelCatalog,
+PROMPT_ROLE_IDS,addModelCandidatePage,commitSettingsCandidate,compactModelCandidatesDraft,countUnicodeGraphemes,createSettingsModelCatalog,
 migrateSettingsDefaults,migrateSettingsSelection,modelLayerSelectionOf,modelPageCountOf,normalizeModelCandidatesDraft,normalizeModelFallbackLimitDraft,
 normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsDraft,normalizeSettingsModelGroups,removeModelCandidatePage,reorderModelLayers,
 resolveSettingsForm,setModelLayerSelection,syncSettingsDefaultsProvider,unifiedProviderOf,validateModelCandidateRows,validatePromptText,
@@ -22806,7 +22798,6 @@ exports.normalizeRolePromptProjection=normalizeRolePromptProjection;
 exports.unifiedProviderOf=unifiedProviderOf;
 exports.migrateSettingsSelection=migrateSettingsSelection;
 exports.syncSettingsDefaultsProvider=syncSettingsDefaultsProvider;
-exports.applyUnifiedProviderToOrchestrator=applyUnifiedProviderToOrchestrator;
 exports.migrateSettingsDefaults=migrateSettingsDefaults;
 exports.commitSettingsCandidate=commitSettingsCandidate;
 exports.formatSubagentMetadata=formatSubagentMetadata;

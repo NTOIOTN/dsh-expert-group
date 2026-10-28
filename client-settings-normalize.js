@@ -229,21 +229,39 @@
     }
 
     /**
-     * 返回当前展示角色的共同 provider。空字符串同时表示没有可统一的 provider 和混合状态；
-     * 只有完全没有行内 provider 时才回退到旧的全局 provider，保持历史 settings 可见且可迁移。
+     * 返回当前模型层上「专家共同 provider」，并按需并入主代理的该层 provider。
+     * 空字符串同时表示没有可统一的 provider 和混合状态；只有完全没有行内 provider 时才
+     * 回退到旧的全局 provider，保持历史 settings 可见且可迁移。
+     *
+     * 第 4 参数 `orchestratorProvider` 是**主代理在当前层**的 provider：只有设置页的两个
+     * 显示调用点（主设置页与 peakValleyViewOf 子视图）传值。保存计划与脏判定仍用三参数
+     * 调用，因此主代理不参与「本次是否要改模型字段」的推导，保存语义逐字不变。
+     *
+     * 主代理的参与规则（用户可见契约，两个视图一致）：
+     * - 该层未配置（没有 provider）→ 不参与推导：升级后存量配置不会一打开就显示「无」；
+     * - 已配置且与专家共同值相同 → 正常显示该 provider（跟随后的稳定状态）；
+     * - 已配置但与专家共同值不同 → 显示空字符串＝「无」：顶部立刻能看出这套模型已不统一，
+     *   用户也才能通过重新选择统一供应商把主代理迁回。
      */
-    function unifiedProviderOf(defaults, roles, legacyProvider = "") {
+    function unifiedProviderOf(defaults, roles, legacyProvider = "", orchestratorProvider = "") {
       const activeRoles = settingsRolesForProvider(roles);
-      if (activeRoles.length === 0) return "";
       const providers = activeRoles.map((role) => {
         const provider = defaults?.[role]?.provider;
         return typeof provider === "string" && provider.length > 0 ? provider : "";
       });
       const configured = providers.filter((provider) => provider.length > 0);
-      if (configured.length === 0) return typeof legacyProvider === "string" ? legacyProvider : "";
-      if (configured.length !== activeRoles.length) return "";
-      const first = configured[0];
-      return configured.every((provider) => provider === first) ? first : "";
+      let unified = "";
+      if (activeRoles.length > 0) {
+        if (configured.length === 0) unified = typeof legacyProvider === "string" ? legacyProvider : "";
+        else if (configured.length === activeRoles.length) {
+          const first = configured[0];
+          unified = configured.every((provider) => provider === first) ? first : "";
+        }
+      }
+      // 主代理只在**该层已配置**时才参与：未配置不得把原本具体的统一值变成「无」。
+      return typeof orchestratorProvider === "string" && orchestratorProvider.length > 0 && orchestratorProvider !== unified
+        ? ""
+        : unified;
     }
 
     /**
@@ -1081,6 +1099,9 @@
     /**
      * 只同步设置页当前可见角色。没有已有模型时暂存 provider + 空 model，
      * 让用户仍能先选 provider 再选模型；保存前 normalizeSettingsDraft 会丢弃空 model。
+     *
+     * 这是「统一供应商 → 可见角色」这条规则的纯函数表述（逐行测试用）；设置页本身现在把
+     * 主代理与专家放进同一个循环、逐行经 setModelLayerSelection 写入，两者规则完全相同。
      */
     function syncSettingsDefaultsProvider(defaults, provider, groups, roles) {
       const next = { ...(defaults && typeof defaults === "object" ? defaults : {}) };
@@ -1090,40 +1111,6 @@
         next[role] = migrated ?? { provider, model: "" };
       }
       return next;
-    }
-
-    /**
-     * 统一供应商 → 主代理的草稿迁移（主模型页只迁 defaults，候选页 i 只迁第 i 层候选）。
-     *
-     * 为什么主代理要跟随：统一供应商在用户眼里是一次「这套模型都换成 X」的动作，而主代理与
-     * 专家行并排渲染在同一张模型表里。不跟随就会留下「专家全变了、第一行还是旧供应商」的
-     * 分裂状态，而主代理没有第二个批量入口能把它改回来。
-     * 为什么未配置时不创建：主代理是独立保留字段（settings.orchestrator）。凭空写入
-     * 「provider + 空模型」会造出一条半填行——候选校验会整次拦下保存，提交变更集里还会多出
-     * 一个用户从未改过的 "orchestrator"。因此「缺 defaults / 该层没有完整候选」一律原样返回。
-     * 迁移口径与专家行完全一致：按模型显示名匹配，目标模型声明了同一思考深度才保留，
-     * 匹配不到就保留新 provider、清空模型（保存前由草稿归一再按「未配置」落盘）。
-     *
-     * @param {object} draft - 当前视图草稿（顶层 settings 或峰谷 profile，两者同形）。
-     * @param {number} page - 当前模型层：0 = 主模型页，i >= 1 = 候选页 i。
-     * @param {string} provider - 统一供应商下拉的新值。
-     * @param {Array} groups - 模型目录（显示名迁移的唯一来源）。
-     * @returns {object} 草稿；没有可迁移的行时原样返回同一引用（否则会被误判成未保存修改）。
-     */
-    function applyUnifiedProviderToOrchestrator(draft, page, provider, groups) {
-      if (typeof provider !== "string" || provider.length === 0) return draft;
-      // 读写都走「页 → 层」的既有语义：主模型页 = defaults，候选页 i = candidates[i - 1]。
-      // 峰谷 profile 与顶层 settings 同形，因此子视图不需要任何特殊分支。
-      const selection = modelLayerSelectionOf(draft, ORCHESTRATOR_ID, page);
-      // 未配置 = 该层没有 provider 与 model 都齐的选择：不干预主代理模型，绝不新建空行。
-      if (typeof selection?.provider !== "string" || selection.provider.length === 0
-        || typeof selection.model !== "string" || selection.model.length === 0) return draft;
-      // 与专家行同一套显示名迁移；迁移不到就保留新 provider、清空模型。
-      const migrated = migrateSettingsSelection(selection, provider, groups) ?? { provider, model: "" };
-      // 同值不写：不制造「有未保存修改」的假脏值（也保证没有可提交的 orchestrator 变更）。
-      return settingsDraftEqual(migrated, selection)
-        ? draft
-        : setModelLayerSelection(draft, ORCHESTRATOR_ID, page, migrated);
     }
 
     /**
@@ -1231,7 +1218,6 @@
     DEFAULT_MODEL_FALLBACK_LIMIT, DEFAULT_PEAK_VALLEY_PERIODS, DEFAULT_PROMPT_MAX_GRAPHEMES, MAX_MODEL_CANDIDATES_PER_ROLE, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_PAGES,
     NEXT_PEAK_VALLEY_PERIOD,
     NOTIFICATION_EVENT_TYPES, ORCHESTRATOR_ID, PROMPT_ROLE_IDS, PROMPT_WARNING_RATIO, SETTINGS_ROLE_LABELS, addModelCandidatePage,
-    applyUnifiedProviderToOrchestrator,
     bindClientRuntime, clampNotificationVolume, commitSettingsCandidate, compactModelCandidatesDraft, compactOrchestratorDraft, countUnicodeGraphemes,
     createSettingsModelCatalog, mergeSettingsDraftOverSource, migrateSettingsDefaults, migrateSettingsSelection, modelCandidatesErrorMessage,
     resolveSettingsForm,

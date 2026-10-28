@@ -20,7 +20,7 @@
   } = clientText;
   const {
     DEFAULT_MODEL_FALLBACK_LIMIT, DEFAULT_PEAK_VALLEY_PERIODS, DEFAULT_PROMPT_MAX_GRAPHEMES, MAX_MODEL_PAGES, ORCHESTRATOR_ID, PROMPT_ROLE_IDS, SETTINGS_ROLE_LABELS, addModelCandidatePage,
-    commitSettingsCandidate, compactModelCandidatesDraft, compactOrchestratorDraft, mergeSettingsDraftOverSource, modelCandidatesErrorMessage, modelLayerMapOf, modelPageCountOf,
+    commitSettingsCandidate, compactModelCandidatesDraft, compactOrchestratorDraft, mergeSettingsDraftOverSource, modelCandidatesErrorMessage, modelLayerMapOf, modelLayerSelectionOf, modelPageCountOf,
     normalizeModelCandidatesDraft, normalizePeakValleyDraft, normalizePromptOverrides, normalizeRolePromptProjection, normalizeSettingsCommitDraft, normalizeSettingsDraft, promptEntryOf,
     promptOverridesEqual, removeModelCandidatePage, reorderModelLayers, settingsDraftEqual, unifiedProviderOf, updateRolePromptProjection,
     useEnabledSettingsRoles, useHostMeta, validateModelCandidateRows, validatePromptText,
@@ -94,15 +94,18 @@
     const profile = state[peakValleyPeriod] ?? emptyPeakValleyDraft()[peakValleyPeriod];
     const modelPageCount = modelPageCountOf(profile);
     const pages = peakValleyPages ?? {};
+    const currentModelPage = Math.min(pages[peakValleyPeriod] ?? 0, modelPageCount - 1);
     const sub = {
       ...view,
-      currentModelPage: Math.min(pages[peakValleyPeriod] ?? 0, modelPageCount - 1),
+      currentModelPage,
       draft: profile,
       modelPageCount,
       // 入口按钮在子视图里没有意义（已经在里面了）；主设置页的周期视图要保留它。
       peakValleyEntry: view.peakValleyEntry === true,
       peakValleyState: state,
-      unifiedProvider: unifiedProviderOf(profile.defaults, roles, profile.provider),
+      // 统一值按**当前页所在层**取主代理 provider（候选页不得拿 defaults 充当候选页值）；与主设置页共用同一个四参数推导，子视图因此没有任何特殊分支。
+      unifiedProvider: unifiedProviderOf(profile.defaults, roles, profile.provider,
+        modelLayerSelectionOf(profile, ORCHESTRATOR_ID, currentModelPage)?.provider),
     };
     sub.editDraft = (update) => editDraft((previous) => {
       const previousState = previous.peakValley ?? emptyPeakValleyDraft();
@@ -1436,8 +1439,9 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
       const modelPageCount = modelPageCountOf(draft);
       const currentModelPage = Math.min(selectedModelPage, modelPageCount - 1);
       const currentModelLayer = modelLayerMapOf(draft, currentModelPage);
-      // 统一选择器只反映**当前页**的共同 provider；候选页没有历史顶层 provider 可回退。
-      const unifiedProvider = unifiedProviderOf(currentModelLayer, roles, currentModelPage === 0 ? draft.provider : "");
+      // 统一选择器只反映**当前页**的共同 provider（候选页没有历史顶层 provider 可回退）；第 4 参数是该层主代理的 provider：未配置不参与，已配置且与专家不同则显示「无」。
+      const unifiedProvider = unifiedProviderOf(currentModelLayer, roles, currentModelPage === 0 ? draft.provider : "",
+        currentModelLayer[ORCHESTRATOR_ID]?.provider);
       /** 页签名称只由位置推导：第一页恒为「主模型」，其余按候选序号。 */
       const modelPageLabelOf = bindModelPageLabelOf(tExtra);
 

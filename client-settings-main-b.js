@@ -14,8 +14,8 @@
   const {
     DEFAULT_MODEL_FALLBACK_LIMIT, MAX_MODEL_CANDIDATES_PER_ROLE, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_PAGES, NEXT_PEAK_VALLEY_PERIOD,
     NOTIFICATION_EVENT_TYPES, ORCHESTRATOR_ID, PROMPT_WARNING_RATIO,
-    applyUnifiedProviderToOrchestrator, clampNotificationVolume, migrateSettingsSelection, modelLayerSelectionOf, normalizeRolePromptProjection, normalizeSettingsDraft, promptEntryOf,
-    setModelLayerSelection, settingsRolesForProvider, syncSettingsDefaultsProvider, validatePromptText,
+    clampNotificationVolume, migrateSettingsSelection, modelLayerSelectionOf, normalizeRolePromptProjection, normalizeSettingsDraft, promptEntryOf,
+    setModelLayerSelection, settingsRolesForProvider, validatePromptText,
   } = clientSettingsNormalize;
   // descriptor 注入的运行期依赖：本模块先于 descriptor 执行，取值只发生在运行期调用时。
   let react = null;
@@ -486,10 +486,9 @@
                 ? null
                 : (migrateSettingsSelection(current, provider, providerGroups) ?? { provider, model: "" });
               const written = setModelLayerSelection(previous, role, 0, next);
-              // 行级 provider 一旦存在就拥有优先权，顶层统一值顺带清空；主代理是独立配置
-              //（统一供应商的写入另走 applyUnifiedProviderToOrchestrator），绝不能顺带清掉
-              // 专家的顶层 provider。
-              return isOrchestrator ? written : { ...written, provider: "" };
+              // 行级 provider 一旦存在就拥有优先权，顶层统一值顺带清空：主代理与专家行同一口径
+              //（它同样是用户手改的单独一行），否则顶部会继续显示一个已经不成立的统一值。
+              return { ...written, provider: "" };
             }
             // 候选页：与主模型页同一套联动，只作用于当前层；空值 = 清空该层该角色。
             const next = !provider
@@ -1159,36 +1158,32 @@
                 disabled: saving || !catalogAvailable,
                 onChange: (event) => editDraft((previous) => {
                   const provider = event.target.value;
-                  if (currentModelPage !== 0) {
-                    // 候选页：统一供应商只改**当前层**六个可见角色的 provider，绝不碰 defaults。
-                    // 「无」只表示当前页没有统一值：既不删行也不写草稿（与主模型页的“无”同语义）。
-                    if (!provider) return previous;
-                    let next = previous;
-                    for (const role of settingsRolesForProvider(roles)) {
-                      const current = modelLayerSelectionOf(next, role, currentModelPage);
-                      // 与单元格换供应商同一套显示名迁移规则；迁移不到就保留 provider、清空模型。
-                      const migrated = migrateSettingsSelection(current, provider, providerGroups) ?? { provider, model: "" };
-                      next = setModelLayerSelection(next, role, currentModelPage, migrated);
-                    }
-                    // 主代理该层候选与专家行同一迁移口径（未配置时原样返回，不创建空行）。
-                    return applyUnifiedProviderToOrchestrator(next, currentModelPage, provider, providerGroups);
-                  }
+                  // 「统一供应商」是一次**整层**动作：主代理（保留键 Orchestrator，配置独立存于
+                  // settings.orchestrator）与六个专家角色走同一个循环、同一套迁移规则——页 0 写
+                  // defaults、页 i 写 candidates[i - 1]，由 setModelLayerSelection 按 role 分派。
+                  // 因此这里没有主代理专用函数或分支，两边的跟随行为不可能再漂移。
+                  const providerRoles = settingsRolesForProvider(roles);
                   if (!provider) {
-                    // “无”仅表示未统一/混合状态，不删除任何专家行的 provider；旧文档只有顶层
-                    // provider 且没有可见行时也保留它，避免选择器动作破坏迁移来源。
-                    const hasVisibleProvider = settingsRolesForProvider(roles).some((role) => {
+                    // 「无」只清空顶层统一值：不删任何行；候选页连草稿都不写（与主模型页同语义）。
+                    // 旧文档只有顶层 provider 且没有可见行时也保留它，避免选择器动作破坏迁移来源。
+                    if (currentModelPage !== 0) return previous;
+                    const hasVisibleProvider = providerRoles.some((role) => {
                       const value = previous.defaults?.[role]?.provider;
                       return typeof value === "string" && value.length > 0;
                     });
                     return hasVisibleProvider ? { ...previous, provider: "" } : previous;
                   }
-                  // 主代理已配置时跟随新供应商（同名模型迁移、思考深度兼容才保留）；未配置则
-                  // 保持「不干预主代理模型」——绝不凭空写入 provider + 空模型。
-                  return applyUnifiedProviderToOrchestrator({
-                    ...previous,
-                    provider,
-                    defaults: syncSettingsDefaultsProvider(previous.defaults, provider, providerGroups, roles),
-                  }, 0, provider, providerGroups);
+                  // 选具体 provider：候选页只改当前层候选、绝不碰 defaults；主模型页写 defaults 并
+                  // 把统一值写回顶层。两个分支共用同一循环，主代理与专家逐字同规则。
+                  let next = currentModelPage === 0 ? { ...previous, provider } : previous;
+                  for (const role of [...providerRoles, ORCHESTRATOR_ID]) {
+                    const current = modelLayerSelectionOf(next, role, currentModelPage);
+                    // 与单元格换供应商同一套显示名迁移；迁移不到（含该行原本未配置/半填）就只保留
+                    // provider、清空 model——半填行正是「跟随」的可见结果，不能因半填而跳过。
+                    const migrated = migrateSettingsSelection(current, provider, providerGroups) ?? { provider, model: "" };
+                    next = setModelLayerSelection(next, role, currentModelPage, migrated);
+                  }
+                  return next;
                 }),
               },
                 react.createElement("option", { value: "" }, t("settings.noProvider")),
