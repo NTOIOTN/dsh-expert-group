@@ -1,6 +1,6 @@
 {
   "name": "dsh-expert-group",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "6个可单独设置模型的专家子代理，侧边栏任务展示，弹窗通知",
   "icon": "./icon.svg",
   "type": "module",
