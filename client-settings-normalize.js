@@ -1093,6 +1093,40 @@
     }
 
     /**
+     * 统一供应商 → 主代理的草稿迁移（主模型页只迁 defaults，候选页 i 只迁第 i 层候选）。
+     *
+     * 为什么主代理要跟随：统一供应商在用户眼里是一次「这套模型都换成 X」的动作，而主代理与
+     * 专家行并排渲染在同一张模型表里。不跟随就会留下「专家全变了、第一行还是旧供应商」的
+     * 分裂状态，而主代理没有第二个批量入口能把它改回来。
+     * 为什么未配置时不创建：主代理是独立保留字段（settings.orchestrator）。凭空写入
+     * 「provider + 空模型」会造出一条半填行——候选校验会整次拦下保存，提交变更集里还会多出
+     * 一个用户从未改过的 "orchestrator"。因此「缺 defaults / 该层没有完整候选」一律原样返回。
+     * 迁移口径与专家行完全一致：按模型显示名匹配，目标模型声明了同一思考深度才保留，
+     * 匹配不到就保留新 provider、清空模型（保存前由草稿归一再按「未配置」落盘）。
+     *
+     * @param {object} draft - 当前视图草稿（顶层 settings 或峰谷 profile，两者同形）。
+     * @param {number} page - 当前模型层：0 = 主模型页，i >= 1 = 候选页 i。
+     * @param {string} provider - 统一供应商下拉的新值。
+     * @param {Array} groups - 模型目录（显示名迁移的唯一来源）。
+     * @returns {object} 草稿；没有可迁移的行时原样返回同一引用（否则会被误判成未保存修改）。
+     */
+    function applyUnifiedProviderToOrchestrator(draft, page, provider, groups) {
+      if (typeof provider !== "string" || provider.length === 0) return draft;
+      // 读写都走「页 → 层」的既有语义：主模型页 = defaults，候选页 i = candidates[i - 1]。
+      // 峰谷 profile 与顶层 settings 同形，因此子视图不需要任何特殊分支。
+      const selection = modelLayerSelectionOf(draft, ORCHESTRATOR_ID, page);
+      // 未配置 = 该层没有 provider 与 model 都齐的选择：不干预主代理模型，绝不新建空行。
+      if (typeof selection?.provider !== "string" || selection.provider.length === 0
+        || typeof selection.model !== "string" || selection.model.length === 0) return draft;
+      // 与专家行同一套显示名迁移；迁移不到就保留新 provider、清空模型。
+      const migrated = migrateSettingsSelection(selection, provider, groups) ?? { provider, model: "" };
+      // 同值不写：不制造「有未保存修改」的假脏值（也保证没有可提交的 orchestrator 变更）。
+      return settingsDraftEqual(migrated, selection)
+        ? draft
+        : setModelLayerSelection(draft, ORCHESTRATOR_ID, page, migrated);
+    }
+
+    /**
      * 提交响应归一：保留已有 settings 草稿形状，同时仅在 wire 明确携带时保留提示词覆盖。
      * 这样旧 Host/旧测试的返回结构不凭空新增 promptOverrides，新 Host 则不会丢失覆盖。
      */
@@ -1197,6 +1231,7 @@
     DEFAULT_MODEL_FALLBACK_LIMIT, DEFAULT_PEAK_VALLEY_PERIODS, DEFAULT_PROMPT_MAX_GRAPHEMES, MAX_MODEL_CANDIDATES_PER_ROLE, MAX_MODEL_FALLBACK_LIMIT, MAX_MODEL_PAGES,
     NEXT_PEAK_VALLEY_PERIOD,
     NOTIFICATION_EVENT_TYPES, ORCHESTRATOR_ID, PROMPT_ROLE_IDS, PROMPT_WARNING_RATIO, SETTINGS_ROLE_LABELS, addModelCandidatePage,
+    applyUnifiedProviderToOrchestrator,
     bindClientRuntime, clampNotificationVolume, commitSettingsCandidate, compactModelCandidatesDraft, compactOrchestratorDraft, countUnicodeGraphemes,
     createSettingsModelCatalog, mergeSettingsDraftOverSource, migrateSettingsDefaults, migrateSettingsSelection, modelCandidatesErrorMessage,
     resolveSettingsForm,

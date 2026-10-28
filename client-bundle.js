@@ -14924,6 +14924,16 @@ next[role]=migrated??{provider,model:""};
 }
 return next;
 }
+function applyUnifiedProviderToOrchestrator(draft,page,provider,groups){
+if(typeof provider!=="string"||provider.length===0)return draft;
+const selection=modelLayerSelectionOf(draft,ORCHESTRATOR_ID,page);
+if(typeof selection?.provider!=="string"||selection.provider.length===0
+||typeof selection.model!=="string"||selection.model.length===0)return draft;
+const migrated=migrateSettingsSelection(selection,provider,groups)??{provider,model:""};
+return settingsDraftEqual(migrated,selection)
+?draft
+:setModelLayerSelection(draft,ORCHESTRATOR_ID,page,migrated);
+}
 function normalizeSettingsCommitDraft(value,roles){
 const normalized=normalizeSettingsDraft(value,roles);
 if(value!==null&&typeof value==="object"
@@ -14993,6 +15003,7 @@ global[SYMBOL]=Object.freeze({
 DEFAULT_MODEL_FALLBACK_LIMIT,DEFAULT_PEAK_VALLEY_PERIODS,DEFAULT_PROMPT_MAX_GRAPHEMES,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,
 NEXT_PEAK_VALLEY_PERIOD,
 NOTIFICATION_EVENT_TYPES,ORCHESTRATOR_ID,PROMPT_ROLE_IDS,PROMPT_WARNING_RATIO,SETTINGS_ROLE_LABELS,addModelCandidatePage,
+applyUnifiedProviderToOrchestrator,
 bindClientRuntime,clampNotificationVolume,commitSettingsCandidate,compactModelCandidatesDraft,compactOrchestratorDraft,countUnicodeGraphemes,
 createSettingsModelCatalog,mergeSettingsDraftOverSource,migrateSettingsDefaults,migrateSettingsSelection,modelCandidatesErrorMessage,
 resolveSettingsForm,
@@ -15973,7 +15984,7 @@ const clientSettingsNormalize=global[clientSettingsNormalizeSymbol]||{};
 const{
 DEFAULT_MODEL_FALLBACK_LIMIT,MAX_MODEL_CANDIDATES_PER_ROLE,MAX_MODEL_FALLBACK_LIMIT,MAX_MODEL_PAGES,NEXT_PEAK_VALLEY_PERIOD,
 NOTIFICATION_EVENT_TYPES,ORCHESTRATOR_ID,PROMPT_WARNING_RATIO,
-clampNotificationVolume,migrateSettingsSelection,modelLayerSelectionOf,normalizeRolePromptProjection,normalizeSettingsDraft,promptEntryOf,
+applyUnifiedProviderToOrchestrator,clampNotificationVolume,migrateSettingsSelection,modelLayerSelectionOf,normalizeRolePromptProjection,normalizeSettingsDraft,promptEntryOf,
 setModelLayerSelection,settingsRolesForProvider,syncSettingsDefaultsProvider,validatePromptText,
 }=clientSettingsNormalize;
 let react=null;
@@ -16865,7 +16876,7 @@ const current=modelLayerSelectionOf(next,role,currentModelPage);
 const migrated=migrateSettingsSelection(current,provider,providerGroups)??{provider,model:""};
 next=setModelLayerSelection(next,role,currentModelPage,migrated);
 }
-return next;
+return applyUnifiedProviderToOrchestrator(next,currentModelPage,provider,providerGroups);
 }
 if(!provider){
 const hasVisibleProvider=settingsRolesForProvider(roles).some((role)=>{
@@ -16874,11 +16885,11 @@ return typeof value==="string"&&value.length>0;
 });
 return hasVisibleProvider?{...previous,provider:""}:previous;
 }
-return{
+return applyUnifiedProviderToOrchestrator({
 ...previous,
 provider,
 defaults:syncSettingsDefaultsProvider(previous.defaults,provider,providerGroups,roles),
-};
+},0,provider,providerGroups);
 }),
 },
 react.createElement("option",{value:""},t("settings.noProvider")),
@@ -22503,7 +22514,7 @@ findNativeStatusTextNode,replaceNativeStatusPrefix,resolveRunningStatusText,
 }=clientNativeStatusModule;
 const clientSettingsNormalizeModule=globalThis[Symbol.for("dsh-expert-group/client-settings-normalize")]||{};
 const{
-PROMPT_ROLE_IDS,addModelCandidatePage,commitSettingsCandidate,compactModelCandidatesDraft,countUnicodeGraphemes,createSettingsModelCatalog,
+PROMPT_ROLE_IDS,addModelCandidatePage,applyUnifiedProviderToOrchestrator,commitSettingsCandidate,compactModelCandidatesDraft,countUnicodeGraphemes,createSettingsModelCatalog,
 migrateSettingsDefaults,migrateSettingsSelection,modelLayerSelectionOf,modelPageCountOf,normalizeModelCandidatesDraft,normalizeModelFallbackLimitDraft,
 normalizePromptOverrides,normalizeRolePromptProjection,normalizeSettingsDraft,normalizeSettingsModelGroups,removeModelCandidatePage,reorderModelLayers,
 resolveSettingsForm,setModelLayerSelection,syncSettingsDefaultsProvider,unifiedProviderOf,validateModelCandidateRows,validatePromptText,
@@ -22795,6 +22806,7 @@ exports.normalizeRolePromptProjection=normalizeRolePromptProjection;
 exports.unifiedProviderOf=unifiedProviderOf;
 exports.migrateSettingsSelection=migrateSettingsSelection;
 exports.syncSettingsDefaultsProvider=syncSettingsDefaultsProvider;
+exports.applyUnifiedProviderToOrchestrator=applyUnifiedProviderToOrchestrator;
 exports.migrateSettingsDefaults=migrateSettingsDefaults;
 exports.commitSettingsCandidate=commitSettingsCandidate;
 exports.formatSubagentMetadata=formatSubagentMetadata;

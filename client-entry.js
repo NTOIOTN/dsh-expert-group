@@ -69,7 +69,7 @@ window.__ModuleLoader__.load({
     } = clientNativeStatusModule;
     const clientSettingsNormalizeModule = globalThis[Symbol.for("dsh-expert-group/client-settings-normalize")] || {};
     const {
-      PROMPT_ROLE_IDS, addModelCandidatePage, commitSettingsCandidate, compactModelCandidatesDraft, countUnicodeGraphemes, createSettingsModelCatalog,
+      PROMPT_ROLE_IDS, addModelCandidatePage, applyUnifiedProviderToOrchestrator, commitSettingsCandidate, compactModelCandidatesDraft, countUnicodeGraphemes, createSettingsModelCatalog,
       migrateSettingsDefaults, migrateSettingsSelection, modelLayerSelectionOf, modelPageCountOf, normalizeModelCandidatesDraft, normalizeModelFallbackLimitDraft,
       normalizePromptOverrides, normalizeRolePromptProjection, normalizeSettingsDraft, normalizeSettingsModelGroups, removeModelCandidatePage, reorderModelLayers,
       resolveSettingsForm, setModelLayerSelection, syncSettingsDefaultsProvider, unifiedProviderOf, validateModelCandidateRows, validatePromptText,
@@ -517,6 +517,7 @@ window.__ModuleLoader__.load({
     exports.unifiedProviderOf = unifiedProviderOf;
     exports.migrateSettingsSelection = migrateSettingsSelection;
     exports.syncSettingsDefaultsProvider = syncSettingsDefaultsProvider;
+    exports.applyUnifiedProviderToOrchestrator = applyUnifiedProviderToOrchestrator;
     exports.migrateSettingsDefaults = migrateSettingsDefaults;
     exports.commitSettingsCandidate = commitSettingsCandidate;
     exports.formatSubagentMetadata = formatSubagentMetadata;

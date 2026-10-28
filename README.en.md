@@ -174,6 +174,7 @@ This row also carries two cross-section constraints:
 
 - The displayed value is "the provider shared by the currently visible roles"; when it is mixed or nothing is selected it shows `无`(None), and the first entry `无` means "not unified".
 - Choosing a concrete provider: switches every visible role's provider to it in one step, and migrates models with the same name by **model display name**; models that cannot be matched are cleared, leaving that role with "a provider selected but no model selected".
+- The parent agent (the first `Orchestrator` row) follows as well: when it is already configured (`settings.orchestrator.defaults` has both a provider and a model) it migrates with the same display-name rule, keeping the new provider with an empty model when the target provider has no model with the same name; when it is not configured it stays "do not touch the parent agent's model" and is **never** created implicitly. On a candidate page only that layer's Orchestrator candidate is synced, never the primary selection.
 - Choosing `无`: only clears the top-level unified selection; it **does not** delete the provider any role already has.
 - It only rewrites the draft: the role table below refreshes in step before you click Save, and is given up if you do not; after that, manually changing the provider on any row makes the "unified" state fall back to mixed (showing `无` again).
 
