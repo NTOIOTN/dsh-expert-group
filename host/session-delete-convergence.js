@@ -45,8 +45,28 @@
  *
  * 处理顺序固定为「先单会话、再批量」。某个成员展开失败（抛错）时：该成员按 RETAINED 处理，
  * 并**降级成单会话 `intent` 条目**（把 attempts / lastError 写回这条新条目），下次启动走标准
- * 重试路径；其余成员照常。只有**全部成员都收敛**时才删除批量记录——部分失败时保留它，未收敛
- * 的成员下次仍会被展开（每一步都幂等）；已降级的成员因单会话条目优先而不会被重复处理。
+ * 重试路径；其余成员照常。只有**全部成员都收敛且成员集合完整**时才删除批量记录——部分失败
+ * 时保留它，未收敛的成员下次仍会被展开（每一步都幂等）；已降级的成员因单会话条目优先而不会
+ * 被重复处理。
+ *
+ * **跨批量记录去重**：多条批量意图可能同时覆盖同一会话（连续两次作业选中同一批）。整轮维护
+ * 一个「已处理成员」集合，展开时跳过落在集合里的会话——否则同一会话会被清理两次（记账 detach
+ * 幂等，但隔离区收尾与残渣计数会被重复执行，`expandedCount` 也会虚高）。每条记录处理完
+ * （含降级成员）才把它的成员全部登记进集合。
+ *
+ * **成员集合不完整时禁止清扫**：归一函数在「有非法成员被丢弃」或「合法唯一成员数超过上限被
+ * 截断」时会给出 `sessionsIncomplete`。此时这条记录**必须保留**（它是「不完整」的唯一证据，
+ * 且下次仍要收尾已知成员），并且**整轮跳过孤儿隔离目录清扫**——漏掉的成员目录仍在磁盘上，
+ * 用不完整集合清扫会把它们当孤儿删掉，那是丢失「未完成删除」的唯一现场。取舍明确：孤儿目录
+ * 只有磁盘空间代价，误删不可逆。
+ *
+ * ## 只在持锁实例上执行（2026-10-30 oracle 复审必须修 1）
+ * 收敛会删条目、扫隔离目录，都是破坏性动作。未持锁的实例（锁被另一个实例持有 / 锁文件不可读）
+ * 如果照常收敛，就会按「原始路径上的日志还在」把**别人写到一半的批量意图**当成可丢弃记录删掉，
+ * 并清扫对方正在使用的隔离目录——对方随后改名并崩溃时，那批会话的 DEG 数据与记账再也没有清理
+ * 入口。锁门槛由装配段保证（`runConvergenceWhenLockHeld`）：`ok !== true` 时只调 `markPaused`
+ * 留下 `delete-instance-lock-unavailable` 结论，**不 run、不扫隔离区**。本模块自身不读锁、
+ * 不感知锁：它是纯收敛实现，锁门槛属于装配职责。
  *
  * ## 孤儿隔离目录清扫（同一次修正）
  * 处理完队列条目后枚举隔离根，把**名字不等于任何「在队列里仍有归属的会话」编码段**的目录整目录
@@ -81,6 +101,14 @@ import { SESSION_LOG_RESOLVE_FAILURES, encodePathSegment } from "./session-delet
 export const SESSION_DELETE_CONVERGENCE_REASONS = Object.freeze({
   /** 收敛文档不可解析：整体暂停（不修改文件、不清理、删除入口不可用）。 */
   QUEUE_UNREADABLE: "delete-queue-unreadable",
+  /**
+   * 本进程不持有实例锁：本轮收敛整体跳过（不清理、不扫隔离区，只记诊断）。
+   *
+   * 为什么收敛也要锁：未持锁的实例如果照常收敛，会按「日志还在」把别人写到一半的批量意图
+   * 当成可丢弃记录删掉，并清扫对方正在使用的隔离目录——对方随后改名并崩溃时，那批会话的
+   * DEG 数据与记账就再也没有清理入口。
+   */
+  LOCK_UNAVAILABLE: "delete-instance-lock-unavailable",
   /** 会话清单读不出来：判不了任何条目的日志状态，整体暂停。 */
   HEADERS_UNREADABLE: "delete-headers-unreadable",
   /** 单个条目的日志状态判不了（定位失败）：该条 fail-closed 并保留。 */
@@ -89,6 +117,11 @@ export const SESSION_DELETE_CONVERGENCE_REASONS = Object.freeze({
   INVALID_SESSION_ID: "delete-session-id-invalid",
   /** 记录体非法或状态未知但键可读：按 intent 处理（诊断只为可观测性）。 */
   RECORD_DEGRADED: "delete-queue-record-degraded",
+  /**
+   * 批量意图的成员集合不完整（字段缺失 / 非法成员被丢弃 / 超上限截断）：保留记录，且本轮
+   * 禁止孤儿清扫——漏掉的成员目录仍在磁盘上，用不完整集合清扫会把它们当孤儿删掉。
+   */
+  BATCH_SESSIONS_INCOMPLETE: "delete-batch-sessions-incomplete",
   /** 日志被重新写入：保留会话与数据（「删除未完成，内容已保留」）。 */
   SESSION_PRESERVED: "delete-incomplete-content-preserved",
   /** 残渣落盘失败：保留收敛日志条目。 */
@@ -106,6 +139,13 @@ export const SESSION_DELETE_CONVERGENCE_REASONS = Object.freeze({
   ENTRY_FAILED: "delete-entry-failed",
   /** 枚举隔离根失败：只影响孤儿目录清扫，不影响条目结论。 */
   QUARANTINE_LIST_FAILED: "delete-quarantine-list-failed",
+  /**
+   * 本轮存在成员集合不完整的批量记录：整轮跳过孤儿隔离目录清扫（其余收敛照常）。
+   *
+   * 这是「宁可留着孤儿目录，也不能删错」的取舍：孤儿目录只有磁盘空间代价，误删则是丢失
+   * 未完成删除的唯一现场。
+   */
+  QUARANTINE_SWEEP_SKIPPED: "delete-quarantine-sweep-skipped",
   /** 孤儿隔离目录删除失败（或名字非法被跳过）：只记诊断，不失败整轮。 */
   QUARANTINE_DISCARD_FAILED: "delete-quarantine-discard-failed",
   /** 保留条目的 attempts / lastError 写回失败：只记诊断，不改变收敛结论。 */
@@ -396,42 +436,82 @@ async function recordRetainedAttempt(store, sessionId, record, entry, diagnostic
 }
 
 /**
+ * 批量展开需要的窄能力面（模块级实现，工厂只负责把闭包里的实现绑进来）。
+ *
+ * 显式端口的价值：模块级实现因此可复用、可被测试替身替换，而工厂内不出现「第二个实现」。
+ *
+ * @param {object} deps - 已绑定的实现。
+ * @returns {{store: object, convergeEntry: Function, retainAttempt: Function,
+ *   dropEntry: Function, consumeHookInterrupt: Function}} 端口面。
+ */
+function buildBatchPortsOf({
+  store,
+  convergeEntry,
+  recordRetainedAttempt,
+  dropQuietly,
+  consumeHookInterrupt,
+  clock,
+  logger,
+}) {
+  return {
+    store,
+    convergeEntry,
+    retainAttempt: (sessionId, record, entry, diagnostics) => (
+      recordRetainedAttempt(store, sessionId, record, entry, diagnostics, clock, logger)
+    ),
+    dropEntry: (drop, diagnostics) => (
+      dropQuietly(drop, diagnostics, SESSION_DELETE_CONVERGENCE_REASONS.QUEUE_DROP_FAILED)
+    ),
+    consumeHookInterrupt,
+  };
+}
+
+/**
  * 展开一条批量写前意图记录（模块级实现，收敛工厂只负责接线）。
  *
  * 为什么成员按 `intent` 处理：批量记录的状态是恒定的「这些会话即将 / 已经进入删除」，
  * 而分支判定只依赖「原始路径上的日志是否存在」——日志不在 → 完整清理，日志还在 → 仅收尾。
  * 这正是逐目标 `intent` 条目时代的语义，只是把 N 条记录合并成 1 条。
  *
- * 三条边界：
+ * 四条边界：
  * 1. **单会话条目优先**：成员若在 `sessionKeySet` 里（有自己的条目），这里直接跳过——
  *    它已由单会话循环处理过，重复展开会重复清理 / 重复收尾；
- * 2. 某个成员抛错：该成员按 RETAINED 处理并**降级成单会话 `intent` 条目**（把 attempts 与
+ * 2. **跨批量记录去重**：成员若已在 `processedMembers`（本轮更早的批量记录处理过），同样跳过。
+ *    多条批量记录覆盖同一会话时（例如连续两次作业选中同一批），该会话的清理只能执行一次；
+ * 3. 某个成员抛错：该成员按 RETAINED 处理并**降级成单会话 `intent` 条目**（把 attempts 与
  *    lastError 写回），下次走标准重试路径；其余成员照常，不影响本轮其它会话；
- * 3. 只有**全部成员收敛**才删除批量记录。部分失败时保留它：未收敛的成员下次仍要展开（幂等），
- *    已降级的成员因单会话条目优先而不会被重复处理。
+ * 4. 只有**全部成员收敛且成员集合完整**才删除批量记录。部分失败时保留它：未收敛的成员下次
+ *    仍要展开（幂等）；集合不完整时也保留——它是「不完整」的唯一证据，且下次仍要收尾已知成员。
  *
  * @param {object} params
  * @param {string} params.batchKey - 批量记录的键。
- * @param {object|undefined} params.record - 归一后的批量记录（含 `sessions`）。
- * @param {{headers: Map, residueRecords: Map, sessionKeySet: Set<string>}} params.context - 本轮快照。
+ * @param {object|undefined} params.record - 归一后的批量记录（含 `sessions` / `sessionsIncomplete`）。
+ * @param {{headers: Map, residueRecords: Map, sessionKeySet: Set<string>,
+ *   processedMembers: Set<string>}} params.context - 本轮快照。
  * @param {object} params.ports - 工厂注入的能力面：
  *   `{convergeEntry, retainAttempt, dropEntry, consumeHookInterrupt}`。
- * @returns {Promise<{entries: object[], degraded: string[], diagnostics: object[]}>} 展开结论。
+ * @returns {Promise<{entries: object[], degraded: string[], diagnostics: object[],
+ *   incomplete: boolean, allConverged: boolean}>} 展开结论。
  */
 async function expandBatchQueueEntry({ batchKey, record, context, ports }) {
   const diagnostics = [];
   const sessions = Array.isArray(record?.sessions) ? record.sessions : [];
-  if (sessions.length === 0) {
-    // 键是批量形态但成员集合读不出来（外部篡改 / 旧版本残留）：fail-closed。
-    // 保留记录并写诊断——猜成员只会删错东西，丢弃记录则会让「不知道谁在删除中」变成静默。
-    recordDiagnostic(diagnostics, SESSION_DELETE_CONVERGENCE_REASONS.RECORD_DEGRADED);
-    return { entries: [], degraded: [], diagnostics };
+  // 成员集合不完整 = 「字段缺失 / 空集合」或归一阶段已经标记 `sessionsIncomplete`。
+  // 这两种情况都必须保留记录（不删）并让调用方本轮禁止孤儿清扫：被丢弃的成员目录仍在磁盘上，
+  // 用不完整集合清扫会把它们当孤儿删掉——那是丢失「未完成删除」的唯一现场。
+  const incomplete = record?.sessionsIncomplete === true || sessions.length === 0;
+  if (incomplete === true) {
+    recordDiagnostic(diagnostics, SESSION_DELETE_CONVERGENCE_REASONS.BATCH_SESSIONS_INCOMPLETE);
+    // 成员集合完全读不出来时再补一条「记录体降级」诊断（可观测性，不影响结论）。
+    if (sessions.length === 0) recordDiagnostic(diagnostics, SESSION_DELETE_CONVERGENCE_REASONS.RECORD_DEGRADED);
   }
   const entries = [];
   const degraded = [];
   let allConverged = true;
   for (const sessionId of sessions) {
     if (context.sessionKeySet.has(sessionId)) continue;
+    // 跨批量记录去重：同一会话在更早的批量记录里已经处理过（含降级），这里不得再清理一次。
+    if (context.processedMembers?.has?.(sessionId) === true) continue;
     let entry;
     try {
       entry = await ports.convergeEntry(
@@ -451,10 +531,10 @@ async function expandBatchQueueEntry({ batchKey, record, context, ports }) {
     }
     entries.push(entry);
   }
-  if (allConverged === true) {
+  if (allConverged === true && incomplete !== true) {
     await ports.dropEntry(() => ports.store.deleteQueueEntry(batchKey), diagnostics);
   }
-  return { entries, degraded, diagnostics };
+  return { entries, degraded, diagnostics, incomplete, allConverged };
 }
 
 /**
@@ -824,24 +904,6 @@ export function installSessionDeleteConvergence({ store, logs, cleanup, quaranti
     };
   }
 
-  /**
-   * 批量展开需要的窄能力面（把闭包内的实现绑成显式端口，便于模块级实现复用与测试替身）。
-   *
-   * 只在有批量记录时才构造：没有批量记录的老现场完全不产生额外对象，行为与修正前一致。
-   */
-  function buildBatchPorts() {
-    return {
-      store,
-      convergeEntry,
-      retainAttempt: (sessionId, record, entry, diagnostics) => (
-        recordRetainedAttempt(store, sessionId, record, entry, diagnostics, clock, logger)
-      ),
-      dropEntry: (drop, diagnostics) => (
-        dropQuietly(drop, diagnostics, SESSION_DELETE_CONVERGENCE_REASONS.QUEUE_DROP_FAILED)
-      ),
-      consumeHookInterrupt,
-    };
-  }
 
   /** 一轮收敛的唯一实现（`run()` 保证它只被调用一次）。 */
   async function execute() {
@@ -891,7 +953,15 @@ export function installSessionDeleteConvergence({ store, logs, cleanup, quaranti
     // 否则孤儿残渣清扫会把它刚写下的恢复记录当成无主残渣删掉。
     const residueReferenced = new Set(sessionKeys);
     const batchSessionIds = [];
-    const ports = buildBatchPorts();
+    // 跨批量记录去重：同一会话可能被多条批量意图同时覆盖（连续两次作业选中同一批）。
+    // 集合在整轮内共享，保证它的清理 / 收尾只执行一次。
+    const processedBatchMembers = new Set();
+    // 是否允许本轮做孤儿隔离目录清扫：任一批量记录的成员集合不完整就必须整轮跳过
+    // （漏掉的成员目录还在磁盘上，按不完整集合清扫会误删）。
+    let sweepUnsafe = false;
+    const ports = buildBatchPortsOf({
+      store, convergeEntry, recordRetainedAttempt, dropQuietly, consumeHookInterrupt, clock, logger,
+    });
     for (const batchKey of batchKeys) {
       const record = queue.records?.get(batchKey);
       const sessions = Array.isArray(record?.sessions) ? record.sessions : [];
@@ -899,20 +969,30 @@ export function installSessionDeleteConvergence({ store, logs, cleanup, quaranti
       const outcome = await expandBatchQueueEntry({
         batchKey,
         record,
-        context: { headers: headerIndex, residueRecords, sessionKeySet },
+        context: { headers: headerIndex, residueRecords, sessionKeySet, processedMembers: processedBatchMembers },
         ports,
       });
       for (const entry of outcome.entries) entries.push(entry);
       for (const sessionId of outcome.degraded) residueReferenced.add(sessionId);
       for (const diagnostic of outcome.diagnostics) recordDiagnostic(diagnostics, diagnostic.code);
+      // 处理完（含降级成员）才把成员全部登记：下一条批量记录据此跳过已处理会话。
+      for (const sessionId of sessions) processedBatchMembers.add(sessionId);
+      if (outcome.incomplete === true) sweepUnsafe = true;
     }
     // 处理完队列条目之后再扫孤儿隔离目录：归属集合此刻才是「本轮真正还在排队」的集合；
     // 批量成员必须计入（否则正在批量删除中的目录会被当孤儿删掉）。
-    const orphanQuarantinesRemoved = await sweepOrphanQuarantines(
-      quarantine,
-      [...sessionKeys, ...batchSessionIds],
-      diagnostics,
-    );
+    // 成员集合不完整时整轮跳过清扫：宁可在磁盘上留孤儿目录（只占空间），也不能把仍在删除中
+    // 的会话目录误删（那是丢失未完成删除的唯一现场）。
+    let orphanQuarantinesRemoved = 0;
+    if (sweepUnsafe === true) {
+      recordDiagnostic(diagnostics, SESSION_DELETE_CONVERGENCE_REASONS.QUARANTINE_SWEEP_SKIPPED);
+    } else {
+      orphanQuarantinesRemoved = await sweepOrphanQuarantines(
+        quarantine,
+        [...sessionKeys, ...batchSessionIds],
+        diagnostics,
+      );
+    }
     const orphanResiduesRemoved = await sweepOrphanResiduesOf(store, [...residueReferenced], residue, diagnostics);
     return summarize(
       entries,

@@ -96,30 +96,57 @@ export function isBatchQueueKey(key) {
   return BATCH_QUEUE_KEY_BODY_PATTERN.test(key.slice(BATCH_QUEUE_KEY_PREFIX.length));
 }
 
+/** 批量键随机段的位数：36^6 ≈ 21.8 亿，同毫秒内碰撞概率可忽略，且键长仍然很短。 */
+const BATCH_KEY_TOKEN_CHARS = 6;
+
 /**
- * 生成一条批量意图记录的键：「batch: + 毫秒时间戳的 36 进制 + - + 随机 token」。
+ * 生成一条批量意图记录的键：「batch: + 毫秒时间戳的 36 进制 + - + 6 位随机 token」。
  *
  * 时间戳保持可读（排查时能一眼看出是哪次作业写的），随机段保证同一毫秒内的两次作业
  * 不会互相覆盖 —— 覆盖会让前一个作业尚未收敛的成员**凭空消失**（整份记录被替换）。
  *
+ * **随机源缺省时退回 `Math.random`**：生产装配不注入它，若缺省退化成固定 token，同一毫秒内
+ * 的两次写入会互相覆盖（时间戳粒度是毫秒，批量删除连续提交时完全可能撞上）。注入值只用于
+ * 测试断言（函数返回值可以是字符串或数字，都会被归一成 6 位 base36 后缀）。
+ *
  * @param {number} now - 毫秒时间戳（非法值退回系统时间：键的取值不承担安全性）。
- * @param {(() => string|number|undefined)|string|number} [random] - 随机 token 提供者或值
- *   （测试可注入确定值）。
- * @returns {string} 满足 isBatchQueueKey 的键。
+ * @param {() => string|number|undefined} [random] - 随机 token 提供者；不是函数时退回 Math.random。
+ * @returns {string} 满足 isBatchQueueKey 的键（长度 ≤ 96、字符集受限）。
  */
 export function makeBatchQueueKey(now, random) {
   const stamp = Number.isFinite(now) && now >= 0 ? Math.floor(now) : Date.now();
+  return BATCH_QUEUE_KEY_PREFIX + stamp.toString(36) + "-" + randomBatchToken(random);
+}
+
+/**
+ * 归一随机 token（**纯函数、永不抛错**，随机源异常时退回 Math.random）。
+ *
+ * 三种输入形状：数字按 36 进制取值（注入 `0.5` 这类确定值便于断言）；字符串先清洗成
+ * 安全字符；缺失/异常则真的取随机数。最后统一成固定 6 位：短则左补 `0`，长则取后 6 位。
+ *
+ * @param {unknown} random - 注入的随机源（期望是函数）。
+ * @returns {string} 6 位 base36 风格 token（只含 `[a-z0-9]`）。
+ */
+function randomBatchToken(random) {
   let raw;
   try {
-    raw = typeof random === "function" ? random() : random;
+    raw = typeof random === "function" ? random() : undefined;
   } catch {
     raw = undefined;
   }
-  const token = String(raw ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]/gu, "")
-    .slice(0, 16) || "0";
-  return BATCH_QUEUE_KEY_PREFIX + stamp.toString(36) + "-" + token;
+  const fallback = () => Math.abs(Math.floor(Math.random() * 36 ** BATCH_KEY_TOKEN_CHARS)).toString(36);
+  let token;
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    token = Math.abs(Math.floor(raw * 36 ** BATCH_KEY_TOKEN_CHARS)).toString(36);
+  } else if (typeof raw === "string") {
+    token = raw.toLowerCase().replace(/[^a-z0-9]/gu, "");
+  } else {
+    token = fallback();
+  }
+  if (token.length === 0) token = fallback();
+  return token.length >= BATCH_KEY_TOKEN_CHARS
+    ? token.slice(-BATCH_KEY_TOKEN_CHARS)
+    : token.padStart(BATCH_KEY_TOKEN_CHARS, "0");
 }
 
 /** 残渣表的失败项上限与单项长度上限（残渣只是可重试记录，不是审计日志）。 */
@@ -173,12 +200,15 @@ export const DOMAIN_SESSION_DELETE_RECORD = domainZ.object({}).passthrough();
  * - `attempts` 非法 → 0（重试计数只影响诊断，不参与安全性）；
  * - `registeredAt` 非法 → 省略（绝不补 0：0 会被误读成「早已登记」）；
  * - `lastError` 非法 → 省略，合法值按上限截断；
- * - `sessions` 非法 / 为空 → 省略；合法值只保留非空字符串、去重、按上限截断。批量意图
- *   记录的成员集合因此永远是有界且无重复的，收敛展开不需要再做二次校验。
+ * - `sessions` 非法 / 为空 → 省略；合法值只保留非空字符串、去重、按上限截断。
+ * - `sessionsIncomplete` 只在**成员集合真的丢了东西**时出现（有非法成员被丢弃，或合法唯一
+ *   成员数超过上限被截断）；纯重复项不算。收敛期据此禁止孤儿清扫——被丢掉的成员其隔离
+ *   目录仍在磁盘上，用不完整集合去清扫会把它们当孤儿删掉。
  *
  * @param {unknown} raw - 表里读到的原始值。
  * @returns {{status: string, attempts: number, registeredAt?: number, lastError?: string,
- *   sessions?: string[], degraded: boolean}} 归一记录；`degraded` 表示原始值不能按契约解释。
+ *   sessions?: string[], sessionsIncomplete?: boolean, degraded: boolean}} 归一记录；
+ *   `degraded` 表示原始值不能按契约解释。
  */
 export function normalizeQueueRecord(raw) {
   const source = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : undefined;
@@ -191,13 +221,14 @@ export function normalizeQueueRecord(raw) {
   const lastError = typeof source?.lastError === "string" && source.lastError.length > 0
     ? source.lastError.slice(0, MAX_QUEUE_ERROR_CHARS)
     : undefined;
-  const sessions = normalizeQueueSessions(source?.sessions);
+  const normalizedSessions = normalizeQueueSessions(source?.sessions);
   return {
     status,
     attempts,
     ...(registeredAt === undefined ? {} : { registeredAt }),
     ...(lastError === undefined ? {} : { lastError }),
-    ...(sessions === undefined ? {} : { sessions }),
+    ...(normalizedSessions.sessions === undefined ? {} : { sessions: normalizedSessions.sessions }),
+    ...(normalizedSessions.incomplete === true ? { sessionsIncomplete: true } : {}),
     // 只有「状态可解释且关键字段齐全」才算未降级；未知状态本身就是降级信号。
     degraded: source === undefined || knownStatus !== true || registeredAt === undefined,
   };
@@ -206,26 +237,36 @@ export function normalizeQueueRecord(raw) {
 /**
  * 归一批量意图的成员集合（**纯函数、永不抛错**）。
  *
- * 只保留非空字符串、去重、上限 200 条；其余情况一律省略该字段（不是「空数组」）：
- * 空集合的批量记录没有意义，省略后读取面才不需要区分「没有成员」与「字段缺失」。
- * 单条成员本身不再做 ID 合法性校验：非法成员由收敛期逐条 fail-closed（那是收敛的职责），
- * 这里越权过滤会让「记录里写了什么」与「收敛看到什么」不一致。
+ * 只保留非空字符串、去重、上限 200 条；空集合省略该字段（不是「空数组」）。
+ * 单条成员本身不做 ID 合法性校验（非法成员由收敛期逐条 fail-closed，那是收敛的职责）。
+ *
+ * 返回值带 `incomplete`：只要有成员被丢弃或截断就是 true。为什么必须显式报出来：收敛期
+ * 用这份集合决定「哪些隔离目录仍有归属」，不完整的集合会让漏掉的成员被当成孤儿删掉；
+ * 纯重复项只是冗余，不算丢失。
  *
  * @param {unknown} raw - 原始 sessions 字段。
- * @returns {string[]|undefined} 归一后的成员集合；无法解释时 undefined。
+ * @returns {{sessions: string[]|undefined, incomplete: boolean}} 归一后的成员集合与是否不完整。
  */
 function normalizeQueueSessions(raw) {
-  if (!Array.isArray(raw)) return undefined;
+  if (!Array.isArray(raw)) return { sessions: undefined, incomplete: false };
   const sessions = [];
   const seen = new Set();
+  let incomplete = false;
   for (const entry of raw) {
-    if (typeof entry !== "string" || entry.length === 0) continue;
+    if (typeof entry !== "string" || entry.length === 0) {
+      incomplete = true;
+      continue;
+    }
     if (seen.has(entry)) continue;
     seen.add(entry);
+    if (sessions.length >= MAX_BATCH_SESSIONS) {
+      // 已达上限且出现了新的唯一成员：集合被截断，调用方不得据此做孤儿清扫。
+      incomplete = true;
+      break;
+    }
     sessions.push(entry);
-    if (sessions.length >= MAX_BATCH_SESSIONS) break;
   }
-  return sessions.length === 0 ? undefined : sessions;
+  return { sessions: sessions.length === 0 ? undefined : sessions, incomplete };
 }
 
 /**

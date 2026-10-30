@@ -16,6 +16,9 @@
  * 3. **收敛（票据 03）**：同样等 binding 就绪后**执行一次**，判据是「日志是否存在」，
  *    不做 live 检查、不等任何就绪信号（规格决策 13）。它排在探测之后，因为探测的
  *    「收敛文档可解析」结论决定本轮是否整体暂停；两者各自读文档，互不依赖。
+ *    **执行前必须复核实例锁归属**（`runConvergenceWhenLockHeld`）：未持锁的实例不得收敛、
+ *    不得扫隔离区——它会把别人写到一半的批量意图当成可丢弃记录删掉，并清扫对方正在使用的
+ *    隔离目录（对方随后崩溃时，那批会话的 DEG 数据就再也没有清理入口）。
  *
  * ## 与既有段的关系
  * 本段只消费 `state.storageBinding` / `state.settingsStorage`（第 3 段已就绪）与宿主服务读取器，
@@ -35,7 +38,10 @@ import {
 } from "./session-delete-quarantine.js";
 import { SESSION_LOG_RESOLVE_FAILURES, resolveSessionLogLocation } from "./session-delete-paths.js";
 import { installSessionDeleteCleanup } from "./session-delete-cleanup.js";
-import { installSessionDeleteConvergence } from "./session-delete-convergence.js";
+import {
+  SESSION_DELETE_CONVERGENCE_REASONS,
+  installSessionDeleteConvergence,
+} from "./session-delete-convergence.js";
 import { releaseLockAfterDrain } from "./session-delete-job.js";
 import { persistDomainEntry, removeDomainEntry } from "../storage.js";
 
@@ -140,6 +146,79 @@ function scheduleProbeWhenStorageReady(state, probe) {
     cancel();
     probe.dispose();
   };
+}
+
+/**
+ * 锁归属复核：只有 `verifyOwnership()` 明确返回 `ok: true` 才算持有。
+ *
+ * 锁面缺失、抛错、返回非对象、`ok` 非 true 一律按「未持锁」处理（fail-closed）：
+ * 收敛会删条目、扫隔离目录，证明不了资格就不能做破坏性动作。
+ *
+ * @param {object} lock - 实例锁能力面。
+ * @returns {boolean} 本进程是否确实持有锁。
+ */
+function hasInstanceLock(lock) {
+  const verify = lock?.verifyOwnership;
+  if (typeof verify !== "function") return false;
+  try {
+    return verify()?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 只在**本进程确实持有实例锁**时执行一次收敛（收敛 effect 的唯一入口）。
+ *
+ * ## 为什么收敛也要锁
+ * 收敛会删队列条目、扫隔离目录，都是破坏性动作。未持锁的实例（锁被另一个实例持有，或锁
+ * 文件不可读）如果照常收敛，就会按「原始路径上的日志还在」把**别人写到一半的批量意图**当成
+ * 可丢弃记录删掉，并清扫对方正在使用的隔离目录——对方随后改名并崩溃时，那批会话的 DEG 数据
+ * 与记账再也没有清理入口（孤儿清扫只删文件）。
+ *
+ * 因此未持锁时**不 run、不扫隔离区**：只调 `markPaused` 留下可读结论并记一行日志。
+ * `markPaused` 是幂等的，重复调用返回同一份暂停快照。
+ *
+ * 导出本函数是为了让测试用锁面替身直接验证门槛（生产只会经 `scheduleConvergenceWhenLockHeld`
+ * 调用它）。
+ *
+ * @param {object} deps
+ * @param {object} deps.lock - 实例锁能力面（`verifyOwnership()`）。
+ * @param {object} deps.convergence - 收敛能力面（`run` / `markPaused`）。
+ * @param {object} [deps.logger] - 诊断日志出口（只记原因码）。
+ * @returns {Promise<object>} 收敛结论或暂停快照。
+ */
+export async function runConvergenceWhenLockHeld({ lock, convergence, logger }) {
+  if (hasInstanceLock(lock) !== true) {
+    try {
+      logger?.info?.(
+        "dsh-expert-group: session delete convergence skipped ["
+          + SESSION_DELETE_CONVERGENCE_REASONS.LOCK_UNAVAILABLE + "]",
+      );
+    } catch {
+      // 诊断日志失败不得影响结论。
+    }
+    return convergence.markPaused(SESSION_DELETE_CONVERGENCE_REASONS.LOCK_UNAVAILABLE);
+  }
+  return convergence.run();
+}
+
+/**
+ * 等 storage binding 就绪后，先复核实例锁归属再执行一次收敛。
+ *
+ * 等待超时仍按「收敛文档不可解析」整体暂停（与锁无关：那时连文档都拿不到）。
+ *
+ * @param {object} state - 装配状态容器（读 storageBinding）。
+ * @param {object} lock - 实例锁能力面。
+ * @param {object} convergence - 收敛能力面。
+ * @param {object} [logger] - 诊断日志出口。
+ * @returns {Function} 卸载函数：取消等待、清定时器。
+ */
+function scheduleConvergenceWhenLockHeld(state, lock, convergence, logger) {
+  return scheduleWhenStorageReady(state, {
+    onReady: () => runConvergenceWhenLockHeld({ lock, convergence, logger }),
+    onTimeout: () => convergence.markPaused(STARTUP_PROBE_REASONS.QUEUE_UNREADABLE),
+  });
 }
 
 /**
@@ -621,13 +700,10 @@ export function assembleSessionDelete(state, hostServices) {
     },
     {
       // 票据 03：收敛 effect **追加**在探测之后（既有两个 effect 的相对顺序一字未改）。
+      // 锁门槛：未持锁的实例**不执行**收敛、不扫隔离区（见 runConvergenceWhenLockHeld）。
       kind: "effect",
       label: "dsh-expert-group: session delete convergence",
-      factory: () => scheduleWhenStorageReady(state, {
-        onReady: () => convergence.run(),
-        // 等不到 binding 等于「收敛文档不可解析」：本轮整体暂停并留下可读结论。
-        onTimeout: () => convergence.markPaused(STARTUP_PROBE_REASONS.QUEUE_UNREADABLE),
-      }),
+      factory: () => scheduleConvergenceWhenLockHeld(state, lock, convergence, logger),
     },
   ];
 }

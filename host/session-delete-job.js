@@ -28,7 +28,8 @@
  * 存在性逐会话收敛：日志不在 → 完整清理，日志还在 → 仅收尾隔离目录。于是把「每目标两条」
  * 压成「每次作业一条批量意图记录」（键由 `makeBatchQueueKey` 生成，成员写进 `sessions`）。
  *
- * 批量意图的**去留**（S6）严格按「是否还有待办」决定：只要本次有 `deleted` / `absent` 的目标，
+ * 批量意图的**去留**（S6）严格按「是否还有待办」决定：只要本次有 `deleted` / `absent` / `raced`
+ * 的目标（即**任何目标真的改过名**），
  * 它们的 DEG 数据、记账、集合与派生缓存**尚未清理**——完整清理只在收敛期发生，而收敛只遍历
  * 队列键。此时丢弃批量意图等于把这些数据永久泄漏（孤儿清扫只删隔离目录里的文件）。因此批量
  * 意图会留到下次启动，由收敛展开并逐条完整清理后再删除。反过来，整批都是 `skipped` / `failed`
@@ -579,16 +580,22 @@ async function writeBatchIntent(deps, pendingTargets) {
 /**
  * 本次作业是否留下了「只能由收敛期收尾」的成员（决定批量意图能不能在 S6 丢弃）。
  *
- * `deleted` / `absent` 的日志已经不在原路径：DEG 数据、记账、归档 / 置顶集合与派生缓存的
- * 清理由收敛期的**完整清理**分支负责，而收敛只遍历队列键。丢弃批量意图等于让这些数据永久
- * 泄漏（孤儿清扫只删隔离目录里的文件，不清理任何 DEG 数据）。
+ * 判据是「**本次有没有目标真的改过名**」，而不是「有没有目标被删掉」：
+ * - `deleted` / `absent`：日志已经不在原路径。DEG 数据、记账、归档 / 置顶集合与派生缓存的
+ *   清理由收敛期的**完整清理**分支负责，而收敛只遍历队列键。丢弃批量意图等于让这些数据永久
+ *   泄漏（孤儿清扫只删隔离目录里的文件，不清理任何 DEG 数据）。
+ * - `raced`：改名已经发生，磁盘上**同时**可能有「隔离区旧代际文件」与「原路径新日志」两份，
+ *   收敛期必须按「日志是否存在」分流（日志在 → 保留会话并丢弃旧日志；日志不在 → 完整清理）。
+ *   race 通常已经写了单会话 `race` 条目，但那条写入也可能失败（S5 状态推进失败路径）——此时
+ *   批量意图是唯一还能让收敛期看到这个会话的记录。因此 `raced` 也必须保留批量意图。
  *
- * 其余结局（skipped / failed / raced）都有各自的归宿：日志仍在原地，或已写了单会话条目，
- * 因此丢弃批量意图不会丢待办。
+ * 只有「全部目标都没改名（skipped / failed）」时才允许 S6 丢弃：日志仍在原地，收敛无事可做，
+ * 留着反而会给闸门留下误导性的 pending 残留。
  */
 function needsPostJobConvergence(results) {
   return (Array.isArray(results) ? results : []).some((result) => result?.state === SESSION_DELETE_STATES.DELETED
-    || result?.state === SESSION_DELETE_STATES.ABSENT);
+    || result?.state === SESSION_DELETE_STATES.ABSENT
+    || result?.state === SESSION_DELETE_STATES.RACED);
 }
 
 /**
