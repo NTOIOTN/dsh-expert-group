@@ -21,7 +21,7 @@
  * @module dsh-expert-group/host/session-delete-quarantine
  */
 import { basename, dirname, join } from "node:path";
-import { mkdirSync, renameSync, rmdirSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync, renameSync, rmdirSync, rmSync, statSync } from "node:fs";
 import { encodePathSegment } from "./session-delete-paths.js";
 
 /** 隔离根目录名（在 DSH home 下）。 */
@@ -56,6 +56,8 @@ const DEFAULT_IO = Object.freeze({
   rmdir: rmdirSync,
   // 票据 03：收敛期的收尾要删掉整个会话隔离目录（含文件），因此需要 rm。
   rm: rmSync,
+  // 孤儿清扫（故障修正）：枚举隔离根下的目录项。
+  readdir: readdirSync,
 });
 
 /**
@@ -324,4 +326,112 @@ export function discardSessionQuarantineDirectory(root, sessionId, io = DEFAULT_
     if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return { settled: true };
     return { settled: false, reason: "failed" };
   }
+}
+
+/**
+ * 列出隔离根下**只**是目录的名字（孤儿清扫用）。
+ *
+ * 为什么需要它：旧版本只有「按会话 ID 拼路径」的入口，没有任何代码枚举隔离根，于是
+ * 「隔离目录还在、收敛队列条目已经没了」的孤儿目录永远没人处理，闸门会一边阻塞删除一边
+ * 又找不到可收敛的对象。收敛期用本函数补上这条路径。
+ *
+ * 边界（刻意保守）：
+ * - 隔离根不存在 → 空数组（没有隔离区就没有孤儿，这不是错误）；
+ * - 只返回 `isDirectory() === true` 的项，隔离根直属文件一律忽略（本函数不删任何东西，
+ *   真正的删除由 {@link discardSessionQuarantineByName} 负责，且只按名字）；
+ * - 其余读失败（权限/IO）**原样抛错**：调用方必须能把它记成诊断，而不是静默当成「没有孤儿」。
+ *
+ * @param {string} root - 隔离根（非空字符串；空/非法返回空数组，不猜路径）。
+ * @param {object} [io] - 文件系统端口（`readdir`）。
+ * @returns {string[]} 目录名数组（不含路径、不含直属文件）。
+ * @throws {Error} 枚举失败（非 ENOENT / ENOTDIR）。
+ */
+function listSessionQuarantineDirectoryNames(root, io = DEFAULT_IO) {
+  if (typeof root !== "string" || root.length === 0) return [];
+  let entries;
+  try {
+    entries = io.readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return [];
+    throw error;
+  }
+  const names = [];
+  for (const entry of entries ?? []) {
+    if (entry === null || typeof entry !== "object") continue;
+    if (typeof entry.isDirectory !== "function" || entry.isDirectory() !== true) continue;
+    const name = typeof entry.name === "string" ? entry.name : undefined;
+    // 空名字不可能来自 readdir；防御性跳过，绝不生成「删除隔离根本身」的路径。
+    if (name === undefined || name.length === 0) continue;
+    names.push(name);
+  }
+  return names;
+}
+
+/**
+ * 按**单个安全路径段**删除隔离根下的一个目录（只用于孤儿清扫）。
+ *
+ * ## 为什么必须校验名字
+ * 这是本模块唯一一个「名字不是来自会话 ID 编码」的删除入口：名字来自 `readdir`，因此
+ * 只要校验不严就可能被拼成路径穿越（`..`、`a/b`、`C:\other`）。规则：
+ * - 必须是**非空**字符串，且不是 `.` / `..`；
+ * - 不含 `/` 或 `\\`（两个平台的路径分隔符），不含控制字符（`\u0000`–`\u001F`、`\u007F`）；
+ * - 校验通过后仍用 `join(root, name)` 拼路径，绝不把名字当相对路径解析。
+ *
+ * ## 失败口径
+ * - 名字非法 → `{settled:false, reason:"invalid-name"}`（调用方记诊断并跳过，绝不删除）；
+ * - 目录已不存在 → 视为已收尾（幂等）；
+ * - 其余删除失败（占用/权限）→ `{settled:false, reason:"failed"}`，由收敛期记诊断；
+ *   清扫失败**不**影响本轮其他条目的结论。
+ *
+ * @param {string} root - 隔离根。
+ * @param {string} directoryName - 目录名（必须是单个安全路径段）。
+ * @param {object} [io] - 文件系统端口（`rm`）。
+ * @returns {{settled: boolean, reason?: string}} 删除结果。
+ */
+function discardSessionQuarantineByName(root, directoryName, io = DEFAULT_IO) {
+  if (typeof root !== "string" || root.length === 0) return { settled: false, reason: "path-unresolved" };
+  if (isSafeQuarantineDirectoryName(directoryName) !== true) return { settled: false, reason: "invalid-name" };
+  const directory = join(root, directoryName);
+  try {
+    io.rm(directory, { recursive: true, force: true });
+    return { settled: true };
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return { settled: true };
+    return { settled: false, reason: "failed" };
+  }
+}
+
+/**
+ * 孤儿清扫的两个入口以**一个命名空间**导出。
+ *
+ * 为什么不是两个独立 export：本模块已经导出 11 个符号，依赖图门禁 C4 的上限是 12
+ * （`scripts/check-dependency-graph.mjs`）。合成一个导出面既守住接口宽度，也表明这两个函数
+ * 只服务同一件事（孤儿目录清扫），不应被其它调用方单独使用。`listDirectoryNames` 只读、
+ * `discardByName` 是唯一按名字删除的入口（且自带路径段校验）。
+ */
+export const SESSION_QUARANTINE_ORPHANS = Object.freeze({
+  /** 列出隔离根下的目录名（只读；隔离根缺失返回空数组，其它读失败抛错）。 */
+  listDirectoryNames: listSessionQuarantineDirectoryNames,
+  /** 按单个安全路径段删除一个目录（只用于孤儿清扫）。 */
+  discardByName: discardSessionQuarantineByName,
+});
+
+/** 控制字符匹配（C0 + DEL）：路径段里出现它们只可能是构造出来的恶意/损坏名字。 */
+const CONTROL_CHARACTER = /[\u0000-\u001F\u007F]/u;
+
+/**
+ * 判定一个名字是否是**单个安全路径段**（孤儿清扫专用）。
+ *
+ * 与 `encodePathSegment` 的分工：那个负责把任意会话 ID 编码成安全段，这里只是**校验**一个
+ * 已经存在的目录名——它只可能来自 `readdir`，因此拒绝任何带分隔符/控制字符/相对路径语义的值。
+ *
+ * @param {unknown} name - 待校验的目录名。
+ * @returns {boolean} 安全与否。
+ */
+function isSafeQuarantineDirectoryName(name) {
+  if (typeof name !== "string" || name.length === 0) return false;
+  if (name === "." || name === "..") return false;
+  if (name.includes("/") || name.includes("\\")) return false;
+  if (CONTROL_CHARACTER.test(name)) return false;
+  return true;
 }

@@ -23,8 +23,12 @@
  * ## 可处理性 = 是不是 live 闭包 × 闸门
  * - `live` / `live-descendant`：目标自己或它的后代仍被宿主占用（规格决策 2/3）。后代来自
  *   header 血缘 ∪ DEG 子会话记录的并集，与作业期冻结闭包用的是同一套展开（闭包模块）；
- * - `pending-cleanup`：上一次删除的收尾没做完（隔离目录还在，或收敛队列仍有未完成条目）。
- *   判定用票据 01 的闸门（同一个纯函数），因此候选结论与作业入口 S0 不会分叉；
+ * - `pending-cleanup`：上一次删除的收尾没做完（隔离目录还在，或收敛队列仍有未完成条目）
+ *   **且原始路径上的日志已不存在**（2026-10-30 故障修正）。日志仍在时残留只是旧代际副本，
+ *   不再阻塞——否则收敛的永久失败分支会让这类会话永远删不掉。判定用票据 01 的闸门
+ *   （同一个纯函数），因此候选结论与作业入口 S0 不会分叉；
+ *   日志存在性只对**本来会 pending** 的候选询问一次（`resolveLogExists` 端口），
+ *   避免对 160 个目标逐个 stat；
  * - 两者都不成立才是 `actionable: true`（含 absent）。
  *
  * ## 优先级：pending-cleanup 先于 live
@@ -368,6 +372,9 @@ function composeScopeSnapshot({ memberIds, headers, degChildren, gateOutcome, re
  * @param {() => Promise<{ungroupedIds: string[], workspaceIds: string[]}>} [deps.readUngroupedMembers]
  *   未分组成员读面（`U − W`，由装配段从持久化清单与全部工作区实体算出来）；缺省 = 未分组
  *   范围不可用（503），绝不退化成空列表。
+ * @param {(header: object) => Promise<boolean|undefined>} [deps.resolveLogExists]
+ *   日志存在性判据（header → true/false/判不了）。由装配段复用 `resolveSessionLog` 注入；
+ *   缺省 = 判不了（残留一律阻塞，即修正前的行为）。只对**本来会 pending** 的候选调用。
  * @returns {{list: Function, listUngrouped: Function, availability: Function}} 候选查询能力面。
  */
 export function installSessionDeleteCandidates({
@@ -377,6 +384,7 @@ export function installSessionDeleteCandidates({
   readDegChildren,
   readSession,
   readUngroupedMembers,
+  resolveLogExists,
 }) {
   /** 取成员：工作区不存在返回 undefined；读面故障抛「候选查询不可用」。 */
   function membersOf(workspaceId) {
@@ -442,6 +450,33 @@ export function installSessionDeleteCandidates({
   }
 
   /**
+   * 构造「日志存在性」判定端口（故障 1 修正）。
+   *
+   * 判据的三级口径与收敛期同一套事实：
+   * 1. 本轮的持久化清单里没有这个会话的 header → **没有日志**（宿主只能从清单加载会话）；
+   * 2. 注入了 `resolveLogExists` → 直接用它（装配段复用 `resolveSessionLog`：定位成功即存在，
+   *    目录/日志缺失即不存在，其它定位失败返回「判不了」）；
+   * 3. 未注入（旧装配/测试替身）→ 返回 undefined（判不了），残留维持阻塞。
+   *
+   * 只会被闸门对**本来会 pending** 的候选调用（`checkMany` 内部先判残留），因此正常的
+   * 160 个目标不会各多做一次定位。
+   *
+   * @param {Array<object>} headers - 已归一的持久化清单 header。
+   * @returns {(sessionId: string) => Promise<boolean|undefined>} 判定端口。
+   */
+  function buildLogExistsPort(headers) {
+    const byId = new Map();
+    for (const header of headers) byId.set(header.id, header);
+    return async (sessionId) => {
+      const header = byId.get(sessionId);
+      if (header === undefined) return false;
+      if (typeof resolveLogExists !== "function") return undefined;
+      // 端口抛错/返回非布尔都由闸门的读取器折成「判不了」→ 保持阻塞，绝不放宽。
+      return await resolveLogExists(header);
+    };
+  }
+
+  /**
    * 一个范围的快照（**两个范围共用**）：成员已解析，其余读序与判定完全相同。
    *
    * 读序：清单（一次）→ DEG 连线 → 闸门批量（一次）→ 组合快照。把读序留在一个地方，
@@ -451,7 +486,8 @@ export function installSessionDeleteCandidates({
     const headers = await headersOf();
     const degChildren = degChildrenOf();
     // 一次性批量闸门：读一次收敛文档 → 一次判定 → 每个成员一个结论（含整批可用性事实）。
-    const gateOutcome = await gate.checkMany(memberIds);
+    // 日志存在性只影响「有残留」的候选，因此不影响「只读一次队列表」的性质。
+    const gateOutcome = await gate.checkMany(memberIds, { logExistsOf: buildLogExistsPort(headers) });
     throwGateUnavailable(gateOutcome, gate);
     return composeScopeSnapshot({ memberIds, headers, degChildren, gateOutcome, readSession });
   }

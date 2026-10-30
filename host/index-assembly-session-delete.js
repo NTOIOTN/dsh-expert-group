@@ -28,11 +28,12 @@ import { installSessionDeleteStore } from "./session-delete-store.js";
 import { installStartupProbe, STARTUP_PROBE_REASONS } from "./session-delete-probe.js";
 import { installDeletionGate } from "./session-delete-gate.js";
 import {
+  SESSION_QUARANTINE_ORPHANS,
   discardSessionQuarantineDirectory,
   quarantineRootPath,
   sessionQuarantineExists,
 } from "./session-delete-quarantine.js";
-import { resolveSessionLogLocation } from "./session-delete-paths.js";
+import { SESSION_LOG_RESOLVE_FAILURES, resolveSessionLogLocation } from "./session-delete-paths.js";
 import { installSessionDeleteCleanup } from "./session-delete-cleanup.js";
 import { installSessionDeleteConvergence } from "./session-delete-convergence.js";
 import { releaseLockAfterDrain } from "./session-delete-job.js";
@@ -381,6 +382,65 @@ function buildDomainTablePort(state) {
 }
 
 /**
+ * 构造「日志存在性判据」端口（故障 1 修正的窄端口）。
+ *
+ * 三级口径（与收敛期的 `readLogState` 同一套事实）：
+ * - 定位成功 → `true`（日志确实还在原路径）；
+ * - 目录缺失 / 目录里没有日志 → `false`（日志确实不在）；
+ * - 其余定位失败（权限、IO、归属校验失败、根解析不出来）→ `undefined`（判不了），
+ *   调用方按旧的阻塞语义处理，绝不把「读不出来」当成「日志存在」放行。
+ *
+ * 本端口永不抛错：异常一律折成 `undefined`（fail-closed）。放在模块级而不是装配闭包里，
+ * 是为了让装配段本身的长度保持在行数门禁之内（`assembleSessionDelete` ≤200 行）。
+ *
+ * @param {(header: object) => Promise<object>} resolveSessionLog - 已绑定宿主服务的日志定位。
+ * @returns {(header: object) => Promise<boolean|undefined>} 日志存在性判据。
+ */
+function buildLogExistsProbe(resolveSessionLog) {
+  return async (header) => {
+    let resolution;
+    try {
+      resolution = await resolveSessionLog(header);
+    } catch {
+      return undefined;
+    }
+    if (resolution?.ok === true) return true;
+    const reason = resolution?.reason;
+    if (reason === SESSION_LOG_RESOLVE_FAILURES.DIRECTORY_MISSING
+      || reason === SESSION_LOG_RESOLVE_FAILURES.LOG_MISSING) {
+      return false;
+    }
+    return undefined;
+  };
+}
+
+/**
+ * 构造孤儿隔离目录清扫端口（故障 1 修正）。
+ *
+ * - `listNames()`：隔离根解析不出来时**抛错**（而不是返回空数组）——那意味着本轮清扫没有可信
+ *   前提，收敛期据此只记一条诊断；返回空数组会把「无法枚举」伪装成「没有孤儿」；
+ * - `discardByName(name)`：路径段校验在隔离区模块里做（含路径穿越防护）；隔离根缺失按失败返回，
+ *   删不掉就只记诊断，绝不猜一个位置。
+ *
+ * @param {() => (string|undefined)} readQuarantineRoot - 隔离根解析（可能每次重新读取）。
+ * @returns {{listNames: Function, discardByName: Function}} 清扫端口。
+ */
+function buildQuarantineSweepPort(readQuarantineRoot) {
+  return {
+    listNames() {
+      const root = readQuarantineRoot();
+      if (root === undefined) throw new Error("session delete quarantine root is unresolved");
+      return SESSION_QUARANTINE_ORPHANS.listDirectoryNames(root);
+    },
+    discardByName(directoryName) {
+      const root = readQuarantineRoot();
+      if (root === undefined) return { settled: false, reason: "path-unresolved" };
+      return SESSION_QUARANTINE_ORPHANS.discardByName(root, directoryName);
+    },
+  };
+}
+
+/**
  * 装配会话删除 host 基础设施（实例锁、启动探测、收敛）。
  *
  * @param {object} state - 装配状态容器（本段写入 `state.sessionDelete`）。
@@ -473,6 +533,9 @@ export function assembleSessionDelete(state, hostServices) {
     });
   };
 
+  // 故障 1 修正：候选查询与作业都要判「原始路径上的日志是否存在」，复用上面那套定位。
+  const resolveLogExists = buildLogExistsProbe(resolveSessionLog);
+
   /**
    * 收敛期的会话事实端口：
    * - `readHeaders()` 读持久化清单（宿主公开 seam，缺失即抛错 → 本轮整体暂停）；
@@ -511,6 +574,8 @@ export function assembleSessionDelete(state, hostServices) {
         if (root === undefined) return { settled: false, reason: "path-unresolved" };
         return discardSessionQuarantineDirectory(root, sessionId);
       },
+      // 故障 1 修正：孤儿隔离目录清扫（枚举 + 按名删除，含路径段校验）。
+      ...buildQuarantineSweepPort(readQuarantineRoot),
     },
     clock: state.clock,
     logger,
@@ -525,6 +590,8 @@ export function assembleSessionDelete(state, hostServices) {
     readSessionsRoot,
     readQuarantineRoot,
     resolveSessionLog,
+    // 故障 1 修正：候选查询用同一套定位判「原始路径上的日志是否存在」。
+    resolveLogExists,
   });
 
   return [

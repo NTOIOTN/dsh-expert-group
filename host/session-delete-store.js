@@ -26,6 +26,7 @@ import {
   DOMAIN_SESSION_DELETE_RESIDUE_ENTRY,
   SESSION_DELETE_QUEUE_TABLE,
   SESSION_DELETE_RESIDUE_TABLE,
+  isBatchQueueKey,
   normalizeQueueRecord,
   normalizeResidueRecord,
 } from "./session-delete-contract.js";
@@ -72,6 +73,25 @@ function readEntries(table) {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * 在**同一份快照**里找出覆盖某个会话的批量意图键（没有则 undefined）。
+ *
+ * 只认 `isBatchQueueKey(key)` 为真的键：普通会话键即使被外部塞进 `sessions` 字段也不算
+ * 「批量意图」，否则一条被篡改的单会话条目就能让别处的闸门永远阻塞。
+ *
+ * @param {{keys: string[], records: Map}} snapshot - readTable 的快照。
+ * @param {string} sessionId - 目标会话 ID。
+ * @returns {string|undefined} 覆盖它的批量键。
+ */
+function findBatchKeyOf(snapshot, sessionId) {
+  for (const key of snapshot.keys) {
+    if (!isBatchQueueKey(key)) continue;
+    const sessions = snapshot.records.get(key)?.sessions;
+    if (Array.isArray(sessions) && sessions.includes(sessionId)) return key;
+  }
+  return undefined;
 }
 
 /**
@@ -168,19 +188,37 @@ export function installSessionDeleteStore({ getBinding, isCurrent, enqueueWrite 
     /**
      * 按会话 ID 读一条收敛日志。
      *
-     * `present` 以**键是否存在**为准（不是「记录是否合法」）：队列里还有这个键就代表这次删除
-     * 尚未收敛完成，闸门必须因此拒绝新作业。
+     * `present` 的判据是「键存在 **或** 某条批量意图记录的 `sessions` 覆盖它」（不是「记录
+     * 是否合法」）：队列里还有这个键（或它仍在某条批量意图里）就代表这次删除尚未收敛完成，
+     * 闸门必须因此拒绝新作业。
+     *
+     * 批量成员返回的是覆盖它的那条**批量记录**（附 `batchKey`）：诊断需要知道「它属于哪次
+     * 作业的意图」，而成员本身没有独立条目可返回。单会话条目**优先**（同一会话同时出现在
+     * 两处时按单会话条目返回）——收敛期的处理顺序与这里一致。
+     *
+     * 仍然只读一次聚合文档：批量成员判定在同一个快照上完成，绝不逐条重新 `entries()`。
      */
     readQueueEntry(sessionId) {
       const snapshot = readTable(QUEUE);
       if (snapshot.readable !== true) return { readable: false, present: false, reason: snapshot.reason };
-      const present = snapshot.keys.includes(sessionId);
-      return {
-        readable: true,
-        present,
-        entry: present ? snapshot.records.get(sessionId) : undefined,
-        degraded: present && snapshot.invalidKeys.includes(sessionId),
-      };
+      if (snapshot.keys.includes(sessionId)) {
+        return {
+          readable: true,
+          present: true,
+          entry: snapshot.records.get(sessionId),
+          degraded: snapshot.invalidKeys.includes(sessionId),
+        };
+      }
+      const batchKey = findBatchKeyOf(snapshot, sessionId);
+      if (batchKey !== undefined) {
+        return {
+          readable: true,
+          present: true,
+          entry: { ...snapshot.records.get(batchKey), batchKey },
+          degraded: snapshot.invalidKeys.includes(batchKey),
+        };
+      }
+      return { readable: true, present: false, entry: undefined, degraded: false };
     },
     /** 按会话 ID 读一条残渣（用于诊断与重试）。 */
     readResidueEntry(sessionId) {

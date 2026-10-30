@@ -317,6 +317,11 @@ export function assembleSessionDeleteRpc(state, hostServices) {
       readDegChildren,
       readSession: buildSessionFactsPort(readHostService),
       readUngroupedMembers,
+      // 故障 1 修正：闸门的残留判据还要看「原始路径上的日志是否存在」，复用同一段定位能力。
+      // 未装配（旧装配/测试替身）时该端口缺省 → 残留一律阻塞（修正前的行为）。
+      ...(typeof sessionDelete.resolveLogExists === "function"
+        ? { resolveLogExists: sessionDelete.resolveLogExists }
+        : {}),
     }),
     job: buildJobPort(state),
     // 删除目标的归属校验（服务端信任边界）：工作区读面抛错 → 503，返回 undefined → 404；
