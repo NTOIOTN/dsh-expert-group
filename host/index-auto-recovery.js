@@ -525,6 +525,17 @@ export function createRecoveryChildRebuild(deps) {
         provider: source.provider,
         model: source.model,
         [EFFORT_MARKER]: source.reasoningEffort,
+        // 真实 AgentOptions.reasoningEffort（与 marker 并列，仅在有档位时写入）：
+        // 自动恢复会新建一次 child activation，0.2.2+ 的 step preparation 同样先固定
+        // ModelSelection 再校验 agent/request waterfall 的一致性；档位只走 marker +
+        // listener 会让重建出来的 child 在「路由与父代理不同」时一启动就失败。
+        // 取值来自恢复上下文（request.agentOptions 的 marker 快照），绝不重新选档。
+        // 与 fan-out 落盘侧（index-expert-tools-fanout.js 的 writeChildModel）同一判据：
+        // 只有**非空字符串**才写入真实字段。marker 原样保留（child_models 的档位列仍由
+        // marker 快照推导），因此空串/坏值不会以"未声明档位"以外的形态进入宿主选择。
+        ...(typeof source.reasoningEffort === "string" && source.reasoningEffort.length > 0
+          ? { reasoningEffort: source.reasoningEffort }
+          : {}),
         [ROLE_MARKER]: record.role,
         [PARENT_MARKER]: record.parentId,
         [CONTINUABLE_MARKER]: true,

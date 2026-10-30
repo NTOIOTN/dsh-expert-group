@@ -1048,6 +1048,15 @@ export function createFanoutRequestBuilder({ identity, models, core, roles, stor
           provider: validatedSelection.provider,
           model: validatedSelection.model,
           [EFFORT_MARKER]: validatedSelection.reasoningEffort,
+          // 真实 AgentOptions.reasoningEffort（与 marker 并列，仅在有档位时写入）。
+          //
+          // 分片 child 与 role 工具走同一条宿主创建路径，因此 0.2.2+ 的要求相同：step
+          // preparation 先固定 ModelSelection，再要求 agent/request waterfall 的结果与它
+          // 逐字段一致；只靠 marker+waterfall 事后补档位会在「分片路由与父代理不同」时
+          // 被宿主删掉继承档位 → selection 无 effort → 一致性断言抛错、分片启动即失败。
+          // 恢复出来的 interrupted attempt 只读 child_models 的实际路由（含 effort），
+          // 因此这里同样只在 effort 已定义时写入真实字段。
+          ...(validatedSelection.reasoningEffort === undefined ? {} : { reasoningEffort: validatedSelection.reasoningEffort }),
           // 目标 subagent provider / 继承开关 marker（票据 29）：随 child_models 落盘。
           [EXPERT_SUBAGENT_PROVIDER_MARKER]: subagentTarget.provider,
           [EXPERT_INHERIT_CONTEXT_MARKER]: subagentTarget.inheritContext,

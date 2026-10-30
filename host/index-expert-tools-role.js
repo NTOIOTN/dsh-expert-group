@@ -108,6 +108,18 @@ export function createRoleToolObserverRoute({ identity, models, core, storage })
           provider: selection.provider,
           model: selection.model,
           [EFFORT_MARKER]: selection.reasoningEffort,
+          // 真实 AgentOptions.reasoningEffort（与 marker 并列，仅在有档位时写入）。
+          //
+          // 为什么必须写：DSH 0.2.2+ 的 agent loop 在 step preparation 里先**固定**
+          // ModelSelection（无已记录选择时回落到 AgentOptions.provider/model/
+          // reasoningEffort），随后要求 agent/request waterfall 返回的
+          // provider/model/reasoningEffort 与它完全一致，否则整轮请求抛错。只靠
+          // marker + waterfall 事后补档位的旧做法，在「子代理路由与父代理不同」时会被
+          // 宿主删掉继承档位（resolveChildAgentOptions 的 routeChanged 分支），于是
+          // selection 没有 effort、waterfall 补 xhigh → 一致性断言失败、child 一启动
+          // 即崩。创建期直接写真实字段在 0.2.1 与 0.2.2 上都成立。
+          // marker 原样保留：child_models 快照、RPC 投影与 usage 归属都读它。
+          ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
           [ROLE_MARKER]: role,
           [PARENT_MARKER]: parent.id,
           [CONTINUABLE_MARKER]: true,
@@ -359,6 +371,15 @@ export function createRoleToolDispatch({ core, models, roles, storage, records, 
    * 回执的时段/层/跨层回退（票据 06）：routeFields 只读本次派发结果里的冻结快照，绝不读
    * settings 或时钟；未启用峰谷/旧路径时它是空对象，回执形状因此逐字不变。
    *
+   * ## 真实 reasoningEffort 与 marker 并列写入（DSH 0.2.2+ 一致性契约）
+   * request.agentOptions 里除了内部的 EFFORT_MARKER，还在有档位时写入真实的
+   * AgentOptions.reasoningEffort。原因：0.2.2+ 的 step preparation 先固定 ModelSelection
+   * （无已记录选择时回落到 AgentOptions），随后要求 agent/request waterfall 的结果与选择
+   * 逐字段一致；而宿主 resolveChildAgentOptions 在「子代理路由与父代理不同」时会删掉继承
+   * 档位，于是「只写 marker、由 listener 事后补档位」会让 selection 无 effort、waterfall
+   * 补 xhigh → 一致性断言抛错、child 一启动就失败。marker 语义保持不变（child_models
+   * 快照、RPC 投影与 usage 归属仍读它）；未配置档位时不写该字段，形状与历史一致。
+   *
    * @param {object} input - 一次调用的入参、ticket 与失败阶段引用。
    * @returns {Promise<{outcome?: object, scopeWarning?: string, routeFields?: object, rejected?: object}>}
    */
@@ -469,7 +490,7 @@ export function createRoleToolDispatch({ core, models, roles, storage, records, 
           agentOptions: {
             provider: selection.provider,
             model: selection.model,
-            [EFFORT_MARKER]: selection.reasoningEffort,
+            [EFFORT_MARKER]: selection.reasoningEffort, ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
             // 目标 subagent provider / 继承开关 marker（票据 29）：随 child_models 落盘，
             // 恢复/重建只读它，不按当前设置重新选择。
             [EXPERT_SUBAGENT_PROVIDER_MARKER]: subagentTarget.provider,
