@@ -85,6 +85,7 @@
     "shared/recovery-ledger.js",
     "shared/turn-settlement.js",
     "shared/retry-policy.js",
+    "shared/error-codes.js",
     "shared/prompts.js",
     "shared/status-dom.js",
     "shared/i18n.js",
@@ -302,11 +303,13 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "check-package": "node scripts/check-package-closure.mjs",
+    "report-baseline": "node scripts/report-baseline.mjs",
     "prepublishOnly": "node scripts/check-package-closure.mjs",
-    "prepare": "npm run build",
+    "prepare": "node scripts/build.mjs",
     "test": "node --test \"test/*.test.mjs\"",
+    "verify": "node scripts/check-module-size.mjs && node scripts/check-dependency-graph.mjs && node scripts/check-package-closure.mjs && node scripts/measure-bundle.mjs",
     "release-gate": "node --test test/release-gate.test.mjs test/package-portability.test.mjs test/client-shared-boundary.test.mjs test/model-config.test.mjs",
-    "release": "node scripts/sync-dsh-version.mjs && node scripts/check-package-closure.mjs && pnpm run build && pnpm run test && pnpm run release-gate"
+    "release": "node scripts/sync-dsh-version.mjs && pnpm run verify && pnpm run build && pnpm run test && pnpm run release-gate"
   },
   "license": "MIT",
   "repository": {

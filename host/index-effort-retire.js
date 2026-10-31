@@ -189,7 +189,7 @@ export function createEffortRetireDomain({ identity, prelude, rootWait, handoff,
     const dispose = effortDisposers.get(agent);
     if (dispose === void 0) return;
     effortDisposers.delete(agent);
-    try { dispose(); } catch {}
+    try { dispose(); } catch { /* child 已销毁时释放监听器抛错只影响该 exact agent 的清理，不能打断其它收敛路径；当前为有意降级，若需观测请走宿主 logger（本模块无 logger）。 */ }
   }
 
   /**

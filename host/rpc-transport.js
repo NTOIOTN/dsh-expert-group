@@ -12,6 +12,7 @@
  * @module dsh-expert-group/host/rpc-transport
  */
 import { StringDecoder } from "node:string_decoder";
+import { RPC_ERROR_CODES } from "../shared/error-codes.js";
 
 function describeError(error) {
   return error instanceof Error ? error.message : String(error);
@@ -163,7 +164,7 @@ export class RpcBodyTooLargeError extends Error {
   constructor({ limit = RPC_JSON_BODY_LIMIT, prefix = "", message = "请求体超过允许上限" } = {}) {
     super(message);
     this.name = "RpcBodyTooLargeError";
-    this.code = "payload-too-large";
+    this.code = RPC_ERROR_CODES.PAYLOAD_TOO_LARGE;
     this.status = 413;
     this.limit = limit;
     this.prefix = prefix;
@@ -181,7 +182,7 @@ export class RpcBodyTooLargeError extends Error {
  */
 export function isRpcBodyTooLargeError(error) {
   return error instanceof RpcBodyTooLargeError
-    || (error?.code === "payload-too-large" && error?.status === 413);
+    || (error?.code === RPC_ERROR_CODES.PAYLOAD_TOO_LARGE && error?.status === 413);
 }
 
 /**
@@ -223,16 +224,6 @@ export function declaredRpcActionFromText(text) {
  */
 export function isImageRpcBodyDeclared(text) {
   return declaredRpcActionFromText(text) === "image-route";
-}
-
-/**
- * 判断一份（可能被截断的）请求体前缀是否声明了 settings-commit。
- *
- * @param {unknown} text
- * @returns {boolean}
- */
-export function isSettingsCommitRpcBodyDeclared(text) {
-  return declaredRpcActionFromText(text) === "settings-commit";
 }
 
 /**

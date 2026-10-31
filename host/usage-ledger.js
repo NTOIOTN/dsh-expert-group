@@ -109,7 +109,7 @@ function retryDelay(base, retryCount) {
 function recordWarning(stats, logger, message, error) {
   stats.lastError = message;
   if (logger !== null && typeof logger?.warn === "function") {
-    try { logger.warn("dsh-expert-group: usage ledger " + message + (error === undefined ? "" : ": " + (error instanceof Error ? error.message : String(error)))); } catch {}
+    try { logger.warn("dsh-expert-group: usage ledger " + message + (error === undefined ? "" : ": " + (error instanceof Error ? error.message : String(error)))); } catch { /* 告警通道自身失败已被隔离：stats.lastError 早已写入，丢失这条 warn 不影响账本写入与后续调度。 */ }
   }
 }
 
@@ -279,7 +279,7 @@ export function createUsageLedger({
       void flush();
     }, delay);
     // 定时器不得阻止进程退出（Node unref 可用时）。
-    try { timer?.unref?.(); } catch {}
+    try { timer?.unref?.(); } catch { /* unref 只影响进程能否提前退出；失败时定时器照常触发刷盘，账本一致性不受影响。 */ }
   }
 
   // 唯一刷盘 helper：owner 掌握 timer / stats / sessions，helper 只见冻结票据。
@@ -583,7 +583,7 @@ export function createUsageLedger({
     const pending = flush();
     disposed = true;
     if (timer !== null) {
-      try { clock.clearTimeout(timer); } catch {}
+      try { clock.clearTimeout(timer); } catch { /* 清理失败最多让该定时器多触发一次 flush；此时 disposed 已置位，写入会直接返回，不会写出脏数据。 */ }
       timer = null;
     }
     return pending;

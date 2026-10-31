@@ -82,6 +82,7 @@ import {
 } from "./validation.js";
 import { providerOfAttempt } from "./provider-attribution.js";
 import { ROUTE_SNAPSHOT_INVALID } from "../shared/route-snapshot.js";
+import { FANOUT_ERROR_CODES } from "../shared/error-codes.js";
 import {
   FANOUT_BUDGET,
   checkAttemptPayloadBudget,
@@ -877,7 +878,7 @@ function normalizeStopIdentity(s, deps, identity) {
 
 function observeStopEvidence(s, deps, identity, rawEvidence) {
   if (deps.gate.closed) {
-    return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+    return { accepted: false, changed: false, code: FANOUT_ERROR_CODES.MANAGER_CLOSED, reason: "manager_closed" };
   }
   if (deps.reclaim.current !== null) return deps.bound.reclaimInProgressResult();
   const id = normalizeStopIdentity(s, deps, identity);
@@ -971,7 +972,7 @@ function observeStopEvidence(s, deps, identity, rawEvidence) {
 
 function markAttributionAged(s, deps, identity, options = {}) {
   if (deps.gate.closed) {
-    return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+    return { accepted: false, changed: false, code: FANOUT_ERROR_CODES.MANAGER_CLOSED, reason: "manager_closed" };
   }
   if (deps.reclaim.current !== null) return deps.bound.reclaimInProgressResult();
   const id = normalizeStopIdentity(s, deps, identity);

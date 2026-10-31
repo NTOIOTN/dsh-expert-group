@@ -27,6 +27,16 @@ export class PayloadTooLargeError extends Error {}
 export class BadJsonError extends Error {}
 
 /**
+ * 票据 08：RPC 域稳定错误码的字面量唯一定义在 `shared/error-codes.js`，这里只做转出。
+ *
+ * 为什么经过本模块转出：`host/index-rpc-action-core.js` 必须同时拿到 RPC 三个 code
+ * 与运行时闸门码，而它的本地 import 已到 C8 上限（12 条）；本模块正是其「HTTP 状态 ↔
+ * 错误 code 词表」的既有依赖边（PayloadTooLargeError / BadJsonError 都定义在此），
+ * 复用同一条 import 边即可，不必为一份常量再开第二条。**这不是第二处定义。**
+ */
+export { RPC_ERROR_CODES, RUNTIME_ERROR_CODES } from "../shared/error-codes.js";
+
+/**
  * 创建 legacy HTTP 传输面。
  *
  * @param {object} deps - 窄能力面（3 组）。

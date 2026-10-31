@@ -248,7 +248,7 @@ export function createExpertStructuredResults({ storage, logger }) {
       structuredRetryPatches.delete(childId);
       writeStructuredPatch(childId, pending, attempt);
     }, delay);
-    try { timer?.unref?.(); } catch {}
+    try { timer?.unref?.(); } catch { /* unref 失败只影响进程退出等待；重试定时器仍会触发，结构化补丁照常落盘。 */ }
     structuredRetryTimers.set(childId, timer);
   }
 

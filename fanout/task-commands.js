@@ -86,7 +86,7 @@ import {
   describeBudgetViolation,
   measureJsonBytes,
 } from "../resource-budget.js";
-
+import { FANOUT_ERROR_CODES, RUNTIME_ERROR_CODES } from "../shared/error-codes.js"; // 票据 08：关闭闸门 code 与 Host 共用唯一来源
 
 /**
  * 任务命令的模块级实现（每个函数显式接收 (s, deps)）。本模块不持有可变状态：s 仅用于签名一致，
@@ -335,8 +335,8 @@ function isShutdownCompletionError(s, deps, error) {
   const code = typeof error.code === "string" ? error.code : "";
   return reason === "runtime_closed"
     || reason === "manager_closed"
-    || code === "RUNTIME_CLOSED"
-    || code === "MANAGER_CLOSED"
+    || code === RUNTIME_ERROR_CODES.RUNTIME_CLOSED
+    || code === FANOUT_ERROR_CODES.MANAGER_CLOSED
     || error.name === "FanoutClosedError";
 }
 
@@ -744,7 +744,7 @@ function submit(s, deps, input) {
     return {
       accepted: false,
       changed: false,
-      code: "MANAGER_CLOSED",
+      code: FANOUT_ERROR_CODES.MANAGER_CLOSED,
       reason: "manager_closed",
       shardIds: [],
     };
@@ -914,7 +914,7 @@ function submit(s, deps, input) {
 }
 
 function continueTask(s, deps, input) {
-  if (deps.gate.closed) return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+  if (deps.gate.closed) return { accepted: false, changed: false, code: FANOUT_ERROR_CODES.MANAGER_CLOSED, reason: "manager_closed" };
   if (deps.reclaim.current !== null) return reclaimInProgressResult(s, deps);
   const verdict = validateSubmitInput(input);
   if (!verdict.ok) {
@@ -1112,7 +1112,7 @@ function continueTask(s, deps, input) {
 }
 
 function cancelShard(s, deps, parentTaskId, shardId) {
-  if (deps.gate.closed) return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+  if (deps.gate.closed) return { accepted: false, changed: false, code: FANOUT_ERROR_CODES.MANAGER_CLOSED, reason: "manager_closed" };
   if (deps.reclaim.current !== null) return reclaimInProgressResult(s, deps);
   const task = deps.store.taskById(parentTaskId);
   if (task === undefined) return { accepted: false, changed: false, reason: "unknown_parent_task" };
@@ -1177,7 +1177,7 @@ function cancelShard(s, deps, parentTaskId, shardId) {
 }
 
 function cancelParent(s, deps, parentTaskId) {
-  if (deps.gate.closed) return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+  if (deps.gate.closed) return { accepted: false, changed: false, code: FANOUT_ERROR_CODES.MANAGER_CLOSED, reason: "manager_closed" };
   if (deps.reclaim.current !== null) return reclaimInProgressResult(s, deps);
   const task = deps.store.taskById(parentTaskId);
   if (task === undefined) return { accepted: false, changed: false, reason: "unknown_parent_task" };
@@ -1262,7 +1262,7 @@ function cancelParent(s, deps, parentTaskId) {
 }
 
 function retryShard(s, deps, parentTaskId, shardId) {
-  if (deps.gate.closed) return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "manager_closed" };
+  if (deps.gate.closed) return { accepted: false, changed: false, code: FANOUT_ERROR_CODES.MANAGER_CLOSED, reason: "manager_closed" };
   if (deps.reclaim.current !== null) return reclaimInProgressResult(s, deps);
   const task = deps.store.taskById(parentTaskId);
   if (task === undefined) return { accepted: false, reason: "unknown_parent_task" };

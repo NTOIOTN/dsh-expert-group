@@ -16,6 +16,7 @@
  *
  * @module dsh-expert-group/host/fanout-ownership
  */
+import { RUNTIME_ERROR_CODES } from "../shared/error-codes.js";
 
 function describeError(error) {
   return error instanceof Error ? error.message : String(error);
@@ -552,7 +553,7 @@ function evaluateCapabilities(judges, sessionId, parentTaskId) {
  */
 function runContinuation(judges, parent, args = {}) {
   const { lineage } = judges;
-  if (judges.isClosed()) return { accepted: false, changed: false, code: "RUNTIME_CLOSED", reason: "runtime_closed" };
+  if (judges.isClosed()) return { accepted: false, changed: false, code: RUNTIME_ERROR_CODES.RUNTIME_CLOSED, reason: "runtime_closed" };
   const parentTaskId = typeof args?.parentTaskId === "string" ? args.parentTaskId.trim() : "";
   if (parentTaskId.length === 0) return { accepted: false, changed: false, reason: "missing_parent_task_id" };
   /**

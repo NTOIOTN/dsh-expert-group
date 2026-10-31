@@ -1146,7 +1146,7 @@ function gateRecoverableHandoffFeedback(agent, record, childId, message) {
   // 否则自己的最终通知会被 tombstone 拦回，后续同 id 副本才应继续拦截。
   if (deliveries.has(message)) return false;
   if (messageId !== void 0 && tombstones.has(messageId)) {
-    try { agent.inbox?.remove?.(messageId); } catch {}
+    try { agent.inbox?.remove?.(messageId); } catch { /* 撤回失败只影响该条消息是否仍留在 inbox：tombstone 已生效且本函数仍返回 true，门控结论不变；当前为有意降级，若需观测请走 logger。 */ }
     return true;
   }
   const objectTombstones = record.recoveryFeedbackObjectTombstones instanceof WeakSet

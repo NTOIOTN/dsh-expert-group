@@ -214,7 +214,7 @@ export function createFanoutRuntime(options = {}) {
    */
   function close() {
     if (!lifecycle.close()) return false;
-    try { unsubscribeManager?.(); } catch {}
+    try { unsubscribeManager?.(); } catch { /* manager 已关闭成功；退订失败最多残留一个订阅，不能反向让 close 失败；当前为有意降级，若需观测请走注入的 log。 */ }
     return true;
   }
 

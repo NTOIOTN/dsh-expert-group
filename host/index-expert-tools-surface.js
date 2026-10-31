@@ -287,11 +287,11 @@ export function createRoutingPrompt({ systemPrompt, config, roles, core, storage
   }
   function refreshRoutingPrompt() {
     if (routingDisposer !== void 0) {
-      try { routingDisposer(); } catch {}
+      try { routingDisposer(); } catch { /* 释放旧 routing 段落失败只影响旧实例回收，刷新必须继续注册新段落；当前为有意降级，若需观测请走宿主 logger（本模块不持有 logger）。 */ }
       routingDisposer = void 0;
     }
     if (orchestratorDisposer !== void 0) {
-      try { orchestratorDisposer(); } catch {}
+      try { orchestratorDisposer(); } catch { /* 同上：orchestrator 段落释放失败只影响旧实例回收，不能让刷新路径失败；当前为有意降级，若需观测请走宿主 logger（本模块不持有 logger）。 */ }
       orchestratorDisposer = void 0;
     }
     const providerReady = core.spawnProviderReady();
@@ -317,7 +317,6 @@ export function createRoutingPrompt({ systemPrompt, config, roles, core, storage
       return;
     }
     // 保留旧 routing 的稳定 role 列表，并在独立字段中追加通用 fanout 能力。
-    const toolsText = roles.map((role) => `${role}`).join(", ");
     const routingToolsText = [...roles, "fanout"].join(", ");
     // routing 只提供 provider、角色和图片路由等动态事实；完整 workflow 已在 root
     // orchestrator system section 中出现一次，避免同一等待/收口契约再次膨胀 system 输入。

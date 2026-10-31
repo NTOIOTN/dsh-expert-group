@@ -20,6 +20,7 @@
  * @module dsh-expert-group/fanout/reclaim
  */
 import { FANOUT_BUDGET } from "../resource-budget.js";
+import { FANOUT_ERROR_CODES } from "../shared/error-codes.js";
 
 /**
  * 创建回收屏障 owner。
@@ -38,7 +39,7 @@ export function createReclaimBarrier({ isClosed }) {
 
 function prepare(deps, parentTaskIds) {
   if (isClosed()) {
-    return { accepted: false, code: "MANAGER_CLOSED", reason: "manager_closed", parentTaskIds: [], skipped: [] };
+    return { accepted: false, code: FANOUT_ERROR_CODES.MANAGER_CLOSED, reason: "manager_closed", parentTaskIds: [], skipped: [] };
   }
   if (current !== null) {
     return { ...deps.boundCommands.reclaimInProgressResult(), parentTaskIds: [], skipped: [] };

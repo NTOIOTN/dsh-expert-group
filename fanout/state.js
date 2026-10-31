@@ -26,9 +26,10 @@ import { isTerminalShardStatus } from "./errors.js";
 import { toShardError } from "./validation.js";
 import { createReclaimBarrier } from "./reclaim.js";
 import { buildRestorePlan, commitRestorePlan, validateRestoreTasks } from "./restore.js";
+import { FANOUT_ERROR_CODES } from "../shared/error-codes.js";
 
 function closeManager(s, deps) {
-  if (s.closed) return { accepted: false, changed: false, code: "MANAGER_CLOSED", reason: "already_closed" };
+  if (s.closed) return { accepted: false, changed: false, code: FANOUT_ERROR_CODES.MANAGER_CLOSED, reason: "already_closed" };
   s.closed = true;
   s.restoreDispatchSuppressed = true;
   deps.boundScheduler.dispatchState.clearPendingWork();
@@ -97,7 +98,7 @@ function closeManager(s, deps) {
   // 关闭后不再保留实时订阅者；历史诊断仍保留在 eventHistory/快照中。
   deps.ledger.clearSubscribers();
   // 不取消既有 drainPromise：已排队的 drain 会看到 closed 并自行结束，调用方可以安全 await。
-  return { accepted: true, changed, code: "MANAGER_CLOSED", reason: "manager_closed" };
+  return { accepted: true, changed, code: FANOUT_ERROR_CODES.MANAGER_CLOSED, reason: "manager_closed" };
 }
 
 /**

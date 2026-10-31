@@ -19,6 +19,7 @@
 import { createFanoutOwnershipService } from "./fanout-ownership.js";
 import { createFanoutPersistenceService } from "./fanout-persistence.js";
 import { createFanoutRestoreService } from "./fanout-restore.js";
+import { RUNTIME_ERROR_CODES } from "../shared/error-codes.js";
 
 function describeError(error) {
   return error instanceof Error ? error.message : String(error);
@@ -26,7 +27,7 @@ function describeError(error) {
 
 /** 关闭态的统一结果（fail-closed 形状；门面与服务共用同一份字面量）。 */
 function closedResult() {
-  return { accepted: false, changed: false, code: "RUNTIME_CLOSED", reason: "runtime_closed" };
+  return { accepted: false, changed: false, code: RUNTIME_ERROR_CODES.RUNTIME_CLOSED, reason: "runtime_closed" };
 }
 
 /**

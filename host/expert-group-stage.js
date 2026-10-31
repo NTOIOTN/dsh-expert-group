@@ -421,9 +421,6 @@ async function projectFanoutShard(shard, task, deps) {
     // 目标 subagent provider / 继承开关（票据 29）：attempt 自身字段优先，其次同一
     // child 的 child_models 快照；都没有时省略字段，不伪造 false。
     const attemptSubagent = subagentContextFields(attempt, null, persisted[childId]);
-    const settledAttempt = Object.keys(attemptSubagent).length === 0
-      ? labeled
-      : { ...labeled, ...attemptSubagent };
     // 用量（票据 25）：归属已证明的 attempt 才允许带 usage；缺失时省略整个字段，
     // 绝不把“没拿到 usage”渲染成 0 token。
     const attemptUsage = usageOfChild(childId, persisted, usageFor);

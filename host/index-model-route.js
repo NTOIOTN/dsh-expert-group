@@ -246,9 +246,9 @@ function installModelSelection(deps, api) {
       // RC1 的目录 API 没有 AbortSignal 参数，因此查询完成后必须再次检查请求生命周期。
       // 目录查询是 advisory：失败仍交给后续 exact resolveCallConfig 判定。
       if (signal?.aborted === true) throw createAbortError();
-      try { if (typeof llm.listProviders === "function") await llm.listProviders(); } catch {}
+      try { if (typeof llm.listProviders === "function") await llm.listProviders(); } catch { /* provider 目录只用于提示，查询失败不改变后续 exact resolveCallConfig 的判定，故静默。 */ }
       if (signal?.aborted === true) throw createAbortError();
-      try { if (typeof llm.listModels === "function") await llm.listModels(selection.provider); } catch {}
+      try { if (typeof llm.listModels === "function") await llm.listModels(selection.provider); } catch { /* 同上：模型目录缺项或查询失败只是缺少提示信息，精确解析仍由 resolveCallConfig 决定。 */ }
       if (signal?.aborted === true) throw createAbortError();
       let resolved;
       try {
@@ -1032,7 +1032,7 @@ function installModelCandidatesValidation(deps, api) {
  */
 function installSettingsCandidateValidation(deps, api) {
   const { ValidationError, roles } = deps;
-  const { roleCatalog, activeRoles } = roles;
+  const { activeRoles } = roles;
 
   // 跨组调用统一走域内能力面（运行期解析）。
   const normalizePromptOverrideCandidate = (...args) => api.normalizePromptOverrideCandidate(...args);
@@ -1117,7 +1117,6 @@ function installSettingsCandidateValidation(deps, api) {
         throw new ValidationError("设置 sidebarEntryEnabled 无效");
       }
       // 角色集合固定为内置六角色（自定义角色能力已删除）。
-      const candidateRoleRegistry = roleCatalog();
       const candidateRoleIds = STATUS_ROLE_IDS;
       /**
        * 并发映射（票据 26）：缺字段 = 旧客户端/旧文档，不写 patch、保持已有映射；

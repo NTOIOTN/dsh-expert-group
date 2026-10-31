@@ -14232,11 +14232,7 @@ let requestPluginRpc=null;
 let createClientFreshnessBoundary=null;
 let RPC_TARGET=null;
 function bindClientRuntime(host){
-react=host.react??null;
-requireFreshnessSurface=host.requireFreshnessSurface??null;
-requestPluginRpc=host.requestPluginRpc??null;
-createClientFreshnessBoundary=host.createClientFreshnessBoundary??null;
-RPC_TARGET=host.RPC_TARGET??null;
+({react=null,requireFreshnessSurface=null,requestPluginRpc=null,createClientFreshnessBoundary=null,RPC_TARGET=null}=host);
 }
 const SETTINGS_ROLE_IDS=STATUS_ROLE_IDS;
 const SETTINGS_ROLE_LABELS=STATUS_ROLE_LABELS;
@@ -15297,11 +15293,7 @@ let RPC_PATH=null;
 let RPC_CHANNEL=null;
 let RPC_ENDPOINT=null;
 function bindClientRuntime(host){
-react=host.react??null;
-requestPluginRpc=host.requestPluginRpc??null;
-RPC_PATH=host.RPC_PATH??null;
-RPC_CHANNEL=host.RPC_CHANNEL??null;
-RPC_ENDPOINT=host.RPC_ENDPOINT??null;
+({react=null,requestPluginRpc=null,RPC_PATH=null,RPC_CHANNEL=null,RPC_ENDPOINT=null}=host);
 }
 function useSessionList(ctx,useSessions){
 if(typeof useSessions==="function")return useSessions((snapshot)=>snapshot);
@@ -15987,9 +15979,7 @@ let ModelConfigSection=null;
 const ORCHESTRATOR_ROW_LABEL="Orchestrator";
 let peakValleyTime=null;
 function bindClientRuntime(host){
-react=host.react??null;
-ModelConfigSection=host.ModelConfigSection??null;
-peakValleyTime=host.peakValleyTime??null;
+({react=null,ModelConfigSection=null,peakValleyTime=null}=host);
 }
 function renderSettingsTail(view){
 const{closePrompt,selectedPromptRole,settingsSnapshot}=view;
@@ -17062,8 +17052,7 @@ renderSettingsTail,
 let react=null;
 let peakValleyTime=null;
 function bindClientRuntime(host){
-react=host.react??null;
-peakValleyTime=host.peakValleyTime??null;
+({react=null,peakValleyTime=null}=host);
 }
 function useSettingsLeaveFocus(view){
 react.useEffect(()=>{
@@ -17952,7 +17941,7 @@ DshExpertGroupSettings,bindClientRuntime,
 const SYMBOL=Symbol.for("dsh-expert-group/client-model-views-b");
 let react=null;
 function bindClientRuntime(host){
-react=host.react??null;
+({react=null}=host);
 }
 let modelDiscoveryTitleSeq=0;
 function focusableDialogControls(scope){
@@ -18231,7 +18220,7 @@ ModelDiscoveryDialog,renderModelRow,toggleCandidateOf,toggleIndexInSet,toggleVis
 }=clientModelViewsB;
 let react=null;
 function bindClientRuntime(host){
-react=host.react??null;
+({react=null}=host);
 }
 function renderProviderModelRows(card,handlers){
 const{disabled,edit,patchRow,toggleRow,toggleEffort,toggleInput,config,session}=handlers;
@@ -18713,7 +18702,7 @@ ModelDiscoveryDialog,renderModelRow,toggleCandidateOf,toggleIndexInSet,toggleVis
 const{CUSTOM_ROUTE_PROBE}=clientModelConfigHost;
 let react=null;
 function bindClientRuntime(host){
-react=host.react??null;
+({react=null}=host);
 }
 function renderCustomProviderModelSection(context){
 const{
@@ -19229,7 +19218,7 @@ pickRemoveFocusTarget,observeRemoveFocusIntent,createRemoveFocusObservationLedge
 const{CUSTOM_PROFILE_BASE_PATH,CUSTOM_PROVIDER_NS,CUSTOM_ROUTE_PROBE}=clientModelConfigHost;
 let react=null;
 function bindClientRuntime(host){
-react=host.react??null;
+({react=null}=host);
 }
 let removeConfirmSeq=0;
 function renderRemoveConfirmDialog(removeIntent,handlers){
@@ -20126,7 +20115,7 @@ const{useHostMeta}=clientSettingsNormalize;
 const{DEG_SETTINGS_SECTION_ID}=clientNavIcon;
 let react=null;
 function bindClientRuntime(host){
-react=host.react??null;
+({react=null}=host);
 }
 const DEG_PLUGIN_DETAIL_SLOT_NAME="plugins.bundle.config";
 const DEG_PLUGIN_DETAIL_ENTRY_KEY=DEG_SETTINGS_SECTION_ID;
@@ -22588,16 +22577,11 @@ react,primitives,requestPluginRpc,requireFreshnessSurface,createClientFreshnessB
 RPC_PATH,RPC_CHANNEL,RPC_ENDPOINT,RPC_TARGET,ModelConfigSection,
 peakValleyTime,
 });
-clientSettingsNormalizeModule.bindClientRuntime?.(clientRuntimeHost);
-clientSubagentModule.bindClientRuntime?.(clientRuntimeHost);
-clientSettingsMainBModule.bindClientRuntime?.(clientRuntimeHost);
-clientSettingsMainAModule.bindClientRuntime?.(clientRuntimeHost);
-clientModelViewsAModule.bindClientRuntime?.(clientRuntimeHost);
-clientModelViewsBModule.bindClientRuntime?.(clientRuntimeHost);
-clientProviderCardModule.bindClientRuntime?.(clientRuntimeHost);
-clientModelSectionModule.bindClientRuntime?.(clientRuntimeHost);
-clientConversationAdaptersModule.bindClientRuntime?.(clientRuntimeHost);
-clientPluginDetailModule.bindClientRuntime?.(clientRuntimeHost);
+for(const clientModule of[
+clientSettingsNormalizeModule,clientSubagentModule,clientSettingsMainBModule,clientSettingsMainAModule,
+clientModelViewsAModule,clientModelViewsBModule,clientProviderCardModule,clientModelSectionModule,
+clientConversationAdaptersModule,clientPluginDetailModule,
+])clientModule.bindClientRuntime?.(clientRuntimeHost);
 function apply(ctx){
 ctx.effect(()=>installImageSubmissionRoute(ctx),"dsh-expert-group: image submission route");
 ctx.effect(()=>installDegSettingsNavIcon(),"dsh-expert-group: settings nav brand icon");

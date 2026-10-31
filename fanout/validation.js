@@ -29,6 +29,7 @@ import {
   validateTimeoutMs,
 } from "./contracts.js";
 import { STOP_EVIDENCE_STATE_OBSERVED } from "./errors.js";
+import { FANOUT_ERROR_CODES } from "../shared/error-codes.js";
 
 /**
  * 确定性的 attempt 标识（旧快照缺字段时的派生规则，新 attempt 复用同一格式）。
@@ -477,7 +478,7 @@ export function validateSubmitInput(input) {
     if (inputCheck.ok) continue;
     return {
       ok: false,
-      code: "INVALID_BUDGET",
+      code: FANOUT_ERROR_CODES.INVALID_BUDGET,
       message: inputCheck.violation.message,
       field: "shards[" + index + "].prompt",
       violation: inputCheck.violation,
@@ -574,7 +575,7 @@ export function budgetVerdict(resource, limit, receivedBytes, field, hint, extra
     : check.violation;
   return {
     ok: false,
-    code: "INVALID_BUDGET",
+    code: FANOUT_ERROR_CODES.INVALID_BUDGET,
     // 容量类拒绝把可执行提示并入顶层 message：工具调用方通常只展示 message，
     // 提示必须在那里可见（hint 字段仍保留在 violation 中供结构化消费者使用）。
     message: extra !== undefined && violation.hint !== undefined

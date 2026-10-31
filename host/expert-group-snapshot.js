@@ -549,14 +549,14 @@ function projectFanoutTimeline(source, status, shards) {
 
 // ── 恢复状态（recovery）投影 ─────────────────────────────────────────────────
 
-/**
- * recovery 块的固定状态集合（票据 04）。
+/*
+ * recovery 块的固定状态集合为三态（票据 04），投影处见 projectRecovery：
+ * status 只可能是 "ok" / "failed" / "none"。
  *
  * - none：本进程从未执行过恢复（没有持久化快照，或恢复入口尚未接线）；
  * - ok：最近一次恢复成功（此时必须清空 code/message，失败细节不得残留）；
  * - failed：最近一次恢复失败，原因码进 code，受限文案进 message。
  */
-export const EXPERT_GROUP_RECOVERY_STATUSES = Object.freeze(["ok", "failed", "none"]);
 
 /*
  * recovery.code 与 failure.code 共用同一份**有限精确允许列表**（isStableFailureCode，

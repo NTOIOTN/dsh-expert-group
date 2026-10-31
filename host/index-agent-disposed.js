@@ -80,9 +80,6 @@ export function createAgentDisposedHandler({ logger, roots, fanout, guards, reco
     const isCurrentRootGeneration = rootDisposed && roots.rootGenerationRegistry.isCurrent(agent.id, agent);
     // 先读取当前 exact Agent 的 generation，再退休完成状态；旧 disposed 事件不触碰新代次。
     const disposedGeneration = roots.rootGenerationRegistry.generationOf(agent.id);
-    // 既有代码保留的只读状态探针（计算结果当前未被后续分支使用，但调用本身是纯读，
-    // 迁移保持原样以免改变 handoff 域的读点序列）。
-    const hasRootState = rootDisposed && roots.hasRootHandoffState(agent);
     if (rootDisposed) {
       roots.markRootDisposed(agent);
       roots.forgetRootUserWait(agent);

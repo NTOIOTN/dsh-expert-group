@@ -42,6 +42,7 @@ import {
   sessionIdOf,
 } from "./fanout-attribution.js";
 import { checkTaskInputBudget } from "../resource-budget.js";
+import { RUNTIME_ERROR_CODES } from "../shared/error-codes.js";
 
 /**
  * continuation admission 期间暂存的终态事件上限。
@@ -174,7 +175,7 @@ function createAdmissionHandle() {
 function fanoutRuntimeClosedError(message = "fan-out runtime 已关闭") {
   const error = new Error(message);
   error.name = "FanoutClosedError";
-  error.code = "RUNTIME_CLOSED";
+  error.code = RUNTIME_ERROR_CODES.RUNTIME_CLOSED;
   error.reason = "runtime_closed";
   return error;
 }

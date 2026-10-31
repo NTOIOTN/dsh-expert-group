@@ -22,11 +22,8 @@
   let RPC_CHANNEL = null;
   let RPC_ENDPOINT = null;
   function bindClientRuntime(host) {
-    react = host.react ?? null;
-    requestPluginRpc = host.requestPluginRpc ?? null;
-    RPC_PATH = host.RPC_PATH ?? null;
-    RPC_CHANNEL = host.RPC_CHANNEL ?? null;
-    RPC_ENDPOINT = host.RPC_ENDPOINT ?? null;
+    // 票据 06：单条解构取代逐字段重复；默认值只在取到 undefined 时生效，与 host.x ?? null 逐项等价。
+    ({ react = null, requestPluginRpc = null, RPC_PATH = null, RPC_CHANNEL = null, RPC_ENDPOINT = null } = host);
   }
 
     /** 使用 shell.overlay 注入的全局 useSessions；旧 slot 则使用现有 sessions.list。 */

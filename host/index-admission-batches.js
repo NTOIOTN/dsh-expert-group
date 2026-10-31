@@ -10,6 +10,7 @@
  * @module dsh-expert-group/host/index-admission-batches
  */
 import { isSubagentCapacityError } from "../shared/capacity-errors.js";
+import { ADMISSION_ERROR_CODES } from "../shared/error-codes.js";
 import { createAdmissionBatchCoordinator } from "../shared/delegation-cohort.js";
 import { CONTEXT_INHERITANCE_ERROR_CODES, MODEL_CANDIDATES_EXHAUSTED } from "../shared/model-route.js";
 import { OUTPUT_SCHEMA_ERROR_CODES } from "../shared/structured.js";
@@ -174,7 +175,7 @@ export function installAdmissionBatches(deps) {
     // 容量耗尽：结构化 code 优先于文案启发式（它已由 DEG 翻译成可读提示，不再匹配
     // steer/messageId 等英文关键词），归入可重试的 steer 失败并保留可读文案。
     if (isSubagentCapacityError(error)) {
-      return { reason: "capacity", code: "SUBAGENT_CAPACITY_REACHED", message };
+      return { reason: "capacity", code: ADMISSION_ERROR_CODES.SUBAGENT_CAPACITY_REACHED, message };
     }
     if (/startContinuable|child admission returned an invalid childId/i.test(message)) {
       return { reason: "start", code: "START_FAILED", message };

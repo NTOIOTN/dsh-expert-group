@@ -17,7 +17,8 @@
   // descriptor 注入的运行期依赖：本模块先于 descriptor 执行，取值只发生在运行期调用时。
   let react = null;
   function bindClientRuntime(host) {
-    react = host.react ?? null;
+    // 票据 06：单条解构取代逐字段重复；默认值只在取到 undefined 时生效，与 host.x ?? null 逐项等价。
+    ({ react = null } = host);
   }
 
   /**

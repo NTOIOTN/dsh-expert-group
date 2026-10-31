@@ -28,6 +28,7 @@ import {
 import { projectRouteSnapshotFields } from "../shared/route-snapshot.js";
 import { hasUsageMetrics, projectUsage } from "./usage-projection.js";
 import { projectStructuredResult } from "../shared/structured.js";
+import { FANOUT_ERROR_CODES } from "../shared/error-codes.js";
 
 export function nonEmpty(value) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -66,7 +67,7 @@ const PERMANENT_RESTORE_CODES = new Set([
   // 派发路由冻结快照非法（票据 03/04）：同一份磁盘数据重试也不会变好，属结构性缺陷。
   "INVALID_SNAPSHOT_ROUTE",
   "UNSUPPORTED_SNAPSHOT_VERSION",
-  "INVALID_BUDGET",
+  FANOUT_ERROR_CODES.INVALID_BUDGET,
   "INVALID_CONCURRENCY_LIMIT",
   "INVALID_SHARD_NAME",
   "INVALID_WRITE_ROLES",

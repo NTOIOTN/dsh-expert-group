@@ -8,6 +8,7 @@
  * @module dsh-expert-group/host/fanout-persistence
  */
 import { createPersistenceHealth } from "./persistence-health.js";
+import { RUNTIME_ERROR_CODES } from "../shared/error-codes.js";
 
 function describeError(error) {
   return error instanceof Error ? error.message : String(error);
@@ -403,7 +404,7 @@ export function createFanoutPersistenceService({
 
 
   /** 关闭后的结构化拒绝形状（与正常拒绝路径同形，durable 必须为 false）。 */
-  const reclaimClosedResult = () => reclaimRejected("RUNTIME_CLOSED", "runtime_closed");
+  const reclaimClosedResult = () => reclaimRejected(RUNTIME_ERROR_CODES.RUNTIME_CLOSED, "runtime_closed");
 
   /**
    * 显式回收本 root 已结算的父任务（票据 05）：两阶段 + **先落盘成功再移除**。

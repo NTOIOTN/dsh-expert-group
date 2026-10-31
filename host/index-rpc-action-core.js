@@ -29,7 +29,7 @@ import { roleDescriptionsOf } from "../shared/protocol.js";
 import { utf8ByteLength } from "../shared/structured.js";
 import { FANOUT_TEMPLATE_LIMIT, FANOUT_TEMPLATE_VERSION } from "../storage.js";
 import { randomUUID } from "node:crypto";
-import { BadJsonError, PayloadTooLargeError } from "./index-rpc-http.js";
+import { BadJsonError, PayloadTooLargeError, RPC_ERROR_CODES, RUNTIME_ERROR_CODES } from "./index-rpc-http.js";
 import { IMAGE_TRANSCODER_UNAVAILABLE_MESSAGE } from "./image-transcode.js";
 import { SETTINGS_NAMESPACE } from "./settings-schema.js";
 
@@ -132,7 +132,7 @@ async function dispatchRpcAction(deps, body, signal, respond, { imageRequest = f
     // 已解码 payload，这里补上同一限制，避免绕过普通 / settings-commit / 图片三档边界。
     // 预算选择复用 host/rpc.transport 的同一函数，两条传输不会各自硬编码数字。
     if (Buffer.byteLength(JSON.stringify(body)) > host.rpc.limitFor({ imageRequest, action: body.action })) {
-      fail(413, "payload-too-large", "请求体超过允许上限");
+      fail(413, RPC_ERROR_CODES.PAYLOAD_TOO_LARGE, "请求体超过允许上限");
       return;
     }
     const globalRun = GLOBAL_ROUTES.get(body.action);
@@ -177,10 +177,10 @@ export function mapRpcError(deps, error, signal) {
   // DSH Gateway 使用 gateway/cancelled 表示远端主动取消；保留同一身份，
   // 避免 Connection/客户端把取消误判为可重试的 500 internal。
   if (signal?.aborted === true || error?.name === "AbortError" || error?.code === "ABORT_ERR") {
-    return { status: 499, code: "gateway/cancelled", message: "请求已取消" };
+    return { status: 499, code: RPC_ERROR_CODES.CANCELLED, message: "请求已取消" };
   }
   if (error instanceof PayloadTooLargeError || host.rpc.isBodyTooLarge(error)) {
-    return { status: 413, code: "payload-too-large", message: "请求体超过允许上限" };
+    return { status: 413, code: RPC_ERROR_CODES.PAYLOAD_TOO_LARGE, message: "请求体超过允许上限" };
   }
   if (error instanceof BadJsonError) {
     return { status: 400, code: "bad-request", message: error.message };
@@ -277,7 +277,7 @@ export function mapRpcError(deps, error, signal) {
   }
   // 原始内部错误只记日志，不向客户端回传（可能含路径/密钥等敏感信息）。
   logger.warn("dsh-expert-group rpc failed: " + (error instanceof Error ? error.message : String(error)));
-  return { status: 500, code: "internal", message: "内部错误，请查看服务端日志" };
+  return { status: 500, code: RPC_ERROR_CODES.INTERNAL, message: "内部错误，请查看服务端日志" };
 }
 
 /**
@@ -1153,7 +1153,7 @@ async function handleFanoutReclaim(deps, req) {
         fail(409, "reclaim-in-progress", "已有回收正在进行中，请稍后重试");
         return;
       }
-      if (reason === "runtime_closed" || outcome?.code === "RUNTIME_CLOSED") {
+      if (reason === "runtime_closed" || outcome?.code === RUNTIME_ERROR_CODES.RUNTIME_CLOSED) {
         fail(503, "reclaim-unavailable", "fan-out 回收入口不可用");
         return;
       }

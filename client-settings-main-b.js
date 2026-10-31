@@ -29,9 +29,8 @@
   // 峰谷时段纯函数：与 Host 校验、保存前校验共用同一份构建期投影实现。
   let peakValleyTime = null;
   function bindClientRuntime(host) {
-    react = host.react ?? null;
-    ModelConfigSection = host.ModelConfigSection ?? null;
-    peakValleyTime = host.peakValleyTime ?? null;
+    // 票据 06：单条解构取代逐字段重复；默认值只在取到 undefined 时生效，与 host.x ?? null 逐项等价。
+    ({ react = null, ModelConfigSection = null, peakValleyTime = null } = host);
   }
 
   /**

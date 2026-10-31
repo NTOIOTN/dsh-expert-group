@@ -22,6 +22,7 @@
  */
 import { FANOUT_BUDGET, checkRestoreBudget, describeBudgetViolation } from "../resource-budget.js";
 import { normalizeRouteSnapshot } from "../shared/route-snapshot.js";
+import { FANOUT_ERROR_CODES } from "../shared/error-codes.js";
 import { validateRestoredStopFields, validateRestoredTimeoutMs } from "./contracts.js";
 import {
   FANOUT_TASK_STATUSES,
@@ -157,7 +158,7 @@ export function validateRestoreTasks(deps, tasks) {
         });
         deps.events.noteBudgetViolation(violation, "restore", { emitEvent: false });
         throw new FanoutValidationError(
-          "INVALID_BUDGET",
+          FANOUT_ERROR_CODES.INVALID_BUDGET,
           "快照 continuationRequests 条数超过预算: " + task.parentTaskId,
           { field: "tasks.continuationRequests", violation },
         );
@@ -322,7 +323,7 @@ export function buildRestorePlan(deps, snapshot, restoreOptions = {}) {
   if (deps.isClosed()) {
     return {
       accepted: false,
-      result: { accepted: false, restored: 0, tasks: 0, code: "MANAGER_CLOSED", reason: "manager_closed" },
+      result: { accepted: false, restored: 0, tasks: 0, code: FANOUT_ERROR_CODES.MANAGER_CLOSED, reason: "manager_closed" },
     };
   }
   // 回收屏障期间恢复会重建/覆盖任务表，直接破坏候选快照的一致性。
@@ -359,7 +360,7 @@ export function buildRestorePlan(deps, snapshot, restoreOptions = {}) {
     deps.events.noteBudgetViolation(restoreBudget.violation, "restore", { emitEvent: false });
     throw validationError({
       ok: false,
-      code: "INVALID_BUDGET",
+      code: FANOUT_ERROR_CODES.INVALID_BUDGET,
       message: restoreBudget.violation.message,
       field: "snapshot",
       violation: restoreBudget.violation,

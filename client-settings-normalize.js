@@ -21,11 +21,8 @@
   let createClientFreshnessBoundary = null;
   let RPC_TARGET = null;
   function bindClientRuntime(host) {
-    react = host.react ?? null;
-    requireFreshnessSurface = host.requireFreshnessSurface ?? null;
-    requestPluginRpc = host.requestPluginRpc ?? null;
-    createClientFreshnessBoundary = host.createClientFreshnessBoundary ?? null;
-    RPC_TARGET = host.RPC_TARGET ?? null;
+    // 票据 06：单条解构取代逐字段重复；默认值只在取到 undefined 时生效，与 host.x ?? null 逐项等价。
+    ({ react = null, requireFreshnessSurface = null, requestPluginRpc = null, createClientFreshnessBoundary = null, RPC_TARGET = null } = host);
   }
 
     /**

@@ -194,16 +194,14 @@ window.__ModuleLoader__.load({
       // 峰谷时段判定面：与 Host 校验、后续界面提示共用同一份投影实现。
       peakValleyTime,
     });
-    clientSettingsNormalizeModule.bindClientRuntime?.(clientRuntimeHost);
-    clientSubagentModule.bindClientRuntime?.(clientRuntimeHost);
-    clientSettingsMainBModule.bindClientRuntime?.(clientRuntimeHost);
-    clientSettingsMainAModule.bindClientRuntime?.(clientRuntimeHost);
-    clientModelViewsAModule.bindClientRuntime?.(clientRuntimeHost);
-    clientModelViewsBModule.bindClientRuntime?.(clientRuntimeHost);
-    clientProviderCardModule.bindClientRuntime?.(clientRuntimeHost);
-    clientModelSectionModule.bindClientRuntime?.(clientRuntimeHost);
-    clientConversationAdaptersModule.bindClientRuntime?.(clientRuntimeHost);
-    clientPluginDetailModule.bindClientRuntime?.(clientRuntimeHost);
+    // 票据 06：10 个已拆出模块的运行时绑定注入收敛为**单一调用点**。
+    // 数组顺序 = 原逐行调用的顺序，逐项行为不变；绑定方向仍是 descriptor -> 模块，
+    // 没有新增 IIFE 依赖边（模块之间不互相读取），也不改变注册数量与初始化时序。
+    for (const clientModule of [
+      clientSettingsNormalizeModule, clientSubagentModule, clientSettingsMainBModule, clientSettingsMainAModule,
+      clientModelViewsAModule, clientModelViewsBModule, clientProviderCardModule, clientModelSectionModule,
+      clientConversationAdaptersModule, clientPluginDetailModule,
+    ]) clientModule.bindClientRuntime?.(clientRuntimeHost);
     // ── 插件主体：注册设置页与状态/元数据桥（通知由 Host 投递，客户端不挂载通知组件）。
     function apply(ctx) {
       ctx.effect(() => installImageSubmissionRoute(ctx), "dsh-expert-group: image submission route");

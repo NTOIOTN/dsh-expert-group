@@ -147,8 +147,6 @@ export function createFanoutManager(options = {}) {
   });
   /** 冲突检查器是否为默认实现：restore 需要据此决定是否随 writeRoles 重建。 */
   const usesDefaultConflictChecker = typeof injectedConflictChecker !== "function";
-  /** 已回收任务 id 的有界集合容量（常量，不属于运行期状态）。 */
-  const RECLAIMED_TASK_MEMORY = 256;
   /**
    * 构造期初值：state 对象字面量内部无法互相引用，先算好再展开。
    *

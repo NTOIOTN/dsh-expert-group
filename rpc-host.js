@@ -22,6 +22,7 @@
  *
  * @module dsh-expert-group/rpc-host
  */
+import { RPC_ERROR_CODES } from "./shared/error-codes.js";
 
 /**
  * 创建 Connection RPC handler。
@@ -81,7 +82,7 @@ export function createConnectionRpcHandler({ endpoint, dispatch } = {}) {
       return {
         ok: false,
         error: {
-          code: "internal",
+          code: RPC_ERROR_CODES.INTERNAL,
           message: "内部错误，请查看服务端日志",
           details: {},
         },
@@ -92,7 +93,7 @@ export function createConnectionRpcHandler({ endpoint, dispatch } = {}) {
       return {
         ok: false,
         error: {
-          code: typeof error?.code === "string" ? error.code : "internal",
+          code: typeof error?.code === "string" ? error.code : RPC_ERROR_CODES.INTERNAL,
           message: typeof error?.message === "string" ? error.message : "RPC 请求失败",
           details: error?.details !== null && typeof error?.details === "object" ? error.details : {},
         },
@@ -301,7 +302,7 @@ export function writeServerResponseEnvelope(rpcId, result) {
     result: {
       ok: false,
       error: {
-        code: typeof error?.code === "string" ? error.code : "internal",
+        code: typeof error?.code === "string" ? error.code : RPC_ERROR_CODES.INTERNAL,
         message: typeof error?.message === "string" ? error.message : "RPC 请求失败",
         details: error?.details !== null && typeof error?.details === "object" ? error.details : {},
       },

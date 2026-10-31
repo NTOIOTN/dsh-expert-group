@@ -34,8 +34,8 @@
   // 客户端只消费它做展示与保存前校验，绝不另写一份判定/归一实现。
   let peakValleyTime = null;
   function bindClientRuntime(host) {
-    react = host.react ?? null;
-    peakValleyTime = host.peakValleyTime ?? null;
+    // 票据 06：单条解构取代逐字段重复；默认值只在取到 undefined 时生效，与 host.x ?? null 逐项等价。
+    ({ react = null, peakValleyTime = null } = host);
   }
 
   /**

@@ -7,6 +7,7 @@
  *
  * @module dsh-expert-group/shared/capacity-errors
  */
+import { ADMISSION_ERROR_CODES } from "./error-codes.js";
 
 /**
  * 子代理容量耗尽的稳定错误码（DSH 0.1.7-alpha.2 新增的进程内容量上限）。
@@ -32,7 +33,7 @@
  */
 export const SUBAGENT_CAPACITY_ERROR_CODES = Object.freeze([
   "ACTIVATION_LIMIT_REACHED",
-  "SUBAGENT_CAPACITY_REACHED",
+  ADMISSION_ERROR_CODES.SUBAGENT_CAPACITY_REACHED,
 ]);
 
 /**
@@ -77,7 +78,7 @@ export function describeSubagentCapacityFailure(error, options = {}) {
   if (!isSubagentCapacityError(error, options)) return undefined;
   return {
     // 稳定的自有 code：不转发宿主原始码，避免调用方重新依赖已折叠的宿主细节。
-    code: "SUBAGENT_CAPACITY_REACHED",
+    code: ADMISSION_ERROR_CODES.SUBAGENT_CAPACITY_REACHED,
     message: SUBAGENT_CAPACITY_MESSAGE,
     retryable: true,
   };

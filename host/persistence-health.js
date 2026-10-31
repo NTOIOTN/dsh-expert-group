@@ -4,6 +4,7 @@
  * 该模块只维护内存中的可观察状态，不写 storage、不触发回调，也不持有 manager 句柄。
  * 失败记录因此不会重新进入持久化链；Host 可以在外层使用 retryDecision 做有界重试。
  */
+import { RPC_ERROR_CODES } from "../shared/error-codes.js";
 
 export const PERSISTENCE_FAILURE_CATEGORIES = Object.freeze([
   "transient",
@@ -92,7 +93,7 @@ export function classifyFailure(input) {
     || code.includes("enospc")
     || code.includes("efbig")
     || code.includes("payload_too_large")
-    || code.includes("payload-too-large")
+    || code.includes(RPC_ERROR_CODES.PAYLOAD_TOO_LARGE)
     || message.includes("quota")
     || message.includes("capacity")
     || message.includes("out of space")

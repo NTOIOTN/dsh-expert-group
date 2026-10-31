@@ -29,6 +29,7 @@ import {
   writeServerResponseEnvelope,
 } from "../rpc-host.js";
 import { RPC_CHANNEL, RPC_ENDPOINT } from "../shared/protocol.js";
+import { RPC_ERROR_CODES } from "../shared/error-codes.js";
 
 /** 通道生命周期的 effect 标签（与迁移前的字面量一致）。 */
 const CONNECTION_CHANNEL_EFFECT = "dsh-expert-group: connection rpc channel";
@@ -134,8 +135,8 @@ export function createConnectionChannel({ logger, hostRpc, webServer, http, erro
           rpcId = rpcIdFromEnvelopeText(fallbackPrefix);
         }
         const mapped = hostRpc.isBodyTooLarge(error)
-          ? { code: "payload-too-large", message: "请求体超过允许上限", details: {} }
-          : { code: "gateway/cancelled", message: "请求已取消", details: {} };
+          ? { code: RPC_ERROR_CODES.PAYLOAD_TOO_LARGE, message: "请求体超过允许上限", details: {} }
+          : { code: RPC_ERROR_CODES.CANCELLED, message: "请求已取消", details: {} };
         // 自持 channel 的早停路径也记类别：诊断面因此覆盖两条传输的全部拒绝入口，
         // 仍然只保存结构化 code，不保存读取到的前缀或错误消息。
         errorTracker.note(mapped.code);

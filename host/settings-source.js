@@ -71,17 +71,6 @@ export function findSettingsDescriptor(service, namespace) {
 }
 
 /**
- * 只取值面的便捷读取：找不到或 value 非对象时返回 undefined。
- *
- * @param {object} service - 注入的 ctx.settings。
- * @param {string} namespace - profile 条目 id。
- * @returns {object|undefined} 该条目的当前值（defaults resolved）。
- */
-export function readSettingsDescriptorValue(service, namespace) {
-  return findSettingsDescriptor(service, namespace)?.value;
-}
-
-/**
  * @param {object} options
  * @param {number[]} [options.unloadingStates] - 覆盖卸载态数值（测试用）。
  */
