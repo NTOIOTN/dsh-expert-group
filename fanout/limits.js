@@ -19,6 +19,34 @@ import { DEFAULT_CONCURRENCY_LIMIT, MAX_CONCURRENCY_LIMIT, normalizeTimeoutMs } 
 import { validateConcurrencyLimit, validateProviderLimit } from "./validation.js";
 
 /**
+ * 把 DEG 的默认角色并发上限按**宿主子代理名额**封顶（纯函数）。
+ *
+ * 宿主对「共享不间断 continuable 父链」的存活 child 数有进程内配额
+ * （`subagent` 行的 `maxActiveSubagents`，默认 8）。DEG 自己的默认并发
+ * （设置页的 `roleConcurrencyLimit`，默认 20）可以比它大，多出来的部分不会让任何
+ * 分片真的并发运行——它们只会各自撞一次宿主的 ACTIVATION_LIMIT_REACHED。把默认值
+ * 预先收敛到宿主名额，排队就会发生在 DEG 自己的账本里（可观测、可重试、有 ETA），
+ * 而不是把一次容量拒绝当成一个分片的失败。
+ *
+ * 封顶范围（刻意收窄，不要在别处再扩）：
+ * - **只**封顶默认值本身。`roleLimits`（逐角色显式覆盖）、`providerLimits` 与
+ *   任务级 `concurrencyLimit` 都是用户的显式选择，必须原值生效；总量仍由宿主名额
+ *   池兜底，超限时已有可重试的容量错误路径（见 shared/capacity-errors）。
+ * - `hostCap` 缺失或非正整数（宿主没有该行 / 读不到 / 字段被写坏）时**完全不封顶**：
+ *   读不到宿主配置不等于「宿主名额为 0」，静默降到 1 会让插件看起来不可用。
+ * - `configured` 必须是已归一过的默认并发（调用方已经过 normalizeRoleConcurrencyLimit），
+ *   本函数不做第二套归一。
+ *
+ * @param {number} configured - 已归一的默认并发（1..64）。
+ * @param {number|undefined} hostCap - 宿主 `maxActiveSubagents`；不可读时 undefined。
+ * @returns {number} 实际用于派发的默认并发。
+ */
+export function effectiveRoleConcurrencyLimitWithHostCap(configured, hostCap) {
+  if (!Number.isSafeInteger(hostCap) || hostCap <= 0) return configured;
+  return Math.min(configured, hostCap);
+}
+
+/**
  * 某个任务/某次执行生效的 provider 名额上限；undefined 表示不受 provider 限流约束。
  *
  * 语义（票据 26 + 票据 05）：

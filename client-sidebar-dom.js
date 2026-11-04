@@ -142,6 +142,30 @@
   }
 
   /**
+   * 宿主 on-screen 会话读面（票 02 / spec D1）：每次调用**现读**，返回三态标记：
+   * - 非空字符串：ok，值就是宿主此刻显示的那个会话；
+   * - ""：absent，宿主明确没有 on-screen 会话（全局面板占位 / 没有选中会话）；
+   * - null：unavailable，读面缺失、旧宿主、或读取抛错（读不到 ≠ 一致）。
+   *
+   * 宿主公开契约（@deepseek-ai/dsh-client-ui-sidebar-right 的 ctx.sidebarRight）：mounted 是
+   * ObservableSnapshot<SessionId | undefined>，读面方法就是它上面的 getSnapshot。methodOf 对
+   * Cordis 代理抛错与缺失一律返回 null，因此这里只需一次 try 兜住「读到一半炸了」。
+   *
+   * **唯一实现**：身份闸门（client-sidebar-panel-hooks-state.js）与切回补偿订阅
+   * （client-sidebar-panel-hooks-effects.js）都从这里读，绝不各写一份解析——两份解析对
+   * 「absent / unavailable」的判定迟早漂移，而这两态的语义正好相反（一个能定位、一个不能）。
+   */
+  function sidebarOnScreenSessionOf(sidebarRight) {
+    try {
+      const mounted = sidebarRight?.mounted ?? null;
+      const getSnapshot = methodOf(mounted, "getSnapshot");
+      if (getSnapshot === null) return null;
+      const value = getSnapshot.call(mounted);
+      return typeof value === "string" && value.length > 0 ? value : "";
+    } catch { return null; }
+  }
+
+  /**
    * 安全解析一个可选客户端服务（uiWorkspace / sidebarRight / sessions 等）。
    *
    * 每个候选项都按「get(name) → 直接属性」两段式探测：Cordis 的服务代理对未声明服务的
@@ -596,6 +620,9 @@
     ".deg_expert_group_header_auto_input{margin:0;cursor:pointer}",
     ".deg_expert_group_header_auto_input:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
     ".deg_expert_group_header_auto_label{font-size:12px;line-height:16px}",
+    // 标题栏诊断入口的反馈槽（票 06）：与刷新按钮同排的次级文字，常规字重、不换行；
+    // 空字符串时宽度为 0，因此常驻节点不会改变标题栏既有排版。
+    ".deg_expert_group_header_diag{flex:0 0 auto;font-size:11px;font-weight:400;color:var(--dsw-alias-label-secondary);white-space:nowrap}",
     // 标题栏峰谷时段标记（票据 09）：与 Auto 标签同一套文字规格（12px / 常规字重 / 次级色），
     // 不换行、不抢标题宽度；其余排版仍由标题栏的 flex-wrap 决定。
     // 启用时的绿色描边与文字色**与设置页入口按钮共用同一条声明**（见 client-styles.js 的
@@ -688,6 +715,10 @@
     ".deg_expert_group_sidebar_batch_action:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-business-primary,var(--dsw-alias-button-info-fill,#22d3ee))}",
     ".deg_expert_group_sidebar_batch_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
     ".deg_expert_group_sidebar_batch_action:disabled{opacity:.45;cursor:wait}",
+    // 旧宿主（on-screen 读面缺失，票 02）：手动入口渲染为禁用态，必须**看得出来**不可用。
+    // 只按 data-surface 标记命中（正常宿主、mismatch、absent、在途 pending 全部不带这个标记），
+    // 因此本规则不改变任何既有状态的外观。属性选择器排在基础类规则之后，同特异度下生效。
+    "[data-surface=unsupported]{opacity:.45;cursor:default}",
     // 「零」占位：inventory 已知为空时的非交互蓝色实心圆（直径 12px）。它只占位：
     // 没有 button / hover / tabindex，不进入键盘与可访问性交互面。
     ".deg_expert_group_sidebar_batch_zero{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary,#22d3ee))}",
@@ -840,8 +871,12 @@
     ".deg_expert_group_attempts_toggle{flex:0 0 auto;align-self:flex-start;box-sizing:border-box;height:20px;margin:1px 0 0;padding:0 4px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
     ".deg_expert_group_attempts_toggle:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
     ".deg_expert_group_attempts_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-    // fan-out 标题列：标题 + 时间线/计数/失败摘要纵向排列，标题行仍可点击导航。
-    ".deg_expert_group_fanout_title{display:flex;flex-direction:column;min-width:0}",
+    // fan-out 标题列：第二行（用量摘要 / 时间线 / 失败摘要）已整行删除（用户要求：
+    // 父任务不承担会话），这里只剩可点击导航的标题一行。
+    // wrapper 本身必须保留：.deg_expert_group_task:focus-visible 的复合选择器与测试都以它为锚点。
+    // 改为单行 flex（行方向 + 垂直居中）：头部网格 min-height 28px + align-items:center，
+    // 与相邻单行任务行（28px 行高）视觉一致，列方向不再把 wrapper 撑高。
+    ".deg_expert_group_fanout_title{display:flex;align-items:center;min-width:0}",
     ".deg_expert_group_fanout_title>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
     // 搜索/过滤/会话模型工具条：位于任务树顶部，只在快照已上屏时出现。
     ".deg_expert_group_toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:5px 0 2px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
@@ -1433,7 +1468,7 @@
     hostAppFrameWidthOf, listSnapshot, makeIcon, metadataOf,
     methodOf, normalizeSubagentAddress, paneNodesOf, parseSplitTracks,
     resolveClientService, resolveSplitContainer, rightbarPanelForSession, rightbarPanelForSessionCompat,
-    runtimeStatusOf, sidebarTabCloseKey, sidebarTabKey, sidebarTabSetsForSession,
+    runtimeStatusOf, sidebarOnScreenSessionOf, sidebarTabCloseKey, sidebarTabKey, sidebarTabSetsForSession,
     splitPairPendingContainers, statusIcon, styleTag, subagentChatAddress,
     subscribeSessions, titleOf, viewportWidthOf,
   });

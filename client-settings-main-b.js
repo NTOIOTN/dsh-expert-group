@@ -1215,8 +1215,13 @@
    */
   function renderSettingsManagementRow(view) {
     const {
-      draft, editDraft, saving, t,
+      draft, editDraft, saving, t, tExtra,
     } = view;
+    // 宿主名额与封顶后的实际生效值并进原生 title（不新增可见摘要区块）。
+    // 两个数都取 Host meta 的**已保存**口径：草稿未保存时绝不能把预览值标成「实际生效」。
+    // 名额/生效值读不到（null / 非法）时显示占位「—」，既不当作 0 也不封顶。
+    const cap = view.hostMeta?.hostConcurrencyCap;
+    const eff = view.hostMeta?.effectiveRoleConcurrencyLimit;
 
     const managementRow = (
         react.createElement("div", { className: "deg_settings_row deg_settings_management_row" },
@@ -1230,8 +1235,12 @@
               id: "deg-settings-role-concurrency-limit",
               type: "number",
               "aria-label": t("settings.concurrencyLimit"),
-              // 与相邻「角色默认超时」输入框一致：原生 title 说明取值范围与默认值（悬停可见）。
-              title: t("settings.concurrencyLimit.title"),
+              // 与相邻「角色默认超时」输入框一致：原生 title 说明取值范围与默认值（悬停可见）；
+              // 末尾追加当前宿主名额与封顶后的实际生效值。
+              title: t("settings.concurrencyLimit.title") + " · " + tExtra("settings.cap.host", {
+                host: cap > 0 ? cap : "—",
+                eff: eff > 0 ? eff : "—",
+              }),
               min: 1,
               max: 64,
               step: 1,
@@ -1282,7 +1291,6 @@
     return managementRow;
   }
 
-
   /** 「峰时 / 谷时」标签：副标题后缀与跨边界提示共用这一份口径，避免两处三目各写一遍。 */
   function periodLabelOf(view, period) {
     return view.tExtra(period === "peak" ? "settings.pv.peak" : "settings.pv.valley");
@@ -1329,8 +1337,12 @@
   function renderSettingsBody(view, actions) {
     const {
       candidatesError, catalogAvailable, directoryState, draft, error, hasUnsavedChanges, modelConfigHost, modelFieldsChanged,
-      roleLabelOf, roles, save, saved, saving, settingsSnapshot, t,
+      roleLabelOf, roles, save, saved, saving, settingsSnapshot, t, tExtra,
     } = view;
+    // 配置值被宿主名额封顶时，在既有保存状态位尾部补一句显式提示（不新增独立摘要区块）。
+    // 判定只读 Host meta 的**已保存** roleConcurrencyLimit：草稿未保存时不误报受限。
+    // 名额读不到（null / 非法）按不封顶处理：与 Host 的 effectiveRoleConcurrencyLimitWithHostCap 同口径。
+    const capLimit = view.hostMeta?.hostConcurrencyCap;
 
       const modelConfigSection = typeof modelConfigHost === "undefined" || modelConfigHost === null
         ? null
@@ -1390,7 +1402,9 @@
         error ? react.createElement("p", { className: "deg_settings_error", role: "status" }, error) : null,
       modelPageDeleteDialog,
         react.createElement("div", { className: "deg_settings_footer" },
-          react.createElement("span", { className: "deg_settings_status", role: "status" }, saved ? t("settings.saved") : hasUnsavedChanges ? t("settings.unsaved") : ""),
+          react.createElement("span", { className: "deg_settings_status", role: "status" },
+            (saved ? t("settings.saved") : hasUnsavedChanges ? t("settings.unsaved") : "")
+            + (capLimit > 0 && view.hostMeta?.roleConcurrencyLimit > capLimit ? tExtra("settings.cap.lim") : "")),
           react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving, onClick: actions.discard }, t("settings.discard")),
           // 票据 20：目录不可用只在本次草稿含模型字段变更时禁用保存；通知、任务开关、
           // 提示词、并发/超时等与模型无关的字段必须照常可保存。

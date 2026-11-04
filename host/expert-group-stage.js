@@ -323,6 +323,36 @@ function routeSnapshotFieldsFor(attempt, persisted) {
 }
 
 /**
+ * 内容可用性判定（票 04 / 规格书 D4）：**合取**条件，只在这里写一次，调用方不得逐处临时判空。
+ *
+ * 可用 ⇔ `proof.contentOwned === true` **且** 有效导航归属成立（`navigationOwned === true`，
+ * 即该 child 的 `owned` 判定为真、已经过 `contradicts` 反证）。
+ *
+ * 为什么必须是合取（两个方向都会泄漏）：
+ * - 只看 `contentOwned`：身份反证成立（记录声明别的父任务/分片，或声明的号不在本分片号域）
+ *   时该 childId 已从输出副本清空，但它的 child_models 内容仍会被挂到本行；
+ * - 只看导航归属：admission 凭据放行时 `contentOwned === false`，此时 provider / model /
+ *   用量 / 结构化结果都来自来源不明的会话，渲染它们等于把别的 root 的内容挂到本根任务树上。
+ *
+ * `available` 与 `record` 分开返回的原因：`usageOfChild` 还有一条**独立**的 `usageFor`
+ * （live 账本）通道，内容可用但没有 child_models 记录时仍要问它；内容不可用时则必须
+ * **整体跳过调用**（只把 persisted 换成单条记录挡不住这条泄漏）。
+ *
+ * @param {string|null} childId - 导航键 / attempt 的 child id。
+ * @param {object|undefined} proof - resolver 结论（`{ owned, contentOwned, … }`）。
+ * @param {boolean} navigationOwned - 该 child 的有效导航归属（已过 `contradicts`）。
+ * @param {object} persisted - 本次构建的 child_models 只读映射。
+ * @returns {{available:boolean, record:object|null}} 内容是否可用，以及（可用时）该 child 的记录。
+ */
+function contentAccessOf(childId, proof, navigationOwned, persisted) {
+  const available = navigationOwned === true
+    && proof !== null && typeof proof === "object" && proof.contentOwned === true;
+  if (!available) return { available: false, record: null };
+  const record = typeof childId === "string" && childId.length > 0 ? persisted?.[childId] ?? null : null;
+  return { available: true, record };
+}
+
+/**
  * 单个 fan-out shard 的投影。
  *
  * attempt 之间彼此独立，因此先把本 shard 需要的归属证明**全部调度**（同一 child 去重），
@@ -397,6 +427,15 @@ async function projectFanoutShard(shard, task, deps) {
     && contradicts(navigationChildId, latestAttempt?.attempt) !== true
     ? navigationProof
     : undefined;
+  /**
+   * 分片级内容读面（票 04）：内容可用 ⇔ `contentOwned === true` 且有效导航归属成立。
+   *
+   * 这里是既有缺口的收口点：`navigationChildId` 即便已因身份反证被清空（`ownedChild`
+   * 为 undefined），`persisted[navigationChildId]` 仍然有值；旧实现直接读它，于是
+   * structured / outputSchemaRequested / roleLabel 回退会从被否决的 child 上取值。
+   * 分片级取值因此与逐 attempt 用同一个 helper，不再单独判断。
+   */
+  const shardContent = contentAccessOf(navigationChildId, navigationProof, ownedChild !== undefined, persisted);
   // 归属未证明（或身份反证成立）的 childId 一律从**输出副本**清空：manager 的权威快照保持原样。
   const projectedAttempts = attempts.map((attempt) => {
     const childId = firstText(attempt?.childId);
@@ -404,30 +443,42 @@ async function projectFanoutShard(shard, task, deps) {
     const owned = (proof === undefined || proof.owned === true)
       && contradicts(childId, attempt?.attempt) !== true;
     if (!owned) return { ...attempt, childId: null };
+    /**
+     * 内容隔离（票 04）：导航归属成立只说明「可以点开」，不说明「内容属于本根」。下面每个
+     * 内容读点都经 `contentAccessOf` 取值（合取条件在那里写死），禁止在这里临时判空：
+     * 逐处判空正是「只满足其中一半条件」的来源。
+     */
+    const content = contentAccessOf(childId, proof, owned, persisted);
     // 实际路由（票据 24）：尝试本身的持久化字段（未来管理器的快照扩展）优先，
     // 缺失时从同一 child 的 child_models 记录补齐 candidateIndex/fallbackCount/
-    // lastRouteErrorCode；没有记录就省略字段，绝不伪造 0。
+    // lastRouteErrorCode；内容不可用或没有记录就省略字段，绝不伪造 0。
     const route = {
       ...projectModelRouteFields(attempt),
-      ...projectModelRouteFields(persisted[childId]),
+      ...projectModelRouteFields(content.record),
       // 时段/层/跨层回退（票据 06）：attempt 的冻结快照是权威，child_models 只是只读投影；
       // attempt 完全没有快照时才读 child 记录（旧记录/未启用峰谷），两者都没有就整体省略。
-      ...routeSnapshotFieldsFor(attempt, persisted[childId]),
+      ...routeSnapshotFieldsFor(attempt, content.record),
     };
     // 角色显示名（票据 27）：attempt 自身记录优先，其次同一 child 的 child_models 快照；
     // 两者都没有时省略字段（不猜显示名）。角色删除后历史 attempt 仍保留标签。
-    const attemptRoleLabel = roleLabelOf(firstText(attempt?.role, task?.role), firstText(attempt?.roleLabel, persisted[childId]?.roleLabel));
+    // 票 04：child_models 的 roleLabel 属于内容，内容不可用时回退不到它（只剩 attempt 自己的值）。
+    const attemptRoleLabel = roleLabelOf(
+      firstText(attempt?.role, task?.role),
+      firstText(attempt?.roleLabel, content.record?.roleLabel),
+    );
     const labeled = attemptRoleLabel === null ? attempt : { ...attempt, roleLabel: attemptRoleLabel };
     // 目标 subagent provider / 继承开关（票据 29）：attempt 自身字段优先，其次同一
     // child 的 child_models 快照；都没有时省略字段，不伪造 false。
-    const attemptSubagent = subagentContextFields(attempt, null, persisted[childId]);
-    // 用量（票据 25）：归属已证明的 attempt 才允许带 usage；缺失时省略整个字段，
+    const attemptSubagent = subagentContextFields(attempt, null, content.record);
+    // 用量（票据 25）：内容可用的 attempt 才允许带 usage；缺失时省略整个字段，
     // 绝不把“没拿到 usage”渲染成 0 token。
-    const attemptUsage = usageOfChild(childId, persisted, usageFor);
+    // 票 04 硬约束：内容不可用时**整体跳过调用**。usageOfChild 还会读**独立**的 usageFor
+    // （live 账本）通道，只把 persisted 换成空对象/单条记录都挡不住这条泄漏。
+    const attemptUsage = content.available === true ? usageOfChild(childId, persisted, usageFor) : null;
     // 结构化交付（票据 30）：只读结果/声明标记来自同一 child 的 child_models；
-    // 归属已证明的 attempt 才补齐，缺失整体省略。
-    const attemptStructured = structuredOfChild(childId, persisted);
-    const attemptRequested = outputSchemaRequestedOfChild(childId, persisted);
+    // 内容可用才补齐，缺失整体省略。
+    const attemptStructured = content.available === true ? structuredOfChild(childId, persisted) : null;
+    const attemptRequested = content.available === true && outputSchemaRequestedOfChild(childId, persisted);
     const settled = Object.keys(route).length === 0 ? labeled : { ...labeled, ...route };
     const withSubagent = Object.keys(attemptSubagent).length === 0 ? settled : { ...settled, ...attemptSubagent };
     return {
@@ -446,8 +497,9 @@ async function projectFanoutShard(shard, task, deps) {
   const shardStatus = firstText(shard?.status, ownedChild?.agent?.status, ownedChild?.session?.status) ?? "unknown";
   // 分片级结构化结果取最新 attempt 的 child_models（与 usage 同一“最新 attempt”口径）；
   // 不跨 attempt 合并 value，每个 attempt 自己的 structured 保留在 attempts 里。
-  const shardStructured = structuredOfChild(navigationChildId, persisted);
-  const shardRequested = outputSchemaRequestedOfChild(navigationChildId, persisted);
+  // 票 04：与逐 attempt 同一合取条件——内容不可用时不得读 persisted[navigationChildId]。
+  const shardStructured = shardContent.available === true ? structuredOfChild(navigationChildId, persisted) : null;
+  const shardRequested = shardContent.available === true && outputSchemaRequestedOfChild(navigationChildId, persisted);
   // 分片最新 child 会话内全部 turn 的累计墙钟 + 最后一个 open turn 起点（与 DSH 状态行同源，
   // 空闲区间不计）；无 live 会话或没有任何可证明的 turn 区间时各自省略。
   const shardTiming = turnTimingOf(sessionEvents(ownedChild?.session), now());
@@ -456,12 +508,20 @@ async function projectFanoutShard(shard, task, deps) {
     childId: ownedChild === undefined ? null : navigationChildId,
     role: firstText(shard?.role, task?.role),
     // 分片角色显示名（票据 27）：manager/分片记录优先，其次同一 child 快照，最后运行期目录。
+    // 票 04：child_models 的 roleLabel 回退同样属于内容，只经 shardContent 取值。
     roleLabel: roleLabelOf(
       firstText(shard?.role, task?.role),
-      firstText(shard?.roleLabel, persisted[navigationChildId]?.roleLabel),
+      firstText(shard?.roleLabel, shardContent.record?.roleLabel),
     ),
     // 第 4 参是最新 attempt：分片的时段/层/跨层回退以 attempt 冻结快照为准（票据 06）。
-    ...modelMetadata(ownedChild?.agent, ownedChild?.childSnapshot ?? null, null, latestAttempt),
+    // 第 2 参 childSnapshot 是内容来源（票 04）：合取不成立时一律传 null；成立时保持既有取值
+    // （resolver 在「冷读补证」分支会把它置 null，这里逐字沿用，不改内容口径）。
+    ...modelMetadata(
+      ownedChild?.agent,
+      shardContent.available === true ? ownedChild?.childSnapshot ?? null : null,
+      null,
+      latestAttempt,
+    ),
     runSummary: runSummary(ownedChild?.session, shardStatus, "continuable", sessionEvents(ownedChild?.session)),
     continuable: true,
     ...(shardUsage === null || !hasUsageMetrics(shardUsage) ? {} : { usage: shardUsage }),

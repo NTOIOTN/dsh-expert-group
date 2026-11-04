@@ -255,6 +255,10 @@ export function createFanoutManager(options = {}) {
     observeStopEvidence: (identity, evidence) => persist.withPersistenceBatch(() => scheduler.observeStopEvidence(identity, evidence)),
     markAttributionAged: (identity, agedOptions) => persist.withPersistenceBatch(() => scheduler.markAttributionAged(identity, agedOptions)),
     stopDiagnostics: scheduler.stopDiagnostics,
+    // admission 凭据读面（票 02）：只转发 store 的派生读（读活任务对象上的 handle），
+    // 不经过 task-commands（其 getTask 返回 cloneJson 快照，不含 handle），也不占用
+    // 那个已贴 1,500 行上限的文件。关闭语义与 getTask 一致（store 内按 isClosed 返回 null）。
+    admittedChildOf: store.admittedChildOf,
     getTask: commands.getTask,
     listTasks: commands.listTasks,
     getCounts: commands.getCounts,

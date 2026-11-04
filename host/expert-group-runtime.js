@@ -110,9 +110,16 @@ export function createExpertGroupRuntime(dependencies = {}) {
     return snapshot?.childModels && typeof snapshot.childModels === "object" ? snapshot.childModels : {};
   }
 
-  // projection 的**组合上下文**：只在这里绑定 recoveryRecords / agents / sessionQuery 三份只读读面，
-  // 之后每次 build 经它新建 coordinator 与 childOwnership owner（plan R2.2-a §1/§2）。
-  const projection = createExpertProjectionContext({ recoveryRecords, agents, sessionQuery });
+  // projection 的**组合上下文**：只在这里绑定 recoveryRecords / agents / sessionQuery / admittedChildOf
+  // 四份只读读面，之后每次 build 经它新建 coordinator 与 childOwnership owner（plan R2.2-a §1/§2）。
+  // admission 凭据读面（票 02 接线，判定在票 03）：fanout runtime 的只读探针原样绑定一次，
+  // 不在这里做任何推导——凭据必须来自 Host 的真实 admission 结果（活 attempt 的 handle），
+  // 而不是「任务在 running」「childId 非空」这类快照状态。fanoutHost 在测试替身里可以缺该
+  // 能力，此时保持 undefined，resolver 侧因此永远拿不到凭据（fail-closed）。
+  const admittedChildOf = typeof fanoutHost?.admittedChildOf === "function"
+    ? fanoutHost.admittedChildOf.bind(fanoutHost)
+    : undefined;
+  const projection = createExpertProjectionContext({ recoveryRecords, agents, sessionQuery, admittedChildOf });
   // 运行期读命令：只绑定一次（纯读面，无 per-build 状态）。
   const projectionTitleOf = createProjectionTitleReader(projectionTitleFor);
   const roleLabelOf = createRoleLabelReader(roleLabels);

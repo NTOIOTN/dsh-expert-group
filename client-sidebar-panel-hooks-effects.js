@@ -18,7 +18,7 @@
   const DOM_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-dom");
   const DOM = global[DOM_SYMBOL] || {};
   const {
-    methodOf, subscribeSessions,
+    methodOf, sidebarOnScreenSessionOf, subscribeSessions,
   } = DOM;
   const POLL_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-poll");
   const POLL = global[POLL_SYMBOL] || {};
@@ -851,6 +851,56 @@
     if (pollSurfaceBlocked() !== null) pauseScheduler();
     else armScheduler();
     try { documentRef?.addEventListener?.("visibilitychange", onVisibilityChange); } catch { /* 可选 API。 */ }
+    /**
+     * 切回补偿（票 03 / spec D5）：订阅宿主 on-screen 读面，值**变成**本面板会话时补一次完整同步。
+     *
+     * 为什么必须有：票 02 的身份闸门让「面板会话不在前台时的自动打开」一律 fail-closed，切回本
+     * 会话后如果没有补偿，闸门就退化成「后台永远不打开、结束了也不收口」。
+     *
+     * 边界（逐条对应 spec D5 与票据 03）：
+     * - **唯一入口**：只调用 sidebarTabSyncRef → syncSidebarTabs，与挂载 / 轮询 / observer /
+     *   inventory 订阅走同一条链路。候选去重（reservation / 在途 opening / busy）、尾随级联与
+     *   失败屏障因此全部复用既有机制，**不新增锁**，也不产生第二条推进路径。
+     * - **不持有旧闭包**：引用取的是最新一帧渲染写下的同步器，不是本 effect 闭包里的副本。
+     * - **闸门照旧**：票 02 的 on-screen 判定在各宿主副作用之前现读，因此「刚切回又切走」时
+     *   这一轮同步仍会被拒绝，绝不把打开写进别人的会话。
+     * - **只在值真的变化时动作**：切走、absent（读面在但没有会话）、unavailable（读面缺失）
+     *   一律不推进任何宿主写操作。
+     * - **不重置自动关闭的预算与冷却**：本段从不触碰 attempts / cooldowns 记账；syncSidebarTabs
+     *   只按既有语义清掉「同一批微任务级联」的失败屏障（spec D5 明确要求清空失败屏障）。
+     * - **安全降级**：读面或订阅方法缺失（旧宿主 / 直接 createExpertGroupPanel 的替身）时退化成
+     *   「不订阅」，不抛错、行为与今天逐字一致。
+     *
+     * 时序：先订阅再读快照做基线（订阅与首次读数之间发生的切换不会被漏掉）；基线本身不补偿，
+     * 因为紧接着下面就会无条件对齐一次。
+     */
+    let unsubscribeOnScreen = null;
+    let onScreenSession = null;
+    let onScreenSessionKnown = false;
+    try {
+      const mounted = sidebarRight?.mounted ?? null;
+      const subscribe = methodOf(mounted, "subscribe");
+      if (subscribe !== null) {
+        const cleanup = subscribe.call(mounted, () => {
+          const next = sidebarOnScreenSessionOf(sidebarRight);
+          // 值没变（宿主重复发布同一次提交）⇒ 什么都不做：不推进同步、不写诊断。
+          if (onScreenSessionKnown === true && next === onScreenSession) return;
+          const baseline = onScreenSessionKnown !== true;
+          onScreenSession = next;
+          onScreenSessionKnown = true;
+          if (baseline === true) return;
+          // 只补「变成**本面板**会话」这一次：切走 / absent / 读面不可用都不产生副作用。
+          if (typeof next !== "string" || next === "") return;
+          if (sidebarSessionId === null || sidebarSessionId === undefined) return;
+          if (String(next) !== String(sidebarSessionId)) return;
+          sidebarTabSyncRef.current?.();
+        });
+        if (typeof cleanup === "function") unsubscribeOnScreen = cleanup;
+      }
+    } catch { unsubscribeOnScreen = null; }
+    // 订阅之后再读一次基线（getSnapshot 缺失 ⇒ 基线为 null，此后只按真实变化判定）。
+    onScreenSession = sidebarOnScreenSessionOf(sidebarRight);
+    onScreenSessionKnown = true;
     // 挂载（或切换 root 后重挂载）时立刻对齐一次：记录可能来自同一个 root 的上一个实例。
     sidebarTabSyncRef.current?.();
     /**
@@ -909,6 +959,8 @@
       refreshState.inFlight = null;
       if (typeof unsubscribe === "function") unsubscribe();
        if (typeof unsubscribeOpenTabs === "function") unsubscribeOpenTabs();
+      // 切回补偿的订阅同样与本次挂载同生共死：卸载即退订，绝不在已卸载的面板上推进同步。
+      if (typeof unsubscribeOnScreen === "function") unsubscribeOnScreen();
       try { documentRef?.removeEventListener?.("visibilitychange", onVisibilityChange); } catch { /* 可选 API。 */ }
       // 观察器必须与本次挂载同生共死：留一个仍在观察 body 的 observer 就是长期泄漏。
       try { tabObserver?.disconnect?.(); } catch { /* 可选 API。 */ }

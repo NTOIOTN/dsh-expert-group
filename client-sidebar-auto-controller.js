@@ -222,8 +222,8 @@
     const {
       clearAutoCloseBudget, idleSidebarResourceAddresses, rootSessionId, runningSidebarResourceAddresses,
       sidebarAutoCloseCooldownsRef, sidebarAutoCloseVerificationsRef, sidebarAutoOriginRef, sidebarAutoReservationRef,
-      sidebarAutoSuppressedRef, sidebarIdleChildren, sidebarResourceTabStateOf, sidebarSessionId,
-      sidebarTabOpeningRef, sidebarTabPendingRef, sidebarTabRecordsRef, trimAutoKeyMap,
+      sidebarAutoSuppressedRef, sidebarIdleChildren, sidebarOnScreenSessionStill, sidebarResourceTabStateOf,
+      sidebarSessionId, sidebarTabOpeningRef, sidebarTabPendingRef, sidebarTabRecordsRef, trimAutoKeyMap,
     } = scope;
     function sidebarAutoCloseKeyIsActive(key) {
       if (sidebarTabPendingRef.current.has(key)) return true;
@@ -299,6 +299,18 @@
         if (age < SIDEBAR_AUTO_OPEN_PLACEHOLDER_TTL_MS) continue;
         if (sidebarTabPendingRef.current.has(key)) continue;
         if (sidebarTabOpeningRef.current.has(key)) continue;
+        /**
+         * on-screen 会话写入闸门（收尾补齐）：下面这一支按**本会话**地址读公开 inventory，并把
+         * 「读到了、而且没有这个地址的 tab」当成「那次打开永远没落地」回收占位。非前台时那份
+         * inventory 描述的是别的会话，本会话仍然有效的占位会被误回收——Auto 随即认为这个资源
+         * 从没打开过（去重记账丢失），还可能在下一轮开出重复 pane。
+         *
+         * 因此身份不一致时**整轮不写不删**（当前条目与后续条目都保持原样，收回下一轮再做）：
+         * 判据只有在「确有一条过期占位、且已经越过 TTL / 在途 / pending 三重挡板」时才现读一次，
+         * 空闲轮次绝不因此多写拒绝诊断。别的 scope 的占位回收（上面那支）只按时间判定，不受影响，
+         * 但这里用 return 而不是 continue：一次拒绝之后本轮不再逐个空转，下一轮照常从头上再判。
+         */
+        if (sidebarOnScreenSessionStill("ownership") !== true) return;
         const state = sidebarResourceTabStateOf(entry.address);
         if (state.readable !== true) {
           // fail-closed：读不到 inventory 时保留占位，绝不把「读不到」当成「没有 tab」。
@@ -345,6 +357,16 @@
           if (idle === 1 ? (!manual && !suppressed.has(key)) : !manual) continue;
           const state = sidebarResourceTabStateOf(address);
           if (!state.readable) continue;
+          /**
+           * on-screen 会话写入闸门（票 02 复审收尾）：本函数在候选闸门**之前**运行（syncSidebarTabs 的
+           * 既定顺序），却会改写 / 删除持久 manual 归属——身份不一致时「原样保留、不写不删」才是正确
+           * 语义（写下去就落进另一个会话的右栏归属，切回后还会按错误的依据接管用户的 tab）。
+           *
+           * 闸门放在「已确认这条地址确实要参与相位对账」之后（上面两处 continue 已排除无关地址）：
+           * 只有真的走到写入前的这一条才记诊断，绝不每轮对空表刷一条。拒绝路径的诊断由闸门自己写既有
+           * decision 通道（event=surface-gate、action=ownership）；切回本会话后的同步再按真实相位对账。
+           */
+          if (sidebarOnScreenSessionStill("ownership") !== true) return;
           const idleMark = suppressed.get(key)?.idle;
           if (idle === 1) {
             // idle+present（偏离态）：保持 manual，并把「这一轮亲眼见过空闲」连同 tabId 记在抑制表
@@ -409,7 +431,7 @@
       closeSidebarResource, rootSessionId, settleAutoCloseAttempt,
       sharedSidebarTabCloseInFlight, sidebarAutoCloseCooldownsRef, sidebarAutoCloseVerificationsRef,
       sidebarAutoFailedKeysRef, sidebarAutoOriginRef, sidebarAutoSuppressedRef,
-      sidebarSessionId, sidebarSurfaceStillCurrent, sidebarTabRecordsRef,
+      sidebarOnScreenSessionStill, sidebarSessionId, sidebarSurfaceStillCurrent, sidebarTabRecordsRef,
       trimAutoKeyMap,
     } = scope;
     // 下层工厂的函数在本层以同名局部别名调用：函数体与拆分前逐字一致。
@@ -453,7 +475,15 @@
        * 宿主换过 tabId 时（旧 tab 消失、同一个资源换成新 tab），旧验证只能归还自己的租约并清理
        * 自己那一笔令牌对应的预算，绝不删除新 generation 的 record / origin / 冷却。
        */
-      const sameTab = scopedRecord !== undefined && scopedRecord.tabId === entry.tabId;
+      /**
+       * on-screen 身份闸门（票 02）：验证链是**若干轮同步之后**才收口的异步路径，此刻宿主画的很
+       * 可能已经是另一个会话。账本写入（删记录 / 撤来源 / 登记抑制 / 持久归属 / 冷却）一律要求
+       * 身份一致；租约归还与验证记录清理照旧执行，否则这个 tabId 的关闭租约会永久悬空、后续关闭
+       * 全部被判成「有人接手」。被拒绝的归属交给新 Panel 的同步按真实 inventory 结算。
+       */
+      const onScreenCurrent = sidebarOnScreenSessionStill("close") === true;
+      const sameTab = onScreenCurrent === true
+        && scopedRecord !== undefined && scopedRecord.tabId === entry.tabId;
       /**
        * 分栏事务的收口只认**这次关闭出发时看到的那一份意图**（不可复用令牌逐对象相等）：
        * record 可能已被记录同步层删掉，但这次关闭确实发生了，事务必须收口，否则右栏会一直停在
@@ -543,6 +573,16 @@
          * 入口里的等价收口；判据含不可复用的 surface 令牌，因此「切走又切回同一组值」同样作废。
          */
         if (sidebarSurfaceStillCurrent() !== true) return { status: "stale", closed: false };
+        /**
+         * on-screen 身份闸门（票 02 / spec D3）：等待竞争租约的这段 await 同样可能跨越一次会话切换，
+         * 而下面会在地址复核通过后**重新获取租约并向宿主真正发出 close()**。宿主 close() 只作用于
+         * on-screen 会话，此刻身份不一致就必须放弃——否则等来的那一次关闭会落到另一个会话的右栏
+         * （同一个 tabId 在两边都可能存在）。判据与其余写入点**同一份实现**（三态 fail-closed），
+         * 拒绝返回 stale：调用方只回滚自己的在途记账，绝不写共享账本，旧 tab 归属交给新 Panel 按
+         * 真实 inventory 结算。
+         */
+        /* 放在这里：下面会重新获取租约并真正发出 close。 */
+        if (sidebarOnScreenSessionStill("close") !== true) return { status: "stale", closed: false };
         /**
          * 等待者绝不直接采信别人的结算结论（旧实现只读布尔 ok），一律用自己的期望地址重新探针：
          *
@@ -650,6 +690,66 @@
     });
   }
 
+  /**
+   * 运行态归属自愈的三态判据（票 05 / 规格 D7）。
+   *
+   * 资源**仍在运行**，而归属记录里那个具体 tabId 已经被权威 inventory 判定「不在清单里」时，这条
+   * auto 归属就是残留：不撤销它，autoOpenCandidate 的 origin.has(key) 会让这个地址在本页生命周期里
+   * **永不重开**（用户报的「右栏什么都没打开」），资源结束后同一份残留也挡着下一次打开。
+   *
+   * 证据分型（强度与关闭验证链逐条同源，绝不新增容器）：
+   * - present：归属仍然有效（顺手清零可能残留的待确认计数）⇒ keep；
+   * - absent：清单可读 + tabId 明确不在 + 已连续确认（SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS）⇒ heal。
+   *   资源仍在运行 ⇒ 本帧随后的候选阶段（autoCloseCandidate ?? autoOpenCandidate）就会重新打开它；
+   *   资源已经结束的相位不走本判据，由空闲相位的既有收口路径**只清账、绝不重开**；
+   * - recycled：这个 tabId 已被宿主回收给**另一个** contentId（按地址比对证明）。它证明的不是
+   *   「我们的 tab 不见了」而是「这个 id 此刻承载别人」，证明力不足以撤销一条仍可能有效的归属
+   *   ——误删 owner 就是永久漏收，因此保持原样（收口仍归空闲相位的既有路径）；
+   * - unreadable：读不到清单既不证明存在也不证明不存在 ⇒ 保持原样且不推进任何计数。
+   *
+   * 占位（tabId 为空）不是归属证据；记录与归属绑定失配、关闭租约在途一律让位（收口权归各自所有者）。
+   * 只处理 auto：真正的删除由 deleteSidebarAutoOwnership 把关（manual 一律保留）。
+   *
+   * 确认计数来源（两条同强度证据链，阈值都是 SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS）：
+   * - 有 record：挂在实例级 record 上的「运行中 + 权威缺席」观测计数（record.absentRunning）。
+   *   它只在资源被快照判为 running 时推进，因此数的是「同一个 tab 连续两轮仍在运行却都不在清单里」；
+   *   也绝不给关闭候选的 tabMisses 采样序列添样本（那会让同一份缺席在两个相位被数两次）；
+   * - 没有 record 的边界路径（重挂载 / 收养只成功一部分）：退回共享 tabMisses 采样，并返回
+   *   "keep-skip-budget" 让调用方跳过预算清理——预算清理会把采样计数一起清掉，先清后采就永远数不到第二次。
+   *
+   * @param {{ boundTabId: string|null, record: object|undefined, presence: string|null,
+   *   closeInFlight: boolean, probe: Function, sample: Function }} input
+   * @returns {"keep"|"keep-skip-budget"|"heal"}
+   */
+  function runningOwnershipVerdictOf(input) {
+    if (input.boundTabId === null || input.closeInFlight === true) return "keep";
+    const record = input.record;
+    if (record !== undefined && record.tabId !== input.boundTabId) return "keep";
+    // 有 record 时以记录同步器写入的「权威缺席」为入口，避免每个运行中资源每轮都现读一次宿主清单。
+    if (input.presence === null && record !== undefined && record.absent !== true) return "keep";
+    const presence = input.presence ?? input.probe();
+    if (presence === "present") {
+      // 正向证据：归属仍然有效，清掉可能残留的运行态缺席观察。无 record 的边界路径退回共享采样。
+      if (record === undefined) input.sample(false);
+      else record.absentRunning = null;
+      return "keep";
+    }
+    if (presence !== "absent") return "keep";
+    if (record === undefined) return input.sample(true) >= SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS ? "heal" : "keep-skip-budget";
+    /**
+     * 连续「运行中 + 权威缺席」观测：只在本判据里推进（本判据只在资源被快照判为 running 的分支调用），
+     * 因此数的是「同一个 tab 连续两轮都还在运行、却都不在清单里」——正是永久阻塞的形状。资源一旦
+     * 转 idle，收口权归空闲相位的既有路径（本计数不参与），绝不会出现「刚关掉就又立刻重开」。
+     * 计数字段挂在实例级 record 上：不新增容器，也不会像共享采样序列那样在两个相位被重复计数。
+     */
+    const previous = record.absentRunning;
+    const misses = previous !== undefined && previous.tabId === input.boundTabId
+      ? (Number(previous.misses) || 0) + 1
+      : 1;
+    record.absentRunning = { tabId: input.boundTabId, misses };
+    return misses >= SIDEBAR_TAB_DISAPPEAR_CONFIRMATIONS ? "heal" : "keep";
+  }
+
   /** 候选选择（该关的 / 该开的）与能力降级判据。 */
   function createSidebarAutoCandidates(scope, tabClosePort, bookkeeping) {
     const {
@@ -660,7 +760,7 @@
       sidebarActiveResourceMatches, sidebarAutoCloseAttemptOwnersRef, sidebarAutoCloseAttemptsRef,
       sidebarAutoCloseCooldownsRef, sidebarAutoCloseVerificationsRef, sidebarAutoEpochRef,
       sidebarAutoFailedKeysRef, sidebarAutoOriginRef, sidebarAutoReservationRef,
-      sidebarAutoSuppressedRef, sidebarManualIntentOf, sidebarOpenTabsAvailable,
+      sidebarAutoSuppressedRef, sidebarManualIntentOf, sidebarOnScreenSessionStill, sidebarOpenTabsAvailable,
       sidebarResourceTabStateOf, sidebarSessionId, sidebarTabOpeningRef,
       sidebarTabPendingRef, sidebarTabRecordsRef, trimAutoKeyMap,
     } = scope;
@@ -673,18 +773,37 @@
       && (readActiveSidebarResource !== null || sidebarOpenTabsAvailable)
       && typeof primitives?.IconChevronLeftOutlineRegular === "function";
     }
+    /**
+     * 关闭候选选择（该关的）。
+     *
+     * on-screen 会话写入闸门（票 02 复审收尾 / spec D3）：本函数在**外层候选闸门之前**运行
+     * （syncAutoSidebarTabs 的既定顺序），却会改写 / 删除 records、共享来源、重试预算、采样计数与
+     * 持久归属。mismatch / absent 时读到的那份 inventory 描述的是**别的会话**，据此判定「这个 tab
+     * 已经不在 / 已被回收」会把本会话仍然有效的 owner 删掉——切回后那个 tab 再也收不回来。
+     *
+     * 因此身份不一致时本轮什么都不做：不写、不删，也不选关闭候选（外层闸门本来也会拒绝它，只是
+     * 拒绝得太晚）。清理延后到**下一个前台轮**：切回补偿会推进一次完整同步，判据与今天的成功路径
+     * 逐字一致，所以关闭候选不会因此永久卡死。拒绝的可见性由闸门自己写既有 decision 通道。
+     *
+     * 闸门只在**确有归属记账**时才现读（origin 为空 ⇒ 下面的循环不会进入，本函数不可能写）：否则面板
+     * 会话不在前台时每一轮空转同步都会多写一条 action=close 的拒绝诊断，把有界诊断环刷成噪音
+     * （spec D8 的限频只聚合连续同源拒绝，open / close 交替时并不成立）。
+     */
     function autoCloseCandidate(running) {
-      const origin = sidebarAutoOriginRef.current;
-      const records = sidebarTabRecordsRef.current;
-      const openings = sidebarTabOpeningRef.current;
-      const attempts = sidebarAutoCloseAttemptsRef.current;
+      const origin = sidebarAutoOriginRef.current, records = sidebarTabRecordsRef.current,
+        openings = sidebarTabOpeningRef.current, attempts = sidebarAutoCloseAttemptsRef.current;
+      if (origin.size > 0 && sidebarOnScreenSessionStill("close") !== true) return null;
       for (const [key, entry] of origin) {
         // 只处理当前 surface 的记账：别的 session/root 的键在当前快照里无法判定，绝不越权操作。
         if (entry.sessionId !== sidebarSessionId || entry.rootSessionId !== rootSessionId) continue;
         const runningNow = running.has(entry.address);
+        // 归属账本绑定的那个具体 tab（null = 占位）：恢复分支与运行态自愈共用同一份读取。
+        const boundRunningTabId = sidebarAutoOriginTabIdOf(entry);
         let scopedRecord = records.get(key);
         if (scopedRecord === undefined
           || scopedRecord.sessionId !== sidebarSessionId || scopedRecord.rootSessionId !== rootSessionId) scopedRecord = undefined;
+        // 本帧已为这个 key 读到的在场证据（null = 还没读过）：只做同帧复用，绝不留到下一帧。
+        let runningPresenceCache = null;
         if (scopedRecord === undefined) {
           // 这个 key 的打开/动作仍在途：运行中交给下面的运行态清理（预算/冷却复位），空闲时等它
           // 落地、本轮不撤销归属。
@@ -699,22 +818,40 @@
              * 保留归属，明确已不是那个 tab 才撤销。
              */
             const persisted = readSidebarAutoOwnershipEntry(sidebarSessionId, rootSessionId, entry.address, { quiet: true, authoritative: true });
-            const boundTabId = sidebarAutoOriginTabIdOf(entry);
-            const presence = persisted === undefined ? "unreadable" : sidebarTabPresenceInInventory(boundTabId, entry.address);
+            const presence = persisted === undefined ? "unreadable" : sidebarTabPresenceInInventory(boundRunningTabId, entry.address);
+            runningPresenceCache = presence;
             if (persisted?.origin === SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL
               || (presence !== "unreadable" && presence !== "present" && !runningNow)) {
               origin.delete(key);
               clearAutoCloseBudget(key);
               continue;
             }
-            if (presence === "present" && sidebarResourceTabStateOf(entry.address).tabId === boundTabId) {
-              records.set(key, scopedRecord = { sessionId: sidebarSessionId, rootSessionId, tabId: boundTabId, title: null, misses: 0, origin: SIDEBAR_TAB_ORIGIN_AUTO });
+            if (presence === "present" && sidebarResourceTabStateOf(entry.address).tabId === boundRunningTabId) {
+              records.set(key, scopedRecord = { sessionId: sidebarSessionId, rootSessionId, tabId: boundRunningTabId, title: null, misses: 0, origin: SIDEBAR_TAB_ORIGIN_AUTO });
             } else if (!runningNow) {
               continue;
             }
           }
         }
         if (runningNow) {
+          // 归属自愈（票 05 / 规格 D7）：三态判据、读面节流与计数来源全在 runningOwnershipVerdictOf。
+          const runningVerdict = runningOwnershipVerdictOf({
+            boundTabId: boundRunningTabId,
+            record: scopedRecord,
+            presence: runningPresenceCache,
+            closeInFlight: sidebarTabCloseInFlight(boundRunningTabId) === true,
+            probe: () => sidebarTabPresenceInInventory(boundRunningTabId, entry.address),
+            sample: (missing) => sampleAutoTabMisses(key, boundRunningTabId, missing),
+          });
+          if (runningVerdict === "heal") {
+            // 连续确认成立 ⇒ 这条 auto 归属是残留：撤销来源、清预算（含采样计数）、删持久 auto 归属。
+            origin.delete(key);
+            records.delete(key);
+            clearAutoCloseAttempt(key);
+            deleteSidebarAutoOwnership(sidebarSessionId, rootSessionId, entry.address, "inventory-absent-selfheal");
+            continue;
+          }
+          if (runningVerdict === "keep-skip-budget") continue;
           // 资源重新变成运行中：它已经开着就保持开着，重试预算、owner 身份与失败冷却一并清零。
           // **绝不**丢弃仍在验证中的关闭：那条链属于「已经发出的一次关闭」，它的收口（删记录、
           // 撤销来源 / 登记抑制）与重试预算无关；丢掉它会让 record 与箭头永久停在 <<。

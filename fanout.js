@@ -68,4 +68,8 @@ export {
   validateSubmitInput,
 } from "./fanout/validation.js";
 
+// 宿主子代理名额封顶（纯函数）：实现在 fanout/limits.js，这里按门面惯例再导出。
+// host/ 侧（派发 resolver 与 meta 投影）都只认门面名，不直接依赖 fanout/ 内部文件。
+export { effectiveRoleConcurrencyLimitWithHostCap } from "./fanout/limits.js";
+
 export { createFanoutManager } from "./fanout/public-api.js";

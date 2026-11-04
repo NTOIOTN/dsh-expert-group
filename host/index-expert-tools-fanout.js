@@ -65,7 +65,11 @@ import {
   prepareFanoutAttempt,
 } from "./fanout-dispatch-route.js";
 import { OUTPUT_SCHEMA_REQUESTED_MARKER } from "../shared/structured.js";
-import { PROVIDER_ROUTE_CHANGED, SHARD_TERMINAL_STATUSES } from "../fanout.js";
+import {
+  effectiveRoleConcurrencyLimitWithHostCap,
+  PROVIDER_ROUTE_CHANGED,
+  SHARD_TERMINAL_STATUSES,
+} from "../fanout.js";
 import { FANOUT_BUDGET, truncateFeedbackText } from "../resource-budget.js";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 
@@ -1312,6 +1316,13 @@ export function createFanoutRuntimeWiring({ identity, roles, storage, waits, cac
   const { lineage, getAgent, storageGeneration } = identity;
   const { activeRoles, roleCatalog } = roles;
   const settingsSource = () => storage.readSettingsSource();
+  /**
+   * 宿主子代理名额的**同步读值函数**（settings-source 的缓存，不在派发热路径跑 describe）。
+   * 旧装配/测试替身没有这一项时返回 undefined —— 语义是「读不到宿主配置」，因此不封顶。
+   */
+  const readHostConcurrencyCap = typeof storage.readHostConcurrencyCap === "function"
+    ? storage.readHostConcurrencyCap
+    : () => undefined;
   const { settleAllFanoutShardWaits, releaseFanoutGoalHandoff } = waits;
   const { clearFanoutOutputSchemas, clearFanoutRoute, clearAllFanoutOutputSchemas, clearAllFanoutRoutes } = caches;
   const { buildFanoutFeedback } = commands;
@@ -1382,9 +1393,14 @@ export function createFanoutRuntimeWiring({ identity, roles, storage, waits, cac
         return entry !== void 0 && entry.readOnly !== true;
       }),
     },
-    // 角色级并发上限：唯一权威来源是插件 settings.roleConcurrencyLimit；传解析函数
-    // 而不是快照值，保证设置保存后新建任务立即按新值调度。
-    concurrencyLimit: () => normalizeRoleConcurrencyLimit(settingsSource()?.roleConcurrencyLimit),
+    // 默认并发上限：唯一权威来源是插件 settings.roleConcurrencyLimit，再按**宿主子代理
+    // 名额**封顶（宿主池才是真正的运行上限）。传解析函数而不是快照值，保证设置保存后
+    // 新建任务立即按新值调度；封顶只作用于默认值，roleLimits / providerLimits / 任务级
+    // concurrencyLimit 仍是用户显式选择，原值生效。
+    concurrencyLimit: () => effectiveRoleConcurrencyLimitWithHostCap(
+      normalizeRoleConcurrencyLimit(settingsSource()?.roleConcurrencyLimit),
+      readHostConcurrencyCap(),
+    ),
     // 逐角色并发覆盖（内置角色集）：与上面的默认值是两层关系，manager 派发时实时解析。
     roleLimits: () => settingsSource()?.roleLimits,
     // provider 级并发上限映射：只约束真正进入 running 的分片数（信号量语义）。

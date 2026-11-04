@@ -169,6 +169,12 @@ export function assembleExpertTools(state) {
     roles: { activeRoles, roleCatalog },
     storage: {
       readSettingsSource: state.readSettingsSource,
+      // 宿主子代理名额（settings-source 的缓存值）：与 settings 读源同属「配置读取」这一组，
+      // 因此并入 storage 能力面，不新增第 9 个协作方（C3 保持 8 组）。同步取值、读不到即
+      // undefined（不封顶），绝不在派发热路径上调用宿主 describe()。
+      readHostConcurrencyCap: () => (typeof host?.settings?.hostConcurrencyCap === "function"
+        ? host.settings.hostConcurrencyCap()
+        : undefined),
       readFanoutSnapshot: () => storageBinding.fanoutSnapshot(),
       persistFanoutSnapshot: state.persistFanoutSnapshot,
       persistenceHealth,

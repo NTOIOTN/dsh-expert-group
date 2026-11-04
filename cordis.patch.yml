@@ -1,5 +1,6 @@
 # dsh-expert-group bundle 补丁。
-# 仅插入一个 Host 行；客户端半由该行的包名经 dsh.client 清单发现。
+# 第一项插入 Host 行；客户端半由该行的包名经 dsh.client 清单发现。
+# 第二项声明宿主子代理并发默认值（安装即生效，用户显式配置仍可在更高层覆盖）。
 - insert:
     - id: dsh-expert-group
       name: dsh-expert-group
@@ -8,3 +9,11 @@
         enableOrchestrator: true
         # 裸 Config 默认关闭；安装 bundle 在此显式开启视觉观察员。
         enableObserver: true
+
+# 安装 DEG 后默认把宿主子代理并发上限改为 64。
+# 注意：bundle patch 的 config 是**整字段替换**（vendor/include patch.ts 同款语义），
+# 当前 base bundle 的 subagent 行没有 config，故不会丢其它字段；若未来 base 增加 config，
+# 需要改为按字段合并的方案。
+- id: subagent
+  config:
+    maxActiveSubagents: 64

@@ -9,6 +9,7 @@
  * @module dsh-expert-group/host/index-assembly-wire
  */
 import { RPC_PATH } from "../shared/protocol.js";
+import { effectiveRoleConcurrencyLimitWithHostCap } from "../fanout.js";
 import { createRpcRequestLifecycle } from "./rpc-request-lifecycle.js";
 import { BadJsonError } from "./index-rpc-http.js";
 import { createIndexRpcActionCore } from "./index-rpc-action-core.js";
@@ -17,6 +18,39 @@ import { createConnectionChannel } from "./index-connection-channel.js";
 import { createHostCapabilityReport } from "./index-capability-report.js";
 import { createRuntimeDiagnostics } from "./index-runtime-diagnostics.js";
 import { installSessionDeleteCommandFace } from "./session-delete-rpc.js";
+
+/**
+ * 宿主子代理并发名额的只读窄命令（meta 投影）。
+ *
+ * 为什么放在装配层而不是 RPC 核心：名额缓存的唯一 owner 是 `host/settings-source`
+ * 模块（composition 的 `settings` 槽位）。这里只交出**调用期解析**的窄命令，RPC 核心
+ * 因此不需要新增本地 import（它的本地 import 已用满 12 条），也不需要知道名额缓存在哪。
+ *
+ * 默认值 64 不再由运行期写入提供：它由 bundle 补丁（`cordis.patch.yml` 的
+ * `- id: subagent` 覆盖项）在安装时声明，用户仍可在 profile / home patch / CLI overlay
+ * 覆盖。这里只负责把「宿主当前名额」如实投影给 meta：读不到名额时 cap 为 null、
+ * 生效值等于配置值（不封顶）。
+ *
+ * @param {object} host - 宿主模块装配记录（`createHostComposition` 的返回值）。
+ * @returns {{hostCapacityProjection: Function}}
+ */
+function hostCapacityReadsOf(host) {
+  // composition 的 settings 槽位在装配前同步创建（与本文件其它 host.* 用法同一前提）。
+  const settingsSourceModule = host.settings;
+  return {
+    /**
+     * meta 投影：`roleConcurrencyLimit` 仍是用户配置值，这里另给宿主名额与**封顶后的
+     * 实际生效默认并发**（与派发 resolver 共用同一个纯函数，绝不出现两套算法）。
+     */
+    hostCapacityProjection: (roleConcurrencyLimit) => {
+      const hostConcurrencyCap = settingsSourceModule.hostConcurrencyCap();
+      return {
+        hostConcurrencyCap: hostConcurrencyCap === undefined ? null : hostConcurrencyCap,
+        effectiveRoleConcurrencyLimit: effectiveRoleConcurrencyLimitWithHostCap(roleConcurrencyLimit, hostConcurrencyCap),
+      };
+    },
+  };
+}
 
 /**
  * RPC action 分发（票据 20）：分发器按 action 域拆成两个模块——核心域（共享响应适配器 +
@@ -107,6 +141,9 @@ export function assembleRpcActions(state, caps) {
       expertGroupRuntime: state.expertGroupRuntime,
       fanoutHost: state.fanoutHost,
       isActiveRole: state.isActiveRole,
+      // 宿主子代理名额的只读投影（meta），实现见本文件的 hostCapacityReadsOf；
+      // owner 仍是 host/settings-source 模块（默认值 64 由 bundle 补丁声明）。
+      ...hostCapacityReadsOf(host),
       // 设置页保存成功后的「未来新会话配置修订」：只重排边界定时器，绝不遍历会话。
       // 调用期解析：装配顺序不保证该域已经构造完成。
       noteOrchestratorSettingsCommit: () => state.orchestratorModel?.noteSettingsCommit(),

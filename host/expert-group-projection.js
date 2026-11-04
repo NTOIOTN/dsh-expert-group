@@ -6,7 +6,8 @@
  *    快照层能直接消费的字段。它们没有 Map、timer 或可写模块状态，因此 Host 组合根、阶段投影与
  *    纯函数测试都可以直接复用；
  * 2. **归属判定与冷读的 per-build owner**：`createColdReadCoordinator`（本次构建的读取 promise
- *    缓存 + 全局并发上限）与 `createChildOwnershipResolver`（本次构建的 childOwnership Map）。
+ *    缓存 + 全局并发上限；`read` 与 `readOutcome` 两个读面共用同一份 promise）与
+ *    `createChildOwnershipResolver`（本次构建的 childOwnership Map）。
  *    后者的 Map **不越出本模块**：对外只有冻结的 `resolveChildOwnership` 命令，调用方读不到
  *    Map、entry 或任何可写引用（规格书 §状态所有权(4)、plan R2.2-a）。
  *
@@ -713,28 +714,59 @@ function isMissingSessionError(error) {
     || message.includes("session not found") || message.includes("session-not-found");
 }
 
+/**
+ * 冷读的**判别值**（票 01）：`{kind:"ok",session}` / `{kind:"missing"}` / `{kind:"mismatch"}`。
+ *
+ * 为什么必须区分：`missing`（会话不存在 / 宿主没提供 sessionQuery）与 `mismatch`（读到了会话，
+ * 但 header.id 或 header.parentSession 与预期不符）在归属判定里是**相反**的结论——
+ * 前者只是「没有证据」，后者一旦发生就说明这个 childId 可能属于别的根，必须否决全部正向证据
+ * （票 03 的判定顺序负责否决；本票只负责让这个区别存在）。折叠成同一个 undefined 就再也分不开。
+ *
+ * 错误边界不变：只有明确的「不存在」才降级为 missing；权限、存储与协议错误必须继续向上抛，
+ * 绝不能被吞成 missing（否则一次 EACCES / 磁盘错误会被当成「没有证据」而静默改变归属结论）。
+ *
+ * `ok` 的 session 对象与拆分前的返回值**逐字段一致**（id/header/events/status/requestHeader），
+ * 因为既有调用点（root 冷读、普通 expert 阶段）仍通过 `read()` 拿它。
+ */
 async function readColdSession(sessionId, parentSessionId, sessionQuery) {
   const query = typeof sessionQuery === "function" ? safeCall(() => sessionQuery(), undefined) : sessionQuery;
-  if (typeof query?.readSession !== "function") return undefined;
+  // 没有读取能力（宿主未提供 sessionQuery，或纯投影夹具）＝没有任何证据，按 missing 处理：
+  // 它不是 mismatch，因此不会否决其它正向证据——这与拆分前返回 undefined 的语义一致。
+  if (typeof query?.readSession !== "function") return { kind: "missing" };
   let log;
   try {
     log = await query.readSession(sessionId);
   } catch (error) {
     // 只有明确的“不存在”才允许继续 ownership fallback；权限、存储和协议错误必须向上暴露。
-    if (isMissingSessionError(error)) return undefined;
+    if (isMissingSessionError(error)) return { kind: "missing" };
     throw error;
   }
   const header = log?.session;
   const actualParent = header?.parentSession ?? null;
   const expectedParent = parentSessionId ?? null;
-  if (header?.id !== sessionId || actualParent !== expectedParent) return undefined;
+  // 两种成因都判 mismatch：① header.id 与请求的 id 不符（读到的不是这个会话）；
+  // ② header.parentSession 与预期的父会话不符（这个会话属于别的根）。
+  if (header?.id !== sessionId || actualParent !== expectedParent) return { kind: "mismatch" };
   return {
-    id: sessionId,
-    header,
-    events: Array.isArray(log.events) ? log.events : [],
-    status: "ready",
-    requestHeader: () => ({ config: header?.config ?? {} }),
+    kind: "ok",
+    session: {
+      id: sessionId,
+      header,
+      events: Array.isArray(log.events) ? log.events : [],
+      status: "ready",
+      requestHeader: () => ({ config: header?.config ?? {} }),
+    },
   };
+}
+
+/**
+ * 判别值 → 既有 `read()` 约定：ok 给 session，missing/mismatch 一律 undefined。
+ *
+ * 模块级纯函数：既有调用点因此**零改动**（它们仍然只拿到 session 或 undefined），
+ * 不需要在调用方重新展开三态。不放在协调器闭包里，避免占用单闭包函数数预算。
+ */
+function sessionOfColdOutcome(outcome) {
+  return outcome?.kind === "ok" ? outcome.session ?? undefined : undefined;
 }
 
 /**
@@ -755,19 +787,26 @@ export const COLD_READ_CONCURRENCY = 4;
  * 同一次投影会从多个入口读取同一份 child 会话：root 冷读、普通 expert 阶段、fan-out 的
  * task/shard/attempt 归属证明。这些入口分属不同阶段且可以并行，因此协调器负责两件事：
  * 1. 按 `parentSessionId + childId` 缓存**读取 promise 本身**：同一快照内同一 child 只会真正
- *    调用一次 `sessionQuery.readSession`；`undefined`（会话不存在/父子不符）与 rejection 同样
- *    被缓存复用，所以第二个调用者拿到的是同一个结果或同一个错误对象，不会触发第二次读取；
+ *    调用一次 `sessionQuery.readSession`；`{kind:"missing"}` / `{kind:"mismatch"}` 与 rejection
+ *    同样被缓存复用，所以第二个调用者拿到的是同一个判别值或同一个错误对象，不会触发第二次读取；
  * 2. 真实 readSession 全局最多 COLD_READ_CONCURRENCY 个同时在飞：请求按 FIFO 排队，
  *    各阶段自己再收敛顺序与错误，因此阶段并行也不会突破上限。
  * 缓存随本次构建回收，构建结束后不再被任何后续快照（含失败后的立即重试）共享。
  *
- * 返回值是冻结的只读命令面：
- * - `read(childId, parentSessionId)`：唯一的读取口；
+ * 返回值是冻结的只读命令面（**双读面，共享同一个缓存与同一个 promise**，票 01）：
+ * - `read(childId, parentSessionId)`：既有调用点的读取口，行为逐字不变
+ *   （ok→session，missing/mismatch→undefined）；root 冷读与普通 expert 阶段只用它；
+ * - `readOutcome(childId, parentSessionId)`：判别值读面（ok / missing / mismatch），
+ *   只有需要区分三态的归属判定使用；它靠同一份缓存 promise 复用读取结果，
+ *   **绝不会**为同一个 child 再发一次 readSession（否则既重复 IO 又突破全局并发上限）；
  * - `limit`：本次构建的全局并发上限（阶段投影用它决定 worker 数，单一事实源，不复制常量）。
  * 内部的 `reads` Map 与队列**不**出现在返回值里，调用方无法读写它们。
  *
  * @param {Function} sessionQuery - Host 注入的 sessionQuery（函数或对象）。
- * @returns {Readonly<{limit:number, read:(childId:string, parentSessionId:string|null)=>Promise<object|undefined>}>}
+ * @returns {Readonly<{limit:number,
+ *   read:(childId:string, parentSessionId:string|null)=>Promise<object|undefined>,
+ *   readOutcome:(childId:string, parentSessionId:string|null)=>Promise<
+ *     {kind:"ok",session:object}|{kind:"missing"}|{kind:"mismatch"}>}>}
  */
 function createColdReadCoordinator(sessionQuery) {
   const reads = new Map();
@@ -780,23 +819,58 @@ function createColdReadCoordinator(sessionQuery) {
       // 这两个回调只 settle 请求方自己的 promise，返回的链式 promise 总是 resolve，
       // 因此协调器内部不会产生未处理的 rejection；请求方的 rejection 由调用方负责处理。
       readColdSession(request.childId, request.parentSessionId, sessionQuery).then(
-        (session) => { active -= 1; request.resolve(session); pump(); },
-        (error) => { active -= 1; request.reject(error); pump(); },
+        (outcome) => { active -= 1; request.settle(outcome); pump(); },
+        (error) => { active -= 1; request.fail(error); pump(); },
       );
     }
   };
-  const read = (childId, parentSessionId) => {
+  /**
+   * 唯一的读取实现：缓存里是**同一个读取的两份结果 promise**（判别值 + 既有读面）。
+   *
+   * 为什么是两个 promise 而不是一个 `.then()` 派生：派生会额外引入一个微任务，
+   * 让既有调用方的 settle 时刻整体推迟一拍。既有调用点（root 冷读、普通 expert 阶段）
+   * 的错误收敛时序是被契约测试锁过的（例如快照缓存的失败退避按 now() 取整），
+   * 因此两个读面必须在**同一个 tick** 结算：这里在 pump 的回调里同步 settle 两者。
+   */
+  const readEntry = (childId, parentSessionId) => {
     const key = (parentSessionId ?? "") + "|" + childId;
     const cached = reads.get(key);
     if (cached !== undefined) return cached;
-    const promise = new Promise((resolve, reject) => {
-      queue.push({ childId, parentSessionId, resolve, reject });
-      pump();
+    const entry = {};
+    entry.outcome = new Promise((resolve, reject) => {
+      entry.resolveOutcome = resolve;
+      entry.rejectOutcome = reject;
     });
-    reads.set(key, promise);
-    return promise;
+    entry.session = new Promise((resolve, reject) => {
+      entry.resolveSession = resolve;
+      entry.rejectSession = reject;
+    });
+    // 两个读面各自是对方的备用面：任一侧被 reject 而当前调用方只用另一侧时，
+    // 该 promise 没有 handler 就会在宿主里冒成 unhandledRejection。这里预先吃掉它，
+    // 但不影响真实调用方——await 的仍是这个 promise 本身，错误对象与拒绝原因不变。
+    // （与 snapshot-cache 的 settled.catch(() => {}) 同一手法。）
+    entry.outcome.catch(() => {});
+    entry.session.catch(() => {});
+    queue.push({
+      childId,
+      parentSessionId,
+      settle: (outcome) => {
+        entry.resolveOutcome(outcome);
+        entry.resolveSession(sessionOfColdOutcome(outcome));
+      },
+      fail: (error) => {
+        entry.rejectOutcome(error);
+        entry.rejectSession(error);
+      },
+    });
+    reads.set(key, entry);
+    pump();
+    return entry;
   };
-  return Object.freeze({ limit: COLD_READ_CONCURRENCY, read });
+  const readOutcome = (childId, parentSessionId) => readEntry(childId, parentSessionId).outcome;
+  // 既有读面：ok → session，missing/mismatch → undefined；与判别值读面共用同一次读取。
+  const read = (childId, parentSessionId) => readEntry(childId, parentSessionId).session;
+  return Object.freeze({ limit: COLD_READ_CONCURRENCY, read, readOutcome });
 }
 
 /**
@@ -840,17 +914,105 @@ export function parentEvidenceVerdict(evidence, rootId) {
 }
 
 /**
- * 证明某个 attempt child 属于当前 root，并给出可用于投影的会话。
+ * 归属**不成立**（或已被否决）时的统一返回形状（票 03）。
  *
- * 三条独立证据，任一成立即可（全部读取既有 DEG/DSH 状态，不新建登记）：
+ * `contentOwned: false` 恒成立：连导航都没授权，内容自然一并收回。
+ * `childId` 由调用方决定语义：入参本身非法时给 null，其余情况保留原 id，
+ * 让上层（stage）按「导航未证明」把输出副本清空，而不是在这里猜一个值。
+ */
+function unownedChild(childId) {
+  return { owned: false, childId, agent: undefined, session: undefined, childSnapshot: null, contentOwned: false };
+}
+
+/**
+ * admission 凭据判定（规格书 D1 / D2）：`admittedChildOf(parentTaskId, childId)` 返回
+ * **非空条目**才算成立。
+ *
+ * 硬边界：
+ * - `parentTaskId` 必须非空——没有父任务就没有「本轮 admission」可言；
+ * - 只接受读面的返回值，**不接受任何布尔入参**，也绝不从 `running` / childId 非空之类
+ *   的快照状态推导：快照状态可能来自损坏数据或 continuation 继承（上一轮 childId 被原样
+ *   复制进新一轮），凭据必须来自宿主的**活状态**（attempt.handle 与 shard/attempt 状态
+ *   由 store 的五条硬条件自己校验）；
+ * - 读面缺失（旧 Host、纯投影夹具）或抛错时恒按「没有凭据」处理（fail-closed）：
+ *   一次探针异常不能让整棵快照构建失败，更不能被当成放行信号。
+ *
+ * @param {Function|undefined} admittedChildOf - Host 转发的只读凭据读面。
+ * @param {string|undefined} parentTaskId - 本次投影的 fan-out 父任务 id。
+ * @param {string} childId - 待判定的 child id。
+ * @returns {object|null} 凭据条目（`{parentTaskId, shardId, attempt}`）或 null。
+ */
+function admissionCredential(admittedChildOf, parentTaskId, childId) {
+  if (typeof admittedChildOf !== "function") return null;
+  if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return null;
+  return safeCall(() => admittedChildOf(parentTaskId, childId), null) ?? null;
+}
+
+/**
+ * 证明某个 attempt child 属于当前 root，并给出可用于投影的会话与**内容授权标记**。
+ *
+ * ## 判定顺序（规格书 D2：先否决，后放行；一处实现）
+ *
+ * 1. `childId` 非非空字符串 → 未授权（`childId: null`）；
+ * 2. `verdict === "foreign"` → 未授权：显式父证据说别的根时，**凭据不得覆盖**；
+ * 3. 冷读判别值为 `mismatch` → 未授权：**否决全部正向证据**（含 `verdict === "owned"`、
+ *    `ownedByFanoutRecord` 与 admission 凭据）；
+ * 4. 正向证据（`verdict === "owned"` 或 `ownedByFanoutRecord`）或 **admission 凭据成立**
+ *    → 授权导航；
+ * 5. `fast === true` 且以上都不成立 → 未授权（B4 保守语义，partial 绝不猜）；
+ * 6. full 且判别值 `ok` → 授权导航（冷读成功即证明归属）；`missing` 且无凭据 → 未授权。
+ *
+ * 三条独立正向证据全部读取既有 DEG/DSH 状态，不新建登记：
  * 1. 在线 child agent 的会话头声明 `header.parentSession === rootId`；
  * 2. DEG 自己的 child 记录匹配：普通专家记录用 `parentId === rootId`，fan-out 子代理
  *    记录用 `fanoutParentTaskId === 当前父任务`（父任务本身已由 manager 的 ownership
  *    过滤证明属于本 root，任务 id 也按 root 唯一，因此这不是跨根推断）；
  * 3. 冷读 `sessionQuery.readSession(childId)` 的 header.id/parentSession 与预期一致
- *    （readColdSession 自带这两项校验）。
- * 三条都不成立时 owned=false：这个 childId 可能属于另一个 root，投影必须丢弃它，
- * 否则客户端一点就会导航到跨根会话，也会把别的根的模型/命令渲染进本根任务树。
+ *    （readColdSession 自带这两项校验）；
+ * 另有第四条**导航专用**证据：admission 凭据（见 `admissionCredential`）。
+ *
+ * ## 为什么凭据能证明「导航」却不证明「内容」
+ *
+ * 凭据（`attempt.handle.childId` 一致 + 该 attempt 是分片最新一轮且 running + 分片自身
+ * running）只说明「**本轮 Host admission 接受了这个 childId**」。它足够证明「点进去会有
+ * 一个会话」，却不足以证明「这个会话的内容属于本根」：
+ * - continuation 会把上一轮 attempt 的 childId 原样带进新一轮（`task-commands.js` 派发前
+ *   复制），损坏/陈旧快照里的 foreign childId 也能借这条路活下来；
+ * - `child_models` 记录是异步落盘、可被 LRU 淘汰、可被吞错的旁路数据，凭据与它无关；
+ * - provider/model/用量/结构化结果/命令文本都来自**会话内容**，来源不明时渲染它们就是
+ *   跨根泄漏。因此凭据放行时 `contentOwned=false`，resolver 直接交出
+ *   `agent: undefined` / `childSnapshot: null` / `session: undefined`，只保留 `childId`，
+ *   上层（stage）据此只允许导航，不得读取任何内容来源（内容隔离由票 04 在 stage 落地）。
+ *
+ * ## 为什么 mismatch 优先于所有正向证据
+ *
+ * 冷读拿回的是会话 header 的**直接观测**：`header.parentSession` 说这个会话属于别的根。
+ * 它比任何本地记录都硬——child_models 与 recovery record 都是本进程写出来的旁路数据，
+ * 而 header 是会话自己的身份。一旦读到不一致，至少有一侧在说谎；按保守方向宁可少一个
+ * 导航键，也不能把别根的会话挂上本根任务树（跨根泄漏的代价远大于暂时无链接）。
+ * 因此 mismatch 放在第 3 步，先于第 4 步的所有放行证据（含 verdict owned 与凭据）。
+ *
+ * ## 为什么不为「检测 mismatch」新增 IO
+ *
+ * 冷读触发条件**与拆分前的旧实现一致**，判定链只复用那次读取的判别值，绝不为「校验 header」
+ * 再补一次：`fast === true` 永不读；有 live/cached 会话且有证据类所有权（或持凭据）时不读；
+ * 有 live/cached 会话但既无证据类所有权也无凭据时**照旧读**（旧行为：用磁盘 header 补证归属）；
+ * 没有 live/cached 会话时直接读。若为「每行都校验 header」而补读，full 构建会给每行增加一次
+ * 文件 IO + 日志反序列化，还要挤进 `COLD_READ_CONCURRENCY` 的全局并发池，首屏与后台重建都会
+ * 明显变慢——这是规格书明确不做的取舍。
+ * 由此产生的**有意边界**：有 live/cached 会话、且已有证据类所有权/凭据的行不会被重新校验
+ * （它们的归属靠 `collectParentEvidence` 或凭据），mismatch 否决只覆盖「本次 build 确实发生过
+ * 冷读」的那些行。风险随数据不一致程度上升；边界、失效条件与锁定用例见
+ * `docs/adr/0012-fanout-navigation-ownership-evidence.md`。
+ *
+ * ## 返回值
+ *
+ * `{ owned, childId, agent, session, childSnapshot, contentOwned }`：
+ * - `contentOwned: true` 当且仅当 `verdict === "owned"` / `ownedByFanoutRecord` / 冷读 `ok`，
+ *   此时 `agent` / `session` / `childSnapshot` 与拆分前的取值一致；
+ * - `contentOwned: false`（仅凭据放行）时三者按上文收回，只剩 `childId` 供导航。
+ * `contentOwned` 是**内部字段**，只给 stage 用，**不进入快照协议**。
+ *
  * 结果在同一次快照内按「父任务 + childId」缓存，避免重复的归属计算；真正的冷读一律交给
  * 本次构建的 `coordinator`，因此 fan-out attempt 与普通 expert 阶段对同一个 child 只会
  * 调用一次 readSession（同一 parentSessionId + childId 共享同一个读取 promise）。
@@ -858,10 +1020,13 @@ export function parentEvidenceVerdict(evidence, rootId) {
  * **owner-only**：`cache` 是 childOwnership Map，只由 `createChildOwnershipResolver` 的闭包
  * 传入，不越过本模块。
  */
-async function resolveOwnedChild(childId, { rootId, parentTaskId, persisted, cache, coordinator, fast, records, agents }) {
-  if (typeof childId !== "string" || childId.length === 0) {
-    return { owned: false, childId: null, agent: undefined, session: undefined, childSnapshot: null };
-  }
+async function resolveOwnedChild(childId, {
+  rootId, parentTaskId, persisted, cache, coordinator, fast, records, agents,
+  // admission 凭据读面（票 02 接线，票 03 起参与判定）：证明「这个 childId 由本轮 Host
+  // admission 接受」。只放行导航，不放行内容（见上方注释）。
+  admittedChildOf,
+}) {
+  if (typeof childId !== "string" || childId.length === 0) return unownedChild(null);
   // 缓存键带上父任务：同一次快照里 fan-out 归属是任务级的。
   const cacheKey = (typeof parentTaskId === "string" ? parentTaskId : "") + "|" + childId;
   const cached = cache.get(cacheKey);
@@ -877,39 +1042,88 @@ async function resolveOwnedChild(childId, { rootId, parentTaskId, persisted, cac
     && (nonEmpty(childSnapshot?.fanoutParentTaskId) === parentTaskId || nonEmpty(record?.fanoutParentTaskId) === parentTaskId);
   let resolved;
   if (verdict === "foreign") {
-    resolved = { owned: false, childId, agent: undefined, session: undefined, childSnapshot: null };
-  } else if (verdict === "owned" || ownedByFanoutRecord) {
-    // 轻量路径（fast）不做冷读：只有 live/cached 会话可用，其余保持 undefined，
-    // 由投影层按「证据不足」处理（childId 保留，但不会读到任何会话内容）。
-    const session = record?.session ?? agent?.session
-      ?? (fast === true ? undefined : await coordinator.read(childId, rootId));
-    resolved = {
-      owned: true,
-      childId,
-      agent,
-      session,
-      // 归属已由显式证据或父任务级记录证明，允许该记录提供 provider/model 回退。
-      childSnapshot,
-    };
-  } else if (fast === true) {
-    // 轻量路径的归属判定 fail-closed：没有任何显式父证据、也没有父任务级记录时，
-    // 不读日志就无法证明这个 child 属于本根，因此按「不属于本根」处理，
-    // 输出副本会把它的 childId 清空（绝不猜测，也绝不跨 root 泄漏条目）。
-    //
-    // ── partial 阶段与 full 阶段的行为差异（B4，**有意保留**）──────────────────
-    // 完整构建在这里还会再冷读一次会话日志，用 header 的 id / parentSession 补证归属，
-    // 因此同一份数据在 full 里可能「有」childId，而在 partial 里是 null：
-    //   partial（首屏，无导航键）→ full 完成后恢复导航键。
-    // 这是**保守方向**的差异（先无、后有）：partial 阶段宁可少一个可点击的导航目标，
-    // 也不允许把来源不明的会话挂到本根任务树上（跨 root 泄漏比暂时少一个链接严重得多）。
-    // 因此这里保留 fail-closed 隔离，不修改归属逻辑；该行为由
-    // test/expert-group-runtime.test.mjs 的「partial 阶段无导航键、full 完成后恢复」用例锁定。
-    resolved = { owned: false, childId, agent: undefined, session: undefined, childSnapshot: null };
+    // 否决 1（先于任何读取）：显式父证据指别的根，凭据/记录/冷读都不能翻案。
+    resolved = unownedChild(childId);
   } else {
-    const coldSession = await coordinator.read(childId, rootId);
-    resolved = coldSession === undefined
-      ? { owned: false, childId, agent: undefined, session: undefined, childSnapshot: null }
-      : { owned: true, childId, agent, session: coldSession, childSnapshot: null };
+    const liveOrCachedSession = record?.session ?? agent?.session;
+    const ownedEvidence = verdict === "owned" || ownedByFanoutRecord;
+    // 凭据是纯内存派生读（store 读活任务对象，无 IO）。它同时参与下面的冷读触发判定，
+    // 因此必须在读取之前取好；判定链本身仍保持「否决 → 放行」的平铺顺序。
+    const credential = admissionCredential(admittedChildOf, parentTaskId, childId);
+    /**
+     * 冷读触发条件（**与拆分前的旧实现等价**，规格书 D2「冷读触发条件不变」）：
+     * - `fast === true` 永不冷读（partial 不做任何文件 IO）；
+     * - 有 live/cached 会话**且**有证据类所有权或持凭据时不读：归属已经证明，不必再花一次
+     *   IO 与全局并发额度；
+     * - 有 live/cached 会话、但**既无证据类所有权也无凭据**时要读：旧实现在这个形状下
+     *   无条件冷读，用磁盘 header 补证归属（内存里那份会话缺 `header.parentSession` 时
+     *   `collectParentEvidence` 为空 → verdict unknown，只能靠冷读说话）。这条**不是**本轮
+     *   新增语义：收窄它会让这类行从「可导航」退化成「无导航键」。
+     * - **没有** live/cached 会话时照旧读：凭据场景也需要这一次读取来检测 mismatch，
+     *   不能因为「有凭据」就跳过（否则第二道防线失效）。
+     * mismatch 只可能来自真正发生过的那次读取——这就是「不为检测 mismatch 新增 IO」的边界。
+     */
+    const needColdRead = fast !== true
+      && (liveOrCachedSession === undefined || (!ownedEvidence && credential === null));
+    const coldOutcome = needColdRead ? await coordinator.readOutcome(childId, rootId) : undefined;
+    if (coldOutcome?.kind === "mismatch") {
+      // 否决 2：header 说这个会话属于别的根 —— 比任何本地记录/凭据都硬，否决全部正向证据。
+      resolved = unownedChild(childId);
+    } else if (ownedEvidence) {
+      // 证据类所有权：内容也授权。取值顺序与旧实现逐字一致：先 record/agent 的会话，
+      // 缺失时才用冷读结果（轻量路径不冷读，因此只剩 undefined）。
+      resolved = {
+        owned: true,
+        childId,
+        agent,
+        session: liveOrCachedSession ?? coldOutcome?.session ?? undefined,
+        childSnapshot,
+        contentOwned: true,
+      };
+    } else if (credential !== null) {
+      // 仅凭据放行：只给导航键，内容一律收回（见函数头「为什么凭据不能证明内容」）。
+      resolved = {
+        owned: true,
+        childId,
+        agent: undefined,
+        session: undefined,
+        childSnapshot: null,
+        contentOwned: false,
+      };
+    } else if (fast === true) {
+      // 轻量路径的归属判定 fail-closed：没有显式父证据、没有父任务级记录、**也没有
+      // admission 凭据**时，不读日志就无法证明这个 child 属于本根，因此按「不属于本根」
+      // 处理，输出副本会把它的 childId 清空（绝不猜测，也绝不跨 root 泄漏条目）。
+      //
+      // ── partial 阶段与 full 阶段的行为差异（B4，**有意保留**）──────────────────
+      // 完整构建在这里还会再冷读一次会话日志，用 header 的 id / parentSession 补证归属，
+      // 因此同一份数据在 full 里可能「有」childId，而在 partial 里是 null：
+      //   partial（首屏，无导航键）→ full 完成后恢复导航键。
+      // 凭据不区分 fast/full（D5）：partial 阶段「运行中 + 凭据成立」的分片**保留导航键**，
+      // 这是本轮闭环的用户可见行为。
+      // 反过来说，没有凭据时保留的仍是**保守方向**的差异（先无、后有）：partial 阶段宁可
+      // 少一个可点击的导航目标，也不允许把来源不明的会话挂到本根任务树上（跨 root 泄漏
+      // 比暂时少一个链接严重得多）。该行为由 test/expert-group-runtime.test.mjs 的
+      // 「partial 阶段无导航键、full 完成后恢复」与 test/expert-group-cache-regression.test.mjs
+      // 的 B4 用例锁定。
+      resolved = unownedChild(childId);
+    } else if (coldOutcome?.kind === "ok") {
+      // 冷读成功即证明归属（既有语义）：内容也授权；childSnapshot 仍不采用（记录未证明本根）。
+      // 注意会话**只取冷读结果**，不用内存里那份 `liveOrCachedSession`：这条分支能走到，
+      // 说明内存会话没有显式父证据（缺 header.parentSession），旧实现同样只认磁盘 header，
+      // 取值顺序在这里必须保持逐字一致。
+      resolved = {
+        owned: true,
+        childId,
+        agent,
+        session: coldOutcome.session,
+        childSnapshot: null,
+        contentOwned: true,
+      };
+    } else {
+      // full 且冷读 missing（会话不存在 / 宿主没有读取能力）且没有凭据：没有证据 → 拒绝。
+      resolved = unownedChild(childId);
+    }
   }
   cache.set(cacheKey, resolved);
   return resolved;
@@ -925,27 +1139,40 @@ async function resolveOwnedChild(childId, { rootId, parentTaskId, persisted, cac
  * - 内部 `new Map()` 是本次 build 的 childOwnership（键 = `parentTaskId|childId`）；
  * - 唯一写入点是内部 `resolveOwnedChild`，写入与去重顺序与拆分前完全一致；
  * - 返回值**不含** Map、不含 entry、不含 `cache`；调用方只能读 `{ owned, childId, agent,
- *   session, childSnapshot }` 结论；
+ *   session, childSnapshot, contentOwned }` 结论（`contentOwned` 是内部字段，不进快照）；
  * - 生命周期仅限当前 build：build 结束即丢弃，不跨 build / 跨 root 复用。
  *
  * 窄上下文（不可变）：对外只接受 `rootId` / `persisted`（只读读面）/ `coordinator`（只用它的
- * `read`）/ `fast` 四个键（plan R2.2-a §4）；`records` / `agents` 是本模块自身的绑定依赖，
- * 由 `createExpertProjectionContext` 的闭包提供，不来自 builder。
+ * `read` / `readOutcome`）/ `fast` 四个键（plan R2.2-a §4）；`records` / `agents` /
+ * `admittedChildOf` 是本模块自身的绑定依赖，由 `createExpertProjectionContext` 的闭包提供，
+ * 不来自 builder——builder 与调用方都不能自行「声明」一份归属凭据。
+ *
+ * `admittedChildOf(parentTaskId, childId)` 是**派生读**：返回 `{parentTaskId, shardId, attempt}`
+ * 或 null，语义是「本轮 Host admission 接受了该 child」（不是「本进程最初创建了它」，
+ * continuation 会复用继承的 childId）。票 02 把读面接到这里，票 03 起它参与判定：
+ * 只放行**导航键**，内容仍由 `contentOwned` 把关（判定顺序见规格书 D2，实现在
+ * `resolveOwnedChild`）。
  *
  * @param {object} options
  * @param {string} options.rootId - 本次构建的 root id。
  * @param {object} options.persisted - 本次构建的 child_models 只读映射。
- * @param {object} options.coordinator - 本次构建的冷读协调器（只用 `read`）。
+ * @param {object} options.coordinator - 本次构建的冷读协调器（只用 `read` / `readOutcome`）。
  * @param {boolean} [options.fast] - 是否轻量路径（轻量路径不做冷读）。
  * @param {Map} options.records - recoveryRecords（projection 自身绑定，只读）。
  * @param {object} [options.agents] - agents 读面（projection 自身绑定，只用 `get`）。
+ * @param {Function} [options.admittedChildOf] - admission 凭据读面（projection 自身绑定，只读）。
  * @returns {Readonly<{resolveChildOwnership:(childId:string, parentTaskId?:string)=>Promise<object>}>}
  */
-function createChildOwnershipResolver({ rootId, persisted, coordinator, fast, records, agents } = {}) {
+function createChildOwnershipResolver({
+  rootId, persisted, coordinator, fast, records, agents,
+  // admission 凭据读面由 createExpertProjectionContext 绑定（与 records/agents 同层），
+  // 不由 builder 传入：builder 只能提供 build 级参数，不能让调用方自己声明「我有凭据」。
+  admittedChildOf,
+} = {}) {
   // 本次 build 独占：Map 的生命周期止于返回的命令闭包，且只在本文件内可见。
   const childOwnership = new Map();
   const resolveChildOwnership = (childId, parentTaskId) => resolveOwnedChild(childId, {
-    rootId, parentTaskId, persisted, cache: childOwnership, coordinator, fast, records, agents,
+    rootId, parentTaskId, persisted, cache: childOwnership, coordinator, fast, records, agents, admittedChildOf,
   });
   return Object.freeze({ resolveChildOwnership });
 }
@@ -985,28 +1212,43 @@ export const expertProjection = Object.freeze({
  *
  * 为什么需要它：`createChildOwnershipResolver` 的对外签名固定为
  * `{ rootId, persisted, coordinator, fast }`（plan R2.2-a §1/§2/§4），而 `recoveryRecords` /
- * `agents` / `sessionQuery` 是 projection **自身的绑定依赖**（§2：「recoveryRecords / agents
- * 由 projection 自己绑定，不由 builder 传入」）。本工厂只用闭包捕获这三份只读读面：
+ * `agents` / `sessionQuery` / `admittedChildOf` 是 projection **自身的绑定依赖**（§2：
+ * 「recoveryRecords / agents 由 projection 自己绑定，不由 builder 传入」）。本工厂只用闭包
+ * 捕获这四份只读读面：
  * - **没有**模块级可变状态：不写任何模块作用域变量，两个 per-build 工厂每调用一次都新建
  *   自己的 Map（`reads` 在协调器里、`childOwnership` 在 resolver 里）；
  * - 返回值冻结，调用方看不到任何 Map / entry / 缓存，只能拿命令；
  * - per-build 状态（`coordinator`、`reads`、`childOwnership`）生命周期止于单次 build。
  *
+ * `admittedChildOf` 是「本轮 admission 是否接受过这个 child」的**只读探针**（票 02 接线）。
+ * 它必须由 Host 从 fanout runtime 转发进来，而不是由 build 调用方传参：凭据只能来自宿主
+ * 真实状态，不能来自调用方的声明。
+ *
  * @param {object} dependencies
  * @param {Map} dependencies.recoveryRecords - DEG 的 recovery 记录（只读读面）。
  * @param {object} [dependencies.agents] - agents 读面（只用 `get`）。
  * @param {Function|object} [dependencies.sessionQuery] - Host 的 sessionQuery（只读读面）。
+ * @param {Function} [dependencies.admittedChildOf] - (parentTaskId, childId) => 凭据 | null。
  * @returns {Readonly<{expertProjection:object, createColdReadCoordinator:Function, createChildOwnershipResolver:Function}>}
  */
-export function createExpertProjectionContext({ recoveryRecords, agents, sessionQuery } = {}) {
+export function createExpertProjectionContext({
+  recoveryRecords, agents, sessionQuery,
+  // admission 凭据读面（票 02）：Host 只转交 fanout runtime 的只读探针，缺失时保持 undefined，
+  // resolver 侧据此 fail-closed（没有凭据就没有凭据，绝不由 running 之类的快照状态推导）。
+  admittedChildOf,
+} = {}) {
   if (!(recoveryRecords instanceof Map)) throw new TypeError("Expert Group projection 需要 recoveryRecords Map");
   return Object.freeze({
     // 阶段投影用的纯函数命令集合（无状态，可安全共享）。
     expertProjection,
-    /** 每次 build 新建一个冷读协调器（内部 reads Map + 队列随构建回收）。 */
+    /** 每次 build 新建一个冷读协调器（内部 reads Map + 队列随构建回收；read / readOutcome 共用）。 */
     createColdReadCoordinator: () => createColdReadCoordinator(sessionQuery),
     /** 每次 build 新建一个 childOwnership owner，只返回冻结的 resolver 命令。 */
     createChildOwnershipResolver: ({ rootId, persisted, coordinator, fast } = {}) =>
-      createChildOwnershipResolver({ rootId, persisted, coordinator, fast, records: recoveryRecords, agents }),
+      createChildOwnershipResolver({
+        rootId, persisted, coordinator, fast, records: recoveryRecords, agents,
+        // 凭据读面与 records/agents 同层绑定：builder 无法替换它，也无法传入「已证明」的布尔值。
+        admittedChildOf,
+      }),
   });
 }

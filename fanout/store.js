@@ -613,6 +613,65 @@ function providerReleaseDiagnostics(s, deps) {
   return s.lastProviderRelease === null ? null : { ...s.lastProviderRelease };
 }
 
+/**
+ * **admission 凭据**读面（票 02）：这个 childId 是否由**本轮 Host admission** 接受过。
+ *
+ * 纯派生读：不新增 Map、不新增持久化、不新增登记调用点。凭据只来自 attempt 上 handle
+ * 这一个既有字段，以下条件**全部**满足才返回 { parentTaskId, shardId, attempt }：
+ * 1. 活任务里存在 attempt.childId === childId；
+ * 2. 该 attempt 仍是 running；
+ * 3. 它是所在 shard 的**最后一个** attempt（多轮复用 / 手工 retry 后只认最新一轮）；
+ * 4. attempt.handle !== undefined 且 attempt.handle.childId === childId；
+ * 5. 该 shard 自身仍是 running（票 02 的反向错位：shard 已终态、但最新 attempt 仍 running
+ *    且带 handle 的损坏快照必须拒绝——否则已结束的分片会重新变成「可导航」）。
+ *
+ * 为什么读 s.tasks 而不是 getTask：getTask 返回 cloneJson 快照（fanout/task-commands.js 的投影
+ * 只带状态与 childId，**不含 handle**），误用会让凭据恒为 null——症状（任务树里运行中却打不开
+ * 会话）不会消失，却看不出任何错误。
+ *
+ * 语义边界（**不得放宽**）：本凭据证明的是「本轮 Host admission 接受了该 child」，
+ * **不是**「本进程最初创建了它」——continuation 会把上一 attempt 的 childId 作为继承值交给
+ * Host，Host 的 handle 也携带同一个 id（host/fanout-lifecycle.js）。因此凭据只能授权
+ * **导航**（哪个会话可以打开），不能当作「内容归属」的证明（provider/model/用量/结构化结果）。
+ * 若将来某个 continuer 不返回 childId，凭据恒空、导航 fail-closed：这是可接受的安全退化。
+ * 证据分层、否决优先级与失效条件见 `docs/adr/0012-fanout-navigation-ownership-evidence.md`。
+ *
+ * 失效由既有清理规则覆盖，不需要额外登记或清理逻辑：
+ * - 结算（succeeded/failed/cancelled/timed_out）会把 attempt.handle 置空，因此「admission
+ *   晚于结算才 resolve」在条件 2 就被拒绝，也不存在「结算删除了登记、admission 又写回」的竞态；
+ * - 条件 3 排除旧 attempt 残留的 handle（non-latest attempt 的迟到结算不改 shard.status）；
+ * - 条件 4 把凭据绑定到 admission 实际返回的 id：handle 缺 childId 或与 childId 不符一律拒绝；
+ * - 条件 5 让「shard 已终态」优先于任何残留句柄：分片一结束就不再是可导航目标。
+ *
+ * 关闭态返回 null（与 getTask 同语义）：close 之后 manager 不再接受新的 admission。
+ * attempt 返回的是 attempt **序号**（标量），不把活对象带出 store。
+ *
+ * @returns {{parentTaskId:string, shardId:string, attempt:number}|null}
+ */
+function admittedChildOf(s, deps, parentTaskId, childId) {
+  if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return null;
+  if (typeof childId !== "string" || childId.length === 0) return null;
+  // isClosed 是构造期可选注入的只读闸门；测试替身可能不提供，缺失时按「未关闭」处理。
+  if (typeof deps.isClosed === "function" && deps.isClosed() === true) return null;
+  const task = s.tasks.get(parentTaskId);
+  if (task === undefined || task === null || !Array.isArray(task.shards)) return null;
+  for (const shard of task.shards) {
+    // 条件 5：shard 与 attempt 的状态错位（正常调度路径不会长期出现，损坏快照会出现）
+    // 一律 fail-closed；终态分片不得借残留 handle 重新获得导航授权。
+    if (shard?.status !== "running") continue;
+    const attempts = shard.attempts;
+    if (!Array.isArray(attempts) || attempts.length === 0) continue;
+    // 只认最新 attempt：旧轮的残留 handle 不是凭据。
+    const latest = attempts[attempts.length - 1];
+    if (latest?.childId !== childId) continue;
+    if (latest.status !== "running") continue;
+    if (latest.handle === undefined || latest.handle === null) continue;
+    if (latest.handle.childId !== childId) continue;
+    return { parentTaskId, shardId: shard.shardId, attempt: latest.attempt };
+  }
+  return null;
+}
+
 function taskById(s, deps, parentTaskId) { return s.tasks.get(parentTaskId); }
 
 function hasTask(s, deps, parentTaskId) { return s.tasks.has(parentTaskId); }
@@ -810,6 +869,7 @@ export function createTaskStore({ config }) {
     activeCountsByProvider: activeCountsByProvider.bind(null, s, deps),
     providerReleaseDiagnostics: providerReleaseDiagnostics.bind(null, s, deps),
     allShardsTerminal: allShardsTerminal.bind(null, s, deps),
+    admittedChildOf: admittedChildOf.bind(null, s, deps),
     taskById: taskById.bind(null, s, deps),
     hasTask: hasTask.bind(null, s, deps),
     putTask: putTask.bind(null, s, deps),

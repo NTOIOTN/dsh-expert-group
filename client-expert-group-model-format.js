@@ -124,6 +124,15 @@ const MESSAGE_CATALOG = Object.freeze({
   "sidebar.error.rpc": { zh: "请求失败", en: "Request failed" },
   "sidebar.refresh": { zh: "刷新", en: "Refresh" },
   "sidebar.retry": { zh: "重试", en: "Retry" },
+  // 票 06：标题栏「诊断」入口（与 shared/i18n.js 的 MESSAGE_CATALOG 逐键同值，由模型测试守住）。
+  "sidebar.diag.button": { zh: "诊断", en: "Diag" },
+  "sidebar.diag.aria": { zh: "复制自动开关诊断记录", en: "Copy auto open/close diagnostics" },
+  "sidebar.diag.header": { zh: "Expert Group 自动开关诊断", en: "Expert Group auto open/close diagnostics" },
+  "sidebar.diag.copied": { zh: "已复制 {count} 条", en: "Copied {count}" },
+  "sidebar.diag.downloaded": { zh: "已下载 {count} 条", en: "Downloaded {count}" },
+  "sidebar.diag.empty": { zh: "暂无诊断记录", en: "No diagnostics yet" },
+  "sidebar.diag.unreadable": { zh: "无法读取诊断记录", en: "Diagnostics unavailable" },
+  "sidebar.diag.failed": { zh: "复制失败，请重试", en: "Copy failed; try again" },
   "sidebar.idleGroup": { zh: "空闲子代理（{count}）", en: "Idle subagents ({count})" },
   "sidebar.idleGroup.name": { zh: "空闲子代理", en: "Idle subagents" },
   "sidebar.search.label": { zh: "任务过滤", en: "Filter tasks" },
@@ -136,6 +145,15 @@ const MESSAGE_CATALOG = Object.freeze({
   "sidebar.filter.empty": { zh: "没有匹配的任务", en: "No matching tasks" },
   "sidebar.collapse": { zh: "收起", en: "Collapse" },
   "sidebar.expand": { zh: "展开", en: "Expand" },
+  // 票 02 / spec D4（逐键同值于 shared/i18n.js）：旧宿主（on-screen 读面缺失）上手动侧栏入口的**可见**不可用说明。
+  // 闸门在 unavailable 时 fail-closed，因此禁用按钮必须带可读原因，绝不让用户以为「点了没反应」。
+  "sidebar.surface.unsupported": {
+    zh: "当前宿主不支持安全的侧栏操作",
+    en: "This host does not support safe sidebar operations",
+  },
+  // 票 02 / spec D4 收尾（逐键同值于 shared/i18n.js）：闸门在 mismatch / absent 时静默拒绝，
+  // 手动点击的可见说明由票 06 的标题栏反馈槽承担，这里只提供文案。
+  "sidebar.skipped": { zh: "已跳过：该会话不在前台", en: "Skipped: session not in foreground" },
   "sidebar.recovery.retry": { zh: "重试恢复", en: "Retry recovery" },
   "sidebar.recovery.retrying": { zh: "重试中…", en: "Retrying…" },
   "sidebar.sessionModel.open": { zh: "会话模型", en: "Session models" },

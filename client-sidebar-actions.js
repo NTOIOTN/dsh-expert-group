@@ -57,7 +57,7 @@
       sidebarAutoCascadeRef, sidebarAutoCloseAttemptOwnersRef, sidebarAutoCloseAttemptsRef,
       sidebarAutoEpochRef, sidebarAutoFailedKeysRef, sidebarAutoOriginRef,
       sidebarAutoReservationRef, sidebarAutoSignatureRef, sidebarAutoSuppressedRef,
-      sidebarManualIntentOf, sidebarManualIntentRef,
+      sidebarManualIntentOf, sidebarManualIntentRef, sidebarOnScreenSessionStill,
       sidebarSessionId, sidebarSplitIntentRef, sidebarSurfaceStillCurrent,
       sidebarTabOpeningRef, sidebarTabPendingRef, sidebarTabRecordsRef,
       sidebarTabSyncRef, snapshot, sweepAutoOpenPlaceholders,
@@ -130,15 +130,40 @@
      * 开关关闭时不做任何自动 open/close（历史行为逐字节不变），已打开的 tab 交由用户手动处理；
      * 清理阶段与开关无关，它只维护插件自己的记账，不触碰宿主。
      */
+    /**
+     * 分片没有可用会话标识时的候选层诊断（票 04）。
+     *
+     * 沿用既有 decision 通道的 skip 语义（与 persisted-manual / owner-capacity 同一形状），
+     * reason 是唯一的可区分判据：shard-child-missing。shardId 只参与 key 摘要，绝不落原文。
+     *
+     * **这条诊断不等于「分片能自动打开」**：Host 投影仍会在归属未证明时清空 childId，
+     * 客户端只能给出原因；真正闭环需要另一张 Host 投影票（见票 04 说明）。
+     */
+    const recordShardChildMissing = (shardId) => {
+      recordSidebarAutoDecision(
+        "open",
+        { key: "shard-child-missing:" + text(shardId, "unknown"), kind: "open" },
+        "skip",
+        "shard-child-missing",
+      );
+    };
+
     function syncAutoSidebarTabs() {
       const source = snapshot;
       // 没有快照（首次加载 / 读取失败）时没有「谁在运行」的证据：既不打开也不关闭。
       if (source === null || source === undefined) return;
       // root 切换瞬间旧快照可能仍在 state 里：只有属于当前 root 的快照才能决定动作。
       if (text(source.rootSessionId, null) !== rootSessionId) return;
-      const known = knownSidebarResourceAddresses();
-      const running = runningSidebarResourceAddresses();
+      /**
+       * Auto 开关的权威读面提前到候选求值之前：`enabled` 只被读取一次（与原实现同一份读面），
+       * 位置前移两行不改变任何写入顺序，只让「本帧是否记录分片诊断」用上同一份结论。
+       */
       const enabled = autoOpenEnabled();
+      const known = knownSidebarResourceAddresses();
+      // 运行中集合是本票唯一的自动打开候选来源，因此由它承载 shard-child-missing 诊断；
+      // 已知地址/空闲候选同样按统一规则排除该分片，但不再各写一条（避免同一事实刷满诊断环）。
+      // Auto 关闭时不写这条诊断：那不是「本可以打开却被挡住」的事实，写它只会填满有界诊断环。
+      const running = runningSidebarResourceAddresses(enabled === true ? recordShardChildMissing : undefined);
       /**
        * 先回收过期的打开占位（缺陷 2）：它只维护插件自己的记账、绝不触碰宿主，因此与 Auto 开关无关
        * （与下面的记账清理同一条边界）。放在候选选择之前，被回收的容量当轮就能重新用上。
@@ -147,6 +172,22 @@
       let candidate = null;
       if (enabled === true && sidebarAutoBusyRef.current !== true) {
         candidate = autoCloseCandidate(running) ?? autoOpenCandidate(running);
+        /**
+         * on-screen 身份闸门（票 02 / spec D3，「active 判定」这一条）：候选一旦被选中，紧接着就会
+         * 写入共享账本并向宿主派发副作用（openResource / close / split 全部只作用于 on-screen 会话）。
+         * 身份不一致时**不派发**，候选当场作废，本轮什么都不做。
+         *
+         * 放在这里而不是只在动作内部拦截，是「闸门拒绝 = 等待」这条口径（spec D4）的落地点：拒绝路径
+         * 不写失败屏障，而动作收尾的尾随级联同步仍会重新求值候选——它同样在这一行被拦住，微任务级联
+         * 因此自然停下，不会自转；真正的重试由下一个**外部**同步轮（轮询 / observer / 切回补偿）发起。
+         * 诊断走同一份判据与限频聚合（每个动作类型最多一条）。
+         */
+        if (candidate !== null && sidebarOnScreenSessionStill(candidate.kind) !== true) {
+          // 候选在被选中的同一段同步里已经写下预留（打开）或预支预算（关闭）：拒绝时必须原路回滚，
+          // 否则下一轮会认为「已经有动作在途 / 预算已烧」而永远不再选它（切回补偿因此失效）。
+          abandonAutoSidebarAction(candidate.key, candidate);
+          candidate = null;
+        }
       }
       cleanupAutoSidebarKeys(known, candidate === null ? null : candidate.key);
       if (candidate === null) return;
@@ -263,6 +304,13 @@
       if (entry === undefined) return;
       // 同一 key 仍有动作在途：它收尾时会再结算一次，绝不在这里并发派发第二个动作。
       if (sidebarTabPendingRef.current.has(key) === true) return;
+      /**
+       * on-screen 身份闸门（票 02）：下面每一条分支都会写共享账本（来源 / 抑制 / 持久归属）或派发
+       * 一次新的打开 / 关闭，全部是会被用户看见或被 Auto 继承的副作用。宿主当前画的不是本面板的
+       * 会话时一律不结算——**意图条目原样保留**，切回本会话后的那轮同步会按真实状态结算它
+       * （切回补偿见票据 03），因此既不丢用户点击，也绝不写进别人的会话。
+       */
+      if (sidebarOnScreenSessionStill(entry.intent === "open" ? "open" : "close") !== true) return;
       const opening = sidebarTabOpeningRef.current.get(key);
       const openingScoped = opening !== undefined
         && opening.sessionId === sidebarSessionId && opening.rootSessionId === rootSessionId;

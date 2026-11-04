@@ -24,7 +24,7 @@
   const PURE_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-pure");
   const PURE = global[PURE_SYMBOL] || {};
   const {
-    finiteNumber, formatCompactDuration, isFailureStatusOf, latestShardChildIdOf, modelApi,
+    finiteNumber, formatCompactDuration, isFailureStatusOf, modelApi,
     object, retryWarningThreshold, statusOf, text,
   } = PURE;
   const DOM_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-dom");
@@ -173,19 +173,6 @@
     if (metrics.decodeMs <= 0 || metrics.decodeTokens <= 0) return null;
     return metrics.decodeTokens / (metrics.decodeMs / 1000);
   };
-  /** fan-out 父任务的会话集合：每个 shard 最新 attempt 的 childId（按 childId 去重）。 */
-  const fanoutSessionIdsOf = (task) => {
-    const ids = [];
-    const seen = new Set();
-    const source = object(task);
-    for (const shard of Array.isArray(source.shards) ? source.shards : []) {
-      const childId = latestShardChildIdOf(shard);
-      if (childId === null || seen.has(childId)) continue;
-      seen.add(childId);
-      ids.push(childId);
-    }
-    return ids;
-  };
   /**
    * 该会话是否已经拿到了「可用的 sessionStats 投影」。
    *
@@ -246,7 +233,9 @@
    * (d) 补出来的段不伪造语义 tooltip（不写「累计轮次用时 0s」「平均吞吐 0tok/s」
    *     「已用 null / 窗口 null」），tooltip 回退为段文本本身。
    *
-   * fan-out 父任务没有单一会话，context 段始终省略（补齐时 skipContext）。
+   * fan-out 父任务不承担会话：产品代码不再为它渲染摘要条（第二行已整行删除，
+   * 见 client-sidebar-views-c.js 的 renderFanout），因此 kind === "fanout" 的 skipContext
+   * 只作为本函数的通用选项保留，当前没有调用方传入。
    */
   const renderMetrics = (ctx, node, options = {}) => {
     const { react } = ctx;
@@ -473,7 +462,6 @@
     return Object.freeze({
       sessionStatsPresentOf: (sessionId) => sessionStatsPresentOf(deps, sessionId),
       durationOfNode: (source, runtimeStatus, sessionId) => durationOfNode(deps, source, runtimeStatus, sessionId),
-      fanoutSessionIdsOf: (task) => fanoutSessionIdsOf(task),
       renderMetrics: (node, options) => renderMetrics(deps, node, options),
       renderRowMain: (node, options) => renderRowMain(deps, node, options),
     });

@@ -26,7 +26,7 @@
   const DOM = global[DOM_SYMBOL] || {};
   const {
     createCatalogLookup, currentSessionIdOf, listSnapshot, makeIcon,
-    methodOf, resolveClientService, runtimeStatusOf, statusIcon,
+    methodOf, resolveClientService, runtimeStatusOf, sidebarOnScreenSessionOf, statusIcon,
     styleTag,
   } = DOM;
   const POLL_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-poll");
@@ -37,7 +37,8 @@
   const AUTO_LEDGER_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-auto-ledger");
   const AUTO_LEDGER = global[AUTO_LEDGER_SYMBOL] || {};
   const {
-    clearSidebarAutoManualSuppressions, recordSidebarAutoDiag, resolveSidebarSharedAutoLedger,
+    clearSidebarAutoManualSuppressions, copySidebarAutoDiagText, readSidebarAutoDiagText,
+    recordSidebarAutoDiag, resolveSidebarSharedAutoLedger, sidebarAutoKeyDigest,
     sidebarSharedAutoLedgerSizes, sidebarSharedAutoLedgerTotal,
   } = AUTO_LEDGER;
   const PANEL_CACHE_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-panel-cache");
@@ -56,9 +57,9 @@
   const HOOKS_STATE_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-state");
   const HOOKS_STATE = global[HOOKS_STATE_SYMBOL] || {};
   const {
-    useSidebarPanelHostServices, useSidebarPanelPeakValleyMarker, useSidebarPanelSessionModel, useSidebarPanelSessionModelPart2,
-    useSidebarPanelSnapshotDerived, useSidebarPanelStateCore, useSidebarPanelStoreAndMeta,
-    useSidebarPanelWidth,
+    useSidebarPanelAutoDiag, useSidebarPanelHostServices, useSidebarPanelPeakValleyMarker,
+    useSidebarPanelSessionModel, useSidebarPanelSessionModelPart2, useSidebarPanelSnapshotDerived,
+    useSidebarPanelStateCore, useSidebarPanelStoreAndMeta, useSidebarPanelWidth,
   } = HOOKS_STATE;
   const HOOKS_EFFECTS_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-panel-hooks-effects");
   const HOOKS_EFFECTS = global[HOOKS_EFFECTS_SYMBOL] || {};
@@ -352,8 +353,13 @@
        * （createSidebarPanelShared 用它建共享账本），而 Hook 模块与账本之间没有依赖边。经由 frame
        * 转交可以保持 manifest.iifeDependencies 与依赖图门禁逐项不变，也不会给 Hook 增加一条只在
        * 一个点击路径上才用得到的装配依赖。
+       *
+       * 票 02 的 on-screen 闸门同理由此转交 recordSidebarAutoDiag / sidebarAutoKeyDigest：闸门本体
+       * 归 hooks-state（surface 判定的 owner），诊断写入器仍留在账本的声明读取方。
        */
-      clearSidebarAutoManualSuppressions,
+      clearSidebarAutoManualSuppressions, recordSidebarAutoDiag, sidebarAutoKeyDigest,
+      // 票 06：诊断读取/脱敏/导出同样经 frame 转交（见上一条注释；Hook 模块与账本之间没有依赖边）。
+      copySidebarAutoDiagText, readSidebarAutoDiagText,
       sessionId, rootSessionId, sidebarSessionId, tabActivityKey,
       model, panelLocale, t, errorLabelOf,
       sessionsService, sidebarRight, requestRightbarDragSync, releaseRightbarDragLock,
@@ -387,7 +393,7 @@
       readActiveSidebarResource, restoreSessionModelDefaults, rootSessionId, sessionId, sessionModelCatalog, sessionModelDialogRef, sessionModelDrafts,
       sessionModelHasInvalidDraft, sessionModelNotice, sessionModelOpen, sessionModelPendingChanges,
       sessionModelSaving, sessionModelState,
-      sessionsSnapshot, sidebarBatchPendingRef, sidebarBatchScopeKey, sidebarBatchStateFor, sidebarOpenTabsAvailable, sidebarSessionId,
+      sessionsSnapshot, sidebarBatchPendingRef, sidebarBatchScopeKey, sidebarBatchStateFor, sidebarOpenTabsAvailable, sidebarRight, sidebarSessionId,
       sidebarTabVisible, sidebarTabRecordsRef, snapshot, subagentAddressOfChild, t, timelineExpandedRef, toggle,
       updateSessionModelDraft,
     } = frame;
@@ -440,13 +446,25 @@
     /** 启用态徽标文案（未启用返回 null）；拼装逻辑与标题栏共用 peakValleyLabelTextOf。 */
     const peakValleyLabelOf = (marker) => peakValleyLabelTextOf(config, frame.panelLocale, marker);
     /**
+     * 旧宿主（on-screen 读面缺失）的渲染期只读投影（票 02 / spec D2、D4）。
+     *
+     * 闸门在 unavailable 时 fail-closed：手动箭头与批量关闭点了不会产生任何宿主写操作，而旧宿主上
+     * 也永远等不到读面出现，用户看到的就是「点了没反应」。这里用**同一份**解析（sidebarOnScreenSessionOf）
+     * 再读一次，只用于渲染态（禁用 + 可读说明）。
+     *
+     * 判据只认 null（读面缺失 / 读不到）＝旧宿主；mismatch 与 absent 是「当前不是这一面」的正常过渡态
+     * （切会话、切走再切回），把它们也渲染成禁用会让控件在每次切会话时闪成不可用。写入是否放行仍由闸门
+     * 在副作用前现读裁决，渲染期结论**绝不参与放行**。
+     */
+    const sidebarSurfaceUnsupported = sidebarOnScreenSessionOf(sidebarRight) === null;
+    /**
      * 视图上下文（第一、二组）：本帧只读投影 + 窄命令。
      *
      * 每次渲染重建一份并交给 createSidebarViewsA/B；它们返回的渲染函数与拆分前 Panel 内的
      * 箭头函数一一对应（同名同签名），因此调用点、调用顺序与渲染结果一字未改。
      */
     const viewCtx = {
-      react, primitives, t, model, meta, snapshot, sessionsSnapshot, config,
+      react, primitives, t, model, meta, snapshot, sessionsSnapshot, config, sidebarSurfaceUnsupported,
       sessionId, sidebarSessionId, rootSessionId, catalogEntryOf,
       handleSidebarAction, handleSidebarBatchClose,
       openSidebarResource, closeSidebarResource, readActiveSidebarResource, sidebarOpenTabsAvailable,
@@ -725,8 +743,8 @@
 
   function renderSidebarPanelSection(frame) {
     const {
-      announcement, autoOpenDraft, autoOpenEnabled, body, config, errorLabelOf,
-      panelLocale, peakValleyMarker, primitives, react, recoveryBanner, renderSessionModelDialog,
+      announcement, autoOpenDraft, autoOpenEnabled, body, config, diagFeedback, errorLabelOf,
+      exportAutoDiag, panelLocale, peakValleyMarker, primitives, react, recoveryBanner, renderSessionModelDialog,
       retry, t, toggleAutoOpen, version, viewState, widthResizer, writeAutoOpenSetting,
     } = frame;
 
@@ -768,6 +786,34 @@
       "aria-label": refreshLabel,
       onClick: retry,
     }, makeIcon(primitives, "IconRefreshOutlineRegular", { size: 14 }));
+    /**
+     * 标题栏「诊断」入口（票 06）：与刷新按钮同一排的紧凑按钮，点击即把最近 ≤60 条自动打开/
+     * 关闭决策复制成纯文本（无剪贴板时自动降级为下载 .txt）。
+     *
+     * - 样式复用工具条的 .deg_expert_group_export_button（同一 24px 高 / 11px 字号 / 既有描边与
+     *   焦点环），不引入新的视觉体系；
+     * - **永不渲染 disabled**：无记录、读面不可用、复制失败一律靠右侧反馈说明原因（票 06 明确
+     *   禁止「不可用却不给原因」的禁用态）；
+     * - aria-label 与 title 都是完整动作说明，可见文字只留「诊断」，窄右栏也不挤标题。
+     *
+     * 反馈槽是一个常驻的 role=status（隐式 aria-live=polite）节点，空字符串时宽度为 0：
+     * 文本变化即被读屏播报，且不抢占任务播报区（.deg_expert_group_announcer）的通道。
+     */
+    const diagLabel = t("sidebar.diag.aria");
+    const diagButton = react.createElement("button", {
+      type: "button",
+      className: "deg_expert_group_export_button",
+      "data-deg-auto-diag": "true",
+      title: diagLabel,
+      "aria-label": diagLabel,
+      onClick: () => exportAutoDiag?.(),
+    }, t("sidebar.diag.button"));
+    const diagStatus = react.createElement("span", {
+      className: "deg_expert_group_header_diag",
+      role: "status",
+      "aria-live": "polite",
+      "data-deg-auto-diag-status": diagFeedback?.key ?? undefined,
+    }, diagFeedback === null || diagFeedback === undefined ? "" : t(diagFeedback.key, { count: diagFeedback.count }));
     /**
      * 标题栏峰谷时段标记（票据 09）：Auto 右侧、错误槽之前。
      *
@@ -811,7 +857,7 @@
             "data-error-source": panelError.source,
             title: panelError.message,
           }, panelErrorLabel),
-        refreshButton), recoveryBanner, body,
+        refreshButton, diagButton, diagStatus), recoveryBanner, body,
       // 「会话模型」弹窗挂在任务树之后：只在打开时渲染（关闭态 DOM 与既有面板一致）。
       renderSessionModelDialog());
   }
@@ -874,6 +920,8 @@
       useSidebarPanelRunActionPart2(frame);
       // 票据 09：标题栏峰谷时段标记（无条件 Hook；未启用时不创建任何定时器）。
       useSidebarPanelPeakValleyMarker(frame);
+      // 票 06：标题栏「诊断」入口（无条件 Hook；只读既有诊断环，点击之外没有任何副作用）。
+      useSidebarPanelAutoDiag(frame);
       assembleSidebarPanelBody(frame);
       assembleSidebarPanelBodyPart2(frame);
       return renderSidebarPanelSection(frame);

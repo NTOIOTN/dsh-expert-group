@@ -64,6 +64,9 @@ export const CLIENT_SOURCE_FILES = Object.freeze([
   "client-sidebar-panel-hooks-state.js",
   "client-sidebar-panel-hooks-effects.js",
   "client-sidebar-panel-hooks-tabs.js",
+  // 票 01 预拆分：hooks-actions 的 tab 记录器自洽块（两个 Hook + 两个私有 helper）移出后单独成文件。
+  // 同样是装配输入：既要有 node --check，也要进入行数门禁的统计范围。
+  "client-sidebar-panel-hooks-actions-recorder.js",
   "client-sidebar-panel-hooks-actions.js",
   "client-sidebar-panel.js",
   "client-expert-group-sidebar.js",

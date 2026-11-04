@@ -147,10 +147,27 @@
   };
 
   /**
+   * 写入器的字段白名单（顺序即落盘顺序）：提示词 / 正文 / 令牌 / 会话原文压根不在这里，因此结构上
+   * 不可能被写进诊断环。target / onscreen 是票 02 闸门的两侧**独立**脱敏摘要（各自 hash）。
+   */
+  const SIDEBAR_AUTO_DIAG_WRITE_FIELDS = [
+    "kind", "event", "action", "verdict", "reason", "key", "origin", "target", "onscreen",
+  ];
+  /**
+   * 连续拒绝的聚合判据（spec D8）：同一「event + action + verdict + reason + 目标会话摘要 +
+   * on-screen 会话摘要」只保留一条并累加 count。
+   *
+   * 为什么必须聚合：宿主在面板会话不在前台时仍会每 2.5 秒推一轮同步，每轮都会撞上闸门——不聚合
+   * 的话 60 条有界环会在几十秒内被同一条事实刷满，把真正有用的其它诊断挤出去。
+   */
+  const SIDEBAR_AUTO_DIAG_AGGREGATE_FIELDS = ["event", "action", "verdict", "reason", "target", "onscreen"];
+
+  /**
    * 写一条诊断（环形、有界、失败静默）。
    *
-   * 结构：{ t, kind, event?, action?, verdict?, reason?, key?, origin?, reused?, degraded?, sizes? }，
-   * key 一律是摘要（sidebarAutoKeyDigest），绝不含原文；单条 JSON 超过硬上限时先丢 sizes 再整体丢弃。
+   * 结构：{ t, kind, event?, action?, verdict?, reason?, key?, origin?, target?, onscreen?, count?,
+   * reused?, degraded?, sizes? }；key / target / onscreen 一律是摘要（sidebarAutoKeyDigest），绝不
+   * 含原文；单条 JSON 超过硬上限时先丢 sizes 再整体丢弃。连续的同源拒绝就地累加 count（不新增行）。
    */
   const recordSidebarAutoDiag = (entry) => {
     try {
@@ -158,7 +175,7 @@
       if (storage === null) return;
       const source = entry !== null && typeof entry === "object" ? entry : {};
       const normalized = { t: Date.now() };
-      for (const field of ["kind", "event", "action", "verdict", "reason", "key", "origin"]) {
+      for (const field of SIDEBAR_AUTO_DIAG_WRITE_FIELDS) {
         const value = sidebarBoundedText(source[field]);
         if (value !== undefined) normalized[field] = value;
       }
@@ -172,18 +189,35 @@
         }
         normalized.sizes = sizes;
       }
-      let serialized = JSON.stringify(normalized);
-      if (serialized.length > SIDEBAR_AUTO_DIAG_ENTRY_MAX_CHARS) {
-        delete normalized.sizes;
-        serialized = JSON.stringify(normalized);
-      }
-      if (serialized.length > SIDEBAR_AUTO_DIAG_ENTRY_MAX_CHARS) return;
       let list = [];
       const raw = storage.getItem(SIDEBAR_AUTO_DIAG_KEY);
       if (typeof raw === "string" && raw.length > 0) {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed) === true) list = parsed.slice(-SIDEBAR_AUTO_DIAG_LIMIT);
       }
+      // 只聚合**拒绝**结论：candidate / skip / failed 这些各自带着不同的事实，合并会让它们串味。
+      const last = list.length > 0 ? list[list.length - 1] : null;
+      if (normalized.verdict === "block" && last !== null && typeof last === "object" && last.verdict === "block") {
+        let same = true;
+        for (const field of SIDEBAR_AUTO_DIAG_AGGREGATE_FIELDS) {
+          if (String(last[field] ?? "") !== String(normalized[field] ?? "")) {
+            same = false;
+            break;
+          }
+        }
+        if (same === true) {
+          last.count = (Number(last.count) > 1 ? Number(last.count) : 1) + 1;
+          last.t = normalized.t;
+          storage.setItem(SIDEBAR_AUTO_DIAG_KEY, JSON.stringify(list));
+          return;
+        }
+      }
+      let serialized = JSON.stringify(normalized);
+      if (serialized.length > SIDEBAR_AUTO_DIAG_ENTRY_MAX_CHARS) {
+        delete normalized.sizes;
+        serialized = JSON.stringify(normalized);
+      }
+      if (serialized.length > SIDEBAR_AUTO_DIAG_ENTRY_MAX_CHARS) return;
       list.push(JSON.parse(serialized));
       storage.setItem(SIDEBAR_AUTO_DIAG_KEY, JSON.stringify(list.slice(-SIDEBAR_AUTO_DIAG_LIMIT)));
     } catch {
@@ -700,11 +734,119 @@
     });
   };
 
+  /**
+   * 诊断读取面的白名单字段（票 06）：与 recordSidebarAutoDiag 的写入器逐项同源，顺序即导出行里的
+   * 字段顺序。提示词、消息正文、令牌、会话原文压根不在写入器范围内，即使某条历史条目不干净，
+   * 也进不了导出。
+   */
+  const SIDEBAR_AUTO_DIAG_FIELDS = ["t", "kind", "event", "action", "verdict", "reason", "key", "origin", "target", "onscreen"];
+  /** 必须是摘要形状的字段：不是（历史条目 / 别的写入者）就当场重新摘要，绝不让原文借道导出。 */
+  const SIDEBAR_AUTO_DIAG_DIGEST_FIELDS = ["key", "target", "onscreen"];
+  /** 摘要键的形状（sidebarAutoKeyDigest 的输出：k + base36）。 */
+  const SIDEBAR_AUTO_DIAG_DIGEST = /^k[0-9a-z]+$/;
+  /**
+   * 读取侧的**第二道脱敏**：即便写入侧只落摘要，reason 仍可能来自 error.message（结算失败路径），
+   * 因此把「32 位以上的连续标识符字符」整段替换成省略号——JWT（eyJ…）、sk-/hf_ 前缀密钥、
+   * 标准 UUID（36 位，完整会话 id 的典型形状）与各类不透明 id 都落在这条判据里。
+   * 下限取 32 是为了绝不误伤 session-guard-unavailable（25 位）、shard-child-missing 这类短码。
+   */
+  const SIDEBAR_AUTO_DIAG_SECRET = /[A-Za-z0-9_-]{32,}/g;
+  /** 复制与下载都不可用时的兜底文件名（固定名，方便在下载目录里找到）。 */
+  const SIDEBAR_AUTO_DIAG_FILE = "dsh-expert-group-auto-diag.txt";
 
+  /**
+   * 导出纯文本（票 06 的读取入口）：一行标题 + 每条诊断一行。
+   *
+   * 返回三态：`null` = 读面不可用（没有 localStorage / 被拒）；`{ count: 0, text }` = 确实没有
+   * 记录；`{ count, text }` = 最近 N 条（沿用写入侧同一个 60 条上限）。三态必须区分——读面不可用
+   * 时不能谎称「暂无记录」。
+   *
+   * 脱敏在这里一次做完：白名单字段 → 截断（sidebarBoundedText）→ 令牌 / id 片段替换 → key 非摘要
+   * 形状时重新摘要 → 换行折叠成空格（保证一条一行）。除 getItem 之外没有任何副作用。
+   */
+  const readSidebarAutoDiagText = (header) => {
+    const storage = sidebarLocalStorage();
+    if (storage === null) return null;
+    let list = [];
+    try {
+      const raw = storage.getItem(SIDEBAR_AUTO_DIAG_KEY);
+      const parsed = typeof raw === "string" && raw.length > 0 ? JSON.parse(raw) : [];
+      list = Array.isArray(parsed) === true ? parsed.slice(-SIDEBAR_AUTO_DIAG_LIMIT) : [];
+    } catch { list = []; }
+    const lines = [String(header ?? "")];
+    for (const item of list) {
+      if (item === null || typeof item !== "object") continue;
+      const parts = [];
+      for (const field of SIDEBAR_AUTO_DIAG_FIELDS) {
+        if (field === "t") {
+          const at = Number(item.t);
+          if (Number.isFinite(at) === true) parts.push(new Date(at).toISOString());
+          continue;
+        }
+        // 换行折叠成空格：reason 来自 error.message 时可能自带换行，必须保证一条一行。
+        const value = sidebarBoundedText(item[field])?.replace(/[\r\n]+/g, " ");
+        if (value === undefined) continue;
+        const safe = SIDEBAR_AUTO_DIAG_DIGEST_FIELDS.includes(field) === true && SIDEBAR_AUTO_DIAG_DIGEST.test(value) !== true
+          ? sidebarAutoKeyDigest(value)
+          : value;
+        parts.push(field + "=" + safe);
+      }
+      // 聚合计数：连续的同源拒绝只占一行，计数一眼可见（spec D8 的限频要能读出来）。
+      const repeat = Number(item.count);
+      if (Number.isFinite(repeat) === true && repeat > 1) parts.push("count=" + Math.trunc(repeat));
+      if (item.reused === true) parts.push("reused");
+      if (item.degraded === true) parts.push("degraded");
+      lines.push(parts.join(" "));
+    }
+    // 令牌 / 长 id 的替换对整段文本做一次即可（不跨行：正则不匹配换行符）。
+    return { count: lines.length - 1, text: lines.join("\n").replace(SIDEBAR_AUTO_DIAG_SECRET, "…") };
+  };
+
+  /**
+   * 复制纯文本：剪贴板 API →（不可用或被拒时）下载 .txt → 仍不可用返回 "failed"。
+   *
+   * 返回 "copied" / "downloaded" / "failed"（Promise）；三种结论都有可读反馈，绝不静默。
+   * 不再走已废弃的 document.execCommand("copy")：不安全上下文里 navigator.clipboard 本就缺失，
+   * 直接下载同样满足「剪贴板不可用时退化为可保存的纯文本」。
+   */
+  const copySidebarAutoDiagText = (value) => {
+    const text = typeof value === "string" ? value : "";
+    try {
+      const clipboard = globalThis.navigator?.clipboard;
+      if (typeof clipboard?.writeText === "function") {
+        return Promise.resolve(clipboard.writeText(text)).then(() => "copied", () => downloadSidebarAutoDiagText(text));
+      }
+    } catch {
+      /* 继续降级到下载。 */
+    }
+    return Promise.resolve(downloadSidebarAutoDiagText(text));
+  };
+
+  /** 下载降级：Blob + 临时 a[download]；任一环节缺失或抛错都返回 "failed"。 */
+  const downloadSidebarAutoDiagText = (value) => {
+    try {
+      const doc = globalThis.document;
+      const url = globalThis.URL;
+      const BlobCtor = globalThis.Blob;
+      if (!doc || typeof BlobCtor !== "function" || typeof url?.createObjectURL !== "function") return "failed";
+      const href = url.createObjectURL(new BlobCtor([value], { type: "text/plain;charset=utf-8" }));
+      const link = doc.createElement("a");
+      link.href = href;
+      link.download = SIDEBAR_AUTO_DIAG_FILE;
+      doc.body?.appendChild?.(link);
+      link.click?.();
+      doc.body?.removeChild?.(link);
+      url.revokeObjectURL?.(href);
+      return "downloaded";
+    } catch {
+      return "failed";
+    }
+  };
   // 只暴露兄弟模块与主 IIFE 实际消费的符号（无全量外挂）。
   global[SYMBOL] = Object.freeze({
     SIDEBAR_AUTO_OWNERSHIP_ORIGIN_AUTO, SIDEBAR_AUTO_OWNERSHIP_ORIGIN_MANUAL, clearSidebarAutoManualSuppressions,
-    deleteSidebarAutoOwnership, purgeSidebarAutoOwnershipForSessions, readSidebarAutoOwnershipEntry,
+    copySidebarAutoDiagText, deleteSidebarAutoOwnership, purgeSidebarAutoOwnershipForSessions,
+    readSidebarAutoDiagText, readSidebarAutoOwnershipEntry,
     recordSidebarAutoDecision, recordSidebarAutoDiag, resolveSidebarSharedAutoLedger, sidebarAutoKeyDigest,
     sidebarAutoOriginEntry, sidebarAutoOriginTabIdOf, sidebarAutoOriginWrittenAtOf, sidebarBoundedText,
     sidebarLocalStorage, sidebarOwnershipAcceptsNewAuto, sidebarSharedAutoLedgerSizes, sidebarSharedAutoLedgerTotal,

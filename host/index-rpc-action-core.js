@@ -639,7 +639,7 @@ async function handleMeta(deps, req) {
   const { describeHostCapabilities, describeRuntimeDiagnostics } = deps.diagnostics;
   const {
     activeRoles, describeRolePrompts, fanoutHost, roleCatalog, roleLabelsProjection, source,
-    usageSummaryFor
+    usageSummaryFor, hostCapacityProjection
   } = deps.reads;
   const { config } = deps.services;
   const { body, send } = req;
@@ -670,6 +670,10 @@ async function handleMeta(deps, req) {
       enableObserver: config.enableObserver === true,
       observerPreferred: snap.observerPreferred === true,
       roleConcurrencyLimit: snap.roleConcurrencyLimit,
+      // 宿主名额封顶（只读投影）：配置值 roleConcurrencyLimit 原样保留，另给宿主名额
+      // （读不到为 null）与封顶后的实际生效默认并发，设置页据此区分「配置值 vs 实际生效」。
+      // 旧装配缺少该窄命令时整块省略（不伪造字段）。
+      ...(typeof hostCapacityProjection === "function" ? hostCapacityProjection(snap.roleConcurrencyLimit) : {}),
       /**
        * 并发映射（票据 26）：meta 必须携带这两个字段，否则设置页无法渲染
        * 逐角色/provider 编辑面（客户端波次），诊断也无法解释任务为什么排队。

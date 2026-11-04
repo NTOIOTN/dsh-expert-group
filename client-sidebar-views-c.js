@@ -226,11 +226,12 @@
     // data-status 是对外的规范运行状态；管理状态改由 data-task-status 暴露，
     // 供了解 fan-out 内部结算的消费方读取，展示层不再出现 succeeded/failed 等词。
     const runtimeStatus = runtimeStatusOf(task, null);
-    // 父任务的用量摘要条（用时/tok/s/tok/命中；无单一会话因此没有 context）与标题同列纵向排列：
-    // 标题仍可点击导航，摘要条不参与导航、不拦截点击。
-    // 用户精简侧栏后，父任务不再显示跨分片的聚合 attempt 时间线；
-    // 分片行同样不再展示自己的 attempt 历史（用户要求，见 renderShard），
-    // 因此整棵 fan-out 子树里都不存在 attempt 时间线节点。
+    // 用户要求（2026-11）：fan-out 父任务不承担会话，第二行整行删除。
+    // 父任务行只保留第一行（状态圆点 + 折叠箭头 + 「角色 · N shards · 状态」标题 + 行尾动作），
+    // 不再渲染「用时 · tok/s · tok · 命中」用量摘要，也不再承载「多次重试」徽标与失败原因摘要
+    // ——这些信息由各分片行自己承载（见 renderShard 的 metrics）。
+    // 连带结果：父任务不再需要跨分片聚合子会话 id（fanoutSessionIdsOf 已随之删除），
+    // 也不再有跨分片的聚合 attempt 时间线；整棵 fan-out 子树里都不存在 attempt 时间线节点。
     // 树语义：fan-out 头部是第 2 层 treeitem，分片容器是它的 group（位置只算可见分片）。
     const meta = treeMeta !== undefined && treeMeta !== null
       ? treeMeta
@@ -285,14 +286,16 @@
       },
         statusIcon(react, primitives, runtimeStatus),
         ctx.a.renderChevron(task, open),
+        // 标题外层 wrapper 保留：focus-visible 样式与测试都以
+        // .deg_expert_group_fanout_title>.deg_expert_group_task 为锚点；
+        // 但它现在只承载这一个子节点（第二行整行删除后不再纵向排列）。
         react.createElement("div", { className: "deg_expert_group_fanout_title" },
           react.createElement("div", {
             className: "deg_expert_group_line deg_expert_group_task",
             title: fanoutTitle,
             ...(fanoutNavigable ? { role: "button", tabIndex: 0, "aria-label": "打开任务会话：" + fanoutTitle, onKeyDown: onFanoutKeyDown } : {}),
             onClick: fanoutNavigable ? () => handleOpen(fanoutNavigationId) : undefined,
-          }, fanoutTitle),
-          ctx.b.renderMetrics(task, { kind: "fanout", runtimeStatus, sessionIds: ctx.b.fanoutSessionIdsOf(task) })),
+          }, fanoutTitle)),
         react.createElement("div", { className: "deg_expert_group_actions" }, actions)),
       // 箭头函数按 (shard, index, array) 收到与旧 `renderShard.bind(null, task)` 完全相同的实参
       // （renderShard 只用前两个），但不再每次渲染都新建一个绑定函数。

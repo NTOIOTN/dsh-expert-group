@@ -375,11 +375,17 @@
      * - 容器身份仍归各自 owner（实例级 ref / realm 级共享账本），本层每次现取 ref.current；
      * - 依赖对象 treeDeps / autoCloseLedger 每帧重建，绝不跨帧复用（旧实现的判据都是闭包值）。
      */
-    const tabTreeDeps = () => ({
+    const tabTreeDeps = (recordShardChildMissing) => ({
       addressOf: subagentAddressOfChild,
       statusOf: runtimeStatusOfNode,
       partial: partialSnapshot,
       neutralStatus: neutralRuntimeStatus,
+      /**
+       * 分片缺少可用会话标识时的诊断出口（票 04）：窄函数注入，地址推导层因此不含任何记账知识。
+       * **只有候选层会传**（见 syncAutoSidebarTabs）；渲染路径同样求值这份地址集合却不传，
+       * 于是同一条事实不会随每一帧渲染刷满有界诊断环。
+       */
+      ...(typeof recordShardChildMissing === "function" ? { recordShardChildMissing } : {}),
     });
     /** 自动关闭预算的四个容器 + 上限：成员 Map 的身份来自主体（实例 ref / 共享账本），本层不 new。 */
     const autoCloseLedger = () => ({
@@ -414,10 +420,10 @@
       tabTreeDeps(),
     );
     const sidebarIdleChildren = () => TAB_STATE.sidebarIdleChildren(sidebarRootChildren(), rootSessionId, tabTreeDeps());
-    const runningSidebarResourceAddresses = () => TAB_STATE.runningSidebarResourceAddresses(
+    const runningSidebarResourceAddresses = (recordShardChildMissing) => TAB_STATE.runningSidebarResourceAddresses(
       sidebarRootChildren(),
       rootSessionId,
-      tabTreeDeps(),
+      tabTreeDeps(recordShardChildMissing),
     );
     const idleSidebarResourceAddresses = (nodes) => TAB_STATE.idleSidebarResourceAddresses(
       nodes,
@@ -682,6 +688,21 @@
        // 照旧能被反映，而用户手动打开的 tab 也不再依赖本插件的打开记录。
        if (records.size === 0) return;
       /**
+       * on-screen 会话写入闸门（收尾补齐；判据与 recordSidebarTab 的 action=record 同源）。
+       *
+       * 本函数按公开 inventory 的四态判定**写记录**：累加 / 清零 misses、标记 / 清除 absent、直接
+       * 删除记录。而调用方（syncSidebarTabs）在候选闸门**之前**调用它，所以这里必须自己现读身份。
+       * 非前台时那份 inventory 描述的是**别的会话**：按它判定「这个 tab 已经不在 / 又出现了」会把
+       * 本会话仍然有效的记录标成缺席甚至删掉（箭头误翻 >>、Auto 归属失去记录支撑）。
+       *
+       * 因此身份不一致时整段记录变更跳过——**只读不写**（不累加、不标记、不删除）；切回前台后的
+       * 下一轮同步按真实 inventory 校正一次（与 autoCloseCandidate 同一条「延后清理」口径）。
+       * 位置在 records 为空短路之后、任何读面之前：没有记录时本轮本就不会写，绝不为此每轮空转
+       * 多写一条拒绝诊断（spec D8 的有界诊断环）。
+       */
+      // 现读 frame 上的实现（只此一处调用，不再多解构一个名字：客户端 raw 余量只剩百余字节）。
+      if (frame.sidebarOnScreenSessionStill("record") !== true) return;
+      /**
        * 本节不再因为「面板 / DOM 读面不可读」就整体提前 return：宿主 0.2.1-rc.3 的公开 openTabs
        * inventory 是每次布局提交同步更新的**权威已提交投影**（覆盖 dock 与 float，不依赖面板可见性），
        * 它可读时单独就能回答「这条 tab 还在不在」——右栏折叠或 surface 过渡期间也必须能复位。
@@ -774,8 +795,9 @@
       sharedSidebarTabCloseInFlight, sidebarActiveResourceMatches, sidebarAutoBusyRef, sidebarAutoCascadeRef, sidebarAutoCloseAttemptOwnersRef, sidebarAutoCloseAttemptsRef,
       sidebarAutoCloseCooldownsRef, sidebarAutoCloseVerificationsRef, sidebarAutoEpochRef, sidebarAutoFailedKeysRef, sidebarAutoOriginRef, sidebarAutoReservationRef,
       sidebarAutoSignatureRef, sidebarAutoSuppressedRef, sidebarIdleChildren, sidebarManualIntentOf, sidebarManualIntentRef, sidebarOpenTabsAvailable,
-      sidebarResourceTabStateOf, sidebarRight, sidebarSessionId, sidebarSplitIntentRef, sidebarSurfaceStillCurrent, sidebarTabOpeningRef,
-      sidebarTabPendingRef, sidebarTabRecordsRef, sidebarTabSyncRef, snapshot, syncSidebarTabRecords, trimAutoKeyMap,
+      sidebarOnScreenSessionStill, sidebarResourceTabStateOf, sidebarRight, sidebarSessionId, sidebarSplitIntentRef,
+      sidebarSurfaceStillCurrent, sidebarTabOpeningRef, sidebarTabPendingRef, sidebarTabRecordsRef, sidebarTabSyncRef, snapshot,
+      syncSidebarTabRecords, trimAutoKeyMap,
     } = frame;
     // 跨 Hook 前向引用的晚绑定包装：这些函数由后续 Hook 声明并登记到 frame.late；
     // 本 Hook 里的调用全部发生在渲染之后的异步 / 事件路径，因此转发保持原来的调用时机与顺序。
@@ -845,6 +867,8 @@
           sidebarManualIntentOf,
           sidebarManualIntentRef,
           sidebarOpenTabsAvailable,
+          // on-screen 会话写入闸门（票 02）：动作面与关闭验证链都在副作用之前现读，必须随作用面注入。
+          sidebarOnScreenSessionStill,
           sidebarResourceTabStateOf,
           sidebarRight,
           sidebarSessionId,

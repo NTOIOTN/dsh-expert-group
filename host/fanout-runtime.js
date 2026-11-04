@@ -195,6 +195,16 @@ function buildRuntimeFacade(context) {
     budget: () => (state.closed || typeof state.runtime?.manager?.budget !== "function" ? null : state.runtime.manager.budget()),
     getTask: (parentTaskId) => (state.closed ? null : state.runtime.manager.getTask(parentTaskId)),
     listTasks: () => (state.closed ? [] : state.runtime.manager.listTasks()),
+    /**
+     * admission 凭据读面（票 02）：只读转发 manager 的派生读（读活 attempt 上的 handle）。
+     *
+     * 关闭语义与 getTask 一致：state.closed 后返回 null（关闭后不会再有新的 admission）。
+     * 旧 runtime / 测试替身缺该方法时同样返回 null——凭据缺失只能 fail-closed，
+     * 绝不能因为「问不到」而被当成「已证明」。
+     */
+    admittedChildOf: (parentTaskId, childId) => (state.closed || typeof state.runtime.manager?.admittedChildOf !== "function"
+      ? null
+      : state.runtime.manager.admittedChildOf(parentTaskId, childId)),
     // 归属解析 / 能力判定全部转交 ownership 服务（关闭语义与 fail-closed 都在服务内）。
     tasksOwnedBy: (sessionId) => ownership.tasksOwnedBy(sessionId),
     ownerOf: (parentTaskId) => ownership.ownerOf(parentTaskId),

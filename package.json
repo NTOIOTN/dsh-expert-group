@@ -41,6 +41,7 @@
     "client-sidebar-panel-hooks-state.js",
     "client-sidebar-panel-hooks-effects.js",
     "client-sidebar-panel-hooks-tabs.js",
+    "client-sidebar-panel-hooks-actions-recorder.js",
     "client-sidebar-panel-hooks-actions.js",
     "client-text.js",
     "client-styles.js",

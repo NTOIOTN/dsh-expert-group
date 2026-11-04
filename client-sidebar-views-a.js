@@ -80,6 +80,22 @@
     return parts.length === 0 ? "用量：—" : "用量：" + parts.join(" · ");
   };
 
+  /**
+   * 旧宿主（on-screen 读面缺失）下手动侧栏入口的**可见不可用**属性组（票 02 / spec D4）。
+   *
+   * 闸门在 unavailable 时 fail-closed：点了不会有任何宿主调用，旧宿主上读面也永远不会出现。为了
+   * 不让用户以为「坏了」，这里把入口渲染成禁用态，并把原因拼进 title / aria-label（同源字符串，
+   * 悬停与读屏都能读到）。判据只认 sidebarSurfaceUnsupported === true（＝读面缺失）；mismatch /
+   * absent 是正常的会话过渡态，**绝不禁用**，否则每次切会话控件都会闪一下。
+   *
+   * 调用方用对象展开 / Object.assign 把这个属性组放在最后，因此它会覆盖同名字面量属性。
+   */
+  const unsupportedPropsOf = (ctx, name) => {
+    if (ctx.sidebarSurfaceUnsupported !== true) return {};
+    const label = name + "（" + ctx.t("sidebar.surface.unsupported") + "）";
+    return { title: label, "aria-label": label, "aria-disabled": "true", disabled: true, "data-surface": "unsupported" };
+  };
+
   const renderChevron = (ctx, node, open) => {
     const { react, primitives, t, toggle } = ctx;
     // 折叠/展开文案走消息表（票据 19）：title 与 aria-label 同源，en 宿主下不再中文硬编码。
@@ -152,6 +168,8 @@
           return handleSidebarBatchClose(state.candidates);
         },
         onKeyDown: (event) => { event?.stopPropagation?.(); },
+        // 旧宿主（读面缺失）：必须最后展开，才能覆盖上面的 title / aria-label / disabled。
+        ...unsupportedPropsOf(ctx, accessibleName),
       }, react.createElement("span", {
         className: "deg_expert_group_double_arrow",
         "data-direction": "close",
@@ -204,6 +222,8 @@
       className: "deg_expert_group_sidebar_action",
       title: accessibleName,
       "aria-label": accessibleName,
+      // 正常宿主上显式 false：禁用态只属于旧宿主（读面缺失），见 unsupportedPropsOf 的覆盖。
+      disabled: false,
       onClick: (event) => {
         event?.preventDefault?.();
         event?.stopPropagation?.();
@@ -216,6 +236,8 @@
       buttonProps["aria-pressed"] = isOpen;
       buttonProps["data-open"] = isOpen ? "true" : "false";
     }
+    // 旧宿主（读面缺失）：打开与关闭两个方向都渲染成禁用，并附可读原因；正常宿主不变。
+    Object.assign(buttonProps, unsupportedPropsOf(ctx, accessibleName));
     // 两个方向都是「两个同向图标」：打开是 >>，打开态是 <<。图标清单与 makeIcon 的具名图标
     // 契约一致，两条分支都已确认对应具名图标存在（右箭头在上面的渲染条件里，左箭头在能力判定里）。
     const arrowIcon = isOpen ? "IconChevronLeftOutlineRegular" : "IconChevronRightOutlineRegular";

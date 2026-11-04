@@ -149,6 +149,10 @@
       "settings.pv.repair": { zh: "修复并保存" },
       "settings.pv.mainScope": { zh: "本页正在编辑{period}模型（打开页面时锁定）" },
       "settings.pv.boundary": { zh: "当前已进入{current}，本页仍在编辑{editing}模型" },
+      // 宿主子代理并发名额（meta 的 hostConcurrencyCap / effectiveRoleConcurrencyLimit）：
+      // 名额与封顶后的生效值并进并发输入框的原生 title；受限时在保存状态位尾部补一句显式提示。
+      "settings.cap.host": { zh: "宿主名额 {host} · 实际生效 {eff}" },
+      "settings.cap.lim": { zh: "（受宿主限制）" },
     });
     /** 取本票据新增控件的文案：locale 缺失或该语言无译文时回退 zh，绝不渲染键名。 */
     function settingsExtraText(locale, key, vars) {

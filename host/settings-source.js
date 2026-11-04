@@ -45,6 +45,48 @@ const CONFIG_OBSERVATION_EVENTS = Object.freeze([
 ]);
 
 /**
+ * 宿主子代理配置行的 profile 条目 id 与名额字段名。
+ *
+ * 宿主把「同时存活的 continuable 子代理数」声明成语义为 volatile 的
+ * `maxActiveSubagents`（默认 8）。DEG 无法直接读宿主的 Config，`describe()` 是唯一
+ * 公开读面；字段名与条目 id 都是宿主契约，改动必须同步宿主版本核对。
+ */
+export const HOST_SUBAGENT_NAMESPACE = "subagent";
+export const HOST_SUBAGENT_CAPACITY_FIELD = "maxActiveSubagents";
+
+/*
+ * 本模块**只读**宿主名额，不提供任何运行期写入口：默认值 64 由 bundle 补丁
+ * （cordis.patch.yml 里的 `- id: subagent` 覆盖项）在安装时声明，profile patch /
+ * home patch / CLI overlay 仍按「后者覆盖前者」的常规层序改写它。读取面服务于两件事：
+ * ① 派发 resolver 的封顶（effectiveRoleConcurrencyLimitWithHostCap）；② meta 投影。
+ */
+
+/**
+ * 读取 describe() 的全量描述符。
+ *
+ * 读取失败（服务不存在、describe 抛错、返回值不是数组）统一折算成 undefined：
+ * 这只代表「当前不可读」，调用方必须回落到各自的安全默认，绝不能因此让插件加载失败。
+ */
+function readSettingsDescriptors(service) {
+  if (service === null || typeof service?.describe !== "function") return undefined;
+  try {
+    const descriptors = service.describe();
+    return Array.isArray(descriptors) ? descriptors : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 从全量描述符里取指定条目；value 不是对象时同样视为不可用（与历史读面一致）。 */
+function descriptorOf(descriptors, namespace) {
+  if (descriptors === undefined) return undefined;
+  const descriptor = descriptors.find((candidate) => candidate?.ns === namespace);
+  if (descriptor === undefined) return undefined;
+  if (descriptor.value === null || typeof descriptor.value !== "object") return undefined;
+  return descriptor;
+}
+
+/**
  * 从 describe() 结果里读取本条目描述符。
  *
  * 宿主只会把「声明了 volatile 字段的条目」放进 describe()；条目 id 被用户重命名
@@ -56,18 +98,39 @@ const CONFIG_OBSERVATION_EVENTS = Object.freeze([
  * @returns {object|undefined} 该条目的描述符；不可读时 undefined。
  */
 export function findSettingsDescriptor(service, namespace) {
-  if (service === null || typeof service?.describe !== "function") return undefined;
-  let descriptors;
-  try {
-    descriptors = service.describe();
-  } catch {
-    return undefined;
-  }
-  if (!Array.isArray(descriptors)) return undefined;
-  const descriptor = descriptors.find((candidate) => candidate?.ns === namespace);
-  if (descriptor === undefined) return undefined;
-  if (descriptor.value === null || typeof descriptor.value !== "object") return undefined;
-  return descriptor;
+  return descriptorOf(readSettingsDescriptors(service), namespace);
+}
+
+/**
+ * 从 describe() 的全量描述符里取宿主子代理名额（纯函数，便于单测）。
+ *
+ * 语义边界：
+ * - 只认 `ns === "subagent"` 那一行的 `value.maxActiveSubagents`；
+ * - 值必须是正整数，缺失/0/负数/非整数/NaN 一律 undefined（不是「名额为 0」）；
+ * - 宿主把该行从 profile 移除时这里自然读不到，调用方据此视为「不封顶」。
+ *
+ * @param {Array<object>|undefined} descriptors - `ctx.settings.describe()` 的返回值。
+ * @returns {number|undefined} 宿主名额；不可读/非法时 undefined。
+ */
+export function hostSubagentCapacityOf(descriptors) {
+  const value = descriptorOf(descriptors, HOST_SUBAGENT_NAMESPACE)?.value;
+  if (value === undefined) return undefined;
+  const capacity = value[HOST_SUBAGENT_CAPACITY_FIELD];
+  return Number.isSafeInteger(capacity) && capacity > 0 ? capacity : undefined;
+}
+
+/**
+ * 从 settings 服务读一次宿主子代理名额。
+ *
+ * **只允许在刷新时机调用**（安装期、三个配置观察点、subagent 行自身的文档事件）：
+ * 派发与 meta 投影热路径一律读 {@link createSettingsSourceModule} 缓存的同一份值，
+ * 绝不在每次派发时再跑一遍 describe()（真实宿主会线性遍历全部活动条目）。
+ *
+ * @param {object} service - 注入的 ctx.settings。
+ * @returns {number|undefined} 宿主名额；读不到时 undefined（调用方不封顶）。
+ */
+export function readHostSubagentCapacity(service) {
+  return hostSubagentCapacityOf(readSettingsDescriptors(service));
 }
 
 /**
@@ -156,7 +219,9 @@ export function createSettingsSourceModule({ unloadingStates = [4, 5] } = {}) {
         // 旧/测试 Host 没有 inject：保持 entry 作为 source，不抛错。
         hooks.setSource(() => entry);
         hooks.onChange();
-        state = { namespace, mode: "entry", notifications: 0, suppressed: 0 };
+        // entry 模式没有注入 settings：宿主名额同样不可读（不封顶），但在共享模块状态里
+        // 显式保留该字段，读取面因此不需要区分「没有字段」与「读不到」。
+        state = { namespace, mode: "entry", notifications: 0, suppressed: 0, hostConcurrencyCap: undefined };
         return { namespace, mode: "entry" };
       }
 
@@ -167,9 +232,14 @@ export function createSettingsSourceModule({ unloadingStates = [4, 5] } = {}) {
         ctx,
         hooks,
         refresh: null,
+        // 只刷新宿主名额（不动 DEG 条目读源、不通知 onChange）：subagent 行的变更与
+        // DEG 自己的配置无关，不该把设置页整轮刷新当成副作用。
+        refreshHostCapacity: null,
         observing: false,
         known: false,
         revision: undefined,
+        // 宿主子代理名额缓存：undefined = 当前不可读（调用方据此**不封顶**）。
+        hostConcurrencyCap: undefined,
         notifications: 0,
         suppressed: 0,
       };
@@ -182,8 +252,16 @@ export function createSettingsSourceModule({ unloadingStates = [4, 5] } = {}) {
         // 本条目文档自身变化：与 loader 事件共用同一幂等入口。DEG 自己的提交也会走到
         // 这里，因此读取面在提交完成后立即收敛到宿主权威值（不再依赖 registration token）。
         ctx.on("settings/document-updated", (updatedNamespace) => {
-          if (updatedNamespace !== namespace) return;
-          observeConfiguration();
+          if (updatedNamespace === namespace) {
+            observeConfiguration();
+            return;
+          }
+          // 宿主子代理行（subagent）的 maxActiveSubagents 变化只刷新名额缓存：DEG 的
+          // 配置一个字都没改，不应该触发 onChange（那会让设置页与角色工具整轮重挂）。
+          if (updatedNamespace === HOST_SUBAGENT_NAMESPACE) {
+            const active = state;
+            if (active !== null && typeof active.refreshHostCapacity === "function") active.refreshHostCapacity();
+          }
         });
       }
 
@@ -194,13 +272,35 @@ export function createSettingsSourceModule({ unloadingStates = [4, 5] } = {}) {
         // 最新一次 describe() 读到的本条目值；undefined 表示当前不可读，读取面回落到 entry。
         let current;
 
-        /** 重新读取宿主 describe()；条目消失时把 current 复位成 undefined（回落 entry）。 */
+        /**
+         * 重新读取宿主 describe()：**一次**调用同时刷新本条目值与宿主子代理名额。
+         *
+         * 为什么合并成一次：describe() 在真实宿主里会线性遍历全部活动条目并按 revision
+         * 派发文档事件，调用两次没有收益；更重要的是「名额与条目值永远来自同一份
+         * 权威快照」，不会出现读到旧名额配新条目的错位。
+         *
+         * 条目消失时把 current 复位成 undefined（回落 entry）；名额读不到时缓存
+         * undefined（调用方不封顶），绝不沿用上一次的旧名额。
+         */
         const refresh = () => {
-          const descriptor = findSettingsDescriptor(service, namespace);
+          const descriptors = readSettingsDescriptors(service);
+          const descriptor = descriptorOf(descriptors, namespace);
           current = descriptor === undefined ? undefined : descriptor.value;
+          active.hostConcurrencyCap = hostSubagentCapacityOf(descriptors);
           return descriptor;
         };
+        /**
+         * 只刷新宿主名额：供 subagent 行（maxActiveSubagents）的文档事件使用。
+         *
+         * 该行由 bundle 补丁声明默认值、也可被用户的 profile / home patch / CLI overlay
+         * 改写，因此运行期仍必须跟随外部编辑；但它在 DEG 的配置面之外，刷新时不通知
+         * onChange。
+         */
+        const refreshHostCapacity = () => {
+          active.hostConcurrencyCap = hostSubagentCapacityOf(readSettingsDescriptors(service));
+        };
         active.refresh = refresh;
+        active.refreshHostCapacity = refreshHostCapacity;
         // 服务世代切换：describe() 的 revision 从新实例重新计数，旧去重基线必须作废，
         // 否则新世代的首个变更会被误判成「同一份文档」而漏通知。
         active.known = false;
@@ -244,7 +344,18 @@ export function createSettingsSourceModule({ unloadingStates = [4, 5] } = {}) {
         namespace: state.namespace,
         mode: state.mode,
         observations: { notifications: state.notifications, suppressed: state.suppressed },
+        // 宿主名额缓存快照：null = 当前不可读（派发面因此不封顶）。
+        hostConcurrencyCap: state.hostConcurrencyCap === undefined ? null : state.hostConcurrencyCap,
       }),
+    /**
+     * 宿主子代理并发名额（缓存值，**同步**读取）。
+     *
+     * 派发 resolver 与 meta 投影都在热路径上调用它：这里只读模块状态，绝不再调用
+     * describe()。未安装/已释放/读不到时返回 undefined，调用方据此不封顶。
+     *
+     * @returns {number|undefined}
+     */
+    hostConcurrencyCap: () => (state === null ? undefined : state.hostConcurrencyCap),
     dispose() {
       // 释放后观察通道失效：所有迟到事件（loader 已提交 volatile 值、事件仍在队列里）
       // 都变成 no-op，插件卸载后不得再刷新任何读源。

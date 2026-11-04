@@ -727,10 +727,21 @@
     });
   }
 
+  /**
+   * 宿主 on-screen 会话读面（票 02 / spec D1）：解析本体在 client-sidebar-dom.js 的
+   * sidebarOnScreenSessionOf（与票 03 的切回补偿订阅**共用同一份实现**）。
+   *
+   * 三态语义与判据逐字不变：非空字符串 = ok；"" = absent；null = unavailable（读不到 ≠ 一致）。
+   * 本模块只按 DOM 注入面取用，不再自带一份解析——两份解析对「absent / unavailable」的判定
+   * 迟早漂移，而这条闸门的三态全部 fail-closed，漂移就等于悄悄放行。
+   */
+  const sidebarOnScreenSessionOf = (sidebarRight) => DOM.sidebarOnScreenSessionOf(sidebarRight);
+
   /** undefined */
   function useSidebarPanelSessionModelPart2(frame) {
     const {
-      currentRootRef, currentSidebarSessionRef, mountedRef, react, rootSessionId, sidebarSessionId,
+      currentRootRef, currentSidebarSessionRef, mountedRef, react, recordSidebarAutoDiag, rootSessionId,
+      sidebarAutoKeyDigest, sidebarRight, sidebarSessionId,
     } = frame;
 
     /**
@@ -779,9 +790,67 @@
       && currentSidebarSessionRef.current === sidebarSessionId
       && surfaceTokenRef.current === surfaceToken;
 
+    /**
+     * on-screen 会话写入闸门（票 02 / spec D2-D3）。与上面的 sidebarSurfaceStillCurrent **分工不同，
+     * 因此刻意不合并**（oracle 明确否决"塞进生命周期闸门就完事"）：
+     * - 生命周期闸门回答「还是不是出发时那一面」（mounted / root / sidebar session + 不可复用令牌）；
+     * - 这条回答「宿主此刻画的那一面是不是我们这一面」（会话身份）。
+     *
+     * 为什么两者缺一不可：同一个实例 A→B→A 之后生命周期闸门的字符串判据会重新成立（只有令牌挡得住），
+     * 而宿主的 openResource / close / split / active 全部**只作用于 on-screen 会话**——身份不一致时
+     * 写下去就落进另一个会话的右栏（本票的真实缺陷）。反过来，身份一致也不代表闭包还属于当前 surface。
+     *
+     * 三态**全部 fail-closed**：ok 且相等才放行；mismatch / absent / unavailable 一律拒绝。
+     * 读不到不等于一致：旧宿主上继续写就是继续串台（spec D2 已按 oracle 裁决取消兼容分支）。
+     *
+     * **每次调用现读**：渲染之后、每个 await 之后都可能切换会话，绝不复用渲染期结论。
+     * 诊断只写既有白名单字段（kind / event / action / verdict / reason / target / onscreen）。
+     *
+     * 两侧会话**分别**落各自的脱敏摘要（spec D8）：target = 本面板会话，onscreen = 宿主此刻画着的
+     * 会话。合成一把复合 key 会把「谁跟谁不一致」压成一个数，导出里再也读不出是哪一侧错了；两个
+     * 摘要都只过 sidebarAutoKeyDigest（只落 hash），绝不落会话原文。absent / unavailable 这一侧没有
+     * 会话可摘要，字段留空、由 reason 独立区分这两种状态。
+     *
+     * 限频聚合不在这里写：写入器（recordSidebarAutoDiag）按「reason + action + 两侧摘要」把连续
+     * 拒绝累加成一条，闸门因此只管如实提交判定。
+     */
+    const sidebarOnScreenSessionStill = (action, manual) => {
+      const onScreen = sidebarOnScreenSessionOf(sidebarRight);
+      if (sidebarSessionId !== null && sidebarSessionId !== undefined
+        && onScreen !== null && onScreen !== "" && String(onScreen) === String(sidebarSessionId)) return true;
+      const reason = onScreen === null ? "session-guard-unavailable" : (onScreen === "" ? "session-absent" : "session-mismatch");
+      const hasOnScreenSession = onScreen !== null && onScreen !== "";
+      /**
+       * 手动点击的可见反馈（票 02 / spec D4 收尾）。
+       *
+       * mismatch / absent 是**正常过渡态**（切走、还没选中会话），控件必须保持可用，因此不能像
+       * unavailable 那样渲染禁用态；但闸门会静默拒绝，用户看到的就是「点了没反应」。这里在调用方
+       * 显式声明「这是用户手动动作」（manual === true）时，复用票 06 标题栏那个常驻 role=status
+       * 反馈槽给一条非阻塞说明（先到的显示、后到的覆盖，不做队列、不弹窗）。
+       *
+       * unavailable（onScreen === null）**不**给点击反馈：那一路已渲染成禁用态并带可读原因，
+       * 再补一条来源不明的提示会与禁用态自相矛盾。自动路径（未声明 manual）同样不提示——后台
+       * 每轮同步都撞闸门，那会把标题栏刷成噪音。
+       */
+      if (manual === true && onScreen !== null) frame.late.skip?.();
+      if (typeof recordSidebarAutoDiag === "function") {
+        recordSidebarAutoDiag({
+          action,
+          event: "surface-gate",
+          kind: "decision",
+          onscreen: hasOnScreenSession ? sidebarAutoKeyDigest(String(onScreen)) : undefined,
+          reason,
+          target: sidebarAutoKeyDigest(String(sidebarSessionId)),
+          verdict: "block",
+        });
+      }
+      return false;
+    };
+
     // 登记给更早 Hook 的晚绑定包装（声明已完成，此后的调用都拿到本帧的实例）。
+    frame.late.sidebarOnScreenSessionStill = sidebarOnScreenSessionStill;
     frame.late.sidebarSurfaceStillCurrent = sidebarSurfaceStillCurrent;
-    Object.assign(frame, { sidebarSurfaceStillCurrent });
+    Object.assign(frame, { sidebarOnScreenSessionStill, sidebarSurfaceStillCurrent });
   }
 
   /** 宿主服务解析、Auto 开关、split 事务入口与无标签同步读面。 */
@@ -999,7 +1068,56 @@
     Object.assign(frame, { peakValleyMarker: shown });
   }
 
+  /**
+   * 标题栏「诊断」入口（票 06）：把最近 60 条自动打开/关闭决策做成可复制的纯文本。
+   *
+   * 设计边界（逐条固定，不得放宽）：
+   * - 不新增存储：只读既有 localStorage 有界诊断环；解析、脱敏与排版全在 auto-ledger 的
+   *   readSidebarAutoDiagText（本 Hook 经 frame 拿到它，不自己解析 JSON）。
+   * - 不新增路由 / 不新增整页视图：一个按钮 + 一行非阻塞反馈，反馈状态只活在本面板实例里。
+   * - 无定时器、无轮询、无 RPC：除点击外不产生任何副作用；反馈保留到下一次点击，且不占用既有的
+   *   任务播报通道（useSidebarPanelAnnouncementEffect 的 aria-live）。
+   * - 每种结论都有可读反馈：已复制 / 已下载 / 暂无记录 / 无法读取 / 复制失败，绝不静默，
+   *   也绝不渲染成「点了没反应」的禁用态。
+   * - 反馈存的是文案键 + 计数（不是渲染后的字符串），语言切换后下一次渲染自动跟上。
+   *
+   * Hook 序列位置：追加在整个序列末尾（与票据 09 的峰谷标记同一条规则），既有槽位不动。
+   */
+  function useSidebarPanelAutoDiag(frame) {
+    const { copySidebarAutoDiagText, react, readSidebarAutoDiagText, t } = frame;
+    const pair = typeof react.useState === "function" ? react.useState(null) : [null, null];
+    const feedback = pair[0];
+    const setFeedback = pair[1];
+    const settle = (key, count) => {
+      if (typeof setFeedback === "function") setFeedback({ key, count });
+    };
+    const exportAutoDiag = () => {
+      let result = null;
+      try {
+        result = readSidebarAutoDiagText(t("sidebar.diag.header"));
+        // null = 读面不可用；count === 0 = 确实没有记录。两者必须给出不同文案。
+        if (result === null) { settle("sidebar.diag.unreadable"); return; }
+        if (result.count === 0) { settle("sidebar.diag.empty"); return; }
+        // copySidebarAutoDiagText 只回 "copied" / "downloaded" / "failed" 三种结论。
+        Promise.resolve(copySidebarAutoDiagText(result.text)).then(
+          (outcome) => settle("sidebar.diag." + (outcome === "copied" || outcome === "downloaded" ? outcome : "failed"), result.count),
+          () => settle("sidebar.diag.failed", result.count),
+        );
+      } catch {
+        settle("sidebar.diag.failed");
+      }
+    };
+    /**
+     * 手动点击被闸门拒绝时的可见说明（票 02 / spec D4 收尾）：**复用**票 06 的同一个反馈槽与
+     * 同一份状态，因此与诊断导出反馈天然「先到的显示、后到的覆盖」，不新增节点、不新增视图、
+     * 也不做队列或阻塞式弹窗。登记到 frame.late：闸门（更早的 Hook）在点击时才会调用它。
+     */
+    frame.late.skip = () => settle("sidebar.skipped");
+    Object.assign(frame, { diagFeedback: feedback, exportAutoDiag });
+  }
+
   global[SYMBOL] = Object.freeze({
+    useSidebarPanelAutoDiag,
     useSidebarPanelHostServices, useSidebarPanelPeakValleyMarker, useSidebarPanelSessionModel, useSidebarPanelSessionModelPart2,
     useSidebarPanelSnapshotDerived, useSidebarPanelStateCore, useSidebarPanelStoreAndMeta,
     useSidebarPanelWidth,

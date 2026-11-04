@@ -94,6 +94,10 @@ const IIFE_EXECUTION_ORDER = Object.freeze([
   "client-sidebar-panel-hooks-state.js",
   "client-sidebar-panel-hooks-effects.js",
   "client-sidebar-panel-hooks-tabs.js",
+  // 票 01 预拆分：hooks-actions 的 tab 记录器自洽块移出为独立 IIFE。它读 pure / dom /
+  // auto-ledger 的检查点，并把两个 Hook 提供给 hooks-actions，因此必须排在 hooks-actions
+  // 之前（后者在加载期就从检查点取回实现），两者都仍先于 panel。
+  "client-sidebar-panel-hooks-actions-recorder.js",
   "client-sidebar-panel-hooks-actions.js",
   "client-sidebar-panel.js",
   "client-expert-group-sidebar.js",
@@ -527,6 +531,34 @@ export const iifeDependencies = Object.freeze([
     from: "client-sidebar-panel-hooks-actions.js",
     to: "client-sidebar-panel.js",
     symbols: Object.freeze(["dsh-expert-group/client-sidebar-panel-hooks-actions"]),
+    via: "iife-symbol",
+  }),
+  // 票 01 预拆分：hooks-actions 的 tab 记录器自洽块移到独立 IIFE 后新增的四条真实边。
+  // 方向仍是「提供方 -> 读取方」：recorder 读 pure / dom / auto-ledger 的检查点，
+  // hooks-actions 读 recorder 的检查点并按原顺序再导出；recorder 不读 hooks-actions，
+  // 因此客户端 IIFE 图仍无环。声明与扫描逐项相等由 test/dependency-graph-gate.test.mjs 校验。
+  Object.freeze({
+    from: "client-sidebar-panel-hooks-actions-recorder.js",
+    to: "client-sidebar-panel-hooks-actions.js",
+    symbols: Object.freeze(["dsh-expert-group/client-sidebar-panel-hooks-actions-recorder"]),
+    via: "iife-symbol",
+  }),
+  Object.freeze({
+    from: "client-sidebar-auto-ledger.js",
+    to: "client-sidebar-panel-hooks-actions-recorder.js",
+    symbols: Object.freeze(["dsh-expert-group/client-sidebar-auto-ledger"]),
+    via: "iife-symbol",
+  }),
+  Object.freeze({
+    from: "client-sidebar-dom.js",
+    to: "client-sidebar-panel-hooks-actions-recorder.js",
+    symbols: Object.freeze(["dsh-expert-group/client-sidebar-dom"]),
+    via: "iife-symbol",
+  }),
+  Object.freeze({
+    from: "client-sidebar-pure.js",
+    to: "client-sidebar-panel-hooks-actions-recorder.js",
+    symbols: Object.freeze(["dsh-expert-group/client-sidebar-pure"]),
     via: "iife-symbol",
   }),
   Object.freeze({
