@@ -1386,7 +1386,10 @@
       view.peakValleyBroken
         ? react.createElement("p", { className: "deg_settings_error" }, view.tExtra("settings.pv.broken"))
         : null,
-      mainPeriod === null ? modelConfigSection : null,
+      // provider 目录是宿主级共享数据（DSH 的 llm 命名空间），不属于 peak / valley 任何一层：
+      // 峰谷启用、本页锁定为「当前时段」编辑视图时仍然渲染，位置与普通模式逐字相同
+      // （副标题之后、任务行之前），切换峰谷前后区域不跳位。
+      modelConfigSection,
       renderSettingsTaskRow(view),
       renderSettingsNotificationRow(view),
       renderSettingsUnifiedRow(modelView),

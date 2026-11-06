@@ -17334,7 +17334,7 @@ renderMainPeriodHint(view,mainPeriod),
 view.peakValleyBroken
 ?react.createElement("p",{className:"deg_settings_error"},view.tExtra("settings.pv.broken"))
 :null,
-mainPeriod===null?modelConfigSection:null,
+modelConfigSection,
 renderSettingsTaskRow(view),
 renderSettingsNotificationRow(view),
 renderSettingsUnifiedRow(modelView),
