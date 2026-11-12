@@ -199,6 +199,37 @@ function installRootWaitCore(deps) {
       && agent.options?.[PARENT_MARKER] === void 0;
   }
 
+  /**
+   * 当前存活 root Agent 快照（rc.1 roots() / rc.2 list() 双契约）。
+   *
+   * 0.2.2-rc.2 删除了 `AgentRegistry.roots()`，只保留 `list()`（全部 live agent）；
+   * 插件必须在两代宿主上给出同一份「可枚举 root」事实：优先用 rc.1 的精确 roots()，
+   * 缺失时用 rc.2 的 list() 再按 DEG 自己的 root 身份判定过滤（无 parentSession、
+   * 无 DEG PARENT marker）。两个 seam 都缺失或抛错时返回空数组——与旧实现
+   * `typeof agents.roots !== "function" → []` 的降级语义一致，绝不猜测或伪造 root。
+   *
+   * @returns {Array<object>} root Agent 只读快照。
+   */
+  function listRootAgents() {
+    try {
+      if (typeof agents?.roots === "function") {
+        const roots = agents.roots();
+        return Array.isArray(roots) ? roots : [];
+      }
+      if (typeof agents?.list === "function") {
+        const all = agents.list();
+        // list() 的契约是 Agent 数组；仍先挡 null/非对象，避免身份判定在坏快照上抛错
+        // 被外层 catch 静默吞成"没有 root"（丢失可诊断性）。
+        return Array.isArray(all)
+          ? all.filter((agent) => agent !== null && typeof agent === "object" && isRootAgentIdentity(agent))
+          : [];
+      }
+    } catch (error) {
+      logTurnWaitError("list roots", error);
+    }
+    return [];
+  }
+
   function isLiveRootAgent(agent) {
     return host.lineage.isLiveRoot(agent);
   }
@@ -361,6 +392,7 @@ function installRootWaitCore(deps) {
     safeErrorLabel,
     logTurnWaitError,
     isRootAgentIdentity,
+    listRootAgents,
     isLiveRootAgent,
     invalidateRootWaitId,
     invalidateWaitersForAgentActivity,

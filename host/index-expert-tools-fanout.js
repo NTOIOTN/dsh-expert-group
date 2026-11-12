@@ -1238,8 +1238,11 @@ export function createFanoutToolHooks({ identity, childIo, core, waits, requestB
     });
   }
 
-  function startContinuable({ request, signal }) {
-    return startExpertActivation({ request, label: request.label, signal });
+  function startContinuable({ request, parentAgent, signal }) {
+    // 0.2.2-rc.2 起宿主强制 spec.parent 为精确存活父 Agent：fan-out lifecycle 已在
+    // admission 时从 lineage 解析出 exact parentAgent（冷恢复时按 parentId 重新解析），
+    // 这里原样透传；缺失时由 startExpertActivation 在插件边界 fail-closed。
+    return startExpertActivation({ request, label: request.label, signal, parent: parentAgent });
   }
 
   /**

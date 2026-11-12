@@ -218,7 +218,9 @@ export function assembleRootWait(state, caps) {
   state.rootWaitDomain = rootWaitDomain;
   const { isRootAgentIdentity } = rootWaitDomain;
 
-  const roots = typeof agents?.roots === "function" ? agents.roots() : [];
+  // rc.2 删除 agents.roots()：统一走 root wait 域的双契约枚举（rc.1 roots() /
+  // rc.2 list()+root 身份过滤），保证预存 root 仍能登记 lineage 与代次。
+  const roots = rootWaitDomain.listRootAgents();
   for (const root of roots) {
     if (isRootAgentIdentity(root) && typeof root.id === "string") {
       host.lineage.activateRoot(root);

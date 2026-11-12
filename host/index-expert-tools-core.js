@@ -426,9 +426,9 @@ export function createExpertChannelResolver({ subagents, storage }) {
   /**
    * 宿主当前注册的 provider 名列表。
    *
-   * rc.2 的 SubagentService 公开 `list()`（返回注册名、插入顺序）；旧替身可能没有
-   * 该 seam，此时返回 undefined，调用方只按默认名探测。绝不用私有 map 或猜测
-   * provider 名。
+   * 0.2.2-rc.2 删除了该枚举 seam（只有 rc.1 及更早的 SubagentService 有 `list()`）；
+   * 因此必须按「seam 不存在 → undefined」降级，调用方只按默认名 + 能力位探测。
+   * 绝不用私有 map 或猜测 provider 名。
    *
    * @returns {string[]|undefined} 注册名数组；seam 缺失/抛错/形状非法时 undefined。
    */
@@ -655,7 +655,7 @@ export function createExpertChannelResolver({ subagents, storage }) {
 }
 
 /**
- * DEG-only 的双契约启动适配器（RC1 startActivation / legacy startContinuable）。
+ * DEG-only 的三代启动适配器（rc.2 扁平 startActivation / rc.1 嵌套 startActivation / legacy startContinuable）。
  *
  * @param {object} deps - 窄能力面。
  * @param {object} deps.subagents - subagent 服务。
@@ -667,19 +667,45 @@ export function createExpertActivationStarter({ subagents, channel, structured }
   const { contextInheritanceError, validSubagentProviderName } = channel;
   const { armStructuredResultCapture } = structured;
   /**
-   * DEG-only 的双契约启动适配器。
+   * 宿主 startActivation 的 spec 形状探测（只读、无副作用）。
    *
-   * startActivation 存在时只组装 RC1 公共字段：request 仅剥离顶层 label 与 signal
-   * （label 走 spec.label、signal 走 spec.signal），其余字段原样透传。persona 与
-   * toolFilter 是 RC1 的 child composition 注入字段——宿主在 child scope 上应用
-   * 它们（persona → child 系统提示词 section，toolFilter → childCtx.tools.restrict），
+   * 0.2.2-rc.2 把 SubagentActivationSpec 从「request 嵌套」扁平化为直接继承
+   * SubagentStartRequest，并把 parent 提升为顶层必填字段；同一次改动新增了
+   * namesOf / rootOf / resolveName / waitForTreeWork 这些具名多层级协作 seam，并移除了
+   * list() 与 waitForChildren()。这里只做能力探测：任一 rc.2 新增的公开方法存在就按
+   * 扁平契约调用；都不存在则保持 0.2.1 / 0.2.2-rc.1 的嵌套 request 契约。
+   * 探测必须在调用 startActivation 之前完成——两代契约的 spec 形状互不兼容，猜错会让
+   * 宿主解引用 undefined.parent/.request 直接抛错。
+   *
+   * @returns {boolean} 宿主是否使用 rc.2+ 的扁平 activation spec。
+   */
+  function activationSpecIsFlat() {
+    return typeof subagents.namesOf === "function"
+      || typeof subagents.rootOf === "function"
+      || typeof subagents.resolveName === "function"
+      || typeof subagents.waitForTreeWork === "function";
+  }
+
+  /**
+   * DEG-only 的三代启动适配器。
+   *
+   * startActivation 存在时按宿主契约组装 spec：request 仅剥离 DEG 私有字段
+   * （顶层 label 与 signal 走 spec 字段，subagentProvider 只用于选择宿主 provider），
+   * 其余字段原样透传。parent 必须是**精确的存活父 Agent**——rc.2 在 service 边界用
+   * `agents.get(parent.id) === parent` 强校验，缺失会让整个派发以 TypeError 崩溃；
+   * rc.1 则从 spec.request.parent 读取同一对象。因此调用方显式传入 parent，
+   * request.parent 只作为旧调用点兜底，两代契约都写入同一个精确值。
+   *
+   * persona 与 toolFilter 是 rc.1 的 child composition 注入字段——宿主在 child scope
+   * 上应用它们（persona → child 系统提示词 section，toolFilter → childCtx.tools.restrict），
    * 因此既不能剥离，也不能把 persona 拼进首条任务消息：任务消息只保留
-   * buildExpertTaskPrompt 生成的「身份行 + 任务内容」两段。delivery 固定为 parent，
-   * 让 DSH manager 负责 parent notification 和 activation 生命周期。
+   * buildExpertTaskPrompt 生成的「身份行 + 任务内容」两段。rc.2 不再从 activation spec
+   * 读取这两个字段，DEG 由 agent/created 的 composition 兜底安装同一份边界。
+   * delivery 固定为 parent，让 DSH manager 负责 parent notification 和 activation 生命周期。
    * startActivation 本身抛错时原样上抛，只有方法不存在才回退旧 startContinuable，
    * 避免把 admission 错误伪装成兼容路径。
    */
-  async function startExpertActivation({ request, label, signal }) {
+  async function startExpertActivation({ request, label, signal, parent }) {
     // 目标 subagent provider（票据 29）：唯一来源是请求上的内部字段，所有调用点
     // （角色工具、fan-out 分片、恢复重建）在组装请求时写入同一份值。它只用于选择
     // 宿主 provider，必须在调用宿主前剥离，绝不作为 SubagentStartRequest 字段透传。
@@ -699,13 +725,25 @@ export function createExpertActivationStarter({ subagents, channel, structured }
         subagentProvider: _requestProvider,
         ...activationRequest
       } = request ?? {};
-      const activation = await subagents.startActivation({
+      // 精确的存活父 Agent：rc.2 的 manager 会先解引用 spec.parent.id，再做对象身份校验；
+      // 这里在插件边界 fail-closed，避免把 undefined.parent 变成宿主内部 TypeError。
+      const activationParent = parent ?? activationRequest.parent;
+      if (activationParent === null || typeof activationParent !== "object"
+        || typeof activationParent.id !== "string" || activationParent.id.length === 0) {
+        throw new TypeError("RC startActivation requires an exact live parent agent");
+      }
+      const specBase = {
         provider: targetProvider,
         label: typeof label === "string" ? label : request?.label,
-        request: activationRequest,
         signal,
         delivery: "parent",
-      });
+      };
+      // 两代契约都携带同一份精确 parent：rc.1 读 spec.request.parent，rc.2 读 spec.parent。
+      // 未知字段（persona/toolFilter 等）在 rc.2 走本地 provider 时被忽略，行为由 DEG 的
+      // agent/created composition 兜底保证；绝不为了适配 rc.2 把 rc.1 的合同时序改掉。
+      const activation = activationSpecIsFlat()
+        ? await subagents.startActivation({ ...specBase, ...activationRequest, parent: activationParent })
+        : await subagents.startActivation({ ...specBase, request: { ...activationRequest, parent: activationParent } });
       // 结构化交付（票据 30）：启动成功即挂接 result，绝不在这里 await 完整结果。
       // request 上的 outputSchema 原样透传给宿主；child_models 只写 structured/标记。
       armStructuredResultCapture(activation, request);

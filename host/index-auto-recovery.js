@@ -563,6 +563,9 @@ export function createRecoveryChildRebuild(deps) {
         request,
         label: source.label,
         signal: op.controller?.signal,
+        // 恢复重建同样是新 activation：父 Agent 已在 dispatch 边界验证为当前存活对象，
+        // rc.2 的 exact-parent 校验依赖它。
+        parent,
       }));
       if (!lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
     } catch (error) {

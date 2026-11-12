@@ -280,6 +280,8 @@ export function createRoleToolRebuild({ records, core, identity, delegation, rec
         request,
         label,
         signal,
+        // rc.2 要求 spec.parent 是精确存活父 Agent；同 id 的 replacement 不能被冒充。
+        parent,
       }));
     } catch (error) {
       const capacityError = createSubagentCapacityError(error);
@@ -585,6 +587,8 @@ export function createRoleToolNewChild({ delegation, records, handoff, recovery,
           request,
           label,
           signal,
+          // 只传本次工具调用已通过 isLiveGeneration 校验的 exact parent。
+          parent,
         }));
       } catch (error) {
         // 容量耗尽在 admission 边界就翻译成 DEG 自有可读错误：后续清理/回滚错误

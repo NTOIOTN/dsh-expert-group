@@ -51,7 +51,6 @@ import {
  */
 export function assembleGuards(state, caps) {
   const { logger } = state;
-  const { agents } = state.services;
   const { delegationTracker, forgetRootDisposed, rootUserWaitGuard } = state;
 
   /**
@@ -64,8 +63,18 @@ export function assembleGuards(state, caps) {
   state.expertReportGuardDisposers = new Map();
   state.rootStructuredGuardStopping = false;
 
+  /**
+   * root 身份判定（不依赖宿主 roots() 枚举）。
+   *
+   * 旧实现用 `agents.roots().includes(agent)`；0.2.2-rc.2 删除 roots() 后会恒为 false，
+   * 导致 root 结构化文件 guard 在 rc.2 上完全失效。这里改用 root wait 域持有的同一份
+   * 结构身份判据（无 parentSession / 无 DEG PARENT marker），两代宿主语义一致。
+   */
   function isRootAgentForStructuredGuard(agent) {
-    return typeof agents?.roots === "function" && agents.roots().includes(agent);
+    // 复用双契约枚举（rc.1 roots() / rc.2 list()+身份过滤）而不是直接判定结构身份：
+    // 既保留旧实现"只把真正登记在宿主 root 集合里的 Agent 视为 root"的语义，
+    // 也避免 rc.2 上恒为 false 让 root guard 静默失效。
+    return state.listRootAgents().includes(agent);
   }
   /**
    * 返回 root 结构化工具 guard 可用的 workspace root。
@@ -190,7 +199,8 @@ export function assembleGuards(state, caps) {
         installRootStructuredPathGuard(agent);
         installExpertReportGuardForAgent(agent);
       });
-      const roots = typeof agents?.roots === "function" ? agents.roots() : [];
+      // rc.2 删除 agents.roots()：用双契约枚举补齐插件挂载时已存在的 root。
+      const roots = state.listRootAgents();
       for (const agent of roots) {
         installRootStructuredPathGuard(agent);
       }
