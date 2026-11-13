@@ -1,5 +1,5 @@
 /**
- * 会话删除实例锁（票据 01；票据 12：**只对 pid 已死的 stale 锁恢复自动接管**）。
+ * 会话删除实例锁（票据 01；票据 12：pid 已死可接管；复审修正：pid 存活仅在跨启动证明 + 本地固定盘时接管）。
  *
  * ## 为什么允许 stale 接管（宿主单实例保证）
  * 纯文件系统没有 compare-and-swap：两个进程可能在同一瞬间都判定「对方已死」，因此**无条件**
@@ -19,7 +19,7 @@
  * |---|---|
  * | 锁文件不存在 | 独占创建（`wx`）→ 写全落盘 → 读回逐字节复核 → `acquired` |
  * | 已存在，且 pid/启动时间/token 都是本进程的 | `acquired`（`adopted:true`，同进程重入） |
- * | 已存在，是别人的，其 **pid 仍存活** | `held` + `instance-lock-held`（**绝不接管**） |
+ * | 已存在，是别人的，其 **pid 仍存活** | 默认 `held` + `instance-lock-held`；仅当通过「跨启动会话证明」时按 stale 接管（见下） |
  * | 已存在，是别人的，其 **pid 已死** | 走下面的「接管三步」→ `acquired`（成功）或 `held` + `instance-lock-takeover-lost` |
  * | 字段缺失 / JSON 不可解析 | `unavailable` + `instance-lock-malformed` |
  * | 读不出来 | `unavailable` + `instance-lock-unreadable` |
@@ -39,6 +39,28 @@
  *
  * **禁止 rename 放回**：POSIX 的 `rename` 会静默覆盖目标，「先确认不存在再 rename」之间
  * 仍有窗口；把原字节用 `wx` 写回才是原子的「不存在才创建」。
+ *
+ * ## 跨启动会话证明（pid 被复用但写锁进程已随上次重启消失）
+ * pid 会被操作系统复用。真机现场：锁记录是 `{pid: 3048, startedAt: …}`，写锁进程早已退出，
+ * 但同一个 pid 被 Windows 复用给一个仍存活的系统进程（svchost.exe），于是 `kill(pid, 0)`
+ * 永久报「活着」，锁再也不会自愈。
+ *
+ * 不能凭 mtime 与 `startedAt` 的时间关系、进程 imageName 或 System32 存在性判定「写锁进程
+ * 已随重启消失」——时钟回拨、进程重命名都能同时骗过这些判据。可靠的事实是**启动会话锚点**：
+ * Windows 的 System 进程（PID 4）CreationDate 由内核记录，之后改时钟不会改写它；同一启动
+ * 会话内所有存活进程的创建时间都晚于这个锚点。
+ *
+ * 因此当且仅当下列条件**全部**成立时才判 stale 并复用上面的接管三步：
+ * ① 记录属于他人；② pid 仍存活（`kill(pid, 0)` 认为在）；③ 锚点查询有效；
+ * ④ 记录 `startedAt` 与锁文件 mtime **都**严格早于 `anchor - 10000ms`；
+ * ⑤ 时间一致性护栏通过（见 {@link evaluatePreBootStale}）；⑥ 锁文件在可信本地路径（非 UNC）。
+ * 其余情况（非 Windows、锚点查询失败/超时/输出非法、mtime 读不到、路径不可信、护栏不过）
+ * 一律保持 held：证明不了就不接管。
+ *
+ * **已知残余风险**：若在「启动完成」与「持锁进程创建/写锁」之间发生超过 10 秒的系统时钟
+ * 回拨，一个真实活跃的锁可能被误判为 pre-boot 并被接管。固定 10 秒余量是工程折中，无法防
+ * 任意时钟跳变；兜底是宿主单实例保证与作业前的 `verifyOwnership`（真出现误判时，另一方仍会
+ * 在作业前发现锁内容不是自己的 token 并 fail-closed）。
  *
  * ## 残余风险
  * 两个进程在同一瞬间都判定「锁属于已死进程」时，各自 rename 到自己的旁路名——只有一个能
@@ -65,9 +87,20 @@
  *
  * @module dsh-expert-group/host/session-delete-lock
  */
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, win32 } from "node:path";
 
 /** 锁文件名（DSH home 下）。 */
 export const INSTANCE_LOCK_FILE_NAME = "session-delete.lock.json";
@@ -104,7 +137,7 @@ export const INSTANCE_LOCK_REASONS = Object.freeze({
   UNREADABLE: "instance-lock-unreadable",
   /** 写不进去（mkdir / 写盘 / 读回复核不符）。 */
   WRITE_FAILED: "instance-lock-write-failed",
-  /** 锁属于另一个**仍存活**的实例：删除能力不可用，绝不接管。 */
+  /** 锁属于另一个**仍存活**的实例：默认删除能力不可用；只有跨启动证明成立时才按 stale 接管。 */
   HELD: "instance-lock-held",
   /**
    * 锁属于另一个**已经退出**的实例（stale）：这是**接管候选**，不是最终结论。
@@ -134,11 +167,51 @@ export const INSTANCE_LOCK_REASONS = Object.freeze({
  */
 export const INSTANCE_LOCK_START_TOLERANCE_MS = 2000;
 
+/**
+ * pre-boot 判定余量（毫秒）：记录与锁文件 mtime 都必须**严格早于**启动锚点 10 秒以上。
+ *
+ * 为什么不是 0：`startedAt` 是 `Date.now() - process.uptime()` 的估算值，锁文件 mtime 由文件
+ * 系统时钟给出，两者与锚点之间都可能存在秒级抖动；留 10 秒吸收这些正常误差，同时仍能把
+ * 「上一个启动会话里的写锁进程」与「本启动会话里刚写的锁」明确分开。
+ */
+const PRE_BOOT_MARGIN_MS = 10000;
+
+/**
+ * `startedAt` 与锁文件 mtime 之间允许的偏差（毫秒）。
+ *
+ * 写锁必然发生在「进程启动」之后，因此记录里的启动时刻不应显著晚于锁文件 mtime。反过来
+ * （mtime 被改早、或写锁前系统时钟回拨）会让「早于锚点」的判断失去意义，只能保持 held。
+ */
+const PRE_BOOT_CLOCK_SKEW_TOLERANCE_MS = 10000;
+
+/** 启动锚点允许晚于当前时钟的容差（毫秒）：锚点在未来说明时钟被回拨过，不能据此判 stale。 */
+const PRE_BOOT_FUTURE_TOLERANCE_MS = 5000;
+
+/** PID 0（System Idle Process）与 PID 4（System）CreationDate 允许的偏差（毫秒）。 */
+const PRE_BOOT_PID0_TOLERANCE_MS = 10000;
+
+/** 跨启动接管的证据短码（写进 `acquired` 状态的 `recoveredBy`，供诊断与断言）。 */
+const PRE_BOOT_EVIDENCE = "stale-by-pre-boot";
+
+/** PowerShell 锚点探针的超时（毫秒）：探测失败只是「不能自愈」，不得拖慢启动。 */
+const BOOT_ANCHOR_TIMEOUT_MS = 5000;
+
+/** FILETIME（自 1601-01-01 起的 100ns 计数）转 Unix 毫秒的固定偏移。 */
+const FILETIME_UNIX_EPOCH_OFFSET_MS = 11644473600000n;
+
+/** 锚点脚本允许出现的两个 PID 与它们必须的进程名（键是逐字的 PID 文本，确名大小写不敏感）。 */
+const BOOT_ANCHOR_PIDS = new Map([["4", "system"], ["0", "system idle process"]]);
+
 /** 随机 token 的字节数（十六进制后 16 个字符，足够避免任何实际碰撞）。 */
 const LOCK_TOKEN_RANDOM_BYTES = 8;
 
 /** 获取时的最大尝试次数（只覆盖「创建时存在、读时又消失」的释放竞态，绝不重试接管）。 */
 const ACQUIRE_ATTEMPTS = 2;
+
+/** 读一个「有限正数」：其他一切（缺失 / NaN / Infinity / 0 / 负数 / 非数值）都返回 undefined。 */
+function readPositiveNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
 
 /**
  * 独占创建配置文件（`wx` + 写全 + fsync + close）。
@@ -169,6 +242,8 @@ const DEFAULT_IO = Object.freeze({
   mkdir: mkdirSync,
   // 只用于接管第一步「把锁移开到旁路名」；任何 rename 都不以锁路径为目标。
   rename: renameSync,
+  // 只用于 pre-boot 判定读锁文件 mtime；缺失/抛错时该判定整体跳过（保持 held）。
+  stat: statSync,
 });
 
 /** 默认存活探针：`kill(pid, 0)` 抛 ESRCH 才算死；EPERM 表示进程存在但无权发信号。 */
@@ -263,17 +338,276 @@ export function evaluateInstanceLock(record, facts) {
     return { status: INSTANCE_LOCK_STATES.ACQUIRED, adopted: true };
   }
   let alive;
+  let aliveUnknown = false;
   try {
     alive = facts.isProcessAlive(record.pid) === true;
   } catch {
     // 判不了存活就按「活着」保守处理（结论同样是 held，只是原因码更保守）。
+    // aliveUnknown 让 acquire 知道「连存活都证明不了」：此时不得做任何接管取证。
     alive = true;
+    aliveUnknown = true;
   }
   return {
     status: INSTANCE_LOCK_STATES.HELD,
     reason: alive ? INSTANCE_LOCK_REASONS.HELD : INSTANCE_LOCK_REASONS.STALE,
+    ...(aliveUnknown === true ? { aliveUnknown: true } : {}),
     holder: { pid: record.pid, startedAt: record.startedAt },
   };
+}
+
+/**
+ * 跨启动会话证明的**纯判定**（导出以便直接测试：不读环境、不 spawn 进程）。
+ *
+ * 只有在「锁记录属于他人 + pid 仍存活」时才会被调用；它回答一个问题：**能不能证明写锁
+ * 进程属于上一个启动会话、并且已经不存在了**。答不了就返回 `{stale:false}`，调用方按既有
+ * held 收尾——绝不因为「时间看起来很久远」就接管。
+ *
+ * 判定顺序与理由：
+ * 1. 字段必须齐全且是有限正数（缺失/NaN/0/负数都不可解释）；
+ * 2. `startedAt` 不得显著晚于锁文件 mtime：写锁在启动之后发生，反过来说明现场被改过或写锁前
+ *    发生过时钟回拨，「早于锚点」不可信；
+ * 3. 锚点不得晚于当前时钟（+5 秒容差）：锚点在未来说明当前时钟被回拨，任何比较都不可信；
+ * 4. PID 0 与 PID 4 的创建时间必须一致（±10 秒）：两者矛盾说明输出不可信；
+ * 5. 只有 `startedAt` 与 mtime **都**严格早于 `anchor - 10 秒` 才判 stale。
+ *
+ * @param {object} [input] - 判定所需事实。
+ * @param {number} input.startedAt - 锁记录里的持有者启动时刻（毫秒）。
+ * @param {number} input.lockMtimeMs - 锁文件 mtime（毫秒）。
+ * @param {number} input.anchorMs - 启动会话锚点（PID 4 CreationDate，毫秒）。
+ * @param {number} [input.pid0Ms] - PID 0 CreationDate（毫秒，可缺失）。
+ * @param {number} input.nowMs - 当前时钟（毫秒）。
+ * @param {number} [input.marginMs] - 余量，默认 10000。
+ * @param {number} [input.clockSkewToleranceMs] - 启动时刻与 mtime 的容差，默认 10000。
+ * @param {number} [input.futureToleranceMs] - 锚点允许晚于当前时钟的容差，默认 5000。
+ * @param {number} [input.pid0ToleranceMs] - PID 0 与锚点的容差，默认 10000。
+ * @returns {{stale: boolean, evidence?: string, detail?: string}} 结论：`stale:true` 只在全部
+ *   前置条件成立时出现；`detail` 是稳定短码，便于诊断「为什么没有自愈」。
+ */
+export function evaluatePreBootStale(input = {}) {
+  const startedAt = readPositiveNumber(input?.startedAt);
+  const lockMtimeMs = readPositiveNumber(input?.lockMtimeMs);
+  const anchorMs = readPositiveNumber(input?.anchorMs);
+  const nowMs = readPositiveNumber(input?.nowMs);
+  const marginMs = input?.marginMs === undefined ? PRE_BOOT_MARGIN_MS : readPositiveNumber(input.marginMs);
+  const clockSkewToleranceMs = input?.clockSkewToleranceMs === undefined
+    ? PRE_BOOT_CLOCK_SKEW_TOLERANCE_MS
+    : readPositiveNumber(input.clockSkewToleranceMs);
+  const futureToleranceMs = input?.futureToleranceMs === undefined
+    ? PRE_BOOT_FUTURE_TOLERANCE_MS
+    : readPositiveNumber(input.futureToleranceMs);
+  const pid0ToleranceMs = input?.pid0ToleranceMs === undefined
+    ? PRE_BOOT_PID0_TOLERANCE_MS
+    : readPositiveNumber(input.pid0ToleranceMs);
+  if (startedAt === undefined
+    || lockMtimeMs === undefined
+    || anchorMs === undefined
+    || nowMs === undefined
+    || marginMs === undefined
+    || clockSkewToleranceMs === undefined
+    || futureToleranceMs === undefined
+    || pid0ToleranceMs === undefined) {
+    return { stale: false, detail: "inputs-invalid" };
+  }
+  let pid0Ms;
+  if (input?.pid0Ms !== undefined) {
+    pid0Ms = readPositiveNumber(input.pid0Ms);
+    if (pid0Ms === undefined) return { stale: false, detail: "pid0-invalid" };
+  }
+  // 护栏 1：写锁发生在进程启动之后，记录里的启动时刻不应显著晚于锁文件 mtime。
+  if (startedAt > lockMtimeMs + clockSkewToleranceMs) {
+    return { stale: false, detail: "started-after-lock-mtime" };
+  }
+  // 护栏 2：锚点在未来 = 当前时钟被回拨过，任何「早于锚点」的比较都不可信。
+  if (anchorMs > nowMs + futureToleranceMs) {
+    return { stale: false, detail: "anchor-in-future" };
+  }
+  // 护栏 3：两个锚点互相矛盾 = 输出不可信（脚本异常 / 系统记录异常），不能据此接管。
+  if (pid0Ms !== undefined && Math.abs(pid0Ms - anchorMs) > pid0ToleranceMs) {
+    return { stale: false, detail: "pid0-mismatch" };
+  }
+  if (startedAt < anchorMs - marginMs && lockMtimeMs < anchorMs - marginMs) {
+    return { stale: true, evidence: PRE_BOOT_EVIDENCE, detail: "before-boot-anchor" };
+  }
+  return { stale: false, detail: "not-before-boot-anchor" };
+}
+
+/**
+ * 解析锚点脚本输出（**纯函数**）：每行 `<pid>|<name>|<FILETIME>` 或 `VOL|<盘符>`。
+ *
+ * 严格解析的理由：这段输出是接管别人锁的**唯一证据**，多一个字符都不该被容忍。
+ * - PID 段必须**逐字等于**脚本固定查询的 `4` 或 `0`（前导零等任何其它写法一律非法），
+ *   进程名必须逐字匹配（大小写不敏感）；
+ * - FILETIME 必须是十进制整数，用 BigInt 转毫秒（`ft / 10000 - 11644473600000`）；
+ * - `VOL|C:` 行来自 `Win32_LogicalDisk` 的 `DriveType=3` 查询（本地固定盘）：盘符必须
+ *   形如 `C:`（字母 + 冒号），重复盘符只保留一份；
+ * - PID 4 必需；PID 0 可以缺失，但**出现却不合法**时整次解析失败；`VOL` 行至少要有一条
+ *   （没有卷列表就无法证明锁文件在本地固定盘上，宁可不可自愈也不猜）；
+ * - 重复 PID、未知前缀、空行以外的多余内容一律视为非法输出。
+ *
+ * @param {string} text - 脚本 stdout。
+ * @returns {{anchorMs: number, pid0Ms?: number, localFixedDrives: string[]}|undefined}
+ *   解析结果；任何不合法都返回 undefined。
+ */
+export function parseBootAnchorOutput(text) {
+  if (typeof text !== "string" || text.trim().length === 0) return undefined;
+  const found = new Map();
+  const localFixedDrives = new Set();
+  for (const rawLine of text.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (line.length === 0) continue;
+    const parts = line.split("|");
+    if (parts.length === 2 && parts[0].trim() === "VOL") {
+      // 本地固定盘列表：盘符必须形如 `C:`（字母 + 冒号），大小写归一后去重。
+      const deviceId = parts[1].trim();
+      if (/^[A-Za-z]:$/u.test(deviceId) !== true) return undefined;
+      localFixedDrives.add(deviceId.toUpperCase());
+      continue;
+    }
+    if (parts.length !== 3) return undefined;
+    const pidText = parts[0].trim();
+    const nameText = parts[1].trim().toLowerCase();
+    const fileTimeText = parts[2].trim();
+    if (/^\d+$/u.test(fileTimeText) !== true) return undefined;
+    // PID 段必须逐字等于脚本固定查询的 4 或 0（前导零等写法一律视为非法输出）。
+    const expectedName = BOOT_ANCHOR_PIDS.get(pidText);
+    if (expectedName === undefined || expectedName !== nameText) return undefined;
+    const pid = Number(pidText);
+    if (found.has(pid)) return undefined;
+    const fileTime = BigInt(fileTimeText);
+    const ms = Number(fileTime / 10000n - FILETIME_UNIX_EPOCH_OFFSET_MS);
+    if (Number.isFinite(ms) !== true || ms <= 0) return undefined;
+    found.set(pid, ms);
+  }
+  const anchorMs = found.get(4);
+  if (anchorMs === undefined) return undefined;
+  // 没有卷列表就无法证明锁文件在本地固定盘上：整次解析失败（fail-closed）。
+  if (localFixedDrives.size === 0) return undefined;
+  const pid0Ms = found.get(0);
+  const drives = [...localFixedDrives].sort();
+  return pid0Ms === undefined
+    ? { anchorMs, localFixedDrives: drives }
+    : { anchorMs, pid0Ms, localFixedDrives: drives };
+}
+
+/**
+ * 锚点脚本：一次调用里查固定 PID（4 与 0）与本地固定盘（DriveType=3），只读系统信息。
+ *
+ * - 进程行输出 `<pid>|<name>|<FILETIME>`；
+ * - 卷行输出 `VOL|<DeviceID>`（如 `VOL|C:`）：只有本地固定盘才允许 pre-boot 接管，UNC /
+ *   映射盘 / 可移动盘都不在这个列表里，调用方据此保持 held。
+ */
+const BOOT_ANCHOR_SCRIPT = [
+  "$ErrorActionPreference = 'Stop'",
+  "Get-CimInstance Win32_Process -Filter 'ProcessId=4 or ProcessId=0' | ForEach-Object {",
+  "  if ($null -ne $_.CreationDate) {",
+  "    '{0}|{1}|{2}' -f $_.ProcessId, $_.Name, $_.CreationDate.ToFileTimeUtc()",
+  "  }",
+  "}",
+  "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {",
+  "  'VOL|' + $_.DeviceID",
+  "}",
+].join("\n");
+
+/**
+ * 构造 Windows 启动会话锚点读取器（非 Windows / 拿不到 SystemRoot 时永远返回 undefined）。
+ *
+ * 为什么用绝对 PowerShell 路径：插件运行在宿主进程里，PATH 可能被裁剪或劫持；这条查询直接
+ * 决定「是否接管别人的锁」，命令解析必须固定，不能依赖名字查找。脚本只执行一次、有固定
+ * 超时、窗口隐藏，且只读系统信息。
+ *
+ * ## 卷类型闸门（复审修复）
+ * 仅凭锚点无法判断锁文件所在文件系统是否可信：UNC、映射网络盘、可移动盘上的锁可能由**另一台
+ * 机器**写入，用本机启动锚点去证明「写锁进程已随本机重启消失」是无效推理。因此脚本在同一次
+ * 调用里同时查询 `Win32_LogicalDisk -Filter 'DriveType=3'`（本地固定盘），读取器按
+ * `lockPath` 的盘符做白名单校验：不是本地固定盘就返回 undefined（调用方保持 held）。
+ *
+ * 读取器签名是 `readBootAnchor(lockPath) -> {anchorMs, pid0Ms?} | undefined`；任何失败
+ * （spawn 抛错、超时、非零退出、输出非法、盘符不可信、查询失败）都返回 undefined。
+ *
+ * @param {object} [deps] - 端口注入（测试用它替换 spawnSync / platform / env，不 spawn 真进程）。
+ * @param {Function} [deps.spawnSync] - `node:child_process.spawnSync`。
+ * @param {string} [deps.platform] - 平台（默认 `process.platform`）。
+ * @param {object} [deps.env] - 环境变量（只读 `SystemRoot`）。
+ * @returns {(lockPath: string) => ({anchorMs: number, pid0Ms?: number}|undefined)} 锚点读取器。
+ */
+export function makeWindowsBootAnchorReader({
+  spawnSync: spawn = spawnSync,
+  platform = process.platform,
+  env = process.env,
+} = {}) {
+  const systemRoot = typeof env?.SystemRoot === "string" && env.SystemRoot.length > 0
+    ? env.SystemRoot
+    : undefined;
+  if (platform !== "win32" || systemRoot === undefined) return () => undefined;
+  const powerShellPath = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  return (lockPath) => {
+    // 先判盘符：UNC / 相对路径 / 非本地固定盘连脚本都不执行（查询失败与不可信等价：held）。
+    const driveRoot = readLocalDriveRoot(lockPath);
+    if (driveRoot === undefined) return undefined;
+    let result;
+    try {
+      result = spawn(powerShellPath, ["-NoProfile", "-NonInteractive", "-Command", BOOT_ANCHOR_SCRIPT], {
+        timeout: BOOT_ANCHOR_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+      });
+    } catch {
+      return undefined;
+    }
+    if (result === null || typeof result !== "object") return undefined;
+    // 超时/启动失败带 error 且 status 为 null；两者都不能当成「查询有效」。
+    if (result.error !== undefined && result.error !== null) return undefined;
+    if (result.status !== 0) return undefined;
+    const parsed = parseBootAnchorOutput(result.stdout);
+    if (parsed === undefined) return undefined;
+    // 盘符必须真的出现在本地固定盘列表里（映射盘不在其中）。
+    if (parsed.localFixedDrives.includes(driveRoot) !== true) return undefined;
+    return parsed.pid0Ms === undefined
+      ? { anchorMs: parsed.anchorMs }
+      : { anchorMs: parsed.anchorMs, pid0Ms: parsed.pid0Ms };
+  };
+}
+
+/** 锁文件 mtime（毫秒）；端口缺失 / 读不到 / 形状非法一律 undefined（= 不能做 pre-boot 判定）。 */
+function readLockFileMtimeMs(io, lockPath) {
+  if (typeof io?.stat !== "function") return undefined;
+  try {
+    const stats = io.stat(lockPath);
+    return readPositiveNumber(stats?.mtimeMs);
+  } catch {
+    return undefined;
+  }
+}
+
+/** UNC 路径与 `\\?\` 扩展前缀路径（扩展格式的本地路径也暂不接管）：pre-boot 取证前直接跳过，保持不可用（映射盘/可移动盘由锚点读取器的卷类型查询负责）。 */
+function isNetworkLockPath(lockPath) {
+  return typeof lockPath === "string" && (lockPath.startsWith("\\\\") || lockPath.startsWith("//"));
+}
+
+
+/**
+ * 锁文件所在卷的盘符（大写、带冒号，如 C:）；UNC / 相对路径 / 无盘符一律 undefined。
+ *
+ * 用 win32.parse 而不是当前平台的 parse：lockPath 是 Windows 路径，即使在别的平台上跑单测
+ * 也必须按 Windows 卷语义解释（在 win32 上两者本来就是同一个实现）。盘符是否属于
+ * 「本地固定盘」由锚点读取器按 DriveType=3 查询结果判定。
+ */
+function readLocalDriveRoot(lockPath) {
+  if (typeof lockPath !== "string" || lockPath.length === 0) return undefined;
+  if (isNetworkLockPath(lockPath)) return undefined;
+  if (win32.isAbsolute(lockPath) !== true) return undefined;
+  let root;
+  try {
+    root = win32.parse(lockPath).root;
+  } catch {
+    return undefined;
+  }
+  if (typeof root !== "string") return undefined;
+  let normalized = root.toUpperCase();
+  while (normalized.endsWith("\\") || normalized.endsWith("/")) {
+    normalized = normalized.slice(0, -1);
+  }
+  return /^[A-Z]:$/u.test(normalized) ? normalized : undefined;
 }
 
 /**
@@ -285,8 +619,13 @@ export function evaluateInstanceLock(record, facts) {
  * @param {number} [deps.startedAt] - 本进程启动时刻（默认按 uptime 估计）。
  * @param {number} [deps.toleranceMs] - 启动时间容差。
  * @param {string} [deps.token] - 本进程身份串（默认随机生成；测试可注入固定值）。
- * @param {object} [deps.io] - 文件系统端口（`readFile / writeFile / unlink / mkdir`）。
+ * @param {object} [deps.io] - 文件系统端口（`readFile / writeFile / unlink / mkdir / rename / stat`）。
  * @param {(pid: number) => boolean} [deps.isProcessAlive] - 存活探针。
+ * @param {(lockPath: string) => ({anchorMs: number, pid0Ms?: number}|undefined)} [deps.readBootAnchor]
+ *   启动会话锚点读取器（按锁文件路径判「本地固定盘」）；**默认不注入**（= 不启用 pre-boot
+ *   接管，现有单测不会 spawn 外部进程）。生产装配注入 {@link makeWindowsBootAnchorReader}，
+ *   测试可用替身直接给结论（可忽略 lockPath 参数）。
+ * @param {() => number} [deps.now] - 只读时钟（pre-boot 判定需要「当前时刻」这个事实）。
  * @returns {{path: Function, acquire: Function, verifyOwnership: Function, release: Function,
  *   snapshot: Function}} 锁能力面。
  */
@@ -298,6 +637,8 @@ export function installInstanceLock({
   token = buildLockToken(pid, startedAt),
   io = DEFAULT_IO,
   isProcessAlive = defaultIsProcessAlive,
+  readBootAnchor,
+  now = () => Date.now(),
 }) {
   /** 最近一次判定结论（不可用结果里带 `lockPath`，供探测诊断透传）。 */
   let state = { status: INSTANCE_LOCK_STATES.UNAVAILABLE, reason: INSTANCE_LOCK_REASONS.HOME_UNRESOLVED };
@@ -483,7 +824,51 @@ export function installInstanceLock({
   }
 
   /**
-   * 获取锁：**独占创建**是唯一判据；已存在就判定，绝不删除、绝不接管。
+   * 收集「跨启动会话证明」的结论（只在「记录属于他人 + pid 仍存活 + 存活判定可信」时调用）。
+   *
+   * 任一前置条件不成立都返回 `{stale:false}`，调用方按既有 held 收尾：未注入锚点端口、
+   * 锁文件在 UNC/网络路径、mtime 读不到、锚点查询抛错/返回非法（含卷类型不可信）、
+   * 当前时钟读不出来。
+   *
+   * @param {string} lockPath - 锁文件路径（锚点读取器据此判「本地固定盘」）。
+   * @param {object} record - 锁记录。
+   * @returns {{stale: boolean, detail?: string}} 判定结论（`stale:true` 时还带 `evidence`）。
+   */
+  function readPreBootVerdict(lockPath, record) {
+    if (typeof readBootAnchor !== "function") return { stale: false };
+    // 记录声称与本进程同一身份（同 pid + 同启动时刻）却 token 不同：本进程此刻就活着，
+    // 不存在「上一个启动会话」的解释，按身份不符 held —— 连锚点都不查。
+    if (record.pid === pid && Math.abs(record.startedAt - startedAt) <= toleranceMs) {
+      return { stale: false, detail: "self-identity-mismatch" };
+    }
+    if (isNetworkLockPath(lockPath)) return { stale: false, detail: "network-path" };
+    const lockMtimeMs = readLockFileMtimeMs(io, lockPath);
+    if (lockMtimeMs === undefined) return { stale: false, detail: "mtime-unreadable" };
+    let anchor;
+    try {
+      anchor = readBootAnchor(lockPath);
+    } catch {
+      return { stale: false, detail: "anchor-read-failed" };
+    }
+    if (anchor === null || typeof anchor !== "object") return { stale: false, detail: "anchor-unavailable" };
+    let nowMs;
+    try {
+      nowMs = now();
+    } catch {
+      // 时钟读不出来就证明不了「锚点在当前时刻之前」：保持 held。
+      return { stale: false, detail: "now-unreadable" };
+    }
+    return evaluatePreBootStale({
+      startedAt: record.startedAt,
+      lockMtimeMs,
+      anchorMs: anchor.anchorMs,
+      pid0Ms: anchor.pid0Ms,
+      nowMs,
+    });
+  }
+
+  /**
+   * 获取锁：**独占创建**是唯一判据；已存在就判定，默认不接管（仅在可证明写锁进程已消失时接管）。
    *
    * @returns {object} 本次判定结论（见 {@link INSTANCE_LOCK_STATES}；不可用结果带 lockPath）。
    */
@@ -535,7 +920,22 @@ export function installInstanceLock({
         ownsLock = false;
         return takeOver(path, current.text);
       }
-      // 对方的 pid 仍存活：只判定，**绝不删除或接管**；原因码与锁路径都带回给诊断。
+      // 对方的 pid 仍存活：pid 可能只是被复用。只有「跨启动会话证明」成立时才按 stale 接管，
+      // 否则一律 held——证明不了写锁进程属于上一个启动会话，就不能动别人的锁。
+      // 存活探针抛错时 verdict.aliveUnknown 为真：连「对方是否存活」都证明不了，绝不取证。
+      if (verdict.aliveUnknown === true) {
+        return heldState(verdict.reason, verdict.holder === undefined ? {} : { holder: verdict.holder });
+      }
+      const preBoot = readPreBootVerdict(path, current.record);
+      if (preBoot.stale === true) {
+        const takeover = takeOver(path, current.text);
+        if (takeover.status === INSTANCE_LOCK_STATES.ACQUIRED) {
+          // adopted 语义不变（仍是新建自己的锁），只额外记录接管依据供诊断。
+          state = { ...takeover, recoveredBy: PRE_BOOT_EVIDENCE };
+        }
+        return state;
+      }
+      // 没有 pre-boot 证据：原因码与锁路径都带回给诊断。
       return heldState(verdict.reason, verdict.holder === undefined ? {} : { holder: verdict.holder });
     }
     // 反复撞上「创建时存在、读时又消失」的抖动：保守不可用，绝不循环重试。

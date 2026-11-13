@@ -6,9 +6,10 @@
  * 2. **会话根可解析**：`dshHomePath('sessions')` 能解析出绝对路径；
  * 3. **记账写入口可用**：`workspaceRegistry` 存在、`list()` 可调用，且（有工作区时）
  *    首个 entity 暴露 `detachSession` 写入口；
- * 4. **实例锁可获取**：实例锁状态为 `acquired`（被占用/无法验证都算失败）。实例锁**不做
- *    自动接管**：锁文件已存在且不是本进程的就一律不可用，并把锁文件绝对路径带进诊断
- *    （`lockPath`），提示用户「请删除该文件后重启 DSH」；
+ * 4. **实例锁可获取**：实例锁状态为 `acquired`（被占用/无法验证都算失败）。锁获取默认
+ *    fail-closed：锁记录属于他人时，只有 pid 已死、或 pid 存活但通过「跨启动会话证明」才会
+ *    按 stale 接管；其余情形一律不可用，并把锁文件绝对路径带进诊断（`lockPath`），提示
+ *    用户「请删除该文件后重启 DSH」；
  * 5. **收敛文档可解析**：两张删除表都读得出来。这一项失败同时意味着**本轮收敛整体暂停**
  *    （读不懂文档就拿不到任何一条记录，不存在「继续处理其他条目」这回事）。
  *
@@ -37,7 +38,11 @@ export const STARTUP_PROBE_REASONS = Object.freeze({
   WORKSPACE_BOOKKEEPING_UNAVAILABLE: "delete-workspace-bookkeeping-unavailable",
   /** 实例锁被另一个**存活**实例持有。 */
   INSTANCE_LOCK_HELD: "delete-instance-lock-held",
-  /** 实例锁属于另一个**已经退出**的实例（不自动接管，需要用户删掉锁文件后重启）。 */
+  /**
+   * 纯判定阶段的「实例锁属于另一个**已经退出**的实例」（pid 已死）：正常情况下 acquire 会
+   * 立刻接管（变成 `acquired`），接管被抢先/失败则记 `takeover-lost`。探测看到该码意味着
+   * 有一个本可自动接管但未完成的现场：按不可用处理并给出锁文件路径。
+   */
   INSTANCE_LOCK_STALE: "delete-instance-lock-stale",
   /** 锁记录字段缺失或 JSON 不可解析。 */
   INSTANCE_LOCK_MALFORMED: "delete-instance-lock-malformed",

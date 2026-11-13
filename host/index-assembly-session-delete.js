@@ -19,6 +19,9 @@
  *    **执行前必须复核实例锁归属**（`runConvergenceWhenLockHeld`）：未持锁的实例不得收敛、
  *    不得扫隔离区——它会把别人写到一半的批量意图当成可丢弃记录删掉，并清扫对方正在使用的
  *    隔离目录（对方随后崩溃时，那批会话的 DEG 数据就再也没有清理入口）。
+ *    **持锁后还要等工作区写能力就绪**（`waitForWorkspaceCleanupReady`，最长 30 秒）：宿主
+ *    的 `workspaceRegistry` 可能在插件装配之后才激活，过早收敛会把整轮记失败；超时只记
+ *    稳定诊断短码并照旧执行一次，不新增暂停状态、不改 completed 缓存语义。
  *
  * ## 与既有段的关系
  * 本段只消费 `state.storageBinding` / `state.settingsStorage`（第 3 段已就绪）与宿主服务读取器，
@@ -26,7 +29,7 @@
  *
  * @module dsh-expert-group/host/index-assembly-session-delete
  */
-import { installInstanceLock } from "./session-delete-lock.js";
+import { installInstanceLock, makeWindowsBootAnchorReader } from "./session-delete-lock.js";
 import { installSessionDeleteStore } from "./session-delete-store.js";
 import { installStartupProbe, STARTUP_PROBE_REASONS } from "./session-delete-probe.js";
 import { installDeletionGate } from "./session-delete-gate.js";
@@ -86,8 +89,16 @@ function scheduleWhenStorageReady(state, { onReady, onTimeout }) {
   /** 任务自身永不 reject 的兜底：任何抛出都折算成「不可用」结论。 */
   const runSafely = (task) => {
     Promise.resolve()
-      .then(() => task?.())
-      .catch(() => onTimeout?.());
+      .then(() => {
+        // 卸载可能正好发生在「读到就绪」与这个微任务之间：取消后**不得**再创建任何等待器或
+        // 执行收敛（否则持锁时会在 effect 清理之后仍跑 convergence.run）。
+        if (cancelled === true) return undefined;
+        return task?.();
+      })
+      .catch(() => {
+        if (cancelled === true) return;
+        onTimeout?.();
+      });
   };
 
   const tick = () => {
@@ -203,22 +214,218 @@ export async function runConvergenceWhenLockHeld({ lock, convergence, logger }) 
   return convergence.run();
 }
 
+/** 收敛前「工作区清理写能力」就绪等待的默认窗口（毫秒）：与启动探测的等待窗口一致。 */
+const CLEANUP_READY_DEADLINE_MS = 30000;
+
+/** 就绪轮询间隔（毫秒）。定时器一律 unref：等待不得阻止进程退出。 */
+const CLEANUP_READY_INTERVAL_MS = 15;
+
+/** 就绪等待超时的诊断短码（稳定、可断言；不含路径与堆栈）。 */
+const CLEANUP_READY_TIMEOUT_DIAGNOSTIC = "dsh-expert-group: session delete convergence readiness timeout";
+
+/** 读一个正的有限数（调度参数注入用）；非法/缺失退回默认值。 */
+function readSchedulerNumber(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 /**
- * 等 storage binding 就绪后，先复核实例锁归属再执行一次收敛。
+ * 只读判据：工作区清理所需的写能力是否已经就绪（**绝不调用任何写方法**）。
+ *
+ * 为什么需要它：宿主的工作区注册表可能在插件装配之后才激活。收敛期一开始就调用
+ * `detachSession` / `unarchiveSession` 会在服务缺失时整轮记失败（条目保留到下次启动，
+ * 用户看不到任何变化），而这段时间通常只有几十毫秒。先等写能力就绪，能把「晚就绪」
+ * 与「真的坏了」分开。
+ *
+ * 就绪口径（与收敛期各端口的实际用法一一对应）：
+ * - `workspaceRegistry` 存在、`list()` 可调用且返回数组；
+ * - 每个实体的可写投影（`registry.get(id)`，失败时退回列表项）能证明「可 detach」：
+ *   要么 `detachSession` 是函数，要么成员集合（两侧至少一组数组）可读；
+ * - 归档/置顶至少各有一条写路径：注册表同时有 `unarchiveSession` 与 `unpinSession`，否则
+ *   要求（任意）可写投影里存在 `unarchiveSession` 且（任意）存在 `unpinSession`——与
+ *   `buildCollectionsPort` 分方法 fallback 的口径一致。
+ *
+ * 整个函数体在 try/catch 内：注册表 `get`、成员 getter 或 Proxy 抛错都折叠成 false，
+ * 绝不让异常从就绪轮询的定时器回调里逃逸。
+ *
+ * 判据只读取，不调用 `detachSession` / `unarchiveSession` / `unpinSession`。
+ *
+ * @param {Function} readHostService - 宿主服务读取器。
+ * @returns {boolean} 写能力是否就绪（任何读失败/形状不符都返回 false）。
+ */
+export function isWorkspaceCleanupReady(readHostService) {
+  try {
+    const { registry, entities } = readWorkspaceEntities(readHostService);
+    const writers = [];
+    for (const entity of entities) {
+      const writer = resolveWorkspaceWriter(registry, entity);
+      if (writer === undefined) return false;
+      const canDetach = typeof writer.detachSession === "function"
+        || readMemberIdsOf(writer, entity) !== undefined;
+      if (canDetach !== true) return false;
+      writers.push(writer);
+    }
+    return hasCollectionWriters(registry, writers);
+  } catch {
+    // 整个函数都在 try 里：registry.get / 成员 getter / Proxy 抛错都必须折成「未就绪」，
+    // 绝不能从定时器回调里逃逸成未捕获异常。
+    return false;
+  }
+}
+
+/**
+ * 归档/置顶是否至少各有**一条**写路径（只读判定，与 buildCollectionsPort 的分方法 fallback 同口径）。
+ *
+ * `buildCollectionsPort` 对 unarchive 与 unpin 分别探测：注册表级方法优先，否则遍历实体、各自
+ * 调用有该方法的 writer。因此就绪判据也按「方法各自存在」算，而不是要求同一个 writer 同时具备
+ * 两者（两代宿主可能把两个方法挂在不同的可写投影上）。
+ *
+ * @param {object} registry - 工作区注册表。
+ * @param {object[]} writers - 已解析出的可写投影。
+ * @returns {boolean} 是否存在可用写路径。
+ */
+function hasCollectionWriters(registry, writers) {
+  if (typeof registry.unarchiveSession === "function"
+    && typeof registry.unpinSession === "function") {
+    return true;
+  }
+  const hasUnarchive = writers.some((writer) => typeof writer.unarchiveSession === "function");
+  const hasUnpin = writers.some((writer) => typeof writer.unpinSession === "function");
+  return hasUnarchive === true && hasUnpin === true;
+}
+
+/**
+ * 等「工作区清理写能力」就绪后执行一次收敛（收敛 effect 的等待器）。
+ *
+ * 语义固定为三条：
+ * 1. **未持锁不等待**：先复核实例锁，未持锁立即 `markPaused(LOCK_UNAVAILABLE)`——未持锁的实例
+ *    本来就不得收敛、不得扫隔离区（见 `runConvergenceWhenLockHeld`），等写能力毫无意义；
+ * 2. **就绪即执行一次**：持锁时以 `intervalMs`（默认 15ms）轮询
+ *    {@link isWorkspaceCleanupReady}，就绪立即收敛，不引入额外延迟；
+ * 3. **有界超时仍执行一次**：最多等 `deadlineMs`（默认 30 秒），超时只记一条稳定诊断短码，
+ *    然后照旧执行一次——保持当前「失败可见（条目 attempts/lastError）」与「暂停/完成」语义，
+ *    不新增状态、不改 completed 缓存。
+ *
+ * 所有定时器 unref；卸载时 `cancel()` 会清掉未完成的定时器并阻止尚未开始的收敛。
+ *
+ * @param {object} deps - 注入面。
+ * @param {Function} [deps.readHostService] - 宿主服务读取器。
+ * @param {object} [deps.lock] - 实例锁能力面（`verifyOwnership()`）。
+ * @param {object} deps.convergence - 收敛能力面（`run` / `markPaused`）。
+ * @param {object} [deps.logger] - 诊断日志出口。
+ * @param {{deadlineMs?: number, intervalMs?: number}} [deps.scheduler] - 测试可注入的短窗口。
+ * @returns {{cancel: Function, done: Promise<object|undefined>}} 取消函数与完成信号。
+ */
+export function waitForWorkspaceCleanupReady({
+  readHostService,
+  lock,
+  convergence,
+  logger,
+  scheduler,
+} = {}) {
+  const deadlineMs = readSchedulerNumber(scheduler?.deadlineMs, CLEANUP_READY_DEADLINE_MS);
+  const intervalMs = readSchedulerNumber(scheduler?.intervalMs, CLEANUP_READY_INTERVAL_MS);
+  let cancelled = false;
+  let handle;
+  let settled = false;
+  let resolveDone;
+  const done = new Promise((resolve) => { resolveDone = resolve; });
+
+  /** 清定时器并兑现完成信号（只兑现一次）。 */
+  const settle = (value) => {
+    if (settled === true) return;
+    settled = true;
+    if (handle !== undefined) {
+      clearTimeout(handle);
+      handle = undefined;
+    }
+    resolveDone(value);
+  };
+
+  /** 执行（且只执行一次）收敛；真正的锁复核在 `runConvergenceWhenLockHeld` 里。 */
+  const runOnce = () => {
+    Promise.resolve()
+      .then(() => {
+        if (cancelled === true) return undefined;
+        return runConvergenceWhenLockHeld({ lock, convergence, logger });
+      })
+      .then((value) => settle(value))
+      .catch(() => {
+        // 与旧 effect 的兜底一致：收敛自身抛错按「收敛文档不可解析」暂停，不影响卸载。
+        try {
+          convergence.markPaused(STARTUP_PROBE_REASONS.QUEUE_UNREADABLE);
+        } catch {
+          // 兜底失败也不能让等待器 reject（effect 不消费这个 Promise）。
+        }
+        settle(undefined);
+      });
+  };
+
+  if (hasInstanceLock(lock) !== true) {
+    // 未持锁：不等待，直接留下暂停结论（既有语义与既有测试不变）。
+    runOnce();
+    return { cancel: () => { cancelled = true; settle(undefined); }, done };
+  }
+
+  const deadlineAt = Date.now() + deadlineMs;
+  const tick = () => {
+    if (cancelled === true) return;
+    if (isWorkspaceCleanupReady(readHostService) === true) {
+      runOnce();
+      return;
+    }
+    if (Date.now() >= deadlineAt) {
+      try {
+        logger?.info?.(CLEANUP_READY_TIMEOUT_DIAGNOSTIC);
+      } catch {
+        // 诊断失败不影响收敛：超时后仍执行一次。
+      }
+      runOnce();
+      return;
+    }
+    handle = setTimeout(tick, intervalMs);
+    handle?.unref?.();
+  };
+  tick();
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      if (handle !== undefined) {
+        clearTimeout(handle);
+        handle = undefined;
+      }
+      settle(undefined);
+    },
+    done,
+  };
+}
+
+/**
+ * 等 storage binding 就绪后，先复核实例锁归属，再等写能力就绪，最后执行一次收敛。
  *
  * 等待超时仍按「收敛文档不可解析」整体暂停（与锁无关：那时连文档都拿不到）。
+ * 卸载函数取消两层等待（storage 等待 + 写能力轮询），保持既有卸载语义。
  *
  * @param {object} state - 装配状态容器（读 storageBinding）。
- * @param {object} lock - 实例锁能力面。
- * @param {object} convergence - 收敛能力面。
- * @param {object} [logger] - 诊断日志出口。
+ * @param {object} deps - `{lock, convergence, logger, readHostService, scheduler}`。
  * @returns {Function} 卸载函数：取消等待、清定时器。
  */
-function scheduleConvergenceWhenLockHeld(state, lock, convergence, logger) {
-  return scheduleWhenStorageReady(state, {
-    onReady: () => runConvergenceWhenLockHeld({ lock, convergence, logger }),
+function scheduleConvergenceWhenLockHeld(state, { lock, convergence, logger, readHostService, scheduler }) {
+  let cancelCleanupWait;
+  const cancelStorageWait = scheduleWhenStorageReady(state, {
+    onReady: () => {
+      const wait = waitForWorkspaceCleanupReady({ readHostService, lock, convergence, logger, scheduler });
+      cancelCleanupWait = wait.cancel;
+      // effect 不 await 收敛：卸载只负责取消，结论通过 convergence.snapshot() 观察。
+      wait.done.catch(() => {});
+    },
     onTimeout: () => convergence.markPaused(STARTUP_PROBE_REASONS.QUEUE_UNREADABLE),
   });
+  return () => {
+    if (typeof cancelCleanupWait === "function") cancelCleanupWait();
+    cancelCleanupWait = undefined;
+    cancelStorageWait();
+  };
 }
 
 /**
@@ -553,6 +760,9 @@ export function assembleSessionDelete(state, hostServices) {
 
   const lock = installInstanceLock({
     homeDirectory: () => readHomeDirectoryOf(readHostService),
+    // pid 会被复用：注入「启动会话锚点」读取器，只有跨启动证明成立时才允许接管
+    // 仍存活的 pid 的锁（非 Windows 下该读取器恒返回 undefined，等于不启用）。
+    readBootAnchor: makeWindowsBootAnchorReader(),
   });
 
   const store = installSessionDeleteStore({
@@ -703,7 +913,12 @@ export function assembleSessionDelete(state, hostServices) {
       // 锁门槛：未持锁的实例**不执行**收敛、不扫隔离区（见 runConvergenceWhenLockHeld）。
       kind: "effect",
       label: "dsh-expert-group: session delete convergence",
-      factory: () => scheduleConvergenceWhenLockHeld(state, lock, convergence, logger),
+      factory: () => scheduleConvergenceWhenLockHeld(state, {
+        lock,
+        convergence,
+        logger,
+        readHostService,
+      }),
     },
   ];
 }
