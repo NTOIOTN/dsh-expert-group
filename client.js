@@ -13829,23 +13829,17 @@ const css=".deg_settings{display:flex;flex-direction:column;gap:18px;max-width:7
 ".deg_sd_count{flex:0 0 auto;white-space:nowrap}.deg_sd_blocked{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}"+
 ".deg_sd_dialog_line{white-space:pre-wrap}";
 const cssTagId="dsh-expert-group/settings.module.css";
-const cssInjectedDocuments=typeof WeakSet==="function"?new WeakSet():null;
+const cssTagSelector="style[data-plugin-css="+JSON.stringify(cssTagId)+"]";
 function ensurePluginStylesheet(){
 const doc=typeof document!=="undefined"?document:null;
 if(doc===null||typeof doc!=="object")return false;
-if(cssInjectedDocuments?.has(doc)===true)return true;
-const selector="style[data-plugin-css="+JSON.stringify(cssTagId)+"]";
-if(typeof doc.querySelector==="function"&&doc.querySelector(selector)!==null){
-cssInjectedDocuments?.add(doc);
-return true;
-}
+if(typeof doc.querySelector==="function"&&doc.querySelector(cssTagSelector)!==null)return true;
 if(typeof doc.createElement!=="function"||typeof doc.head?.appendChild!=="function")return false;
 const tag=doc.createElement("style");
 tag.dataset.plugin="dsh-expert-group";
 tag.dataset.pluginCss=cssTagId;
 tag.textContent=css;
 doc.head.appendChild(tag);
-cssInjectedDocuments?.add(doc);
 return true;
 }
 ensurePluginStylesheet();

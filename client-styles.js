@@ -131,31 +131,34 @@
 
 
     const cssTagId = "dsh-expert-group/settings.module.css";
-    /** 已注入过样式表的 document：同一 document 只注入一次，设置页适配样式不会重复注入。 */
-    const cssInjectedDocuments = typeof WeakSet === "function" ? new WeakSet() : null;
+    /** 本插件样式标签的选择器：每次注入前用它复核 DOM 事实，不缓存「注入过」的布尔状态。 */
+    const cssTagSelector = "style[data-plugin-css=" + JSON.stringify(cssTagId) + "]";
 
     /**
-     * 幂等注入插件样式表。
-     * 模块求值可能早于 document 可用（测试替身、SSR、装配期求值），此时首次注入会被跳过；
-     * 设置页导航和模型配置需要的样式在运行期补注入；只写 DEG 自己的 style 标签，
-     * 不触碰 DSH 宿主样式。
+     * 幂等注入插件样式表——**以 DOM 为准**：每次调用都先复核目标标签是否真的还在文档里。
+     *
+     * 为什么不能记住「这个 document 注入过」：DSH 的客户端热替换（dsh-client-hmr →
+     * client-modules 的 replace()）会先 prefetch 新 bundle（IIFE 求值期本函数已注入一次），
+     * 再 tearDown / removeOwnedStyles("dsh-expert-group") 删掉本插件全部 style[data-plugin]
+     * 标签，最后才 materialize 新的 factory（client-entry.js 里会再次调用本函数）。
+     * 命中「注入过」缓存就直接 return true 的话，刚被宿主删掉的 settings.module.css
+     * 永远补不回来——会话删除确认弹窗退化成无样式原生 DOM 贴在窗口左上角
+     * （DSH 0.2.2-rc.2 真机现象）。因此这里只认 DOM：存在即幂等返回，不存在就重建补插。
+     *
+     * 安全降级保持不变：模块求值可能早于 document 可用（测试替身、SSR、装配期求值），
+     * 此时返回 false 而不抛错；只写 DEG 自己的 style 标签，不触碰 DSH 宿主样式。
      */
     function ensurePluginStylesheet() {
       const doc = typeof document !== "undefined" ? document : null;
       if (doc === null || typeof doc !== "object") return false;
-      if (cssInjectedDocuments?.has(doc) === true) return true;
-      const selector = "style[data-plugin-css=" + JSON.stringify(cssTagId) + "]";
-      if (typeof doc.querySelector === "function" && doc.querySelector(selector) !== null) {
-        cssInjectedDocuments?.add(doc);
-        return true;
-      }
+      // 标签还在文档里 = 已注入（宿主删过则下面重建一份），绝不用缓存假装成功。
+      if (typeof doc.querySelector === "function" && doc.querySelector(cssTagSelector) !== null) return true;
       if (typeof doc.createElement !== "function" || typeof doc.head?.appendChild !== "function") return false;
       const tag = doc.createElement("style");
       tag.dataset.plugin = "dsh-expert-group";
       tag.dataset.pluginCss = cssTagId;
       tag.textContent = css;
       doc.head.appendChild(tag);
-      cssInjectedDocuments?.add(doc);
       return true;
     }
     ensurePluginStylesheet();
