@@ -41,6 +41,124 @@ function resolvePersonaPrefixOrder(promptService) {
 }
 
 /**
+ * 宿主结果交付引导段（@deepseek-ai/dsh-subagent 的 withResultDeliveryGuidance）。
+ *
+ * 0.2.2 起，宿主在 manager.startLocalNamed 里给 parent-delivered child 的首条任务追加
+ * 这一段固定的**英文**文本块。DEG 的专家是叶子 worker，persona 里已由 FINAL_SUMMARY_RULE
+ * 固定"只在最终 assistant 输出中交付结果"的中文交付协议，因此这段英文对 DEG 是冗余注入；
+ * 更关键的是它会随首条任务消息进入 durable 会话日志与 GUI，成为用户可见的英文提示词。
+ *
+ * 文本必须与宿主逐字一致：宿主一旦改词，命中失败也不会误删任务正文（见下面的匹配规则）。
+ */
+const HOST_RESULT_DELIVERY_GUIDANCE = "Your final answer is delivered automatically if your parent is still online. Include the result and relevant evidence in that answer; the parent does not receive your full transcript, tool output, or reasoning. If your last action is a message to your parent, the completion notice omits your final answer; include the result and relevant evidence in that message.";
+
+/** 同一引导段的固定首句：仅用于人工诊断与文档引用，不参与过滤判定。 */
+const HOST_RESULT_DELIVERY_GUIDANCE_PREFIX = "Your final answer is delivered automatically if your parent is still online.";
+
+/** 归一化后用于比较：折叠连续空白并 trim，避免换行/缩进差异造成漏判。 */
+function normalizeHostGuidanceText(text) {
+  return text.replace(/\s+/gu, " ").trim();
+}
+
+/**
+ * 判断一个文本块是否就是宿主的 result-delivery 引导段。
+ *
+ * 只接受归一化后与完整引导段逐字相等的「独立块」：不做前缀容错，也不做"单块尾部内嵌"
+ * 裁剪。文本匹配无法证明来源：正文恰好以同一段结尾（旧宿主没追加、或用户粘贴了同一段）
+ * 时，任何后缀/前缀容错都会静默改写真实输入；漏过滤的代价只是一段英文仍可见。
+ */
+function isHostResultDeliveryGuidanceBlock(text) {
+  if (typeof text !== "string") return false;
+  const value = normalizeHostGuidanceText(text);
+  return value.length > 0 && value === HOST_RESULT_DELIVERY_GUIDANCE;
+}
+
+/**
+ * 对首条任务提交后的第一个 step 做不可变改写：删除宿主追加的 result-delivery 引导段块。
+ *
+ * 为什么改 decision.messages：宿主 agent-loop 会把 pre-step decision 的 messages 逐条
+ * append 成 user/message，这是"模型请求、durable 日志、GUI"共用的唯一来源；未命中的消息
+ * 保持原对象引用，非 enter 决策原样返回，因此 reject 等既有语义不受影响。
+ *
+ * 来源消歧（关键，oracle 复审要求）：文本匹配本身无法证明"这段是宿主追加的"。本函数
+ * 只删除满足以下全部条件的块，使误删真实输入在结构上不可能：
+ * 1. 调用方只在 turn 1 / step 1 调用（宿主只在 startLocalNamed 提交首条任务时追加；
+ *    sendMessage 续作、后续 turn 与 notice 都不会追加）；
+ * 2. 该块是消息中"非第一个"的独立文本块——DEG 自己的首条任务永远由
+ *    buildExpertTaskPrompt / buildObserverVisualTask 产出一个文本块（图片路由再加一个
+ *    图片块），用户正文只能藏在第一个文本块内部，因此第二个及以后、内容恰为引导段的
+ *    独立块只可能来自宿主追加；
+ * 3. 归一化后与完整引导段逐字相等（单块内嵌或前缀相似一律不裁）。
+ * 过滤后 content 为空时保留原消息，绝不制造空 user 消息。
+ *
+ * @param {object} decision - agent/pre-step waterfall 的决策。
+ * @returns {object} 改写后的决策（无命中时返回原引用）。
+ */
+function stripHostResultDeliveryGuidanceFromDecision(decision) {
+  if (decision === null || typeof decision !== "object" || decision.kind !== "enter") return decision;
+  const messages = Array.isArray(decision.messages) ? decision.messages : [];
+  let changed = false;
+  const nextMessages = messages.map((message) => {
+    if (message === null || typeof message !== "object" || !Array.isArray(message.content)) return message;
+    let messageChanged = false;
+    const nextContent = [];
+    for (let index = 0; index < message.content.length; index += 1) {
+      const block = message.content[index];
+      // 第一个内容块永远保留：即使整条消息只有引导段，也不制造空消息/空正文。
+      if (index > 0 && block !== null && typeof block === "object" && block.type === "text"
+        && isHostResultDeliveryGuidanceBlock(block.text)) {
+        messageChanged = true;
+        continue;
+      }
+      nextContent.push(block);
+    }
+    if (!messageChanged || nextContent.length === 0) return message;
+    changed = true;
+    return { ...message, content: nextContent };
+  });
+  return changed ? { ...decision, messages: nextMessages } : decision;
+}
+
+/**
+ * 在 child 自身 scope 上安装 result-delivery 引导段过滤器（agent/pre-step waterfall）。
+ *
+ * 作用域：childCtx 在 agent/created 时已绑定到该 child，scope-filtered 派发保证只收到
+ * 这个 child 的 pre-step；{ prepend: true } 让它在同层最先执行，先 await next() 拿到下游
+ * 合并后的最终决策再改写，因此不会与宿主的 modelSwitchNotice 等监听器抢顺序。
+ *
+ * 门控：宿主只在 startLocalNamed 提交首条任务时追加该段，因此只在 turn 1 / step 1 介入；
+ * 续作消息、后续 turn 与 notice 一律原样放行，避免把"正文自己以该段结尾"误判成注入。
+ *
+ * 失败语义：注册失败只告警并返回 undefined（保持"没装上"的既有语义）；运行期改写异常
+ * 也只告警并返回未修改的决策，绝不让首条任务因为本过滤器失败而打不开。
+ *
+ * @param {object} childCtx - child 的 scoped context。
+ * @param {Function} warn - 宿主 logger.warn 的窄封装。
+ * @returns {(() => void)|undefined} disposer；无法注册时 undefined。
+ */
+function installHostResultDeliveryGuidanceFilter(childCtx, warn) {
+  if (typeof childCtx?.on !== "function") return undefined;
+  const handler = async (payload, next) => {
+    // 非首条任务提交的 step 不是宿主追加点：直接放行，不读取/不改写决策。
+    if (payload?.turn !== 1 || payload?.step !== 1) return next();
+    const decision = await next();
+    try {
+      return stripHostResultDeliveryGuidanceFromDecision(decision);
+    } catch (error) {
+      warn("dsh-expert-group: host result-delivery guidance filter failed: " + compositionErrorMessage(error));
+      return decision;
+    }
+  };
+  try {
+    const dispose = childCtx.on("agent/pre-step", handler, { prepend: true });
+    return typeof dispose === "function" ? dispose : undefined;
+  } catch (error) {
+    warn("dsh-expert-group: could not install host result-delivery guidance filter: " + compositionErrorMessage(error));
+    return undefined;
+  }
+}
+
+/**
  * 旧 RC1 startLocal 兼容层：把 admission 算出的 child composition 直接补到 child 自己的
  * scoped context 上（persona + 工具 deny 边界）。
  *
@@ -50,16 +168,21 @@ function resolvePersonaPrefixOrder(promptService) {
  * 标记的 send_message，就会把 parent agent id、send_message 调用说明与结果回传要求追加到
  * 首条任务消息，污染 buildExpertTaskPrompt 的「身份行 + 任务正文」两段结构。
  *
- * 三步（顺序有语义）：
+ * 四步（顺序有语义）：
  * ① 在 child 自身作用域注册 send_message 遮蔽定义：own 层遮蔽 inherited，使宿主的
  *    `get("send_message", child)` 解析到不带 adjacent 标记、且 fail-closed 的定义；
  *    随后用对象身份比对判定它是否真的生效。
  * ② 施加 admission 的 deny：只把当前 scope 的 restrictableNames 里的名字交给
  *    tools.restrict()，避免 own 层名称让整次 restriction 抛错。
  * ③ 注册角色 persona section（与宿主 child composition 同名，作用域内遮蔽全局默认项）。
+ * ④ 安装宿主 result-delivery 引导段过滤器：0.2.2 起宿主会给 parent-delivered child 的
+ *    首条任务追加一段固定英文（withResultDeliveryGuidance）。DEG 的 persona 已固定中文
+ *    交付协议，这段英文对 DEG 冗余却会进入首条任务消息与 GUI；过滤器在 agent/pre-step
+ *    把它从进入 step 的消息里剔除，使模型请求、durable 日志与界面一致。
  *
  * 时机：调用点在 agent/created（早于宿主 guidance 判定与首条任务消息提交，也早于第一次
- * system prompt 组装），因此补上的 section、restriction 与遮蔽定义都会被首个模型 step 采用。
+ * system prompt 组装），因此补上的 section、restriction、遮蔽定义与 pre-step 监听器都会在
+ * 首个模型 step 生效。
  *
  * fail loud 的边界（只对确有证据的一种情况抛错）：
  * - foreign（child 视图确实解析到别人的 send_message 定义）→ 抛错，让 agent/created 监听器
@@ -176,6 +299,12 @@ export function installExpertChildComposition(childCtx, spec = {}) {
       }
     }
   }
+
+  // ④ 宿主结果交付引导段：0.2.2 起宿主导致的首条任务英文注入。在 child 自有 scope 上
+  // 用 agent/pre-step 把该文本块从进入 step 的消息里剔除，模型请求、durable 日志与 GUI
+  // 同步变干净；DEG 的 persona 已固定中文交付协议，这里只是清掉冗余的宿主引导。
+  const guidanceFilterDispose = installHostResultDeliveryGuidanceFilter(childCtx, warn);
+  if (typeof guidanceFilterDispose === "function") disposers.push(guidanceFilterDispose);
 
   if (disposers.length === 0) return void 0;
   return () => {
