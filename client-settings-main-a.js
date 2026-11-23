@@ -311,14 +311,10 @@
         if (candidate.observerPreferred !== source.observerPreferred) {
           ops.push({ op: "set", path: ["observerPreferred"], value: candidate.observerPreferred });
         }
-        if (candidate.roleConcurrencyLimit !== source.roleConcurrencyLimit) {
-          ops.push({ op: "set", path: ["roleConcurrencyLimit"], value: candidate.roleConcurrencyLimit });
-        }
-        // 角色默认超时（票据 06）：只有真正变化才写 op，避免一次无关保存把
-        // 用户已保存的值重置回 0。
-        if (candidate.roleTimeoutMs !== source.roleTimeoutMs) {
-          ops.push({ op: "set", path: ["roleTimeoutMs"], value: candidate.roleTimeoutMs });
-        }
+        // 说明：fan-out 删除前这里还有 roleConcurrencyLimit / roleTimeoutMs 两条
+        // 「真正变化才写 op」的判定。两个字段已随 fan-out 移除，客户端既不读也不写：
+        // 旧 settings 文档里存的值由 Host 原样保留（缺字段 = 不覆盖），因此没有任何兼容
+        // 分支需要留在保存计划里。
         // 任务管理开关单独成一个保存 op，只用于判定「是否真的需要提交」；
         // 新客户端的完整候选始终显式携带该字段，Host 按「显式字段才写 patch」处理。
         if (candidate.taskManagementEnabled !== source.taskManagementEnabled) {
@@ -425,7 +421,7 @@
         const repairing = repair === true && peakValleyBroken;
         if ((!hasUnsavedChanges && !repairing) || saving || settingsSnapshot.writable !== true) return null;
         // 票据 20：模型目录不可用只阻断「这次确实要改模型字段」的保存。与模型无关的
-        // 字段（通知、任务开关、提示词、并发/超时）不依赖目录，必须照常保存——否则一次
+        // 字段（通知、任务开关、提示词等）不依赖目录，必须照常保存——否则一次
         // 目录刷新失败就会让整页设置不可写。
         if (modelFieldsChanged && !catalogAvailable) return null;
         // 最新权威配置：快照滞后时用刚提交的 accepted（见 committedAuthorityRef）。
@@ -1214,8 +1210,8 @@ function bindNotificationEventsDismiss({ isOpen, rootRef, triggerRef, setOpen })
        * - 判定对象是最终要提交的合成草稿（effectiveDraft）：只改提示词/候选时模型字段
        *   等于最新 source，因此不算模型字段变更；
        * - 顶层统一供应商或任一角色行级 defaults 与已保存快照不同即为变更；
-       * - 模型目录不可用时**只有它为真**才阻断保存：通知、任务开关、提示词、并发/超时
-       *   等与模型无关的字段必须照常保存。模型下拉本身已按目录可用性禁用，用户不可能
+       * - 模型目录不可用时**只有它为真**才阻断保存：通知、任务开关、提示词等与模型
+       *   无关的字段必须照常保存。模型下拉本身已按目录可用性禁用，用户不可能
        *   在没有目录的情况下做出新的模型草稿，因此这里判定草稿差异而不是操作来源。
        */
       const modelFieldsChanged = react.useMemo(() => {

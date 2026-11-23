@@ -165,6 +165,9 @@ export function createLineageModule({
       let candidate;
       do {
         sequence += 1;
+        // 前缀 "fanout-" 只是稳定 id 的命名空间，与功能无关：既有 parentTaskId 形状、
+        // 持久化 parentSessions 键与 RPC 归属查询都沿用该前缀，保留它以维持既有 id 的
+        // 连续性，不代表对应功能的存续。
         candidate = "fanout-" + parent.id + "-" + now().toString(36) + "-" + sequence.toString(36);
       } while (getTask(candidate) !== null);
       return candidate;

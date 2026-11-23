@@ -602,7 +602,7 @@ function buildCollectionsPort(readHostService) {
 /**
  * DEG 数据表端口（收敛期清理 DEG 数据用）。
  *
- * 只暴露两件事：按会话 ID **整行删除**、以及「读一行 → 变换 → 写回」（fan-out 任务树摘引用）。
+ * 只暴露两件事：按会话 ID **整行删除**、以及「读一行 → 变换 → 写回」（摘除记录里的跨会话引用）。
  * 两者都走宿主的写串行链与代次判定：绕过它们会破坏「单条记录原子、写入互不覆盖」的契约。
  */
 function buildDomainTablePort(state) {

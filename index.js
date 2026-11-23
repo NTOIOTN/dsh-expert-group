@@ -91,8 +91,8 @@ class ValidationError extends Error {}
 /**
  * 跨段装配状态容器（票据 21b）：替代迁移前 `apply` 内的 const/let 词法作用域。
  *
- * - 域句柄、晚绑定槽位（fanoutHost / expertCore / roleTools…）与共享取值函数都挂在同一个
- *   per-apply 对象上；
+ * - 域句柄、晚绑定槽位（expertCore / roleTools…）与共享取值函数都挂在同一个 per-apply
+ *   对象上；
  * - 一个进程会并发装配多个插件实例（测试 Host 并行），因此**不能用模块级 let**：那会让
  *   实例之间互相污染；
  * - 装配模块只接收这个显式状态对象与具名能力面，绝不接收 ctx。
@@ -114,10 +114,7 @@ function createAssemblyState({ config, goals, services, logger, clock }) {
     ...services,
     // 晚绑定槽位（= 迁移前 apply 内的 let）：所有调用点都在运行期，装配顺序保证
     // 「先用后赋值」的调用点在赋值之后才被执行。
-    fanoutHost: void 0,
     expertCore: void 0,
-    fanoutWaits: void 0,
-    fanoutCaches: void 0,
     roleTools: void 0,
     attachmentStore: void 0,
     expertGroupSessionQuery: void 0,
@@ -132,6 +129,11 @@ function createAssemblyState({ config, goals, services, logger, clock }) {
    */
   state.settingsSource = () => state.settingsStorage.readSettingsSource();
   state.source = () => state.settingsStorage.readSnapshot();
+  // 全部agent/created消费者共用同一个 exact-Agent 登记判定（宿主 registry 是唯一权威）。
+  state.isExactRegisteredAgent = (agent) => {
+    if (agent === null || typeof agent !== "object" || typeof agent.id !== "string" || agent.id.length === 0) return false;
+    try { return state.services?.agents?.get(agent.id) === agent; } catch { return false; }
+  };
   return state;
 }
 
@@ -181,7 +183,7 @@ function readHostClock(ctx) {
  * - `readCtxLocale` / `hasWaterfall` 是严格 Cordis Context 的 fail-closed 探针。
  * ctx 本体绝不出入口。
  */
-function createAssemblyCapabilities(ctx, tools) {
+function createAssemblyCapabilities(ctx, tools, state) {
   return {
     readCtxLocale: () => { try { return ctx.locale; } catch { return void 0; } },
     hasWaterfall: () => { try { return typeof ctx.waterfall === "function"; } catch { return false; } },
@@ -189,7 +191,31 @@ function createAssemblyCapabilities(ctx, tools) {
     effect: (factory, label) => ctx.effect(factory, label),
     effectValue: ctx.effect,
     subscribe: (event, handler, options) => (options === void 0 ? ctx.on(event, handler) : ctx.on(event, handler, options)),
-    registerTool: (definition, label) => ctx.effect(() => tools.register(definition), label),
+    registerTool: (definition, label) => {
+      let unregisterAttempted = false;
+      let unregisterSucceeded = false;
+      const disposeEffect = ctx.effect(() => {
+        const unregister = tools.register(definition);
+        return () => {
+          unregisterAttempted = true;
+          if (typeof unregister !== "function") {
+            unregisterSucceeded = false;
+            throw new Error("tools.register did not return an unregister disposer");
+          }
+          try {
+            unregister();
+            unregisterSucceeded = true;
+          } catch (error) {
+            unregisterSucceeded = false;
+            throw error;
+          }
+        };
+      }, label);
+      return () => {
+        disposeEffect();
+        return unregisterAttempted && unregisterSucceeded;
+      };
+    },
     /**
      * root 等待域的**三条全局活动监听**：域自己决定安装时机（首次查询前、只装一次），
      * 因此这里只能交出注册 adapter，不能预先登记。但 ctx.effect + 三个 ctx.on 与逆序
@@ -199,6 +225,7 @@ function createAssemblyCapabilities(ctx, tools) {
     registerRootWaitActivityListeners: ({ onActivity, onDispose }) => {
       ctx.effect(() => {
         const stopCreated = ctx.on("agent/created", ({ agent }) => {
+          if (!state.isExactRegisteredAgent(agent)) return;
           onActivity(agent);
         });
         const stopStatus = ctx.on("agent/status", ({ agent }) => {
@@ -284,9 +311,9 @@ export default {
       clock: readHostClock(ctx),
     });
     state.ValidationError = ValidationError;
-    // 请求取消错误构造器：上传归一与手动派发的 abort 能力面共用同一实现。
+    // 请求取消错误构造器：上传归一的 abort 能力面使用的唯一实现。
     state.createAbortError = createAbortError;
-    const caps = createAssemblyCapabilities(ctx, tools);
+    const caps = createAssemblyCapabilities(ctx, tools, state);
     const register = (entries) => applyAssemblyRegistrations(ctx, tools, entries);
     /**
      * 宿主服务读取器（票据 01）：会话删除要消费 sessionPersistence / workspaceRegistry /
@@ -332,7 +359,7 @@ export default {
       },
       onChange() {
         // 三个观察点收敛到同一入口（host/settings-source）：工具面已装配时保持
-        // 角色工具/fanout/提示词与设置一致（幂等）。
+        // 角色工具与提示词与设置一致（幂等）。
         state.syncRoleTools();
       },
     });
@@ -352,7 +379,7 @@ export default {
     register(assembleSnapshotInvalidation(state));
     assembleRoleTools(state);
     register(assembleToolSurface(state, caps));
-    // ── 7. RPC 传输 / 图片路由 / 模板 / 手动派发（票据 19/20）────────────────
+    // ── 7. RPC 传输 / 图片路由（票据 19/20）─────────────────────────────────
     register(assembleRpcSurface(state));
     register(assembleRpcActions(state, caps));
     register(assembleDiagnosticsAndRoute(state, caps));

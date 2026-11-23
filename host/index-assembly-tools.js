@@ -1,10 +1,10 @@
 /**
- * 入口装配段 4（票据 21b · R4-21）：专家委派工具域（core / fan-out / role / surface）、
- * fan-out runtime 接线、专家群运行时投影与工具面挂载。
+ * 入口装配段 4（票据 21b · R4-21）：专家委派工具域（core / role / surface）、
+ * 专家群运行时投影与工具面挂载。
  *
  * ## 注册点归属
- * - `ctx.effect`（fan-out runtime 关闭、四条快照失效监听、provider-added/removed）由入口按
- *   本模块返回的有序数组登记。
+ * - `ctx.effect`（四条快照失效监听、provider-added/removed）由入口按本模块返回的
+ *   有序数组登记。
  * - 工具挂载（`ctx.effect(() => tools.register(...))`）是**动态注册**：挂载时机由设置变更与
  *   provider 事件驱动，因此经入口提供的 `caps.registerTool` 能力注册；该能力的箭头函数
  *   （唯一调用 ctx.effect + tools.register 的位置）仍写在入口里。
@@ -12,16 +12,6 @@
  * @module dsh-expert-group/host/index-assembly-tools
  */
 import { createIndexExpertToolsCore } from "./index-expert-tools-core.js";
-import {
-  createFanoutWaitLedger,
-  createFanoutShardWaits,
-  createFanoutDeclarationCaches,
-  createFanoutTaskCommands,
-  createFanoutRequestBuilder,
-  createFanoutChildHandlers,
-  createFanoutToolHooks,
-  createFanoutRuntimeWiring,
-} from "./index-expert-tools-fanout.js";
 import {
   createRoleToolHandles,
   createRoleToolRebuild,
@@ -40,28 +30,22 @@ import {
   createRoleToolDefinition,
   createIndexExpertRoleTools,
 } from "./index-expert-tools-role.js";
-import { createFanoutToolSurface, createRoutingPrompt } from "./index-expert-tools-surface.js";
+import { createRoutingPrompt } from "./index-expert-tools-surface.js";
 import { createExpertGroupRuntime } from "./expert-group-runtime.js";
 
 /**
- * 委派核心 + fan-out 域（票据 18）：声明缓存 → 等待账本 → 任务命令 → 请求构造/child 回调
- * → runtime 装配；装配完成后立即消费 runtime 的 restore 快照并交出一条关闭 effect。
+ * 专家委派核心域（票据 18）：结构化声明/结果补丁、继承通道、启动适配器与 admission 事实。
+ *
+ * fan-out 域（声明缓存 / 等待账本 / 任务命令 / runtime 装配）已整体移除，本段因此不再
+ * 产生任何注册描述。
  *
  * @param {object} state 装配状态容器。
- * @returns {Array<object>} 有序注册描述。
+ * @returns {Array<object>} 有序注册描述（恒为空数组）。
  */
 export function assembleExpertTools(state) {
   const { logger } = state;
   const { tools, subagents, agents } = state.services;
-  const {
-    host,
-    delegationTracker,
-    storageBinding,
-    persistenceHealth,
-    activeRoles,
-    roleCatalog,
-    roleLabelOfRole,
-  } = state;
+  const { host } = state;
 
   const expertToolsIdentity = {
     lineage: host.lineage,
@@ -85,116 +69,9 @@ export function assembleExpertTools(state) {
     logger,
   });
 
-  // fan-out 域：声明缓存 -> 等待账本 -> 任务命令 -> 请求构造/child 回调 -> runtime 装配。
-  const fanoutRuntimeAccess = { getFanoutHost: () => state.fanoutHost };
-  state.fanoutCaches = createFanoutDeclarationCaches({ storage: { readSnapshot: state.readSnapshot }, runtime: fanoutRuntimeAccess });
-  const fanoutShardWaits = createFanoutShardWaits({
-    rootWait: {
-      isRootWaitStopping: state.isRootWaitStopping,
-      isLiveRootAgent: state.isLiveRootAgent,
-      track: (agent, work) => state.rootTurnWaits.track(agent, work),
-      settle: (agent, work) => state.rootTurnWaits.settle(agent, work),
-    },
-    runtime: fanoutRuntimeAccess,
-    caches: state.fanoutCaches,
-  });
-  state.fanoutWaits = createFanoutWaitLedger({
-    rootWait: {
-      isRootWaitStopping: state.isRootWaitStopping,
-      isLiveRootAgent: state.isLiveRootAgent,
-      track: (agent, work) => state.rootTurnWaits.track(agent, work),
-      settle: (agent, work) => state.rootTurnWaits.settle(agent, work),
-    },
-    agents,
-    runtime: fanoutRuntimeAccess,
-    caches: state.fanoutCaches,
-    shards: fanoutShardWaits,
-  });
-  const fanoutCommands = createFanoutTaskCommands({
-    core: state.expertCore,
-    models: { resolveRole: state.resolveRole },
-    runtime: fanoutRuntimeAccess,
-    waits: state.fanoutWaits,
-    caches: state.fanoutCaches,
-  });
-  state.fanoutCommands = fanoutCommands;
-  const fanoutRequestBuilder = createFanoutRequestBuilder({
-    identity: expertToolsIdentity,
-    models: {
-      restoredFanoutModelRoute: state.restoredFanoutModelRoute,
-      resolveRoleModelRoute: state.resolveRoleModelRoute,
-      routeMarkerOf: state.routeMarkerOf,
-      // 派发路由冻结快照 marker（票据 03）：与 attempt.route 同一份数据，随 child_models 落盘。
-      routeSnapshotMarkerOf: state.routeSnapshotMarkerOf,
-    },
-    core: state.expertCore,
-    roles: { require: (role) => roleCatalog().require(role) },
-    storage: { resolvePersonaForAdmission: state.resolvePersonaForAdmission },
-    caches: state.fanoutCaches,
-  });
-  const fanoutChildHandlers = createFanoutChildHandlers({
-    childSurface: {
-      installExpertReportGuardForAgent: state.installExpertReportGuardForAgent,
-      installEffortInjection: state.installEffortInjection,
-      installModelFallbackRouteOverride: state.installModelFallbackRouteOverride,
-      resolveEffortOf: state.resolveEffortOf,
-    },
-    storage: { readSnapshot: state.readSnapshot, writeChildModel: state.writeChildModel },
-    core: state.expertCore,
-    roles: { roleLabelOfRole },
-    recovery: { noteChildActivation: state.noteChildActivation },
-  });
-  const fanoutHooks = createFanoutToolHooks({
-    identity: expertToolsIdentity,
-    childIo: {
-      sendMessageToExistingChild: state.sendMessageToExistingChild,
-      interrupt: (childId, parentAgent) => subagents.interrupt(childId, { kind: "ancestor", agent: parentAgent }),
-    },
-    core: state.expertCore,
-    waits: state.fanoutWaits,
-    requestBuilder: fanoutRequestBuilder,
-    childHandlers: fanoutChildHandlers,
-    /**
-     * 派发期路由冻结 seam（票据 03）：只交出两个**只读取值函数**（同一代读的设置快照 +
-     * 只读时钟）。判定语义留在 fanout 域（host/fanout-dispatch-route.js），组合根不写
-     * 第二套选路；时钟沿用 per-apply 的只读时钟，因此测试注入假时钟即可确定性断言。
-     */
-    dispatch: {
-      readSettingsSnapshot: () => state.readSnapshot(),
-      clock: state.clock,
-    },
-  });
-  const fanoutRuntime = createFanoutRuntimeWiring({
-    identity: expertToolsIdentity,
-    roles: { activeRoles, roleCatalog },
-    storage: {
-      readSettingsSource: state.readSettingsSource,
-      // 宿主子代理名额（settings-source 的缓存值）：与 settings 读源同属「配置读取」这一组，
-      // 因此并入 storage 能力面，不新增第 9 个协作方（C3 保持 8 组）。同步取值、读不到即
-      // undefined（不封顶），绝不在派发热路径上调用宿主 describe()。
-      readHostConcurrencyCap: () => (typeof host?.settings?.hostConcurrencyCap === "function"
-        ? host.settings.hostConcurrencyCap()
-        : undefined),
-      readFanoutSnapshot: () => storageBinding.fanoutSnapshot(),
-      persistFanoutSnapshot: state.persistFanoutSnapshot,
-      persistenceHealth,
-    },
-    waits: state.fanoutWaits,
-    caches: state.fanoutCaches,
-    hooks: fanoutHooks,
-    commands: fanoutCommands,
-    logger,
-  });
-  state.fanoutHost = fanoutRuntime.host;
-  state.consumeFanoutRestore("runtime-wired", state.fanoutHost.restore());
-  // 关闭/回收边界清理 Host 侧 schema 映射：关闭后不再有可复用的派发契约。
-  return [{
-    kind: "effect",
-    label: "dsh-expert-group: fan-out runtime",
-    factory: () => () => {
-      fanoutRuntime.close();
-    },
-  }];
+  // fan-out 域（任务账本 / 声明缓存 / 任务命令 / runtime 装配）已随 fan-out 整体移除：
+  // 本段现在只构造专家委派核心域，不再注册任何运行期 effect。
+  return [];
 }
 
 /**
@@ -219,8 +96,8 @@ export function assembleExpertGroupRuntime(state) {
   state.expertGroupRuntime = createExpertGroupRuntime({
     agents: { agents },
     goals: { goals: state.goals },
-    // 归属判定读面：血缘链 + 任务管理器（两者已作为单个聚合传给 fanoutTasksOwnedBy）。
-    ownership: { lineage: state.host.lineage, fanoutHost: state.fanoutHost },
+    // 归属判定读面：血缘链（任务管理器已随 fan-out 移除）。
+    ownership: { lineage: state.host.lineage },
     // 恢复域读面：模块命令面 + 记录表（记录表同时供快照缓存复用）。
     recovery: { recovery: state.recovery, recoveryRecords: state.recordsView },
     sources: {
@@ -274,7 +151,10 @@ export function assembleSnapshotInvalidation(state) {
         invalidateSnapshotFor(session?.id);
       },
     },
-    { kind: "on", event: "agent/created", handler: ({ agent } = {}) => invalidateSnapshotFor(agent?.id) },
+    { kind: "on", event: "agent/created", handler: ({ agent } = {}) => {
+      if (!state.isExactRegisteredAgent(agent)) return;
+      invalidateSnapshotFor(agent?.id);
+    } },
     { kind: "on", event: "agent/status", handler: ({ agent } = {}) => invalidateSnapshotFor(agent?.id) },
     { kind: "on", event: "agent/disposed", handler: ({ agent } = {}) => invalidateSnapshotFor(agent?.id) },
   ];
@@ -405,7 +285,7 @@ export function assembleRoleTools(state) {
 }
 
 /**
- * 工具面装配域（票据 18）：fanout 工具定义 + routing 提示词 + 挂载表 + provider 事件。
+ * 工具面装配域（票据 18）：routing 提示词 + 角色工具挂载表 + provider 事件。
  *
  * 挂载/卸载函数写到状态容器：角色工具同步命令（bootstrap 段）与 provider 事件都通过
  * 它们走同一个注册 adapter（`caps.registerTool`）。
@@ -415,17 +295,8 @@ export function assembleRoleTools(state) {
  * @returns {Array<object>} 有序注册描述。
  */
 export function assembleToolSurface(state, caps) {
-  const { services, activeRoles, isActiveRole } = state;
+  const { services, activeRoles, logger } = state;
   const { systemPrompt } = services;
-  const fanoutSurface = createFanoutToolSurface({
-    commands: state.fanoutCommands,
-    models: { resolveRoleModelRoute: state.resolveRoleModelRoute },
-    identity: state.expertToolsIdentity,
-    core: state.expertCore,
-    roles: { isActiveRole, activeRoles },
-    toolMount: state.roleTools,
-  });
-  state.fanoutSurface = fanoutSurface;
   const routingPrompt = createRoutingPrompt({
     systemPrompt,
     config: state.config,
@@ -446,27 +317,15 @@ export function assembleToolSurface(state, caps) {
     state.roleTools.release(role);
   }
 
-  /** 挂载通用 fanout 工具（同样只走入口的注册 adapter）。 */
-  function mountFanoutTool() {
-    const prepared = fanoutSurface.prepareFanoutMount();
-    if (prepared === null) return;
-    const disposeTool = caps.registerTool(prepared.definition, prepared.label);
-    fanoutSurface.commitFanoutMount(disposeTool);
-  }
-
-  function unmountFanoutTool() {
-    fanoutSurface.unmountFanoutTool();
-  }
-
   function refreshRoutingPrompt() {
+    // role 目录刷新（syncRoleTools）也会走到这里：它只重建 routing/orchestrator 段落。
     routingPrompt.refreshRoutingPrompt();
   }
-  Object.assign(state, { mountRole, unmountRole, mountFanoutTool, unmountFanoutTool, refreshRoutingPrompt });
+  Object.assign(state, { mountRole, unmountRole, refreshRoutingPrompt });
 
   for (const role of activeRoles()) mountRole(role);
-  mountFanoutTool();
   refreshRoutingPrompt();
-  // 工具面装配完成：此后任何目录重建（设置保存/外部编辑）都要同步挂载/卸载工具。
+  // 工具面装配完成：此后任何角色目录重建（设置保存/外部编辑）都要同步挂载/卸载角色工具。
   state.roleToolsReady = true;
 
   return [
@@ -475,8 +334,11 @@ export function assembleToolSurface(state, caps) {
       event: "subagent/provider-added",
       handler: (provider) => {
         if (provider?.name !== "spawn") return;
-        for (const role of activeRoles()) mountRole(role);
-        mountFanoutTool();
+        for (const role of activeRoles()) {
+          try { mountRole(role); } catch (error) {
+            logger.warn("dsh-expert-group: mount tool " + role + " failed: " + (error instanceof Error ? error.name : typeof error));
+          }
+        }
         refreshRoutingPrompt();
       },
     },
@@ -486,8 +348,11 @@ export function assembleToolSurface(state, caps) {
       event: "subagent/provider-removed",
       handler: (providerName) => {
         if (providerName !== "spawn") return;
-        for (const role of activeRoles()) unmountRole(role);
-        unmountFanoutTool();
+        for (const role of activeRoles()) {
+          try { unmountRole(role); } catch (error) {
+            logger.warn("dsh-expert-group: unmount tool " + role + " failed: " + (error instanceof Error ? error.name : typeof error));
+          }
+        }
         refreshRoutingPrompt();
       },
     },

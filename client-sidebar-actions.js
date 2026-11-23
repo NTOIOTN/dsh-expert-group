@@ -130,23 +130,6 @@
      * 开关关闭时不做任何自动 open/close（历史行为逐字节不变），已打开的 tab 交由用户手动处理；
      * 清理阶段与开关无关，它只维护插件自己的记账，不触碰宿主。
      */
-    /**
-     * 分片没有可用会话标识时的候选层诊断（票 04）。
-     *
-     * 沿用既有 decision 通道的 skip 语义（与 persisted-manual / owner-capacity 同一形状），
-     * reason 是唯一的可区分判据：shard-child-missing。shardId 只参与 key 摘要，绝不落原文。
-     *
-     * **这条诊断不等于「分片能自动打开」**：Host 投影仍会在归属未证明时清空 childId，
-     * 客户端只能给出原因；真正闭环需要另一张 Host 投影票（见票 04 说明）。
-     */
-    const recordShardChildMissing = (shardId) => {
-      recordSidebarAutoDecision(
-        "open",
-        { key: "shard-child-missing:" + text(shardId, "unknown"), kind: "open" },
-        "skip",
-        "shard-child-missing",
-      );
-    };
 
     function syncAutoSidebarTabs() {
       const source = snapshot;
@@ -154,16 +137,9 @@
       if (source === null || source === undefined) return;
       // root 切换瞬间旧快照可能仍在 state 里：只有属于当前 root 的快照才能决定动作。
       if (text(source.rootSessionId, null) !== rootSessionId) return;
-      /**
-       * Auto 开关的权威读面提前到候选求值之前：`enabled` 只被读取一次（与原实现同一份读面），
-       * 位置前移两行不改变任何写入顺序，只让「本帧是否记录分片诊断」用上同一份结论。
-       */
       const enabled = autoOpenEnabled();
       const known = knownSidebarResourceAddresses();
-      // 运行中集合是本票唯一的自动打开候选来源，因此由它承载 shard-child-missing 诊断；
-      // 已知地址/空闲候选同样按统一规则排除该分片，但不再各写一条（避免同一事实刷满诊断环）。
-      // Auto 关闭时不写这条诊断：那不是「本可以打开却被挡住」的事实，写它只会填满有界诊断环。
-      const running = runningSidebarResourceAddresses(enabled === true ? recordShardChildMissing : undefined);
+      const running = runningSidebarResourceAddresses();
       /**
        * 先回收过期的打开占位（缺陷 2）：它只维护插件自己的记账、绝不触碰宿主，因此与 Auto 开关无关
        * （与下面的记账清理同一条边界）。放在候选选择之前，被回收的容量当轮就能重新用上。

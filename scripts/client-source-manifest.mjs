@@ -120,7 +120,6 @@ const IIFE_EXECUTION_ORDER = Object.freeze([
   // 全部先于唯一 descriptor 执行——descriptor 只从各自检查点取回实现。
   "client-text.js",
   "client-styles.js",
-  "client-fanout-normalize.js",
   "client-native-status.js",
   "client-settings-normalize.js",
   "client-model-config-host.js",
@@ -810,12 +809,6 @@ export const iifeDependencies = Object.freeze([
     from: "client-expert-group-model.js",
     to: "client-text.js",
     symbols: Object.freeze(["dsh-expert-group/client-expert-group-model"]),
-    via: "iife-symbol",
-  }),
-  Object.freeze({
-    from: "client-fanout-normalize.js",
-    to: "client-entry.js",
-    symbols: Object.freeze(["dsh-expert-group/client-fanout-normalize"]),
     via: "iife-symbol",
   }),
   Object.freeze({

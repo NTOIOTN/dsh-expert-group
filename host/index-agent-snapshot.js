@@ -113,9 +113,9 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
    *
    * @param {object} agent - exact Agent 对象。
    * @param {object} expert - resolveExpertIdentity 的结果加 isExpertChild 判定。
-   * @param {{effort: *}} input - 已解析的显式推理深度。
+   * @param {{effort: *, snapshotOnly?: boolean}} input - 已解析档位；snapshotOnly只允许跳过runtime副作用。
    */
-  function persistChildModel(agent, expert, { effort }) {
+  function persistChildModel(agent, expert, { effort, snapshotOnly = false }) {
     const { role, parentId, isContinuable, recordedExpert, isExpertChild, pluginChildAuthenticated } = expert;
     const denyMarkerSnapshot = agent.options?.[DENY_MARKER] !== void 0
       ? agent.options[DENY_MARKER]
@@ -165,8 +165,8 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
     const inheritContextSnapshot = typeof agent.options?.[EXPERT_INHERIT_CONTEXT_MARKER] === "boolean"
       ? agent.options[EXPERT_INHERIT_CONTEXT_MARKER]
       : (typeof recordedExpert?.inheritContext === "boolean" ? recordedExpert.inheritContext : void 0);
-    if (pluginChildAuthenticated) registerPluginExpertChildAgent(agent);
-    if (isExpertChild) {
+    if (snapshotOnly !== true && pluginChildAuthenticated) registerPluginExpertChildAgent(agent);
+    if (snapshotOnly !== true && isExpertChild) {
       // 该监听器在早期 guard listener 之后运行；此时 role/parentId 已从 marker、
       // cold-resume 快照或 recovery record 建立，必须再次尝试 child scoped guard。
       guards.installExpertReportGuard(agent, { role, parentId, source: recordedExpert === void 0 ? "marker" : "snapshot" });
@@ -176,9 +176,9 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
        * 写入语义选择：**浅合并**（`storage.writeChildModelPatch`），而不是整条替换。
        *
        * 本函数只负责「本次 created 观测到的」模型 / 身份 / 路由 / 结构化 / shadow 字段，
-       * 它**不负责** child_models 里的 lastDispatch、usage、createdAt 与 fanout* 来源身份。
+       * 它**不负责** child_models 里的 lastDispatch、usage、createdAt 等历史字段。
        * 旧实现用 `writeChildModel` 整条覆盖，于是每次 agent/created（含**冷恢复**重放）
-       * 都会把这些字段一并抹掉：真实数据里 22 条非 fanout 记录只剩本函数的字段集合，
+       * 都会把这些字段一并抹掉：真实数据里 22 条历史记录只剩本函数的字段集合，
        * 历史专家行的任务名因此回退到 DSH session title（prompt 首句）。
        *
        * 改用 patch 后，本函数只覆盖自己真正知道的键，其余字段（含将来新增的持久字段）
@@ -211,8 +211,7 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
           // 实际路由元数据（票据 24）：与 provider/model 同层落盘，恢复/续作只读不重选。
           ...(routeMarkerSnapshot === undefined ? {} : routeMarkerSnapshot),
           // 派发路由冻结快照（票据 03）：完整计划 + 时段 + 层；child 侧只是只读投影，
-          // fanout 的权威快照在 attempt.route（本票未改造 fanout 协议时，此字段是分片
-          // child 在进程内的唯一载体，冷恢复仍能读到同一形状）。
+          // 该字段是 child 在进程内的唯一载体，冷恢复仍能读到同一形状。
           ...(routeSnapshot === undefined ? {} : { route: routeSnapshot }),
           // 目标 subagent provider 与继承开关（票据 29）：恢复/重建只读这两个字段，
           // 绝不按当前设置重新选择。旧记录缺失时按 spawn/false 处理。
@@ -236,12 +235,25 @@ export function createAgentSnapshotDomain({ storage, roles, core, modelRoute, gu
   }
 
   /**
-   * 为专家 child 安装运行期模型降级覆盖（动态 agent.ctx.on 注册 adapter 在组合根）。
-   * @param {object} agent - exact Agent 对象。
+   * 仅为auto-recovery已提交的exact replacement写基础快照；不登记身份或安装运行期guard。
+   * @param {object} agent - exact且已commit的replacement Agent。
+   * @param {{role: string, parentId: string, effort: *}} identity - 已提交的恢复身份与档位。
    */
+  function persistCommittedRecoveryChild(agent, { role, parentId, effort }) {
+    const recordedExpert = readChildModel(agent.id);
+    persistChildModel(agent, {
+      role,
+      parentId,
+      isContinuable: true,
+      recordedExpert,
+      isExpertChild: true,
+      pluginChildAuthenticated: false,
+    }, { effort, snapshotOnly: true });
+  }
+
   function installFallbackRoute(agent) {
     modelRoute.installFallbackOverride(agent);
   }
 
-  return { resolveExpertIdentity, readChildModel, persistChildModel, installFallbackRoute };
+  return { resolveExpertIdentity, readChildModel, persistChildModel, persistCommittedRecoveryChild, installFallbackRoute };
 }

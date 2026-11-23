@@ -18,15 +18,16 @@ import { createAgentRequestErrorHandler } from "./index-agent-request-error.js";
  * 会话覆盖 + 模型路由 + 设置校验域（票据 16）。
  *
  * 域服务只返回纯能力面：没有 ctx 注册点，也不持有容器。ValidationError 由入口创建并
- * 放进状态容器（RPC 400 映射与图片路由共用同一个类身份），subagent provider 名归一
- * 是 R4d 域的纯函数（晚绑定，调用期解析）。
+ * 放进状态容器（RPC 400 映射与图片路由共用同一个类身份）。subagent provider 名归一的
+ * 旧参数 `normalizeSubagentProvider` 已随 fan-out 物理删除成为死码（本工厂从未解构它），
+ * 因此不再传入；该能力仍由 agent 快照段的 `core` 面持有。
  *
  * @param {object} state 装配状态容器。
  */
 export function assembleModelRoute(state) {
   const { logger, config } = state;
   const { llm, settings } = state.services;
-  const { settingsRuntime, updateSettingsAtGeneration, configMigrationPending, roleCatalog, activeRoles } = state;
+  const { settingsRuntime, updateSettingsAtGeneration, roleCatalog, activeRoles } = state;
 
   const modelRoute = createIndexModelRouteDomain({
     llm,
@@ -36,7 +37,6 @@ export function assembleModelRoute(state) {
     clock: state.clock,
     settingsRuntime,
     updateSettingsAtGeneration,
-    configMigrationPending,
     settingsRead: {
       readSettingsSource: state.readSettingsSource,
       readSnapshot: state.readSnapshot,
@@ -44,9 +44,7 @@ export function assembleModelRoute(state) {
       defaultPersonaForRole: state.defaultPersonaForRole,
     },
     roles: { roleCatalog, activeRoles },
-    getFanoutHost: () => state.fanoutHost,
     ValidationError: state.ValidationError,
-    normalizeSubagentProvider: (value) => state.expertCore?.validSubagentProviderName(value),
   });
   Object.assign(state, modelRoute);
   state.modelRoute = modelRoute;
@@ -71,7 +69,6 @@ export function assembleModelRoute(state) {
       dropParentRecoveryRecords: state.dropParentRecoveryRecords,
     },
     delegation: { dropParent: (parentId) => state.delegationTracker.dropParent(parentId) },
-    fanout: { releaseRetiredRootHandoffs: (agent) => state.fanoutWaits?.retireHandoffRecordsForRoot(agent) },
   });
   Object.assign(state, effortRetire);
   state.effortRetire = effortRetire;
@@ -125,6 +122,8 @@ export function assembleAgentHandlers(state) {
     modelRoute: { installFallbackOverride: (agent) => state.installModelFallbackRouteOverride(agent) },
     guards: { installExpertReportGuard: (agent, resolvedIdentity) => state.installExpertReportGuardForAgent(agent, resolvedIdentity) },
   });
+  // 后续auto-recovery只在rebuild已提交后调用此snapshot-only窄写面。
+  state.persistCommittedRecoveryChild = (...args) => agentSnapshot.persistCommittedRecoveryChild(...args);
   // root 生命周期面：身份/代际/等待/退休与 handoff 只读状态探针属于同一关注点
   // （回答「这个 exact root 当前处在哪个生命周期阶段」），因此合并为一组传入。
   const rootLifecycle = () => ({
@@ -137,7 +136,6 @@ export function assembleAgentHandlers(state) {
     markRootDisposed: state.markRootDisposed,
     forgetRootUserWait: state.forgetRootUserWait,
     rootTurnWaits: state.rootTurnWaits,
-    releaseRetiredRootHandoffs: state.releaseFanoutHandoffRecordsForRetiredRoot,
     hasRootHandoffState: (agent) => host.handoff.some((entry) => entry.parent === agent)
       || state.hasParentTurnEnds(agent)
       || state.hasFailedHandoffParent(agent),
@@ -145,11 +143,6 @@ export function assembleAgentHandlers(state) {
   const agentCreatedHandler = createAgentCreatedHandler({
     logger,
     rootWait: { engageRootTurnWaitForCreatedAgent: state.engageRootTurnWaitForCreatedAgent },
-    fanout: {
-      consumeFanoutRestore: state.consumeFanoutRestore,
-      getFanoutHost: () => state.fanoutHost,
-      reconcileGoalHandoffs: () => state.fanoutWaits?.reconcileFanoutGoalHandoffs(),
-    },
     roots: rootLifecycle(),
     guards: { installExpertReportGuard: (agent, resolvedIdentity) => state.installExpertReportGuardForAgent(agent, resolvedIdentity) },
     effort: { resolveEffortOf: state.resolveEffortOf, installEffortInjection: state.installEffortInjection },
@@ -161,11 +154,11 @@ export function assembleAgentHandlers(state) {
       invalidateRequestRetryState: state.invalidateRequestRetryState,
     },
     snapshot: agentSnapshot,
+    getOrdinaryActivationIntent: () => state.expertCore?.currentOrdinaryActivationIntent(),
   });
   const agentDisposedHandler = createAgentDisposedHandler({
     logger,
     roots: rootLifecycle(),
-    fanout: { getFanoutHost: () => state.fanoutHost },
     // F6 的 guard disposer 表仍由状态容器持有；域只经两个命令读取与摘除（同序、同容错）。
     guards: {
       getGuardCleanup: (agent) => state.expertReportGuardDisposers.get(agent),
@@ -182,7 +175,6 @@ export function assembleAgentHandlers(state) {
       dropParent: (parentId) => delegationTracker.dropParent(parentId),
       completeDetachedActiveTasksForChild: (childId) => delegationTracker.completeDetachedActiveTasksForChild(childId),
     },
-    snapshot: agentSnapshot,
   });
   const agentRequestErrorHandler = createAgentRequestErrorHandler({
     logger,
@@ -200,7 +192,7 @@ export function assembleAgentHandlers(state) {
   void recoveryDomain;
 
   return [
-    { kind: "on", event: "agent/created", handler: ({ agent }) => agentCreatedHandler.handleAgentCreated(agent) },
+    { kind: "on", event: "agent/created", handler: (event) => agentCreatedHandler.handleAgentCreated(event) },
     { kind: "on", event: "agent/disposed", handler: ({ agent }) => agentDisposedHandler.handleAgentDisposed(agent) },
     { kind: "on", event: "agent/request-error", handler: agentRequestErrorHandler.handleAgentRequestError, options: { prepend: true } },
   ];

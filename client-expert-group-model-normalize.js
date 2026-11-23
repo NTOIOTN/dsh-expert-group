@@ -5,9 +5,9 @@
  * **归一与状态推导**这一半：
  * 1. 无副作用原语：isObject / text / firstText / numberOrNull，以及有界归一原语
  *    （countOrNull / boundedText / durationBetween / collapseFailureMessage / redactFailurePaths）；
- * 2. 状态推导：normalizeStatus / statusFromTask / runningOf / activitySignalOf /
+ * 2. 状态推导：normalizeStatus / runningOf / activitySignalOf /
  *    runtimeStatusOf，以及运行摘要（normalizeRunSummary）与恢复块（normalizeRecovery）归一；
- * 3. 快照树归一：能力、时间线、attempt / shard / fanout / session 节点，直到
+ * 3. 快照树归一：能力、时间线、attempt 与 session 节点，直到
  *    normalizeExpertGroupSnapshot —— 快照树归一是状态推导的核心，不留在展示侧。
  *
  * ## 依赖方向（单一，由 scripts/check-dependency-graph.mjs 验证）
@@ -56,7 +56,7 @@
    * 超长内容截断，绝不把任意自由文本原样渲染进 UI。
    */
   const CAPABILITY_ACTIONS = Object.freeze(["read", "cancel", "retry", "continue"]);
-  const SHARD_CAPABILITY_ACTIONS = Object.freeze(["cancel", "retry"]);
+
   const CAPABILITY_REASON_MAX_LENGTH = 64;
 
   /**
@@ -70,10 +70,6 @@
   const ROUTE_PERIOD_VALUES = Object.freeze(["peak", "valley", "none"]);
   const ROUTE_TIER_VALUES = Object.freeze(["peak", "valley", "normal-override", "normal-fallback"]);
   const ROUTE_TEXT_MAX_LENGTH = 64;
-
-  const COUNT_FIELDS = Object.freeze([
-    "queued", "waiting", "running", "succeeded", "failed", "cancelled", "timed_out", "interrupted", "pending",
-  ]);
 
   // ── 任务时间线与受限失败摘要（票据 12） ──────────────────────────────────────
   //
@@ -113,7 +109,7 @@
    * 右侧栏对外的**代理运行状态**只有这两个规范值。
    *
    * 官方源字段（DSH 子代理目录）用 activity=running/inactive、Agent status=running/idle
-   * 两套词表；协议快照还带着 fan-out 的 queued/waiting/终态。展示层把它们全部收敛成
+   * 两套词表；协议快照还带着 queued/waiting/终态。展示层把它们全部收敛成
    * running|ready：只有「明确运行」才是 running，其余一律 ready。
    */
   const RUNTIME_STATUSES = Object.freeze(["running", "ready"]);
@@ -254,14 +250,6 @@
     return STATUS_ALIASES[key] || "unknown";
   }
 
-  function statusFromTask(value) {
-    const source = text(value);
-    if (source === "pending") return "running";
-    if (source === "completed" || source === "complete") return "succeeded";
-    if (source === "completed_with_errors") return "failed";
-    return normalizeStatus(source);
-  }
-
   function runningOf(status, explicit) {
     if (typeof explicit === "boolean") return explicit;
     if (status === "unknown") return null;
@@ -308,7 +296,7 @@
    * 只要存在任何证据（目录 activity/status、节点 running 布尔、协议 status）就仍按原规则渲染。
    * 不传 options 时行为与旧实现逐字一致（旧 Host、测试与所有既有调用点不受影响）。
    *
-   * @param {object} node - 快照节点（专家/根/fan-out 任务或分片）。
+   * @param {object} node - 快照节点（专家或根会话）。
    * @param {object} [entry] - sessions 快照里的官方目录项。
    * @param {{partial?: boolean}} [options] - 展示层选项；partial 为 true 时才可能出现中性值。
    * @returns {"running"|"ready"|"unknown"}
@@ -578,36 +566,6 @@
   }
 
   /**
-   * 节点级时间线字段归一（fanout/shard 共用，票据 12）。
-   *
-   * Host 投影的字段恒存在；旧快照可能一个都没有。规则：
-   * - startedAt：缺失时用 fallback（fanout/shard 都可回退 createdAt，与 Host 同义）；
-   * - finishedAt：只取**输入里显式给出的值**，绝不按状态补一个完成时间（运行中的分片没有终点）；
-   * - durationMs：缺失时由 startedAt/finishedAt 推导（旧快照仍带着两端时间戳），两者都缺就是 null；
-   * - attemptCount：缺失时由调用方给出的可证明结构（attempts.length / 分片汇总）回退，再缺为 0；
-   * - retryCount：缺失时按 max(0, attemptCount-1) 回退，绝不臆造 maxAttempts；
-   * - failure：受限摘要或 null（形状见 normalizeFailure）。
-   */
-  function normalizeTimelineFields(source, fallback) {
-    const defaults = isObject(fallback) ? fallback : {};
-    const startedAt = numberOrNull(source.startedAt) ?? numberOrNull(defaults.startedAt);
-    // 明确仍在进行中的节点没有完成时间：即使输入误带 finishedAt/durationMs 也不采用，
-    // 否则侧栏会把「正在跑」渲染成「已耗时 X」。状态缺失/unknown 时保持宽容。
-    const stillActive = ACTIVE_STATUS_SET.has(normalizeStatus(source.status));
-    const finishedAt = stillActive ? null : numberOrNull(source.finishedAt);
-    const attemptCount = numberOrNull(source.attemptCount) ?? (numberOrNull(defaults.attemptCount) ?? 0);
-    return {
-      startedAt,
-      finishedAt,
-      durationMs: stillActive ? null : (numberOrNull(source.durationMs) ?? durationBetween(startedAt, finishedAt)),
-      lastActivityAt: numberOrNull(source.lastActivityAt) ?? numberOrNull(defaults.lastActivityAt),
-      attemptCount,
-      retryCount: numberOrNull(source.retryCount) ?? (numberOrNull(defaults.retryCount) ?? Math.max(0, attemptCount - 1)),
-      failure: normalizeFailure(source.failure),
-    };
-  }
-
-  /**
    * 跨层回退白名单归一（票据 06）：形状不完整就整字段省略，绝不补默认值。
    *
    * 为什么逐字段校验：Host 已经收敛过一次，但旧 Host 或手工合成的负载仍可能夹带自由文本；
@@ -629,7 +587,7 @@
   }
 
   /**
-   * attempt / shard / fanout / 会话节点的时段·层·跨层回退字段（票据 06）。
+   * attempt 与会话节点的时段·层·跨层回退字段（票据 06）。
    *
    * 纯只读投影：存在才透传，缺失不写默认值（旧 Host 的快照因此不会凭空多出三个键）；
    * 客户端也不做任何「按当前时段补一个值」的推断。
@@ -666,138 +624,6 @@
       // 旧快照的 attempt 只有两端时间戳；从它们算出耗时是事实推导，不是伪造。
       durationMs: stillActive ? null : (numberOrNull(source.durationMs) ?? durationBetween(startedAt, finishedAt)),
       failure: normalizeFailure(source.failure),
-    };
-  }
-
-  function normalizeShard(value, inherited) {
-    const source = isObject(value) ? value : {};
-    const defaults = isObject(inherited) ? inherited : {};
-    const attempts = Array.isArray(source.attempts) ? source.attempts.map(normalizeAttempt) : [];
-    const latest = attempts.length === 0 ? null : attempts[attempts.length - 1];
-    const managerStatus = source.status === undefined ? "unknown" : normalizeStatus(source.status);
-    // Host 已将 fan-out manager 与 attempt 历史归并成权威状态；客户端仅在旧 Host
-    // 没有投影该字段时用最新 attempt 补全，避免浏览器再次解释协议并产生漂移。
-    const status = managerStatus !== "unknown" ? managerStatus : (latest?.status ?? "unknown");
-    return {
-      shardId: text(source.shardId),
-      // taskName 是 Host 投影的权威分片任务名（优先任务名称，旧数据回退分片代号）；
-      // 客户端只在旧 Host 完全没有投影该字段时才用 shardId 兜底，绝不反过来覆盖已有名称。
-      taskName: firstText(source.taskName, source.shardId),
-      prompt: firstText(source.prompt, source.content),
-      role: firstText(source.role, defaults.role),
-      // 角色显示名（票据 27）：分片自身的 roleLabel 优先，缺失回退父任务继承值。
-      roleLabel: firstText(source.roleLabel, defaults.roleLabel),
-      provider: firstText(source.provider, defaults.provider),
-      model: firstText(source.model, defaults.model),
-      effort: firstText(source.effort, source.reasoningEffort, defaults.effort, defaults.reasoningEffort),
-      // 时段/层/跨层回退（票据 06）：来自 Host 投影，客户端只读透传。
-      ...routeFields(source),
-      status,
-      // 票据 25/30：分片级用量与最新 attempt 的结构化结果（Host 已投影在分片上）。
-      ...usageFields(source),
-      ...structuredFields(source),
-      running: runningOf(status, source.running),
-      runSummary: normalizeRunSummary(source.runSummary),
-      // 该会话全部 turn 的累计墙钟（与 DSH 状态行同源，轮次之间空闲不计）；旧快照缺失时为 null。
-      turnDurationMs: numberOrNull(source.turnDurationMs),
-      // 最后一个未闭合 turn 的起点（additive）：客户端锚定外推的唯一依据；闭合/旧快照为 null。
-      turnOpenSince: numberOrNull(source.turnOpenSince),
-      continuable: typeof source.continuable === "boolean" ? source.continuable : null,
-      // shard 能力（票据 09）：只有 Host 给出可判定项时才存在；缺失时渲染层回退状态推导。
-      ...(() => {
-        const capabilities = normalizeCapabilities(source.capabilities, SHARD_CAPABILITY_ACTIONS);
-        return capabilities === null ? {} : { capabilities };
-      })(),
-      childId: latest?.childId ?? text(source.childId),
-      createdAt: numberOrNull(source.createdAt),
-      attempts,
-      // 时间线（票据 12）：字段恒存在，旧快照缺失时为 null/0。startedAt 回退 createdAt 与
-      // Host 的 projectShardTimeline 同义；attemptCount 在旧快照里可由 attempts 长度证明。
-      ...normalizeTimelineFields(source, {
-        startedAt: numberOrNull(source.createdAt),
-        attemptCount: attempts.length,
-      }),
-    };
-  }
-
-  function normalizeCounts(value) {
-    if (!isObject(value)) return null;
-    const result = {};
-    for (const field of COUNT_FIELDS) result[field] = numberOrNull(value[field]);
-    return result;
-  }
-
-  function normalizeFanout(value) {
-    const source = isObject(value) ? value : {};
-    const parentTaskId = text(source.parentTaskId);
-    const taskStatus = text(source.taskStatus) || text(source.status);
-    const status = taskStatus === null ? "unknown" : statusFromTask(taskStatus);
-    const rawShards = Array.isArray(source.shards) ? source.shards : [];
-    // 先归一分片，父任务的 attemptCount/retryCount 才能用分片汇总做旧快照回退
-    // （与 Host projectFanoutTimeline 的汇总口径一致：父任务不把同一份 attempts 再算一遍）。
-    const shards = rawShards.map((shard) => normalizeShard(shard, source));
-    let shardAttemptCount = 0;
-    let shardRetryCount = 0;
-    for (const shard of shards) {
-      shardAttemptCount += numberOrNull(shard.attemptCount) ?? 0;
-      shardRetryCount += numberOrNull(shard.retryCount) ?? 0;
-    }
-    return {
-      id: parentTaskId,
-      kind: "fanout",
-      parentTaskId,
-      taskName: firstText(source.taskName, source.title),
-      content: firstText(source.content),
-      basePrompt: firstText(source.basePrompt, source.content),
-      contentSource: text(source.contentSource),
-      role: text(source.role),
-      // 角色显示名（票据 27）：父任务角色被删除后仍保留创建期标签。
-      roleLabel: text(source.roleLabel),
-      provider: text(source.provider),
-      model: text(source.model),
-      effort: firstText(source.effort, source.reasoningEffort),
-      // 时段/层/跨层回退（票据 06）：父任务节点同样只读透传。
-      ...routeFields(source),
-      taskStatus,
-      status,
-      running: runningOf(status, source.running),
-      createdAt: numberOrNull(source.createdAt),
-      counts: normalizeCounts(source.counts),
-      // 票据 25/30：父任务用量（按 childId 去重汇总）与逐 attempt 的结构化结果数组。
-      ...usageFields(source),
-      ...(() => {
-        // task 级 structured 是逐 attempt 的数组（shardId/attempt/childId/structured），Host 明确
-        // 不合并 value；这里只收敛每个条目的白名单字段，空数组按缺失处理（不渲染空结构化区）。
-        if (!Array.isArray(source.structured)) return {};
-        const entries = [];
-        for (const entry of source.structured) {
-          if (!isObject(entry)) continue;
-          const inner = normalizeStructured(entry.structured);
-          if (inner === null) continue;
-          const shardId = boundedText(entry.shardId, USAGE_TEXT_MAX_LENGTH);
-          const childId = boundedText(entry.childId, USAGE_TEXT_MAX_LENGTH);
-          const attempt = countOrNull(entry.attempt);
-          entries.push({
-            ...(shardId === null ? {} : { shardId }),
-            ...(attempt === null ? {} : { attempt }),
-            ...(childId === null ? {} : { childId }),
-            structured: inner,
-          });
-        }
-        return entries.length === 0 ? {} : { structured: entries };
-      })(),
-      // 父任务能力：Host 权威投影；缺失（旧 Host）时省略字段，侧栏回退 ACTIVE/RETRY 状态推导。
-      ...(() => {
-        const capabilities = normalizeCapabilities(source.capabilities, CAPABILITY_ACTIONS);
-        return capabilities === null ? {} : { capabilities };
-      })(),
-      shards,
-      // 时间线（票据 12）：startedAt 回退 createdAt；旧快照的计数用分片汇总回退。
-      ...normalizeTimelineFields(source, {
-        startedAt: numberOrNull(source.createdAt),
-        attemptCount: shardAttemptCount,
-        retryCount: shardRetryCount,
-      }),
     };
   }
 
@@ -844,8 +670,7 @@
       ...usageFields(source),
       ...structuredFields(source),
       continuable: typeof source.continuable === "boolean" ? source.continuable : null,
-      // 会话节点（root/普通专家）的能力对象：只描述 read/写动作是否适用，
-      // 侧栏不会在这些节点上渲染 fan-out 管理按钮。
+      // 会话节点（root/普通专家）的能力对象：只描述 read 等动作是否适用。
       ...(() => {
         const capabilities = normalizeCapabilities(source.capabilities, CAPABILITY_ACTIONS);
         return capabilities === null ? {} : { capabilities };
@@ -863,24 +688,18 @@
     };
   }
 
-  function attemptChildIds(nodes) {
-    const ids = new Set();
-    for (const node of nodes) {
-      if (node.kind !== "fanout") continue;
-      for (const shard of node.shards) for (const attempt of shard.attempts) {
-        if (attempt.childId !== null) ids.add(attempt.childId);
-      }
-    }
-    return ids;
-  }
-
+  /**
+   * 子节点来源：优先用 Host 的 `root.children`，缺失时回退顶层 `experts`。
+   *
+   * Host 的 projectChildren 只投影普通专家，`root.children` 因此不会再出现 `kind ===
+   * "fanout"` 的父任务节点（fan-out 移除后已无该分支），这里按真实输入原样返回：不做
+   * 种类过滤，也不吞掉任何节点。单个节点是否是合法对象仍由下游 normalizeSessionNode
+   * 负责（非对象按空壳节点容错），防御性判断不在这里重复。
+   */
   function childSourceList(raw, root) {
-    if (Array.isArray(root?.children)) return root.children;
-    const expertChildren = Array.isArray(raw?.experts) ? raw.experts : [];
-    const fanoutChildren = Array.isArray(raw?.fanoutTasks)
-      ? raw.fanoutTasks
-      : (Array.isArray(raw?.tasks) ? raw.tasks : []);
-    return [...expertChildren, ...fanoutChildren];
+    return Array.isArray(root?.children)
+      ? root.children
+      : (Array.isArray(raw?.experts) ? raw.experts : []);
   }
 
   /**
@@ -899,12 +718,7 @@
     root.sessionId = rootSessionId;
     root.id = rootSessionId;
     const rawChildren = childSourceList(raw, sourceRoot);
-    const children = rawChildren.map((child) => {
-      const kind = isObject(child) && child.kind === "fanout" ? "fanout" : "expert";
-      return kind === "fanout" ? normalizeFanout(child) : normalizeSessionNode(child, "expert");
-    });
-    const fanoutIds = attemptChildIds(children);
-    root.children = children.filter((child) => child.kind !== "expert" || child.sessionId === null || !fanoutIds.has(child.sessionId));
+    root.children = rawChildren.map((child) => normalizeSessionNode(child, "expert"));
     return {
       schemaVersion: SCHEMA_VERSION,
       sessionId: rootSessionId,

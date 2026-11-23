@@ -57,11 +57,6 @@ window.__ModuleLoader__.load({
     const {
       createModelConfigHost,
     } = clientModelConfigHostModule;
-    const clientFanoutModule = globalThis[Symbol.for("dsh-expert-group/client-fanout-normalize")] || {};
-    const {
-      fanoutCanCancelParent, fanoutCanCancelShard, fanoutCanRetryShard, fanoutStatusLabel, fanoutTaskLabel, mergeFanoutEvent,
-      normalizeFanoutListResponse, normalizeFanoutTask,
-    } = clientFanoutModule;
     const clientNativeStatusModule = globalThis[Symbol.for("dsh-expert-group/client-native-status")] || {};
     const {
       NATIVE_RUNNING_STATUS_PREFIX, NATIVE_RUNNING_STATUS_PREFIXES, createNativeTextRewriter, findNativeConversationScope,
@@ -547,14 +542,6 @@ window.__ModuleLoader__.load({
     exports.createNativeTextRewriter = createNativeTextRewriter;
     exports.findNativeStatusTextNode = findNativeStatusTextNode;
     exports.installNativeStatusBridge = installNativeStatusBridge;
-    exports.normalizeFanoutTask = normalizeFanoutTask;
-    exports.mergeFanoutEvent = mergeFanoutEvent;
-    exports.fanoutTaskLabel = fanoutTaskLabel;
-    exports.fanoutStatusLabel = fanoutStatusLabel;
-    exports.fanoutCanCancelShard = fanoutCanCancelShard;
-    exports.fanoutCanRetryShard = fanoutCanRetryShard;
-    exports.fanoutCanCancelParent = fanoutCanCancelParent;
-    exports.normalizeFanoutListResponse = normalizeFanoutListResponse;
     exports.createClientFreshnessBoundary = createClientFreshnessBoundary;
     exports.normalizePluginRpcResult = normalizePluginRpcResult;
     exports.requestPluginRpc = requestPluginRpc;

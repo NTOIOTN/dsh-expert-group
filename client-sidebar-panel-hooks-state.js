@@ -81,10 +81,10 @@
     const filterState = filterPair[0] !== null && typeof filterPair[0] === "object" ? filterPair[0] : emptyFilter;
     const setFilterState = filterPair[1];
     /**
-     * 「查看全部」时间线的本地展开集合：键是稳定节点键（fanout:<id> / shard:<parent>:<shard>）。
+     * 「查看全部」时间线的本地展开集合：键由视图层给出，本层只做有界记账，不解析键的语义。
      *
      * 用 ref + bump 而不是 useState：展开集合不参与快照内容比较，也不需要跨渲染树传递；
-     * 这样与 pendingSet / recoveryRetryRef 同一模式，点击只触发一次重渲染。
+     * 这样与 pendingSet 同一模式，点击只触发一次重渲染。
      * 同样不持久化：刷新后回到「最近 5 条」的默认视图。
      */
     const timelineExpandedRef = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };

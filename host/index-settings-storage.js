@@ -5,7 +5,7 @@
  * - 两个语义明确的读能力：readSettingsSource()（可被重绑定的归一读面）与
  *   readSnapshot()（一次读齐 settings + storage 各表的**一致快照**）；
  * - storage 初始化 gate 与写串行链（唯一 owner 在本模块）；
- * - child_models / fan-out 快照写命令（先 durable put，再裁剪 / 更新缓存）；
+ * - child_models 写命令（先 durable put，再裁剪 / 更新缓存）；
  * - settings 投影与 persona 解析（describeRolePrompts / resolvePersonaForAdmission*）；
  * - 冷启动事件历史恢复结果的可观察记录（诊断只读投影）。
  *
@@ -29,7 +29,6 @@
 import {
   CHILD_LRU_LIMIT,
   createInitializationGate,
-  persistDomainEntry,
   persistLruEntry,
   readDomainSnapshot,
 } from "../storage.js";
@@ -40,11 +39,7 @@ import {
   promptOverrideFor,
 } from "../shared/prompts.js";
 import { DEFAULT_MODEL_FALLBACK_LIMIT } from "../shared/model-route.js";
-import {
-  DEFAULT_NOTIFICATION_EVENTS,
-  DEFAULT_ROLE_CONCURRENCY_LIMIT,
-  DEFAULT_ROLE_TIMEOUT_MS,
-} from "./settings-schema.js";
+import { DEFAULT_NOTIFICATION_EVENTS } from "./settings-schema.js";
 import { normalizeSnapshot } from "./settings-read-projection.js";
 import { defaultPeakValleyState } from "./peak-valley-settings.js";
 import { EXPERT_STORAGE_DOMAIN_SPEC } from "./storage-domain-schema.js";
@@ -69,11 +64,9 @@ export function defaultSettingsEntry() {
     notificationEnabled: true,
     notificationVolume: 100,
     notificationEvents: { ...DEFAULT_NOTIFICATION_EVENTS },
-    roleConcurrencyLimit: DEFAULT_ROLE_CONCURRENCY_LIMIT,
-    // 并发映射（票据 26）：默认空映射 = 全部落到 roleConcurrencyLimit / 不限制。
-    roleLimits: {},
-    providerLimits: {},
-    roleTimeoutMs: DEFAULT_ROLE_TIMEOUT_MS,
+    // 惰性兼容输入：fan-out 时代遗留的 roleConcurrencyLimit / roleLimits / providerLimits /
+    // roleTimeoutMs 不再有默认值，也不进入读源。旧文档里的值原样留在 settings 文档中
+    // （不删除、不改写），只是不再被任何读面投影。
     observerPreferred: false,
     taskManagementEnabled: true,
     autoOpenSubagentSidebar: false,
@@ -89,10 +82,12 @@ export function defaultSettingsEntry() {
   };
 }
 
-    /**
-     * root replacement/dispose 后移除旧 Agent 的 fan-out 所有权索引。task/result
-     * 历史仍由 manager 保留；只有 ownership 被摘除，避免同 id 新 root 复用旧任务。
-     */
+/**
+ * 读一张 storage domain 表并投影成 `[key, value][]`。
+ *
+ * 拿到不可读/已关闭的表时返回 undefined（调用方据此把 binding 视为不可用），
+ * 绝不把「读失败」降级成「空表」。
+ */
 export function tableEntries(table) {
       if (table === void 0) return void 0;
       try { return [...table.entries()]; } catch { return void 0; }
@@ -103,12 +98,10 @@ export function tableEntries(table) {
  *
  * @param {object} deps - 窄能力面（**禁止**传整个 ctx）。
  * @param {object} deps.logger - 宿主 logger（只记固定类别，绝不复述正文）。
- * @param {object} deps.storageBinding - host.storage（binding 代次 + domain/fan-out 快照缓存）。
- * @param {object} deps.lineage - host.lineage（只用到 restoreParentSessions）。
+ * @param {object} deps.storageBinding - host.storage（binding 代次 + domain 快照缓存）。
  * @param {object} deps.roles - 角色目录能力面 { roleCatalog, activeRoles }。
  * @param {object} deps.persistenceHealth - 共享持久化健康状态（只记录，不改变写入结果）。
- * @param {()=>object|undefined} deps.getFanoutHost - fan-out Host 的晚绑定取值（storage-ready 恢复）。
- * @param {()=>void} deps.onStorageRestored - storage-ready 后的组合根命令（goal handoff 冷恢复登记）。
+ * @param {()=>void} [deps.onStorageRestored] - storage-ready 后的组合根命令（可选；缺失时跳过）。
  * @returns {object} settings / storage 域能力面（见各 installer 的返回对象）。
  */
 export function createIndexSettingsStorageDomain(deps) {
@@ -157,7 +150,7 @@ function installSettingsSource(deps, api) {
     /** source() 只读最后一次成功读取的 domain；没有 ready domain 时不覆盖既有快照。 */
     function readSnapshot() {
       // 读源本身已经是归一快照（含读取期丢弃诊断）；这里再归一是为了对旧结构做一次
-      // 防御性收敛，但 limitDiagnostics 这类"一次性事实"必须在第二次归一前取出，
+      // 防御性收敛，但各诊断列表这类"一次性事实"必须在第二次归一前取出，
       // 否则合法值重新归一后诊断会被清空，设置页就再也看不到"哪些条目被丢弃"。
       const rawSettingsSnapshot = readSettingsSource();
       const settingsSnapshot = normalizeSnapshot(rawSettingsSnapshot, activeRoles());
@@ -168,15 +161,9 @@ function installSettingsSource(deps, api) {
         // 处理（invalidate），绝不用空代次静默降级——那会让 CAS 永远从 0 通过。
         const sessionOverrideMetaEntries = tableEntries(binding.sessionOverrideMetaTable);
         const childEntries = tableEntries(binding.childTable);
-        const fanoutEntries = tableEntries(binding.fanoutTable);
-        // 模板表（票据 28）与运行数据同源读取：缺表/读失败与其它表同样按 binding
-        // 不可用处理，绝不用空模板静默降级——那会让保存后的模板在读取面上“消失”。
-        const templateEntries = tableEntries(binding.fanoutTemplateTable);
         if (sessionEntries !== void 0 && sessionOverrideMetaEntries !== void 0
-          && childEntries !== void 0 && fanoutEntries !== void 0
-          && templateEntries !== void 0) {
-          storageBinding.setDomainSnapshot(readDomainSnapshot(sessionEntries, childEntries, sessionOverrideMetaEntries, templateEntries));
-          storageBinding.setFanoutSnapshot(fanoutEntries.find(([key]) => key === "current")?.[1]);
+          && childEntries !== void 0) {
+          storageBinding.setDomainSnapshot(readDomainSnapshot(sessionEntries, childEntries, sessionOverrideMetaEntries));
         } else {
           storageBinding.invalidate(binding);
         }
@@ -194,20 +181,13 @@ function installSettingsSource(deps, api) {
         notificationEnabled: settingsSnapshot.notificationEnabled,
         notificationVolume: settingsSnapshot.notificationVolume,
         notificationEvents: settingsSnapshot.notificationEvents,
-        roleConcurrencyLimit: settingsSnapshot.roleConcurrencyLimit,
-        // 并发映射（票据 26）同理：缺少它们会让调度器悄悄退回「只有默认值」，
-        // 设置页显示的逐角色/provider 上限与实际调度脱节。
-        roleLimits: settingsSnapshot.roleLimits,
-        providerLimits: settingsSnapshot.providerLimits,
-        limitDiagnostics: rawSettingsSnapshot?.limitDiagnostics ?? settingsSnapshot.limitDiagnostics,
+        // 惰性兼容输入：归一快照里不再有 roleConcurrencyLimit / roleLimits / providerLimits /
+        // roleTimeoutMs，因此这里也不投影它们（旧文档里的值不会进入运行期读源）。
         // 上下文继承（票据 29）：必须随同一份快照进入 source()，否则 meta/get 与派发
-        // 判定会悄悄退回“全部关闭”。诊断与 limitDiagnostics 同理使用原始快照的一次性事实。
+        // 判定会悄悄退回“全部关闭”。诊断与其它读取面诊断同理使用原始快照的一次性事实。
         inheritContext: settingsSnapshot.inheritContext,
         inheritContextDiagnostics: rawSettingsSnapshot?.inheritContextDiagnostics
           ?? settingsSnapshot.inheritContextDiagnostics,
-        // 角色默认超时属于全局 settings：必须随同一份快照进入 source()，
-        // 否则冷恢复/服务重载之后读到的值会悄悄退回“不启用”。
-        roleTimeoutMs: settingsSnapshot.roleTimeoutMs,
         observerPreferred: settingsSnapshot.observerPreferred,
         taskManagementEnabled: settingsSnapshot.taskManagementEnabled,
         // 自动打开属于全局 settings：必须随同一份快照进入 source()，否则冷恢复/服务重载
@@ -222,7 +202,7 @@ function installSettingsSource(deps, api) {
          * 归一值里已带 invalidCode（启用但非法），票 03 的路由据此 fail-closed。
          */
         peakValley: settingsSnapshot.peakValley,
-        // 与 limitDiagnostics 同理：读取期丢弃诊断是"一次性事实"，必须在第二次归一前
+        // 与其它读取面诊断同理：读取期丢弃诊断是"一次性事实"，必须在第二次归一前
         // 从原始快照取出，否则合法值重新归一后诊断会被清空，meta 再也看不到哪些条目被丢弃。
         peakValleyDiagnostics: rawSettingsSnapshot?.peakValleyDiagnostics ?? settingsSnapshot.peakValleyDiagnostics,
         /**
@@ -236,7 +216,7 @@ function installSettingsSource(deps, api) {
         // 单价（票据 25）：与 settings 同源进入运行期读源，RPC meta/get 与客户端设置页
         // 读到同一份归一值；诊断只服务 meta，不进入设置响应。
         modelPrices: settingsSnapshot.modelPrices,
-        // 与 limitDiagnostics 同理：读取期丢弃诊断是“一次性事实”，必须在第二次归一前
+        // 与其它读取面诊断同理：读取期丢弃诊断是“一次性事实”，必须在第二次归一前
         // 从原始快照取出，否则合法值重新归一后诊断会被清空，meta 再也看不到哪些条目被丢弃。
         modelPriceDiagnostics: rawSettingsSnapshot?.modelPriceDiagnostics ?? settingsSnapshot.modelPriceDiagnostics,
         ...storageBinding.snapshots(),
@@ -247,7 +227,7 @@ function installSettingsSource(deps, api) {
 }
 
 /**
- * S2：storage 写入域（初始化 gate + 串行写链 + child_models / fan-out 快照写命令）。
+ * S2：storage 写入域（初始化 gate + 串行写链 + child_models 写命令）。
  *
  * 状态唯一 owner：writeChain（写串行链）、storageInitializationGate 与
  * domainInitialization（代次闸门）。域外只经命令读写，绝不持有这些容器。
@@ -313,27 +293,6 @@ function installStorageWrites(deps, api) {
     }
 
 
-    /**
-     * 消费一次 fan-out 恢复结果（票据 04）。
-     *
-     * restore 不再允许"失败即静默"：返回值里的结构化 error（code/field/violation）会
-     * 进入日志，并通过 fanoutHost.describe().persistence 进入 RPC 诊断；fail-closed 的
-     * persistenceBlocked 由 host/fanout-runtime 维护，这里只负责观测与告警。
-     *
-     * @param {string} label - 调用位置标签（storage-ready / agent-created / runtime-wired）。
-     * @param {object|undefined} outcome - fanoutHost.restore() 的返回值。
-     */
-    function consumeFanoutRestore(label, outcome) {
-      if (outcome === null || typeof outcome !== "object") return outcome;
-      if (outcome.ok === true) return outcome;
-      const error = outcome.error;
-      if (error === undefined || error === null) return outcome;
-      logger.warn("dsh-expert-group: fan-out snapshot restore failed (" + label + ") ["
-        + (typeof error.code === "string" && error.code.length > 0 ? error.code : "RESTORE_FAILED") + "]: "
-        + (typeof error.message === "string" ? error.message : "unknown"));
-      return outcome;
-    }
-
 
     /** domain 写入串行，并在执行前等待当前 storage-domain generation ready。 */
     function enqueueWrite(fn) {
@@ -345,33 +304,6 @@ function installStorageWrites(deps, api) {
       return run;
     }
 
-
-    function persistFanoutSnapshot(stored) {
-      return enqueueWrite(async () => {
-        const binding = storageBinding.active();
-        if (binding?.fanoutAuthoritative !== true || binding.fanoutTable === void 0) {
-          throw new Error("storage domain is not ready for fan-out snapshot write");
-        }
-        const result = await persistDomainEntry({
-          table: binding.fanoutTable,
-          key: "current",
-          value: stored,
-          isCurrent: () => storageBinding.isCurrent(binding),
-        });
-        if (result.detached === true) {
-          const error = new Error("storage domain binding was replaced during fan-out snapshot write");
-          error.code = "PERSISTENCE_GENERATION_STALE";
-          error.category = "generation-stale";
-          throw error;
-        }
-        storageBinding.setFanoutSnapshot(stored);
-        return true;
-      }).catch((error) => {
-        logger.warn("dsh-expert-group: fan-out snapshot persistence failed: " + (error instanceof Error ? error.message : String(error)));
-        // 日志是旁路；必须继续 reject，让 runtime 的 health seam 记录真实失败类别。
-        throw error;
-      });
-    }
 
 
     /** 对 domain 表先 durable put，再按显式 lru 序号裁剪。 */
@@ -453,9 +385,7 @@ function installStorageWrites(deps, api) {
     settleStorageInitialization,
     awaitPendingWrites,
     observeStorageWrite,
-    consumeFanoutRestore,
     enqueueWrite,
-    persistFanoutSnapshot,
     writeChildModel,
     writeChildModelPatch,
   };
@@ -463,36 +393,21 @@ function installStorageWrites(deps, api) {
 /**
  * S3：storage domain 绑定与冷启动恢复（注入回调的初始化段）。
  *
- * 状态唯一 owner：lastFanoutEventRestore（最近一次 restoreEvents 结果，诊断只读投影）。
- * binding 的 begin/install/invalidate 全部经 storageBinding 命令；closeOpened / closed /
- * closePromise 只在本闭包内。
+ * 状态唯一 owner：本闭包内的 opened / closed / closePromise（domain 打开与关闭时序）；
+ * binding 的 begin/install/invalidate 全部经 storageBinding 命令。
+ * fan-out 整体移除后，冷启动不再恢复 fan-out 任务快照与事件历史，也不再记录它们的恢复结论。
  *
  * @param {object} deps - 见 createIndexSettingsStorageDomain。
  * @param {object} api - 域内能力面。
  * @returns {object} S3 能力面。
  */
 function installStorageDomainBinding(deps, api) {
-  const { logger, storageBinding, lineage, getFanoutHost, onStorageRestored } = deps;
+  const { logger, storageBinding, onStorageRestored } = deps;
 
   // 跨组调用统一走域内能力面（运行期解析，构造期不依赖 install 顺序）。
   const failStorageInitialization = (...args) => api.failStorageInitialization(...args);
   const settleStorageInitialization = (...args) => api.settleStorageInitialization(...args);
   const awaitPendingWrites = (...args) => api.awaitPendingWrites(...args);
-  const consumeFanoutRestore = (...args) => api.consumeFanoutRestore(...args);
-
-    /**
-     * 最近一次冷启动 restoreEvents 的结果（票据 04）。
-     *
-     * 事件历史恢复的布尔返回值过去被直接丢弃：快照里的历史因超预算被整体拒绝时，
-     * 进程端 cursor 会从 0 重新开始，但没有任何日志/诊断说明原因。这里记录 accepted
-     * 与是否真的存在待恢复事件，供 describeRuntimeDiagnostics 与告警使用。
-     */
-    let lastFanoutEventRestore = null;
-
-  /** 只读投影：最近一次冷启动 restoreEvents 结果（诊断面使用，不交出可变包装）。 */
-  function readLastFanoutEventRestore() {
-    return lastFanoutEventRestore;
-  }
 
   /**
    * 安装一次 storage domain 绑定。
@@ -544,9 +459,8 @@ function installStorageDomainBinding(deps, api) {
         // EXPERT_STORAGE_DOMAIN_SPEC 创建，旧数据只意味着 revision 从 0 开始。
         const sessionOverrideMetaTable = domain.table("session_override_meta");
         const childTable = domain.table("child_models");
-        const fanoutTable = domain.table("fanout_tasks");
-        // 手动派发模板（票据 28）：与运行数据同域、独立表；domain version 保持 1。
-        const fanoutTemplateTable = domain.table("fanout_templates");
+        // fan-out 整体移除：fanout_tasks（父任务快照表）与 fanout_templates（手动派发
+        // 模板表）已从 EXPERT_STORAGE_DOMAIN_SPEC 删除，这里也不再取它们的表句柄。
         // 主代理模型配置的功能启用切点（B3）：与运行数据同域、独立表、固定一行。
         // 读取面不参与 readSnapshot 投影（切点不是设置，也不进 RPC 契约），只供
         // host/orchestrator-epoch 从 binding 直接读写；表缺失时该模块按"还没有切点"
@@ -555,12 +469,9 @@ function installStorageDomainBinding(deps, api) {
         const sessionEntries = tableEntries(sessionTable);
         const sessionOverrideMetaEntries = tableEntries(sessionOverrideMetaTable);
         const childEntries = tableEntries(childTable);
-        const fanoutEntries = tableEntries(fanoutTable);
-        const templateEntries = tableEntries(fanoutTemplateTable);
         const orchestratorStateEntries = tableEntries(orchestratorStateTable);
         if (sessionEntries === void 0 || sessionOverrideMetaEntries === void 0
-          || childEntries === void 0 || fanoutEntries === void 0
-          || templateEntries === void 0 || orchestratorStateEntries === void 0) {
+          || childEntries === void 0 || orchestratorStateEntries === void 0) {
           throw new Error("storage domain table read failed");
         }
         if (!storageBinding.isCurrent(binding)) {
@@ -568,42 +479,19 @@ function installStorageDomainBinding(deps, api) {
           throw new Error("storage domain binding was replaced before ready");
         }
         const installed = storageBinding.install(binding, {
-          domain, sessionTable, sessionOverrideMetaTable, childTable, fanoutTable, fanoutTemplateTable,
+          domain, sessionTable, sessionOverrideMetaTable, childTable,
           orchestratorStateTable,
           sessionAuthoritative: true, sessionOverrideMetaAuthoritative: true,
-          childAuthoritative: true, fanoutAuthoritative: true,
-          fanoutTemplateAuthoritative: true, orchestratorStateAuthoritative: true,
+          childAuthoritative: true, orchestratorStateAuthoritative: true,
         });
         if (!installed) {
           await closeOpened();
           throw new Error("storage domain binding was replaced before ready");
         }
-        storageBinding.setDomainSnapshot(readDomainSnapshot(sessionEntries, childEntries, sessionOverrideMetaEntries, templateEntries));
-        storageBinding.setFanoutSnapshot(fanoutEntries.find(([key]) => key === "current")?.[1]);
-        const persistedFanoutSnapshot = storageBinding.fanoutSnapshot();
-        // 事件历史与任务快照同代持久化；Host 自有查询缓存也必须先水合，避免冷启动 cursor 从 0 重置。
-        const eventRestoreAccepted = getFanoutHost().restoreEvents(persistedFanoutSnapshot?.events);
-        lastFanoutEventRestore = {
-          accepted: eventRestoreAccepted === true,
-          attempted: Array.isArray(persistedFanoutSnapshot?.events),
-          at: Date.now(),
-        };
-        if (eventRestoreAccepted !== true && Array.isArray(persistedFanoutSnapshot?.events)) {
-          // 恢复失败必须可见：布尔返回值 + 预算违规（只记资源名/字节，不记事件正文）。
-          const violation = typeof getFanoutHost().budget === "function" ? getFanoutHost().budget()?.lastViolation : null;
-          logger.warn("dsh-expert-group: fan-out event history restore rejected (events="
-            + persistedFanoutSnapshot.events.length
-            + (violation === null || violation === undefined
-              ? ""
-              : ", resource=" + String(violation.resource) + ", received=" + String(violation.receivedBytes)
-                + ", limit=" + String(violation.maxBytes))
-            + ")");
-        }
-        lineage.restoreParentSessions(persistedFanoutSnapshot);
-        consumeFanoutRestore("storage-ready", getFanoutHost().restore());
-        // 冷恢复：restore 之后为「已在运行、但本进程还没有登记」的 fan-out 父任务补登记
-        // 等待工作。终态任务只标记已释放，绝不登记（它们不会再产生 task_settled）。
-        onStorageRestored();
+        storageBinding.setDomainSnapshot(readDomainSnapshot(sessionEntries, childEntries, sessionOverrideMetaEntries));
+        // 冷恢复：fan-out 快照（任务树 + 事件历史 + 父会话归属）整体不再持久化，因此这里
+        // 只保留组合根的 storage-ready 命令（可选；旧装配没有该回调时跳过）。
+        if (typeof onStorageRestored === "function") onStorageRestored();
       });
       const pending = Promise.race([initialize, cancelled]).catch(async (error) => {
         if (storageBinding.isCurrent(binding)) {
@@ -628,7 +516,7 @@ function installStorageDomainBinding(deps, api) {
     };
   }
 
-  return { attachStorageDomain, readLastFanoutEventRestore };
+  return { attachStorageDomain };
 }
 /**
  * S4：settings 只读投影与 persona 解析。

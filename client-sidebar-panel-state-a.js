@@ -3,7 +3,7 @@
  *
  * ## 职责边界（R6 票据 22）
  * Panel 的**实例级**状态机械的一半：宿主语言/文案解析、本地过滤派生、宽度拖拽比例换算、
- * fanout 事件游标推进、surface 身份令牌派生、任务状态播报差异。
+ * surface 身份令牌派生与任务状态播报差异。
  *
  * ## 三种生命周期（规格书 §状态所有权(3)）中本文件的位置
  * 这里全部是**实例级**派生：每次挂载重建、卸载即弃。本文件**不**持有任何容器：
@@ -87,7 +87,7 @@
    *
    * 三条语义：
    * - 过滤状态绑定 root：切换会话后旧搜索词/角色/状态不会把新会话的树整棵隐藏；
-   * - 祖先路径保留：父级用 isVisible（自身命中，或任一子节点/分片命中）决定整棵子树是否展示；
+   * - 祖先路径保留：父级用 isVisible（自身命中，或任一子节点命中）决定整棵子树是否展示；
    * - 批量 slot 在过滤期间隐藏：批量关闭作用于整棵树，不能让用户在「看不见候选」时误关。
    *
    * @returns {{ filterSource: any, taskFilter: any, filterActive: boolean, passesFilter: (node: any) => boolean }}
@@ -139,41 +139,6 @@
     if (key === "ArrowLeft") return base - WIDTH_RATIO_KEY_STEP;
     if (key === "ArrowRight") return base + WIDTH_RATIO_KEY_STEP;
     return null;
-  }
-  /**
-   * fanout 事件游标的 root 归属规整：root 变了就重开一份 { cursor: 0 }（旧 root 的游标对新 root 没有意义）。
-   *
-   * 返回**同一个对象**表示无需改动，返回新对象表示调用方要写回自己的 ref。
-   */
-  function normalizeFanoutCursor(cursor, rootSessionId) {
-    if (cursor !== null && cursor !== undefined && cursor.rootSessionId === rootSessionId) return cursor;
-    return { rootSessionId, cursor: 0 };
-  }
-
-  /**
-   * 采纳一次快照响应里出现的游标（票据 15 的强制全量路径）。
-   *
-   * Host 当前的 expert-group-snapshot 响应**不带** cursor（契约只有 snapshot + revision），
-   * 因此这里按「有就采纳、没有就保持」处理：
-   * - 返回 null 时调用方什么都不做，下一轮 fanout-events 继续用当前游标（绝不伪造一个进度）；
-   * - 只接受本 root 的响应：旧 root 的迟到响应不得改写新 root 的游标。
-   */
-  function adoptFanoutCursor(cursor, requestRoot, envelope) {
-    const next = Number.isSafeInteger(envelope?.cursor) && envelope.cursor >= 0 ? envelope.cursor : null;
-    if (next === null) return null;
-    if (cursor.rootSessionId !== requestRoot) return null;
-    return { rootSessionId: requestRoot, cursor: Math.max(cursor.cursor, next) };
-  }
-
-  /**
-   * 把事件游标推进到 max(当前, 给定值)（票据 15）：null/非法值表示 Host 没给游标 ⇒ 原地不动，
-   * 绝不伪造一个进度；只接受本 root 的推进（旧 root 的迟到结果不得改写新 root 的游标）。
-   */
-  function advanceFanoutCursor(cursor, rootSessionId, nextCursor) {
-    if (!Number.isSafeInteger(nextCursor) || nextCursor < 0) return null;
-    if (cursor.rootSessionId !== rootSessionId) return null;
-    if (nextCursor <= cursor.cursor) return null;
-    return { rootSessionId, cursor: nextCursor };
   }
 
   /**
@@ -236,8 +201,6 @@
   // 只暴露主 IIFE 实际消费的符号（无全量外挂）。
   global[SYMBOL] = Object.freeze({
     EMPTY_TASK_FILTER,
-    adoptFanoutCursor,
-    advanceFanoutCursor,
     announcementTextOf,
     createPanelTranslator,
     deriveSurfaceToken,
@@ -246,7 +209,6 @@
     nextFilterPatch,
     nextWidthRatioFromDrag,
     nextWidthRatioFromKey,
-    normalizeFanoutCursor,
     resolvePanelLocale,
     selectTaskFilter,
   });

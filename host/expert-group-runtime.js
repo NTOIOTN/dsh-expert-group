@@ -4,7 +4,7 @@
  * 本模块只做**组合**与**快照构建**，不再持有缓存状态：
  * - 纯投影 / 归属判定 → `host/expert-group-projection.js`（含 per-build 的冷读协调器与
  *   `childOwnership` owner）；
- * - 阶段投影（`collectExperts` / fan-out 三件套）→ `host/expert-group-stage.js`；
+ * - 阶段投影（`collectExperts`）→ `host/expert-group-stage.js`；
  * - 两级快照缓存（`snapshotCache` / `snapshotInFlight` / generation / LRU / sortAnchor）→
  *   `host/snapshot-cache.js`；
  * - 本文件只保留：工厂依赖校验、per-build 装配（builder）与缓存组合。
@@ -34,7 +34,6 @@ import {
   createdAtOf,
   currentRoleLabels,
   expertProjection,
-  fanoutTasksOwnedBy,
   firstText,
   modelMetadata,
   nonEmpty,
@@ -46,7 +45,7 @@ import {
   sessionTitle,
   turnTimingOf,
 } from "./expert-group-projection.js";
-import { collectExperts, firstRejection, projectFanoutTasks } from "./expert-group-stage.js";
+import { collectExperts } from "./expert-group-stage.js";
 import { createSnapshotCache } from "./snapshot-cache.js";
 
 // index.js 与既有调用方仍从本模块读取这两个纯投影（R2.2 归属到 projection 后在此原样转出，
@@ -59,10 +58,9 @@ export { restoreFailureRetryable, rootNotificationLabel } from "./expert-group-p
  *
  * 1. `agents`：live Agent 读面（`agents.get(id)`，root/child 对象身份来源）；
  * 2. `goals`：goal 阶段只读投影（`goals.get(root)`，仅用于根行 objective）；
- * 3. `ownership`：**归属判定读面**——`lineage`（血缘链 / activeRoot）与 `fanoutHost`
- *    （任务管理器 / restoreStatus）。两者在代码里**已经作为单个聚合**传给
- *    `fanoutTasksOwnedBy({ fanoutHost, lineage }, id)`，共同回答"这个 child/task 属于哪个
- *    root"，因此是一组；
+ * 3. `ownership`：**归属判定读面**——`lineage`（血缘链 / activeRoot）与可选的
+ *    `fanoutHost`（fan-out 已移除，装配不再提供，这里只保留向后兼容的只读槽位）。
+ *    两者原本作为单个聚合回答"这个 child 属于哪个 root"，因此仍是一组；
  * 4. `recovery`：**恢复域读面**——恢复模块命令面 `recovery` 与记录表 `recoveryRecords`
  *    （同一 owner、同一关注点；记录表同时供快照缓存复用）；
  * 5. `sources`：**投影的只读数据来源**——`source`（settings 快照里的 child_models 持久化
@@ -129,27 +127,24 @@ export function createExpertGroupRuntime(dependencies = {}) {
    *
    * 背景：唯一排序点（expert-group-snapshot.js 的 sortByCreatedAt）按 createdAt 升序、缺失兜底
    * Infinity 排到最后。普通专家的 createdAt 在完整路径由冷读到的 session.createdAt 补上，而真实
-   * child_models 记录里没有这个字段，轻量路径又没有 session，因此 fast 下恒为 null；fan-out 任务的
-   * createdAt 来自 manager，两条路径一致。于是同一个 fan-out 节点在 partial / full 之间相对位置
-   * 会跳变（Explorer 因 createdAt 最小恒居第一，所以它稳定，Oracle 会来回跳）。
+   * child_models 记录里没有这个字段，轻量路径又没有 session，因此 fast 下恒为 null。于是同一个
+   * 节点在 partial / full 之间相对位置会跳变（createdAt 最小的行恒居第一，其余会来回跳）。
    *
    * 处理方式：完整构建成功后由 **cache owner** 把该快照里所有节点的 id → createdAt 记进锚点；
    * 轻量构建时只对 **createdAt 为 null** 的节点用锚点兜底填充，锚点里没有的保持 null（既有兜底
    * 行为不变）。这里只拿到 `sortAnchorFor(nodeId)` 只读查询，因此 builder 既读不到条目，
    * 也写不了锚点（plan R2.3 ④↔⑤）。
    *
-   * 只按节点 id 匹配（专家节点 id 即 childId/sessionId，fan-out 节点 id 即 parentTaskId），
-   * 因此锚点天然按 root 隔离：它挂在该 root 的缓存条目上，绝不跨 root 共享。
+   * 只按节点 id 匹配（专家节点 id 即 childId/sessionId），因此锚点天然按 root 隔离：
+   * 它挂在该 root 的缓存条目上，绝不跨 root 共享。
    */
   function applySortAnchor(nodes, sortAnchorFor) {
     if (typeof sortAnchorFor !== "function") return nodes;
     for (const node of nodes) {
       if (node === null || typeof node !== "object") continue;
-      // 只补缺失值：已有真实 createdAt（完整路径 / manager 给出的任务时间）绝不被覆盖。
-      if (node.createdAt !== null && node.createdAt !== undefined) continue;
-      // 键与快照层一致：专家节点的 id 就是 childId/sessionId，fan-out 父任务的 id 由 parentTaskId
-      // 派生（原始 manager 任务对象上没有 id 字段，因此这里按同一优先级回退）。
-      const key = firstText(node.id, node.parentTaskId, node.sessionId, node.childId);
+      // 只补缺失值：已有真实 createdAt（完整路径冷读到的会话时间）绝不被覆盖。
+      // 键与快照层一致：专家节点的 id 就是 childId/sessionId（其余身份字段按同一优先级回退）。
+      const key = firstText(node.id, node.sessionId, node.childId);
       if (key === null) continue;
       const anchored = sortAnchorFor(key);
       if (typeof anchored === "number" && Number.isFinite(anchored)) node.createdAt = anchored;
@@ -165,11 +160,9 @@ export function createExpertGroupRuntime(dependencies = {}) {
    * - `resolver`：`childOwnership` owner（内部 Map，只暴露冻结的 `resolveChildOwnership`）。
    *
    * 阶段收敛（R2.5 第 10 条，不得回归）：
-   * - 先启动 `collectExperts`，再启动 fan-out 阶段；两个阶段并行推进、共享同一个协调器；
-   * - 两阶段都用 `allSettled` 收敛，**都 settle 之后**才返回或抛错，因此构建失败返回时不会有
-   *   残留冷读，同一 root 的立即重试不会与旧批次重叠；
-   * - 双失败时按**优化前的阶段顺序**（fan-out 优先）选错：`firstRejection([fanoutOutcome,
-   *   expertOutcome])`，与谁先失败/谁先完成无关（否则错误会随负载抖动）。
+   * - fan-out 阶段已随 fan-out 整体移除，现在只剩普通 expert 阶段（`collectExperts`）；
+   * - 该阶段内部保证「所有已调度的冷读都 settle 之后才抛出首个错误」，因此构建失败返回时不会
+   *   有残留冷读，同一 root 的立即重试不会与旧批次重叠（语义与拆分前一致）。
    *
    * 参数 `previousExpertTaskNames`（可选，`Map<childId, 展示名>`）：只由 cache owner 在**轻量
    * 构建**时传入，内容取自同一 root 最近一份完整快照。fast 路径不冷读会话，拿不到 DSH 的
@@ -188,29 +181,25 @@ export function createExpertGroupRuntime(dependencies = {}) {
      * 本次构建的**唯一时间样本**（时间锚点，不得回归）。
      *
      * 客户端在两次权威快照之间做外推：显示值 = turnDurationMs + (客户端 now - generatedAt)。
-     * 因此同一份快照里**所有** turnDurationMs（root / expert / shard）必须与顶层 generatedAt
+     * 因此同一份快照里**所有** turnDurationMs（root / expert）必须与顶层 generatedAt
      * 同源——否则运行中的行会被系统性低估，低估量正好是「该行采样时刻 → generatedAt」之间的
      * 构建耗时（冷读慢时可达数秒）。
      *
-     * 旧实现的两个缺陷：① stageDeps.now 直接透传注入时钟，expert 阶段（stage:253）与 fan-out
-     * 分片（stage:435）各自 now()；② 顶层 generatedAt 在两个阶段都 settle 之后才 now()。
-     * 于是 expert/shard 算到更早的时刻、root 算到 generatedAt，客户端却按统一的 generatedAt
-     * 外推，子任务用时被低估。
+     * 旧实现的两个缺陷：① stageDeps.now 直接透传注入时钟，expert 阶段各自 now()；
+     * ② 顶层 generatedAt 在阶段 settle 之后才 now()。于是 expert 算到更早的时刻、root 算到
+     * generatedAt，客户端却按统一的 generatedAt 外推，子任务用时被低估。
      *
      * 代价（有意接受）：generatedAt 早于响应返回时刻，即「快照年龄」包含本次构建耗时；而客户端
      * 外推加的正是这段年龄，所以展示仍然精确（外推值 = 真实到客户端时刻的用时）。这里取在构建
      * 最开始，构建耗时被完整覆盖，不会出现「锚点晚于采样」的反向低估。
      */
     const builtAt = now();
-    // 本次构建独有的冷读协调器：root 冷读、普通 expert 阶段与 fan-out 阶段共用同一份读取
-    // promise 缓存与同一个全局并发上限；构建结束即回收，不会被后续快照或别的 root 复用。
+    // 本次构建独有的冷读协调器：root 冷读与普通 expert 阶段共用同一份读取 promise 缓存与同一个
+    // 全局并发上限；构建结束即回收，不会被后续快照或别的 root 复用。
     // 轻量构建（fast）不会调用它——那时它只是一个空协调器，不产生任何 IO。
     const coordinator = projection.createColdReadCoordinator();
-    // 没有 ownership 证明时 fail-closed；fanoutHost 的全局 list 不能作为当前根的回退。
-    const rawFanoutTasks = fanoutTasksOwnedBy({ fanoutHost, lineage }, id);
     const persisted = persistedChildren();
     const knownByChild = Object.values(persisted).some((child) => child?.parentId === id);
-    const knownByFanout = Array.isArray(rawFanoutTasks) && rawFanoutTasks.length > 0;
     let root = safeCall(() => lineage?.activeRoot?.(id), undefined) ?? safeCall(() => agents?.get?.(id), undefined);
     // 轻量路径用占位 root 时，root 自身也没有任何运行证据；投影层据此把它降级为中性状态。
     let placeholderRoot = false;
@@ -219,10 +208,10 @@ export function createExpertGroupRuntime(dependencies = {}) {
       if (fast === true) {
         // 轻量路径不冷读 root 会话。首屏只要求「有内容」，而 root 行的显示并不依赖会话日志
         // （第一行固定「主代理」，标题由客户端自己的会话投影给出）；因此这里只做廉价的存在性判定：
-        // - 有 DEG 记录或 fan-out 任务能证明该 id 被使用过 → 用占位 root 继续投影子节点；
+        // - 有 DEG 的 child_models 记录能证明该 id 被使用过 → 用占位 root 继续投影子节点；
         // - 完全没有证据 → 返回 null，让调用方回落到完整构建，从而保留「陌生 id 一律 404」
         //   以及「冷 root 会话仍能读到标题/内容」这两个既有契约。
-        if (!knownByChild && !knownByFanout) return null;
+        if (!knownByChild) return null;
         const session = { id, header: { id }, events: [], status: "ready", requestHeader: () => ({ config: {} }) };
         root = { id, status: "ready", session, options: {} };
         placeholderRoot = true;
@@ -236,8 +225,8 @@ export function createExpertGroupRuntime(dependencies = {}) {
 
     if (root === undefined || root === null || root.id !== id) {
       // sessionQuery 是可选服务。它缺失时，只允许已有 DEG 记录能够证明 ownership 的根；
-      // 一个完全陌生的 id 仍返回 404，不能借任务视图枚举别的会话。
-      if (!knownByChild && !knownByFanout) {
+      // 一个完全陌生的 id 仍返回 404，不能借任何视图枚举别的会话。
+      if (!knownByChild) {
         const error = new Error("root session not found: " + id);
         error.code = "session-not-found";
         throw error;
@@ -278,9 +267,8 @@ export function createExpertGroupRuntime(dependencies = {}) {
       recoveryRecords,
       agents,
       recovery,
-      fanoutHost,
-      // 阶段投影的时钟**固定成本次构建的唯一样本**（两个阶段共用同一时刻），而不是透传注入时钟：
-      // 这样 expert 与 shard 的 turnTimingOf 全部算到 builtAt，与顶层 generatedAt 同源。
+      // 阶段投影的时钟**固定成本次构建的唯一样本**，而不是透传注入时钟：
+      // 这样 expert 的 turnTimingOf 全部算到 builtAt，与顶层 generatedAt 同源。
       // stageDeps 是 Object.freeze 的窄依赖对象，因此在**构造时**就给闭包，不改成可变对象。
       now: () => builtAt,
       usageFor,
@@ -294,34 +282,24 @@ export function createExpertGroupRuntime(dependencies = {}) {
       previousExpertTaskNames,
       project: expertProjection,
     });
-    // 普通 expert 阶段先启动：它决定首屏的专家列表，理应优先占用冷读队列；fan-out 阶段紧随其后
-    // 启动。两个阶段**并行**推进，但共享同一个冷读协调器，因此真实 readSession 全局最多
-    // COLD_READ_CONCURRENCY 个同时在飞，同一个 child 也不会被两个阶段读两次。
-    const expertsStage = collectExperts(root, stageDeps);
-    const fanoutStage = projectFanoutTasks(rawFanoutTasks, stageDeps);
-    // 两个阶段都用 allSettled 收敛：阶段内部已保证各自已调度的分支全部 settle，这里再保证跨阶段
-    // 收敛，因此构建失败返回时不会有残留冷读，同一 root 的立即重试不会与旧批次重叠。
-    const settledStages = await Promise.allSettled([expertsStage, fanoutStage]);
-    const [expertOutcome, fanoutOutcome] = settledStages;
-    // 顶层错误选择显式按 **fan-out 优先**，用于兼容优化前的阶段顺序：改动前 buildSnapshotForSession
-    // 先 await fan-out 投影、之后才 await collectExperts，两个阶段都失败时外部只会收到 fan-out 的
-    // 错误。并行化以后必须用显式顺序保留这个可观察契约，绝不能依赖谁先失败/谁先完成（否则错误会随
-    // 负载抖动）。此处两个阶段都已 settle，所以提前 throw 不会留下后台读取。
-    const stageFailure = firstRejection([fanoutOutcome, expertOutcome]);
-    if (stageFailure !== null) throw stageFailure.reason;
-    const experts = expertOutcome.value;
-    const fanoutTasks = fanoutOutcome.value;
+    // 唯一的阶段：普通 expert 阶段决定首屏的专家列表，冷读经本次构建的协调器执行，因此真实
+    // readSession 全局最多 COLD_READ_CONCURRENCY 个同时在飞，同一个 child 也不会被读两次。
+    // 该阶段内部已保证「所有已调度的读取都 settle 之后才抛首个错误」，所以构建失败返回时不会
+    // 有残留冷读，同一 root 的立即重试不会与旧批次重叠。
+    const experts = await collectExperts(root, stageDeps);
     // 修复 A：轻量路径用排序锚点补 createdAt，让同一节点在 partial / full 下拿到同一个排序键。
     // 完整路径不传锚点（它的 createdAt 本来就是权威值），因此这里只影响 fast。
-    if (fast === true) applySortAnchor([...experts, ...fanoutTasks], sortAnchorFor);
+    if (fast === true) applySortAnchor(experts, sortAnchorFor);
     /**
      * 恢复状态（票据 04）：两条构建路径都投影同一份只读状态，且**不做任何冷读**——
-     * 它来自 fanoutHost 内存里的 restoreStatus()，因此轻量快照也能立刻反映恢复失败，
+     * 它来自 owner 内的只读 restoreStatus() 探针，因此轻量快照也能立刻反映恢复失败，
      * 用户不必等完整快照就能看到错误横幅与重试入口。
+     * fan-out 移除后装配不再提供该探针：此时归一结果恒为 status="none"（没有任何恢复失败可报），
+     * 投影行为与「本进程从未执行过恢复」完全一致，不需要额外分支。
      */
     const recoveryInput = recoveryInputFromRestoreStatus(safeCall(() => fanoutHost?.restoreStatus?.(), null));
     // generatedAt 复用构建开始时的同一份样本（**不再在阶段结束后重新 now()**）：root 与
-    // expert/shard 的 turnDurationMs 因此全部锚定同一个时刻，客户端按 generatedAt 外推时不会
+    // expert 的 turnDurationMs 因此全部锚定同一个时刻，客户端按 generatedAt 外推时不会
     // 低估任何一行。此处只是把样本落到快照顶层，不重新读时钟。
     const generatedAt = builtAt;
     // 根会话全部 turn 的累计墙钟用时（与 DSH 状态行同源，轮次之间的空闲不计）；
@@ -352,7 +330,6 @@ export function createExpertGroupRuntime(dependencies = {}) {
         createdAt: createdAtOf(session?.createdAt, session?.header?.createdAt, header?.createdAt),
       },
       experts,
-      fanoutTasks,
       // 角色显示名（票据 27）：含历史角色显示名（包括已删除角色的持久化标签）；
       // 只有至少一个条目时才出现在快照顶层。
       roleLabels: currentRoleLabels(roleLabels),

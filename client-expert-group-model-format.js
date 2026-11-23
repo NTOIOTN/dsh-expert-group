@@ -93,18 +93,6 @@
    */
   const DEFAULT_COLLAPSED_STATUSES = new Set(["idle", "ready", "succeeded", "cancelled"]);
 
-  /**
-   * fan-out 父任务的「已结算」状态词表：父任务到达这些终态即代表全部分片都已结算。
-   *
-   * 取值必须与 client-sidebar-pure.js 的 FANOUT_SETTLED_STATUSES **同值**：那边是运行侧
-   * 唯一定义，这里保留一份投影只是为了不让模型层反向依赖侧栏类库。client-sidebar-tab-state.js
-   * 的空闲子代理分组（sidebarIdleChildren）正是用这份词表判定成员，因此
-   * 「结算态 fan-out」与「位于空闲子代理分组内的 fan-out」在当前代码里等价，
-   * defaultExpanded 据此决定已结算 fan-out 的默认折叠。两处词表由本注释与空闲组成员判定对齐，
-   * 改动其一时必须同步另一处。
-   */
-  const FANOUT_SETTLED_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
-
   /** 单条结构化结果 JSON 预览的字符上限：UI 只显示有界前缀，完整值仍留在导出 JSON 里。 */
   const STRUCTURED_PREVIEW_MAX_CHARS = 400;
 
@@ -266,7 +254,6 @@ const MESSAGE_CATALOG = Object.freeze({
   "settings.notificationVolume.range": { zh: "通知音量滑块", en: "Notification volume slider" },
   "settings.notificationVolume.number": { zh: "通知音量数值", en: "Notification volume value" },
   "settings.notificationEvent.completed": { zh: "任务完成", en: "Task completed" },
-  "settings.roleTimeout.aria": { zh: "角色默认超时", en: "Default role timeout" },
   "settings.notificationEvent.completed.aria": { zh: "通知任务完成", en: "Notify on task completed" },
   "settings.notificationEvent.waiting.aria": { zh: "通知等待用户", en: "Notify on waiting for user" },
   "settings.notificationEvent.failed.aria": { zh: "通知任务失败", en: "Notify on task failed" },
@@ -277,16 +264,6 @@ const MESSAGE_CATALOG = Object.freeze({
   "settings.unifiedProvider": { zh: "统一供应商", en: "Unified provider" },
   "settings.noProvider": { zh: "无", en: "None" },
   "settings.observerPreferred": { zh: "Observer优先", en: "Prefer Observer" },
-  "settings.concurrencyLimit": { zh: "单个角色并发上限", en: "Per-role concurrency limit" },
-  "settings.concurrencyLimit.title": {
-    zh: "取值范围 1–64 的整数；默认 20；保存后生效",
-    en: "An integer from 1–64; defaults to 20; takes effect after saving",
-  },
-  "settings.roleTimeout": { zh: "角色默认超时 (s)", en: "Default role timeout (s)" },
-  "settings.roleTimeout.title": {
-    zh: "默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
-    en: "Defaults to 10 hours (36000 s); 0 disables it; enabled values are 1–86400 s (integer, 1 s precision). Applies only to attempts created after saving; running shards are unchanged.",
-  },
   "settings.save": { zh: "保存", en: "Save" },
   "settings.saving": { zh: "保存中…", en: "Saving…" },
   "settings.discard": { zh: "放弃修改", en: "Discard changes" },
@@ -653,11 +630,9 @@ const MESSAGE_CATALOG = Object.freeze({
    * - 「缺失」= 该字段不是 string（null / undefined / 其它类型）；
    * - 只处理展示用文本字段（durationText / throughputText / totalTokensText /
    *   cacheHitText / contextText），数值字段（durationMs 等）保持调用方的值；
-   * - options.skipContext === true 时不补 contextText：fan-out 父任务没有单一会话，
-   *   context 段必须保持省略。
-   *
+
    * @param {object|null} summary - summarizeUsageMetrics 的返回值（可为 null）。
-   * @param {{skipContext?: boolean}} [options]
+   * @param {object} [options]
    * @returns {{metrics: object, filled: {durationText:boolean, throughputText:boolean,
    *   totalTokensText:boolean, cacheHitText:boolean, contextText:boolean}}}
    */
@@ -673,12 +648,6 @@ const MESSAGE_CATALOG = Object.freeze({
       contextText: false,
     };
     for (const key of ["durationText", "throughputText", "totalTokensText", "cacheHitText", "contextText"]) {
-      // fan-out 父任务没有单一会话：context 段即使缺失也保持省略（显式 null，便于调用方判断），
-      // 避免伪造 context 0%。
-      if (key === "contextText" && settings.skipContext === true) {
-        if (typeof source[key] !== "string") metrics[key] = null;
-        continue;
-      }
       if (typeof source[key] === "string") continue;
       metrics[key] = ZERO_USAGE_TEXTS[key];
       filled[key] = true;
@@ -731,8 +700,7 @@ const MESSAGE_CATALOG = Object.freeze({
   /**
    * attempt 时间线投影（票据 12）：只读、有序、可按「最近 N 条」截断。
    *
-   * - shard 节点用自身的 attempts；fanout 父任务把各分片的 attempts 摊平后按时间排序，
-   *   每条额外带 shardId/shardTaskName（内存里的只读视图，不会写回快照）；
+   * - 节点自身的 attempts（内存里的只读视图，不会写回快照）；
    * - 排序键是 finishedAt → startedAt；两者都缺的旧 attempt 当作最旧（保留输入顺序），
    *   同键用原始下标兜底，结果不依赖引擎排序实现的稳定性；
    * - expanded=false 时取最近 limit 条（仍按时间升序展示，最新的在最后）；
@@ -747,26 +715,10 @@ const MESSAGE_CATALOG = Object.freeze({
       : ATTEMPT_TIMELINE_LIMIT;
     const expanded = optionSource.expanded === true;
     const entries = [];
-    const appendAttempts = (attempts, shard) => {
-      if (!Array.isArray(attempts)) return;
-      for (const attempt of attempts) {
-        const normalized = normalizeAttempt(attempt);
-        entries.push({
-          ...normalized,
-          position: entries.length + 1,
-          shardId: shard === null ? null : text(shard.shardId),
-          shardTaskName: shard === null ? null : firstText(shard.taskName, shard.shardId),
-        });
+    if (Array.isArray(source.attempts)) {
+      for (const attempt of source.attempts) {
+        entries.push({ ...normalizeAttempt(attempt), position: entries.length + 1 });
       }
-    };
-    const shards = Array.isArray(source.shards) ? source.shards : [];
-    if (shards.length > 0) {
-      for (const shard of shards) {
-        const shardSource = isObject(shard) ? shard : {};
-        appendAttempts(shardSource.attempts, shardSource);
-      }
-    } else {
-      appendAttempts(source.attempts, null);
     }
     const keyed = entries.map((entry, index) => ({
       entry,
@@ -802,7 +754,7 @@ const MESSAGE_CATALOG = Object.freeze({
 
   function filterHaystackOf(value) {
     const source = isObject(value) ? value : {};
-    return [source.taskName, source.role, source.model, source.provider, source.status, source.shardId]
+    return [source.taskName, source.role, source.model, source.provider, source.status]
       .filter((item) => typeof item === "string" && item.trim() !== "")
       .join(" ")
       .toLowerCase();
@@ -811,13 +763,12 @@ const MESSAGE_CATALOG = Object.freeze({
   /**
    * 客户端本地过滤器（票据 12）：只读快照，不发任何 RPC、不写持久化。
    *
-   * 匹配字段是任务名 / 角色 / 模型 / provider / 状态 / 分片代号；返回的谓词保留命中节点的
-   * **祖先路径**：isVisible(node) 为真当且仅当节点自身命中，或其子节点/分片命中。UI 用
-   * isVisible 决定整棵子树是否展示，用 shardsFor 决定 fan-out 分支里保留哪些分片
-   * （只保留命中的分片，不因父任务命中而放宽——否则状态筛选会漏出同分支的其它状态）。
+   * 匹配字段是任务名 / 角色 / 模型 / provider / 状态；返回的谓词保留命中节点的
+   * **祖先路径**：isVisible(node) 为真当且仅当节点自身命中，或其子节点命中。UI 用
+   * isVisible 决定整棵子树是否展示。
    *
-   * active=false 时 matches 恒真、isVisible 恒真、shardsFor 原样返回，调用方可以统一走同一套
-   * 分支而无需额外判断（同时也保证「不筛选」的路径零行为变化）。
+   * active=false 时 matches 恒真、isVisible 恒真，调用方可以统一走同一套分支而无需额外判断
+   * （同时也保证「不筛选」的路径零行为变化）。
    */
   function createTaskFilter(input) {
     const source = isObject(input) ? input : {};
@@ -839,7 +790,6 @@ const MESSAGE_CATALOG = Object.freeze({
       if (depth >= MAX_NESTED_EXPERT_DEPTH) return false;
       const node = isObject(value) ? value : {};
       if (Array.isArray(node.children) && node.children.some((child) => visible(child, depth + 1) === true)) return true;
-      if (Array.isArray(node.shards) && node.shards.some((shard) => visible(shard, depth + 1) === true)) return true;
       return false;
     };
     return Object.freeze({
@@ -849,14 +799,6 @@ const MESSAGE_CATALOG = Object.freeze({
       active,
       matches,
       isVisible: (value) => visible(value, 0),
-      shardsFor: (value) => {
-        const node = isObject(value) ? value : {};
-        const shards = Array.isArray(node.shards) ? node.shards : [];
-        // 过滤启用时只保留命中的分片：父任务命中不代表它的全部子分片都命中
-        // （否则「只看失败」会把同一分支里成功的分片也一起展示出来）。
-        if (active !== true) return shards;
-        return shards.filter((shard) => visible(shard, 1) === true);
-      },
     });
   }
 
@@ -873,7 +815,6 @@ const MESSAGE_CATALOG = Object.freeze({
     const filterNode = (value) => {
       if (filter.isVisible(value) !== true) return null;
       const node = isObject(value) ? value : {};
-      if (node.kind === "fanout") return { ...node, shards: filter.shardsFor(node) };
       if (Array.isArray(node.children) && node.children.length > 0) {
         return { ...node, children: node.children.map(filterNode).filter((child) => child !== null) };
       }
@@ -984,14 +925,10 @@ const MESSAGE_CATALOG = Object.freeze({
   function markdownNodeLines(node, level) {
     const source = isObject(node) ? node : {};
     const lines = [];
-    const kind = source.kind === "fanout"
-      ? "fanout"
-      : (source.kind === "root" ? "root" : (source.kind === "shard" ? "shard" : "expert"));
-    const name = markdownTextOf(firstText(source.taskName, source.shardId, source.sessionId, source.parentTaskId), "未命名任务");
+    const kind = source.kind === "root" ? "root" : "expert";
+    const name = markdownTextOf(firstText(source.taskName, source.sessionId), "未命名任务");
     const heading = "#".repeat(Math.min(6, Math.max(1, level)));
     if (kind === "root") lines.push(heading + " 主代理");
-    else if (kind === "fanout") lines.push(heading + " Fan-out 任务：" + name);
-    else if (kind === "shard") lines.push(heading + " 分片：" + name);
     else lines.push(heading + " 专家：" + name);
     const meta = [];
     const role = text(source.role);
@@ -1004,11 +941,7 @@ const MESSAGE_CATALOG = Object.freeze({
     const effort = firstText(source.effort, source.reasoningEffort);
     if (effort !== null) meta.push("effort：" + effort);
     if (meta.length > 0) lines.push("- " + meta.join(" · "));
-    const statusParts = ["状态：" + normalizeStatus(source.status)];
-    if (kind === "fanout" && text(source.taskStatus) !== null && source.taskStatus !== source.status) {
-      statusParts.push("原始状态：" + text(source.taskStatus));
-    }
-    lines.push("- " + statusParts.join(" · "));
+    lines.push("- 状态：" + normalizeStatus(source.status));
     // 票据 25：用量按节点导出（缺失显示「—」，绝不伪造 0）。
     lines.push("- 用量：" + usageMarkdownText(source.usage));
     // 票据 30：结构化结果只导出有界预览 / 回退原因。
@@ -1021,13 +954,12 @@ const MESSAGE_CATALOG = Object.freeze({
     if (failure !== null && isFailureStatus(source.status) === true) {
       lines.push("- 失败：" + failure.code + (failure.message === null ? "" : " · " + failure.message));
     }
-    const shards = Array.isArray(source.shards) ? source.shards : [];
     const attempts = Array.isArray(source.attempts) ? source.attempts : [];
     if (attempts.length > 0) {
       lines.push("- 尝试时间线（" + attempts.length + " 条）：");
       lines.push(...markdownAttemptLines(attempts));
     }
-    return { lines, shards, children: Array.isArray(source.children) ? source.children : [] };
+    return { lines, children: Array.isArray(source.children) ? source.children : [] };
   }
 
   function renderMarkdownSnapshot(snapshot) {
@@ -1044,14 +976,6 @@ const MESSAGE_CATALOG = Object.freeze({
     const emit = (value, level) => {
       const parsed = markdownNodeLines(value, level);
       lines.push(...parsed.lines, "");
-      for (const shard of parsed.shards) {
-        const shardSource = isObject(shard) ? shard : {};
-        emit({
-          ...shardSource,
-          kind: "shard",
-          taskName: firstText(shardSource.taskName, shardSource.shardId),
-        }, level + 1);
-      }
       for (const child of parsed.children) emit(child, level + 1);
     };
     emit(source.root, 1);
@@ -1088,22 +1012,13 @@ const MESSAGE_CATALOG = Object.freeze({
     if (isObject(node) && node.kind === "root") return true;
     if (isObject(node) && node.kind === "idle-group") return true;
     const status = normalizeStatus(isObject(node) ? (node.status ?? node.taskStatus) : undefined);
-    // fan-out 的缺省展开规则（有意行为变更）：
-    // - 未结算（queued / waiting / running 等）：默认展开，运行时看到全部分片，行为不变；
-    // - 已结算（succeeded / failed / cancelled）：默认收起 —— 用户要求「进入空闲组后默认收起」。
-    //   结算态 fan-out 必然被 client-sidebar-tab-state.js 的空闲子代理分组收纳
-    //   （sidebarIdleChildren 用与 FANOUT_SETTLED_STATUSES 同值的词表判定成员），
-    //   所以这里按状态判定与「在空闲组内默认收起」等价。
-    // 这里只改变**默认值**，且绝不写进 sessionStorage：createExpansionStore 的 isExpanded
-    // 仍优先返回用户手动展开/折叠留下的 override，手动选择永远压过缺省值。
-    if (isObject(node) && node.kind === "fanout") return !FANOUT_SETTLED_STATUSES.has(status);
     return !DEFAULT_COLLAPSED_STATUSES.has(status);
   }
 
   function taskIdOf(value) {
     if (typeof value === "string") return text(value) || "unknown";
     const source = isObject(value) ? value : {};
-    return firstText(source.taskId, source.id, source.parentTaskId, source.sessionId, source.shardId) || "unknown";
+    return firstText(source.taskId, source.id, source.sessionId) || "unknown";
   }
 
   function safeStorage(storage) {

@@ -19,10 +19,10 @@
  *   `scripts/client-source-manifest.mjs` 的 `iifeDependencies`（显式声明）；
  *   `collectIifeDependencyEdges`（扫描源码 Symbol 读写）保留为同一输入的**等价性证据**，
  *   两者的逐项相等由 `test/dependency-graph-gate.test.mjs` 持续校验。
- * - **C2** `host/`、`shared/`、`fanout/` 下的模块不得 import 入口 `index.js`。相对路径
+ * - **C2** `host/`、`shared/` 下的模块不得 import 入口 `index.js`。相对路径
  *   解析 + `posix.normalize` 归一化之后再判定，所以 `../index.js`、`./index.js` 都会被识别。
- *   兼容 R1 之前的文件形态：`shared.js`、`fanout.js` 同样在 C2 范围内（R1 之后它们分别
- *   变成 `shared/`、`fanout/` 目录，前缀规则已覆盖）。
+ *   兼容 R1 之前的文件形态：`shared.js` 同样在 C2 范围内（R1 之后它变成
+ *   `shared/` 目录，前缀规则已覆盖）。
  * - **C4** 内部模块导出数 ≤12：票据 45 起按 **AST 的导出名个数**计（`countModuleExports`）：
  *   `export { a, b }` / `export { a, b } from "…"` 按名字个数计；`export const A = 1, B = 2`
  *   按**声明名个数**计（2——词法器只数 `export` 关键字、会漏成 1）；`export * from`（含
@@ -153,18 +153,18 @@ export const ENTRY_MODULE = "index.js";
 
 /**
  * C2 的作用域：这些模块不得 import 入口。
- * - 目录前缀覆盖 R1 之后的 `shared/`、`fanout/` 与既有的 `host/`；
- * - `shared.js`、`fanout.js` 是 R1 之前的文件形态（R1 会把它们拆成目录 + 门面）。
- * 注意：规格书 C2 只声明这三处；`fanout-host.js` 等根目录模块不在判据范围内，故不纳入。
+ * - 目录前缀覆盖 `shared/` 与既有的 `host/`；
+ * - `shared.js` 是 R1 之前的文件形态（R1 会把它拆成目录 + 门面）。
+ * 注意：`fanout/` 与 `fanout.js` 随 fan-out 物理删除一并移出判据范围。
  */
-const ENTRY_DEPENDENT_PREFIXES = Object.freeze(["host/", "shared/", "fanout/"]);
-const ENTRY_DEPENDENT_FILES = Object.freeze(["shared.js", "fanout.js"]);
+const ENTRY_DEPENDENT_PREFIXES = Object.freeze(["host/", "shared/"]);
+const ENTRY_DEPENDENT_FILES = Object.freeze(["shared.js"]);
 
 /**
  * C4 豁免第 3 类「凝聚纯函数库」的**显式登记表**（规格书 §C4 导出数豁免）。
  *
  * 为什么必须显式登记而不做启发式放行：按 plan §6 切分后 `model-route`、`retry-policy`、
- * `turn-settlement`、`protocol`、`fanout/contracts` 等模块的导出数必然超过 12，它们本身是
+ * `turn-settlement`、`protocol` 等模块的导出数必然超过 12，它们本身是
  * 单一关注点的纯函数/常量集合；但「看起来像纯函数库」无法自动证明，所以登记必须由人完成，
  * 并且**登记后仍要通过机械校验**（见 `inspectPureFunctionLibrary`）。
  *
@@ -173,12 +173,13 @@ const ENTRY_DEPENDENT_FILES = Object.freeze(["shared.js", "fanout.js"]);
  * - `concern`：该库的单一关注点；
  * - `reason`：为什么它是纯函数库（与台账 §「C4 导出数豁免登记」逐条对应）。
  *
- * 当前登记 11 项，分两批：
- * 1. **7 个不会被任何拆分批次改动的单关注点领域库**（用户 2026-10-22 裁决）；
+ * fan-out 物理删除批次移除了 4 项 fan-out 专属登记（`resource-budget.js` 与
+ * `fanout/` 下的三个叶子），当前登记 14 项，分两批：
+ * 1. **6 个不会被任何拆分批次改动的单关注点领域库**（用户 2026-10-22 裁决）；
  * 2. **R1-05 拆出的 4 个导出 >12 的 shared 叶子**（`protocol` 15 / `turn-settlement` 19 /
  *    `retry-policy` 23 / `model-route` 29），它们的导出数由已批准的 plan §6 切分**决定**，
  *    再切碎只会增加模块数而不降低耦合——主代理 2026-10-22 按台账 §3 登记。
- * `shared.js` 已转为纯 re-export 门面（C4 走 facade 机械豁免）、`fanout.js`（R3 拆 manager）、
+ * `shared.js` 已转为纯 re-export 门面（C4 走 facade 机械豁免）、
  * `host/usage-ledger.js`（R2 拆 usage-projection）**故意不登记**，保留它们被 C4 报出，
  * 作为后续批次的可见目标。
  */
@@ -201,11 +202,6 @@ export const PURE_FUNCTION_LIBRARY_EXEMPTIONS = Object.freeze([
   {
     file: "image-routing.js",
     concern: "图片路由判定、能力探测与 PNG 归一",
-    reason: "单一关注点 + 导出全为函数/类/常量 + 内部状态由 C5 台账登记",
-  },
-  {
-    file: "resource-budget.js",
-    concern: "fan-out 预算常量与文本截断",
     reason: "单一关注点 + 导出全为函数/类/常量 + 内部状态由 C5 台账登记",
   },
   {
@@ -239,22 +235,7 @@ export const PURE_FUNCTION_LIBRARY_EXEMPTIONS = Object.freeze([
     concern: "模型候选计划、路由 marker 归一与路由错误分类",
     reason: "单一关注点 + 导出全为函数/常量 + 内部状态仅两个只读查找 Set（见 C5 台账）",
   },
-  // ── R1-06 / R1-07 从入口与 fanout 前段拆出的领域库（导出数由已批准的切分边界决定）──
-  {
-    file: "fanout/contracts.js",
-    concern: "fan-out 契约常量、停止证据校验与恢复字段校验",
-    reason: "单一关注点 + 导出全为函数/常量 + 无模块级内部可变状态",
-  },
-  {
-    file: "fanout/errors.js",
-    concern: "shard/父任务状态词表、停止证据状态与终态判定",
-    reason: "单一关注点 + 导出全为函数/常量 + 内部状态仅两个只读查找 Set（见 C5 台账）",
-  },
-  {
-    file: "fanout/validation.js",
-    concern: "attempt 身份、错误构造归一与 submit/limit 校验",
-    reason: "单一关注点 + 导出全为函数/类/常量 + 无模块级内部可变状态",
-  },
+  // ── R1-06 / R1-07 从入口拆出的领域库（导出数由已批准的切分边界决定）──
   {
     file: "host/expert-guards.js",
     concern: "专家报告/发送拦截、persona marker 与 deny 收窄",
@@ -323,15 +304,15 @@ export const C3_FACES_REQUIRED_MIN = 6;
  * 条目约束，台账 §2 也只按工厂登记。`groups` 的口径是**注入的能力组数**：
  * - 扁平解构袋按「一个协作方 = 一组」计（同一协作方拆成多个参数就按多个计，见规格书）；
  * - 数据构造函数（参数全是数据、不注入协作方）记 0；
- * - 组数已由台账签核的条目沿用台账值（例如 `createFanoutRuntime` 24、`createUsageLedger` 6、
+ * - 组数已由台账签核的条目沿用台账值（例如 `createUsageLedger` 6、
  *   `createSnapshotCache` 5），票据 32/33 收窄过的条目用**收窄后**的实测值；
  * - 命名空间化的工厂（票据 32/33 收窄后）按命名空间个数计：`createRootTurnWaitRegistry` 8、
  *   `createRootWaitDomain` 8、`createHandoffDomain` 7、`createFinalizeDomain` 7、
  *   `createSystemToastModule` 3、`createExpertGroupRuntime` 8。
  *
- * ## 超上限的 2 条（都是组合根豁免，每条必须有 reason）
- * `createFanoutRuntime`（20）、`createFanoutRuntimeModule`（25）：fanout 子系统的组合根，
- * 与 `index.js` 同类，规格书 §C3 与组合根条款明确豁免。
+ * ## 超上限条目
+ * fan-out 物理删除后，登记表里已没有超过 8 组的条目（此前两条 fan-out 组合根豁免
+ * `createFanoutRuntime` / `createFanoutRuntimeModule` 随 fan-out 一并移除）。
  *
  * 票据 33 已把此前如实登记的三个「待收窄偏差」收掉（`createFinalizeDomain` 18→7、
  * `createSystemToastModule` 14→3、`createExpertGroupRuntime` 13→8），它们的 `reason`
@@ -339,80 +320,6 @@ export const C3_FACES_REQUIRED_MIN = 6;
  */
 export const C3_FACTORY_REGISTRY = Object.freeze([
   { file: "client-freshness.js", name: "createClientFreshnessBoundary", groups: 2 },
-  {
-    file: "fanout-host.js",
-    name: "createFanoutRuntime",
-    // 票据 34 复核：此前的 24 是从 createFanoutRuntimeModule 的形参数直接沿用过来的。
-    // 票据 36（第四轮复审）按源码实际读取重算：本函数读 **22 个 option keys**，其中
-    // clock / now / setTimeout / clearTimeout 四个 key 在函数体内被折叠成**同一组**时钟能力
-    // （clock 对象承载 now/setTimeout/clearTimeout），所以能力组 = 22 − 4 + 1 = **19 组**。
-    // 票据 03 增补 prepareAttempt（派发前路由冻结 seam）→ 23 个 key、**20 组**。
-    // 模块侧的 24 个形参里有 5 个（createRuntime / lineage / getAgent / buildFeedback /
-    // writeSnapshot / readSnapshot / getPersistenceGeneration 等）只被模块层消费，
-    // 不会被转发给 runtime，因此不在本条目里计数。
-    groups: 20,
-    faces: [
-      { name: "allowOverlap", capability: "并发重叠提交策略开关" },
-      { name: "prepareAttempt", capability: "派发前路由冻结：attempt 进入 running 之前同步构造快照" },
-      { name: "attributionAgingMs", capability: "归属老化阈值：配置" },
-      { name: "buildRequest", capability: "子 agent 请求构建" },
-      { name: "clock", capability: "时间与定时器控制：Date.now / setTimeout / clearTimeout" },
-      { name: "concurrencyLimit", capability: "并发上限：配置" },
-      { name: "conflictChecker", capability: "写角色冲突检查器" },
-      { name: "continueMessage", capability: "续作消息投递" },
-      { name: "interrupt", capability: "中断请求投递" },
-      { name: "log", capability: "日志函数" },
-      { name: "onAgentCreated", capability: "agent 创建钩子" },
-      { name: "onEvent", capability: "fan-out 事件回调" },
-      { name: "parentAgentOf", capability: "父 agent 解析" },
-      { name: "persistence", capability: "快照持久化读写" },
-      { name: "providerLimits", capability: "提供商并发上限：配置" },
-      { name: "resolveChildSession", capability: "子会话解析" },
-      { name: "roleLimits", capability: "角色限额：配置" },
-      { name: "roleTimeoutMs", capability: "角色超时：配置" },
-      { name: "startContinuable", capability: "可续作子 agent 启动" },
-      { name: "writeRoles", capability: "写角色冲突策略：写角色集合" },
-    ],
-    reason: "【组合根豁免】fanout 子系统的组合根（与 index.js 同类）：读 23 个 option keys，其中 clock/now/setTimeout/clearTimeout 折叠为 1 组时钟能力 → 20 个能力组（模块侧 createFanoutRuntimeModule 是 25 个形参，其中 5 个只在模块层消费、不转发给 runtime），规格书 §C3 与组合根条款明确豁免，收窄需改 fanout 子系统装配面",
-  },
-  { file: "fanout/events.js", name: "createFanoutEventBus", groups: 3 },
-  { file: "fanout/limits.js", name: "createLimitResolver", groups: 2 },
-  { file: "fanout/persistence.js", name: "createFanoutPersistence", groups: 5 },
-  { file: "fanout/public-api.js", name: "createFanoutManager", groups: 3 },
-  { file: "fanout/reclaim.js", name: "createReclaimBarrier", groups: 1 },
-  { file: "fanout/scheduler.js", name: "createAttempt", groups: 1 },
-  { file: "fanout/scheduler.js", name: "createScheduler", groups: 7, faces: [
-    { name: "store", capability: "分片/父任务存储端口" },
-    { name: "limits", capability: "角色/提供商并发与超时限额" },
-    { name: "events", capability: "fan-out 事件总线" },
-    { name: "persistence", capability: "快照持久化读写" },
-    { name: "agents", capability: "宿主 agent 查询：getAgent/list" },
-    { name: "clock", capability: "时间源：Date.now 注入" },
-    { name: "ownerGate", capability: "owner 闸门：并发准入" },
-  ] },
-  { file: "fanout/snapshot.js", name: "createFanoutSerializer", groups: 5 },
-  { file: "fanout/state.js", name: "createFanoutState", groups: 8, faces: [
-    { name: "store", capability: "分片/父任务存储端口" },
-    { name: "limits", capability: "角色/提供商并发与超时限额" },
-    { name: "events", capability: "fan-out 事件总线" },
-    { name: "persistence", capability: "快照持久化读写" },
-    { name: "snapshot", capability: "fan-out 快照序列化" },
-    { name: "clock", capability: "时间源：Date.now 注入" },
-    { name: "budget", capability: "资源预算与文本截断" },
-    { name: "config", capability: "插件配置读面：Config" },
-  ] },
-  { file: "fanout/store.js", name: "createTaskStore", groups: 1 },
-  { file: "fanout/task-commands.js", name: "createTaskCommands", groups: 8, faces: [
-    { name: "store", capability: "分片/父任务存储端口" },
-    { name: "limits", capability: "角色/提供商并发与超时限额" },
-    { name: "scheduler", capability: "尝试调度器" },
-    { name: "events", capability: "fan-out 事件总线" },
-    { name: "persistence", capability: "快照持久化读写" },
-    { name: "agents", capability: "宿主 agent 查询：getAgent/list" },
-    { name: "clock", capability: "时间源：Date.now 注入" },
-    { name: "ownerGate", capability: "owner 闸门：并发准入" },
-  ] },
-  { file: "fanout/validation.js", name: "createWriteRoleConflictChecker", groups: 1 },
   { file: "host/composition.js", name: "createHostComposition", groups: 7, faces: [
     { name: "recovery", capability: "恢复服务：checkpoint/重建" },
     { name: "rpc", capability: "RPC 传输/分发" },
@@ -445,134 +352,23 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
     { name: "diagnostics", capability: "运行诊断投影" },
     { name: "clock", capability: "时间源：Date.now 注入" },
   ] },
-  { file: "host/fanout-attribution.js", name: "createAttributionAging", groups: 1 },
-  { file: "host/fanout-attribution.js", name: "createAttributionRegistry", groups: 1 },
-  { file: "host/fanout-attribution.js", name: "createAttributionState", groups: 7, faces: [
-    { name: "log", capability: "日志函数" },
-    { name: "managerPort", capability: "fan-out 管理器端口" },
-    { name: "clock", capability: "时间源：Date.now 注入" },
-    { name: "attributionAgingMs", capability: "归属老化阈值：配置" },
-    { name: "resolveChildSession", capability: "子会话解析" },
-    { name: "parentAgentOf", capability: "父 agent 解析" },
-    { name: "hasContinueRoute", capability: "续作路由判定" },
-  ] },
-  { file: "host/fanout-attribution.js", name: "createAttributionVerdicts", groups: 2 },
-  { file: "host/fanout-attribution.js", name: "createFanoutAttribution", groups: 7, faces: [
-    { name: "log", capability: "日志函数" },
-    { name: "managerPort", capability: "fan-out 管理器端口" },
-    { name: "clock", capability: "时间源：Date.now 注入" },
-    { name: "attributionAgingMs", capability: "归属老化阈值：配置" },
-    { name: "resolveChildSession", capability: "子会话解析" },
-    { name: "parentAgentOf", capability: "父 agent 解析" },
-    { name: "hasContinueRoute", capability: "续作路由判定" },
-  ] },
-  { file: "host/fanout-event-log.js", name: "createFanoutEventLog", groups: 0 },
-  { file: "host/fanout-lifecycle.js", name: "createAdmissionHandle", groups: 0 },
-  { file: "host/fanout-lifecycle.js", name: "createAgentHandlers", groups: 4 },
-  { file: "host/fanout-lifecycle.js", name: "createAttemptAdmission", groups: 7, faces: [
-    { name: "log", capability: "日志函数" },
-    { name: "attribution", capability: "fan-out 归属判定与 aging" },
-    { name: "buildRequest", capability: "子 agent 请求构建" },
-    { name: "startContinuable", capability: "可续作子 agent 启动" },
-    { name: "continueMessage", capability: "续作消息投递" },
-    { name: "settlement", capability: "任务结算记录" },
-    { name: "requestInterrupt", capability: "中断请求回调" },
-  ] },
-  { file: "host/fanout-lifecycle.js", name: "createAttemptInterrupt", groups: 3 },
-  { file: "host/fanout-lifecycle.js", name: "createDeferred", groups: 0 },
-  { file: "host/fanout-lifecycle.js", name: "createFanoutLifecycle", groups: 8, faces: [
-    { name: "log", capability: "日志函数" },
-    { name: "attribution", capability: "fan-out 归属判定与 aging" },
-    { name: "managerPort", capability: "fan-out 管理器端口" },
-    { name: "buildRequest", capability: "子 agent 请求构建" },
-    { name: "startContinuable", capability: "可续作子 agent 启动" },
-    { name: "continueMessage", capability: "续作消息投递" },
-    { name: "interrupt", capability: "中断请求投递" },
-    { name: "onAgentCreated", capability: "agent 创建钩子" },
-  ] },
-  { file: "host/fanout-lifecycle.js", name: "createRecordSettlement", groups: 1 },
-  { file: "host/fanout-lifecycle.js", name: "createRuntimeClose", groups: 5 },
-  { file: "host/fanout-ownership.js", name: "createFanoutOwnershipService", groups: 6, faces: [
-    { name: "lineage", capability: "agent 血缘与任务记录" },
-    { name: "getAgent", capability: "宿主 agent 查询" },
-    { name: "getManager", capability: "fan-out 管理器获取" },
-    { name: "continuationReadiness", capability: "续作就绪判定" },
-    { name: "isClosed", capability: "会话关闭判定" },
-    { name: "warn", capability: "告警日志" },
-  ] },
-  { file: "host/fanout-ownership.js", name: "createOwnershipIndex", groups: 2 },
-  { file: "host/fanout-persistence.js", name: "createFanoutPersistenceService", groups: 7, faces: [
-    { name: "lineage", capability: "agent 血缘与任务记录" },
-    { name: "getManager", capability: "fan-out 管理器获取" },
-    { name: "storage", capability: "存储服务：持久化域读写" },
-    { name: "persistenceHealth", capability: "持久化健康检查" },
-    { name: "retryBackoff", capability: "持久化重试退避" },
-    { name: "warn", capability: "告警日志" },
-    { name: "ownership", capability: "child 归属索引" },
-  ] },
-  { file: "host/fanout-restore.js", name: "createFanoutRestoreService", groups: 7, faces: [
-    { name: "lineage", capability: "agent 血缘与任务记录" },
-    { name: "getAgent", capability: "宿主 agent 查询" },
-    { name: "getManager", capability: "fan-out 管理器获取" },
-    { name: "readSnapshot", capability: "快照读取" },
-    { name: "ownership", capability: "child 归属索引" },
-    { name: "persistence", capability: "快照持久化读写" },
-    { name: "warn", capability: "告警日志" },
-  ] },
-  {
-    file: "host/fanout-runtime.js",
-    name: "createFanoutRuntimeModule",
-    // 票据 03：新增 prepareAttempt（派发前路由冻结 seam）→ 25 个形参。
-    groups: 25,
-    faces: [
-      { name: "createRuntime", capability: "runtime 构造回调" },
-      { name: "runtimeOptions", capability: "runtime 选项袋" },
-      { name: "concurrencyLimit", capability: "并发上限：配置" },
-      { name: "roleLimits", capability: "角色限额：配置" },
-      { name: "providerLimits", capability: "提供商并发上限：配置" },
-      { name: "roleTimeoutMs", capability: "角色超时：配置" },
-      { name: "onFanoutEvent", capability: "fan-out 事件回调" },
-      { name: "buildRequest", capability: "子 agent 请求构建" },
-      { name: "startContinuable", capability: "可续作子 agent 启动" },
-      { name: "continueMessage", capability: "续作消息投递" },
-      { name: "resolveChildSession", capability: "子会话解析" },
-      { name: "interrupt", capability: "中断请求投递" },
-      { name: "onAgentCreated", capability: "agent 创建钩子" },
-      { name: "prepareAttempt", capability: "派发前路由冻结：attempt 进入 running 之前同步构造快照" },
-      { name: "lineage", capability: "agent 血缘与任务记录" },
-      { name: "getAgent", capability: "宿主 agent 查询" },
-      { name: "buildFeedback", capability: "父任务反馈构建" },
-      { name: "injectFeedback", capability: "父任务反馈注入" },
-      { name: "onParentSettled", capability: "父任务结算回调" },
-      { name: "writeSnapshot", capability: "快照写入" },
-      { name: "readSnapshot", capability: "快照读取" },
-      { name: "persistenceHealth", capability: "持久化健康检查" },
-      { name: "retryBackoff", capability: "持久化重试退避" },
-      { name: "getPersistenceGeneration", capability: "持久化代次读取" },
-      { name: "logger", capability: "日志器" },
-    ],
-    reason: "【组合根豁免】fanout 子系统的中心组合根（与 createFanoutRuntime 同一注入面，但多 5 个只在模块层消费的 seam）：装配全部执行 seam，规格书 §C3 与组合根条款明确豁免",
-  },
   { file: "host/handoff.js", name: "createHandoffRegistryModule", groups: 0 },
-  { file: "host/index-agent-created.js", name: "createAgentCreatedHandler", groups: 8, faces: [
+  { file: "host/index-agent-created.js", name: "createAgentCreatedHandler", groups: 7, faces: [
     { name: "logger", capability: "日志器" },
     { name: "rootWait", capability: "root turn 等待注册表" },
-    { name: "fanout", capability: "fan-out 管理器端口" },
     { name: "roots", capability: "根集合与根存活判定" },
     { name: "guards", capability: "专家发送/报告拦截" },
     { name: "effort", capability: "思考深度：effort标记" },
     { name: "records", capability: "agent 记录注册表" },
-    { name: "snapshot", capability: "fan-out 快照序列化" },
+    { name: "snapshot", capability: "child 快照域（身份解析与 child_models 落盘）" },
   ] },
-  { file: "host/index-agent-disposed.js", name: "createAgentDisposedHandler", groups: 8, faces: [
+  { file: "host/index-agent-disposed.js", name: "createAgentDisposedHandler", groups: 6, faces: [
     { name: "logger", capability: "日志器" },
     { name: "roots", capability: "根集合与根存活判定" },
-    { name: "fanout", capability: "fan-out 管理器端口" },
     { name: "guards", capability: "专家发送/报告拦截" },
     { name: "recovery", capability: "恢复服务：checkpoint/重建" },
     { name: "effort", capability: "思考深度：effort标记" },
     { name: "delegation", capability: "委派服务：任务清单/次数/预算" },
-    { name: "snapshot", capability: "fan-out 快照序列化" },
   ] },
   { file: "host/index-agent-records.js", name: "createAgentRecordRegistration", groups: 5 },
   { file: "host/index-agent-request-error.js", name: "createAgentRequestErrorHandler", groups: 2 },
@@ -604,14 +400,16 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
     { name: "agents", capability: "宿主 agent 查询：getAgent/list" },
     { name: "delegation", capability: "委派服务：任务清单/次数/预算" },
   ] },
-  { file: "host/index-auto-recovery.js", name: "createRecoveryEventBridge", groups: 8, faces: [
+  // 按源码真实解构订正：createRecoveryEventBridge 只解构
+  // { logger, records, handoff, identity, rootWait, notifications, delegation } 七组；
+  // 旧登记的 `fanout` 面随 fan-out 物理删除后源码已不再读取，登记随之移除（组数 8 → 7）。
+  { file: "host/index-auto-recovery.js", name: "createRecoveryEventBridge", groups: 7, faces: [
     { name: "logger", capability: "日志器" },
     { name: "records", capability: "agent 记录注册表" },
     { name: "handoff", capability: "handoff 服务：pending 交接" },
     { name: "identity", capability: "根/会话身份归一：lineage" },
     { name: "rootWait", capability: "root turn 等待注册表" },
     { name: "notifications", capability: "通知服务：Toast/系统通知" },
-    { name: "fanout", capability: "fan-out 管理器端口" },
     { name: "delegation", capability: "委派服务：任务清单/次数/预算" },
   ] },
   { file: "host/index-capability-report.js", name: "createHostCapabilityReport", groups: 6, faces: [
@@ -632,14 +430,16 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
     { name: "dispatch", capability: "通知/事件分发" },
     { name: "fallbackEffect", capability: "Connection 回落 effect" },
   ] },
-  { file: "host/index-effort-retire.js", name: "createEffortRetireDomain", groups: 7, faces: [
+  // 按源码真实解构订正：createEffortRetireDomain 只解构
+  // { identity, prelude, rootWait, handoff, recovery, delegation } 六组；
+  // 旧登记的 `fanout` 面随 fan-out 物理删除后源码已不再读取，登记随之移除（组数 7 → 6）。
+  { file: "host/index-effort-retire.js", name: "createEffortRetireDomain", groups: 6, faces: [
     { name: "identity", capability: "根/会话身份归一：lineage" },
     { name: "prelude", capability: "入口前置装配：config/logger" },
     { name: "rootWait", capability: "root turn 等待注册表" },
     { name: "handoff", capability: "handoff 服务：pending 交接" },
     { name: "recovery", capability: "恢复服务：checkpoint/重建" },
     { name: "delegation", capability: "委派服务：任务清单/次数/预算" },
-    { name: "fanout", capability: "fan-out 管理器端口" },
   ] },
   { file: "host/index-expert-tools-admission.js", name: "createRoleToolClosures", groups: 8, faces: [
     { name: "handles", capability: "child 显式句柄" },
@@ -697,38 +497,6 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
   { file: "host/index-expert-tools-core.js", name: "createExpertOutputSchemaSupport", groups: 1 },
   { file: "host/index-expert-tools-core.js", name: "createExpertStructuredResults", groups: 2 },
   { file: "host/index-expert-tools-core.js", name: "createIndexExpertToolsCore", groups: 5 },
-  { file: "host/index-expert-tools-fanout.js", name: "createFanoutChildHandlers", groups: 5 },
-  { file: "host/index-expert-tools-fanout.js", name: "createFanoutDeclarationCaches", groups: 2 },
-  { file: "host/index-expert-tools-fanout.js", name: "createFanoutRequestBuilder", groups: 6, faces: [
-    { name: "identity", capability: "根/会话身份归一：lineage" },
-    { name: "models", capability: "模型目录/选择读面" },
-    { name: "core", capability: "专家工具核心域句柄" },
-    { name: "roles", capability: "角色注册表与启用态" },
-    { name: "storage", capability: "存储服务：持久化域读写" },
-    { name: "caches", capability: "fan-out 声明缓存" },
-  ] },
-  { file: "host/index-expert-tools-fanout.js", name: "createFanoutRuntimeWiring", groups: 8, faces: [
-    { name: "identity", capability: "根/会话身份归一：lineage" },
-    { name: "roles", capability: "角色注册表与启用态" },
-    { name: "storage", capability: "存储服务：持久化域读写" },
-    { name: "waits", capability: "shard 等待登记" },
-    { name: "caches", capability: "fan-out 声明缓存" },
-    { name: "hooks", capability: "工具挂载 hooks" },
-    { name: "commands", capability: "任务命令：取消/重试/停止" },
-    { name: "logger", capability: "日志器" },
-  ] },
-  { file: "host/index-expert-tools-fanout.js", name: "createFanoutShardWaits", groups: 3 },
-  { file: "host/index-expert-tools-fanout.js", name: "createFanoutTaskCommands", groups: 5 },
-  { file: "host/index-expert-tools-fanout.js", name: "createFanoutToolHooks", groups: 7, faces: [
-    { name: "identity", capability: "根/会话身份归一：lineage" },
-    { name: "childIo", capability: "child 会话 IO：发送/续作" },
-    { name: "core", capability: "专家工具核心域句柄" },
-    { name: "waits", capability: "shard 等待登记" },
-    { name: "requestBuilder", capability: "子请求构建器" },
-    { name: "childHandlers", capability: "child 工具处理器集合" },
-    { name: "dispatch", capability: "派发期只读读面：设置快照 + 时钟" },
-  ] },
-  { file: "host/index-expert-tools-fanout.js", name: "createFanoutWaitLedger", groups: 5 },
   { file: "host/index-expert-tools-role.js", name: "createIndexExpertRoleTools", groups: 6, faces: [
     { name: "closures", capability: "role 工具闭包集合" },
     { name: "definition", capability: "工具定义注册面" },
@@ -748,16 +516,9 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
   ] },
   { file: "host/index-expert-tools-role.js", name: "createRoleToolExecute", groups: 4 },
   { file: "host/index-expert-tools-role.js", name: "createRoleToolObserverRoute", groups: 4 },
-  { file: "host/index-expert-tools-surface.js", name: "createFanoutToolSurface", groups: 6, faces: [
-    { name: "commands", capability: "任务命令：取消/重试/停止" },
-    { name: "models", capability: "模型目录/选择读面" },
-    { name: "identity", capability: "根/会话身份归一：lineage" },
-    { name: "core", capability: "专家工具核心域句柄" },
-    { name: "roles", capability: "角色注册表与启用态" },
-    { name: "toolMount", capability: "工具挂载面" },
-  ] },
+  // fan-out tombstone 与可见性闸门随 fan-out 物理删除一并移除后，surface 模块只剩
+  // createRoutingPrompt（C3 登记仅保留仍真实存在的工厂）。
   { file: "host/index-expert-tools-surface.js", name: "createRoutingPrompt", groups: 5 },
-  { file: "host/index-fanout-rpc.js", name: "createFanoutRpcReads", groups: 4 },
   { file: "host/index-finalize.js", name: "createFinalizeDomain", groups: 7, faces: [
     { name: "host", capability: "宿主装配状态袋" },
     { name: "rootWait", capability: "root turn 等待注册表" },
@@ -778,15 +539,6 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
   ] },
   { file: "host/index-image-claims.js", name: "createImageRouteClaims", groups: 4 },
   { file: "host/index-image-route.js", name: "createImageRouteWire", groups: 2 },
-  { file: "host/index-manual-dispatch.js", name: "createManualFanoutDispatch", groups: 7, faces: [
-    { name: "failures", capability: "失败记录与重试判定" },
-    { name: "routing", capability: "故障转交路由" },
-    { name: "commands", capability: "任务命令：取消/重试/停止" },
-    { name: "core", capability: "专家工具核心域句柄" },
-    { name: "abort", capability: "请求中止信号/AbortSignal 读面" },
-    { name: "identity", capability: "根/会话身份归一：lineage" },
-    { name: "reads", capability: "RPC 只读投影" },
-  ] },
   // 主代理（Orchestrator）模型配置运行期（批次 A）：6 个能力组
   // （settings 快照读面 / 根会话判定与 sessionController 读取 / catalog 预检 / 时钟 / logger /
   // DEG 持久化域）。时钟组按仓接口径把 now + setTimeout + clearTimeout 折叠成 1 组
@@ -806,23 +558,28 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
   { file: "host/orchestrator-epoch.js", name: "createOrchestratorEpochStore", groups: 3 },
   // 会话覆盖的 durable 写入（RPC 与运行期共用）：存储写面 / 读投影 / 冲突构造器。
   { file: "host/session-override-store.js", name: "createSessionOverrideStore", groups: 3 },
-  { file: "host/index-model-route.js", name: "createIndexModelRouteDomain", groups: 8, faces: [
-    { name: "settings", capability: "设置读写服务" },
-    { name: "settingsRuntime", capability: "设置运行期：派生/缓存" },
-    { name: "settingsRead", capability: "设置只读投影" },
+  // 会话覆盖 / 模型路由 / 设置校验与提交域：7 组。一处聚合沿用台账 §2 的签核口径
+  // （同一协作方的窄投影不另立一组）：`settingsRuntime` + `updateSettingsAtGeneration`
+  // （同属 settings 提交边界）。fan-out 退役后不再有配置迁移标记投影（`configMigrationPending`
+  // 随 roleConcurrencyLimit 的读取别名一并删除），`settings` 只余宿主 describe 读面。
+  // fan-out 物理删除后本工厂不再收到 getFanoutHost；`normalizeSubagentProvider` 从未被本
+  // 工厂解构，属死参数，已随本轮清理从装配调用点一并删除（调用点与工厂两侧都不再出现）。
+  { file: "host/index-model-route.js", name: "createIndexModelRouteDomain", groups: 7, faces: [
+    { name: "settings", capability: "宿主 settings 文档：describe 只读读面" },
+    { name: "settingsRuntime", capability: "设置提交边界：串行链/代次 + 带代次栅栏的写入命令" },
+    { name: "settingsRead", capability: "设置只读投影：读源/快照/角色提示词" },
     { name: "roles", capability: "角色注册表与启用态" },
-    { name: "getFanoutHost", capability: "fan-out 宿主句柄获取" },
-    { name: "normalizeSubagentProvider", capability: "子代理 provider 归一" },
+    { name: "clock", capability: "派发期唯一时钟：now 注入" },
     { name: "llm", capability: "LLM 服务：模型调用" },
     { name: "ValidationError", capability: "参数校验错误构造器：ValidationError 类" },
   ] },
-  { file: "host/index-prelude.js", name: "createIndexPrelude", groups: 7, faces: [
+  // fan-out 物理删除后组合根不再注入 getFanoutHost：装配前言只剩 6 组。
+  { file: "host/index-prelude.js", name: "createIndexPrelude", groups: 6, faces: [
     { name: "config", capability: "插件配置读面：Config" },
     { name: "logger", capability: "日志器" },
     { name: "settings", capability: "设置读写服务" },
     { name: "agents", capability: "宿主 agent 查询：getAgent/list" },
     { name: "isRootAgent", capability: "根 agent 判定" },
-    { name: "getFanoutHost", capability: "fan-out 宿主句柄获取" },
     { name: "isTurnWaitStopping", capability: "turn 等待停止判定" },
   ] },
   { file: "host/index-recovery.js", name: "createIndexRecoveryDomain", groups: 8, faces: [
@@ -845,40 +602,43 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
     { name: "hostEvents", capability: "宿主事件订阅" },
     { name: "waterfall", capability: "宿主 waterfall 中间件" },
   ] },
-  { file: "host/index-rpc-action-core.js", name: "createIndexRpcActionCore", groups: 8, faces: [
-    { name: "runtime", capability: "fan-out runtime 句柄" },
-    { name: "session", capability: "宿主会话快照/当前会话袋" },
-    { name: "settings", capability: "设置读写服务" },
-    { name: "subagents", capability: "子 agent 服务：启动/续作" },
-    { name: "image", capability: "图片路由服务" },
-    { name: "manualDispatch", capability: "手动派发服务" },
+  // RPC 分发核心（R4f）：deps 的 7 个顶层命名空间 = 7 组（台账 §2.10「deps 型域工厂取源码
+  // 实际读取的顶层命名空间」）。旧条目的 `manualDispatch` 面已随 fan-out 物理删除零引用
+  // （全仓只剩登记表自身），`settings`/`subagents` 是 `services` 袋内的子面而非独立顶层面，
+  // `diagnostics`（能力矩阵 + 运行时诊断投影）此前漏登记——本轮按源码真实解构重列。
+  { file: "host/index-rpc-action-core.js", name: "createIndexRpcActionCore", groups: 7, faces: [
+    { name: "services", capability: "宿主服务袋：agents/config/llm/roleTools/settings/subagents 与设置提交命令" },
+    { name: "reads", capability: "RPC 只读投影：设置读源/角色标签/用量/运行时快照/宿主名额" },
+    { name: "image", capability: "图片路由服务：路由判定/声明/上传归一/观察者清理" },
     { name: "notifications", capability: "通知服务：Toast/系统通知" },
-    { name: "reads", capability: "RPC 只读投影" },
+    { name: "runtime", capability: "运行时窄面：host 装配袋 + rpcErrorTracker + logger + ValidationError" },
+    { name: "diagnostics", capability: "能力矩阵与运行时诊断投影" },
+    { name: "session", capability: "会话域分发表（含会话删除命令面）" },
   ] },
   { file: "host/index-rpc-action-core.js", name: "createRpcActionResponder", groups: 2 },
   { file: "host/index-rpc-action-session.js", name: "createIndexRpcActionSession", groups: 4 },
   { file: "host/index-rpc-http.js", name: "createRpcHttpSurface", groups: 3 },
-  { file: "host/index-runtime-diagnostics.js", name: "createRuntimeDiagnostics", groups: 8, faces: [
-    { name: "host", capability: "宿主装配状态袋" },
-    { name: "settings", capability: "设置读写服务" },
-    { name: "storage", capability: "存储服务：持久化域读写" },
+  // fan-out 退役后并发上限已无任何运行期来源（default/roles/providers 固定为中性值），
+  // 工厂因此不再解构角色目录：8 组降为 7 组。
+  { file: "host/index-runtime-diagnostics.js", name: "createRuntimeDiagnostics", groups: 7, faces: [
+    { name: "host", capability: "宿主组合门面：lineage/handoff/notifications 只读 describe" },
+    { name: "settings", capability: "设置读面：代次/在途写入" },
+    { name: "storage", capability: "存储服务：持久化域读写 + 普通 session/child 写入健康只读投影（persistenceHealth）" },
     { name: "recovery", capability: "恢复服务：checkpoint/重建" },
-    { name: "fanout", capability: "fan-out 管理器端口" },
-    { name: "roles", capability: "角色注册表与启用态" },
+    // fan-out 物理删除后装配不再提供该槽位：工厂仍按可选依赖做容错读取（只剩持久化/预算
+    // 等历史诊断段），缺失时按空投影归一，绝不抛错。
+    { name: "fanout", capability: "fan-out 宿主读面的历史晚绑定：getFanoutHost()（可选，缺失即无样本）" },
     { name: "delegation", capability: "委派服务：任务清单/次数/预算" },
-    { name: "observability", capability: "turn 等待可观测记录" },
+    { name: "observability", capability: "只读诊断输入：RPC 错误类别/系统 Toast/root 等待/图片路由" },
   ] },
-  { file: "host/index-settings-storage.js", name: "createIndexSettingsStorageDomain", groups: 7, faces: [
+  // fan-out 物理删除后本工厂不再解构 host.lineage / getFanoutHost：剩 5 组。
+  { file: "host/index-settings-storage.js", name: "createIndexSettingsStorageDomain", groups: 5, faces: [
     { name: "storageBinding", capability: "存储绑定：waitReady" },
     { name: "roles", capability: "角色注册表与启用态" },
     { name: "logger", capability: "日志器" },
     { name: "persistenceHealth", capability: "持久化健康检查" },
-    { name: "lineage", capability: "agent 血缘与任务记录" },
-    { name: "getFanoutHost", capability: "fan-out 宿主句柄获取" },
     { name: "onStorageRestored", capability: "存储恢复回调" },
   ] },
-  { file: "host/index-template-plan.js", name: "createFanoutTemplatePlanner", groups: 3 },
-  { file: "host/index-template-store.js", name: "createFanoutTemplateStore", groups: 2 },
   { file: "host/index-toast.js", name: "createSystemToastChannel", groups: 5 },
   { file: "host/index-upload-normalize.js", name: "createUploadNormalizer", groups: 6, faces: [
     { name: "ValidationError", capability: "参数校验错误构造器：ValidationError 类" },
@@ -968,7 +728,6 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
   ] },
   { file: "index.js", name: "createAssemblyCapabilities", groups: 2 },
   { file: "index.js", name: "createAssemblyState", groups: 4 },
-  { file: "resource-budget.js", name: "createEventHistoryAccounting", groups: 1 },
   { file: "role-registry.js", name: "createRoleRegistry", groups: 1 },
   { file: "rpc-host.js", name: "createConnectionRpcHandler", groups: 2 },
   { file: "shared/capacity-errors.js", name: "createSubagentCapacityError", groups: 2 },
@@ -994,7 +753,7 @@ export const C3_FACTORY_REGISTRY = Object.freeze([
   // ── 票据 34 补齐：oracle 第二轮发现的 55 项差集里 52 个**真工厂** ────────────
   // 差集来源：按 `^[ \t]*(export\s+)?(async\s+)?function\s+(create\w*)\s*\(` 扫全部产品源码，
   // 与「登记表 ∪ 例外表」求差集（见 inspectFactoryRegistry 的 reconcile 分支）。此前的清单
-  // 只覆盖 host/、fanout/、shared/ 与少量根模块，客户端 R5–R8 拆分产物（client-*.js）整批漏记。
+  // 只覆盖 host/、shared/ 与少量根模块，客户端 R5–R8 拆分产物（client-*.js）整批漏记。
   //
   // 组数口径（与台账 §2.1 一致，逐条按关注点归并，不按字段数）：
   // - 一个**外部协作面**（宿主服务/端口、宿主 RPC 命令、DOM 或 React 运行时、UI 原语库、
@@ -1199,11 +958,6 @@ export const C3_NON_FACTORY_EXCLUSIONS = Object.freeze([
     reason: "纯 helper / 局部变量（不是工厂）：= null 的局部标记，随后在函数体内被重新赋值，不构造对象、不持有协作方；嵌套在函数 capture 内",
   },
   {
-    file: "host/expert-group-snapshot.js",
-    name: "createdAt",
-    reason: "纯 helper / 局部变量（不是工厂）：= numberOrNull(source?.createdAt)，只做时间戳归一，纯值投影；嵌套在函数 projectShardTimeline 内",
-  },
-  {
     file: "host/notifications.js",
     name: "created",
     reason: "纯 helper / 局部变量（不是工厂）：= { generation, runSeq: 0, publishedRunSeq: null, snapshot: null } 的局部状态袋，由宿主函数内部使用，不注入协作方；嵌套在函数 stateOf 内",
@@ -1218,17 +972,12 @@ export const C3_NON_FACTORY_EXCLUSIONS = Object.freeze([
     name: "created",
     reason: "纯 helper / 局部变量（不是工厂）：= createSessionState() 的局部别名，真正的会话状态工厂已按 0 组登记；嵌套在函数 stateOf 内",
   },
-  // ── 票据 44：AST 让词法器看不见的两处**描述符转发属性**进对账 ────────────────
-  // 这两个名字此前完全不在声明清单里：词法器只认 `function createX(` 与 `const/let createX =`，
-  // 而它们是**对象字面量里函数值的属性**（`createX: (options) => 真实工厂(options)`）。
-  // AST 侧按"方法"形态收集后，差集暴露出这 2 个键；它们不是独立工厂——只是把已登记的
+  // ── 票据 44：AST 让词法器看不见的**描述符转发属性**进对账 ──────────────────
+  // 这个键此前完全不在声明清单里：词法器只认 `function createX(` 与 `const/let createX =`，
+  // 而它是**对象字面量里函数值的属性**（`createX: (options) => 真实工厂(options)`）。
+  // AST 侧按"方法"形态收集后，差集暴露出这 1 个键；它不是独立工厂——只是把已登记的
   // 工厂暴露成模块描述符上的端口，因此归入例外而不是登记（否则同一家工厂的能力组会被
-  // 数第二遍，C3 的组数口径就被污染了）。
-  {
-    file: "host/index-expert-tools-fanout.js",
-    name: "createRuntime",
-    reason: "模块描述符的**转发属性**而非独立工厂：`createRuntime: (options) => createFanoutRuntime(options)` 只是把已登记的 createFanoutRuntime（fanout-host.js，19 组组合根豁免）暴露成 host 端口；函数体里没有自己的协作方集合，若登记会把同一批能力组重复计数。票据 44：词法器看不见对象字面量方法，故此前不在对账范围内",
-  },
+  // 数第二遍，C3 的组数口径就被污染了）。fan-out 物理删除后只剩 rpc-transport 这一项。
   {
     file: "host/rpc-transport.js",
     name: "createRegistration",
@@ -3074,8 +2823,7 @@ function pickEdge(edges, from, to) {
 }
 
 /**
- * 判断模块是否在 C2 的作用域内（`host/`、`shared/`、`fanout/` 前缀，及 R1 前的
- * `shared.js` / `fanout.js`）。
+ * 判断模块是否在 C2 的作用域内（`host/`、`shared/` 前缀，及 R1 前的 `shared.js`）。
  */
 export function isEntryDependentModule(file) {
   const normalized = normalizeModulePath(file);
@@ -3662,7 +3410,7 @@ function printReport(result) {
   }
   reportViolations(result, "C1");
 
-  console.log("C2 host/、shared/、fanout/ 不得反向 import 入口 " + ENTRY_MODULE);
+  console.log("C2 host/、shared/ 不得反向 import 入口 " + ENTRY_MODULE);
   const scoped = graph.files.filter(isEntryDependentModule);
   console.log("  纳入检查的内部模块 " + scoped.length + " 个：" + scoped.join(", "));
   reportViolations(result, "C2");

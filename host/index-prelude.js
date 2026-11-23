@@ -12,9 +12,9 @@
  * （票据 15 铁律 1）。工厂只接收**窄能力面**，绝不接收整个 `ctx`。
  *
  * ## 晚绑定的依赖
- * `getFanoutHost` / `isTurnWaitStopping` / `isRootAgent` 指向 `apply` 后段才就绪的
- * 状态或函数；它们在 `host` 组合里只以**回调**形式被调用，因此这里只保存取值函数，
- * 不在构造期求值——与迁移前的闭包语义逐字等价。
+ * `isTurnWaitStopping` / `isRootAgent` 指向 `apply` 后段才就绪的状态或函数；它们在
+ * `host` 组合里只以**回调**形式被调用，因此这里只保存取值函数，不在构造期求值——
+ * 与迁移前的闭包语义逐字等价。
  *
  * @module dsh-expert-group/host/index-prelude
  */
@@ -23,11 +23,10 @@ import { createDelegationTracker } from "../shared/delegation-tracker.js";
 import { ROLE_REGISTRY } from "../role-registry.js";
 import { createHostComposition } from "./composition.js";
 import { createSettingsRuntimeModule } from "./settings-runtime.js";
-import { findSettingsDescriptor } from "./settings-source.js";
 import { createSystemToastModule } from "./system-toast.js";
 import { createPersistenceHealth } from "./persistence-health.js";
 import { createRootGenerationRegistry } from "./expert-child-composition.js";
-import { SETTINGS_NAMESPACE, CONFIG_MIGRATION_VERSION } from "./settings-schema.js";
+import { SETTINGS_NAMESPACE } from "./settings-schema.js";
 import { createRpcErrorTracker, RPC_ERROR_CATEGORY_LIMIT } from "./runtime-diagnostics.js";
 
 /**
@@ -39,7 +38,6 @@ import { createRpcErrorTracker, RPC_ERROR_CATEGORY_LIMIT } from "./runtime-diagn
  * @param {object} deps.settings - 注入的 `ctx.settings`（提交边界需要 mutate）。
  * @param {object} deps.agents - 注入的 `ctx.agents`（Host 组合的 live 查询面）。
  * @param {(agent: object) => boolean} deps.isRootAgent - root 身份判定的晚绑定取值。
- * @param {() => object|undefined} deps.getFanoutHost - fan-out Host 的晚绑定取值。
  * @param {() => boolean} deps.isTurnWaitStopping - 卸载闩的晚绑定取值。
  * @returns {object} 装配前言能力面（见文件末尾的返回对象）。
  */
@@ -49,7 +47,6 @@ export function createIndexPrelude({
   settings,
   agents,
   isRootAgent,
-  getFanoutHost,
   isTurnWaitStopping,
 }) {
   /**
@@ -61,23 +58,6 @@ export function createIndexPrelude({
   /** settings 提交边界：目录代次栅栏与提交串行链由 host/settings-runtime 持有。 */
   const updateSettingsAtGeneration = (patch, expectedRevision, generation) =>
     settingsRuntime.updateAtGeneration(patch, expectedRevision, generation);
-
-  /**
-   * 本次 settings-commit 是否需要落下配置迁移标记（读取面别名的持久化开关）。
-   *
-   * 只在**真正保存**时读一次当前文档，因此不依赖启动期 describe 是否已投影本条目：
-   * 桌面版 apply 阶段 describe 里可能还没有本插件条目，启动写回会静默跳过。
-   * describe 不可读/条目缺失按缺省版本 0 处理——这一次保存顺手补上标记；
-   * 读取路径永远不会触发写入。
-   *
-   * @returns {boolean} true = patch 里追加 configMigrationVersion。
-   */
-  function configMigrationPending() {
-    const descriptor = findSettingsDescriptor(settings, SETTINGS_NAMESPACE);
-    const rawVersion = descriptor?.value?.configMigrationVersion;
-    const version = Number.isSafeInteger(rawVersion) && rawVersion >= 0 ? rawVersion : 0;
-    return version < CONFIG_MIGRATION_VERSION;
-  }
 
   /**
    * 最近 RPC 错误类别记录器：两条传输共用 mapRpcError，因此这里是同一份只读视图。
@@ -94,7 +74,7 @@ export function createIndexPrelude({
    * bundle patch 可以把它覆盖为 true。
    */
   const activeRoles = () => roleCatalog().enabledIds({ enableObserver: config.enableObserver === true });
-  /** 角色是否在当前启用集合内（fan-out 派发、模型预检、设置保存共用）。 */
+  /** 角色是否在当前启用集合内（模型预检、设置保存共用）。 */
   const isActiveRole = (role) => activeRoles().includes(role);
   /** 角色显示名映射（供快照与 RPC 只读投影）。 */
   const roleLabelsProjection = () => roleLabelsOf(roleCatalog().records());
@@ -119,8 +99,6 @@ export function createIndexPrelude({
       disposedRoots: disposedRootAgents,
       isRootAgent,
       getAgent: (id) => agents.get(id),
-      getTask: (id) => getFanoutHost()?.getTask(id) ?? null,
-      listTasks: () => getFanoutHost()?.listTasks() ?? [],
       isGenerationBlocked: () => isTurnWaitStopping(),
     },
     notifications: {
@@ -148,9 +126,9 @@ export function createIndexPrelude({
 
   const storageBinding = host.storage;
   /**
-   * 共享持久化健康状态：fan-out 快照走 manager sequence 的有界重试，session/child
+   * 共享持久化健康状态：domain 快照写入走 manager sequence 的有界重试，session/child
    * 写入走独立观察通道（observeStorageWrite）。两者共用同一个内存状态对象，但通道
-   * 互不覆盖，因此 session/child 失败不会改变 fan-out 的重试判定。
+   * 互不覆盖，因此 session/child 失败不会改变 domain 快照的重试判定。
    * 只读投影：健康状态不写入 settings，也不写入任何 domain 快照。
    * config.createPersistenceHealth 是可选注入 seam（默认创建），供受控 Host/测试
    * 在执行任何写入前捕获同一个实例；未注入时行为与历史完全一致。
@@ -179,7 +157,6 @@ export function createIndexPrelude({
   return {
     settingsRuntime,
     updateSettingsAtGeneration,
-    configMigrationPending,
     rpcErrorTracker,
     roleCatalog,
     activeRoles,

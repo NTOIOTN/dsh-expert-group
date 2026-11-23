@@ -1,12 +1,10 @@
 /**
  * Expert Group 快照的**阶段投影**（票据 09 / R2 从 host/expert-group-runtime.js 拆出）。
  *
- * 两个阶段：
- * - 普通 expert 阶段（`collectExperts`）：按 child_models / recovery 记录收集本根专家，冷读走本次
- *   构建的共享协调器（受控并发），最后按输入顺序投影成快照节点；
- * - fan-out 阶段（`projectFanoutTasks` → `projectFanoutTask` → `projectFanoutShard`）：先调度本
- *   shard 需要的全部归属证明，用 `Promise.allSettled` 收敛后按输入顺序选首错，最后按输入顺序
- *   重组输出。
+ * 唯一阶段：普通 expert 阶段（`collectExperts`）——按 child_models / recovery 记录收集本根
+ * 专家，冷读走本次构建的共享协调器（受控并发），最后按输入顺序投影成快照节点。
+ * fan-out 整体移除后，父任务 / 分片 / attempt 的三层阶段投影（`projectFanoutTasks` →
+ * `projectFanoutTask` → `projectFanoutShard`）已随 fan-out 一并删除。
  *
  * 边界（plan R2.2-a §3/§6）：
  * - 本模块**不 import** `host/expert-group-projection.js` 与 `host/snapshot-cache.js`：纯投影 helper
@@ -14,14 +12,15 @@
  *   调用。因此 stage 只持有**命令**，不持有 Map、不读任何 owner 的状态；
  * - `deps` 里**没有** `cache` / `snapshotCache` / entry / `sortAnchor`：阶段投影绝不写缓存。
  *
- * 首错契约（不得回归）：shard 内按 proofIds 的稳定顺序选首错（attempts 输入顺序，末尾是导航回退），
- * 与读取完成时序无关；task 按 shards 输入顺序、tasks 按 rawTasks 输入顺序。
+ * 首错契约（不得回归）：阶段内所有已调度的读取都 settle 之后才抛出**首个**错误（按输入顺序稳定，
+ * 与完成时序无关），因此失败返回时不会有残留冷读。
  *
  * @module dsh-expert-group/host/expert-group-stage
  */
-import { projectModelRouteFields } from "../shared/model-route.js";
-import { projectRouteSnapshotFields } from "../shared/route-snapshot.js";
-import { hasUsageMetrics, sumUsageByChildId } from "./usage-projection.js";
+// 历史数据兼容判定与恢复选择器共用唯一来源（见 shared/fanout-history.js）：
+// 投影与恢复必须对「哪些 child_models 记录属于已删除的 fan-out」给出同一结论，
+// 否则旧记录会被恢复路径排除、却仍出现在普通专家树里。
+import { isHistoricalFanoutChildRecord } from "../shared/fanout-history.js";
 
 /**
  * 受控并发的遍历（彼此独立的项并行、并发数有上限）。
@@ -71,87 +70,6 @@ async function forEachWithConcurrency(items, limit, worker) {
 }
 
 /**
- * 从 Promise.allSettled 的结果数组里取**首个** rejection（按数组顺序，稳定），全部成功时返回 null。
- *
- * 用对象包住 reason，是因为 worker 可以 `throw undefined`：直接返回 reason 无法与「没有失败」
- * 区分。阶段投影统一用它收敛错误：所有已调度分支 settle 之后才向上抛错，且抛出的是同一个
- * 错误对象，重复构建得到的结果稳定（不依赖完成顺序）。
- *
- * 导出给 runtime 组合点使用：跨阶段收敛（fan-out 优先）复用同一套判定，不复制实现。
- */
-export function firstRejection(results) {
-  for (const result of results) {
-    if (result.status === "rejected") return { reason: result.reason };
-  }
-  return null;
-}
-
-/**
- * fan-out 分片身份一致性校验（**只用廉价记录，绝不冷读**）。
- *
- * 归属证明回答的是「这个 child 属于本 root 吗」；本函数回答的是更强的「它属于**本分片的这些
- * attempt** 吗」。完整路径靠 `readSession` 的 header 证明前者，轻量路径没有这次读取，因此两种
- * 模式都用 `child_models` 记录自带的 fan-out 身份做**反证**：记录一旦声明了
- * fanoutParentTaskId / fanoutShardId / fanoutAttempt，就必须与当前父任务 / 分片一致，
- * 否则返回 true（调用方把该 childId 清空），保证 fast 与 full 的归属结论一致、都 fail-closed。
- *
- * attempt 号的两种判定及其适用前提（oracle 复审）：
- * - 号域成员判定只在记录**同时声明** fanoutParentTaskId 与 fanoutShardId 时成立：父任务与
- *   分片声明把号域锁定到「本分片该 child 的 attempts」，此时成员关系才有归属含义；
- * - 只声明 fanoutAttempt（或任一作用域字段缺失）的陈旧记录，其号域成员关系无法证明它属于
- *   当前父任务 / 分片，必须回退精确比较（declaredAttempt !== attempt 即矛盾）。
- *
- * 只有「记录存在且与之矛盾」才算反证：完全没有记录的 child（例如由 live agent 的
- * header.parentSession 证明归属）不受影响，避免把可用的导航键误删。
- *
- * fanoutAttempt 的口径（continuation 合法复用同一 child）：
- * child_models 里的 fanoutAttempt 记录的是 **child 创建时**的 attempt 号，只在创建 child 时
- * 写一次（host/index-expert-tools-fanout.js）。continuation 会复用同一个 child 进入新的逻辑
- * 轮次，于是该 child 的 attempt 号可以是 {1,2,…}（本分片 attempts 里出现的那些），而
- * fanoutAttempt 仍是 1。若继续用「等于最新 attempt 号」做精确比较，第 2 轮起就会被误判成
- * 身份矛盾、把导航键清空。因此在**作用域已声明**（见上）且号集合非空时，一致性口径是
- * 「declaredAttempt 属于本分片该 child 的 attempt 号集合」（attemptNumbers），而不是「等于
- * 传入的那一个 attempt 号」。号集合缺失 / 为空（没有 attempt 级证据）或作用域未声明时，
- * 一律回退精确比较，保持既有 fail-closed 行为不变。
- */
-function fanoutIdentityContradicts(nonEmpty, record, childSnapshot, { parentTaskId, shardId, attempt, attemptNumbers }) {
-  for (const source of [record, childSnapshot]) {
-    if (source === null || source === undefined) continue;
-    const declaredTask = nonEmpty(source.fanoutParentTaskId);
-    if (declaredTask !== null && declaredTask !== parentTaskId) return true;
-    const declaredShard = nonEmpty(source.fanoutShardId);
-    if (declaredShard !== null && shardId !== null && declaredShard !== shardId) return true;
-    const declaredAttempt = Number.isSafeInteger(source.fanoutAttempt) ? source.fanoutAttempt : null;
-    if (declaredAttempt === null) continue;
-    // 号域成员判定的前提：该记录同时声明了父任务与分片，号集合才被锁定到「本分片该 child」。
-    // 只声明 fanoutAttempt 的陈旧记录无法用成员关系证明归属（号可能来自别的父任务/分片），
-    // 必须回退精确比较。作用域声明存在时仍按集合判定；集合 null/空（没有 attempt 级证据）
-    // 同样回退精确比较，保持既有 fail-closed 行为。
-    const declaresScope = declaredTask !== null && declaredShard !== null;
-    if (declaresScope && attemptNumbers !== null && attemptNumbers !== undefined && attemptNumbers.size > 0) {
-      if (!attemptNumbers.has(declaredAttempt)) return true;
-    } else if (attempt !== null && declaredAttempt !== attempt) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * 逐动作能力（票据 09）：唯一来源是 fanoutHost.capabilitiesOf（归属 + manager 能力）。
- *
- * 返回 undefined 表示**旧 Host 或测试替身没有该读面**：投影层据此完全省略 capabilities
- * 字段，客户端回退既有状态推导，绝不伪造一个「全部拒绝」的能力对象。
- */
-function fanoutCapabilitiesFor(safeCall, fanoutHost, rootId, parentTaskId) {
-  if (typeof parentTaskId !== "string" || parentTaskId.length === 0) return undefined;
-  if (typeof fanoutHost?.capabilitiesOf !== "function") return undefined;
-  const capabilities = safeCall(() => fanoutHost.capabilitiesOf(rootId, parentTaskId), undefined);
-  if (capabilities === null || typeof capabilities !== "object" || Array.isArray(capabilities)) return undefined;
-  return capabilities;
-}
-
-/**
  * 普通专家阶段投影。
  *
  * @param {object} root - 本次构建的根（live / 冷读 / 占位三种形状）。
@@ -180,7 +98,10 @@ export async function collectExperts(root, deps) {
     if (record?.parentId === root.id && typeof record?.childId === "string") ids.add(record.childId);
   }
   for (const [childId, child] of Object.entries(persisted)) {
-    if (child?.parentId === root.id && child?.fanout !== true) ids.add(childId);
+    // 历史 fan-out child 不得进入普通专家树：判定与恢复选择器同一份（唯一来源），
+    // 因此只带 fanoutAttempt / fanoutParentAgentId 等身份字段、没有 fanout:true 的旧记录
+    // 在这里同样被排除，不会出现「恢复跳过但任务树仍显示」的不一致。
+    if (child?.parentId === root.id && !isHistoricalFanoutChildRecord(child)) ids.add(childId);
   }
 
   // 第一步（同步，顺序 = ids）：只做筛选与归属判定，把需要投影的 child 按原顺序收进 candidates。
@@ -189,7 +110,9 @@ export async function collectExperts(root, deps) {
   for (const childId of ids) {
     const record = recoveryRecords.get(childId);
     const childSnapshot = persisted[childId];
-    if (childSnapshot?.fanout === true) continue;
+    // 第二道闸门：id 也可能来自 recovery 记录（上面的循环），因此这里再按同一判定过滤一次；
+    // 两张表对历史 fan-out 记录的口径必须一致，绝不按字段子集各判一套。
+    if (isHistoricalFanoutChildRecord(childSnapshot)) continue;
     const agent = safeCall(() => agents?.get?.(childId), undefined) ?? record?.agent;
     const cachedSession = record?.session;
     // 只按 record.parentId 就直接使用 record.session 是不安全的：record 可能停留在旧代际，
@@ -204,7 +127,7 @@ export async function collectExperts(root, deps) {
 
   // 第二步（受控并发）：冷读之间互不依赖（各自只读一份日志，不引用彼此结果），串行会让总等待
   // 时间随 child 数线性增长，因此交给受控并发池。每次读取都走本次构建的共享协调器，与 root
-  // 冷读、fan-out attempt 共用同一份 promise 缓存和同一个全局并发上限；这里的
+  // 全部冷读共用同一份 promise 缓存和同一个全局并发上限；这里的
   // forEachWithConcurrency 只负责本阶段的顺序与失败收敛语义。
   // 每个 child 读到的会话写回各自的 candidate，读取内容、归属校验与错误语义都不变；
   // live/cached 会话在上面已被快速跳过。
@@ -303,299 +226,4 @@ export async function collectExperts(root, deps) {
     });
   }
   return experts;
-}
-
-/**
- * attempt 与 child 记录之间的路由投影合并（票据 06）。
- *
- * 与 host/expert-group-projection.js 的 routeSnapshotFieldsOf 同一口径：attempt 的冻结快照
- * 优先，缺失时才回退同一 child 的 child_models 缓存。两份实现各自只依赖 shared 纯函数，
- * 因此结果逐字一致（测试对两者分别断言）。
- *
- * @param {object|undefined} attempt - 本次 attempt 记录（可含 `route`）。
- * @param {object|undefined} persisted - 同一 child 的 child_models 记录。
- * @returns {object} 可展开的投影字段；没有快照时为空对象。
- */
-function routeSnapshotFieldsFor(attempt, persisted) {
-  const fromAttempt = projectRouteSnapshotFields(attempt);
-  if (Object.keys(fromAttempt).length > 0) return fromAttempt;
-  return projectRouteSnapshotFields(persisted);
-}
-
-/**
- * 内容可用性判定（票 04 / 规格书 D4）：**合取**条件，只在这里写一次，调用方不得逐处临时判空。
- *
- * 可用 ⇔ `proof.contentOwned === true` **且** 有效导航归属成立（`navigationOwned === true`，
- * 即该 child 的 `owned` 判定为真、已经过 `contradicts` 反证）。
- *
- * 为什么必须是合取（两个方向都会泄漏）：
- * - 只看 `contentOwned`：身份反证成立（记录声明别的父任务/分片，或声明的号不在本分片号域）
- *   时该 childId 已从输出副本清空，但它的 child_models 内容仍会被挂到本行；
- * - 只看导航归属：admission 凭据放行时 `contentOwned === false`，此时 provider / model /
- *   用量 / 结构化结果都来自来源不明的会话，渲染它们等于把别的 root 的内容挂到本根任务树上。
- *
- * `available` 与 `record` 分开返回的原因：`usageOfChild` 还有一条**独立**的 `usageFor`
- * （live 账本）通道，内容可用但没有 child_models 记录时仍要问它；内容不可用时则必须
- * **整体跳过调用**（只把 persisted 换成单条记录挡不住这条泄漏）。
- *
- * @param {string|null} childId - 导航键 / attempt 的 child id。
- * @param {object|undefined} proof - resolver 结论（`{ owned, contentOwned, … }`）。
- * @param {boolean} navigationOwned - 该 child 的有效导航归属（已过 `contradicts`）。
- * @param {object} persisted - 本次构建的 child_models 只读映射。
- * @returns {{available:boolean, record:object|null}} 内容是否可用，以及（可用时）该 child 的记录。
- */
-function contentAccessOf(childId, proof, navigationOwned, persisted) {
-  const available = navigationOwned === true
-    && proof !== null && typeof proof === "object" && proof.contentOwned === true;
-  if (!available) return { available: false, record: null };
-  const record = typeof childId === "string" && childId.length > 0 ? persisted?.[childId] ?? null : null;
-  return { available: true, record };
-}
-
-/**
- * 单个 fan-out shard 的投影。
- *
- * attempt 之间彼此独立，因此先把本 shard 需要的归属证明**全部调度**（同一 child 去重），
- * 再用 allSettled 收敛：任一次读取失败，也要等本 shard 的全部证明 settle 之后才向上抛首个
- * 错误，避免失败返回后仍有 readSession 在后台运行。真实并发由协调器统一限流，shard 内因此
- * 可以放心地一次性调度全部 attempt。输出仍按 attempts 的输入顺序重组，与完成顺序无关。
- * **首错契约**：shard 内的首错按 proofIds 的稳定顺序选取（attempts 输入顺序，末尾是导航回退），
- * 与读取完成时序无关——先调度但迟到的失败，仍然优先于后调度却更早返回的失败。
- */
-async function projectFanoutShard(shard, task, deps) {
-  const { project, rootId, persisted, recoveryRecords, resolveChildOwnership, usageFor, roleLabelOf, now } = deps;
-  const {
-    firstText, nonEmpty, sessionEvents, modelMetadata, runSummary, turnTimingOf,
-    subagentContextFields, usageOfChild, structuredOfChild, outputSchemaRequestedOfChild,
-  } = project;
-
-  const attempts = Array.isArray(shard?.attempts) ? shard.attempts : [];
-  const latestAttempt = attempts.length > 0 ? attempts[attempts.length - 1] : undefined;
-  const shardId = firstText(shard?.shardId);
-  // 导航目标是最新 attempt 的 child；manager 若在 shard 上直接给了 childId，则作为回退。
-  const navigationChildId = firstText(latestAttempt?.childId, shard?.childId);
-  const parentTaskId = firstText(task?.parentTaskId);
-  // 去重后的归属证明请求：proofIds 决定错误与结果的稳定顺序（attempts 顺序 + 导航回退）。
-  const proofIds = [];
-  const proofPromises = new Map();
-  const requestProof = (childId) => {
-    if (childId === null || proofPromises.has(childId)) return;
-    proofIds.push(childId);
-    // 归属判定只经冻结的 resolver 命令；rootId / persisted / coordinator / fast 都在 owner 内。
-    proofPromises.set(childId, resolveChildOwnership(childId, parentTaskId));
-  };
-  for (const attempt of attempts) requestProof(firstText(attempt?.childId));
-  requestProof(navigationChildId);
-  const settled = await Promise.allSettled(proofIds.map((childId) => proofPromises.get(childId)));
-  const failure = firstRejection(settled);
-  if (failure !== null) throw failure.reason;
-  const proofs = new Map(proofIds.map((childId, index) => [childId, settled[index].value]));
-  const navigationProof = navigationChildId === null ? undefined : proofs.get(navigationChildId);
-  /**
-   * childId → 本分片 attempts 中出现的 attempt 号集合（身份反证的「合法号域」）。
-   *
-   * 只收 Number.isSafeInteger(attempt.attempt) 且 childId 非空的行：缺少 attempt 号的记录
-   * 不能证明任何号域，直接跳过。continuation 复用同一 child 时，同一 childId 会出现在多个
-   * attempt 号上，集合因此可能有多个成员；导航 child 与逐 attempt 两处反证共用这份集合，
-   * 保证「声明号属于本分片该 child 的号域」这一口径一致。
-   */
-  const attemptNumbersByChildId = new Map();
-  for (const attempt of attempts) {
-    const childId = firstText(attempt?.childId);
-    if (childId === null) continue;
-    if (!Number.isSafeInteger(attempt?.attempt)) continue;
-    const numbers = attemptNumbersByChildId.get(childId) ?? new Set();
-    numbers.add(attempt.attempt);
-    attemptNumbersByChildId.set(childId, numbers);
-  }
-  /**
-   * 廉价反证（两种模式都执行，保证 fast 与 full 的归属结论一致、且都 fail-closed）：
-   * 记录里声明了别的父任务 / 别的分片，或声明的 attempt 号不在本分片该 child 的号域内时，
-   * 即使归属证明还算通过，也必须把该 childId 从输出副本清空——否则本行会挂上不属于它的会话。
-   * 反证只用已经在手的持久化记录与 recovery 记录，不产生任何额外 IO。
-   */
-  const contradicts = (childId, attemptNumber) => {
-    if (childId === null) return false;
-    return fanoutIdentityContradicts(nonEmpty, recoveryRecords.get(childId), persisted[childId], {
-      parentTaskId,
-      shardId,
-      attempt: Number.isSafeInteger(attemptNumber) ? attemptNumber : null,
-      attemptNumbers: attemptNumbersByChildId.get(childId) ?? null,
-    });
-  };
-  const ownedChild = navigationProof?.owned === true
-    && contradicts(navigationChildId, latestAttempt?.attempt) !== true
-    ? navigationProof
-    : undefined;
-  /**
-   * 分片级内容读面（票 04）：内容可用 ⇔ `contentOwned === true` 且有效导航归属成立。
-   *
-   * 这里是既有缺口的收口点：`navigationChildId` 即便已因身份反证被清空（`ownedChild`
-   * 为 undefined），`persisted[navigationChildId]` 仍然有值；旧实现直接读它，于是
-   * structured / outputSchemaRequested / roleLabel 回退会从被否决的 child 上取值。
-   * 分片级取值因此与逐 attempt 用同一个 helper，不再单独判断。
-   */
-  const shardContent = contentAccessOf(navigationChildId, navigationProof, ownedChild !== undefined, persisted);
-  // 归属未证明（或身份反证成立）的 childId 一律从**输出副本**清空：manager 的权威快照保持原样。
-  const projectedAttempts = attempts.map((attempt) => {
-    const childId = firstText(attempt?.childId);
-    const proof = proofs.get(childId);
-    const owned = (proof === undefined || proof.owned === true)
-      && contradicts(childId, attempt?.attempt) !== true;
-    if (!owned) return { ...attempt, childId: null };
-    /**
-     * 内容隔离（票 04）：导航归属成立只说明「可以点开」，不说明「内容属于本根」。下面每个
-     * 内容读点都经 `contentAccessOf` 取值（合取条件在那里写死），禁止在这里临时判空：
-     * 逐处判空正是「只满足其中一半条件」的来源。
-     */
-    const content = contentAccessOf(childId, proof, owned, persisted);
-    // 实际路由（票据 24）：尝试本身的持久化字段（未来管理器的快照扩展）优先，
-    // 缺失时从同一 child 的 child_models 记录补齐 candidateIndex/fallbackCount/
-    // lastRouteErrorCode；内容不可用或没有记录就省略字段，绝不伪造 0。
-    const route = {
-      ...projectModelRouteFields(attempt),
-      ...projectModelRouteFields(content.record),
-      // 时段/层/跨层回退（票据 06）：attempt 的冻结快照是权威，child_models 只是只读投影；
-      // attempt 完全没有快照时才读 child 记录（旧记录/未启用峰谷），两者都没有就整体省略。
-      ...routeSnapshotFieldsFor(attempt, content.record),
-    };
-    // 角色显示名（票据 27）：attempt 自身记录优先，其次同一 child 的 child_models 快照；
-    // 两者都没有时省略字段（不猜显示名）。角色删除后历史 attempt 仍保留标签。
-    // 票 04：child_models 的 roleLabel 属于内容，内容不可用时回退不到它（只剩 attempt 自己的值）。
-    const attemptRoleLabel = roleLabelOf(
-      firstText(attempt?.role, task?.role),
-      firstText(attempt?.roleLabel, content.record?.roleLabel),
-    );
-    const labeled = attemptRoleLabel === null ? attempt : { ...attempt, roleLabel: attemptRoleLabel };
-    // 目标 subagent provider / 继承开关（票据 29）：attempt 自身字段优先，其次同一
-    // child 的 child_models 快照；都没有时省略字段，不伪造 false。
-    const attemptSubagent = subagentContextFields(attempt, null, content.record);
-    // 用量（票据 25）：内容可用的 attempt 才允许带 usage；缺失时省略整个字段，
-    // 绝不把“没拿到 usage”渲染成 0 token。
-    // 票 04 硬约束：内容不可用时**整体跳过调用**。usageOfChild 还会读**独立**的 usageFor
-    // （live 账本）通道，只把 persisted 换成空对象/单条记录都挡不住这条泄漏。
-    const attemptUsage = content.available === true ? usageOfChild(childId, persisted, usageFor) : null;
-    // 结构化交付（票据 30）：只读结果/声明标记来自同一 child 的 child_models；
-    // 内容可用才补齐，缺失整体省略。
-    const attemptStructured = content.available === true ? structuredOfChild(childId, persisted) : null;
-    const attemptRequested = content.available === true && outputSchemaRequestedOfChild(childId, persisted);
-    const settled = Object.keys(route).length === 0 ? labeled : { ...labeled, ...route };
-    const withSubagent = Object.keys(attemptSubagent).length === 0 ? settled : { ...settled, ...attemptSubagent };
-    return {
-      ...withSubagent,
-      ...(attemptUsage === null ? {} : { usage: attemptUsage }),
-      ...(attemptStructured === null ? {} : { structured: attemptStructured }),
-      ...(attemptRequested ? { outputSchemaRequested: true } : {}),
-    };
-  });
-  // 分片用量 = 全部 attempt 的用量按 childId 去重汇总：续作复用同一 child 时，
-  // child_models.usage 是累计值，不能被多轮 attempt 重复相加。
-  const shardUsage = sumUsageByChildId(projectedAttempts.map((attempt) => ({
-    childId: attempt?.childId,
-    usage: attempt?.usage,
-  })));
-  const shardStatus = firstText(shard?.status, ownedChild?.agent?.status, ownedChild?.session?.status) ?? "unknown";
-  // 分片级结构化结果取最新 attempt 的 child_models（与 usage 同一“最新 attempt”口径）；
-  // 不跨 attempt 合并 value，每个 attempt 自己的 structured 保留在 attempts 里。
-  // 票 04：与逐 attempt 同一合取条件——内容不可用时不得读 persisted[navigationChildId]。
-  const shardStructured = shardContent.available === true ? structuredOfChild(navigationChildId, persisted) : null;
-  const shardRequested = shardContent.available === true && outputSchemaRequestedOfChild(navigationChildId, persisted);
-  // 分片最新 child 会话内全部 turn 的累计墙钟 + 最后一个 open turn 起点（与 DSH 状态行同源，
-  // 空闲区间不计）；无 live 会话或没有任何可证明的 turn 区间时各自省略。
-  const shardTiming = turnTimingOf(sessionEvents(ownedChild?.session), now());
-  return {
-    ...shard,
-    childId: ownedChild === undefined ? null : navigationChildId,
-    role: firstText(shard?.role, task?.role),
-    // 分片角色显示名（票据 27）：manager/分片记录优先，其次同一 child 快照，最后运行期目录。
-    // 票 04：child_models 的 roleLabel 回退同样属于内容，只经 shardContent 取值。
-    roleLabel: roleLabelOf(
-      firstText(shard?.role, task?.role),
-      firstText(shard?.roleLabel, shardContent.record?.roleLabel),
-    ),
-    // 第 4 参是最新 attempt：分片的时段/层/跨层回退以 attempt 冻结快照为准（票据 06）。
-    // 第 2 参 childSnapshot 是内容来源（票 04）：合取不成立时一律传 null；成立时保持既有取值
-    // （resolver 在「冷读补证」分支会把它置 null，这里逐字沿用，不改内容口径）。
-    ...modelMetadata(
-      ownedChild?.agent,
-      shardContent.available === true ? ownedChild?.childSnapshot ?? null : null,
-      null,
-      latestAttempt,
-    ),
-    runSummary: runSummary(ownedChild?.session, shardStatus, "continuable", sessionEvents(ownedChild?.session)),
-    continuable: true,
-    ...(shardUsage === null || !hasUsageMetrics(shardUsage) ? {} : { usage: shardUsage }),
-    ...(shardStructured === null ? {} : { structured: shardStructured }),
-    ...(shardRequested ? { outputSchemaRequested: true } : {}),
-    ...(shardTiming.durationMs === null ? {} : { turnDurationMs: shardTiming.durationMs }),
-    // open turn 起点（additive）：与 root/expert 同一口径，闭合时省略。
-    ...(shardTiming.openSince === null ? {} : { turnOpenSince: shardTiming.openSince }),
-    attempts: projectedAttempts,
-  };
-}
-
-/**
- * 单个 fan-out 父任务的投影：shards 全部并行调度，等所有 shard settle 之后再抛首个错误；
- * 首错按 shards 的输入顺序选取（稳定，与完成时序无关）；成功时按 shards 的输入顺序重组，
- * 输出顺序与旧实现完全一致。
- */
-async function projectFanoutTask(task, deps) {
-  const { project, fanoutHost, rootId } = deps;
-  const { firstText, safeCall } = project;
-  const shards = Array.isArray(task?.shards) ? task.shards : [];
-  const settled = await Promise.allSettled(shards.map((shard) => projectFanoutShard(shard, task, deps)));
-  const failure = firstRejection(settled);
-  if (failure !== null) throw failure.reason;
-  const projectedShards = settled.map((result) => result.value);
-  /**
-   * 逐动作能力（票据 09）：父任务与每个 shard 都带上 Host 的权威能力投影。
-   *
-   * 能力只由 fanoutHost.capabilitiesOf 产生（归属 + manager 规则），快照层不做二次判定：
-   * - 旧 Host/测试替身没有该读面时整个字段省略（客户端回退旧行为）；
-   * - shard 能力按 shardId 对齐，缺失条目的 shard 不带字段，绝不补一个假的 allowed。
-   * 这里写的是**投影副本**（projectFanoutShard 每次都返回新对象），不会改动 manager 的输入。
-   */
-  const capabilities = fanoutCapabilitiesFor(safeCall, fanoutHost, rootId, task?.parentTaskId);
-  if (capabilities !== undefined) {
-    const shardCapabilities = capabilities.shards !== null && typeof capabilities.shards === "object"
-      && !Array.isArray(capabilities.shards)
-      ? capabilities.shards
-      : {};
-    for (const projected of projectedShards) {
-      const shardId = firstText(projected?.shardId);
-      if (shardId === null) continue;
-      const shardCapability = shardCapabilities[shardId];
-      if (shardCapability !== null && typeof shardCapability === "object" && !Array.isArray(shardCapability)) {
-        projected.capabilities = shardCapability;
-      }
-    }
-  }
-  // 父任务用量 = 全部分片 attempt 的用量按 childId 去重汇总（防止跨分片重复或
-  // 续作多轮重复）。没有有效样本时省略字段，父任务不显示假成本。
-  const taskUsage = sumUsageByChildId(projectedShards.flatMap((shard) => (
-    Array.isArray(shard?.attempts) ? shard.attempts.map((attempt) => ({
-      childId: attempt?.childId,
-      usage: attempt?.usage,
-    })) : []
-  )));
-  return {
-    ...task,
-    shards: projectedShards,
-    ...(capabilities === undefined ? {} : { capabilities }),
-    ...(taskUsage === null || !hasUsageMetrics(taskUsage) ? {} : { usage: taskUsage }),
-  };
-}
-
-/**
- * fan-out 阶段：所有父任务并行调度（真实冷读由协调器全局限流），等所有已调度分支 settle
- * 之后再抛出**稳定**的首个错误；成功时按 rawTasks 的输入顺序重组，保持既有输出顺序。
- * **首错契约**：按「task → shard → attempt（含导航回退）」的输入顺序取第一个失败的 rejection，
- * 与完成时序无关，因此同一份输入重复构建得到同一个错误对象。
- */
-export async function projectFanoutTasks(rawTasks, deps) {
-  const tasks = Array.isArray(rawTasks) ? rawTasks : [];
-  const settled = await Promise.allSettled(tasks.map((task) => projectFanoutTask(task, deps)));
-  const failure = firstRejection(settled);
-  if (failure !== null) throw failure.reason;
-  return settled.map((result) => result.value);
 }

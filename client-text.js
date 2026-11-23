@@ -54,7 +54,6 @@
       "settings.notificationVolume.range": "通知音量滑块",
       "settings.notificationVolume.number": "通知音量数值",
       "settings.notificationEvent.completed": "任务完成",
-      "settings.roleTimeout.aria": "角色默认超时",
       "settings.notificationEvent.completed.aria": "通知任务完成",
       "settings.notificationEvent.waiting.aria": "通知等待用户",
       "settings.notificationEvent.failed.aria": "通知任务失败",
@@ -64,10 +63,6 @@
       "settings.noProvider": "无",
       "settings.observerPreferred": "Observer优先",
       "settings.orchestrator.empty": "未配置（不干预主代理模型）",
-      "settings.concurrencyLimit": "单个角色并发上限",
-      "settings.concurrencyLimit.title": "取值范围 1–64 的整数；默认 20；保存后生效",
-      "settings.roleTimeout": "角色默认超时 (s)",
-      "settings.roleTimeout.title": "默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
       "settings.save": "保存",
       "settings.saving": "保存中…",
       "settings.discard": "放弃修改",
@@ -149,10 +144,6 @@
       "settings.pv.repair": { zh: "修复并保存" },
       "settings.pv.mainScope": { zh: "本页正在编辑{period}模型（打开页面时锁定）" },
       "settings.pv.boundary": { zh: "当前已进入{current}，本页仍在编辑{editing}模型" },
-      // 宿主子代理并发名额（meta 的 hostConcurrencyCap / effectiveRoleConcurrencyLimit）：
-      // 名额与封顶后的生效值并进并发输入框的原生 title；受限时在保存状态位尾部补一句显式提示。
-      "settings.cap.host": { zh: "宿主名额 {host} · 实际生效 {eff}" },
-      "settings.cap.lim": { zh: "（受宿主限制）" },
     });
     /** 取本票据新增控件的文案：locale 缺失或该语言无译文时回退 zh，绝不渲染键名。 */
     function settingsExtraText(locale, key, vars) {

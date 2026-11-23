@@ -181,7 +181,11 @@ export const DOMAIN_CHILD_MODEL_RECORD = domainZ.object({
   }).optional(),
   // 是否在派发时声明过 outputSchema；只保存布尔，绝不保存 schema 原文。
   outputSchemaRequested: domainZ.boolean().optional(),
-  // fan-out child 必须持久化完整来源身份；普通 child 只有 role/parentId 时不能被误路由。
+  // 以下 fanout* 字段保留为历史数据兼容：不再写入新值，只用于读既有磁盘记录。
+  // 唯一消费方是 shared/fanout-history.js 的 isHistoricalFanoutChildRecord（恢复选择器与快照
+  // 投影据此跳过历史 fan-out child）；投影侧的父任务级归属判定已随 fan-out 物理删除，
+  // 这里不再有任何匹配逻辑。删除这些字段会让旧记录上的取值在 domain 归一后丢失，
+  // 历史 child 的过滤随之失效。
   fanout: domainZ.boolean().optional(),
   fanoutParentTaskId: domainZ.string().optional(),
   fanoutParentAgentId: domainZ.string().optional(),
@@ -190,24 +194,6 @@ export const DOMAIN_CHILD_MODEL_RECORD = domainZ.object({
   // 内部 LRU 序号；历史 domain 记录没有该字段时按稳定 key 规则补齐。
   lruSequence: domainZ.number().int().nonnegative().optional(),
 });
-// fan-out 快照的详细 task/result 字段由 fanout.js 负责版本化；domain 只保证
-// 它是 JSON 对象并把运行数据放在独立表中，绝不借用 settings。
-const DOMAIN_FANOUT_SNAPSHOT = domainZ.object({
-  version: domainZ.number().int().nonnegative(),
-  tasks: domainZ.array(domainZ.unknown()),
-}).passthrough();
-/**
- * 手动派发模板（票据 28）的独立表文档。
- *
- * 形状刻意保持最小：只校验版本与“模板是对象数组”，单模板字段由组合根在写入前做
- * 严格校验（名称长度、prompt 预算、schema 64KiB、时间/并发取值）。storage domain
- * 的职责是持久化与版本化，不复制业务规则；读取面再按 {@link normalizeTemplateDocumentEntries}
- * 做有界归一，因此外部篡改不会把无界数据带进 RPC/侧栏。
- */
-const DOMAIN_FANOUT_TEMPLATES = domainZ.object({
-  version: domainZ.number().int().nonnegative(),
-  templates: domainZ.array(domainZ.unknown()),
-}).passthrough();
 /**
  * 主代理模型配置的功能启用切点（B3）。
  *
@@ -230,12 +216,10 @@ export const EXPERT_STORAGE_DOMAIN_SPEC = defineDomain({
     // 会话覆盖代次（票据 21 CAS 栅栏）：独立表，绝不混进 session_overrides 的角色键空间。
     session_override_meta: domainTable(DOMAIN_SESSION_OVERRIDE_META),
     child_models: domainTable(DOMAIN_CHILD_MODEL_RECORD),
-    fanout_tasks: domainTable(DOMAIN_FANOUT_SNAPSHOT),
-    // 手动派发模板（票据 28）：与运行数据同域、独立表，绝不把模板塞进 settings
-    // 或 fanout_tasks 快照。domain version 保持 1（新增表不是破坏性变更）。
-    fanout_templates: domainTable(DOMAIN_FANOUT_TEMPLATES),
+    // fan-out 整体移除后不再有 fanout_tasks（父任务快照表）与 fanout_templates
+    // （手动派发模板表）：它们的读写方随 fan-out 一并删除，这里不再声明。
     // 主代理模型配置的功能启用切点（B3）：独立表、固定一行 key="epoch"。
-    // 与模板表同理——新增表不是破坏性变更，domain version 仍为 1。
+    // 新增表不是破坏性变更，domain version 仍为 1。
     [ORCHESTRATOR_STATE_TABLE]: domainTable(DOMAIN_ORCHESTRATOR_STATE),
     /**
      * 会话删除（票据 01）的两张表：删除收敛日志与删除残渣。
@@ -247,8 +231,7 @@ export const EXPERT_STORAGE_DOMAIN_SPEC = defineDomain({
      * （按 intent 处理、其余条目照常）。严格形状由写入边界（host/session-delete-store 的
      * zod 校验）承担，读取面负责显式降级，理由详见 host/session-delete-contract 的模块头注释。
      *
-     * 新增表不是破坏性变更：domain version 仍为 1（与 fanout_templates / orchestrator_state
-     * 同一处理方式）。
+     * 新增表不是破坏性变更：domain version 仍为 1（与 orchestrator_state 同一处理方式）。
      */
     [SESSION_DELETE_QUEUE_TABLE]: domainTable(DOMAIN_SESSION_DELETE_RECORD),
     [SESSION_DELETE_RESIDUE_TABLE]: domainTable(DOMAIN_SESSION_DELETE_RECORD),

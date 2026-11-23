@@ -193,7 +193,8 @@ function installRootWaitCore(deps) {
     logger.warn("dsh-expert-group: root turn wait " + action + " failed: " + safeErrorLabel(error));
   }
   function isRootAgentIdentity(agent) {
-    return agent !== void 0
+    return agent !== null
+      && typeof agent === "object"
       && typeof agent.id === "string"
       && agent.session?.header?.parentSession === void 0
       && agent.options?.[PARENT_MARKER] === void 0;
@@ -205,29 +206,34 @@ function installRootWaitCore(deps) {
    * 0.2.2-rc.2 删除了 `AgentRegistry.roots()`，只保留 `list()`（全部 live agent）；
    * 插件必须在两代宿主上给出同一份「可枚举 root」事实：优先用 rc.1 的精确 roots()，
    * 缺失时用 rc.2 的 list() 再按 DEG 自己的 root 身份判定过滤（无 parentSession、
-   * 无 DEG PARENT marker）。两个 seam 都缺失或抛错时返回空数组——与旧实现
-   * `typeof agents.roots !== "function" → []` 的降级语义一致，绝不猜测或伪造 root。
+   * 无 DEG PARENT marker）。合法空数组表示当前确实没有 root；API 缺失、抛错或返回
+   * 非数组都必须保留为不可用/非法状态，绝不能伪装成空集合。
    *
-   * @returns {Array<object>} root Agent 只读快照。
+   * @returns {Array<object>|undefined} 合法 root 快照；undefined 表示能力缺失或枚举失败，
+   *   非数组的错误返回值原样传递给调用方以便 fail-closed 判定。
    */
   function listRootAgents() {
-    try {
-      if (typeof agents?.roots === "function") {
+    if (typeof agents?.roots === "function") {
+      try {
         const roots = agents.roots();
-        return Array.isArray(roots) ? roots : [];
+        return roots;
+      } catch (error) {
+        logTurnWaitError("list roots", error);
+        return void 0;
       }
-      if (typeof agents?.list === "function") {
+    }
+    if (typeof agents?.list === "function") {
+      try {
         const all = agents.list();
-        // list() 的契约是 Agent 数组；仍先挡 null/非对象，避免身份判定在坏快照上抛错
-        // 被外层 catch 静默吞成"没有 root"（丢失可诊断性）。
         return Array.isArray(all)
           ? all.filter((agent) => agent !== null && typeof agent === "object" && isRootAgentIdentity(agent))
-          : [];
+          : all;
+      } catch (error) {
+        logTurnWaitError("list roots", error);
+        return void 0;
       }
-    } catch (error) {
-      logTurnWaitError("list roots", error);
     }
-    return [];
+    return void 0;
   }
 
   function isLiveRootAgent(agent) {
@@ -258,7 +264,7 @@ function installRootWaitCore(deps) {
    * 全部祖先 root** 的等待结论。
    *
    * 为什么按血缘链向上而不是只看 id：child 的 parentSession 可能指向另一个 child
-   * （fan-out 分片、嵌套委派），真正需要重新判定的是整条链上仍在等待的 root。
+   * （嵌套委派），真正需要重新判定的是整条链上仍在等待的 root。
    * 链上出现环或父级不可解析时按 id 逐级命中后停止，绝不无限回溯。
    */
   function invalidateWaitersForAgentActivity(agent) {

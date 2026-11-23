@@ -1,7 +1,7 @@
 /**
  * 客户端侧栏 · 轮询调度与 RPC 适配（R5 / sidebar-poll）
  *
- * 侧栏轮询的唯一调度面：快照结构比较、轮询节奏与退避、fan-out 事件批次读取、
+ * 侧栏轮询的唯一调度面：快照结构比较、轮询节奏与退避、
  * RPC 失败归因与 callRpc 适配。
  *
  * 本模块不持有轮询状态：所有节流/失败计数都由调用方（Panel）以参数传入，
@@ -63,8 +63,8 @@
       // partial 必须参与比较：任务树内容恰好一致时（轻量快照与完整快照投影结果相同），
       // 从 partial→完整 的升级仍要上屏，否则中性渲染会一直留在界面上。
       && (left.partial === true) === (right.partial === true)
-      // recovery 必须参与比较：恢复成功/失败切换时任务树可能一字未变，但错误横幅必须
-      // 立刻出现或消失——漏掉它会让「重试成功」停在旧横幅上（反之亦然）。
+      // recovery 必须参与比较：恢复状态切换时任务树可能一字未变，但快照内容确实变了，
+      // 漏掉它会让缓存与上屏状态停在旧值上（Host 仍投影该块，字段取值恒为 none）。
       && snapshotContentEquals(left.recovery ?? null, right.recovery ?? null)
       && snapshotContentEquals(left.root, right.root);
   }
@@ -128,47 +128,6 @@
   }
 
   /**
-   * 归一化 fanout-events 响应（票据 15；Host 契约见 index.js 的 fanout-events 分支）。
-   *
-   * 关键判据是 conclusive：只有 events 是数组时，这份响应才真的回答了「游标之后有没有新事件」。
-   * 旧 Host 或测试替身可能对任何 action 都回同一份载荷（例如只给 snapshot），此时**绝不**把
-   * 「读不到」当成「没有变化」——调用方必须退回全量快照，宁可多拉一次，也不让界面停在旧数据上。
-   *
-   * cursor 缺失/非法时保持 null（不伪造）：下一轮仍用当前游标重读，绝不假装已经同步过。
-   */
-  function readFanoutEventBatch(raw) {
-    const source = object(raw);
-    const events = Array.isArray(source.events) ? source.events : null;
-    const cursor = Number.isSafeInteger(source.cursor) && source.cursor >= 0 ? source.cursor : null;
-    const earliestSequence = Number.isSafeInteger(source.earliestSequence) && source.earliestSequence > 0
-      ? source.earliestSequence
-      : null;
-    return {
-      events,
-      cursor,
-      earliestSequence,
-      gap: source.gap === true,
-      dropped: Number.isSafeInteger(source.dropped) && source.dropped > 0 ? source.dropped : 0,
-      conclusive: events !== null,
-    };
-  }
-
-  /**
-   * 游标是否过旧（读不到的事件已经永久缺失）。
-   *
-   * Host 的 gap 字段是权威答案；缺失该字段时按 Host 的同一公式自行判定：
-   * 序号从 1 开始，所以只有「确实裁剪过队首」（earliest > 1）且 cursor 落在裁剪区间里才算缺口——
-   * cursor=0 与 earliest=1 时前面本来就没有事件，绝不能误判成 gap 而每轮都全量重拉。
-   */
-  function fanoutBatchIsStale(batch, cursor) {
-    if (batch === null || batch === undefined) return false;
-    if (batch.gap === true) return true;
-    if (batch.earliestSequence === null || batch.earliestSequence === undefined) return false;
-    const after = Number.isSafeInteger(cursor) && cursor >= 0 ? cursor : 0;
-    return batch.earliestSequence > 1 && after < batch.earliestSequence;
-  }
-
-  /**
    * 快照里是否还有运行中的任务（决定运行态 2.5s 还是空闲阶梯退避）。
    *
    * 复用模型的运行状态证据链（runtimeStatusOf：目录/Host running 布尔/协议 status），
@@ -196,7 +155,6 @@
       try { status = runtimeStatusOf(node, undefined, {}); } catch { status = "unknown"; }
       if (status === "running") return true;
       if (Array.isArray(node.children)) for (const child of node.children) pending.push(child);
-      if (Array.isArray(node.shards)) for (const shard of node.shards) pending.push(shard);
     }
     return false;
   }
@@ -268,7 +226,7 @@
   /**
    * 面板标题栏错误槽的来源分类（票据 13：状态可读性）。
    *
-   * 症状：快照轮询失败与用户动作（取消/重试分片、取消父任务）失败共用同一个标题栏错误面，
+   * 症状：快照轮询失败与用户动作失败共用同一个标题栏错误面，
    * 该错误面固定渲染「快照读取失败」——于是一次动作失败会被读成「任务树坏了」，用户去点重试
    * 只会重新拉一次快照，动作失败的真实原因与后续动作都得不到提示。
    *
@@ -495,9 +453,9 @@
   // 只暴露兄弟模块与主 IIFE 实际消费的符号（无全量外挂）。
   global[SYMBOL] = Object.freeze({
     PANEL_ERROR_SOURCES, PANEL_POLL_TIMINGS, RPC_FAILURE_TRANSPORT, applyPanelPollCycle,
-    callRpc, fanoutBatchIsStale, panelNextPollDelayMs,
-    readFanoutEventBatch, readPanelTabActivity, rpcFailureKindOf, samePanelSnapshot,
-    // 运行态判定同时服务轮询节奏与「无 fanout 事件时仍刷新快照」：同一口径只有一个来源。
+    callRpc, panelNextPollDelayMs,
+    readPanelTabActivity, rpcFailureKindOf, samePanelSnapshot,
+    // 运行态判定同时服务轮询节奏与「每轮刷新仍要读快照」：同一口径只有一个来源。
     snapshotHasRunningWork,
   });
 })(globalThis);

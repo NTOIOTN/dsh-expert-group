@@ -204,10 +204,8 @@ async function handleGet(deps, req) {
       // normalizeSnapshot 里回退为空/默认 2，客户端无需再容错。
       candidates,
       fallbackLimit: snap.fallbackLimit,
-      // 并发映射（票据 26）：与 meta 同源的归一值；设置页读取面据此渲染
-      // 逐角色/provider 编辑面（UI 属客户端波次），旧客户端忽略未知字段。
-      roleLimits: snap.roleLimits ?? {},
-      providerLimits: snap.providerLimits ?? {},
+      // 惰性兼容输入：fan-out 时代遗留的 roleLimits / providerLimits 不再回传；与 meta
+      // 同源，旧 settings 文档里的值既不参与归一也不触发任何错误。
       // 上下文继承（票据 29）：与 meta 同源的归一映射；设置页读取面据此渲染开关
       // （UI 属客户端波次），旧客户端忽略未知字段。
       inheritContext: snap.inheritContext ?? {},
@@ -248,16 +246,16 @@ async function handleGet(deps, req) {
  * 「session-override-get」 的 handler（原始源行归属 3118–3127）。
  */
 async function handleSessionOverrideGet(deps, req) {
-  const { fanoutRpcRootSession, sessionOverrideProjectionOf, source } = deps.reads;
+  const { liveRootSession, sessionOverrideProjectionOf, source } = deps.reads;
   const { body, send, fail, sessionId, isChild } = req;
 
   if (body.action === "session-override-get") {
     if (isChild) { fail(404, "session-not-found", "根会话不存在或尚未恢复"); return; }
     const snap = source();
     const view = sessionOverrideProjectionOf(snap, sessionId);
-    // live 用现有 exact root/live 判定（与 fan-out 读根解析同一入口）：agent 在线、
+    // live 用现有 exact root/live 判定：agent 在线、
     // 且不是任何父会话的子代理。离线时仍返回持久化覆盖，供设置页只读展示。
-    const live = fanoutRpcRootSession(sessionId) !== void 0;
+    const live = liveRootSession(sessionId) !== void 0;
     send(200, { ok: true, sessionId, overrides: view.overrides, revision: view.revision, live });
     return;
   }
@@ -269,7 +267,7 @@ async function handleSessionOverrideGet(deps, req) {
 async function handleSessionOverrideSet(deps, req) {
   const { validateSelectionWithSignal } = deps.models;
   const {
-    fanoutRpcRootSession, isActiveRole, orchestratorApplyOverride, orchestratorApplyOverrideCleared,
+    liveRootSession, isActiveRole, orchestratorApplyOverride, orchestratorApplyOverrideCleared,
     sessionOverrideProjectionOf, source,
   } = deps.reads;
   const { sessionOverrideStore } = deps.storage;
@@ -280,7 +278,7 @@ async function handleSessionOverrideSet(deps, req) {
     if (isChild) { fail(400, "read-only", "子代理会话只读，不能修改会话级模型覆盖"); return; }
     // 写入必须由 live root 发起：离线会话的覆盖无法证明归属于当前调用方，
     // 且客户端本就应按只读处理；这里再 fail-closed 一次。
-    if (fanoutRpcRootSession(sessionId) === void 0) {
+    if (liveRootSession(sessionId) === void 0) {
       fail(404, "session-not-found", "会话不存在或尚未恢复");
       return;
     }

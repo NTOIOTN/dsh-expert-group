@@ -2,8 +2,8 @@
  * Client 共享边界（浏览器安全的纯 ES 模块）。
  *
  * 这里保存 Client 双面共用的三组纯逻辑，不引用 React、DOM、cordis 或任何 Node API：
- * - freshness boundary：统一 session epoch、请求序列、settings revision、catalog
- *   generation 与 fan-out cursor，只保存 JSON 兼容快照，不发请求、不渲染；
+ * - freshness boundary：统一 session epoch、请求序列、settings revision 与 catalog
+ *   generation，只保存 JSON 兼容快照，不发请求、不渲染；
  * - RPC 归一：把 DSH Connection envelope 与同源 fetch 归一成同一种 fetch-like
  *   Response，错误 code/status/details 在两条传输上完全一致；
  * - settings 提交：动态校验后的提交与本地 revision 辅助同步。
@@ -101,8 +101,8 @@ export async function requestPluginRpc(connection, request, init = {}, fetchImpl
 }
 
 /**
- * Client 双面共享的 freshness seam：统一 session epoch、请求序列、settings revision、
- * catalog generation 和 fan-out cursor。它只保存 JSON 兼容快照，不渲染、不发请求；
+ * Client 双面共享的 freshness seam：统一 session epoch、请求序列、settings revision 与
+ * catalog generation。它只保存 JSON 兼容快照，不渲染、不发请求；
  * 所有迟到响应必须先通过对应 accept 方法，卸载后不会再通知调用方。
  */
 export function createClientFreshnessBoundary({ sessionId = "", onUpdate } = {}) {
@@ -114,7 +114,6 @@ export function createClientFreshnessBoundary({ sessionId = "", onUpdate } = {})
   const latestRequests = new Map();
   let settings = { revision: -1, value: undefined };
   let catalog = { generation: -1, value: undefined };
-  let fanout = { sessionId: currentSessionId, generation: -1, cursor: 0, snapshot: undefined };
 
   const requestKey = (kind, key = "") => String(kind) + "\u0000" + String(key ?? "");
   const isObject = (value) => value !== null && typeof value === "object";
@@ -139,7 +138,6 @@ export function createClientFreshnessBoundary({ sessionId = "", onUpdate } = {})
       sessionEpoch += 1;
       sequence += 1;
       latestRequests.clear();
-      fanout = { sessionId: currentSessionId, generation: -1, cursor: 0, snapshot: undefined };
       return Object.freeze({ accepted: true, sessionId: currentSessionId, epoch: sessionEpoch, sequence });
     },
     beginRequest(kind, key = "") {
@@ -173,33 +171,6 @@ export function createClientFreshnessBoundary({ sessionId = "", onUpdate } = {})
       emit("catalog", catalog);
       return result(true, undefined, catalog);
     },
-    acceptFanoutSnapshot({ sessionId: incomingSessionId, generation, cursor, snapshot, requestToken } = {}) {
-      if (incomingSessionId !== currentSessionId) return result(false, "stale-session", fanout);
-      if (!tokenIsCurrent(requestToken)) return result(false, "stale-request", fanout);
-      if (!safeRevision(generation)) return result(false, "invalid-generation", fanout);
-      if (!safeRevision(cursor)) return result(false, "invalid-cursor", fanout);
-      if (generation < fanout.generation) return result(false, "stale-generation", fanout);
-      if (cursor < fanout.cursor) return result(false, "stale-cursor", fanout);
-      if (generation === fanout.generation && cursor === fanout.cursor && fanout.snapshot !== undefined) return result(false, "duplicate", fanout);
-      fanout = { sessionId: currentSessionId, generation, cursor, snapshot };
-      emit("fanout", fanout);
-      return result(true, undefined, fanout);
-    },
-    acceptFanoutEvents({ sessionId: incomingSessionId, generation, cursor, events, snapshot, requestToken } = {}) {
-      return api.acceptFanoutSnapshot({
-        sessionId: incomingSessionId,
-        generation,
-        cursor,
-        snapshot: snapshot === undefined ? events : snapshot,
-        requestToken,
-      });
-    },
-    acceptFanoutAction({ sessionId: incomingSessionId, generation, requestToken } = {}) {
-      if (incomingSessionId !== currentSessionId) return result(false, "stale-session");
-      if (!tokenIsCurrent(requestToken)) return result(false, "stale-request");
-      if (generation !== undefined && (!safeRevision(generation) || generation < fanout.generation)) return result(false, "stale-generation");
-      return result(true, undefined, fanout);
-    },
     snapshot() {
       return {
         disposed,
@@ -207,7 +178,6 @@ export function createClientFreshnessBoundary({ sessionId = "", onUpdate } = {})
         epoch: sessionEpoch,
         settings,
         catalog,
-        fanout,
       };
     },
     dispose() {
@@ -217,7 +187,6 @@ export function createClientFreshnessBoundary({ sessionId = "", onUpdate } = {})
       notify = null;
       settings = { revision: -1, value: undefined };
       catalog = { generation: -1, value: undefined };
-      fanout = { sessionId: currentSessionId, generation: -1, cursor: 0, snapshot: undefined };
       return true;
     },
   };

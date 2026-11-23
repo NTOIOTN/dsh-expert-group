@@ -988,12 +988,12 @@ const scopeDiagnosisTool = defineTool({
  * 3. 后代查询必须明确回答 known===true；查询失败/降级/未知一律拒绝并返回稳定原因码；
  * 4. running 非空一律拒绝（只回数量，不回 child id）；
  * 5. 成功后只做三件事：标记 batch.abandoned/closed、清 pendingClose、收口等待账本。
- *    绝不调用 delegationTracker/fanoutHost/cancel/notify 的任何释放或取消方法——
+ *    绝不调用 delegationTracker/cancel/notify 的任何释放或取消方法——
  *    专家 child 继续运行，影响范围保护继续持有，真实停止判定不受影响。
  */
 const abandonWaitTool = defineTool({
   name: "dsh_expert_group_abandon_wait",
-  description: "Root-only manual escape for a root turn wait ledger. Call it only when the authoritative root-scoped descendant query explicitly reports that no descendant is running (known and empty). It closes the current admission batch's wait ledger and marks the batch abandoned: it never cancels, interrupts, or concludes any expert child, never releases the DEG file-range scope, never changes the fanout manager, and never affects the real stop boundary. Query failure, capability degradation, or unknown descendant state is rejected with a stable reason code (descendant-query-unknown); running descendants are rejected as descendants-active; no open admission batch is rejected as no-open-batch. This tool is a last resort for a batch that is demonstrably still while the root turn cannot settle, not a way to skip waiting for live experts.",
+  description: "Root-only manual escape for a root turn wait ledger. Call it only when the authoritative root-scoped descendant query explicitly reports that no descendant is running (known and empty). It closes the current admission batch's wait ledger and marks the batch abandoned: it never cancels, interrupts, or concludes any expert child, never releases the DEG file-range scope, and never affects the real stop boundary. Query failure, capability degradation, or unknown descendant state is rejected with a stable reason code (descendant-query-unknown); running descendants are rejected as descendants-active; no open admission batch is rejected as no-open-batch. This tool is a last resort for a batch that is demonstrably still while the root turn cannot settle, not a way to skip waiting for live experts.",
   parameters: {
     reason: {
       type: "string",
@@ -1179,7 +1179,7 @@ function pendingRootAutomaticAdmissions(parent) {
  * root turn 即将关闭时的等待兜底（与 finalize 共用**同一个**等待账本/状态机）。
  *
  * 为什么需要它：`dsh_expert_group_finalize` 仍是模型必需路径（prompt 契约要求模型
- * 调用它登记等待），但模型可能遗漏它；纯 `continue_parent_turn` 批次与 fan-out 也可能
+ * 调用它登记等待），但模型可能遗漏它；纯 `continue_parent_turn` 批次也可能
  * 在 turn 结束时仍有子代理在跑。此时若直接关闭 turn，root 会变 idle。
  *
  * 本函数**不**暂停/恢复任何 goal，也不主动结束 turn：它把「本 turn 已接受、但还没被

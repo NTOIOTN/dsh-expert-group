@@ -29,7 +29,6 @@ import {
 import { projectRouteSnapshotFields } from "../shared/route-snapshot.js";
 import { hasUsageMetrics, projectUsage } from "./usage-projection.js";
 import { projectStructuredResult } from "../shared/structured.js";
-import { FANOUT_ERROR_CODES } from "../shared/error-codes.js";
 
 export function nonEmpty(value) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -68,7 +67,7 @@ const PERMANENT_RESTORE_CODES = new Set([
   // 派发路由冻结快照非法（票据 03/04）：同一份磁盘数据重试也不会变好，属结构性缺陷。
   "INVALID_SNAPSHOT_ROUTE",
   "UNSUPPORTED_SNAPSHOT_VERSION",
-  FANOUT_ERROR_CODES.INVALID_BUDGET,
+  // fan-out 预算拒绝码 INVALID_BUDGET 已随 fan-out 快照恢复一并移除：不再有读到它的路径。
   "INVALID_CONCURRENCY_LIMIT",
   "INVALID_SHARD_NAME",
   "INVALID_WRITE_ROLES",
@@ -692,21 +691,6 @@ export function createProjectionTitleReader(projectionTitleFor) {
   };
 }
 
-/**
- * 当前根会话拥有的 fan-out 父任务。
- *
- * 归属查询优先问 fanout runtime：它按同一套 parentSessions 语义过滤 manager 的权威
- * 任务，并额外覆盖「活动 ownership 已释放、但持久化仍记录归属」的已终态恢复任务
- * （冷启动后这些任务必须继续出现在自己的根下）。两者都按根过滤，绝不退回全局
- * listTasks()——没有归属证明时保持 fail-closed，不借任务视图枚举别的会话。
- */
-export function fanoutTasksOwnedBy({ fanoutHost, lineage } = {}, sessionId) {
-  const fromRuntime = safeCall(() => fanoutHost?.tasksOwnedBy?.(sessionId), undefined);
-  if (Array.isArray(fromRuntime)) return fromRuntime;
-  const fromLineage = safeCall(() => lineage?.tasksOwnedBy?.(sessionId), undefined);
-  return Array.isArray(fromLineage) ? fromLineage : [];
-}
-
 function isMissingSessionError(error) {
   const code = firstText(error?.code, error?.name)?.toLowerCase();
   const message = typeof error?.message === "string" ? error.message.toLowerCase() : "";
@@ -938,7 +922,8 @@ function unownedChild(childId) {
  *   一次探针异常不能让整棵快照构建失败，更不能被当成放行信号。
  *
  * @param {Function|undefined} admittedChildOf - Host 转发的只读凭据读面。
- * @param {string|undefined} parentTaskId - 本次投影的 fan-out 父任务 id。
+ * @param {string|undefined} parentTaskId - 本次投影的父任务 id；fan-out 投影已删除，当前只作为
+ *   归属缓存的键前缀与 admission 凭据读面的入参保留（不再参与任何 fan-out 记录匹配）。
  * @param {string} childId - 待判定的 child id。
  * @returns {object|null} 凭据条目（`{parentTaskId, shardId, attempt}`）或 null。
  */
@@ -955,18 +940,18 @@ function admissionCredential(admittedChildOf, parentTaskId, childId) {
  *
  * 1. `childId` 非非空字符串 → 未授权（`childId: null`）；
  * 2. `verdict === "foreign"` → 未授权：显式父证据说别的根时，**凭据不得覆盖**；
- * 3. 冷读判别值为 `mismatch` → 未授权：**否决全部正向证据**（含 `verdict === "owned"`、
- *    `ownedByFanoutRecord` 与 admission 凭据）；
- * 4. 正向证据（`verdict === "owned"` 或 `ownedByFanoutRecord`）或 **admission 凭据成立**
- *    → 授权导航；
+ * 3. 冷读判别值为 `mismatch` → 未授权：**否决全部正向证据**（含 `verdict === "owned"`
+ *    与 admission 凭据）；
+ * 4. 正向证据（`verdict === "owned"`）或 **admission 凭据成立** → 授权导航；
  * 5. `fast === true` 且以上都不成立 → 未授权（B4 保守语义，partial 绝不猜）；
  * 6. full 且判别值 `ok` → 授权导航（冷读成功即证明归属）；`missing` 且无凭据 → 未授权。
  *
  * 三条独立正向证据全部读取既有 DEG/DSH 状态，不新建登记：
  * 1. 在线 child agent 的会话头声明 `header.parentSession === rootId`；
- * 2. DEG 自己的 child 记录匹配：普通专家记录用 `parentId === rootId`，fan-out 子代理
- *    记录用 `fanoutParentTaskId === 当前父任务`（父任务本身已由 manager 的 ownership
- *    过滤证明属于本 root，任务 id 也按 root 唯一，因此这不是跨根推断）；
+ * 2. DEG 自己的 child 记录匹配：普通专家记录用 `parentId === rootId`。原先还有一条
+ *    「fan-out 子代理记录用父任务 id 匹配」的父任务级证据：它只服务已删除的 fan-out
+ *    投影、没有任何调用方，装配也不再向 runtime 注入父任务读面，因此随本轮 fan-out
+ *    残留清理一并删除；普通记录证据与 lineage 归属判定都保持不变；
  * 3. 冷读 `sessionQuery.readSession(childId)` 的 header.id/parentSession 与预期一致
  *    （readColdSession 自带这两项校验）；
  * 另有第四条**导航专用**证据：admission 凭据（见 `admissionCredential`）。
@@ -1008,13 +993,13 @@ function admissionCredential(admittedChildOf, parentTaskId, childId) {
  * ## 返回值
  *
  * `{ owned, childId, agent, session, childSnapshot, contentOwned }`：
- * - `contentOwned: true` 当且仅当 `verdict === "owned"` / `ownedByFanoutRecord` / 冷读 `ok`，
+ * - `contentOwned: true` 当且仅当 `verdict === "owned"` / 冷读 `ok`，
  *   此时 `agent` / `session` / `childSnapshot` 与拆分前的取值一致；
  * - `contentOwned: false`（仅凭据放行）时三者按上文收回，只剩 `childId` 供导航。
  * `contentOwned` 是**内部字段**，只给 stage 用，**不进入快照协议**。
  *
  * 结果在同一次快照内按「父任务 + childId」缓存，避免重复的归属计算；真正的冷读一律交给
- * 本次构建的 `coordinator`，因此 fan-out attempt 与普通 expert 阶段对同一个 child 只会
+ * 本次构建的 `coordinator`，因此普通 expert 阶段对同一个 child 只会
  * 调用一次 readSession（同一 parentSessionId + childId 共享同一个读取 promise）。
  *
  * **owner-only**：`cache` 是 childOwnership Map，只由 `createChildOwnershipResolver` 的闭包
@@ -1027,7 +1012,8 @@ async function resolveOwnedChild(childId, {
   admittedChildOf,
 }) {
   if (typeof childId !== "string" || childId.length === 0) return unownedChild(null);
-  // 缓存键带上父任务：同一次快照里 fan-out 归属是任务级的。
+  // 缓存键带上父任务参数：调用方按「父任务 + childId」键控，不同父任务下的同一 child
+  // 不复用同一结论（fan-out 记录匹配已删除，参数形状保留）。
   const cacheKey = (typeof parentTaskId === "string" ? parentTaskId : "") + "|" + childId;
   const cached = cache.get(cacheKey);
   if (cached !== undefined) return cached;
@@ -1038,15 +1024,13 @@ async function resolveOwnedChild(childId, {
   // 就一律拒绝：ownedByAgent/ownedByRecord 的 OR 语义不得绕过冲突检查。
   const evidence = collectParentEvidence({ agent, record, childSnapshot, session: record?.session });
   const verdict = parentEvidenceVerdict(evidence, rootId);
-  const ownedByFanoutRecord = typeof parentTaskId === "string" && parentTaskId.length > 0
-    && (nonEmpty(childSnapshot?.fanoutParentTaskId) === parentTaskId || nonEmpty(record?.fanoutParentTaskId) === parentTaskId);
   let resolved;
   if (verdict === "foreign") {
     // 否决 1（先于任何读取）：显式父证据指别的根，凭据/记录/冷读都不能翻案。
     resolved = unownedChild(childId);
   } else {
     const liveOrCachedSession = record?.session ?? agent?.session;
-    const ownedEvidence = verdict === "owned" || ownedByFanoutRecord;
+    const ownedEvidence = verdict === "owned";
     // 凭据是纯内存派生读（store 读活任务对象，无 IO）。它同时参与下面的冷读触发判定，
     // 因此必须在读取之前取好；判定链本身仍保持「否决 → 放行」的平铺顺序。
     const credential = admissionCredential(admittedChildOf, parentTaskId, childId);

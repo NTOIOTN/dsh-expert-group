@@ -2,9 +2,9 @@
  * 工具回执里的「时段 / 层 / 跨层回退」增量字段（票据 06 · B 段）。
  *
  * ## 为什么单独成模块
- * role 工具与 fanout 工具（含手动派发）需要**同一套**读取口径，但两者的输入形状不同：
- * role 工具拿到的是本次派发的 `route`（含冻结快照），fanout 拿到的是任务快照（每个 shard
- * 的最新 attempt 才可能带快照）。把口径收在一处，避免两个入口各写一份「怎么读快照」。
+ * 回执字段只从**派发期冻结快照**读取，且「没有可读快照就不新增任何键」这条边界必须与读取
+ * 口径收在一处：工具面（host/index-expert-tools-role.js）只负责展开结果，不自己判断快照
+ * 形态。fan-out 任务面与手动派发随 fan-out 物理删除后，本模块只剩 role 工具这一个消费方。
  *
  * ## 红线
  * - **只增字段**：没有可读快照时返回空对象，调用方展开后回执形状逐字不变；
@@ -33,46 +33,4 @@ export function roleRouteReceiptFields(route, role) {
     ? route.snapshot
     : route;
   return projectRouteSnapshotFields(snapshot, role);
-}
-
-/**
- * fanout 任务回执字段：全部 shard 的最新 attempt 必须都带**可读且一致**的冻结快照。
- *
- * 为什么要求「全部一致」而不是取第一片：回执描述的是**一次派发**的时段/层。不同分片可能
- * 落在不同时段（例如跨峰谷边界的任务），此时任何单一取值都会对另一半说谎；而缺快照的分片
- * 说明它还没派发（提交那一刻必然如此），也不能推断成「和别的分片一样」。
- * 两种情况下函数都返回空对象，让回执保持既有形状。
- *
- * @param {object|undefined|null} task - manager 的只读任务快照（含 shards[].attempts[]）。
- * @param {unknown} role - 父任务角色 id。
- * @returns {object} 可展开的回执字段，或空对象。
- */
-export function fanoutTaskRouteReceiptFields(task, role) {
-  const shards = Array.isArray(task?.shards) ? task.shards : [];
-  if (shards.length === 0) return {};
-  let agreedFields = null;
-  let agreedKey = null;
-  for (const shard of shards) {
-    const attempts = Array.isArray(shard?.attempts) ? shard.attempts : [];
-    const latest = attempts[attempts.length - 1];
-    const fields = projectRouteSnapshotFields(latest, role);
-    // 任一分片没有可读快照（尚未派发 / 旧快照 / 非法快照）→ 整组省略，绝不补默认值。
-    if (Object.keys(fields).length === 0) return {};
-    const fallback = fields.ordinaryFallback ?? null;
-    const key = JSON.stringify([
-      fields.routePeriod,
-      fields.routeTier,
-      fallback === null ? null : fallback.fromTier,
-      fallback === null ? null : fallback.toTier,
-      fallback === null ? null : fallback.reasonCode,
-    ]);
-    if (agreedFields === null) {
-      agreedFields = fields;
-      agreedKey = key;
-      continue;
-    }
-    // 分片之间不一致：不存在一个能代表「这次派发」的时段/层，整组省略。
-    if (key !== agreedKey) return {};
-  }
-  return agreedFields ?? {};
 }

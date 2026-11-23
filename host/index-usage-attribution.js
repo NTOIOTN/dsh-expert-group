@@ -21,7 +21,6 @@
  *
  * @module dsh-expert-group/host/index-usage-attribution
  */
-import { isFanoutAgent, isFanoutIdentity } from "../fanout-host.js";
 import { createUsageLedger } from "./usage-ledger.js";
 import {
   MAX_RECENT_USAGE_TASKS,
@@ -109,13 +108,9 @@ function installUsageAttribution(deps) {
       record?.parentId,
       agent?.options?.[PARENT_MARKER],
     );
-    // fan-out child 的身份可能只有 fan-out marker（role/parentId 仍会写入 child_models，
-    // 但 cold/异常记录不一定完整）：任何 fan-out 证据都视为 DEG child。
-    let fanoutChild = persisted?.fanout === true
-      || isFanoutAgent(agent)
-      || isFanoutIdentity(persisted)
-      || isFanoutIdentity(record);
-    const hasEvidence = persisted !== undefined || record !== undefined || fanoutChild
+    // fan-out 已整体移除：child 身份的归属证据只来自 child_models 记录、recovery 记录
+    // 与 live Agent 的 role/parent marker，不再存在「只带 fan-out marker」的身份通道。
+    const hasEvidence = persisted !== undefined || record !== undefined
       || role !== null || parentId !== null;
     if (!hasEvidence) {
       // live root 的 assistant 事件不属于任何 expert child：先用 lineage 的 O(1) 查询
@@ -128,7 +123,6 @@ function installUsageAttribution(deps) {
       // 这条路径只对“非 root 且无 marker”的会话生效，root 已在上面提前返回。
       try { persisted = readSnapshot()?.childModels?.[sessionId]; } catch { persisted = undefined; }
       if (persisted === undefined) return undefined;
-      fanoutChild = persisted?.fanout === true || isFanoutIdentity(persisted);
       role = firstNonEmptyText(role, persisted?.role);
       parentId = firstNonEmptyText(parentId, persisted?.parentId);
     } else if (persisted === undefined) {
@@ -179,7 +173,7 @@ function installUsageAttribution(deps) {
   /**
    * 专用 session/event 处理（票据 25）。ctx.on 注册点仍在组合根（铁律 1）。
    *
-   * 与既有 fanout/recovery/快照失效监听**并列**，不替换、不改变它们的语义：
+   * 与既有 recovery/快照失效监听**并列**，不替换、不改变它们的语义：
    * - assistant/message：请求数 + usage（data.usage 优先，其次 stream 最后一个 usage chunk）；
    * - assistant/attempt：重试数 + stream usage；
    * - llm/retry-started（可选宿主能力）：与 attempt 按 (turn, step) 合并，避免双计；

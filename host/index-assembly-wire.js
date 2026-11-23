@@ -9,7 +9,6 @@
  * @module dsh-expert-group/host/index-assembly-wire
  */
 import { RPC_PATH } from "../shared/protocol.js";
-import { effectiveRoleConcurrencyLimitWithHostCap } from "../fanout.js";
 import { createRpcRequestLifecycle } from "./rpc-request-lifecycle.js";
 import { BadJsonError } from "./index-rpc-http.js";
 import { createIndexRpcActionCore } from "./index-rpc-action-core.js";
@@ -24,7 +23,7 @@ import { installSessionDeleteCommandFace } from "./session-delete-rpc.js";
  *
  * 为什么放在装配层而不是 RPC 核心：名额缓存的唯一 owner 是 `host/settings-source`
  * 模块（composition 的 `settings` 槽位）。这里只交出**调用期解析**的窄命令，RPC 核心
- * 因此不需要新增本地 import（它的本地 import 已用满 12 条），也不需要知道名额缓存在哪。
+ * 因此不需要新增本地 import，也不需要知道名额缓存在哪。
  *
  * 默认值 64 不再由运行期写入提供：它由 bundle 补丁（`cordis.patch.yml` 的
  * `- id: subagent` 覆盖项）在安装时声明，用户仍可在 profile / home patch / CLI overlay
@@ -39,14 +38,16 @@ function hostCapacityReadsOf(host) {
   const settingsSourceModule = host.settings;
   return {
     /**
-     * meta 投影：`roleConcurrencyLimit` 仍是用户配置值，这里另给宿主名额与**封顶后的
-     * 实际生效默认并发**（与派发 resolver 共用同一个纯函数，绝不出现两套算法）。
+     * meta 投影：只投影宿主子代理名额本身（`maxActiveSubagents`），读不到时为 null。
+     *
+     * 惰性兼容输入：fan-out 时代这里还会把「用户配置的默认并发」按名额封顶后一并投影
+     * （effectiveRoleConcurrencyLimit）。roleConcurrencyLimit 已随 fan-out 退役，没有任何
+     * 运行期上限来源，因此不再有可封顶的配置值——名额只按事实投影，不伪造「生效并发」。
      */
-    hostCapacityProjection: (roleConcurrencyLimit) => {
+    hostCapacityProjection: () => {
       const hostConcurrencyCap = settingsSourceModule.hostConcurrencyCap();
       return {
         hostConcurrencyCap: hostConcurrencyCap === undefined ? null : hostConcurrencyCap,
-        effectiveRoleConcurrencyLimit: effectiveRoleConcurrencyLimitWithHostCap(roleConcurrencyLimit, hostConcurrencyCap),
       };
     },
   };
@@ -84,8 +85,15 @@ export function assembleRpcActions(state, caps) {
       candidateSelectionsOfRole: state.candidateSelectionsOfRole,
       preflightSelectionEntry: state.preflightSelectionEntry,
       sessionOverrideProjectionOf: state.sessionOverrideProjectionOf,
-      fanoutRpcRootSession: state.fanoutRpcRootSession,
       isActiveRole: state.isActiveRole,
+      // 会话覆盖读写的「该会话是否有 live root」判定。原实现来自已删除的 fan-out 读根解析
+      // （createFanoutRpcReads.fanoutRpcRootSession），这里用 lineage 的当前代次 root 加上
+      // 既有 live 判定组合出等价语义：在线且不是任何父会话的子代理时才返回该 root。
+      liveRootSession: (sessionId) => {
+        let root;
+        try { root = host.lineage?.activeRoot?.(sessionId); } catch { root = void 0; }
+        return root !== void 0 && root !== null && state.isLiveRootAgent?.(root) === true ? root : void 0;
+      },
       // 主代理模型配置读面（批次 A）：调用期解析运行期 manager，避免装配顺序耦合。
       orchestratorStatusOf: (sessionId) => state.orchestratorModel.getStatus(sessionId),
       // 主代理模型配置的**显式写入**入口（B2）：会话覆盖 set/clear 落盘成功后，
@@ -139,7 +147,6 @@ export function assembleRpcActions(state, caps) {
       describeRolePrompts: state.describeRolePrompts,
       usageSummaryFor: state.usageSummaryFor,
       expertGroupRuntime: state.expertGroupRuntime,
-      fanoutHost: state.fanoutHost,
       isActiveRole: state.isActiveRole,
       // 宿主子代理名额的只读投影（meta），实现见本文件的 hostCapacityReadsOf；
       // owner 仍是 host/settings-source 模块（默认值 64 由 bundle 补丁声明）。
@@ -171,34 +178,6 @@ export function assembleRpcActions(state, caps) {
       validateImageRouteReleaseBody: state.validateImageRouteReleaseBody,
       validateImageRouteCancelBody: state.validateImageRouteCancelBody,
     },
-    fanout: {
-      fanoutRpcSessionId: state.fanoutRpcSessionId,
-      fanoutRpcRootSession: state.fanoutRpcRootSession,
-      fanoutRpcIsChildSession: state.fanoutRpcIsChildSession,
-      fanoutRpcReadRootSession: state.fanoutRpcReadRootSession,
-      fanoutRpcOwnerOf: state.fanoutRpcOwnerOf,
-      fanoutRpcCapabilitiesOf: state.fanoutRpcCapabilitiesOf,
-      fanoutRpcSendOwnerNotLive: state.fanoutRpcSendOwnerNotLive,
-      fanoutRpcAfter: state.fanoutRpcAfter,
-      fanoutRpcTaskWithCapabilities: state.fanoutRpcTaskWithCapabilities,
-      fanoutCaches: state.fanoutCaches,
-      fanoutWaits: state.fanoutWaits,
-      consumeFanoutRestore: state.consumeFanoutRestore,
-      refreshFanoutSnapshotFromStorage: state.refreshFanoutSnapshotFromStorage,
-      rehydrateFanoutOwnership: state.rehydrateFanoutOwnership,
-    },
-    manualDispatch: {
-      requireManualFanoutRoot: state.requireManualFanoutRoot,
-      buildManualDispatchPlan: state.buildManualDispatchPlan,
-      runManualFanoutDispatch: state.runManualFanoutDispatch,
-      manualDispatchFailure: state.manualDispatchFailure,
-      readFanoutTemplateDocument: state.readFanoutTemplateDocument,
-      persistFanoutTemplateDocument: state.persistFanoutTemplateDocument,
-      runFanoutTemplateMutation: state.runFanoutTemplateMutation,
-      buildFanoutTemplatePlan: state.buildFanoutTemplatePlan,
-      summarizeFanoutTemplate: state.summarizeFanoutTemplate,
-      FANOUT_TEMPLATE_MAX_BYTES: state.FANOUT_TEMPLATE_MAX_BYTES,
-    },
     notifications: {
       systemToast: state.systemToast,
       systemToastEnabled: state.systemToastEnabled,
@@ -218,7 +197,7 @@ export function assembleRpcActions(state, caps) {
     // 会话域分发表：核心模块只读取，不复制共享适配器。
     //
     // 会话删除（票据 04）的两个 action 不需要 sessionId，但语义属于「删会话」，因此与会话域
-    // 动作共用同一个 deps 命名空间：这样 RPC 核心的能力组仍是已签核的 8 组，不新增第 9 个
+    // 动作共用同一个 deps 命名空间：这样 RPC 核心的能力组仍是已签核的 7 组，不新增第 8 个
     // 协作方。命令面由后段（assembleSessionDeleteRpc）晚绑定，这里只在**调用期**解析。
     session: { ...rpcSessionActions, sessionDelete: sessionDeleteCommands },
   });
@@ -283,14 +262,21 @@ export function assembleDiagnosticsAndRoute(state, caps) {
 
   const runtimeDiagnostics = createRuntimeDiagnostics({
     host: { lineage: host.lineage, handoff: host.handoff, notifications: host.notifications },
-    settings: { describe: () => state.settingsRuntime.describe() },
+    // settings 读面只交出提交代次/在途写入的只读投影。
+    // 惰性兼容输入：fan-out 退役后不再有任何运行期并发上限来源，诊断面的 default/roles/
+    // providers 因此固定为中性值（见 host/index-runtime-diagnostics.js），这里不再派生读面。
+    settings: {
+      describe: () => state.settingsRuntime.describe(),
+    },
     storage: {
       describe: () => state.storageBinding.describe(),
-      readLastEventRestore: () => state.readLastFanoutEventRestore(),
+      // 普通 session/child 写入（session_overrides / child_models）的健康快照：与
+      // storageBinding 同属既有 storage 协作面，因此不新增能力组。fan-out 物理删除后
+      // 装配不再提供 fanout 依赖；持久化诊断段（lastFailure/lastSuccess/失败分类/连续
+      // 失败计数）改由这里读取组合根唯一持有的 persistenceHealth（只读 describe）。
+      persistenceHealth: () => state.persistenceHealth.describe(),
     },
     recovery: { describe: () => state.recovery.describe(), activationCount: state.activationCount, recordCount: state.recordCount },
-    fanout: { getFanoutHost: () => state.fanoutHost },
-    roles: { activeRoles: state.activeRoles },
     delegation: {
       activeTaskCounts: () => state.delegationTracker.activeTaskCounts(),
       readLastRefusedScopeRelease: state.readLastRefusedScopeRelease,

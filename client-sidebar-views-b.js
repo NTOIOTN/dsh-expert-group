@@ -100,8 +100,7 @@
   /**
    * DSH 权威会话指标的聚合读取（sessionStats + tokenUsage）。
    *
-   * - 单会话行传 [node.sessionId]；分片传最新 attempt 的 childId；
-   * - fan-out 父任务传各 shard 最新 attempt 的 childId（按 childId 去重）；
+   * - 单会话行传 [node.sessionId]；
    * - 同名字段逐会话相加，只有真的出现过数值才保留（缺失保持 null，绝不补 0）；
    * - 一条有效字段都没有时返回 null，调用方回退 DEG usage/duration。
    */
@@ -191,12 +190,12 @@
   /**
    * 运行时间（毫秒）的唯一解析顺序：节点 durationMs → 用量 runMs → 起止时间差。
    *
-   * 起止时间差（任何行都适用，包括没有 sessionId 的 fan-out 父任务）：
-   * - 起点：节点 startedAt 优先（分片跨 attempt 时以分片起点为准），其次会话 createdAt；
+   * 起止时间差（任何行都适用）：
+   * - 起点：节点 startedAt 优先，其次会话 createdAt；
    * - 运行中终点：**DEG Host 快照** snapshot.generatedAt 优先——生产环境的 sessions 列表
    *   快照（DSH getListSnapshot）只有 items/state/phase/error/projectionsBySession，没有
    *   generatedAt，因此 sessionsSnapshot.generatedAt 仅作旧宿主兼容兜底；
-   * - 非运行中终点：会话 updatedAt，其次节点 lastActivityAt（fan-out/分片没有会话时用它）；
+   * - 非运行中终点：会话 updatedAt，其次节点 lastActivityAt（没有会话证据时用它）；
    * - 差值必须 > 0，否则 null（摘要条省略「用时」，绝不写 0）。
    */
   const durationOfNode = (ctx, source, runtimeStatus, sessionId) => {
@@ -233,15 +232,11 @@
    * (d) 补出来的段不伪造语义 tooltip（不写「累计轮次用时 0s」「平均吞吐 0tok/s」
    *     「已用 null / 窗口 null」），tooltip 回退为段文本本身。
    *
-   * fan-out 父任务不承担会话：产品代码不再为它渲染摘要条（第二行已整行删除，
-   * 见 client-sidebar-views-c.js 的 renderFanout），因此 kind === "fanout" 的 skipContext
-   * 只作为本函数的通用选项保留，当前没有调用方传入。
    */
   const renderMetrics = (ctx, node, options = {}) => {
     const { react } = ctx;
     const source = object(node);
     const status = statusOf(source);
-    const kind = text(options.kind, text(source.kind, "expert"));
     const runtimeStatus = text(options.runtimeStatus, null);
     const sessionId = text(options.sessionId, null);
     const sessionIds = Array.isArray(options.sessionIds)
@@ -293,9 +288,9 @@
     const zeroFill = summary !== null && (idlePlaceholder
       || (summary.durationText !== null
         && (runtimeStatus === "running" || dsh !== null || usage !== null || summary.totalTokens !== null)));
-    // 只补缺失段（浅拷贝，绝不覆盖真值）；fan-out 父任务没有单一会话，context 段不补。
+    // 只补缺失段（浅拷贝，绝不覆盖真值）。
     const fill = zeroFill && typeof api?.zeroFilledUsageMetrics === "function"
-      ? api.zeroFilledUsageMetrics(summary, { skipContext: kind === "fanout" })
+      ? api.zeroFilledUsageMetrics(summary)
       : null;
     if (fill !== null) summary = fill.metrics;
     const segments = [];
@@ -368,7 +363,8 @@
     if (segments.length === 0 && retryWarning === null && failure === null) return null;
     return react.createElement("div", {
       className: "deg_expert_group_metrics",
-      "data-metrics-kind": kind,
+      // 行种类取自归一化后的节点（与同行主行的 data-kind 同源）；fan-out 移除后此处不再有独立 kind 变量。
+      "data-metrics-kind": source.kind || "expert",
       role: "group",
       "aria-label": "任务用量摘要",
     }, ...segments, retryWarning, failure);
@@ -384,11 +380,8 @@
    *
    * 第一行文案完整交给 CSS 处理，渲染层不做任何 grapheme 硬截断——完整文本同时是
    * React 文本、title（悬浮提示）与无障碍标签的来源，用户始终能读到全名。
-   * 省略行为按行粒度区分（options.oneLine）：
-   * - 默认 true：普通专家/根节点维持单行省略（.deg_expert_group_line 的
-   *   overflow:hidden + text-overflow:ellipsis + white-space:nowrap），节点行高与树线语义不变；
-   * - false：fan-out 分片第一行是「分片代号  任务名称」的组合文本，代号会占满单行额度，
-   *   因此改用可换行样式（见 .deg_expert_group_shard_task），在右栏窄宽度下完整展示多行名称。
+   * 省略行为：所有行维持单行省略（.deg_expert_group_line 的 overflow:hidden +
+   * text-overflow:ellipsis + white-space:nowrap），节点行高与树线语义不变。
    *
    * 可导航的第一行是 role=button 的 div（不是嵌套 <button>，避免无效 HTML）：
    * 鼠标点击行为不变，同时支持键盘 Enter/Space，并带 tabIndex 与 aria-label。
@@ -400,7 +393,6 @@
     const { react, subagentAddressOfChild, handleOpen, navigation } = ctx;
     const source = object(node);
     const fullName = titleOf(source);
-    const oneLine = options.oneLine !== false;
     const parentId = text(options.parentId, null);
     const clickableId = text(options.sessionId, text(source.sessionId, text(source.childId, null)));
     // 地址既决定主视图导航的目标形态（SubagentAddress 还是裸 session id），也决定侧栏
@@ -425,8 +417,7 @@
       onKeyDown,
     };
     const metadata = metadataOf(source, ctx.a.mergedRoleLabels);
-    const taskClassName = "deg_expert_group_line deg_expert_group_task"
-      + (oneLine ? "" : " deg_expert_group_shard_task");
+    const taskClassName = "deg_expert_group_line deg_expert_group_task";
     const trailing = options.trailing === undefined ? null : options.trailing;
     const taskChildren = [
       react.createElement("div", { className: taskClassName, title: fullName, onClick: onNavigate, ...navigateProps }, fullName),
@@ -437,7 +428,7 @@
       className: "deg_expert_group_task_line" + (trailing === null ? "" : " deg_expert_group_task_line_trailing"),
     }, ...taskChildren);
     // 主代理批量控件作为标题行的相邻 flex 项，标题收缩省略时控件仍固定在标题末尾。
-    // 其它专家 / 分片 / 空闲成员不传 trailing，单会话箭头结构保持不变。
+    // 其它专家与空闲成员不传 trailing，单会话箭头结构保持不变。
     // 两行主体必须保持恰好 2 个子节点（DOM 契约）：用量摘要条/attempt 时间线放在
     // 相邻块（.deg_expert_group_cell）里纵向排列，绝不改变两行网格的行数与顺序。
     const rowMain = react.createElement("div", { className: "deg_expert_group_row_main", "data-kind": source.kind || "expert", "data-expanded": true },

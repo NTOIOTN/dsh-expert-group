@@ -20,15 +20,7 @@ import {
 import { normalizeModelPrices } from "./usage-projection.js";
 import { normalizePeakValleyForRead } from "./peak-valley-settings.js";
 import { mergeOrchestratorDraft, normalizeOrchestratorForRead } from "./orchestrator-settings.js";
-import {
-  LIMIT_DIAGNOSTIC_LIMIT,
-  normalizeRoleLimitsForRead,
-  normalizeProviderLimitsForRead,
-  normalizeNotificationEvents,
-  normalizeRoleConcurrencyLimitForRead,
-  normalizeConfigMigrationVersion,
-  normalizeRoleTimeoutMs,
-} from "./settings-schema.js";
+import { normalizeNotificationEvents } from "./settings-schema.js";
 
 /**
  * 把「与当前默认 persona 逐字相同」的覆盖折算成"没有覆盖"。
@@ -201,36 +193,6 @@ export function mergeOrchestratorSettingsCandidate(candidate, savedSnapshot, mak
 }
 
 /**
- * 读取期并发映射诊断的有界投影（meta 用，票据 26）。
- *
- * 只保留字段名、角色/provider 键（截断）与稳定原因码：不包含原始值、用户正文或
- * 任何会话数据；条数由读取面归一器限制在 LIMIT_DIAGNOSTIC_LIMIT 内，这里再兜一次。
- *
- * @param {unknown} value - normalizeSnapshot 的 limitDiagnostics。
- * @returns {{roleLimits: object[], providerLimits: object[]}} 冻结的只读诊断。
- */
-export function projectLimitDiagnostics(value) {
-  const project = (list) => {
-    const projected = [];
-    for (const entry of (Array.isArray(list) ? list : []).slice(0, LIMIT_DIAGNOSTIC_LIMIT)) {
-      if (entry === null || typeof entry !== "object") continue;
-      projected.push(Object.freeze({
-        field: entry.field === "providerLimits" ? "providerLimits" : "roleLimits",
-        ...(typeof entry.role === "string" && entry.role.length > 0 ? { role: entry.role.slice(0, 64) } : {}),
-        ...(typeof entry.provider === "string" && entry.provider.length > 0 ? { provider: entry.provider.slice(0, 64) } : {}),
-        reason: typeof entry.reason === "string" ? entry.reason : "invalid_limit",
-      }));
-    }
-    return Object.freeze(projected);
-  };
-  const source = value !== null && typeof value === "object" ? value : {};
-  return Object.freeze({
-    roleLimits: project(source.roleLimits),
-    providerLimits: project(source.providerLimits),
-  });
-}
-
-/**
  * 单价读取期丢弃诊断的有界投影（票据 25，meta 用）。
  *
  * 只保留条目下标、稳定原因码与被截断的 provider/model 标识；不含原始数值、用户正文
@@ -330,12 +292,6 @@ export function normalizeSnapshot(snapshot, visibleRoles) {
   const volume = Number(snapshot?.notificationVolume);
   // 角色集合固定为内置六角色（自定义角色能力已删除）。
   const knownRoleIds = STATUS_ROLE_IDS;
-  /**
-   * 并发映射读取面（票据 26）：角色键按内置角色集校验，
-   * provider 键只要求非空字符串。非法条目丢弃并诊断，缺字段 = 空映射（旧配置兼容）。
-   */
-  const roleLimitsRead = normalizeRoleLimitsForRead(snapshot?.roleLimits, knownRoleIds);
-  const providerLimitsRead = normalizeProviderLimitsForRead(snapshot?.providerLimits);
   // 上下文继承（票据 29）：只允许内置非 Observer 角色的显式 true；非法键丢弃并诊断。
   // 缺字段（旧配置）=> 空映射 => 全部关闭，内置角色的行为逐字节不变。
   const inheritContextRead = normalizeInheritContextForRead(snapshot?.inheritContext);
@@ -376,30 +332,11 @@ export function normalizeSnapshot(snapshot, visibleRoles) {
     notificationVolume: Number.isFinite(volume) ? Math.min(100, Math.max(0, Math.round(volume))) : 100,
     // 通知事件类型（票据 14）：旧文档缺字段 => 三个类别全开（历史行为）。
     notificationEvents: normalizeNotificationEvents(snapshot?.notificationEvents),
-    // 读取别名：旧默认值 10 + 标记缺失 => 20；标记落盘后 10 原样保留。
-    roleConcurrencyLimit: normalizeRoleConcurrencyLimitForRead(snapshot),
     /**
-     * 内部迁移标记（只读）：读取别名必须幂等。readStorageSnapshot 会对已归一快照再做
-     * 一次防御性归一，如果这里丢掉标记，"标记=1 + 10" 会在第二次归一里被重新解释成
-     * 20（meta 与调度器读到的值不一致）。它不是设置页字段，也不进入提交候选。
-     */
-    configMigrationVersion: normalizeConfigMigrationVersion(snapshot),
-    /**
-     * 逐角色并发上限（票据 26）：旧配置缺字段 => 空映射（全部落到 roleConcurrencyLimit
-     * 默认值），读取面非法条目已被丢弃，调度器因此永远拿不到越界值。
-     */
-    roleLimits: roleLimitsRead.limits,
-    /**
-     * 逐 provider 并发上限（票据 26）：0 或缺失 = 不限制。读取面只做结构/范围归一，
-     * 不查模型目录（provider 是否存在属于模型配置的职责，不是限流配置的前置条件）。
-     */
-    providerLimits: providerLimitsRead.limits,
-    // 读取期被丢弃条目的只读诊断（有界；RPC meta 投影，客户端只读展示）。
-    limitDiagnostics: Object.freeze({
-      roleLimits: Object.freeze(roleLimitsRead.diagnostics.map((entry) => Object.freeze({ ...entry }))),
-      providerLimits: Object.freeze(providerLimitsRead.diagnostics.map((entry) => Object.freeze({ ...entry }))),
-    }),
-    /**
+     * 惰性兼容输入：fan-out 时代遗留的 roleConcurrencyLimit / roleLimits / providerLimits /
+     * roleTimeoutMs 不在这里归一、也不出现在归一快照里。旧文档中的这些值即使被读进内存，
+     * 也只作为普通文档内容原样躺在 settings 文档里，不进入任何读面或写面。
+     *
      * 角色级上下文继承开关（票据 29）：只含内置非 Observer 角色的显式 true。
      * 缺字段（旧配置）/显式 false 都归一为关闭；空对象表示全部关闭。
      * 是否真正可继承还要看宿主是否有合格的 fork provider（派发时 fail-closed 校验）。
@@ -407,8 +344,6 @@ export function normalizeSnapshot(snapshot, visibleRoles) {
     inheritContext: inheritContextRead.value,
     // 读取期被丢弃键的有界诊断（meta 投影；不是配置，不进入设置响应）。
     inheritContextDiagnostics: Object.freeze(inheritContextRead.diagnostics.map((entry) => Object.freeze({ ...entry }))),
-    // 角色默认超时：旧配置/非法值归一为 0（不启用），不阻断读取。
-    roleTimeoutMs: normalizeRoleTimeoutMs(snapshot?.roleTimeoutMs),
     // 模型候选（票据 24）：非法读取值回退为空映射；缺字段的旧配置同样为空。
     candidates: normalizeModelCandidatesForRead(snapshot?.candidates, knownRoleIds),
     // 自动降级上限：缺失/非法回退默认 2，读取面永远给出 0..4 的合法整数。

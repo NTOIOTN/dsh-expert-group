@@ -19,7 +19,7 @@
  * 相污染。state 由入口在每次 apply 时新建，等价于迁移前 apply 内的词法作用域。
  *
  * ## 晚绑定
- * `settingsSource` / `source` / `fanoutHost` / `expertCore` / `roleTools` 等指向
+ * `settingsSource` / `source` / `expertCore` / `roleTools` 等指向
  * apply 后段才就绪的对象：它们只以 state 槽位或取值函数形式出现，绝不在构造期求值，
  * 与迁移前的闭包语义逐字等价。
  *
@@ -64,9 +64,8 @@ export function assemblePrelude(state, caps) {
     logger,
     settings,
     agents,
-    // 晚绑定：root 身份判定、fan-out Host 与卸载闩都在 apply 后段才就绪。
+    // 晚绑定：root 身份判定与卸载闩都在 apply 后段才就绪。
     isRootAgent: (agent) => state.isRootAgentIdentity(agent),
-    getFanoutHost: () => state.fanoutHost,
     isTurnWaitStopping: () => state.isRootWaitStopping(),
   });
   const {
@@ -204,7 +203,9 @@ export function assembleRootWait(state, caps) {
     // ⑥ 组合根注册 adapter（铁律 2）：域自己决定安装时机（首次查询前、只装一次），
     //    这里只把 handlers 交给入口能力面；ctx.effect + 三个 ctx.on 的实际调用点仍写在 index.js。
     hostEvents: {
-      registerActivityListeners: (handlers) => caps.registerRootWaitActivityListeners(handlers),
+      registerActivityListeners: (handlers) => caps.registerRootWaitActivityListeners({
+        ...handlers,
+      }),
     },
     // ⑦ 宿主扩展点访问：探针与调用必须在组合根完成——严格 Cordis Context 对未声明属性会抛，
     //    且调用需要以宿主 ctx 为 this。两者都保持迁移前的 try/catch 语义。
@@ -220,14 +221,23 @@ export function assembleRootWait(state, caps) {
 
   // rc.2 删除 agents.roots()：统一走 root wait 域的双契约枚举（rc.1 roots() /
   // rc.2 list()+root 身份过滤），保证预存 root 仍能登记 lineage 与代次。
-  const roots = rootWaitDomain.listRootAgents();
-  for (const root of roots) {
-    if (isRootAgentIdentity(root) && typeof root.id === "string") {
-      host.lineage.activateRoot(root);
-      host.lineage.tokenFor(root);
-      rootGenerationRegistry.activate(root.id, root);
-      // 恢复出的 root 只建立空状态：不能继承同 id 旧 root 遗留的终止快照。
-      notificationHost.activateRoot({ rootId: root.id, generation: rootGenerationRegistry.generationOf(root.id) });
+  let roots;
+  try {
+    roots = rootWaitDomain.listRootAgents();
+  } catch {
+    // root wait 域已记录异常；这里不伪装成空数组，只跳过 lineage 恢复：不可信的枚举
+    // 不能当作「当前确实没有 root」。
+  }
+  // 不可信的 root enumeration 不能中止同步工具面装配，也不能当作可信空 root 集合。
+  if (Array.isArray(roots)) {
+    for (const root of roots) {
+      if (isRootAgentIdentity(root) && typeof root.id === "string") {
+        host.lineage.activateRoot(root);
+        host.lineage.tokenFor(root);
+        rootGenerationRegistry.activate(root.id, root);
+        // 恢复出的 root 只建立空状态：不能继承同 id 旧 root 遗留的终止快照。
+        notificationHost.activateRoot({ rootId: root.id, generation: rootGenerationRegistry.generationOf(root.id) });
+      }
     }
   }
   return registrations;
@@ -339,19 +349,18 @@ export function assembleHandoffAndFinalize(state) {
  */
 export function assembleSettingsStorage(state, caps) {
   const { logger } = state;
-  // settings/storage 域的纯表读取面：模板存储与 fan-out RPC 读都复用它，由状态容器转发。
+  // settings/storage 域的纯表读取面：需要直读 domain 表的域复用它，由状态容器转发。
   state.tableEntries = tableEntries;
-  const { host, storageBinding, persistenceHealth, roleCatalog, activeRoles } = state;
+  const { storageBinding, persistenceHealth, roleCatalog, activeRoles } = state;
   const registrations = [];
 
+  // 本域不消费 `host.lineage`（工厂从未解构该键）：该参数已随 fan-out 物理删除成为死码，
+  // 因此不再传入；`host.lineage` 的其它消费点（root 激活、usage attribution）保持不变。
   const settingsStorage = createIndexSettingsStorageDomain({
     logger,
     storageBinding,
-    lineage: host.lineage,
     roles: { roleCatalog, activeRoles },
     persistenceHealth,
-    getFanoutHost: () => state.fanoutHost,
-    onStorageRestored: () => state.fanoutWaits?.reconcileFanoutGoalHandoffs(),
   });
   Object.assign(state, settingsStorage);
   state.settingsStorage = settingsStorage;
@@ -415,7 +424,9 @@ export function assembleRoleToolSync(state) {
 
 /**
  * 幂等同步：#1 定义签名变化的角色先卸载；#2 不在启用集合里的角色卸载；
- * #3 逐个挂载启用角色；#4 fanout 工具按当前 role 枚举重挂载；#5 重建 routing 提示词。
+ * #3 逐个挂载启用角色；#4 重建 routing 提示词。
+ *
+ * 只处理 role 目录本身：生效集合之外的已挂载角色被卸载，定义签名变化的角色先卸后挂。
  */
 function syncRoleTools(state) {
   if (!state.roleToolsReady) return;
@@ -430,15 +441,10 @@ function syncRoleTools(state) {
     state.unmountRole(role);
   }
   for (const role of state.roleTools.mountedRoleIds()) {
-    if (role === "fanout" || desired.has(role)) continue;
+    if (desired.has(role)) continue;
     state.unmountRole(role);
   }
   for (const role of desired) state.mountRole(role);
-  // fanout 的 role 枚举与描述在注册时生成：重挂载保证枚举与当前启用集合同源。
-  if (state.roleTools.isMounted("fanout")) {
-    state.unmountFanoutTool();
-    state.mountFanoutTool();
-  }
   state.refreshRoutingPrompt();
 }
 

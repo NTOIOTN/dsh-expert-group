@@ -7,17 +7,23 @@
 
 import z from "@deepseek-ai/schemastery";
 import { DEFAULT_NOTIFICATION_VOLUME } from "./system-toast.js";
-import { STATUS_ROLE_IDS } from "../shared/prompts.js";
-import {
-  MIN_CONCURRENCY_LIMIT,
-  MAX_CONCURRENCY_LIMIT,
-  MIN_PROVIDER_LIMIT,
-  MAX_PROVIDER_LIMIT,
-  validateTimeoutMs,
-  TIMEOUT_STEP_MS,
-  MAX_TIMEOUT_MS,
-} from "../fanout.js";
 import { MAX_MODEL_FALLBACK_LIMIT, DEFAULT_MODEL_FALLBACK_LIMIT } from "../shared/model-route.js";
+
+/**
+ * 惰性兼容输入（fan-out 物理删除后这四个设置项的唯一残留语义）。
+ *
+ * 旧 settings 文档里可能仍保存着 `roleConcurrencyLimit` / `roleLimits` /
+ * `providerLimits` / `roleTimeoutMs` 四个键（它们只服务已删除的 fan-out 调度器）。
+ * 本模块**不再声明**它们：
+ * - 不进入 Config schema、不进入读取归一，因此设置读面（describe / meta / settings 快照）
+ *   永远不会出现这四个键；
+ * - 也不进入任何提交 patch：旧文档保存其它设置时既不报错，也不改写、不删除磁盘上的旧值
+ *   （写入面只按显式候选构造 patch，未声明的键天然不会被写）。
+ *
+ * 曾只为它们存在的常量与归一（并发/超时边界、默认值、读取别名、读取诊断上限与校验
+ * helper）已一并删除。宿主通用子代理名额（`maxActiveSubagents` / hostConcurrencyCap）
+ * 与它们无关，继续保留在 settings-source 的读面里。
+ */
 
 const ROLE_SELECTION = z.object({
   provider: z.string().required(),
@@ -41,156 +47,6 @@ export const DEFAULT_NOTIFICATION_EVENTS = Object.freeze({ completed: true, wait
  * 常量与归一函数都来自 host/system-toast.js，保证设置读取面与投递面用的是同一套规则。
  */
 export const DEFAULT_NOTIFICATION_VOLUME_SETTING = DEFAULT_NOTIFICATION_VOLUME;
-/**
- * per-role 并发上限的默认值（未显式保存 `roleConcurrencyLimit` 时使用）。
- *
- * 与客户端展示/归一（client.js 的 normalizeRoleConcurrencyLimit）和设置页 title 文案
- * 保持同一数值；只影响没有该字段的历史配置，已显式保存的旧值仍按原值生效。
- */
-export const DEFAULT_ROLE_CONCURRENCY_LIMIT = 20;
-/**
- * 内部配置迁移目标版本（持久化在 settings.configMigrationVersion）。
- *
- * 版本 1 = 「旧默认并发上限 10 → 20」的**读取别名 + 首次保存落标记**方案：
- * - 标记缺失/小于该版本时，读取面把恰好等于旧默认值 10 的配置按 20 展示与调度；
- * - 第一次 settings-commit 会把标记与其它字段写进同一份 patch；
- * - 标记落盘后 10 原样保留，用户可随时手动改回 10。
- */
-export const CONFIG_MIGRATION_VERSION = 1;
-/** 旧默认并发上限：只有恰好等于该值的配置才会被读取别名按 20 解释。 */
-const LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT = 10;
-/**
- * 角色级默认超时（毫秒，票据 06）：默认 10 小时，显式 0 = 不启用。
- *
- * 与管理器的三级优先级（shard > 父任务 > 角色 > 未启用）共用同一语义；
- * 设置读取面必须总能给出一个合法值，所以非法/缺失回退到默认 10 小时。
- */
-export const DEFAULT_ROLE_TIMEOUT_MS = 36000000;
-
-/** 角色并发上限必须是 1 到 64 的安全整数；旧配置或非法值回退到默认值。 */
-export function normalizeRoleConcurrencyLimit(value) {
-  return Number.isSafeInteger(value) && value >= 1 && value <= 64
-    ? value
-    : DEFAULT_ROLE_CONCURRENCY_LIMIT;
-}
-
-/** 读取面归一：内部迁移版本（缺省/非法按 0 处理，与 Host 首次保存的补写规则一致）。 */
-export function normalizeConfigMigrationVersion(snapshot) {
-  const rawVersion = snapshot?.configMigrationVersion;
-  return Number.isSafeInteger(rawVersion) && rawVersion >= 0 ? rawVersion : 0;
-}
-
-/**
- * 读取面归一：把「旧默认值 10 + 尚未落迁移标记」解释为新默认值 20。
- *
- * 背景：默认值从 10 调整为 20 后，旧 profile 里显式保存的 10 在标记缺失时必须按 20
- * 展示与调度，否则用户升级后仍会看到/使用旧默认值。标记只在**首次保存**时随 patch
- * 落盘（不依赖启动期 describe 可见性）；标记落盘后 10 原样保留，用户之后手动改回
- * 10 不会被再次改写。
- *
- * 这是纯读取别名：绝不改写写入值，用户自定义的其它合法值完全不受影响。
- *
- * @param {object|undefined} snapshot - 已保存的 settings 文档（或已归一快照）。
- * @returns {number} 1~64 的生效并发上限。
- */
-export function normalizeRoleConcurrencyLimitForRead(snapshot) {
-  const limit = normalizeRoleConcurrencyLimit(snapshot?.roleConcurrencyLimit);
-  return normalizeConfigMigrationVersion(snapshot) < CONFIG_MIGRATION_VERSION
-    && limit === LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT
-    ? DEFAULT_ROLE_CONCURRENCY_LIMIT
-    : limit;
-}
-
-/**
- * 读取面诊断条数上限（票据 26）：非法 roleLimits/providerLimits 条目只保留有界摘要，
- * 诊断面因此不随用户写坏多少键而增长。
- */
-export const LIMIT_DIAGNOSTIC_LIMIT = 16;
-
-/**
- * 读取面归一：roleLimits（逐角色并发上限映射，票据 26）。
- *
- * 语义与其它设置读取面一致：
- * - 缺字段（旧配置/旧客户端）= 空映射，不是错误；
- * - 非法/越界值、未知角色键**丢弃并诊断**，绝不让设置页因一份坏文档打不开；
- * - 写入面（settings-commit）仍严格拒绝整份候选，读取面的宽容只服务历史文档
- *   与宿主通用写入路径。
- *
- * @param {unknown} value - settings.roleLimits 原始值。
- * @param {readonly string[]} allowedRoles - 当前候选设置自己的角色集（内置 + 自定义）。
- * @returns {{limits: Record<string, number>, diagnostics: Array<object>}}
- */
-export function normalizeRoleLimitsForRead(value, allowedRoles) {
-  const limits = {};
-  const diagnostics = [];
-  if (value === undefined || value === null) return { limits, diagnostics };
-  if (typeof value !== "object" || Array.isArray(value)) {
-    diagnostics.push({ field: "roleLimits", reason: "invalid_shape" });
-    return { limits, diagnostics };
-  }
-  const allowed = new Set(Array.isArray(allowedRoles) ? allowedRoles : STATUS_ROLE_IDS);
-  for (const [role, limit] of Object.entries(value)) {
-    // 先判值的合法性再判键：一个"未知角色 + 非法值"的条目最需要说明的是值坏了
-    // （invalid_limit 是可操作的提示），而不是角色表里没有它。
-    if (!Number.isSafeInteger(limit) || limit < MIN_CONCURRENCY_LIMIT || limit > MAX_CONCURRENCY_LIMIT) {
-      if (diagnostics.length < LIMIT_DIAGNOSTIC_LIMIT) diagnostics.push({ field: "roleLimits", role: role.slice(0, 64), reason: "invalid_limit" });
-      continue;
-    }
-    if (role.trim().length === 0 || !allowed.has(role)) {
-      if (diagnostics.length < LIMIT_DIAGNOSTIC_LIMIT) diagnostics.push({ field: "roleLimits", role: role.slice(0, 64), reason: "unknown_role" });
-      continue;
-    }
-    limits[role] = limit;
-  }
-  return { limits, diagnostics };
-}
-
-/**
- * 读取面归一：providerLimits（逐 provider 并发上限映射，票据 26）。
- *
- * 与 roleLimits 的区别（都是刻意的）：
- * - 键只要求非空字符串：provider 集合来自模型目录，插件不应在读取面替用户判定
- *   "这个 provider 是否存在"（目录可能暂时不可用）；
- * - 0 是合法值（显式不限制），只有越界/非整数才丢弃。
- *
- * @param {unknown} value - settings.providerLimits 原始值。
- * @returns {{limits: Record<string, number>, diagnostics: Array<object>}}
- */
-export function normalizeProviderLimitsForRead(value) {
-  const limits = {};
-  const diagnostics = [];
-  if (value === undefined || value === null) return { limits, diagnostics };
-  if (typeof value !== "object" || Array.isArray(value)) {
-    diagnostics.push({ field: "providerLimits", reason: "invalid_shape" });
-    return { limits, diagnostics };
-  }
-  for (const [provider, limit] of Object.entries(value)) {
-    if (provider.trim().length === 0) {
-      if (diagnostics.length < LIMIT_DIAGNOSTIC_LIMIT) diagnostics.push({ field: "providerLimits", reason: "invalid_key" });
-      continue;
-    }
-    if (!Number.isSafeInteger(limit) || limit < MIN_PROVIDER_LIMIT || limit > MAX_PROVIDER_LIMIT) {
-      if (diagnostics.length < LIMIT_DIAGNOSTIC_LIMIT) diagnostics.push({ field: "providerLimits", provider: provider.slice(0, 64), reason: "invalid_limit" });
-      continue;
-    }
-    limits[provider] = limit;
-  }
-  return { limits, diagnostics };
-}
-
-/**
- * 角色默认超时归一：需与 fanout.js 的 validateTimeoutMs 同源（只接受 0 或
- * 1000~86,400,000 的整秒毫秒数）。缺失/非法值回退默认 10 小时，保证读取面与
- * 调度器永远拿不到越界值；写入面仍由 validateSettingsCandidate 严格拒绝。
- *
- * @param {unknown} value - 待归一的 settings 值。
- * @returns {number} 0 或合法启用值。
- */
-export function normalizeRoleTimeoutMs(value) {
-  const check = validateTimeoutMs(value);
-  return check.ok && typeof check.value === "number" ? check.value : DEFAULT_ROLE_TIMEOUT_MS;
-}
-
 /**
  * 通知事件开关归一：只读取三个声明过的类别，缺失/非法一律按开启处理。
  *
@@ -220,8 +76,11 @@ export function normalizeNotificationEvents(value) {
  * 字段语义与默认值必须与设置页的读取面一致：`describe()` 返回的 value 是
  * defaults resolved 后的结果（provider 空字符串表示用户尚未选择 provider，
  * promptOverrides 空对象表示全部跟随代码默认 persona）。运行期读源由
- * host/settings-source 从 describe() 取得，提交端点只写设置页可改的偏好字段
- * （`configMigrationVersion` 例外：它是内部迁移版本，不对用户展示、也不在提交端点写入面内）。
+ * host/settings-source 从 describe() 取得，提交端点只写设置页可改的偏好字段。
+ *
+ * 注意：fan-out 时代遗留的 `roleConcurrencyLimit` / `roleLimits` / `providerLimits` /
+ * `roleTimeoutMs` 已从本 schema 移除（见文件顶部的「惰性兼容输入」说明）。旧文档里的
+ * 这些键既不会出现在 describe() 的 value 里，也不会被任何 patch 改写或删除。
  */
 export const Config = z.object({
   // 主代理能力默认启用；false 可用于仅使用专家工具的兼容部署。
@@ -240,34 +99,6 @@ export const Config = z.object({
     waiting: z.boolean().default(true),
     failed: z.boolean().default(true),
   }).default({}).volatile(),
-  roleConcurrencyLimit: z.number().step(1).min(1).max(64).default(DEFAULT_ROLE_CONCURRENCY_LIMIT).volatile(),
-  /**
-   * 内部配置迁移版本（volatile 只是让宿主允许插件写入并投影 describe）。
-   *
-   * 0 = 尚未落下标记；1 = 已落标记（当前只包含旧默认并发上限 10 → 20 的读取别名）。
-   * 该字段不在设置页展示，也不进入 settings-commit 的候选；它由 Host 在首次成功
-   * 保存时与其它字段写入同一份 patch，用来关闭读取别名：标记落盘后，用户手动把
-   * roleConcurrencyLimit 改回 10 会原样保留，绝不会被再次解释成 20。
-   */
-  configMigrationVersion: z.number().step(1).min(0).default(0).volatile(),
-  /**
-   * 逐角色并发上限覆盖（票据 26）：roleId -> 1..64。未出现的角色落到 roleConcurrencyLimit。
-   *
-   * 这里只声明类型层（角色键/范围由 DEG 自有提交端点严格校验，见
-   * assertRoleLimitsCandidate）。缺字段 = 旧配置/旧客户端：读取为空映射，保存时保持
-   * 已有映射（不写 patch），因此不会把用户已配置的逐角色上限一次无关保存清空。
-   */
-  roleLimits: z.dict(z.number().step(1).min(1).max(64)).default({}).volatile(),
-  /**
-   * 逐 provider 并发上限（票据 26）：providerId -> 0..64。
-   *
-   * 0 或未设置表示不限制（规则见 docs/specs/03 §3）；provider 键只要求非空字符串，
-   * 保存时不调用模型目录校验，避免目录暂时不可用时连限流配置都无法保存。
-   */
-  providerLimits: z.dict(z.number().step(1).min(0).max(64)).default({}).volatile(),
-  // 角色级默认超时（毫秒，票据 06）：0 = 不启用；启用值为 1000~86,400,000 且为 1000 的整数倍。
-  // 它只影响保存之后创建的 attempt，不会改写运行中的分片（三级优先级见 fanout.js）。
-  roleTimeoutMs: z.number().step(TIMEOUT_STEP_MS).min(0).max(MAX_TIMEOUT_MS).default(DEFAULT_ROLE_TIMEOUT_MS).volatile(),
   // 模型候选与启动前 fallback（票据 24）：候选是全局配置，按角色有序排列；
   // 会话覆盖只替换主选择（defaults/session_overrides），绝不修改这里。
   // 读取面把非法值归一为空映射/默认 2，不阻塞设置读取；严格拒绝落在 DEG 提交端点。

@@ -2,7 +2,7 @@
  * Host 关注点模块：storage binding / 初始化代际 / 快照缓存。
  *
  * 接管原先散落在 apply 里的 binding 生成器实例、active binding 投影与
- * domain/fan-out 快照缓存；写入串行链与 storage domain 的 open/close 时序仍留在
+ * domain 快照缓存；写入串行链与 storage domain 的 open/close 时序仍留在
  * index.js（源码契约测试锁定），任务 06 再收缩。
  *
  * @module dsh-expert-group/host/storage-binding
@@ -19,17 +19,15 @@ export function createStorageBindingModule({ bindingController = createBindingCo
     throw new TypeError("createStorageBindingModule 需要 bindingController");
   }
   let domainSnapshot = {};
-  let fanoutSnapshot;
 
   return Object.freeze({
     /**
      * 开始新 generation：旧 binding 立即失效，且清空快照缓存，
-     * 避免新 generation 复用上一代的 domain/fan-out 数据。
+     * 避免新 generation 复用上一代的 domain 数据。
      */
     begin() {
       const binding = bindingController.begin();
       domainSnapshot = {};
-      fanoutSnapshot = undefined;
       return binding;
     },
     /** 安装 ready binding；迟到/被替换的 binding 返回 false。 */
@@ -63,12 +61,7 @@ export function createStorageBindingModule({ bindingController = createBindingCo
       domainSnapshot = value !== null && typeof value === "object" ? value : {};
       return domainSnapshot;
     },
-    setFanoutSnapshot(value) {
-      fanoutSnapshot = value;
-      return fanoutSnapshot;
-    },
     domainSnapshot: () => domainSnapshot,
-    fanoutSnapshot: () => fanoutSnapshot,
     /** readStorageSnapshot 使用的合并投影（settings 字段由调用方补）。 */
     snapshots: () => ({ ...domainSnapshot }),
     describe() {
@@ -81,15 +74,15 @@ export function createStorageBindingModule({ bindingController = createBindingCo
         // 运行期硬依赖，缺失时写路径会显式拒绝，诊断必须如实列出。
         tableNames: binding === undefined
           ? []
-          // 票据 28：模板表与运行数据同域、独立表。诊断只投影“有哪些表”，
-          // 不暴露表内容；旧 binding 缺该表时如实少一项（= 写路径会显式拒绝）。
-          : ["session_overrides", "session_override_meta", "child_models", "fanout_tasks", "fanout_templates", "orchestrator_state"]
+          // 诊断只投影“有哪些表”，不暴露表内容；旧 binding 缺某张表时如实少一项
+          // （= 该表的写路径会显式拒绝）。fan-out 的 fanout_tasks / fanout_templates
+          // 两张表已随 fan-out 整体移除。
+          : ["session_overrides", "session_override_meta", "child_models", "orchestrator_state"]
             .filter((name) => binding[tableKeyOf(name)] !== undefined),
       };
     },
     dispose() {
       domainSnapshot = {};
-      fanoutSnapshot = undefined;
     },
   });
 }
@@ -98,8 +91,8 @@ function tableKeyOf(tableName) {
   if (tableName === "session_overrides") return "sessionTable";
   if (tableName === "session_override_meta") return "sessionOverrideMetaTable";
   if (tableName === "child_models") return "childTable";
-  if (tableName === "fanout_templates") return "fanoutTemplateTable";
   // 主代理功能启用切点（B3）：与运行数据同域的独立表，诊断面同样如实列出。
   if (tableName === "orchestrator_state") return "orchestratorStateTable";
-  return "fanoutTable";
+  // 未登记的表名在诊断面如实省略（不再有隐式的 fan-out 表兜底）。
+  return undefined;
 }

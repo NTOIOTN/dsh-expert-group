@@ -2,8 +2,8 @@
  * 入口 agent/disposed 事件接线域（R4e · 票据 19）。
  *
  * 这是 `ctx.on("agent/disposed")` 的纯 handler：按 exact Agent 对象收敛该代际的
- * 全部运行期边界——child scoped guard、fan-out attempt、请求级重试状态、effort 注入、
- * root 代际表、等待账本、fan-out 登记、委派活动与恢复记录。
+ * 全部运行期边界——child scoped guard、请求级重试状态、effort 注入、root 代际表、
+ * 等待账本、委派活动与恢复记录。
  *
  * 关键语义（与迁移前逐行一致）：
  * - 只有**当前** root generation 才能清理终止快照、delegation tracker、admission 与
@@ -22,28 +22,23 @@
  *
  * @module dsh-expert-group/host/index-agent-disposed
  */
-import { isFanoutAgent, isFanoutIdentity } from "../fanout-host.js";
-
 /**
  * 创建 agent/disposed handler。
  *
- * @param {object} deps - 窄能力面（8 组）。
+ * @param {object} deps - 窄能力面（6 组）。
  * @param {object} deps.logger - 宿主 logger（只记固定类别与错误名）。
  * @param {object} deps.roots - 根代际面（identity + prelude + 等待/退休命令的同一关注点）：
  *   `isRootAgentIdentity`、`lineage`、`rootGenerationRegistry`、`notificationHost`、
- *   `markRootDisposed`、`forgetRootUserWait`、`rootTurnWaits.retire`、
- *   `releaseRetiredRootHandoffs`。
- * @param {object} deps.fanout - fan-out 面：`getFanoutHost`（晚绑定）。
+ *   `markRootDisposed`、`forgetRootUserWait`、`rootTurnWaits.retire`。
  * @param {object} deps.guards - F6 guard 清理 adapter：`getGuardCleanup(agent)` /
  *   `forgetGuardCleanup(agent)`。
  * @param {object} deps.recovery - 恢复域：`forgetChildActivation`、`invalidateRequestRetryState`、
  *   `dropParentRecoveryRecords`、`dropModelFallbackState`。
  * @param {object} deps.effort - effort 域：`disposeEffortInjection(agent)`。
  * @param {object} deps.delegation - 委派跟踪器：`completeDetachedActiveTasksForChild(childId)`。
- * @param {object} deps.snapshot - child 快照域：`readChildModel(childId)`。
  * @returns {{handleAgentDisposed: (agent: object) => void}} handler 能力面。
  */
-export function createAgentDisposedHandler({ logger, roots, fanout, guards, recovery, effort, delegation, snapshot }) {
+export function createAgentDisposedHandler({ logger, roots, guards, recovery, effort, delegation }) {
   /**
    * 执行并摘除某个 Agent 的 scoped guard 清理函数（删除发生在执行之后，单条抛错不阻断）。
    * @param {object} agent - exact Agent 对象。
@@ -64,18 +59,6 @@ export function createAgentDisposedHandler({ logger, roots, fanout, guards, reco
    */
   function handleAgentDisposed(agent) {
     releaseGuardCleanup(agent);
-    const recordedFanoutChild = typeof agent?.id === "string" ? snapshot.readChildModel(agent.id) : void 0;
-    const fanoutHost = fanout.getFanoutHost();
-    if (isFanoutAgent(agent) || isFanoutIdentity(recordedFanoutChild)) {
-      // cold-resume child 可能没有 creation marker；disposed 仍必须让同一 attempt 收敛。
-      fanoutHost?.handleAgentDisposed(agent, recordedFanoutChild);
-      if (typeof agent?.id === "string") {
-        recovery.forgetChildActivation(agent.id, agent);
-      }
-      recovery.invalidateRequestRetryState(agent);
-      effort.disposeEffortInjection(agent);
-      return;
-    }
     const rootDisposed = roots.isRootAgentIdentity(agent) && roots.lineage.isKnownRoot(agent);
     const isCurrentRootGeneration = rootDisposed && roots.rootGenerationRegistry.isCurrent(agent.id, agent);
     // 先读取当前 exact Agent 的 generation，再退休完成状态；旧 disposed 事件不触碰新代次。
@@ -91,11 +74,9 @@ export function createAgentDisposedHandler({ logger, roots, fanout, guards, reco
       }
       roots.rootGenerationRegistry.retire(agent.id, agent);
     }
-    // 与 retireRootGeneration 同一语义：root dispose 后它的分片不会再产生
-    // task_settled。取消该 root 的全部等待，并摘除它的 fan-out 登记（旧代际的登记
-    // 绝不能被新代际继承）。
+    // 与 retireRootGeneration 同一语义：root dispose 后取消该 root 的全部等待
+    // （旧代际的等待记录绝不能被新代际继承）。
     if (agent !== void 0) roots.rootTurnWaits.retire(agent, "root-disposed");
-    if (rootDisposed) roots.releaseRetiredRootHandoffs(agent);
     if (typeof agent?.id === "string") {
       recovery.forgetChildActivation(agent.id, agent);
     }

@@ -286,59 +286,12 @@
       return Number.isFinite(number) ? Math.min(100, Math.max(0, Math.round(number))) : 100;
     }
 
-    /** 旧默认并发上限、新默认值与迁移标记版本：与 Host（index.js）保持同一语义。 */
-    const DEFAULT_ROLE_CONCURRENCY_LIMIT = 20;
-    const LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT = 10;
-    const CONFIG_MIGRATION_VERSION = 1;
-
-    /**
-     * 共享每个 role 的 running shard 上限：只接受 1~64 的整数，旧配置或非法值回退到默认 20。
-     * 与 Host 的 DEFAULT_ROLE_CONCURRENCY_LIMIT、设置页 title 文案保持同一数值。
-     */
-    function normalizeRoleConcurrencyLimit(value) {
-      return Number.isSafeInteger(value) && value >= 1 && value <= 64
-        ? value
-        : DEFAULT_ROLE_CONCURRENCY_LIMIT;
-    }
-
-    /**
-     * 读取面别名（与 Host 的 normalizeRoleConcurrencyLimitForRead 同一规则）。
-     *
-     * 默认值从 10 调整为 20 后，旧 profile 里显式保存的 10 在迁移标记落盘前按 20
-     * 展示；首次保存由 Host 写入标记，之后用户手动改回 10 时原样保留。
-     * 只影响读取展示，不改变用户输入的其它合法值。
-     *
-     * @param {object|undefined} source - settings 快照。
-     * @returns {number} 1~64 的生效并发上限。
-     */
-    function effectiveRoleConcurrencyLimit(source) {
-      const limit = normalizeRoleConcurrencyLimit(source?.roleConcurrencyLimit);
-      const rawVersion = source?.configMigrationVersion;
-      const version = Number.isSafeInteger(rawVersion) && rawVersion >= 0 ? rawVersion : 0;
-      return version < CONFIG_MIGRATION_VERSION && limit === LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT
-        ? DEFAULT_ROLE_CONCURRENCY_LIMIT
-        : limit;
-    }
-
-    // 与 Host 的默认值保持一致：10 小时；显式 0 仍表示禁用，不被默认值覆盖。
-    const DEFAULT_ROLE_TIMEOUT_MS = 36000000;
-
-    /**
-     * 角色默认超时（毫秒，票据 06）只接受 0（不启用）或
-     * 1000~86,400,000 的整秒毫秒数；缺失或非法值回退默认 10 小时。
-     *
-     * 客户端只做读取/草稿归一，权威拒绝仍在 Host 的 settings-commit
-     * （与 fanout.js validateTimeoutMs 同一语义）：这里不能把越界值渲染成“已保存”。
-     *
-     * @param {unknown} value - settings 中的超时值。
-     * @returns {number} 0 或合法启用值。
-     */
-    function normalizeRoleTimeoutMs(value) {
-      if (value === 0) return 0;
-      return Number.isSafeInteger(value) && value >= 1000 && value <= 86400000 && value % 1000 === 0
-        ? value
-        : DEFAULT_ROLE_TIMEOUT_MS;
-    }
+    // 说明：fan-out 删除前这里还有一套「角色并发上限 / 角色默认超时」的客户端归一
+    // （DEFAULT_ROLE_CONCURRENCY_LIMIT / CONFIG_MIGRATION_VERSION / DEFAULT_ROLE_TIMEOUT_MS
+    // 以及 normalizeRoleConcurrencyLimit / effectiveRoleConcurrencyLimit / normalizeRoleTimeoutMs）。
+    // 这两个字段只服务已删除的 fan-out 调度，客户端草稿不再读取、不再展示、不再回写；
+    // 旧 settings 文档里的 roleConcurrencyLimit / roleTimeoutMs 仍由 Host 作为惰性兼容输入
+    // 保留（可加载、可保存、不报错），因此这里不需要任何兼容分支。
 
     // ── 票据 24：候选模型与降级上限的归一、校验（设置页草稿与提交共用）──────────
     //
@@ -762,10 +715,6 @@
         notificationEnabled: source.notificationEnabled !== false,
         notificationVolume: clampNotificationVolume(source.notificationVolume),
         notificationEvents: normalizeNotificationEvents(source.notificationEvents),
-        // 读取别名：旧默认值 10 + 标记缺失 => 显示/保存为 20；标记落盘后 10 原样保留。
-        roleConcurrencyLimit: effectiveRoleConcurrencyLimit(source),
-        // 角色默认超时缺失或非法时使用默认 10 小时；显式 0 保留为不启用。
-        roleTimeoutMs: normalizeRoleTimeoutMs(source.roleTimeoutMs),
         // 旧客户端/Host 缺少字段时保持关闭，避免升级后改变图片路由。
         observerPreferred: source.observerPreferred === true,
         // 任务管理缺字段时保持开启：默认必须维持 Expert Group 注册到侧边栏的历史行为。
@@ -809,8 +758,6 @@
       "notificationEnabled",
       "notificationVolume",
       "notificationEvents",
-      "roleConcurrencyLimit",
-      "roleTimeoutMs",
       "observerPreferred",
       "taskManagementEnabled",
       "autoOpenSubagentSidebar",

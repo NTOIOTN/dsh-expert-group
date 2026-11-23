@@ -1,9 +1,9 @@
 /**
- * 客户端侧栏 · Panel 视图层（第三组：专家 / 空闲分组 / 分片 / fan-out / 工具条与「会话模型」弹窗）
+ * 客户端侧栏 · Panel 视图层（第三组：专家 / 空闲分组 / 工具条与「会话模型」弹窗）
  * — R6 / sidebar-views-c
  *
  * ## 职责边界（R6 票据 23）
- * Panel 渲染期最外层的任务树视图：专家行（含子级递归）、空闲分组、fan-out 分片行与父任务、
+ * Panel 渲染期最外层的任务树视图：专家行（含子级递归）、空闲分组、
  * 顶部工具条，以及「会话模型」弹窗（按角色编辑本会话覆盖）。
  *
  * ## 视图层不持有可写状态
@@ -28,12 +28,12 @@
   const PURE_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-pure");
   const PURE = global[PURE_SYMBOL] || {};
   const {
-    ACTIVE_STATUSES, RETRY_STATUSES, RUNTIME_STATUS_LABELS, STATUS_FILTER_OPTIONS,
-    normalizeSessionModelSelection, object, sessionModelModelOptions, sessionModelOrchestratorOf, sessionModelRolesOf, statusOf, text,
+    STATUS_FILTER_OPTIONS,
+    normalizeSessionModelSelection, object, sessionModelModelOptions, sessionModelOrchestratorOf, sessionModelRolesOf, text,
   } = PURE;
   const DOM_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-dom");
   const DOM = global[DOM_SYMBOL] || {};
-  const { capabilityAllowed, runtimeStatusOf, statusIcon } = DOM;
+  const { statusIcon } = DOM;
 
   const renderExpert = (ctx, node, index, parentId, treeMeta) => {
     const { react, primitives, passesFilter, partialSnapshot, expand } = ctx;
@@ -99,7 +99,7 @@
     const idleTitleChildren = [
       react.createElement("div", { className: "deg_expert_group_line deg_expert_group_task" }, t("sidebar.idleGroup", { count: members.length })),
     ];
-    // 空闲分组的批量候选只来自当前 idleChildren；运行中的专家或分片会被排除。
+    // 空闲分组的批量候选只来自当前 idleChildren；运行中的专家会被排除。
     // slot 与计数标题同属第三列的 inline flex，标题按可用宽度省略，slot 不会被推到行尾。
     if (trailing !== undefined && trailing !== null) idleTitleChildren.push(trailing);
     // 轻量快照下分组容器同样不声明「已结束」：它收纳的成员状态可能还没被完整读取，
@@ -124,186 +124,7 @@
         statusIcon(react, primitives, idleGroupStatus),
         ctx.a.renderChevron(group, open),
         react.createElement("div", { className: "deg_expert_group_idle_title_line" }, ...idleTitleChildren)),
-      open ? react.createElement("div", { className: "deg_expert_group_children deg_expert_group_idle_children", role: "group" }, members.map((node, index) => node.kind === "fanout" ? renderFanout(ctx, node, index, { level: meta.level + 1, posinset: index + 1, setsize: members.length }) : renderExpert(ctx, node, index, rootSessionId, { level: meta.level + 1, posinset: index + 1, setsize: members.length }))) : null);
-  };
-
-  const renderShard = (ctx, task, shard, index, treeMeta) => {
-    // 注意：这里刻意不读 ctx.expand。分片行不再有可折叠内容（见下方注释），
-    // 展开存储对分片不再有渲染期副作用。
-    const { react, primitives, rootSessionId, runAction, isActionPending } = ctx;
-    const shardKey = text(shard.shardId, "shard-" + index);
-    const latestChildId = text(shard.childId, null);
-    const status = statusOf(shard);
-    // shardId 只在 parentTaskId 内唯一；shardNode.id 仍使用 parentTaskId:shardId 复合键，
-    // 避免不同 fan-out 中同名分片共用同一节点身份。最新 attempt childId 仍是唯一导航目标。
-    // 第一行文本：有任务名称时是"分片代号  任务名称"，没有名称的旧数据只有分片代号。
-    // 拼接结果作为完整文本进入 renderRowMain，并以 oneLine:false 走分片专用的可换行
-    // 第一行样式：渲染层不再做 grapheme 截断，分片代号因此不会挤掉任务名称的显示额度。
-    // shardId 仍是 key、data-shard-id 与取消/重试请求的唯一标识，
-    // 展示文本绝不参与任何管理动作定位。名字为空白时按缺失处理，不显示悬空分隔符。
-    const shardTaskName = text(shard.taskName, null);
-    const shardNode = {
-      ...shard,
-      id: task.parentTaskId + ":" + shardKey,
-      kind: "expert",
-      taskName: shardTaskName === null || shardTaskName === shardKey ? shardKey : shardKey + "  " + shardTaskName,
-      content: text(shard.prompt, ""),
-    };
-    const cancelKey = "cancel:" + task.parentTaskId + ":" + shardKey;
-    const retryKey = "retry:" + task.parentTaskId + ":" + shardKey;
-    const actions = [];
-    // 票据 09：能力字段存在时严格按能力渲染；缺失时回退既有状态推导（旧 Host 兼容）。
-    // 拒绝原因不再由界面解释——Host 已把「为什么不可用」收敛成稳定原因码，
-    // 按钮的有无就是唯一可见结论，绝不给用户一个点了只会被拒绝的入口。
-    const cancelCapability = capabilityAllowed(shard, "cancel");
-    const retryCapability = capabilityAllowed(shard, "retry");
-    const showCancel = cancelCapability === null ? ACTIVE_STATUSES.has(status) : cancelCapability === true;
-    const showRetry = retryCapability === null ? RETRY_STATUSES.has(status) : retryCapability === true;
-    if (showCancel) actions.push(ctx.a.renderAction("取消分片 " + shardKey, "IconStopFillRegular", () => runAction({ action: "fanout-cancel-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, cancelKey, true, "确认取消分片 " + shardKey + "？"), isActionPending(cancelKey)));
-    if (showRetry) actions.push(ctx.a.renderAction("重试分片 " + shardKey, "IconRefreshOutlineRegular", () => runAction({ action: "fanout-retry-shard", parentTaskId: task.parentTaskId, shardId: shardKey }, retryKey, false, ""), isActionPending(retryKey)));
-    // 展示状态用规范运行状态，证据与行内圆点同源（最新 attempt 的 childId 查目录项）；
-    // status 仍保留给取消/重试判定（管理语义不变）。
-    const runtimeStatus = ctx.runtimeStatusOfNode(shardNode, rootSessionId, latestChildId);
-    // 分片不再展示 attempt 时间线（用户要求）：分片行只保留与普通叶子子代理行一致的信息
-    // （状态点 + 箭头占位 + 任务名 + 行尾双箭头 + 用量摘要 + 结构化结果），
-    // 因此这里不再读取展开状态、也不再生成 timelineKey。
-    // 结构化结果仍常驻：它不是「多出来的信息」，普通专家行同样有，缺省时 footer 保持 null。
-    const shardStructured = ctx.a.renderStructuredBlock(shard.structured, shard.outputSchemaRequested, { kind: "shard" });
-    const shardFooter = shardStructured === null
-      ? null
-      : react.createElement("div", { className: "deg_expert_group_shard_extra" }, shardStructured);
-    // 分片是 fan-out 父任务下的下一级树项（顶层 fan-out 时为第 3 层）。
-    // 位置/总数只按**当前可见分片**计算（过滤后集合）。
-    const meta = treeMeta !== undefined && treeMeta !== null
-      ? treeMeta
-      : { level: 3, posinset: index + 1, setsize: index + 1 };
-    return react.createElement("div", {
-      key: shardKey,
-      className: "deg_expert_group_shard",
-      role: "treeitem",
-      "aria-level": meta.level,
-      "aria-posinset": meta.posinset,
-      "aria-setsize": meta.setsize,
-      "data-shard-id": shardKey,
-      "data-status": runtimeStatus,
-      // data-expanded 恒为 true：分片行永远完整显示，同时避免 CSS
-      // .deg_expert_group_shard[data-expanded=false]{min-height:24px} 意外命中而改变行高。
-      "data-expanded": true,
-    },
-      statusIcon(react, primitives, runtimeStatus),
-      // 折叠箭头改为占位 span，与 renderExpert 的叶子分支完全一致：
-      // 分片已经没有可折叠内容，绝不留下点了没有变化的按钮。
-      react.createElement("span", { className: "deg_expert_group_chevron_placeholder", "aria-hidden": "true" }),
-      ctx.b.renderRowMain(shardNode, {
-        sessionId: latestChildId,
-        parentId: rootSessionId,
-        oneLine: false,
-        // 用量摘要条常驻（用时/tok/s/tok/命中/context + 异常提示）；attempt 时间线已移除。
-        metrics: ctx.b.renderMetrics(shard, { kind: "shard", runtimeStatus, sessionId: latestChildId, sessionIds: [latestChildId] }),
-        footer: shardFooter,
-      }),
-      react.createElement("div", { className: "deg_expert_group_actions" }, actions));
-  };
-
-  const renderFanout = (ctx, task, index, treeMeta) => {
-    const { react, primitives, expand, handleOpen, navigation, passesFilter, filterActive, taskFilter, runAction, isActionPending } = ctx;
-    // 本地过滤：父任务自身命中时保留全部分片，否则只保留命中的分片；
-    // 整条分支（含父任务）都不命中时由父级 passesFilter 直接跳过。
-    if (passesFilter(task) !== true) return null;
-    const shards = Array.isArray(task.shards) ? task.shards : [];
-    const visibleShards = filterActive === true && taskFilter !== null ? taskFilter.shardsFor(task) : shards;
-    const open = expand(task);
-    const incomplete = shards.filter((shard) => ACTIVE_STATUSES.has(statusOf(shard))).length;
-    const parentKey = "cancel-parent:" + task.parentTaskId;
-    // 父任务取消同样以 Host 能力为准；能力缺失时保留「有活跃分片或父任务仍活跃」的旧判定。
-    const cancelCapability = capabilityAllowed(task, "cancel");
-    const showCancel = cancelCapability === null
-      ? (ACTIVE_STATUSES.has(statusOf(task)) || incomplete > 0)
-      : cancelCapability === true;
-    const actions = showCancel
-      ? [ctx.a.renderAction("取消父任务（未完成 " + incomplete + " 个分片）", "IconStopFillRegular", () => runAction({ action: "fanout-cancel-parent", parentTaskId: task.parentTaskId }, parentKey, true, "确认取消父任务？未完成 " + incomplete + " 个分片。"), isActionPending(parentKey))]
-      : [];
-    // data-status 是对外的规范运行状态；管理状态改由 data-task-status 暴露，
-    // 供了解 fan-out 内部结算的消费方读取，展示层不再出现 succeeded/failed 等词。
-    const runtimeStatus = runtimeStatusOf(task, null);
-    // 用户要求（2026-11）：fan-out 父任务不承担会话，第二行整行删除。
-    // 父任务行只保留第一行（状态圆点 + 折叠箭头 + 「角色 · N shards · 状态」标题 + 行尾动作），
-    // 不再渲染「用时 · tok/s · tok · 命中」用量摘要，也不再承载「多次重试」徽标与失败原因摘要
-    // ——这些信息由各分片行自己承载（见 renderShard 的 metrics）。
-    // 连带结果：父任务不再需要跨分片聚合子会话 id（fanoutSessionIdsOf 已随之删除），
-    // 也不再有跨分片的聚合 attempt 时间线；整棵 fan-out 子树里都不存在 attempt 时间线节点。
-    // 树语义：fan-out 头部是第 2 层 treeitem，分片容器是它的 group（位置只算可见分片）。
-    const meta = treeMeta !== undefined && treeMeta !== null
-      ? treeMeta
-      : { level: 2, posinset: index + 1, setsize: index + 1 };
-    // fan-out 标题（票据 18）：可聚焦 + Enter/Space 跳转会话，与任务名同一套键盘契约。
-    // 只有真的能导航（宿主提供 uiWorkspace.openSession 且任务有 sessionId）时才挂 role/tabIndex，
-    // 绝不留下一个「可聚焦但按了没反应」的标题；它是 div，不是嵌套 button。
-    // 票据 27：fan-out 标题的角色段优先使用显示名（含历史角色显示名，
-    // 包括已删除角色的持久化标签），没有显示名时保持既有的
-    // 「角色 id 首字母大写」文案逐字不变。
-    const fanoutRole = ctx.a.roleLabelFor(task.role, task.roleLabel) ?? "Expert";
-    const fanoutTitle = fanoutRole.charAt(0).toUpperCase() + fanoutRole.slice(1)
-      + " · " + shards.length + " shards · " + RUNTIME_STATUS_LABELS[runtimeStatusOf(task, null)];
-    /**
-     * fan-out 标题的导航目标（票据 18）。
-     *
-     * Host 快照里的 fan-out 父任务是**任务**而不是会话：投影不带 sessionId，旧实现的
-     * onClick 因此永远拿不到可导航目标（标题看起来可点、实际没反应）。这里给出一条可证明的
-     * 落点：优先用显式 sessionId（老形状/未来 Host 提供时逐字沿用），否则用最新分片 attempt
-     * 的 childId——优先仍在运行的可见分片，其次 manager 顺序里第一个有 childId 的分片。
-     * 目标只从当前**可见**分片里选：过滤隐藏的分片绝不成为导航目标。
-     */
-    const fanoutNavigationId = (() => {
-      const explicit = text(task.sessionId, null);
-      if (explicit !== null) return explicit;
-      let fallback = null;
-      for (const shard of visibleShards) {
-        const childId = text(object(shard).childId, null);
-        if (childId === null) continue;
-        if (ACTIVE_STATUSES.has(statusOf(shard))) return childId;
-        if (fallback === null) fallback = childId;
-      }
-      return fallback;
-    })();
-    const fanoutNavigable = navigation.available === true && fanoutNavigationId !== null;
-    const onFanoutKeyDown = fanoutNavigable
-      ? (event) => {
-        if (event?.key !== "Enter" && event?.key !== " ") return;
-        event.preventDefault?.();
-        event.stopPropagation?.();
-        handleOpen(fanoutNavigationId);
-      }
-      : undefined;
-    return react.createElement("div", { key: task.parentTaskId || "fanout-" + index, className: "deg_expert_group_fanout", role: "none", "data-status": runtimeStatus, "data-task-status": statusOf(task) },
-      react.createElement("div", {
-        className: "deg_expert_group_fanout_header",
-        role: "treeitem",
-        "aria-level": meta.level,
-        "aria-posinset": meta.posinset,
-        "aria-setsize": meta.setsize,
-        "aria-expanded": open,
-      },
-        statusIcon(react, primitives, runtimeStatus),
-        ctx.a.renderChevron(task, open),
-        // 标题外层 wrapper 保留：focus-visible 样式与测试都以
-        // .deg_expert_group_fanout_title>.deg_expert_group_task 为锚点；
-        // 但它现在只承载这一个子节点（第二行整行删除后不再纵向排列）。
-        react.createElement("div", { className: "deg_expert_group_fanout_title" },
-          react.createElement("div", {
-            className: "deg_expert_group_line deg_expert_group_task",
-            title: fanoutTitle,
-            ...(fanoutNavigable ? { role: "button", tabIndex: 0, "aria-label": "打开任务会话：" + fanoutTitle, onKeyDown: onFanoutKeyDown } : {}),
-            onClick: fanoutNavigable ? () => handleOpen(fanoutNavigationId) : undefined,
-          }, fanoutTitle)),
-        react.createElement("div", { className: "deg_expert_group_actions" }, actions)),
-      // 箭头函数按 (shard, index, array) 收到与旧 `renderShard.bind(null, task)` 完全相同的实参
-      // （renderShard 只用前两个），但不再每次渲染都新建一个绑定函数。
-      open ? react.createElement("div", { className: "deg_expert_group_fanout_shards deg_expert_group_tree_children", role: "group" }, visibleShards.map((shard, shardIndex) => renderShard(ctx, task, shard, shardIndex, {
-        level: meta.level + 1,
-        posinset: shardIndex + 1,
-        setsize: visibleShards.length,
-      }))) : null);
+      open ? react.createElement("div", { className: "deg_expert_group_children deg_expert_group_idle_children", role: "group" }, members.map((node, index) => renderExpert(ctx, node, index, rootSessionId, { level: meta.level + 1, posinset: index + 1, setsize: members.length }))) : null);
   };
 
   /**
@@ -808,7 +629,7 @@
    *
    * 只在快照已上屏时渲染（skeleton/空态没有可过滤的内容）；输入/下拉只改内存过滤状态，
    * 「会话模型」按钮只切换本地折叠状态（真正的读写都发生在它自己的 effect 里）。
-   * 角色候选从当前快照里现算（普通专家、fan-out 父任务与分片），而不是写死词表。
+   * 角色候选从当前快照里的普通专家现算，而不是写死词表。
    */
   const renderToolbar = (ctx) => {
     const { react, t, snapshot, root, filterSource, updateFilter, sessionModelOpen, sessionModelEntryRef, toggleSessionModelDialog } = ctx;
@@ -822,7 +643,6 @@
       for (const node of Array.isArray(nodes) ? nodes : []) {
         addRole(node.role);
         collectRoles(node.children);
-        for (const shard of Array.isArray(node.shards) ? node.shards : []) addRole(shard.role);
       }
     };
     // 刻意不把根会话角色放进候选：根行永远可见，选中它只会得到「根行 + 空结果」，
@@ -885,7 +705,7 @@
    * 绑定「本帧视图上下文」的渲染函数集合。
    *
    * ctx = Panel 本帧的只读投影 + 窄命令；viewsA / viewsB 是兄弟视图模块的**同名同级**渲染函数
-   * （纯读、无状态），分片 / 专家 / fan-out 复用它们，绝不复制实现。
+   * （纯读、无状态），专家行与空闲分组复用它们，绝不复制实现。
    * 每次渲染新建一份，绝不缓存（否则会看到上一帧的 root / 展开状态）。
    */
   function createSidebarViewsC(ctx, viewsA, viewsB) {
@@ -893,8 +713,6 @@
     return Object.freeze({
       renderExpert: (node, index, parentId, treeMeta) => renderExpert(deps, node, index, parentId, treeMeta),
       renderIdleGroup: (nodes, trailing, treeMeta) => renderIdleGroup(deps, nodes, trailing, treeMeta),
-      renderShard: (task, shard, index, treeMeta) => renderShard(deps, task, shard, index, treeMeta),
-      renderFanout: (task, index, treeMeta) => renderFanout(deps, task, index, treeMeta),
       renderToolbar: () => renderToolbar(deps),
       renderSessionModelDialog: () => renderSessionModelDialog(deps),
     });

@@ -1,8 +1,14 @@
 /**
  * 持久化旁路健康状态。
  *
- * 该模块只维护内存中的可观察状态，不写 storage、不触发回调，也不持有 manager 句柄。
+ * 该模块只维护内存中的可观察状态，不写 storage、不触发回调，也不持有任何域对象句柄。
  * 失败记录因此不会重新进入持久化链；Host 可以在外层使用 retryDecision 做有界重试。
+ *
+ * 模块内只有两条记账通道，且互不覆盖：
+ * - **带档位通道**（recordSuccess / recordFailure）：记录其它域写入的最近结果，带
+ *   generation/sequence 档位，用档位前沿做陈旧判定并据此给 retryDecision 提供依据；
+ * - **session/child 写入通道**（observeStorageWrite）：只带 generation、没有 sequence，
+ *   单独计数与记录，绝不推进带档位通道的前沿。
  */
 import { RPC_ERROR_CODES } from "../shared/error-codes.js";
 
@@ -173,7 +179,7 @@ function normalizeDrainState(value) {
 
 /**
  * 创建健康状态。maxRetries 表示同一次提交最多允许追加的 retry 次数；它不限制之后
- * 由新的 manager sequence 发起的独立提交。
+ * 由新的 generation/sequence 档位发起的独立提交。
  */
 export function createPersistenceHealth({ now = () => Date.now(), maxRetries = 2 } = {}) {
   const retryLimit = Number.isSafeInteger(maxRetries) && maxRetries >= 0 ? maxRetries : 2;
@@ -188,14 +194,19 @@ export function createPersistenceHealth({ now = () => Date.now(), maxRetries = 2
   /**
    * session/child domain 写入的独立观察通道。
    *
-   * 这两类写入没有 fanout 快照的 manager sequence，若复用 recordFailure 会覆盖
-   * latestPosition/latestKind，从而把 fanout 的有界重试判定（retryDecision）与
-   * "已成功"的陈旧判定一起污染。因此这里单独计数与记录：它是纯内存状态，不触发
-   * 任何持久化回调，失败记录不可能形成 persistence feedback loop。
-   * 成功也不清除 fanout 的 lastFailure——两个通道各自表达自己的最近结果。
+   * 这两类写入只带 generation、没有 sequence 档位；若复用 recordSuccess/recordFailure，
+   * 无档位记录会经 advancePosition 把带档位通道的档位前沿（latestPosition/latestKind）
+   * 降级为 null——按 staleAgainstLatest 的显式语义，之后不再判 stale——并覆盖它的
+   * lastFailure/consecutiveFailures 视图，把它的有界重试判定（retryDecision）与"已成功"
+   * 的陈旧判定一起污染。因此这里单独计数与记录：它是纯内存状态，不触发任何持久化回调，
+   * 失败记录不可能形成 persistence feedback loop。
+   * 成功也不清除带档位通道的 lastFailure——两个通道各自表达自己的最近结果。
    */
   let storageObserved = 0;
   let storageFailures = 0;
+  // 连续失败计数与带档位通道的 consecutiveFailures 各自独立：成功会把本通道清零，
+  // 失败的 session/child 写入不会改变带档位通道的计数（反向同理）。
+  let consecutiveStorageFailures = 0;
   let lastStorageFailure = null;
   let lastStorageSuccess = null;
 
@@ -218,10 +229,12 @@ export function createPersistenceHealth({ now = () => Date.now(), maxRetries = 2
       failureCode: lastFailure?.code ?? null,
       lastFailure,
       maxRetries: retryLimit,
-      // session/child 写入通道：只读投影，不参与 fanout 的 latestPosition 比较。
+      // session/child 写入通道：只读投影，不参与带档位通道的 latestPosition 比较。
       storage: {
         observed: storageObserved,
         failures: storageFailures,
+        // 连续失败（成功即清零）：诊断面据此区分「曾经失败过」与「当前仍在连续失败」。
+        consecutiveFailures: consecutiveStorageFailures,
         lastFailure: lastStorageFailure,
         lastSuccess: lastStorageSuccess,
       },
@@ -353,8 +366,8 @@ export function createPersistenceHealth({ now = () => Date.now(), maxRetries = 2
      * 记录一次 session/child domain 写入的结果（同步 throw 或异步 reject 都归一到这里）。
      *
      * - 失败：分类为 transient/generation-stale/capacity/permanent 并只更新本通道；
-     *   不触碰 fanout 的 lastFailure/latestPosition，因此不会改变其重试判定；
-     * - 成功：只更新本通道的 lastSuccess，不掩盖 fanout 自己的失败状态。
+     *   不触碰带档位通道的 lastFailure/latestPosition，因此不会改变它的重试判定；
+     * - 成功：只更新本通道的 lastSuccess，不掩盖带档位通道自己的失败状态。
      *
      * @param {object} input - { ok, error, generation, at, source }
      * @returns {{ok:boolean, category:string|null, code:string|null, health:object}}
@@ -364,12 +377,14 @@ export function createPersistenceHealth({ now = () => Date.now(), maxRetries = 2
       const observedAt = atOf(at, now);
       if (ok === true) {
         storageObserved += 1;
+        consecutiveStorageFailures = 0;
         lastStorageSuccess = { generation: position, at: observedAt, source: textOf(source) };
         return { ok: true, category: null, code: null, health: stateSnapshot() };
       }
       const normalized = classifyFailure({ error });
       storageObserved += 1;
       storageFailures += 1;
+      consecutiveStorageFailures += 1;
       lastStorageFailure = {
         category: normalized.category,
         code: normalized.code,

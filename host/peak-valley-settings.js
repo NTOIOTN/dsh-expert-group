@@ -112,7 +112,7 @@ function providesPeakValleyRepairSurface(draft) {
 
 /**
  * 读取期诊断条数上限：诊断只服务设置页与 meta，绝不随用户写坏多少键而增长。
- * 与 LIMIT_DIAGNOSTIC_LIMIT（票据 26）取同一数量级。
+ * 与其它读取面诊断（16 条）取同一数量级。
  */
 const DIAGNOSTIC_LIMIT = 16;
 

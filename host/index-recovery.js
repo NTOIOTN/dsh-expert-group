@@ -30,7 +30,6 @@
  *
  * @module dsh-expert-group/host/index-recovery
  */
-import { isFanoutAgent, isFanoutIdentity, FANOUT_PARENT_AGENT_MARKER } from "../fanout-host.js";
 import {
   DEFAULT_MODEL_FALLBACK_LIMIT,
   EXPERT_ROUTE_MARKER,
@@ -550,6 +549,7 @@ function installRecoveryRecords(deps, api, store) {
    */
   function moveRecoveryRecordToChild(record, childId, childAgent) {
     const previousChildId = record.childId;
+    const previousAgent = record.agent;
     if (previousChildId !== childId) {
       // child replacement 会复用数字 turn；清空旧 Session 的 transient 映射，
       // 但不动 durable tasks/pendingRecoveries/activity/cohort。
@@ -562,7 +562,11 @@ function installRecoveryRecords(deps, api, store) {
       record.recoveryFeedbackTerminal = false;
       record.recoveryFeedbackTerminalTurn = void 0;
       recordDelete(previousChildId);
-      migrateChildHandoff(record.parentAgent, previousChildId, childId, childAgent, record.agent);
+      migrateChildHandoff(record.parentAgent, previousChildId, childId, childAgent, previousAgent);
+    }
+    if (childAgent !== undefined && childAgent !== null) {
+      record.agent = childAgent;
+      record.session = childAgent.session;
     }
     const provisional = store.get(childId);
     if (provisional !== void 0 && provisional !== record) recordDelete(childId);
@@ -830,7 +834,7 @@ function installActivationState(deps, api, store) {
   return {
     readChildActivation: (childId) => childActivationStates.get(childId),
     /**
-     * 登记当前 Activation（agent/created 与 fan-out child 创建共用）。
+     * 登记当前 Activation（agent/created 与普通专家 child 创建共用）。
      * 新对象覆盖同 id 的旧 Activation；disposed 时由 forgetChildActivation 精确摘除。
      */
     noteChildActivation: (childId, agent) => { childActivationStates.set(childId, { agent, status: "live" }); },
@@ -917,12 +921,9 @@ function installModelFallback(deps, api) {
   /**
    * 请求级重试 + 运行期降级的统一目标判定。
    *
-   * 与 requestRetryTarget 的唯一差异：并行 fan-out 分片 child 没有 DEG 的
-   * recovery record（它们由 fan-out 自己的 attempt 账本管理），因此这里用
-   * 「fan-out marker + 持久化 fan-out 身份 + live activation + live 父 root」
-   * 四重证据补上目标判定，让分片也获得同一套请求级重试与运行期降级。
-   * 证据强度与专家 child 对齐：任何一环不成立都返回 undefined（回到 Host 默认行为），
-   * 绝不靠 role/parentId 这类可复制 metadata 猜测身份。
+   * 目标身份完全由 recovery record 事实决定：没有 record（或 record 不是可定位的专家
+   * child）就返回 undefined，直接回到 Host 默认行为，绝不靠 role/parentId 这类可复制
+   * metadata 猜测身份。
    *
    * root 仍由 requestRetryTarget 命中（既有重试语义完全不变），但它没有角色候选链，
    * modelFallbackChainFor 会返回 undefined，运行期降级对 root 恒不生效。
@@ -936,29 +937,10 @@ function installModelFallback(deps, api) {
    */
   function requestFallbackTarget(agent) {
     const expert = requestRetryTarget(agent);
-    if (expert !== void 0) {
-      return {
-        agent,
-        role: firstNonEmptyText(expert.record?.role, agent?.options?.[ROLE_MARKER]) ?? void 0,
-      };
-    }
-    if (typeof agent?.id !== "string") return void 0;
-    let persisted;
-    try { persisted = readSnapshot()?.childModels?.[agent.id]; } catch { persisted = void 0; }
-    if (!isFanoutAgent(agent) && !isFanoutIdentity(persisted)) return void 0;
-    const activation = readChildActivation(agent.id);
-    if (activation?.agent !== agent || activation.status !== "live") return void 0;
-    const parentId = firstNonEmptyText(
-      agent?.options?.[FANOUT_PARENT_AGENT_MARKER],
-      persisted?.fanoutParentAgentId,
-      persisted?.parentId,
-      agent?.options?.[PARENT_MARKER],
-    );
-    if (parentId === null) return void 0;
-    if (!isLiveRootAgent(host.lineage.activeRoot(parentId))) return void 0;
+    if (expert === void 0) return void 0;
     return {
       agent,
-      role: firstNonEmptyText(agent?.options?.[ROLE_MARKER], persisted?.role) ?? void 0,
+      role: firstNonEmptyText(expert.record?.role, agent?.options?.[ROLE_MARKER]) ?? void 0,
     };
   }
 

@@ -79,7 +79,6 @@ export const CLIENT_SOURCE_FILES = Object.freeze([
   // 它们是装配输入（descriptor 从各自检查点取回实现），必须参与 node --check 与行数门禁。
   "client-text.js",
   "client-styles.js",
-  "client-fanout-normalize.js",
   "client-native-status.js",
   "client-settings-normalize.js",
   "client-model-config-host.js",

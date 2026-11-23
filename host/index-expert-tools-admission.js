@@ -30,7 +30,6 @@ import {
 } from "../shared/model-route.js";
 import { OUTPUT_SCHEMA_REQUESTED_MARKER } from "../shared/structured.js";
 import { TASK_BINDING_LIMIT, evictOldestEntries } from "../shared/recovery-ledger.js";
-import { isFanoutAgent, isFanoutIdentity } from "../fanout-host.js";
 import { registerPluginExpertChildAgent } from "./expert-guards.js";
 
 /**
@@ -88,7 +87,7 @@ export function createRoleToolHandles({ delegation, records, agents, storage, su
    *
    * 覆盖面刻意完整：显式 childId 的归属校验会拒绝任何不在此集合中的 id，
    * 因此这里必须包含所有**本 root 该角色**真实创建过的 child，同时绝不包含
-   * 其他父代理、fan-out 或不属于该角色的 child。
+   * 其他父代理或不属于该角色的 child。
    * @param {string} scope - delegationScopeKey(parentId, role)。
    * @param {string} [candidateTaskKey] - 可选的归一化任务 key（其绑定 child 也算已知）。
    * @param {{parent?:object}} [owner] - 可选的 exact root Agent：给出时额外要求 recovery
@@ -125,19 +124,9 @@ export function createRoleToolHandles({ delegation, records, agents, storage, su
       if (parentAgent !== void 0 && record.parentAgent !== void 0 && record.parentAgent !== parentAgent) continue;
       // 有效性：只有可续接、且确实成功 acceptance 过的专家 child 才是合法目标。
       if (record.continuable !== true || record.invalidAcceptance === true) continue;
-      // fan-out child 属于另一条恢复链：普通 role 工具绝不显式续作/取消它。
-      if (isFanoutChildId(recordChildId)) continue;
       ids.add(recordChildId);
     }
     return [...ids];
-  }
-
-  /**
-   * childId 是否属于 fan-out 链路：内存 Agent 与持久化 child_models 快照任一侧命中
-   * 即算（与 agent/created 的 fan-out 判定同源），fan-out 目标永不由普通 role 工具续作。
-   */
-  function isFanoutChildId(childId) {
-    return isFanoutAgent(agents.get(childId)) || isFanoutIdentity(storage.readSnapshot().childModels?.[childId]);
   }
 
   /**
@@ -200,7 +189,6 @@ export function createRoleToolHandles({ delegation, records, agents, storage, su
     return {
       resolveContinueTarget,
       trackerChildIdsForScope,
-      isFanoutChildId,
       readExplicitHandle,
       describeHandleValue,
       rejectedHandleResult,
@@ -219,7 +207,7 @@ export function createRoleToolHandles({ delegation, records, agents, storage, su
  */
 export function createRoleToolRebuild({ records, core, identity, delegation, recovery, recoveryFlow, usage, storage }) {
   const { getRecord, ensureRecoveryRecord, dropRecoveryRecord } = records;
-  const { resolvePersistedSubagentTarget, contextInheritanceError, markStructuredRequest, startExpertActivation } = core;
+  const { resolvePersistedSubagentTarget, contextInheritanceError, markStructuredRequest, startOrdinaryExpertActivation } = core;
   const delegationTracker = delegation;
 
   function forRole(role) {
@@ -276,12 +264,15 @@ export function createRoleToolRebuild({ records, core, identity, delegation, rec
     let rebuiltChildId;
     let messageId;
     try {
-      ({ childId: rebuiltChildId, messageId } = await startExpertActivation({
+      ({ childId: rebuiltChildId, messageId } = await startOrdinaryExpertActivation({
         request,
         label,
         signal,
-        // rc.2 要求 spec.parent 是精确存活父 Agent；同 id 的 replacement 不能被冒充。
+        // recovery rebuild也必须把Host创建的exact local child关联回这次普通激活。
         parent,
+        role,
+        rootToken,
+        recoveryRebuild: true,
       }));
     } catch (error) {
       const capacityError = createSubagentCapacityError(error);
@@ -558,7 +549,7 @@ export function createRoleToolNewChild({ delegation, records, handoff, recovery,
   const delegationTracker = delegation;
   const { getRecord, ensureRecoveryRecord, dropRecoveryRecord, pushPendingCreation, removePendingCreation, rollbackCreationTransaction } = records;
   const { registerPendingHandoffAdmission, bindPendingHandoffAdmission, failPendingHandoffAdmission, removePendingHandoffAdmission } = handoff;
-  const { startExpertActivation } = core;
+  const { startOrdinaryExpertActivation } = core;
   const { getAgent } = identity;
 
   function forRole(role) {
@@ -583,12 +574,14 @@ export function createRoleToolNewChild({ delegation, records, handoff, recovery,
       let childId;
       let messageId;
       try {
-        ({ childId, messageId } = await startExpertActivation({
+        ({ childId, messageId } = await startOrdinaryExpertActivation({
           request,
           label,
           signal,
           // 只传本次工具调用已通过 isLiveGeneration 校验的 exact parent。
           parent,
+          role,
+          rootToken,
         }));
       } catch (error) {
         // 容量耗尽在 admission 边界就翻译成 DEG 自有可读错误：后续清理/回滚错误
@@ -598,7 +591,11 @@ export function createRoleToolNewChild({ delegation, records, handoff, recovery,
         throw error;
       }
       acceptedChildId = childId;
-      if (typeof childId !== "string" || childId.length === 0 || typeof messageId !== "string" || messageId.length === 0) throw new Error("startContinuable returned an invalid acceptance");
+      if (typeof childId !== "string" || childId.length === 0) throw new Error("activation returned an invalid childId");
+      const localProvider = core.isLocalProvider?.(request?.subagentProvider) === true;
+      if (localProvider && (typeof messageId !== "string" || messageId.length === 0)) {
+        throw new Error("local activation returned an invalid messageId");
+      }
       if (!identity.isLiveGeneration(parent, rootToken)) {
         if (pendingHandoffAdmission !== void 0) {
           failPendingHandoffAdmission(parent, pendingHandoffAdmission, getRecord(childId));

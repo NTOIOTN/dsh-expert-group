@@ -1,14 +1,14 @@
 /**
  * Host 关注点模块：Expert Group JSON 投影。
  *
- * 把「一个根会话 + 它的普通专家子代理 + 它的 fan-out 父任务」这套运行时对象，
- * 归一成一份**只读的 JSON 树**（schemaVersion:1），供右侧栏/客户端直接渲染。
+ * 把「一个根会话 + 它的普通专家子代理」这套运行时对象，归一成一份**只读的 JSON 树**
+ * （schemaVersion:1），供右侧栏/客户端直接渲染。
+ * fan-out 整体移除后，本模块不再投影父任务 / 分片 / attempt 节点（root.children 只含普通专家）。
  *
  * 设计边界：
  *
  * 1. 单向投影：本模块只读输入，绝不修改调用方对象（数组一律复制后处理，禁止原地排序）。
- * 2. 不重算状态：fan-out manager 已经给出 task/shard 明确状态时原样采用；只有在
- *    manager 没给 shard 状态时才回退到「最新 attempt」的状态。客户端不得再重算。
+ * 2. 不重算状态：节点状态由 Host 运行时给出，投影只按统一词表归一。客户端不得再重算。
  * 3. 不猜内容：读不到的字段统一归一为 null，状态词表外的值统一归一为 "unknown"；
  *    缺失 taskName/content/contentSource 时不会用 id、prompt 或时间戳去拼凑。
  * 4. 幂等：同一份输入重复投影得到深度相等的输出，便于 RPC 缓存与差异比较。
@@ -21,10 +21,10 @@
  * @module dsh-expert-group/host/expert-group-snapshot
  */
 import { createHash } from "node:crypto";
-import { hasUsageMetrics, projectUsage, sumUsageByChildId } from "./usage-projection.js";
+import { hasUsageMetrics, projectUsage } from "./usage-projection.js";
 import { projectModelRouteFields } from "../shared/model-route.js";
 import { projectRouteSnapshotFields } from "../shared/route-snapshot.js";
-import { projectStructuredResult, structuredProjectionFields } from "../shared/structured.js";
+import { structuredProjectionFields } from "../shared/structured.js";
 
 /** 投影 schema 版本；客户端只接受该版本的负载。 */
 export const EXPERT_GROUP_SNAPSHOT_SCHEMA_VERSION = 1;
@@ -57,7 +57,7 @@ const STATUS_SET = new Set(EXPERT_GROUP_STATUSES);
 
 /**
  * 同义状态别名表：只收敛**拼写差异**（大小写、连字符、空格、常见同义词），
- * 不做语义推断。例如 "completed" 与 "succeeded" 在 fan-out 与 DSH 中含义一致，
+ * 不做语义推断。例如 "completed" 与 "succeeded" 在 DSH 里含义一致，
  * 因此可安全归一；而 "paused"/"blocked" 之类没有对应词表项，一律落回 "unknown"。
  */
 const STATUS_ALIASES = new Map([
@@ -87,49 +87,12 @@ function textOrNull(value) {
   return value.length === 0 ? null : value;
 }
 
-/**
- * 分片任务名称归一：只有"去掉首尾空白后仍非空"的字符串才算有值。
- *
- * 与 textOrNull 的差别：纯空白名称在这里按缺失处理（回退分片代号），因为它是给用户
- * 看的任务名——一个只有空格的名称在侧栏上等价于空标签，还会多出一个悬空分隔符。
- * 名称内部的大小写与标点一律保留，返回值已 trim。
- */
-function trimmedNameOrNull(value) {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed.length === 0 ? null : trimmed;
-}
-
 /** 时间字段归一：只接受有限数值（epoch 毫秒），其余统一为 null。 */
 function numberOrNull(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 // ── 任务时间线与受限失败摘要（票据 12） ──────────────────────────────────────
-
-/**
- * 终态词表（与模块顶部的状态注释一致）：只有这些状态才可能有 finishedAt/durationMs。
- *
- * 非终态（queued/waiting/running）以及 unknown 一律没有完成时间：时钟在走不代表任务结束。
- */
-const TERMINAL_STATUS_SET = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
-
-/**
- * 「失败」语义的终态集合。
- *
- * cancelled 不算失败（用户主动取消不是错误）；只有 failed/timed_out/interrupted 才参与
- * 父任务级 failure 的挑选，避免把一次主动取消渲染成任务失败。
- */
-const FAILURE_STATUS_SET = new Set(["failed", "timed_out", "interrupted"]);
-
-/**
- * 「明确仍在进行中」的状态集合（与 client-expert-group-model.js 的 ACTIVE_STATUS_SET 同义）。
- *
- * 这些节点没有终点：即使输入误带 finishedAt/durationMs 也一律不采用，否则侧栏会把
- * 「正在运行」渲染成「已耗时 1.2s」。unknown / 缺失状态保持宽容——旧快照没有可靠状态时，
- * 显式给出的时间戳仍是唯一可用事实。
- */
-const ACTIVE_STATUS_SET = new Set(["queued", "waiting", "running"]);
 
 /**
  * 失败摘要 code 的字符上限：只作防御性闸门（允许列表内最长的码仅 19 位），
@@ -188,10 +151,11 @@ const INVISIBLE_FORMAT_PATTERN = /[\p{Cf}\p{Cs}\uFE00-\uFE0F]/u;
  * - POSIX/Node errno（17 项）；
  * - 插件/运行时稳定码（16 项）；
  * - CamelCase 错误类名（10 项）；
- * - 现有测试与运行时实际使用、但不属于前三组的稳定码（5 项：BUDGET_EXCEEDED 由 fan-out
- *   预算闸门产生并会进入 attempt.error.code；ERR_MODULE_NOT_FOUND / ERR_MODEL_NOT_FOUND
- *   是 Node 与模型解析失败的稳定短码；DivisionByZero / FIRST_FAILURE 是既有回归用例使用的
- *   稳定夹具码，保留它们只为继续验证「name 回退」与「attempt 级合法码保留」两条语义）。
+ * - 现有测试与运行时实际使用、但不属于前三组的稳定码（5 项：BUDGET_EXCEEDED 历史上来
+ *   自 fan-out 预算闸门，fan-out 移除后仍可能出现于既有持久化记录中，故保留在允许列表；
+ *   ERR_MODULE_NOT_FOUND / ERR_MODEL_NOT_FOUND 是 Node 与模型解析失败的稳定短码；
+ *   DivisionByZero / FIRST_FAILURE 是既有回归用例使用的稳定夹具码，保留它们只为继续
+ *   验证「name 回退」与「合法码保留」两条语义）。
  */
 export const FAILURE_STABLE_CODES = Object.freeze([
   // POSIX/Node errno
@@ -438,115 +402,6 @@ function projectFailure(value) {
   };
 }
 
-/**
- * 两个时间戳之间的耗时（毫秒）。
- *
- * 任一缺失 → null：「不知道多久」不能写成 0，否则客户端会把未知显示成瞬时完成。
- * 时钟回拨导致负值时按 0 处理，绝不向客户端输出负耗时。
- */
-function durationBetween(startedAt, finishedAt) {
-  if (startedAt === null || finishedAt === null) return null;
-  return Math.max(0, finishedAt - startedAt);
-}
-
-/** 最新一次带错误 attempt 的受限失败摘要（attempts 按时间顺序追加，因此从后往前找）。 */
-function latestAttemptFailure(attempts) {
-  for (let index = attempts.length - 1; index >= 0; index -= 1) {
-    if (attempts[index].failure !== null) return attempts[index].failure;
-  }
-  return null;
-}
-
-/**
- * shard 节点的时间线字段。
- *
- * - startedAt：第一个真正开始的 attempt 的 startedAt；旧快照完全没有 attempt 级时间时
- *   回退 createdAt（分片登记时刻即时间线起点），不凭空造一个时间；
- * - finishedAt：最后一个 attempt 的 finishedAt；**仍在运行的分片恒为 null**——历史
- *   attempt 的完成时间不是当前这一轮的终点；
- * - lastActivityAt：manager 的 updatedAt（任何状态推进都会刷新它），缺失为 null；
- * - attemptCount/retryCount：**两者语义不同**。attemptCount 统计总尝试数（attempts.length）；
- *   retryCount 只统计**真实重试**（retryShard 追加 attempt、不增 task.round），由调用方按
- *   「attempts.length − 本分片经历的轮次数（task.round）」算好传入。continuation 每个逻辑
- *   轮次都会给每个分片追加一个 attempt 并递增 task.round（fanout/task-commands.js），
- *   这类复用不是重试，因此不计入 retryCount——否则每复用一轮侧栏就会多出一个「重试」；
- * - failure：最新一次带 error 的 attempt 的受限摘要。
- */
-function projectShardTimeline(source, status, attempts, running, retryCount) {
-  const createdAt = numberOrNull(source?.createdAt);
-  let startedAt = createdAt;
-  for (const attempt of attempts) {
-    if (attempt.startedAt === null) continue;
-    startedAt = attempt.startedAt;
-    break;
-  }
-  const lastAttempt = attempts.length === 0 ? null : attempts[attempts.length - 1];
-  // 明确仍在进行中的分片（queued/waiting/running，或 running 布尔为 true）没有终点：
-  // 即使输入误带时间也不采用，与 attempt 级、客户端归一保持同一口径。
-  const stillActive = running === true || ACTIVE_STATUS_SET.has(status);
-  const finishedAt = stillActive || lastAttempt === null ? null : lastAttempt.finishedAt;
-  const attemptCount = attempts.length;
-  return {
-    startedAt,
-    finishedAt,
-    durationMs: durationBetween(startedAt, finishedAt),
-    lastActivityAt: numberOrNull(source?.updatedAt),
-    attemptCount,
-    // 真实重试数由调用方按 attempts 与 task.round 的差算出（见函数注释），这里原样输出。
-    retryCount,
-    failure: latestAttemptFailure(attempts),
-  };
-}
-
-/**
- * 首个失败 shard 的受限失败摘要（父任务级 failure）。
- *
- * 只在**失败语义**的 shard 中挑选（failed/timed_out/interrupted）：某个分片重试后成功时，
- * 它的历史错误不应被当成任务级失败。命中失败状态但没有可用摘要（例如仅超时、从未写过
- * error）时继续往后找；全部没有则 null。
- */
-function firstShardFailure(shards) {
-  for (const shard of shards) {
-    if (!FAILURE_STATUS_SET.has(shard.status)) continue;
-    if (shard.failure !== null) return shard.failure;
-  }
-  return null;
-}
-
-/**
- * fan-out 父任务节点的时间线字段。
- *
- * - startedAt = createdAt（任务登记时刻就是时间线起点）；
- * - finishedAt 只给**终态**任务：优先 manager 的 settledAt；旧快照可能没有该字段，
- *   此时回退 updatedAt（manager 在结算时保证 updatedAt === settledAt，见 fanout.js 的
- *   aggregateTask）。非终态一律 null，绝不把「最后一次活动」伪装成完成时间；
- * - attemptCount/retryCount：所有 shard 的 attempt 总数与**真实重试**总数（分片内重试之和）。
- *   分片的 retryCount 已按 task.round 排除 continuation 复用轮次（见 projectShardTimeline），
- *   这里只是求和，不再对同一份 attempts 二次推导；
- * - failure：首个失败 shard 的受限摘要。
- */
-function projectFanoutTimeline(source, status, shards) {
-  const startedAt = numberOrNull(source?.createdAt);
-  const updatedAt = numberOrNull(source?.updatedAt);
-  const settledAt = numberOrNull(source?.settledAt) ?? updatedAt;
-  const finishedAt = TERMINAL_STATUS_SET.has(status) ? settledAt : null;
-  let attemptCount = 0;
-  let retryCount = 0;
-  for (const shard of shards) {
-    attemptCount += shard.attemptCount;
-    retryCount += shard.retryCount;
-  }
-  return {
-    startedAt,
-    finishedAt,
-    durationMs: durationBetween(startedAt, finishedAt),
-    lastActivityAt: updatedAt,
-    attemptCount,
-    retryCount,
-    failure: firstShardFailure(shards),
-  };
-}
-
 // ── 恢复状态（recovery）投影 ─────────────────────────────────────────────────
 
 /*
@@ -600,7 +455,7 @@ function recoveryMessageOrNull(value) {
 /**
  * 恢复状态块投影（白名单出口）。
  *
- * 入参是 Host 运行时从 fanoutHost.restoreStatus() 归一出来的**不可信候选**：
+ * 入参是 Host 运行时从只读 restoreStatus() 归一出来的**不可信候选**：
  * 本函数只保留声明字段，其余一律丢弃（字段白名单），并对 code/message 做边界收敛。
  * 恢复成功（status=ok）时强制清空 code/message；从未恢复过（none）同样不带任何
  * 失败细节。返回 null 表示调用方没有提供 recovery 信息（旧调用方/旧 Host 兼容）。
@@ -844,24 +699,6 @@ function projectExpertChildren(experts) {
   return asArray(experts).map((record) => projectExpertNode(record));
 }
 
-// ── 逐动作能力投影（票据 09） ───────────────────────────────────────────────
-
-/**
- * 能力动作词表（Host 投影出口的唯一集合）。
- *
- * - 普通专家/根节点只有 read 有意义：写动作属于 fan-out 管理层，对这些节点一律
- *   not_supported（客户端据此不渲染任何按钮）；
- * - fan-out 父节点带任务级四项，shard 节点只带 cancel/retry。
- */
-export const EXPERT_GROUP_CAPABILITY_ACTIONS = Object.freeze(["read", "cancel", "retry", "continue"]);
-export const EXPERT_GROUP_SHARD_CAPABILITY_ACTIONS = Object.freeze(["cancel", "retry"]);
-
-/**
- * 能力原因码的最大长度：原因码是稳定的机器 token（如 task_not_found），客户端只做
- * 展示/判定，不解析自由文本。超长输入截断而不是丢弃，避免旧 Host 的长文案撑爆横幅。
- */
-export const CAPABILITY_REASON_MAX_LENGTH = 64;
-
 /** 会话节点（root/普通专家）的固定能力：只读可见，写动作不适用于会话。 */
 function sessionCapabilities() {
   return {
@@ -872,330 +709,13 @@ function sessionCapabilities() {
   };
 }
 
-/**
- * 单项能力归一（白名单出口）：
- * - 只有 allowed 是布尔才算有效项；其它形状返回 null（调用方整体省略该动作）；
- * - allowed=true 时丢弃 reason（成功态不允许残留拒绝原因）；
- * - allowed=false 时保留稳定原因码；缺失/空/非字符串退回 not_supported，并限制长度。
- */
-function projectCapabilityEntry(value) {
-  const source = asRecord(value);
-  if (source === undefined || typeof source.allowed !== "boolean") return null;
-  if (source.allowed === true) return { allowed: true };
-  const rawReason = textOrNull(source.reason);
-  return {
-    allowed: false,
-    reason: rawReason === null ? "not_supported" : rawReason.slice(0, CAPABILITY_REASON_MAX_LENGTH),
-  };
-}
-
-/** 按动作词表投影能力对象；一个有效项都没有时返回 null（调用方省略字段）。 */
-function projectCapabilities(value, actions) {
-  const source = asRecord(value);
-  if (source === undefined) return null;
-  const projected = {};
-  let any = false;
-  for (const action of actions) {
-    const entry = projectCapabilityEntry(source[action]);
-    if (entry === null) continue;
-    projected[action] = entry;
-    any = true;
-  }
-  return any ? projected : null;
-}
-
-// ── fan-out 分支投影 ────────────────────────────────────────────────────────
-
-/** counts 的固定键集合，与 fanout.js 的 SHARD_STATUS_KEYS + pending 完全一致。 */
-const COUNT_KEYS = Object.freeze([
-  "queued",
-  "running",
-  "succeeded",
-  "failed",
-  "cancelled",
-  "timed_out",
-  "interrupted",
-  "pending",
-]);
+// ── 子节点投影 ──────────────────────────────────────────────────────────────
 
 /**
- * fan-out manager 的**父任务**状态枚举到统一词表的显式映射。
- *
- * 这是 manager 自己的状态字（fanout.js FANOUT_TASK_STATUSES），不是客户端推断：
- * - pending（仍有未终态 shard）→ running（任务已派发且未收敛）；
- * - completed → succeeded；
- * - completed_with_errors → failed（部分成功在统一词表里没有独立项，原始字保留在
- *   taskStatus，消费方需要区分时读它）；
- * - cancelled → cancelled。
- */
-const FANOUT_TASK_STATUS_MAP = new Map([
-  ["pending", "running"],
-  ["completed", "succeeded"],
-  ["completed_with_errors", "failed"],
-  ["cancelled", "cancelled"],
-]);
-
-/** 父任务状态归一：先走 manager 枚举表，再退回通用状态词表。 */
-function normalizeTaskStatus(value) {
-  const text = textOrNull(value);
-  if (text === null) return "unknown";
-  const mapped = FANOUT_TASK_STATUS_MAP.get(text.trim().toLowerCase());
-  return mapped ?? normalizeStatus(text);
-}
-
-/**
- * 单次 attempt 投影（attempt 身份 = attempt 序号 + childId）。
- *
- * 只保留导航、状态与**受限**失败摘要：result 可能很大且有独立读取通道，投影不搬运；
- * error 只取 code/name 与 message 首行（见 projectFailure），stack 与完整负载绝不外传。
- */
-function projectAttemptNode(attempt) {
-  const source = asRecord(attempt);
-  const status = normalizeStatus(source?.status);
-  // 活动 attempt（queued/waiting/running，含 pending 归一后的 queued）没有完成时间：
-  // 即使输入误带 finishedAt 也丢弃，与 client-expert-group-model.js 的 normalizeAttempt
-  // 同一口径——否则侧栏会把「运行中」渲染成「运行中 已耗时 1.2s」。
-  const stillActive = ACTIVE_STATUS_SET.has(status);
-  const startedAt = numberOrNull(source?.startedAt);
-  const finishedAt = stillActive ? null : numberOrNull(source?.finishedAt);
-  return {
-    attempt: numberOrNull(source?.attempt),
-    status,
-    childId: textOrNull(source?.childId),
-    // 历史 attempt 的角色显示名快照（票据 27）：随 child_models 记录持久化，
-    // 角色后来被删除时仍然可读。
-    roleLabel: textOrNull(source?.roleLabel),
-    // 每次 attempt 的实际路由（票据 24）：恢复/续作只读，不重新选择；缺失省略。
-    ...projectModelRouteFields(source),
-    // 时段/层/跨层回退（票据 06）：字段存在才出现（快照缺失时整组省略，不补默认值），
-    // 且绝不携带 plan/provider 等执行快照内容。
-    ...projectRouteSnapshotFields(source),
-    // 目标 subagent provider / 继承开关（票据 29）：缺失省略，不伪造 false。
-    ...projectSubagentContextFields(source),
-    // 单次 attempt 的用量（票据 25）：来自该 attempt.childId 的 child_models/账本；
-    // 归属未证明的 attempt 不会有 usage，缺失时整字段省略。
-    ...usageField(source?.usage),
-    // 结构化交付（票据 30）：同一 child 的只读结构化结果；缺失省略。
-    ...structuredProjectionFields(source),
-    startedAt,
-    finishedAt,
-    // 单次尝试的耗时与失败摘要：任一输入缺失即为 null（不填 0、不猜原因）。
-    durationMs: stillActive ? null : durationBetween(startedAt, finishedAt),
-    failure: projectFailure(source?.error),
-  };
-}
-
-/**
- * 单 shard 投影。
- *
- * 状态优先级：manager 的明确 shard.status 优先；manager 没给（部分输入/旧快照）时，
- * 才取**最新一次 attempt**（输入数组最后一项，manager 保证追加顺序）的状态。
- * 因此「历史 attempt 失败、最新 attempt 成功」必须投影为 succeeded，反之亦然——
- * 历史 attempt 不覆盖当前有效结果，只作为审计信息保留在 attempts 里。
- * childId 同理只取最新 attempt 的，作为唯一导航键。
- */
-function projectShardNode(shard, inherited = {}) {
-  const source = asRecord(shard);
-  const defaults = asRecord(inherited);
-  // 分片最新 child 会话内全部 turn 的累计墙钟用时（与 DSH 状态行同源，空闲区间不计）：缺失时省略。
-  const turnDurationMs = numberOrNull(source?.turnDurationMs);
-  // 分片最新 child 的 open turn 起点（additive）：闭合/旧快照时省略。
-  const turnOpenSince = numberOrNull(source?.turnOpenSince);
-  const attempts = asArray(source?.attempts).map((attempt) => projectAttemptNode(attempt));
-  const latestAttempt = attempts.length === 0 ? null : attempts[attempts.length - 1];
-  const shardId = textOrNull(source?.shardId);
-  const managerStatus = textOrNull(source?.status);
-  const status = managerStatus === null
-    ? latestAttempt?.status ?? "unknown"
-    : normalizeStatus(managerStatus);
-  const running = runningOf(source, status);
-  /**
-   * 真实重试数（与 continuation 轮次区分开，见 projectShardTimeline 注释）。
-   *
-   * 依据是父任务的 round：continuation 每轮 +1 且给每个分片各追加一个 attempt；
-   * retryShard 只追加 attempt、不增 round。因此「每个轮次基线一次尝试」，
-   * retryCount = attempts.length − max(1, min(attempts.length, rounds))：
-   * - rounds 缺失（旧快照）时默认 1，与改动前 max(0, length-1) 完全一致；
-   * - rounds 大于 attempts.length 时基线被钳到 attempts.length，重试数钳到 0，绝不出现负数。
-   */
-  const rounds = Math.max(1, numberOrNull(defaults?.round) ?? 1);
-  const baselineAttempts = Math.max(1, Math.min(attempts.length, rounds));
-  const retryCount = Math.max(0, attempts.length - baselineAttempts);
-  // 时间线字段一次性算出：startedAt/finishedAt/durationMs/lastActivityAt/attemptCount/
-  // retryCount/failure 全部由 attempts、createdAt、updatedAt 与状态推导（见 projectShardTimeline）。
-  const timeline = projectShardTimeline(source, status, attempts, running, retryCount);
-  // 分片用量（票据 25）：runtime 已按 childId 去重汇总时直接采用；直接调用本投影
-  // （没有 runtime 参与）时从 attempts 的 usage 汇总同一口径，绝不补零。
-  const explicitUsage = projectUsage(source?.usage);
-  const shardUsage = explicitUsage !== null && hasUsageMetrics(explicitUsage)
-    ? explicitUsage
-    : sumUsageByChildId(attempts.map((attempt) => ({ childId: attempt.childId, usage: attempt.usage })));
-  return {
-    shardId,
-    // 主代理提供的分片任务名称优先（投影出的任务行第一行文本）；旧数据没有该字段或
-    // 名称是空白串时回退分片代号，保持既有「分片标识即任务名称」的展示语义不变。
-    taskName: trimmedNameOrNull(source?.name) ?? shardId,
-    prompt: textOrNull(source?.prompt),
-    // fan-out 一次提交使用同一专家角色；provider/model/effort 则由 runtime 按
-    // 最新 attempt child 补齐。旧快照没有分片级字段时再继承父任务元数据。
-    role: firstText(source?.role, defaults?.role),
-    // 分片角色显示名：优先分片自己的记录，其次父任务元数据（票据 27）。
-    roleLabel: firstText(source?.roleLabel, defaults?.roleLabel),
-    provider: firstText(source?.provider, defaults?.provider),
-    model: firstText(source?.model, defaults?.model),
-    effort: firstText(source?.reasoningEffort, source?.effort, defaults?.reasoningEffort, defaults?.effort),
-    ...(turnDurationMs === null ? {} : { turnDurationMs }),
-    ...(turnOpenSince === null ? {} : { turnOpenSince }),
-    // 分片实际路由（票据 24）：来自最新 attempt child 的 child_models 记录；缺失省略。
-    ...projectModelRouteFields(source),
-    // 时段/层/跨层回退（票据 06）：字段存在才出现（快照缺失时整组省略，不补默认值），
-    // 且绝不携带 plan/provider 等执行快照内容。
-    ...projectRouteSnapshotFields(source),
-    // 目标 subagent provider / 继承开关（票据 29）：来自同一 child 的 child_models；缺失省略。
-    ...projectSubagentContextFields(source),
-    // 分片用量（票据 25）：没有有效样本时整字段省略。
-    ...(shardUsage === null || !hasUsageMetrics(shardUsage) ? {} : { usage: shardUsage }),
-    // 结构化交付（票据 30）：分片取最新 attempt 的只读结果，不跨 attempt 合并 value。
-    ...(latestAttempt?.structured === undefined ? {} : { structured: latestAttempt.structured }),
-    ...(latestAttempt?.outputSchemaRequested === true ? { outputSchemaRequested: true } : {}),
-    status,
-    running,
-    runSummary: projectRunSummary(source?.runSummary),
-    continuable: typeof source?.continuable === "boolean" ? source.continuable : null,
-    // shard 能力只覆盖管理层真正拥有的两个动作；缺失（旧 Host/直连投影）时整字段省略，
-    // 客户端据此回退到既有状态推导。
-    ...(() => {
-      const capabilities = projectCapabilities(source?.capabilities, EXPERT_GROUP_SHARD_CAPABILITY_ACTIONS);
-      return capabilities === null ? {} : { capabilities };
-    })(),
-    childId: latestAttempt?.childId ?? null,
-    createdAt: numberOrNull(source?.createdAt),
-    // 票据 12 时间线：字段恒存在（缺失值为 null/0），客户端不需要判断存在性。
-    ...timeline,
-    attempts,
-  };
-}
-
-/** counts 归一：manager 没给 counts 就保持 null（投影不按 shards 重算）；给了则逐键取值，缺失键为 null。 */
-function projectCounts(counts) {
-  const source = asRecord(counts);
-  if (source === undefined) return null;
-  const projected = {};
-  for (const key of COUNT_KEYS) projected[key] = numberOrNull(source[key]);
-  return projected;
-}
-
-/**
- * fan-out 父任务节点投影。
- *
- * taskStatus 保留 manager 的原始字（便于区分 completed / completed_with_errors），
- * status 是统一词表出口。父任务状态**不做 shard 聚合**：manager 没给就是 unknown。
- */
-function projectFanoutNode(task) {
-  const source = asRecord(task);
-  const parentTaskId = textOrNull(source?.parentTaskId);
-  const taskStatus = textOrNull(source?.status);
-  const status = normalizeTaskStatus(taskStatus);
-  // 先投影 shards：父任务的 attemptCount/retryCount/failure 是对分片投影结果的汇总，
-  // 因此两者不会出现「父任务与分片对同一份 attempts 各算一遍」的不一致。
-  const shards = asArray(source?.shards).map((shard) => projectShardNode(shard, {
-    role: source?.role,
-    roleLabel: source?.roleLabel,
-    provider: source?.provider,
-    model: source?.model,
-    reasoningEffort: source?.reasoningEffort,
-    effort: source?.effort,
-    // 逻辑轮次：manager 快照恒给 round>=1（fanout/store.js），分片据此把 continuation 追加的
-    // attempt 从「重试」里排除；旧快照缺 round 时默认 1，退化为改动前的口径。
-    // 只接受安全整数且 >=1：numberOrNull 仅校验有限性，1.5 这类值会让基线变成小数，
-    // retryCount 随之出现 0.5 这种无法解释的「半次重试」；非整数一律按缺失（第 1 轮）处理。
-    round: Number.isSafeInteger(source?.round) && source.round >= 1 ? source.round : 1,
-  }));
-  const timeline = projectFanoutTimeline(source, status, shards);
-  /**
-   * 结构化结果汇总（票据 30）：只保留每个 attempt 自己的只读结果，**绝不合并 value**。
-   * task 节点的 structured 是数组（shardId/attempt/childId/structured），没有结果时整个
-   * 字段省略；outputSchemaRequested 只在至少一个 attempt 声明过时为 true。
-   */
-  const structuredResults = [];
-  let outputSchemaRequested = false;
-  for (const shard of shards) {
-    for (const attempt of Array.isArray(shard?.attempts) ? shard.attempts : []) {
-      if (attempt?.outputSchemaRequested === true) outputSchemaRequested = true;
-      if (attempt?.structured === undefined) continue;
-      structuredResults.push({
-        shardId: shard?.shardId ?? null,
-        attempt: attempt?.attempt ?? null,
-        childId: attempt?.childId ?? null,
-        structured: projectStructuredResult(attempt.structured),
-      });
-    }
-  }
-  // 父任务用量（票据 25）：runtime 汇总值优先；直接调用本投影时按 attempts 的
-  // (childId, usage) 去重汇总，与 runtime 完全同口径。没有有效样本时省略字段。
-  const explicitUsage = projectUsage(source?.usage);
-  const taskUsage = explicitUsage !== null && hasUsageMetrics(explicitUsage)
-    ? explicitUsage
-    : sumUsageByChildId(shards.flatMap((shard) => (
-      Array.isArray(shard.attempts) ? shard.attempts.map((attempt) => ({ childId: attempt.childId, usage: attempt.usage })) : []
-    )));
-  return {
-    // 父任务 id 本身就是稳定身份，可直接作为节点 id（kind 区分它与专家会话 id）。
-    id: parentTaskId,
-    kind: "fanout",
-    parentTaskId,
-    basePrompt: textOrNull(source?.basePrompt),
-    role: textOrNull(source?.role),
-    roleLabel: textOrNull(source?.roleLabel),
-    status,
-    taskStatus,
-    running: runningOf(source, status),
-    createdAt: numberOrNull(source?.createdAt),
-    // 票据 12 时间线：startedAt/finishedAt/durationMs/lastActivityAt/attemptCount/
-    // retryCount/failure。字段恒存在，缺失值为 null/0（旧输入向后兼容）。
-    ...timeline,
-    // 任务级用量（票据 25）：缺失时整字段省略，客户端显示“用量不可用”而不是 0。
-    ...(taskUsage === null || !hasUsageMetrics(taskUsage) ? {} : { usage: taskUsage }),
-    // 结构化交付（票据 30）：逐 attempt 保留、不合并 value；缺失整体省略。
-    ...(structuredResults.length === 0 ? {} : { structured: structuredResults }),
-    ...(outputSchemaRequested ? { outputSchemaRequested: true } : {}),
-    counts: projectCounts(source?.counts),
-    // 父任务能力：由 Host 注入（fanoutHost.capabilitiesOf）；旧调用方没有该字段时省略，
-    // 保持「不伪造授权」的投影原则。
-    ...(() => {
-      const capabilities = projectCapabilities(source?.capabilities, EXPERT_GROUP_CAPABILITY_ACTIONS);
-      return capabilities === null ? {} : { capabilities };
-    })(),
-    shards,
-  };
-}
-
-/**
- * 收集所有 fan-out attempt 的 childId。
- *
- * 这些会话已经在 fan-out 分支里以「分片 + attempt」的形式出现，属于同一个 Expert
- * Group 节点的另一种视图；如果同时再作为普通 expert 子节点输出，客户端会看到重复
- * 任务。注意是**任意** attempt（含历史失败 attempt），不只是最新那次。
- */
-function collectAttemptChildIds(fanoutTasks) {
-  const childIds = new Set();
-  for (const task of asArray(fanoutTasks)) {
-    for (const shard of asArray(asRecord(task)?.shards)) {
-      for (const attempt of asArray(asRecord(shard)?.attempts)) {
-        const childId = textOrNull(asRecord(attempt)?.childId);
-        if (childId !== null) childIds.add(childId);
-      }
-    }
-  }
-  return childIds;
-}
-
-/**
- * 合并排序：普通专家与 fan-out 分支统一按 createdAt 升序。
+ * 排序：普通专家子节点按 createdAt 升序。
  *
  * 缺失 createdAt 的节点表示「时间未知」，统一排在有序节点之后，并在它们之间保持
  * 输入顺序；相同时间戳也用输入下标兜底，结果不依赖引擎排序实现的稳定性。
- * fan-out 内部的 shards/attempts 不参与该排序，始终保留 manager 顺序。
  */
 function sortByCreatedAt(nodes) {
   return nodes
@@ -1210,16 +730,17 @@ function sortByCreatedAt(nodes) {
 }
 
 /**
- * root.children = 普通专家子节点 + fan-out 分支节点。
- * 先按 attempt.childId 去重，再按 createdAt 升序合并。
+ * root.children = **只包含普通专家子节点**。
+ *
+ * fan-out 整体移除后，这里不再有父任务 / 分片 / attempt 三层节点，也不再需要
+ * 「按 attempt.childId 去重」与「普通专家 + fan-out 混排」两步归一：客户端因此可以
+ * 完全删掉 `kind === "fanout"` 的判断，只按普通专家节点渲染。
+ *
+ * 排序仍然按 createdAt 升序（缺失排最后、相同时间戳用输入下标兜底），与改动前
+ * 普通专家之间的相对顺序逐字一致。
  */
-function projectChildren(experts, fanoutTasks) {
-  const fanoutChildIds = collectAttemptChildIds(fanoutTasks);
-  const expertNodes = projectExpertChildren(experts)
-    // 身份缺失的专家无法判定是否与 attempt 重复，保留原样而不是误删。
-    .filter((node) => node.sessionId === null || !fanoutChildIds.has(node.sessionId));
-  const fanoutNodes = asArray(fanoutTasks).map((task) => projectFanoutNode(task));
-  return sortByCreatedAt([...expertNodes, ...fanoutNodes]);
+function projectChildren(experts) {
+  return sortByCreatedAt(projectExpertChildren(experts));
 }
 
 // ── 顶层内容摘要 revision（票据 12） ────────────────────────────────────────
@@ -1268,11 +789,10 @@ function computeSnapshotRevision(snapshot) {
  * @param {string} input.sessionId - Expert Group 的根会话 id（必填，非法即抛 TypeError）。
  * @param {object} [input.root] - 根会话/根 Agent 记录；声明的会话 id 必须与 sessionId 一致。
  * @param {Array} [input.experts] - 普通专家记录（自身状态由 DSH 给出）。
- * @param {Array} [input.fanoutTasks] - fan-out manager 的父任务快照。
  * @param {number} [input.generatedAt] - 投影生成时间（epoch 毫秒）。
  * @param {boolean} [input.partial] - 是否为**轻量快照**（跳过全部冷读、状态可能不完整）。
  *   true 时客户端必须保持状态圆点与活动文案中性，等完整快照（partial:false）替换。
- * @param {object} [input.recovery] - 可选的恢复状态候选（来自 fanoutHost.restoreStatus()）。
+ * @param {object} [input.recovery] - 可选的恢复状态候选（来自 Host 的只读 restoreStatus()）。
  *   提供时投影为顶层可选 recovery 块；未提供时**整块省略**（旧调用方/旧 Host 兼容，
  *   客户端按缺失回退为「没有恢复错误」）。
  * @param {object} [input.roleLabels] - 角色 id → 显示名（票据 27，含历史角色显示名，
@@ -1280,7 +800,7 @@ function computeSnapshotRevision(snapshot) {
  *   提供时投影为顶层 roleLabels；未提供/为空时整块省略，客户端回退原生文案。
  * @returns {object} schemaVersion:1 的只读 JSON 树。
  */
-export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks, generatedAt, partial, recovery, roleLabels } = {}) {
+export function buildExpertGroupSnapshot({ sessionId, root, experts, generatedAt, partial, recovery, roleLabels } = {}) {
   const rootSessionId = assertSessionId(sessionId);
   const declaredRootId = identityOf(root);
   if (declaredRootId !== null && declaredRootId !== rootSessionId) {
@@ -1309,7 +829,7 @@ export function buildExpertGroupSnapshot({ sessionId, root, experts, fanoutTasks
         id: declaredRootId ?? rootSessionId,
         sessionId: rootSessionId,
       }),
-      children: projectChildren(experts, fanoutTasks),
+      children: projectChildren(experts),
     },
   };
   // revision 最后写入：它覆盖除 generatedAt/revision 自身之外的全部内容

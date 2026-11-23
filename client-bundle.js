@@ -15,14 +15,10 @@ error:"failed",errored:"failed",active:"running",in_progress:"running","in-progr
 working:"running",pending:"queued",scheduled:"queued",wait:"waiting",
 });
 const CAPABILITY_ACTIONS=Object.freeze(["read","cancel","retry","continue"]);
-const SHARD_CAPABILITY_ACTIONS=Object.freeze(["cancel","retry"]);
 const CAPABILITY_REASON_MAX_LENGTH=64;
 const ROUTE_PERIOD_VALUES=Object.freeze(["peak","valley","none"]);
 const ROUTE_TIER_VALUES=Object.freeze(["peak","valley","normal-override","normal-fallback"]);
 const ROUTE_TEXT_MAX_LENGTH=64;
-const COUNT_FIELDS=Object.freeze([
-"queued","waiting","running","succeeded","failed","cancelled","timed_out","interrupted","pending",
-]);
 const FAILURE_CODE_MAX_LENGTH=64;
 const FAILURE_MESSAGE_MAX_LENGTH=160;
 const MAX_NESTED_EXPERT_DEPTH=16;
@@ -107,13 +103,6 @@ if(source===null)return"unknown";
 const key=source.toLowerCase().replace(/\s+/g,"_");
 if(STATUSES.has(key))return key;
 return STATUS_ALIASES[key]||"unknown";
-}
-function statusFromTask(value){
-const source=text(value);
-if(source==="pending")return"running";
-if(source==="completed"||source==="complete")return"succeeded";
-if(source==="completed_with_errors")return"failed";
-return normalizeStatus(source);
 }
 function runningOf(status,explicit){
 if(typeof explicit==="boolean")return explicit;
@@ -324,22 +313,6 @@ any=true;
 }
 return any?normalized:null;
 }
-function normalizeTimelineFields(source,fallback){
-const defaults=isObject(fallback)?fallback:{};
-const startedAt=numberOrNull(source.startedAt)??numberOrNull(defaults.startedAt);
-const stillActive=ACTIVE_STATUS_SET.has(normalizeStatus(source.status));
-const finishedAt=stillActive?null:numberOrNull(source.finishedAt);
-const attemptCount=numberOrNull(source.attemptCount)??(numberOrNull(defaults.attemptCount)??0);
-return{
-startedAt,
-finishedAt,
-durationMs:stillActive?null:(numberOrNull(source.durationMs)??durationBetween(startedAt,finishedAt)),
-lastActivityAt:numberOrNull(source.lastActivityAt)??numberOrNull(defaults.lastActivityAt),
-attemptCount,
-retryCount:numberOrNull(source.retryCount)??(numberOrNull(defaults.retryCount)??Math.max(0,attemptCount-1)),
-failure:normalizeFailure(source.failure),
-};
-}
 function normalizeRouteFallback(value){
 if(!isObject(value))return null;
 if(value.fromTier!=="peak"&&value.fromTier!=="valley")return null;
@@ -380,114 +353,6 @@ startedAt,
 finishedAt,
 durationMs:stillActive?null:(numberOrNull(source.durationMs)??durationBetween(startedAt,finishedAt)),
 failure:normalizeFailure(source.failure),
-};
-}
-function normalizeShard(value,inherited){
-const source=isObject(value)?value:{};
-const defaults=isObject(inherited)?inherited:{};
-const attempts=Array.isArray(source.attempts)?source.attempts.map(normalizeAttempt):[];
-const latest=attempts.length===0?null:attempts[attempts.length-1];
-const managerStatus=source.status===undefined?"unknown":normalizeStatus(source.status);
-const status=managerStatus!=="unknown"?managerStatus:(latest?.status??"unknown");
-return{
-shardId:text(source.shardId),
-taskName:firstText(source.taskName,source.shardId),
-prompt:firstText(source.prompt,source.content),
-role:firstText(source.role,defaults.role),
-roleLabel:firstText(source.roleLabel,defaults.roleLabel),
-provider:firstText(source.provider,defaults.provider),
-model:firstText(source.model,defaults.model),
-effort:firstText(source.effort,source.reasoningEffort,defaults.effort,defaults.reasoningEffort),
-...routeFields(source),
-status,
-...usageFields(source),
-...structuredFields(source),
-running:runningOf(status,source.running),
-runSummary:normalizeRunSummary(source.runSummary),
-turnDurationMs:numberOrNull(source.turnDurationMs),
-turnOpenSince:numberOrNull(source.turnOpenSince),
-continuable:typeof source.continuable==="boolean"?source.continuable:null,
-...(()=>{
-const capabilities=normalizeCapabilities(source.capabilities,SHARD_CAPABILITY_ACTIONS);
-return capabilities===null?{}:{capabilities};
-})(),
-childId:latest?.childId??text(source.childId),
-createdAt:numberOrNull(source.createdAt),
-attempts,
-...normalizeTimelineFields(source,{
-startedAt:numberOrNull(source.createdAt),
-attemptCount:attempts.length,
-}),
-};
-}
-function normalizeCounts(value){
-if(!isObject(value))return null;
-const result={};
-for(const field of COUNT_FIELDS)result[field]=numberOrNull(value[field]);
-return result;
-}
-function normalizeFanout(value){
-const source=isObject(value)?value:{};
-const parentTaskId=text(source.parentTaskId);
-const taskStatus=text(source.taskStatus)||text(source.status);
-const status=taskStatus===null?"unknown":statusFromTask(taskStatus);
-const rawShards=Array.isArray(source.shards)?source.shards:[];
-const shards=rawShards.map((shard)=>normalizeShard(shard,source));
-let shardAttemptCount=0;
-let shardRetryCount=0;
-for(const shard of shards){
-shardAttemptCount+=numberOrNull(shard.attemptCount)??0;
-shardRetryCount+=numberOrNull(shard.retryCount)??0;
-}
-return{
-id:parentTaskId,
-kind:"fanout",
-parentTaskId,
-taskName:firstText(source.taskName,source.title),
-content:firstText(source.content),
-basePrompt:firstText(source.basePrompt,source.content),
-contentSource:text(source.contentSource),
-role:text(source.role),
-roleLabel:text(source.roleLabel),
-provider:text(source.provider),
-model:text(source.model),
-effort:firstText(source.effort,source.reasoningEffort),
-...routeFields(source),
-taskStatus,
-status,
-running:runningOf(status,source.running),
-createdAt:numberOrNull(source.createdAt),
-counts:normalizeCounts(source.counts),
-...usageFields(source),
-...(()=>{
-if(!Array.isArray(source.structured))return{};
-const entries=[];
-for(const entry of source.structured){
-if(!isObject(entry))continue;
-const inner=normalizeStructured(entry.structured);
-if(inner===null)continue;
-const shardId=boundedText(entry.shardId,USAGE_TEXT_MAX_LENGTH);
-const childId=boundedText(entry.childId,USAGE_TEXT_MAX_LENGTH);
-const attempt=countOrNull(entry.attempt);
-entries.push({
-...(shardId===null?{}:{shardId}),
-...(attempt===null?{}:{attempt}),
-...(childId===null?{}:{childId}),
-structured:inner,
-});
-}
-return entries.length===0?{}:{structured:entries};
-})(),
-...(()=>{
-const capabilities=normalizeCapabilities(source.capabilities,CAPABILITY_ACTIONS);
-return capabilities===null?{}:{capabilities};
-})(),
-shards,
-...normalizeTimelineFields(source,{
-startedAt:numberOrNull(source.createdAt),
-attemptCount:shardAttemptCount,
-retryCount:shardRetryCount,
-}),
 };
 }
 function normalizeSessionNode(value,kind,fallbackId,depth){
@@ -534,23 +399,10 @@ turnOpenSince:numberOrNull(source.turnOpenSince),
 children:rawChildren.map((child)=>normalizeSessionNode(child,"expert",null,nestedDepth+1)),
 };
 }
-function attemptChildIds(nodes){
-const ids=new Set();
-for(const node of nodes){
-if(node.kind!=="fanout")continue;
-for(const shard of node.shards)for(const attempt of shard.attempts){
-if(attempt.childId!==null)ids.add(attempt.childId);
-}
-}
-return ids;
-}
 function childSourceList(raw,root){
-if(Array.isArray(root?.children))return root.children;
-const expertChildren=Array.isArray(raw?.experts)?raw.experts:[];
-const fanoutChildren=Array.isArray(raw?.fanoutTasks)
-?raw.fanoutTasks
-:(Array.isArray(raw?.tasks)?raw.tasks:[]);
-return[...expertChildren,...fanoutChildren];
+return Array.isArray(root?.children)
+?root.children
+:(Array.isArray(raw?.experts)?raw.experts:[]);
 }
 function normalizeExpertGroupSnapshot(raw){
 if(!isObject(raw)||raw.schemaVersion!==SCHEMA_VERSION)return null;
@@ -561,12 +413,7 @@ const root=normalizeSessionNode(sourceRoot,"root",rootSessionId);
 root.sessionId=rootSessionId;
 root.id=rootSessionId;
 const rawChildren=childSourceList(raw,sourceRoot);
-const children=rawChildren.map((child)=>{
-const kind=isObject(child)&&child.kind==="fanout"?"fanout":"expert";
-return kind==="fanout"?normalizeFanout(child):normalizeSessionNode(child,"expert");
-});
-const fanoutIds=attemptChildIds(children);
-root.children=children.filter((child)=>child.kind!=="expert"||child.sessionId===null||!fanoutIds.has(child.sessionId));
+root.children=rawChildren.map((child)=>normalizeSessionNode(child,"expert"));
 return{
 schemaVersion:SCHEMA_VERSION,
 sessionId:rootSessionId,
@@ -638,7 +485,6 @@ incomplete:Object.freeze(["failed","timed_out","interrupted","cancelled","idle",
 completed:Object.freeze(["succeeded"]),
 });
 const DEFAULT_COLLAPSED_STATUSES=new Set(["idle","ready","succeeded","cancelled"]);
-const FANOUT_SETTLED_STATUSES=new Set(["succeeded","failed","cancelled"]);
 const STRUCTURED_PREVIEW_MAX_CHARS=400;
 const SUPPORTED_LOCALES=Object.freeze(["zh","en"]);
 const DEFAULT_LOCALE="zh";
@@ -784,7 +630,6 @@ en:"Automatically open running subagent sidebar sessions",
 "settings.notificationVolume.range":{zh:"通知音量滑块",en:"Notification volume slider"},
 "settings.notificationVolume.number":{zh:"通知音量数值",en:"Notification volume value"},
 "settings.notificationEvent.completed":{zh:"任务完成",en:"Task completed"},
-"settings.roleTimeout.aria":{zh:"角色默认超时",en:"Default role timeout"},
 "settings.notificationEvent.completed.aria":{zh:"通知任务完成",en:"Notify on task completed"},
 "settings.notificationEvent.waiting.aria":{zh:"通知等待用户",en:"Notify on waiting for user"},
 "settings.notificationEvent.failed.aria":{zh:"通知任务失败",en:"Notify on task failed"},
@@ -793,16 +638,6 @@ en:"Automatically open running subagent sidebar sessions",
 "settings.unifiedProvider":{zh:"统一供应商",en:"Unified provider"},
 "settings.noProvider":{zh:"无",en:"None"},
 "settings.observerPreferred":{zh:"Observer优先",en:"Prefer Observer"},
-"settings.concurrencyLimit":{zh:"单个角色并发上限",en:"Per-role concurrency limit"},
-"settings.concurrencyLimit.title":{
-zh:"取值范围 1–64 的整数；默认 20；保存后生效",
-en:"An integer from 1–64; defaults to 20; takes effect after saving",
-},
-"settings.roleTimeout":{zh:"角色默认超时 (s)",en:"Default role timeout (s)"},
-"settings.roleTimeout.title":{
-zh:"默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
-en:"Defaults to 10 hours (36000 s); 0 disables it; enabled values are 1–86400 s (integer, 1 s precision). Applies only to attempts created after saving; running shards are unchanged.",
-},
 "settings.save":{zh:"保存",en:"Save"},
 "settings.saving":{zh:"保存中…",en:"Saving…"},
 "settings.discard":{zh:"放弃修改",en:"Discard changes"},
@@ -1056,10 +891,6 @@ cacheHitText:false,
 contextText:false,
 };
 for(const key of["durationText","throughputText","totalTokensText","cacheHitText","contextText"]){
-if(key==="contextText"&&settings.skipContext===true){
-if(typeof source[key]!=="string")metrics[key]=null;
-continue;
-}
 if(typeof source[key]==="string")continue;
 metrics[key]=ZERO_USAGE_TEXTS[key];
 filled[key]=true;
@@ -1104,26 +935,10 @@ const limit=numberOrNull(optionSource.limit)!==null&&optionSource.limit>0
 :ATTEMPT_TIMELINE_LIMIT;
 const expanded=optionSource.expanded===true;
 const entries=[];
-const appendAttempts=(attempts,shard)=>{
-if(!Array.isArray(attempts))return;
-for(const attempt of attempts){
-const normalized=normalizeAttempt(attempt);
-entries.push({
-...normalized,
-position:entries.length+1,
-shardId:shard===null?null:text(shard.shardId),
-shardTaskName:shard===null?null:firstText(shard.taskName,shard.shardId),
-});
+if(Array.isArray(source.attempts)){
+for(const attempt of source.attempts){
+entries.push({...normalizeAttempt(attempt),position:entries.length+1});
 }
-};
-const shards=Array.isArray(source.shards)?source.shards:[];
-if(shards.length>0){
-for(const shard of shards){
-const shardSource=isObject(shard)?shard:{};
-appendAttempts(shardSource.attempts,shardSource);
-}
-}else{
-appendAttempts(source.attempts,null);
 }
 const keyed=entries.map((entry,index)=>({
 entry,
@@ -1155,7 +970,7 @@ return Object.prototype.hasOwnProperty.call(STATUS_FILTER_GROUPS,key)?key:null;
 }
 function filterHaystackOf(value){
 const source=isObject(value)?value:{};
-return[source.taskName,source.role,source.model,source.provider,source.status,source.shardId]
+return[source.taskName,source.role,source.model,source.provider,source.status]
 .filter((item)=>typeof item==="string"&&item.trim()!=="")
 .join(" ")
 .toLowerCase();
@@ -1180,7 +995,6 @@ if(matches(value)===true)return true;
 if(depth>=MAX_NESTED_EXPERT_DEPTH)return false;
 const node=isObject(value)?value:{};
 if(Array.isArray(node.children)&&node.children.some((child)=>visible(child,depth+1)===true))return true;
-if(Array.isArray(node.shards)&&node.shards.some((shard)=>visible(shard,depth+1)===true))return true;
 return false;
 };
 return Object.freeze({
@@ -1190,12 +1004,6 @@ status:statusGroup,
 active,
 matches,
 isVisible:(value)=>visible(value,0),
-shardsFor:(value)=>{
-const node=isObject(value)?value:{};
-const shards=Array.isArray(node.shards)?node.shards:[];
-if(active!==true)return shards;
-return shards.filter((shard)=>visible(shard,1)===true);
-},
 });
 }
 function filterSnapshot(snapshot,input){
@@ -1205,7 +1013,6 @@ if(filter.active!==true)return snapshot;
 const filterNode=(value)=>{
 if(filter.isVisible(value)!==true)return null;
 const node=isObject(value)?value:{};
-if(node.kind==="fanout")return{...node,shards:filter.shardsFor(node)};
 if(Array.isArray(node.children)&&node.children.length>0){
 return{...node,children:node.children.map(filterNode).filter((child)=>child!==null)};
 }
@@ -1304,14 +1111,10 @@ return structuredFallbackText(preview.reason)+"（"+(preview.reason??"result_una
 function markdownNodeLines(node,level){
 const source=isObject(node)?node:{};
 const lines=[];
-const kind=source.kind==="fanout"
-?"fanout"
-:(source.kind==="root"?"root":(source.kind==="shard"?"shard":"expert"));
-const name=markdownTextOf(firstText(source.taskName,source.shardId,source.sessionId,source.parentTaskId),"未命名任务");
+const kind=source.kind==="root"?"root":"expert";
+const name=markdownTextOf(firstText(source.taskName,source.sessionId),"未命名任务");
 const heading="#".repeat(Math.min(6,Math.max(1,level)));
 if(kind==="root")lines.push(heading+" 主代理");
-else if(kind==="fanout")lines.push(heading+" Fan-out 任务："+name);
-else if(kind==="shard")lines.push(heading+" 分片："+name);
 else lines.push(heading+" 专家："+name);
 const meta=[];
 const role=text(source.role);
@@ -1324,11 +1127,7 @@ if(model!==null)meta.push("模型："+model);
 const effort=firstText(source.effort,source.reasoningEffort);
 if(effort!==null)meta.push("effort："+effort);
 if(meta.length>0)lines.push("- "+meta.join(" · "));
-const statusParts=["状态："+normalizeStatus(source.status)];
-if(kind==="fanout"&&text(source.taskStatus)!==null&&source.taskStatus!==source.status){
-statusParts.push("原始状态："+text(source.taskStatus));
-}
-lines.push("- "+statusParts.join(" · "));
+lines.push("- 状态："+normalizeStatus(source.status));
 lines.push("- 用量："+usageMarkdownText(source.usage));
 const structuredPreview=structuredPreviewOf(source.structured);
 if(structuredPreview!==null||source.outputSchemaRequested===true){
@@ -1339,13 +1138,12 @@ const failure=normalizeFailure(source.failure);
 if(failure!==null&&isFailureStatus(source.status)===true){
 lines.push("- 失败："+failure.code+(failure.message===null?"":" · "+failure.message));
 }
-const shards=Array.isArray(source.shards)?source.shards:[];
 const attempts=Array.isArray(source.attempts)?source.attempts:[];
 if(attempts.length>0){
 lines.push("- 尝试时间线（"+attempts.length+" 条）：");
 lines.push(...markdownAttemptLines(attempts));
 }
-return{lines,shards,children:Array.isArray(source.children)?source.children:[]};
+return{lines,children:Array.isArray(source.children)?source.children:[]};
 }
 function renderMarkdownSnapshot(snapshot){
 const source=isObject(snapshot)?snapshot:{};
@@ -1361,14 +1159,6 @@ lines.push("- 导出范围：任务树元数据与时间线（不含提示词正
 const emit=(value,level)=>{
 const parsed=markdownNodeLines(value,level);
 lines.push(...parsed.lines,"");
-for(const shard of parsed.shards){
-const shardSource=isObject(shard)?shard:{};
-emit({
-...shardSource,
-kind:"shard",
-taskName:firstText(shardSource.taskName,shardSource.shardId),
-},level+1);
-}
 for(const child of parsed.children)emit(child,level+1);
 };
 emit(source.root,1);
@@ -1392,13 +1182,12 @@ function defaultExpanded(node){
 if(isObject(node)&&node.kind==="root")return true;
 if(isObject(node)&&node.kind==="idle-group")return true;
 const status=normalizeStatus(isObject(node)?(node.status??node.taskStatus):undefined);
-if(isObject(node)&&node.kind==="fanout")return!FANOUT_SETTLED_STATUSES.has(status);
 return!DEFAULT_COLLAPSED_STATUSES.has(status);
 }
 function taskIdOf(value){
 if(typeof value==="string")return text(value)||"unknown";
 const source=isObject(value)?value:{};
-return firstText(source.taskId,source.id,source.parentTaskId,source.sessionId,source.shardId)||"unknown";
+return firstText(source.taskId,source.id,source.sessionId)||"unknown";
 }
 function safeStorage(storage){
 if(storage&&typeof storage.getItem==="function"&&typeof storage.setItem==="function")return storage;
@@ -2151,9 +1940,6 @@ Object.freeze({value:"running",label:"运行中"}),
 Object.freeze({value:"incomplete",label:"未完成"}),
 Object.freeze({value:"completed",label:"已完成"}),
 ]);
-const ACTIVE_STATUSES=new Set(["queued","waiting","running"]);
-const RETRY_STATUSES=new Set(["failed","timed_out","interrupted"]);
-const FANOUT_SETTLED_STATUSES=new Set(["succeeded","failed","cancelled"]);
 const STYLE_ID="dsh-expert-group/expert-group-sidebar";
 const RIGHTBAR_WIDTH_RATIO=0.2;
 const OTHER_RIGHTBAR_WIDTH_RATIO=0.5;
@@ -2368,19 +2154,7 @@ if(snapshotHasUsageFact(source.root,depth+1))return true;
 for(const child of Array.isArray(source.children)?source.children:[]){
 if(snapshotHasUsageFact(child,depth+1))return true;
 }
-for(const shard of Array.isArray(source.shards)?source.shards:[]){
-if(snapshotHasUsageFact(shard,depth+1))return true;
-for(const attempt of Array.isArray(object(shard).attempts)?object(shard).attempts:[]){
-if(snapshotHasUsageFact(attempt,depth+1))return true;
-}
-}
 return false;
-}
-function latestShardChildIdOf(shard){
-const source=object(shard);
-const attempts=Array.isArray(source.attempts)?source.attempts:[];
-const latest=attempts.length===0?null:object(attempts[attempts.length-1]);
-return text(latest?.childId,text(source.childId,null));
 }
 function collectSnapshotSessionIds(snapshot){
 const ids=[];
@@ -2398,7 +2172,6 @@ const source=object(node);
 if(Object.keys(source).length===0)return;
 visited+=1;
 push(source.sessionId);
-for(const shard of Array.isArray(source.shards)?source.shards:[])push(latestShardChildIdOf(shard));
 for(const child of Array.isArray(source.children)?source.children:[])visit(child,depth+1);
 };
 visit(object(snapshot).root,0);
@@ -2427,12 +2200,6 @@ const name=isRoot
 :text(source.taskName,text(source.sessionId,fallbackName));
 result.set(id,{name:text(name,id),status:statusOf(source)});
 for(const child of Array.isArray(source.children)?source.children:[])visit(child,id);
-for(const shard of Array.isArray(source.shards)?source.shards:[]){
-const shardId=text(shard.shardId,null);
-if(shardId===null)continue;
-const shardName=text(shard.taskName,shardId);
-result.set(id+":"+shardId,{name:shardName,status:statusOf(shard)});
-}
 };
 visit(root,"主代理");
 return result;
@@ -2525,8 +2292,8 @@ const roleLabelFor=(role,nodeLabel,labels)=>text(nodeLabel,null)
 ??roleLabelFromMap(role,labels)
 ??text(role,null);
 global[SYMBOL]=Object.freeze({
-ACTIVE_STATUSES,ANNOUNCEMENT_MAX_ITEMS,ATTEMPT_STATUS_LABELS,BRAND_ICON_PATHS,
-EXPERT_GROUP_TAB_IDS,FANOUT_SETTLED_STATUSES,OTHER_RIGHTBAR_WIDTH_RATIO,RETRY_STATUSES,
+ANNOUNCEMENT_MAX_ITEMS,ATTEMPT_STATUS_LABELS,BRAND_ICON_PATHS,
+EXPERT_GROUP_TAB_IDS,OTHER_RIGHTBAR_WIDTH_RATIO,
 RIGHTBAR_DOCK_HOST_ATTRIBUTE,RIGHTBAR_DOCK_HOST_VALUE,RIGHTBAR_FLOAT_SELECTOR,RIGHTBAR_FLOAT_TITLE_SELECTOR,
 RIGHTBAR_PANEL_SELECTOR,RIGHTBAR_PANEL_SESSION_ATTRIBUTE,RIGHTBAR_PANE_COLUMN_ATTRIBUTE,RIGHTBAR_PANE_ID_ATTRIBUTE,
 RIGHTBAR_PANE_SELECTOR,RIGHTBAR_SPLIT_ATTRIBUTE,RIGHTBAR_SPLIT_SELECTOR,RIGHTBAR_STRIP_TABS_ATTRIBUTE,
@@ -2542,7 +2309,7 @@ STATUS_FILTER_OPTIONS,STYLE_ID,TIMELINE_EXPANDED_KEY_LIMIT,announcementEventsOf,
 clampRightbarWidthRatio,closeSettleReason,collectAnnouncementTasks,collectSnapshotSessionIds,
 failureSummaryText,finiteNumber,formatClockText,formatCompactDuration,
 formatDurationText,formatIsoText,isFailureStatusOf,isGeneratedExpertGroupTabId,
-latestShardChildIdOf,mergedRoleLabelsOf,modelApi,modelFunction,
+mergedRoleLabelsOf,modelApi,modelFunction,
 normalizeHostMeta,normalizeSessionModelOverrides,normalizeSessionModelSelection,normalizeSessionModelView,
 object,resolveExpertRightbarWidthRatio,retryWarningThreshold,roleLabelFor,
 safeNormalize,sessionModelModelOptions,sessionModelOrchestratorOf,sessionModelRolesOf,sessionModelRowKeysOf,sessionModelSelectionEquals,
@@ -2749,11 +2516,6 @@ available:true,
 }
 return{open:()=>{},acceptsAddress:false,available:false};
 }
-function capabilityAllowed(node,action){
-const capabilities=object(object(node).capabilities);
-const entry=object(capabilities[action]);
-return typeof entry.allowed==="boolean"?entry.allowed:null;
-}
 function runtimeStatusOf(node,entry,options){
 const model=modelApi();
 if(typeof model.runtimeStatusOf==="function")return model.runtimeStatusOf(node,entry,options);
@@ -2804,11 +2566,6 @@ return[text(source.role,source.kind==="root"?"Orchestrator":"Expert"),text(sourc
 }
 function titleOf(node){
 const source=object(node);
-if(source.kind==="fanout"){
-const role=text(source.role,"Expert");
-const count=Array.isArray(source.shards)?source.shards.length:0;
-return role.charAt(0).toUpperCase()+role.slice(1)+" · "+count+" shards · "+RUNTIME_STATUS_LABELS[runtimeStatusOf(source,null)];
-}
 if(source.kind==="root")return"主代理";
 return text(source.taskName,"未命名任务");
 }
@@ -2871,19 +2628,12 @@ const PANEL_CSS_SHELL=[
 ".deg_expert_group_header_auto_label{font-size:12px;line-height:16px}",
 ".deg_expert_group_header_diag{flex:0 0 auto;font-size:11px;font-weight:400;color:var(--dsw-alias-label-secondary);white-space:nowrap}",
 ".deg_expert_group_header_peak_valley{flex:0 0 auto;padding:1px 6px;border-radius:6px;font-size:12px;font-weight:400;color:var(--dsw-alias-label-secondary);white-space:nowrap}",
-".deg_expert_group_recovery{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin:6px 0 0;padding:6px 8px;border:1px solid var(--dsw-alias-state-error-primary,var(--dsw-alias-state-warning-primary,#f59e0b));border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-primary));font-weight:600}",
-".deg_expert_group_recovery_text{flex:1 1 140px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-".deg_expert_group_recovery_retry_error{flex:1 1 100%;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-weight:400}",
-".deg_expert_group_recovery_retry{flex:0 0 auto;box-sizing:border-box;height:24px;padding:0 8px;border:0;border-radius:5px;background:transparent;color:inherit;font-weight:600;cursor:pointer}",
-".deg_expert_group_recovery_retry:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}",
-".deg_expert_group_recovery_retry:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_recovery_retry:disabled{cursor:default;opacity:.7}",
 ".deg_expert_group_header_action:hover,.deg_expert_group_chevron:hover,.deg_expert_group_action:hover:not(:disabled),.deg_expert_group_sidebar_action:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
 ".deg_expert_group_header_action:focus-visible,.deg_expert_group_chevron:focus-visible,.deg_expert_group_action:focus-visible,.deg_expert_group_sidebar_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
 ".deg_expert_group_tree{min-width:0;padding-top:5px}",
 ".deg_expert_group_tree_items{min-width:0}",
 ".deg_expert_group_announcer{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}",
-".deg_expert_group_task:focus-visible,.deg_expert_group_fanout_title>.deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
+".deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
 ".deg_expert_group_resizer{position:absolute;top:0;left:0;bottom:0;width:6px;cursor:col-resize;touch-action:none;background:transparent;z-index:2}",
 ".deg_expert_group_resizer:hover,.deg_expert_group_resizer[data-dragging=true]{background:var(--dsw-alias-interactive-bg-hover)}",
 ".deg_expert_group_resizer:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:-2px}",
@@ -2902,10 +2652,8 @@ const PANEL_CSS_SHELL=[
 ".deg_expert_group_double_arrow_icon path{stroke:currentColor;stroke-width:1.5;stroke-linejoin:round}",
 ".deg_expert_group_line{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 ".deg_expert_group_task{min-width:0;flex:0 1 auto;font-weight:600;cursor:pointer}",
-".deg_expert_group_shard_task{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere}",
 ".deg_expert_group_task:hover{text-decoration:underline}",
 ".deg_expert_group_chevron{width:20px;height:20px;padding:0;align-self:start}",
-".deg_expert_group_fanout_header>.deg_expert_group_chevron{align-self:center}",
 ".deg_expert_group_chevron_placeholder{display:inline-block;width:20px;height:20px}",
 ".deg_expert_group_status_icon{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;color:var(--dsw-alias-label-secondary)}",
 ".deg_expert_group_state_dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor}",
@@ -2923,25 +2671,16 @@ const PANEL_CSS_SHELL=[
 "[data-surface=unsupported]{opacity:.45;cursor:default}",
 ".deg_expert_group_sidebar_batch_zero{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary,#22d3ee))}",
 ".deg_expert_group_children{position:relative;min-width:0;margin:0;padding:0;--deg-parent-row-height:44px}",
-".deg_expert_group_children>.deg_expert_group_node,.deg_expert_group_children>.deg_expert_group_fanout,.deg_expert_group_children>.deg_expert_group_idle_group{--deg-tree-anchor:14px;position:relative}",
-".deg_expert_group_children>.deg_expert_group_fanout{--deg-tree-anchor:14px}",
+".deg_expert_group_children>.deg_expert_group_node,.deg_expert_group_children>.deg_expert_group_idle_group{--deg-tree-anchor:14px;position:relative}",
 ".deg_expert_group_children>:first-child:before{position:absolute;top:calc(var(--deg-tree-anchor) - var(--deg-parent-row-height));bottom:calc(100% - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
 ".deg_expert_group_children>:not(:last-child):after{position:absolute;top:var(--deg-tree-anchor);bottom:calc(0px - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-".deg_expert_group_node>.deg_expert_group_row,.deg_expert_group_fanout_header,.deg_expert_group_idle_group>.deg_expert_group_row{position:relative}",
-".deg_expert_group_node:not(.deg_expert_group_node_root)>.deg_expert_group_row:before,.deg_expert_group_fanout_header:before,.deg_expert_group_idle_group>.deg_expert_group_row:before{position:absolute;top:var(--deg-tree-anchor,14px);left:-6px;width:16px;border-top:1px solid var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-".deg_expert_group_row>*,.deg_expert_group_fanout_header>*{position:relative;z-index:1}",
+".deg_expert_group_node>.deg_expert_group_row,.deg_expert_group_idle_group>.deg_expert_group_row{position:relative}",
+".deg_expert_group_node:not(.deg_expert_group_node_root)>.deg_expert_group_row:before,.deg_expert_group_idle_group>.deg_expert_group_row:before{position:absolute;top:var(--deg-tree-anchor,14px);left:-6px;width:16px;border-top:1px solid var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
+".deg_expert_group_row>*{position:relative;z-index:1}",
 ".deg_expert_group_idle_group{position:relative;min-width:0;padding-left:16px;--deg-tree-anchor:14px}",
 ".deg_expert_group_idle_group>.deg_expert_group_children{margin:0;padding:0;--deg-parent-row-height:28px}",
 ".deg_expert_group_idle_group>.deg_expert_group_row.deg_expert_group_idle_header{display:grid;grid-template-columns:20px 20px minmax(0,1fr);align-items:center;height:28px;min-height:28px;padding:4px 0}",
 ".deg_expert_group_idle_group>.deg_expert_group_row{margin:0}",
-".deg_expert_group_fanout{position:relative;margin-top:0;padding-left:16px}",
-".deg_expert_group_fanout_header{display:grid;grid-template-columns:20px 20px minmax(0,1fr) auto;align-items:center;min-width:0;min-height:28px;gap:4px}",
-".deg_expert_group_fanout_shards{position:relative;min-width:0;--deg-parent-row-height:28px}",
-".deg_expert_group_fanout_shards>.deg_expert_group_shard{--deg-tree-anchor:13px;position:relative}",
-".deg_expert_group_fanout_shards>.deg_expert_group_shard:first-child:before{position:absolute;top:calc(var(--deg-tree-anchor) - var(--deg-parent-row-height));bottom:calc(100% - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-".deg_expert_group_fanout_shards>.deg_expert_group_shard:not(:last-child):after{position:absolute;top:var(--deg-tree-anchor);bottom:calc(0px - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-".deg_expert_group_shard{display:grid;grid-template-columns:20px 20px minmax(0,1fr) auto;min-width:0;min-height:48px;padding:3px 0;gap:0 3px}",
-".deg_expert_group_shard[data-expanded=false]{min-height:24px}",
 ".deg_expert_group_actions{display:flex;align-items:flex-start;gap:2px}",
 ".deg_expert_group_action{width:24px;height:24px;padding:0}",
 ".deg_expert_group_action:disabled{opacity:.45;cursor:wait}",
@@ -2968,7 +2707,6 @@ const PANEL_CSS_SHELL=[
 ".deg_expert_group_attempt_cost[data-cost-configured=false]{color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary))}",
 ".deg_expert_group_structured{min-width:0;margin:2px 0 0;padding:2px 4px;border-inline-start:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:15px;overflow-wrap:anywhere;max-height:84px;overflow:auto}",
 ".deg_expert_group_structured[data-fallback=true]{border-inline-start-color:var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
-".deg_expert_group_shard_extra{display:flex;flex-direction:column;min-width:0}",
 ].join("");
 const PANEL_CSS_SESSION_MODEL=[
 ".deg_expert_group_session_model_dialog{position:fixed;inset:0;margin:auto;box-sizing:border-box;width:min(920px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100vh - 48px);padding:0;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;box-shadow:0 18px 48px rgba(0,0,0,.28);overflow:hidden}",
@@ -3015,8 +2753,6 @@ const PANEL_CSS_TIMELINE=[
 ".deg_expert_group_attempts_toggle{flex:0 0 auto;align-self:flex-start;box-sizing:border-box;height:20px;margin:1px 0 0;padding:0 4px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
 ".deg_expert_group_attempts_toggle:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
 ".deg_expert_group_attempts_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-".deg_expert_group_fanout_title{display:flex;align-items:center;min-width:0}",
-".deg_expert_group_fanout_title>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
 ".deg_expert_group_toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:5px 0 2px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
 ".deg_expert_group_search{flex:1 1 120px;min-width:0;box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px}",
 ".deg_expert_group_filter{flex:0 1 auto;min-width:0;box-sizing:border-box;height:24px;padding:0 2px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px;color-scheme:light}",
@@ -3328,7 +3064,7 @@ const value=Number(match[1]);
 return Number.isFinite(value)?value:null;
 }
 global[SYMBOL]=Object.freeze({
-RIGHTBAR_DRAG_HANDLE_SELECTOR,SUBAGENT_CHAT_KIND,capabilityAllowed,createBrandIcon,
+RIGHTBAR_DRAG_HANDLE_SELECTOR,SUBAGENT_CHAT_KIND,createBrandIcon,
 createCatalogLookup,currentSessionIdOf,expertGroupTabIdsOf,getOpenSession,
 hostAppFrameWidthOf,listSnapshot,makeIcon,metadataOf,
 methodOf,normalizeSubagentAddress,paneNodesOf,parseSplitTracks,
@@ -3400,29 +3136,6 @@ if(failureDelay>0)return failureDelay;
 if(source.running!==false)return PANEL_POLL_TIMINGS.activeMs;
 return panelIdleDelayMs(source.idleLevel);
 }
-function readFanoutEventBatch(raw){
-const source=object(raw);
-const events=Array.isArray(source.events)?source.events:null;
-const cursor=Number.isSafeInteger(source.cursor)&&source.cursor>=0?source.cursor:null;
-const earliestSequence=Number.isSafeInteger(source.earliestSequence)&&source.earliestSequence>0
-?source.earliestSequence
-:null;
-return{
-events,
-cursor,
-earliestSequence,
-gap:source.gap===true,
-dropped:Number.isSafeInteger(source.dropped)&&source.dropped>0?source.dropped:0,
-conclusive:events!==null,
-};
-}
-function fanoutBatchIsStale(batch,cursor){
-if(batch===null||batch===undefined)return false;
-if(batch.gap===true)return true;
-if(batch.earliestSequence===null||batch.earliestSequence===undefined)return false;
-const after=Number.isSafeInteger(cursor)&&cursor>=0?cursor:0;
-return batch.earliestSequence>1&&after<batch.earliestSequence;
-}
 function snapshotHasRunningWork(snapshot){
 if(snapshot===null||typeof snapshot!=="object")return false;
 if(snapshot.partial===true)return true;
@@ -3439,7 +3152,6 @@ let status;
 try{status=runtimeStatusOf(node,undefined,{});}catch{status="unknown";}
 if(status==="running")return true;
 if(Array.isArray(node.children))for(const child of node.children)pending.push(child);
-if(Array.isArray(node.shards))for(const shard of node.shards)pending.push(shard);
 }
 return false;
 }
@@ -3589,8 +3301,8 @@ return typeof select==="function"?select(response):(response?.snapshot??response
 }
 global[SYMBOL]=Object.freeze({
 PANEL_ERROR_SOURCES,PANEL_POLL_TIMINGS,RPC_FAILURE_TRANSPORT,applyPanelPollCycle,
-callRpc,fanoutBatchIsStale,panelNextPollDelayMs,
-readFanoutEventBatch,readPanelTabActivity,rpcFailureKindOf,samePanelSnapshot,
+callRpc,panelNextPollDelayMs,
+readPanelTabActivity,rpcFailureKindOf,samePanelSnapshot,
 snapshotHasRunningWork,
 });
 })(globalThis);
@@ -4120,10 +3832,9 @@ const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-tab-state");
 const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
 const PURE=global[PURE_SYMBOL]||{};
 const{
-FANOUT_SETTLED_STATUSES,RIGHTBAR_FLOAT_SELECTOR,RIGHTBAR_FLOAT_TITLE_SELECTOR,
+RIGHTBAR_FLOAT_SELECTOR,RIGHTBAR_FLOAT_TITLE_SELECTOR,
 SIDEBAR_AUTO_CLOSE_COOLDOWN_BASE_MS,SIDEBAR_AUTO_CLOSE_COOLDOWN_MAX_MS,
 SIDEBAR_AUTO_KEY_LIMIT,SIDEBAR_TAB_KEY_SEPARATOR,
-latestShardChildIdOf,
 object,statusOf,text,
 }=PURE;
 const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
@@ -4152,24 +3863,10 @@ function knownSidebarResourceAddresses(snapshot,rootSessionId,addressOf){
 const addresses=new Set();
 const add=(node,parentId)=>{
 const source=object(node);
-if(source.kind==="fanout"){
-const shards=Array.isArray(source.shards)?source.shards:[];
-for(const shard of shards){
-const shardSource=object(shard);
-const childId=text(latestShardChildIdOf(shardSource),null);
-if(childId===null)continue;
-const address=subagentChatAddress(addressOf(childId,parentId,{
-...shardSource,
-kind:"expert",
-}));
-if(address!==null)addresses.add(address);
-}
-}else{
 const childId=text(source.sessionId,text(source.childId,null));
 if(childId!==null){
 const address=subagentChatAddress(addressOf(childId,parentId,source));
 if(address!==null)addresses.add(address);
-}
 }
 if(Array.isArray(source.children)){
 for(const child of source.children)add(child,parentId);
@@ -4183,26 +3880,7 @@ function sidebarExpertResourceAddresses(node,parentId,addresses,deps){
 const addressOf=deps.addressOf;
 const statusOfNode=deps.statusOf;
 const source=object(node);
-const kind=text(source.kind,null);
-if(kind==="fanout"){
-const shards=Array.isArray(source.shards)?source.shards:[];
-for(const shard of shards){
-const shardSource=object(shard);
-const childId=text(latestShardChildIdOf(shardSource),null);
-if(childId===null){
-deps.recordShardChildMissing?.(text(shardSource.shardId,null));
-continue;
-}
-if(statusOfNode(shardSource,parentId,childId)!=="running")continue;
-const address=subagentChatAddress(addressOf(childId,parentId,{
-...shardSource,
-kind:"expert",
-}));
-if(address!==null)addresses.add(address);
-}
-return;
-}
-if(kind!=="expert")return;
+if(text(source.kind,null)!=="expert")return;
 const childId=text(source.sessionId,text(source.childId,null));
 if(childId!==null&&statusOfNode(source,parentId,childId)==="running"){
 const address=subagentChatAddress(addressOf(childId,parentId,source));
@@ -4222,11 +3900,8 @@ return deps.partial===true&&status===deps.neutralStatus;
 }
 function sidebarIdleChildren(children,rootSessionId,deps){
 return(Array.isArray(children)?children:[])
-.filter((node)=>{
-if(node.kind==="fanout")return FANOUT_SETTLED_STATUSES.has(statusOf(node));
-return node.kind==="expert"
-&&sidebarNodeIsIdleMembership(node,rootSessionId,text(node.sessionId,null),deps);
-});
+.filter((node)=>node.kind==="expert"
+&&sidebarNodeIsIdleMembership(node,rootSessionId,text(node.sessionId,null),deps));
 }
 function runningSidebarResourceAddresses(children,rootSessionId,deps){
 const addresses=new Set();
@@ -4239,19 +3914,6 @@ function idleSidebarResourceAddresses(nodes,rootSessionId,deps){
 const addresses=new Set();
 for(const node of Array.isArray(nodes)?nodes:[]){
 const source=object(node);
-if(source.kind==="fanout"){
-for(const shard of Array.isArray(source.shards)?source.shards:[]){
-const shardSource=object(shard);
-const shardChildId=text(latestShardChildIdOf(shardSource),null);
-if(shardChildId===null||sidebarNodeIsIdleReady(shardSource,rootSessionId,shardChildId,deps)!==true)continue;
-const shardAddress=subagentChatAddress(deps.addressOf(shardChildId,rootSessionId,{
-...shardSource,
-kind:"expert",
-}));
-if(shardAddress!==null)addresses.add(shardAddress);
-}
-continue;
-}
 const childId=text(source.sessionId,text(source.childId,null));
 if(childId===null)continue;
 if(sidebarNodeIsIdleReady(source,rootSessionId,text(source.sessionId,null),deps)!==true)continue;
@@ -4523,22 +4185,6 @@ if(key==="ArrowLeft")return base-WIDTH_RATIO_KEY_STEP;
 if(key==="ArrowRight")return base+WIDTH_RATIO_KEY_STEP;
 return null;
 }
-function normalizeFanoutCursor(cursor,rootSessionId){
-if(cursor!==null&&cursor!==undefined&&cursor.rootSessionId===rootSessionId)return cursor;
-return{rootSessionId,cursor:0};
-}
-function adoptFanoutCursor(cursor,requestRoot,envelope){
-const next=Number.isSafeInteger(envelope?.cursor)&&envelope.cursor>=0?envelope.cursor:null;
-if(next===null)return null;
-if(cursor.rootSessionId!==requestRoot)return null;
-return{rootSessionId:requestRoot,cursor:Math.max(cursor.cursor,next)};
-}
-function advanceFanoutCursor(cursor,rootSessionId,nextCursor){
-if(!Number.isSafeInteger(nextCursor)||nextCursor<0)return null;
-if(cursor.rootSessionId!==rootSessionId)return null;
-if(nextCursor<=cursor.cursor)return null;
-return{rootSessionId,cursor:nextCursor};
-}
 function deriveSurfaceToken(scope,token,rootSessionId,sidebarSessionId){
 if(scope===null||scope===undefined
 ||scope.rootSessionId!==rootSessionId
@@ -4568,8 +4214,6 @@ return visible.join(options?.locale==="en"?"; ":"；");
 }
 global[SYMBOL]=Object.freeze({
 EMPTY_TASK_FILTER,
-adoptFanoutCursor,
-advanceFanoutCursor,
 announcementTextOf,
 createPanelTranslator,
 deriveSurfaceToken,
@@ -4578,7 +4222,6 @@ nextAnnouncementBaseline,
 nextFilterPatch,
 nextWidthRatioFromDrag,
 nextWidthRatioFromKey,
-normalizeFanoutCursor,
 resolvePanelLocale,
 selectTaskFilter,
 });
@@ -5200,7 +4843,6 @@ const renderMetrics=(ctx,node,options={})=>{
 const{react}=ctx;
 const source=object(node);
 const status=statusOf(source);
-const kind=text(options.kind,text(source.kind,"expert"));
 const runtimeStatus=text(options.runtimeStatus,null);
 const sessionId=text(options.sessionId,null);
 const sessionIds=Array.isArray(options.sessionIds)
@@ -5238,7 +4880,7 @@ const zeroFill=summary!==null&&(idlePlaceholder
 ||(summary.durationText!==null
 &&(runtimeStatus==="running"||dsh!==null||usage!==null||summary.totalTokens!==null)));
 const fill=zeroFill&&typeof api?.zeroFilledUsageMetrics==="function"
-?api.zeroFilledUsageMetrics(summary,{skipContext:kind==="fanout"})
+?api.zeroFilledUsageMetrics(summary)
 :null;
 if(fill!==null)summary=fill.metrics;
 const segments=[];
@@ -5302,7 +4944,7 @@ const failure=isFailureStatusOf(status)?ctx.a.renderFailureSummary(source.failur
 if(segments.length===0&&retryWarning===null&&failure===null)return null;
 return react.createElement("div",{
 className:"deg_expert_group_metrics",
-"data-metrics-kind":kind,
+"data-metrics-kind":source.kind||"expert",
 role:"group",
 "aria-label":"任务用量摘要",
 },...segments,retryWarning,failure);
@@ -5311,7 +4953,6 @@ const renderRowMain=(ctx,node,options={})=>{
 const{react,subagentAddressOfChild,handleOpen,navigation}=ctx;
 const source=object(node);
 const fullName=titleOf(source);
-const oneLine=options.oneLine!==false;
 const parentId=text(options.parentId,null);
 const clickableId=text(options.sessionId,text(source.sessionId,text(source.childId,null)));
 const address=subagentAddressOfChild(clickableId,parentId,source);
@@ -5331,8 +4972,7 @@ tabIndex:0,
 onKeyDown,
 };
 const metadata=metadataOf(source,ctx.a.mergedRoleLabels);
-const taskClassName="deg_expert_group_line deg_expert_group_task"
-+(oneLine?"":" deg_expert_group_shard_task");
+const taskClassName="deg_expert_group_line deg_expert_group_task";
 const trailing=options.trailing===undefined?null:options.trailing;
 const taskChildren=[
 react.createElement("div",{className:taskClassName,title:fullName,onClick:onNavigate,...navigateProps},fullName),
@@ -5369,12 +5009,12 @@ const SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-views-c");
 const PURE_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-pure");
 const PURE=global[PURE_SYMBOL]||{};
 const{
-ACTIVE_STATUSES,RETRY_STATUSES,RUNTIME_STATUS_LABELS,STATUS_FILTER_OPTIONS,
-normalizeSessionModelSelection,object,sessionModelModelOptions,sessionModelOrchestratorOf,sessionModelRolesOf,statusOf,text,
+STATUS_FILTER_OPTIONS,
+normalizeSessionModelSelection,object,sessionModelModelOptions,sessionModelOrchestratorOf,sessionModelRolesOf,text,
 }=PURE;
 const DOM_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-dom");
 const DOM=global[DOM_SYMBOL]||{};
-const{capabilityAllowed,runtimeStatusOf,statusIcon}=DOM;
+const{statusIcon}=DOM;
 const renderExpert=(ctx,node,index,parentId,treeMeta)=>{
 const{react,primitives,passesFilter,partialSnapshot,expand}=ctx;
 if(passesFilter(node)!==true)return null;
@@ -5443,127 +5083,7 @@ role:"treeitem",
 statusIcon(react,primitives,idleGroupStatus),
 ctx.a.renderChevron(group,open),
 react.createElement("div",{className:"deg_expert_group_idle_title_line"},...idleTitleChildren)),
-open?react.createElement("div",{className:"deg_expert_group_children deg_expert_group_idle_children",role:"group"},members.map((node,index)=>node.kind==="fanout"?renderFanout(ctx,node,index,{level:meta.level+1,posinset:index+1,setsize:members.length}):renderExpert(ctx,node,index,rootSessionId,{level:meta.level+1,posinset:index+1,setsize:members.length}))):null);
-};
-const renderShard=(ctx,task,shard,index,treeMeta)=>{
-const{react,primitives,rootSessionId,runAction,isActionPending}=ctx;
-const shardKey=text(shard.shardId,"shard-"+index);
-const latestChildId=text(shard.childId,null);
-const status=statusOf(shard);
-const shardTaskName=text(shard.taskName,null);
-const shardNode={
-...shard,
-id:task.parentTaskId+":"+shardKey,
-kind:"expert",
-taskName:shardTaskName===null||shardTaskName===shardKey?shardKey:shardKey+"  "+shardTaskName,
-content:text(shard.prompt,""),
-};
-const cancelKey="cancel:"+task.parentTaskId+":"+shardKey;
-const retryKey="retry:"+task.parentTaskId+":"+shardKey;
-const actions=[];
-const cancelCapability=capabilityAllowed(shard,"cancel");
-const retryCapability=capabilityAllowed(shard,"retry");
-const showCancel=cancelCapability===null?ACTIVE_STATUSES.has(status):cancelCapability===true;
-const showRetry=retryCapability===null?RETRY_STATUSES.has(status):retryCapability===true;
-if(showCancel)actions.push(ctx.a.renderAction("取消分片 "+shardKey,"IconStopFillRegular",()=>runAction({action:"fanout-cancel-shard",parentTaskId:task.parentTaskId,shardId:shardKey},cancelKey,true,"确认取消分片 "+shardKey+"？"),isActionPending(cancelKey)));
-if(showRetry)actions.push(ctx.a.renderAction("重试分片 "+shardKey,"IconRefreshOutlineRegular",()=>runAction({action:"fanout-retry-shard",parentTaskId:task.parentTaskId,shardId:shardKey},retryKey,false,""),isActionPending(retryKey)));
-const runtimeStatus=ctx.runtimeStatusOfNode(shardNode,rootSessionId,latestChildId);
-const shardStructured=ctx.a.renderStructuredBlock(shard.structured,shard.outputSchemaRequested,{kind:"shard"});
-const shardFooter=shardStructured===null
-?null
-:react.createElement("div",{className:"deg_expert_group_shard_extra"},shardStructured);
-const meta=treeMeta!==undefined&&treeMeta!==null
-?treeMeta
-:{level:3,posinset:index+1,setsize:index+1};
-return react.createElement("div",{
-key:shardKey,
-className:"deg_expert_group_shard",
-role:"treeitem",
-"aria-level":meta.level,
-"aria-posinset":meta.posinset,
-"aria-setsize":meta.setsize,
-"data-shard-id":shardKey,
-"data-status":runtimeStatus,
-"data-expanded":true,
-},
-statusIcon(react,primitives,runtimeStatus),
-react.createElement("span",{className:"deg_expert_group_chevron_placeholder","aria-hidden":"true"}),
-ctx.b.renderRowMain(shardNode,{
-sessionId:latestChildId,
-parentId:rootSessionId,
-oneLine:false,
-metrics:ctx.b.renderMetrics(shard,{kind:"shard",runtimeStatus,sessionId:latestChildId,sessionIds:[latestChildId]}),
-footer:shardFooter,
-}),
-react.createElement("div",{className:"deg_expert_group_actions"},actions));
-};
-const renderFanout=(ctx,task,index,treeMeta)=>{
-const{react,primitives,expand,handleOpen,navigation,passesFilter,filterActive,taskFilter,runAction,isActionPending}=ctx;
-if(passesFilter(task)!==true)return null;
-const shards=Array.isArray(task.shards)?task.shards:[];
-const visibleShards=filterActive===true&&taskFilter!==null?taskFilter.shardsFor(task):shards;
-const open=expand(task);
-const incomplete=shards.filter((shard)=>ACTIVE_STATUSES.has(statusOf(shard))).length;
-const parentKey="cancel-parent:"+task.parentTaskId;
-const cancelCapability=capabilityAllowed(task,"cancel");
-const showCancel=cancelCapability===null
-?(ACTIVE_STATUSES.has(statusOf(task))||incomplete>0)
-:cancelCapability===true;
-const actions=showCancel
-?[ctx.a.renderAction("取消父任务（未完成 "+incomplete+" 个分片）","IconStopFillRegular",()=>runAction({action:"fanout-cancel-parent",parentTaskId:task.parentTaskId},parentKey,true,"确认取消父任务？未完成 "+incomplete+" 个分片。"),isActionPending(parentKey))]
-:[];
-const runtimeStatus=runtimeStatusOf(task,null);
-const meta=treeMeta!==undefined&&treeMeta!==null
-?treeMeta
-:{level:2,posinset:index+1,setsize:index+1};
-const fanoutRole=ctx.a.roleLabelFor(task.role,task.roleLabel)??"Expert";
-const fanoutTitle=fanoutRole.charAt(0).toUpperCase()+fanoutRole.slice(1)
-+" · "+shards.length+" shards · "+RUNTIME_STATUS_LABELS[runtimeStatusOf(task,null)];
-const fanoutNavigationId=(()=>{
-const explicit=text(task.sessionId,null);
-if(explicit!==null)return explicit;
-let fallback=null;
-for(const shard of visibleShards){
-const childId=text(object(shard).childId,null);
-if(childId===null)continue;
-if(ACTIVE_STATUSES.has(statusOf(shard)))return childId;
-if(fallback===null)fallback=childId;
-}
-return fallback;
-})();
-const fanoutNavigable=navigation.available===true&&fanoutNavigationId!==null;
-const onFanoutKeyDown=fanoutNavigable
-?(event)=>{
-if(event?.key!=="Enter"&&event?.key!==" ")return;
-event.preventDefault?.();
-event.stopPropagation?.();
-handleOpen(fanoutNavigationId);
-}
-:undefined;
-return react.createElement("div",{key:task.parentTaskId||"fanout-"+index,className:"deg_expert_group_fanout",role:"none","data-status":runtimeStatus,"data-task-status":statusOf(task)},
-react.createElement("div",{
-className:"deg_expert_group_fanout_header",
-role:"treeitem",
-"aria-level":meta.level,
-"aria-posinset":meta.posinset,
-"aria-setsize":meta.setsize,
-"aria-expanded":open,
-},
-statusIcon(react,primitives,runtimeStatus),
-ctx.a.renderChevron(task,open),
-react.createElement("div",{className:"deg_expert_group_fanout_title"},
-react.createElement("div",{
-className:"deg_expert_group_line deg_expert_group_task",
-title:fanoutTitle,
-...(fanoutNavigable?{role:"button",tabIndex:0,"aria-label":"打开任务会话："+fanoutTitle,onKeyDown:onFanoutKeyDown}:{}),
-onClick:fanoutNavigable?()=>handleOpen(fanoutNavigationId):undefined,
-},fanoutTitle)),
-react.createElement("div",{className:"deg_expert_group_actions"},actions)),
-open?react.createElement("div",{className:"deg_expert_group_fanout_shards deg_expert_group_tree_children",role:"group"},visibleShards.map((shard,shardIndex)=>renderShard(ctx,task,shard,shardIndex,{
-level:meta.level+1,
-posinset:shardIndex+1,
-setsize:visibleShards.length,
-}))):null);
+open?react.createElement("div",{className:"deg_expert_group_children deg_expert_group_idle_children",role:"group"},members.map((node,index)=>renderExpert(ctx,node,index,rootSessionId,{level:meta.level+1,posinset:index+1,setsize:members.length}))):null);
 };
 const sessionModelOptionOf=(ctx,value,label,disabled)=>{
 const{react}=ctx;
@@ -5997,7 +5517,6 @@ const collectRoles=(nodes)=>{
 for(const node of Array.isArray(nodes)?nodes:[]){
 addRole(node.role);
 collectRoles(node.children);
-for(const shard of Array.isArray(node.shards)?node.shards:[])addRole(shard.role);
 }
 };
 collectRoles(root?.children);
@@ -6050,8 +5569,6 @@ const deps={...ctx,a:viewsA,b:viewsB};
 return Object.freeze({
 renderExpert:(node,index,parentId,treeMeta)=>renderExpert(deps,node,index,parentId,treeMeta),
 renderIdleGroup:(nodes,trailing,treeMeta)=>renderIdleGroup(deps,nodes,trailing,treeMeta),
-renderShard:(task,shard,index,treeMeta)=>renderShard(deps,task,shard,index,treeMeta),
-renderFanout:(task,index,treeMeta)=>renderFanout(deps,task,index,treeMeta),
 renderToolbar:()=>renderToolbar(deps),
 renderSessionModelDialog:()=>renderSessionModelDialog(deps),
 });
@@ -6748,21 +6265,13 @@ sidebarAutoCascadeRef.current=false;
 }
 });
 }
-const recordShardChildMissing=(shardId)=>{
-recordSidebarAutoDecision(
-"open",
-{key:"shard-child-missing:"+text(shardId,"unknown"),kind:"open"},
-"skip",
-"shard-child-missing",
-);
-};
 function syncAutoSidebarTabs(){
 const source=snapshot;
 if(source===null||source===undefined)return;
 if(text(source.rootSessionId,null)!==rootSessionId)return;
 const enabled=autoOpenEnabled();
 const known=knownSidebarResourceAddresses();
-const running=runningSidebarResourceAddresses(enabled===true?recordShardChildMissing:undefined);
+const running=runningSidebarResourceAddresses();
 sweepAutoOpenPlaceholders(running);
 let candidate=null;
 if(enabled===true&&sidebarAutoBusyRef.current!==true){
@@ -9333,8 +8842,8 @@ methodOf,sidebarOnScreenSessionOf,subscribeSessions,
 const POLL_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-poll");
 const POLL=global[POLL_SYMBOL]||{};
 const{
-PANEL_ERROR_SOURCES,PANEL_POLL_TIMINGS,applyPanelPollCycle,callRpc,fanoutBatchIsStale,panelNextPollDelayMs,
-readFanoutEventBatch,samePanelSnapshot,snapshotHasRunningWork,
+PANEL_ERROR_SOURCES,PANEL_POLL_TIMINGS,applyPanelPollCycle,callRpc,panelNextPollDelayMs,
+samePanelSnapshot,
 }=POLL;
 const PANEL_STATE_A_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-state-a");
 const PANEL_STATE_A=global[PANEL_STATE_A_SYMBOL]||{};
@@ -9510,10 +9019,6 @@ react,rootSessionId,state,
 const refreshStateRef=typeof react.useRef==="function"
 ?react.useRef({rootSessionId:null,inFlight:null,pending:false})
 :{current:{rootSessionId:null,inFlight:null,pending:false}};
-const fanoutCursorRef=typeof react.useRef==="function"
-?react.useRef({rootSessionId,cursor:0})
-:{current:{rootSessionId,cursor:0}};
-fanoutCursorRef.current=PANEL_STATE_A.normalizeFanoutCursor(fanoutCursorRef.current,rootSessionId);
 const latestSnapshotRef=typeof react.useRef==="function"
 ?react.useRef(state.snapshot)
 :{current:state.snapshot};
@@ -9526,20 +9031,14 @@ const pollSyncStateRef=typeof react.useRef==="function"
 ?react.useRef({rootSessionId:null,inFlight:null,pending:false})
 :{current:{rootSessionId:null,inFlight:null,pending:false}};
 const pollCycleSequenceRef=typeof react.useRef==="function"?react.useRef(0):{current:0};
-const adoptFanoutCursorFromSnapshot=(requestRoot,envelope)=>{
-const next=PANEL_STATE_A.adoptFanoutCursor(fanoutCursorRef.current,requestRoot,envelope);
-if(next===null)return false;
-fanoutCursorRef.current=next;
-return true;
-};
 Object.assign(frame,{
-adoptFanoutCursorFromSnapshot,fanoutCursorRef,latestPanelErrorRef,latestSnapshotRef,pollCycleSequenceRef,pollSyncStateRef,
+latestPanelErrorRef,latestSnapshotRef,pollCycleSequenceRef,pollSyncStateRef,
 refreshStateRef,
 });
 }
 function createPanelRefreshAction(deps){
 const{
-adoptFanoutCursorFromSnapshot,config,contextRef,mountedRef,peekCachedSnapshot,
+config,contextRef,mountedRef,peekCachedSnapshot,
 refreshStateRef,requestSequenceRef,rootSessionId,setState,writeCachedSnapshot,
 }=deps;
 return function refresh(refreshOptions){
@@ -9590,7 +9089,7 @@ error:null,
 };
 });
 const promise=fetchPanelSnapshot({
-adoptFanoutCursorFromSnapshot,cachedBaseline,commitManualTimestamp,config,contextRef,controller,
+cachedBaseline,commitManualTimestamp,config,contextRef,controller,
 mountedRef,outcomeReason:text(refreshOptions?.reason,"refresh"),refresh,refreshState,request,
 requestSequence,requestSequenceRef,rootSessionId,setState,writeCachedSnapshot,
 });
@@ -9600,7 +9099,7 @@ return promise;
 }
 async function fetchPanelSnapshot(ctx){
 const{
-adoptFanoutCursorFromSnapshot,cachedBaseline,commitManualTimestamp,config,contextRef,controller,
+cachedBaseline,commitManualTimestamp,config,contextRef,controller,
 mountedRef,outcomeReason,refresh,refreshState,request,requestSequence,requestSequenceRef,
 rootSessionId,setState,writeCachedSnapshot,
 }=ctx;
@@ -9624,7 +9123,6 @@ outcome={ok:true,snapshot:next,stale:current!==true,reason:outcome.reason};
 if(current){
 const updatedAt=Date.now();
 writeCachedSnapshot(rootSessionId,next,updatedAt);
-adoptFanoutCursorFromSnapshot(rootSessionId,envelope);
 setState((previous)=>{
 const keptError=previous.error!==null&&previous.error.source===PANEL_ERROR_SOURCES.action
 ?previous.error
@@ -9685,95 +9183,32 @@ return outcome;
 }
 function createPanelPollCycle(deps){
 const{
-advanceFanoutCursor,config,contextRef,fanoutCursorRef,latestPanelErrorRef,latestSnapshotRef,
+latestPanelErrorRef,latestSnapshotRef,
 pollCycleSequenceRef,pollSyncStateRef,pollSurfaceStillCurrent,refresh,rootSessionId,
 }=deps;
-const pollOnce=async(request)=>{
+const pollOnce=async()=>{
 const nextId=()=>{
 pollCycleSequenceRef.current+=1;
 return pollCycleSequenceRef.current;
 };
-const cancelledCycle=(outcome)=>({id:nextId(),outcome,ok:false,cancelled:true,snapshot:null});
 const partialBaseline=latestSnapshotRef.current!==null&&latestSnapshotRef.current?.partial===true;
 const lastSnapshotError=latestPanelErrorRef.current;
 const retryAfterFailure=lastSnapshotError!==null
 &&lastSnapshotError!==undefined
 &&lastSnapshotError.source===PANEL_ERROR_SOURCES.snapshot;
-if(partialBaseline||retryAfterFailure){
-const full=(await refresh({reason:partialBaseline?"partial":"retry"}))??{};
+const reason=partialBaseline?"partial":(retryAfterFailure?"retry":"poll");
+const full=(await refresh({reason}))??{};
 return{
 id:nextId(),
-outcome:partialBaseline?"partial":"retry",
+outcome:reason,
 ok:full.ok===true,
 cancelled:full.aborted===true||full.stale===true,
 snapshot:full.snapshot??null,
-};
-}
-const cursorBefore=fanoutCursorRef.current.rootSessionId===rootSessionId?fanoutCursorRef.current.cursor:0;
-let batch=null;
-try{
-const response=await callRpc(
-config,
-contextRef.current,
-{action:"fanout-events",sessionId:rootSessionId,after:cursorBefore},
-request.controller===null?{}:{signal:request.controller.signal},
-);
-batch=readFanoutEventBatch(response);
-}catch(error){
-const aborted=request.controller?.signal?.aborted===true||error?.name==="AbortError";
-if(aborted)return cancelledCycle("cancelled");
-batch=null;
-}
-if(!pollSurfaceStillCurrent())return cancelledCycle("stale");
-if(batch!==null&&batch.conclusive){
-if(fanoutBatchIsStale(batch,cursorBefore)){
-const full=(await refresh({reason:"gap"}))??{};
-if(full.ok===true&&full.stale!==true&&full.merged!==true)advanceFanoutCursor(batch.cursor);
-return{
-id:nextId(),
-outcome:"gap",
-ok:full.ok===true,
-cancelled:full.aborted===true||full.stale===true,
-snapshot:full.snapshot??null,
-};
-}
-if(batch.events.length>0){
-const full=(await refresh({reason:"events"}))??{};
-if(full.ok===true&&full.stale!==true&&full.merged!==true)advanceFanoutCursor(batch.cursor);
-return{
-id:nextId(),
-outcome:"events",
-ok:full.ok===true,
-cancelled:full.aborted===true||full.stale===true,
-snapshot:full.snapshot??null,
-};
-}
-advanceFanoutCursor(batch.cursor);
-if(snapshotHasRunningWork(latestSnapshotRef.current)){
-const full=(await refresh({reason:"running"}))??{};
-return{
-id:nextId(),
-outcome:"running",
-ok:full.ok===true,
-cancelled:full.aborted===true||full.stale===true,
-snapshot:full.snapshot??null,
-};
-}
-return{id:nextId(),outcome:"none",ok:true,cancelled:false,snapshot:null};
-}
-const fallback=(await refresh({reason:"events-unavailable"}))??{};
-return{
-id:nextId(),
-outcome:"fallback",
-ok:fallback.ok===true,
-cancelled:fallback.aborted===true||fallback.stale===true,
-snapshot:fallback.snapshot??null,
 };
 };
 const runPollCycle=()=>{
 const state=pollSyncStateRef.current;
 if(state.rootSessionId!==rootSessionId){
-state.inFlight?.controller?.abort?.();
 state.inFlight=null;
 state.pending=false;
 state.rootSessionId=rootSessionId;
@@ -9782,19 +9217,15 @@ if(state.inFlight!==null){
 state.pending=true;
 return state.inFlight.promise;
 }
-const request={
-rootSessionId,
-controller:typeof globalThis.AbortController==="function"?new globalThis.AbortController():null,
-promise:null,
-};
+const request={rootSessionId,promise:null};
 state.inFlight=request;
 const promise=(async()=>{
 let cycle=null;
 try{
-cycle=await pollOnce(request);
+cycle=await pollOnce();
 while(state.pending&&state.inFlight===request&&pollSurfaceStillCurrent()){
 state.pending=false;
-cycle=await pollOnce(request);
+cycle=await pollOnce();
 }
 }catch{
 pollCycleSequenceRef.current+=1;
@@ -9812,18 +9243,12 @@ return{pollOnce,runPollCycle};
 }
 function useSidebarPanelPolling(frame){
 const{
-adoptFanoutCursorFromSnapshot,config,contextRef,fanoutCursorRef,latestPanelErrorRef,latestSnapshotRef,
+config,contextRef,latestPanelErrorRef,latestSnapshotRef,
 mountedRef,peekCachedSnapshot,pollCycleSequenceRef,pollSyncStateRef,react,refreshStateRef,
 requestSequenceRef,rootSessionId,setState,sidebarSurfaceStillCurrent,state,writeCachedSnapshot,
 }=frame;
-const advanceFanoutCursor=(nextCursor)=>{
-const next=PANEL_STATE_A.advanceFanoutCursor(fanoutCursorRef.current,rootSessionId,nextCursor);
-if(next===null)return false;
-fanoutCursorRef.current=next;
-return true;
-};
 const refresh=createPanelRefreshAction({
-adoptFanoutCursorFromSnapshot,config,contextRef,mountedRef,peekCachedSnapshot,refreshStateRef,
+config,contextRef,mountedRef,peekCachedSnapshot,refreshStateRef,
 requestSequenceRef,rootSessionId,setState,writeCachedSnapshot,
 });
 const refreshRef=typeof react.useRef==="function"?react.useRef(refresh):{current:refresh};
@@ -9831,12 +9256,11 @@ refreshRef.current=refresh;
 const panelSchedulerRef=typeof react.useRef==="function"?react.useRef(null):{current:null};
 const pollSurfaceStillCurrent=()=>sidebarSurfaceStillCurrent();
 const{pollOnce,runPollCycle}=createPanelPollCycle({
-advanceFanoutCursor,config,contextRef,fanoutCursorRef,latestPanelErrorRef,latestSnapshotRef,
+latestPanelErrorRef,latestSnapshotRef,
 pollCycleSequenceRef,pollSyncStateRef,pollSurfaceStillCurrent,refresh,rootSessionId,
 });
 Object.assign(frame,{
-advanceFanoutCursor,panelSchedulerRef,pollOnce,pollSurfaceStillCurrent,refresh,refreshRef,
-runPollCycle,
+panelSchedulerRef,pollOnce,pollSurfaceStillCurrent,refresh,refreshRef,runPollCycle,
 });
 }
 function useSidebarPanelMountEffects(frame){
@@ -10055,7 +9479,6 @@ const node=pending.pop();
 if(node===null||typeof node!=="object")continue;
 if(Number.isFinite(node.turnOpenSince)&&(node.running===true||node.status==="running"))return true;
 if(Array.isArray(node.children))pending.push(...node.children);
-if(Array.isArray(node.shards))pending.push(...node.shards);
 }
 return false;
 }
@@ -10280,12 +9703,11 @@ subagentAddressOfChild,
 }=frame;
 const runtimeStatusOfNode=(...args)=>frame.late.runtimeStatusOfNode(...args);
 const sidebarAutoCloseKeyIsActive=(...args)=>frame.late.sidebarAutoCloseKeyIsActive(...args);
-const tabTreeDeps=(recordShardChildMissing)=>({
+const tabTreeDeps=()=>({
 addressOf:subagentAddressOfChild,
 statusOf:runtimeStatusOfNode,
 partial:partialSnapshot,
 neutralStatus:neutralRuntimeStatus,
-...(typeof recordShardChildMissing==="function"?{recordShardChildMissing}:{}),
 });
 const autoCloseLedger=()=>({
 closeAttempts:sidebarAutoCloseAttemptsRef.current,
@@ -10319,10 +9741,10 @@ childId,
 tabTreeDeps(),
 );
 const sidebarIdleChildren=()=>TAB_STATE.sidebarIdleChildren(sidebarRootChildren(),rootSessionId,tabTreeDeps());
-const runningSidebarResourceAddresses=(recordShardChildMissing)=>TAB_STATE.runningSidebarResourceAddresses(
+const runningSidebarResourceAddresses=()=>TAB_STATE.runningSidebarResourceAddresses(
 sidebarRootChildren(),
 rootSessionId,
-tabTreeDeps(recordShardChildMissing),
+tabTreeDeps(),
 );
 const idleSidebarResourceAddresses=(nodes)=>TAB_STATE.idleSidebarResourceAddresses(
 nodes,
@@ -11448,9 +10870,6 @@ catalogEntryOf(parentId,childId??text(object(node).sessionId,null)),
 options,
 );
 const pendingSet=typeof react.useRef==="function"?react.useRef(new Set()):{current:new Set()};
-const recoveryRetryRef=typeof react.useRef==="function"
-?react.useRef({rootSessionId:null,inFlight:false,error:null})
-:{current:{rootSessionId:null,inFlight:false,error:null}};
 const runAction=async(request,key,requiresConfirm,message,options)=>{
 const actionOptions=object(options);
 if(mountedRef.current!==true)return null;
@@ -11505,53 +10924,12 @@ if(mountedRef.current===true)bump((value)=>value+1);
 };
 frame.late.runtimeStatusOfNode=runtimeStatusOfNode;
 Object.assign(frame,{
-pendingSet,recoveryRetryRef,runAction,runtimeStatusOfNode,
-});
-}
-function useSidebarPanelRunActionPart2(frame){
-const{
-bump,config,contextRef,currentRootRef,mountedRef,recoveryRetryRef,refreshRef,
-}=frame;
-const retryRecovery=async()=>{
-if(mountedRef.current!==true)return;
-const targetSessionId=typeof currentRootRef.current==="string"?currentRootRef.current:"";
-if(targetSessionId==="")return;
-const previous=recoveryRetryRef.current;
-if(previous.rootSessionId===targetSessionId&&previous.inFlight===true)return;
-recoveryRetryRef.current={rootSessionId:targetSessionId,inFlight:true,error:null};
-bump((value)=>value+1);
-let failure=null;
-try{
-const result=await callRpc(config,contextRef.current,{
-action:"fanout-restore-retry",
-sessionId:targetSessionId,
-});
-if(result?.restored!==true){
-const error=object(result?.error);
-const code=text(error.code,null);
-failure=code===null
-?{code:"NO_RESTORABLE_SNAPSHOT",message:"当前没有可恢复的持久化任务"}
-:{code,message:text(error.message,"")};
-}
-}catch(error){
-failure={
-code:"RETRY_FAILED",
-message:error instanceof Error?error.message:String(error),
-};
-}
-const stillCurrent=mountedRef.current===true&&currentRootRef.current===targetSessionId;
-recoveryRetryRef.current={rootSessionId:targetSessionId,inFlight:false,error:stillCurrent?failure:null};
-if(stillCurrent!==true)return;
-bump((value)=>value+1);
-await refreshRef.current();
-};
-Object.assign(frame,{
-retryRecovery,
+pendingSet,runAction,runtimeStatusOfNode,
 });
 }
 global[SYMBOL]=Object.freeze({
 useSidebarPanelActionHandlers,useSidebarPanelActionHandlersPart2,useSidebarPanelBatchClose,
-useSidebarPanelRunAction,useSidebarPanelRunActionPart2,useSidebarPanelTabRecorder,
+useSidebarPanelRunAction,useSidebarPanelTabRecorder,
 useSidebarPanelTabRecorderPart2,
 });
 })(globalThis);
@@ -11622,7 +11000,7 @@ const HOOKS_ACTIONS_SYMBOL=Symbol.for("dsh-expert-group/client-sidebar-panel-hoo
 const HOOKS_ACTIONS=global[HOOKS_ACTIONS_SYMBOL]||{};
 const{
 useSidebarPanelActionHandlers,useSidebarPanelActionHandlersPart2,useSidebarPanelBatchClose,
-useSidebarPanelRunAction,useSidebarPanelRunActionPart2,useSidebarPanelTabRecorder,
+useSidebarPanelRunAction,useSidebarPanelTabRecorder,
 useSidebarPanelTabRecorderPart2,
 }=HOOKS_ACTIONS;
 function createSidebarPanelShared(deps){
@@ -11797,7 +11175,7 @@ projectionRefreshRequestedRef,
 function assembleSidebarPanelBody(frame){
 const{
 emptyFilter,errorLabelOf,expand,filterState,idleSidebarResourceAddresses,model,
-partialSnapshot,pendingSet,react,recoveryRetryRef,renderSidebarBatchSlot,retryRecovery,
+partialSnapshot,pendingSet,react,renderSidebarBatchSlot,
 rootSessionId,runAction,runningSidebarResourceAddresses,runtimeStatusOfNode,sessionModelEntryRef,setFilterState,
 setSessionModelOpen,setSessionModelReloadToken,sidebarIdleChildren,snapshot,t,viewCtx,
 viewsA,viewsB,
@@ -11828,52 +11206,11 @@ root,filterSource,updateFilter,passesFilter,filterActive,taskFilter,
 runAction,isActionPending,runtimeStatusOfNode,sessionModelEntryRef,
 closeSessionModelDialog,toggleSessionModelDialog,retrySessionModelLoad,
 },viewsA,viewsB);
-const{renderExpert,renderIdleGroup,renderFanout,renderToolbar,renderSessionModelDialog}=viewsC;
+const{renderExpert,renderIdleGroup,renderToolbar,renderSessionModelDialog}=viewsC;
 const rootOpen=root===null?true:expand(root);
 const idleGroupVisible=!(filterActive===true&&visibleIdleChildren.length===0);
 const rootSiblingCount=visibleChildren.length+(idleGroupVisible?1:0);
 const rootStatus=runtimeStatusOf(root,null,{partial:partialSnapshot});
-const recovery=snapshot?.recovery??null;
-const recoveryFailed=recovery!==null&&recovery.status==="failed";
-const recoveryRetry=recoveryRetryRef.current;
-const recoveryRetryPending=recoveryRetry.inFlight===true&&recoveryRetry.rootSessionId===rootSessionId;
-const recoveryCode=recovery===null?null:text(recovery.code,"RESTORE_FAILED");
-const recoveryRetryError=recoveryFailed===true
-&&recoveryRetry.rootSessionId===rootSessionId
-&&recoveryRetry.error!==null
-&&(recoveryRetry.error.code===recoveryCode
-||recoveryRetry.error.code==="RETRY_FAILED"
-||recoveryRetry.error.code==="NO_RESTORABLE_SNAPSHOT")
-?recoveryRetry.error
-:null;
-const recoveryMessage=recovery===null?null:text(recovery.message,null);
-const recoveryBanner=recoveryFailed!==true
-?null
-:react.createElement("div",{
-className:"deg_expert_group_recovery",
-role:"alert",
-"data-recovery-status":"failed",
-"data-recovery-code":recoveryCode,
-title:recoveryMessage===null?"恢复失败（"+recoveryCode+"）":recoveryMessage,
-},
-react.createElement("span",{className:"deg_expert_group_recovery_text"},
-"任务恢复失败（"+recoveryCode+"）"+(recoveryMessage===null?"":"："+recoveryMessage)),
-recoveryRetryError===null
-?null
-:react.createElement("span",{className:"deg_expert_group_recovery_retry_error",role:"status"},
-"重试未恢复（"+text(recoveryRetryError.code,"RETRY_FAILED")+"）"
-+(text(recoveryRetryError.message,"")===""?"":"："+text(recoveryRetryError.message,""))),
-react.createElement("button",{
-type:"button",
-className:"deg_expert_group_recovery_retry",
-title:recovery.retryable===false
-?"该原因通常需要修复持久化快照后才能恢复；点击会重新读取当前持久化快照"
-:"重新读取当前持久化快照并重跑恢复",
-"aria-label":t("sidebar.recovery.retry"),
-"aria-busy":recoveryRetryPending||undefined,
-disabled:recoveryRetryPending,
-onClick:retryRecovery,
-},recoveryRetryPending?t("sidebar.recovery.retrying"):t("sidebar.recovery.retry")));
 const errorEmptyState=(panelError)=>react.createElement("div",{
 className:"deg_expert_group_empty deg_expert_group_error_empty",
 role:"alert",
@@ -11885,8 +11222,8 @@ errorLabelOf(panelError.source)),
 react.createElement("div",{className:"deg_expert_group_error_empty_detail"},panelError.message));
 Object.assign(frame,{
 children,closeSessionModelDialog,errorEmptyState,filterActive,filterSource,idleBatchSlot,
-idleChildren,idleGroupVisible,isActionPending,passesFilter,recovery,recoveryBanner,
-renderExpert,renderFanout,renderIdleGroup,renderSessionModelDialog,renderToolbar,retrySessionModelLoad,
+idleChildren,idleGroupVisible,isActionPending,passesFilter,
+renderExpert,renderIdleGroup,renderSessionModelDialog,renderToolbar,retrySessionModelLoad,
 root,rootBatchSlot,rootOpen,rootSiblingCount,rootStatus,taskFilter,
 toggleSessionModelDialog,updateFilter,visibleChildren,visibleIdleChildren,
 });
@@ -11894,7 +11231,7 @@ toggleSessionModelDialog,updateFilter,visibleChildren,visibleIdleChildren,
 function assembleSidebarPanelBodyPart2(frame){
 const{
 errorEmptyState,filterActive,idleBatchSlot,idleChildren,idleGroupVisible,primitives,
-react,renderChevron,renderExpert,renderFanout,renderIdleGroup,renderMetrics,
+react,renderChevron,renderExpert,renderIdleGroup,renderMetrics,
 renderRowMain,renderToolbar,root,rootBatchSlot,rootOpen,rootSessionId,
 rootSiblingCount,rootStatus,snapshot,t,taskFilter,viewState,
 visibleChildren,visibleIdleChildren,
@@ -11926,9 +11263,7 @@ trailing:rootBatchSlot,
 metrics:renderMetrics(root,{kind:"root",runtimeStatus:rootStatus,sessionId:root.sessionId,sessionIds:[root.sessionId]}),
 }))),
 rootOpen?react.createElement("div",{className:"deg_expert_group_children",role:"group"},[
-...visibleChildren.map((node,index)=>node.kind==="fanout"
-?renderFanout(node,index,{level:2,posinset:index+1,setsize:rootSiblingCount})
-:renderExpert(node,index,rootSessionId,{level:2,posinset:index+1,setsize:rootSiblingCount})),
+...visibleChildren.map((node,index)=>renderExpert(node,index,rootSessionId,{level:2,posinset:index+1,setsize:rootSiblingCount})),
 idleGroupVisible
 ?renderIdleGroup(filterActive===true?visibleIdleChildren:idleChildren,idleBatchSlot,{level:2,posinset:visibleChildren.length+1,setsize:rootSiblingCount})
 :null,
@@ -11944,7 +11279,7 @@ body,
 function renderSidebarPanelSection(frame){
 const{
 announcement,autoOpenDraft,autoOpenEnabled,body,config,diagFeedback,errorLabelOf,
-exportAutoDiag,panelLocale,peakValleyMarker,primitives,react,recoveryBanner,renderSessionModelDialog,
+exportAutoDiag,panelLocale,peakValleyMarker,primitives,react,renderSessionModelDialog,
 retry,t,toggleAutoOpen,version,viewState,widthResizer,writeAutoOpenSetting,
 }=frame;
 const autoOpenChecked=autoOpenDraft===null?autoOpenEnabled():autoOpenDraft===true;
@@ -12017,7 +11352,7 @@ className:"deg_expert_group_error",
 "data-error-source":panelError.source,
 title:panelError.message,
 },panelErrorLabel),
-refreshButton,diagButton,diagStatus),recoveryBanner,body,
+refreshButton,diagButton,diagStatus),body,
 renderSessionModelDialog());
 }
 function createSidebarPanel(deps){
@@ -12063,7 +11398,6 @@ useSidebarPanelViews(frame);
 useSidebarPanelProjectionRef(frame);
 useSidebarPanelProjectionEffect(frame);
 useSidebarPanelRunAction(frame);
-useSidebarPanelRunActionPart2(frame);
 useSidebarPanelPeakValleyMarker(frame);
 useSidebarPanelAutoDiag(frame);
 assembleSidebarPanelBody(frame);
@@ -13700,7 +13034,6 @@ const SETTINGS_ZH_FALLBACK=Object.freeze({
 "settings.notificationVolume.range":"通知音量滑块",
 "settings.notificationVolume.number":"通知音量数值",
 "settings.notificationEvent.completed":"任务完成",
-"settings.roleTimeout.aria":"角色默认超时",
 "settings.notificationEvent.completed.aria":"通知任务完成",
 "settings.notificationEvent.waiting.aria":"通知等待用户",
 "settings.notificationEvent.failed.aria":"通知任务失败",
@@ -13710,10 +13043,6 @@ const SETTINGS_ZH_FALLBACK=Object.freeze({
 "settings.noProvider":"无",
 "settings.observerPreferred":"Observer优先",
 "settings.orchestrator.empty":"未配置（不干预主代理模型）",
-"settings.concurrencyLimit":"单个角色并发上限",
-"settings.concurrencyLimit.title":"取值范围 1–64 的整数；默认 20；保存后生效",
-"settings.roleTimeout":"角色默认超时 (s)",
-"settings.roleTimeout.title":"默认 10 小时（36000 秒）；0 = 不启用；启用值为 1–86400 秒（整数，精度 1 秒）。只影响保存之后创建的尝试，不改变运行中分片。",
 "settings.save":"保存",
 "settings.saving":"保存中…",
 "settings.discard":"放弃修改",
@@ -13767,8 +13096,6 @@ const SETTINGS_EXTRA_MESSAGES=Object.freeze({
 "settings.pv.repair":{zh:"修复并保存"},
 "settings.pv.mainScope":{zh:"本页正在编辑{period}模型（打开页面时锁定）"},
 "settings.pv.boundary":{zh:"当前已进入{current}，本页仍在编辑{editing}模型"},
-"settings.cap.host":{zh:"宿主名额 {host} · 实际生效 {eff}"},
-"settings.cap.lim":{zh:"（受宿主限制）"},
 });
 function settingsExtraText(locale,key,vars){
 const entry=SETTINGS_EXTRA_MESSAGES[key];
@@ -13845,201 +13172,6 @@ return true;
 ensurePluginStylesheet();
 global[SYMBOL]=Object.freeze({
 ensurePluginStylesheet,
-});
-})(globalThis);
-/* source: client-fanout-normalize.js */
-(function installClientFanoutNormalize(global){
-"use strict";
-const SYMBOL=Symbol.for("dsh-expert-group/client-fanout-normalize");
-const FANOUT_SHARD_STATUS_KEYS=["queued","running","succeeded","failed","cancelled","timed_out","interrupted"];
-const FANOUT_TERMINAL_SHARD_STATUSES=new Set(["succeeded","failed","cancelled","timed_out","interrupted"]);
-const FANOUT_RETRYABLE_SHARD_STATUSES=new Set(["failed","timed_out","cancelled","interrupted"]);
-const FANOUT_STATUS_LABELS={
-queued:"排队中",
-running:"运行中",
-succeeded:"成功",
-failed:"失败",
-cancelled:"已取消",
-timed_out:"已超时",
-interrupted:"已中断",
-pending:"等待中",
-completed:"已完成",
-completed_with_errors:"部分失败",
-};
-function fanoutIsObject(value){
-return value!==null&&typeof value==="object"&&!Array.isArray(value);
-}
-function cloneFanoutValue(value,seen=new WeakMap()){
-if(value===null||typeof value!=="object")return value;
-if(seen.has(value))return seen.get(value);
-if(Array.isArray(value)){
-const clone=[];
-seen.set(value,clone);
-for(const item of value)clone.push(cloneFanoutValue(item,seen));
-return clone;
-}
-const clone={};
-seen.set(value,clone);
-for(const key of Object.keys(value))clone[key]=cloneFanoutValue(value[key],seen);
-return clone;
-}
-function fanoutString(value,fallback=void 0){
-if(typeof value!=="string")return fallback;
-const text=value.trim();
-return text.length>0?text:fallback;
-}
-function fanoutStatusOf(value,fallback){
-return fanoutString(value,fallback)??fallback;
-}
-function fanoutTimestampOf(value){
-return typeof value==="number"&&Number.isFinite(value)?value:null;
-}
-function fanoutCountOf(value,fallback=0){
-return Number.isFinite(value)&&value>=0?Math.floor(value):fallback;
-}
-function normalizeFanoutAttempt(rawAttempt,index,fallbackStatus){
-const source=fanoutIsObject(rawAttempt)?rawAttempt:{};
-const attempt=Number.isSafeInteger(source.attempt)&&source.attempt>0
-?source.attempt
-:index+1;
-const normalized={
-attempt,
-status:fanoutStatusOf(source.status,fallbackStatus),
-};
-for(const field of["error","result","childId","messageId"]){
-if(!Object.prototype.hasOwnProperty.call(source,field)||source[field]===void 0)continue;
-normalized[field]=cloneFanoutValue(source[field]);
-}
-return normalized;
-}
-function normalizeFanoutShard(rawShard){
-if(!fanoutIsObject(rawShard))return null;
-const shardId=fanoutString(rawShard.shardId);
-if(shardId===void 0)return null;
-const status=fanoutStatusOf(rawShard.status,"queued");
-const attempts=Array.isArray(rawShard.attempts)
-?rawShard.attempts.map((attempt,index)=>normalizeFanoutAttempt(attempt,index,status))
-:[];
-return{
-shardId,
-prompt:typeof rawShard.prompt==="string"?rawShard.prompt:"",
-status,
-attempts,
-};
-}
-function deriveFanoutCounts(shards){
-const counts={};
-for(const key of FANOUT_SHARD_STATUS_KEYS)counts[key]=0;
-for(const shard of Array.isArray(shards)?shards:[]){
-if(Object.prototype.hasOwnProperty.call(counts,shard?.status))counts[shard.status]+=1;
-}
-counts.pending=counts.queued+counts.running;
-return counts;
-}
-function normalizeFanoutCounts(rawCounts,shards){
-const derived=deriveFanoutCounts(shards);
-const source=fanoutIsObject(rawCounts)?rawCounts:{};
-const counts={};
-for(const key of FANOUT_SHARD_STATUS_KEYS)counts[key]=fanoutCountOf(source[key],derived[key]);
-counts.pending=fanoutCountOf(source.pending,counts.queued+counts.running);
-return counts;
-}
-function normalizeFanoutTask(rawTask){
-if(!fanoutIsObject(rawTask))return null;
-const parentTaskId=fanoutString(rawTask.parentTaskId);
-if(parentTaskId===void 0)return null;
-const shards=(Array.isArray(rawTask.shards)?rawTask.shards:[])
-.map(normalizeFanoutShard)
-.filter((shard)=>shard!==null);
-return{
-parentTaskId,
-role:fanoutString(rawTask.role,"unknown"),
-basePrompt:typeof rawTask.basePrompt==="string"?rawTask.basePrompt:"",
-status:fanoutStatusOf(rawTask.status,"pending"),
-createdAt:fanoutTimestampOf(rawTask.createdAt),
-updatedAt:fanoutTimestampOf(rawTask.updatedAt),
-settledAt:fanoutTimestampOf(rawTask.settledAt),
-counts:normalizeFanoutCounts(rawTask.counts,shards),
-shards,
-};
-}
-function fanoutTaskLabel(task){
-const role=fanoutString(task?.role,"unknown");
-const parentTaskId=fanoutString(task?.parentTaskId,"unknown");
-return role+" · "+parentTaskId;
-}
-function fanoutStatusLabel(status){
-return FANOUT_STATUS_LABELS[status]??fanoutString(status,"未知状态");
-}
-function fanoutCanCancelShard(shard){
-const status=typeof shard==="string"?shard:shard?.status;
-return!FANOUT_TERMINAL_SHARD_STATUSES.has(status);
-}
-function fanoutCanRetryShard(shard){
-const status=typeof shard==="string"?shard:shard?.status;
-return FANOUT_RETRYABLE_SHARD_STATUSES.has(status);
-}
-function fanoutCanCancelParent(task){
-return(Array.isArray(task?.shards)?task.shards:[]).some(fanoutCanCancelShard);
-}
-function normalizeFanoutListResponse(payload,previousState={tasks:[],cursor:0,loaded:false}){
-const previous=fanoutIsObject(previousState)
-?previousState
-:{tasks:[],cursor:0,loaded:false};
-if(payload?.ok!==true||!Array.isArray(payload.tasks))return previous;
-const tasks=payload.tasks.map(normalizeFanoutTask).filter((task)=>task!==null);
-const cursor=Number.isSafeInteger(payload.cursor)&&payload.cursor>=0
-?payload.cursor
-:fanoutCountOf(previous.cursor,0);
-return{...previous,tasks,cursor,loaded:true};
-}
-function mergeFanoutEvent(task,event){
-const current=normalizeFanoutTask(task);
-if(current===null||!fanoutIsObject(event)||event.parentTaskId!==current.parentTaskId)return current;
-const updates=Array.isArray(event.shards)
-?event.shards.filter((shard)=>fanoutString(shard?.shardId)!==void 0)
-:fanoutString(event.shardId)===void 0?[]:[event];
-const updateByShardId=new Map(updates.map((shard)=>[fanoutString(shard.shardId),shard]));
-const shards=current.shards.map((shard)=>{
-const update=updateByShardId.get(shard.shardId);
-if(!fanoutIsObject(update))return shard;
-const nextStatus=fanoutStatusOf(update.status,shard.status);
-const attempts=shard.attempts.map((attempt)=>({...attempt}));
-const eventAttempt=Number.isSafeInteger(update.attempt)&&update.attempt>0?update.attempt:void 0;
-const declaredAttempts=Number.isSafeInteger(update.attempts)&&update.attempts>=0?update.attempts:0;
-if(eventAttempt!==void 0){
-while(attempts.length<eventAttempt){
-attempts.push({attempt:attempts.length+1,status:"queued"});
-}
-const attemptIndex=attempts.findIndex((attempt)=>attempt.attempt===eventAttempt);
-const baseAttempt=attemptIndex>=0?attempts[attemptIndex]:{attempt:eventAttempt,status:nextStatus};
-const mergedAttempt=normalizeFanoutAttempt({...baseAttempt,...update,attempt:eventAttempt,status:nextStatus},attemptIndex>=0?attemptIndex:attempts.length,nextStatus);
-if(attemptIndex>=0)attempts[attemptIndex]=mergedAttempt;
-else attempts.push(mergedAttempt);
-}
-while(attempts.length<declaredAttempts){
-attempts.push({attempt:attempts.length+1,status:nextStatus});
-}
-return{...shard,status:nextStatus,attempts};
-});
-const next={
-...current,
-shards,
-counts:normalizeFanoutCounts(event.counts,shards),
-updatedAt:fanoutTimestampOf(event.at)??current.updatedAt,
-};
-if(event.type==="task_settled"){
-next.status=fanoutStatusOf(event.status,current.status);
-next.settledAt=fanoutTimestampOf(event.at)??current.settledAt;
-}else if(updates.some((update)=>update.status==="queued"||update.status==="running")){
-next.status="pending";
-next.settledAt=null;
-}
-return normalizeFanoutTask(next);
-}
-global[SYMBOL]=Object.freeze({
-fanoutCanCancelParent,fanoutCanCancelShard,fanoutCanRetryShard,fanoutStatusLabel,fanoutTaskLabel,
-mergeFanoutEvent,normalizeFanoutListResponse,normalizeFanoutTask,
 });
 })(globalThis);
 /* source: client-native-status.js */
@@ -14715,29 +13847,6 @@ function clampNotificationVolume(value){
 const number=Number(value);
 return Number.isFinite(number)?Math.min(100,Math.max(0,Math.round(number))):100;
 }
-const DEFAULT_ROLE_CONCURRENCY_LIMIT=20;
-const LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT=10;
-const CONFIG_MIGRATION_VERSION=1;
-function normalizeRoleConcurrencyLimit(value){
-return Number.isSafeInteger(value)&&value>=1&&value<=64
-?value
-:DEFAULT_ROLE_CONCURRENCY_LIMIT;
-}
-function effectiveRoleConcurrencyLimit(source){
-const limit=normalizeRoleConcurrencyLimit(source?.roleConcurrencyLimit);
-const rawVersion=source?.configMigrationVersion;
-const version=Number.isSafeInteger(rawVersion)&&rawVersion>=0?rawVersion:0;
-return version<CONFIG_MIGRATION_VERSION&&limit===LEGACY_DEFAULT_ROLE_CONCURRENCY_LIMIT
-?DEFAULT_ROLE_CONCURRENCY_LIMIT
-:limit;
-}
-const DEFAULT_ROLE_TIMEOUT_MS=36000000;
-function normalizeRoleTimeoutMs(value){
-if(value===0)return 0;
-return Number.isSafeInteger(value)&&value>=1000&&value<=86400000&&value%1000===0
-?value
-:DEFAULT_ROLE_TIMEOUT_MS;
-}
 const MAX_MODEL_CANDIDATES_PER_ROLE=3;
 const MAX_MODEL_FALLBACK_LIMIT=4;
 const DEFAULT_MODEL_FALLBACK_LIMIT=2;
@@ -15006,8 +14115,6 @@ defaults,
 notificationEnabled:source.notificationEnabled!==false,
 notificationVolume:clampNotificationVolume(source.notificationVolume),
 notificationEvents:normalizeNotificationEvents(source.notificationEvents),
-roleConcurrencyLimit:effectiveRoleConcurrencyLimit(source),
-roleTimeoutMs:normalizeRoleTimeoutMs(source.roleTimeoutMs),
 observerPreferred:source.observerPreferred===true,
 taskManagementEnabled:source.taskManagementEnabled!==false,
 autoOpenSubagentSidebar:source.autoOpenSubagentSidebar===true,
@@ -15033,8 +14140,6 @@ const SETTINGS_DRAFT_MERGE_FIELDS=Object.freeze([
 "notificationEnabled",
 "notificationVolume",
 "notificationEvents",
-"roleConcurrencyLimit",
-"roleTimeoutMs",
 "observerPreferred",
 "taskManagementEnabled",
 "autoOpenSubagentSidebar",
@@ -17214,66 +16319,13 @@ return unifiedRow;
 }
 function renderSettingsManagementRow(view){
 const{
-draft,editDraft,saving,t,tExtra,
+draft,editDraft,saving,t,
 }=view;
-const cap=view.hostMeta?.hostConcurrencyCap;
-const eff=view.hostMeta?.effectiveRoleConcurrencyLimit;
 const managementRow=(
 react.createElement("div",{className:"deg_settings_row deg_settings_management_row"},
 react.createElement("label",{className:"deg_settings_checkbox"},
 react.createElement("input",{type:"checkbox","aria-label":t("settings.observerPreferred"),checked:draft.observerPreferred,disabled:saving,onChange:(event)=>editDraft((previous)=>({...previous,observerPreferred:event.target.checked}))}),
-react.createElement("span",{className:"deg_settings_label"},t("settings.observerPreferred"))),
-react.createElement("label",{className:"deg_settings_control",htmlFor:"deg-settings-role-concurrency-limit"},
-react.createElement("span",{className:"deg_settings_label"},t("settings.concurrencyLimit")),
-react.createElement("input",{
-id:"deg-settings-role-concurrency-limit",
-type:"number",
-"aria-label":t("settings.concurrencyLimit"),
-title:t("settings.concurrencyLimit.title")+" · "+tExtra("settings.cap.host",{
-host:cap>0?cap:"—",
-eff:eff>0?eff:"—",
-}),
-min:1,
-max:64,
-step:1,
-inputMode:"numeric",
-value:draft.roleConcurrencyLimit,
-disabled:saving,
-onChange:(event)=>{
-const raw=event.target.value;
-const number=raw===""?null:Number(raw);
-editDraft((previous)=>({
-...previous,
-roleConcurrencyLimit:raw===""
-?""
-:Number.isFinite(number)?number:previous.roleConcurrencyLimit,
-}));
-},
-})),
-react.createElement("label",{className:"deg_settings_control",htmlFor:"deg-settings-role-timeout-ms"},
-react.createElement("span",{className:"deg_settings_label"},t("settings.roleTimeout")),
-react.createElement("input",{
-id:"deg-settings-role-timeout-ms",
-type:"number",
-"aria-label":t("settings.roleTimeout.aria"),
-title:t("settings.roleTimeout.title"),
-min:0,
-max:86400,
-step:1,
-inputMode:"numeric",
-value:draft.roleTimeoutMs===""?"":draft.roleTimeoutMs/1000,
-disabled:saving,
-onChange:(event)=>{
-const raw=event.target.value;
-const seconds=raw===""?null:Number(raw);
-editDraft((previous)=>({
-...previous,
-roleTimeoutMs:raw===""
-?""
-:Number.isFinite(seconds)?Math.round(seconds)*1000:previous.roleTimeoutMs,
-}));
-},
-})))
+react.createElement("span",{className:"deg_settings_label"},t("settings.observerPreferred"))))
 );
 return managementRow;
 }
@@ -17300,9 +16352,8 @@ editing:periodLabelOf(view,mainPeriod),
 function renderSettingsBody(view,actions){
 const{
 candidatesError,catalogAvailable,directoryState,draft,error,hasUnsavedChanges,modelConfigHost,modelFieldsChanged,
-roleLabelOf,roles,save,saved,saving,settingsSnapshot,t,tExtra,
+roleLabelOf,roles,save,saved,saving,settingsSnapshot,t,
 }=view;
-const capLimit=view.hostMeta?.hostConcurrencyCap;
 const modelConfigSection=typeof modelConfigHost==="undefined"||modelConfigHost===null
 ?null
 :react.createElement(ModelConfigSection,{
@@ -17345,8 +16396,7 @@ error?react.createElement("p",{className:"deg_settings_error",role:"status"},err
 modelPageDeleteDialog,
 react.createElement("div",{className:"deg_settings_footer"},
 react.createElement("span",{className:"deg_settings_status",role:"status"},
-(saved?t("settings.saved"):hasUnsavedChanges?t("settings.unsaved"):"")
-+(capLimit>0&&view.hostMeta?.roleConcurrencyLimit>capLimit?tExtra("settings.cap.lim"):"")),
+saved?t("settings.saved"):hasUnsavedChanges?t("settings.unsaved"):""),
 react.createElement("button",{type:"button",className:"deg_btn",disabled:!hasUnsavedChanges||saving,onClick:actions.discard},t("settings.discard")),
 react.createElement("button",{type:"button",className:"deg_btn",disabled:!hasUnsavedChanges||saving||(modelFieldsChanged&&!catalogAvailable)||settingsSnapshot.writable!==true,onClick:save},saving?t("settings.saving"):t("settings.save"))));
 }
@@ -17498,12 +16548,6 @@ ops.push({op:"set",path:["notificationEvents"],value:candidate.notificationEvent
 }
 if(candidate.observerPreferred!==source.observerPreferred){
 ops.push({op:"set",path:["observerPreferred"],value:candidate.observerPreferred});
-}
-if(candidate.roleConcurrencyLimit!==source.roleConcurrencyLimit){
-ops.push({op:"set",path:["roleConcurrencyLimit"],value:candidate.roleConcurrencyLimit});
-}
-if(candidate.roleTimeoutMs!==source.roleTimeoutMs){
-ops.push({op:"set",path:["roleTimeoutMs"],value:candidate.roleTimeoutMs});
 }
 if(candidate.taskManagementEnabled!==source.taskManagementEnabled){
 ops.push({op:"set",path:["taskManagementEnabled"],value:candidate.taskManagementEnabled});
@@ -22579,7 +21623,6 @@ let notify=typeof onUpdate==="function"?onUpdate:null;
 const latestRequests=new Map();
 let settings={revision:-1,value:undefined};
 let catalog={generation:-1,value:undefined};
-let fanout={sessionId:currentSessionId,generation:-1,cursor:0,snapshot:undefined};
 const requestKey=(kind,key="")=>String(kind)+"\u0000"+String(key??"");
 const isObject=(value)=>value!==null&&typeof value==="object";
 const safeRevision=(value)=>Number.isSafeInteger(value)&&value>=0;
@@ -22602,7 +21645,6 @@ currentSessionId=typeof nextSessionId==="string"?nextSessionId:"";
 sessionEpoch+=1;
 sequence+=1;
 latestRequests.clear();
-fanout={sessionId:currentSessionId,generation:-1,cursor:0,snapshot:undefined};
 return Object.freeze({accepted:true,sessionId:currentSessionId,epoch:sessionEpoch,sequence});
 },
 beginRequest(kind,key=""){
@@ -22636,33 +21678,6 @@ catalog={generation,value:value===undefined?groups:value};
 emit("catalog",catalog);
 return result(true,undefined,catalog);
 },
-acceptFanoutSnapshot({sessionId:incomingSessionId,generation,cursor,snapshot,requestToken}={}){
-if(incomingSessionId!==currentSessionId)return result(false,"stale-session",fanout);
-if(!tokenIsCurrent(requestToken))return result(false,"stale-request",fanout);
-if(!safeRevision(generation))return result(false,"invalid-generation",fanout);
-if(!safeRevision(cursor))return result(false,"invalid-cursor",fanout);
-if(generation<fanout.generation)return result(false,"stale-generation",fanout);
-if(cursor<fanout.cursor)return result(false,"stale-cursor",fanout);
-if(generation===fanout.generation&&cursor===fanout.cursor&&fanout.snapshot!==undefined)return result(false,"duplicate",fanout);
-fanout={sessionId:currentSessionId,generation,cursor,snapshot};
-emit("fanout",fanout);
-return result(true,undefined,fanout);
-},
-acceptFanoutEvents({sessionId:incomingSessionId,generation,cursor,events,snapshot,requestToken}={}){
-return api.acceptFanoutSnapshot({
-sessionId:incomingSessionId,
-generation,
-cursor,
-snapshot:snapshot===undefined?events:snapshot,
-requestToken,
-});
-},
-acceptFanoutAction({sessionId:incomingSessionId,generation,requestToken}={}){
-if(incomingSessionId!==currentSessionId)return result(false,"stale-session");
-if(!tokenIsCurrent(requestToken))return result(false,"stale-request");
-if(generation!==undefined&&(!safeRevision(generation)||generation<fanout.generation))return result(false,"stale-generation");
-return result(true,undefined,fanout);
-},
 snapshot(){
 return{
 disposed,
@@ -22670,7 +21685,6 @@ sessionId:currentSessionId,
 epoch:sessionEpoch,
 settings,
 catalog,
-fanout,
 };
 },
 dispose(){
@@ -22680,7 +21694,6 @@ latestRequests.clear();
 notify=null;
 settings={revision:-1,value:undefined};
 catalog={generation:-1,value:undefined};
-fanout={sessionId:currentSessionId,generation:-1,cursor:0,snapshot:undefined};
 return true;
 },
 };
@@ -22811,11 +21824,6 @@ const clientModelConfigHostModule=globalThis[Symbol.for("dsh-expert-group/client
 const{
 createModelConfigHost,
 }=clientModelConfigHostModule;
-const clientFanoutModule=globalThis[Symbol.for("dsh-expert-group/client-fanout-normalize")]||{};
-const{
-fanoutCanCancelParent,fanoutCanCancelShard,fanoutCanRetryShard,fanoutStatusLabel,fanoutTaskLabel,mergeFanoutEvent,
-normalizeFanoutListResponse,normalizeFanoutTask,
-}=clientFanoutModule;
 const clientNativeStatusModule=globalThis[Symbol.for("dsh-expert-group/client-native-status")]||{};
 const{
 NATIVE_RUNNING_STATUS_PREFIX,NATIVE_RUNNING_STATUS_PREFIXES,createNativeTextRewriter,findNativeConversationScope,
@@ -23130,14 +22138,6 @@ exports.resolveRunningStatusText=resolveRunningStatusText;
 exports.createNativeTextRewriter=createNativeTextRewriter;
 exports.findNativeStatusTextNode=findNativeStatusTextNode;
 exports.installNativeStatusBridge=installNativeStatusBridge;
-exports.normalizeFanoutTask=normalizeFanoutTask;
-exports.mergeFanoutEvent=mergeFanoutEvent;
-exports.fanoutTaskLabel=fanoutTaskLabel;
-exports.fanoutStatusLabel=fanoutStatusLabel;
-exports.fanoutCanCancelShard=fanoutCanCancelShard;
-exports.fanoutCanRetryShard=fanoutCanRetryShard;
-exports.fanoutCanCancelParent=fanoutCanCancelParent;
-exports.normalizeFanoutListResponse=normalizeFanoutListResponse;
 exports.createClientFreshnessBoundary=createClientFreshnessBoundary;
 exports.normalizePluginRpcResult=normalizePluginRpcResult;
 exports.requestPluginRpc=requestPluginRpc;

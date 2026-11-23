@@ -11,7 +11,7 @@
  * `agent/turn-stopping` 兜底共用同一份实现，绝不维护两套。
  *
  * ## 释放条件（缺一不可，全部为「明确成立」而非「无法证明」）
- * 1. 该 root 名下没有任何未结算的登记工作（role admission / fan-out attempt）；
+ * 1. 该 root 名下没有任何未结算的登记工作（role admission）；
  * 2. root-scoped 的后代查询**明确**返回「没有 running 后代」
  *    （`snapshotDescendants` 返回 `known:true` 且 `running` 为空）。
  *
@@ -21,8 +21,8 @@
  * ## 竞态保护
  * 每次登记/结算/外部活动都会推进 `version`。一次静止判定只有在「异步查询期间
  * version 未变、且登记集仍为空」时才成立；判定成立后仍会在同一同步临界区里
- * 复查一次 version，因此「判定通过」与「真正释放」之间不可能插入新的 dispatch、
- * child 创建或 fanout retry。
+ * 复查一次 version，因此「判定通过」与「真正释放」之间不可能插入新的 dispatch
+ * 或 child 创建。
  *
  * ## 可观测性与人工逃生（票据 11）
  * 记录额外保存 startedAt / lastSnapshot / lastDelivery / capabilityLevel 与长等待提醒状态：
@@ -77,31 +77,6 @@ export function turnWaitWorkKey(work) {
   if (work === null || typeof work !== "object") return void 0;
   if (work.kind === "admission") {
     return typeof work.token === "string" && work.token.length > 0 ? "admission:" + work.token : void 0;
-  }
-  if (work.kind === "fanout") {
-    if (typeof work.parentTaskId !== "string" || work.parentTaskId.length === 0) return void 0;
-    const attempt = work.attempt;
-    return Number.isSafeInteger(attempt) && attempt > 0
-      ? "fanout:" + work.parentTaskId + ":" + attempt
-      : "fanout:" + work.parentTaskId;
-  }
-  /**
-   * 单个排队分片的工作键（票据 26 背压）。
-   *
-   * 语义：一个 shard 处于 queued（= 正在排队等待 role/provider 名额）时登记一项工作，
-   * shard 进入 running 或任一终态时精确结算。键只含 parentTaskId + shardId：
-   * - **幂等**：提交/续作/重试/恢复都可能对同一排队分片重复登记，键相同即同一项，
-   *   不会把一次排队算成多份未结算工作；
-   * - **不含 attempt**：排队是 shard 的当前状态，重试产生的新 attempt 仍然只是
-   *   "这个分片在排队"，用 attempt 会把同一段排队拆成两个键、结算后残留悬挂项；
-   * - 与任务级 "fanout:<id>:<attempt>" 键不同源：任务级工作表达「整个父任务还没结算」，
-   *   per-shard 工作表达「这个分片还没开始/没结束」，两者必须能独立结算，否则排队
-   *   分片结束而任务仍在跑时无法精确释放。
-   */
-  if (work.kind === "fanout-shard") {
-    if (typeof work.parentTaskId !== "string" || work.parentTaskId.length === 0) return void 0;
-    if (typeof work.shardId !== "string" || work.shardId.length === 0) return void 0;
-    return "fanout-shard:" + work.parentTaskId + ":" + work.shardId;
   }
   return void 0;
 }
@@ -741,8 +716,8 @@ function createTurnWaitLifecycle(state, observability) {
     }
     if (record.destroyed === true) return;
     // 从「快照落地」到「判定静止」之间没有任何 await / 回调边界，因此这里的判定
-    // 与释放处于同一同步临界区：「通过」与「释放」之间不可能插入新的 dispatch、
-    // child 创建或 fanout retry。
+    // 与释放处于同一同步临界区：「通过」与「释放」之间不可能插入新的 dispatch
+    // 或 child 创建。
     if (record.works.size > 0 || running.length > 0) {
       // 仍有未结算工作，或确有 running 后代：继续等待。
       if (record.recheck === true) {
@@ -826,7 +801,7 @@ function createTurnWaitCommands(state, lifecycle, observability) {
    * 登记一项未结算工作。重复登记同一键幂等。
    *
    * @param {object} agent - exact root Agent。
-   * @param {{kind:"admission",token:string}|{kind:"fanout",parentTaskId:string,attempt?:number}|{kind:"fanout-shard",parentTaskId:string,shardId:string}} work - 工作描述。
+   * @param {{kind:"admission",token:string}} work - 工作描述。
    * @returns {string|undefined} 工作键；非法输入或已卸载时 undefined。
    */
   function track(agent, work) {
@@ -909,7 +884,7 @@ function createTurnWaitCommands(state, lifecycle, observability) {
   }
 
   /**
-   * 外部活动（child 创建 / 状态转 running / fanout retry）让当前静止结论作废。
+   * 外部活动（child 创建 / 状态转 running）让当前静止结论作废。
    * 只推进 version 并重跑判定，不改变登记集。
    */
   function invalidate(agent) {

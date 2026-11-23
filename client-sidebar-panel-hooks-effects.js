@@ -23,8 +23,8 @@
   const POLL_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-poll");
   const POLL = global[POLL_SYMBOL] || {};
   const {
-    PANEL_ERROR_SOURCES, PANEL_POLL_TIMINGS, applyPanelPollCycle, callRpc, fanoutBatchIsStale, panelNextPollDelayMs,
-    readFanoutEventBatch, samePanelSnapshot, snapshotHasRunningWork,
+    PANEL_ERROR_SOURCES, PANEL_POLL_TIMINGS, applyPanelPollCycle, callRpc, panelNextPollDelayMs,
+    samePanelSnapshot,
   } = POLL;
   const PANEL_STATE_A_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-panel-state-a");
   const PANEL_STATE_A = global[PANEL_STATE_A_SYMBOL] || {};
@@ -260,7 +260,7 @@
 
   }
 
-  /** 快照与轮询的单飞状态 ref、fanout 游标及其推进。 */
+  /** 快照与轮询的单飞状态 ref。 */
   function useSidebarPanelSnapshotRefs(frame) {
     const {
       react, rootSessionId, state,
@@ -269,21 +269,6 @@
     const refreshStateRef = typeof react.useRef === "function"
       ? react.useRef({ rootSessionId: null, inFlight: null, pending: false })
       : { current: { rootSessionId: null, inFlight: null, pending: false } };
-    /**
-     * fanout 事件游标（票据 15）：{ rootSessionId, cursor }，只描述「本实例当前 root 已经读到哪」。
-     *
-     * 语义边界：
-     * - 起始值 0 = 「从头读保留窗口」（Host 的 getEvents 以 0 为起点），不是伪造的对齐位置；
-     * - 切换 root 时重置（旧 root 的游标对新 root 没有意义）；A→B→A 同样从头读，
-     *   多读一轮事件最多触发一次全量快照，绝不会漏事件；
-     * - 只在**真正读到** Host 返回的 cursor 时推进：请求失败、响应缺字段、被取消、旧代次
-     *   一律原地不动 —— 下一轮用同一个游标重读，宁可重复也绝不把未确认的区间当成已同步。
-     */
-    const fanoutCursorRef = typeof react.useRef === "function"
-      ? react.useRef({ rootSessionId, cursor: 0 })
-      : { current: { rootSessionId, cursor: 0 } };
-    // root 归属规整（换 root 即重开 cursor:0）归 panel-state-a；同一 root 返回同一对象。
-    fanoutCursorRef.current = PANEL_STATE_A.normalizeFanoutCursor(fanoutCursorRef.current, rootSessionId);
     /**
      * 最近一次渲染提交的快照（票据 16）。
      *
@@ -310,7 +295,7 @@
      * 增量轮询的单飞状态（票据 15）：{ rootSessionId, inFlight, pending }。
      *
      * 与 refreshStateRef 分工不同：那条链路保护**快照请求**（通知/手动/动作尾随共用），
-     * 这条保护**一轮增量同步**（先 fanout-events、必要时再快照）。两者都有「单飞 + 一次尾随」：
+     * 这条保护**一轮轮询同步**。两者都有「单飞 + 一次尾随」：
      * 在途期间到来的轮询只记一次 pending，结算后立刻补跑一轮，绝不并发堆请求。
      */
     const pollSyncStateRef = typeof react.useRef === "function"
@@ -318,24 +303,9 @@
       : { current: { rootSessionId: null, inFlight: null, pending: false } };
     /** 轮次序号：同一轮结果被多个 tick 观察到时，调度器据此只记账一次（见 applyPanelPollCycle）。 */
     const pollCycleSequenceRef = typeof react.useRef === "function" ? react.useRef(0) : { current: 0 };
-    /**
-     * 采纳一次快照响应里出现的游标（票据 15 的强制全量路径）。
-     *
-     * Host 当前的 expert-group-snapshot 响应**不带** cursor（契约只有 snapshot + revision），
-     * 因此这里按「有就采纳、没有就保持」处理：
-     * - 返回 false 时调用方什么都不做，下一轮 fanout-events 继续用当前游标（绝不伪造一个进度）；
-     * - 只接受本 root 的响应：旧 root 的迟到响应不得改写新 root 的游标。
-     */
-    const adoptFanoutCursorFromSnapshot = (requestRoot, envelope) => {
-      // 游标推进规则（只认本 root / 绝不伪造进度）归 panel-state-a；这里只负责写回自己的 ref。
-      const next = PANEL_STATE_A.adoptFanoutCursor(fanoutCursorRef.current, requestRoot, envelope);
-      if (next === null) return false;
-      fanoutCursorRef.current = next;
-      return true;
-    };
 
     Object.assign(frame, {
-      adoptFanoutCursorFromSnapshot, fanoutCursorRef, latestPanelErrorRef, latestSnapshotRef, pollCycleSequenceRef, pollSyncStateRef,
+      latestPanelErrorRef, latestSnapshotRef, pollCycleSequenceRef, pollSyncStateRef,
       refreshStateRef,
     });
   }
@@ -349,7 +319,7 @@
    */
   function createPanelRefreshAction(deps) {
     const {
-      adoptFanoutCursorFromSnapshot, config, contextRef, mountedRef, peekCachedSnapshot,
+      config, contextRef, mountedRef, peekCachedSnapshot,
       refreshStateRef, requestSequenceRef, rootSessionId, setState, writeCachedSnapshot,
     } = deps;
 
@@ -424,7 +394,7 @@
         };
       });
       const promise = fetchPanelSnapshot({
-        adoptFanoutCursorFromSnapshot, cachedBaseline, commitManualTimestamp, config, contextRef, controller,
+        cachedBaseline, commitManualTimestamp, config, contextRef, controller,
         mountedRef, outcomeReason: text(refreshOptions?.reason, "refresh"), refresh, refreshState, request,
         requestSequence, requestSequenceRef, rootSessionId, setState, writeCachedSnapshot,
       });
@@ -439,7 +409,7 @@
    */
   async function fetchPanelSnapshot(ctx) {
     const {
-      adoptFanoutCursorFromSnapshot, cachedBaseline, commitManualTimestamp, config, contextRef, controller,
+      cachedBaseline, commitManualTimestamp, config, contextRef, controller,
       mountedRef, outcomeReason, refresh, refreshState, request, requestSequence, requestSequenceRef,
       rootSessionId, setState, writeCachedSnapshot,
     } = ctx;
@@ -449,8 +419,7 @@
     // （失败退避 / 空闲退避 / 运行态判定），不改变任何既有调用方看到的行为。
     let outcome = { ok: false, snapshot: null, reason: outcomeReason };
     try {
-      // 用带 select 的调用拿完整 envelope：快照本体之外，Host 若在顶层给出 cursor，
-      // 这里必须能读到它（票据 15 的强制全量路径）。不传 select 的调用方行为逐字不变。
+      // 用带 select 的调用把响应正文收敛成对象：Host 的 { ok, snapshot } 信封与旧替身/旧 Host
       const envelope = await callRpc(
         config,
         contextRef.current,
@@ -458,7 +427,7 @@
         controller === null ? {} : { signal: controller.signal },
         (body) => object(body),
       );
-      // 兼容两种响应形状：Host 的 { ok, snapshot } 信封，或旧替身/旧 Host 直接给快照本体。
+      // 直接给快照本体的形状都由下面两行兼容。
       const raw = envelope.snapshot === undefined || envelope.snapshot === null ? envelope : envelope.snapshot;
       const next = safeNormalize(raw);
       if (next === null) throw new Error("快照格式无效");
@@ -481,9 +450,6 @@
         // （标题栏的「更新于」文本已按用户要求移除，updatedAt 只服务这条同源基线与手动刷新语义。）
         const updatedAt = Date.now();
         writeCachedSnapshot(rootSessionId, next, updatedAt);
-        // 强制全量路径（票据 15）：响应带 cursor 就采纳并重建游标；Host 当前不带，
-        // 则保持当前游标（下一轮 fanout-events 从它继续），绝不伪造一个「已对齐」。
-        adoptFanoutCursorFromSnapshot(rootSessionId, envelope);
         setState((previous) => {
           // 内容级比较：Host 每次响应都是全新对象（generatedAt 还是新的 Date.now()），
           // 引用不同但上屏内容深度相等时不产生新状态 —— React 直接 bail out，
@@ -571,124 +537,59 @@
   }
 
   /**
-   * 一轮增量同步（先读 fanout-events，再决定是否拉全量）与单飞 + 一次尾随的轮次循环。
+   * 一轮轮询同步（整棵快照刷新）与单飞 + 一次尾随的轮次循环。
    * 从 useSidebarPanelPolling 抽出：拆开后 Hook 只剩「按本帧依赖绑定」与 ref 声明。
+   *
+   * 每一轮都真的读一次 expert-group-snapshot：任务树的变化（含运行中 turn 持续推进的墙钟）
+   * 只有重新读快照才能反映到界面上，因此这里没有任何「先探测变化、没有变化就跳过」的短路。
+   * 刷新频率仍由调度器（运行态 2.5s / 空闲阶梯退避 / 失败退避）决定，轮次本身不改变
+   * 既有结果语义：ok / cancelled / snapshot 的形状与调度器记账口径都逐字保留。
    */
   function createPanelPollCycle(deps) {
     const {
-      advanceFanoutCursor, config, contextRef, fanoutCursorRef, latestPanelErrorRef, latestSnapshotRef,
+      latestPanelErrorRef, latestSnapshotRef,
       pollCycleSequenceRef, pollSyncStateRef, pollSurfaceStillCurrent, refresh, rootSessionId,
     } = deps;
 
-    const pollOnce = async (request) => {
+    const pollOnce = async () => {
       const nextId = () => {
         pollCycleSequenceRef.current += 1;
         return pollCycleSequenceRef.current;
       };
-      const cancelledCycle = (outcome) => ({ id: nextId(), outcome, ok: false, cancelled: true, snapshot: null });
-      // 两条「必须强制全量」的既有语义，都优先于事件探测：
-      // 1. 轻量快照（partial）：Host 的 partial 只在冷读时出现，若因为「没有新事件」跳过快照，
-      //    partial 可能永远停在界面上（票据 13 的升级语义会回归）；
-      // 2. 上一轮快照读取失败：事件读面健康（无事件）不能让快照失败永久挂起，失败必须被重试到成功。
+      // 两条既有语义决定这一轮的 reason（只用于诊断与归因，不改变请求本身）：
+      // 1. 轻量快照（partial）：Host 的 partial 只在冷读时出现，必须继续刷新到完整快照为止
+      //    （票据 13 的升级语义）；
+      // 2. 上一轮快照读取失败：失败必须被重试到成功，绝不因为「看起来没变化」而挂在界面上。
       const partialBaseline = latestSnapshotRef.current !== null && latestSnapshotRef.current?.partial === true;
       const lastSnapshotError = latestPanelErrorRef.current;
       const retryAfterFailure = lastSnapshotError !== null
         && lastSnapshotError !== undefined
         && lastSnapshotError.source === PANEL_ERROR_SOURCES.snapshot;
-      if (partialBaseline || retryAfterFailure) {
-        const full = (await refresh({ reason: partialBaseline ? "partial" : "retry" })) ?? {};
-        return {
-          id: nextId(),
-          outcome: partialBaseline ? "partial" : "retry",
-          ok: full.ok === true,
-          cancelled: full.aborted === true || full.stale === true,
-          snapshot: full.snapshot ?? null,
-        };
-      }
-      const cursorBefore = fanoutCursorRef.current.rootSessionId === rootSessionId ? fanoutCursorRef.current.cursor : 0;
-      let batch = null;
-      try {
-        const response = await callRpc(
-          config,
-          contextRef.current,
-          { action: "fanout-events", sessionId: rootSessionId, after: cursorBefore },
-          request.controller === null ? {} : { signal: request.controller.signal },
-        );
-        batch = readFanoutEventBatch(response);
-      } catch (error) {
-        const aborted = request.controller?.signal?.aborted === true || error?.name === "AbortError";
-        // 取消/旧代次：这一轮作废，绝不推进游标、也绝不当成「没有变化」。
-        if (aborted) return cancelledCycle("cancelled");
-        // 读面不可用：降级为全量快照（旧 Host 语义），不写错误横幅。
-        batch = null;
-      }
-      if (!pollSurfaceStillCurrent()) return cancelledCycle("stale");
-      if (batch !== null && batch.conclusive) {
-        if (fanoutBatchIsStale(batch, cursorBefore)) {
-          // gap / 游标过旧：事件已经永久缺失，只能整棵重拉。
-          const full = (await refresh({ reason: "gap" })) ?? {};
-          // 只有全量**成功**后才以响应 cursor 重建游标：失败/取消时保留旧游标，下一轮重读同一段。
-          // 否则一次失败的 gap 恢复会把这段事件当成「已处理」，界面就永久停在旧数据上。
-          if (full.ok === true && full.stale !== true && full.merged !== true) advanceFanoutCursor(batch.cursor);
-          return {
-            id: nextId(),
-            outcome: "gap",
-            ok: full.ok === true,
-            cancelled: full.aborted === true || full.stale === true,
-            snapshot: full.snapshot ?? null,
-          };
-        }
-        if (batch.events.length > 0) {
-          const full = (await refresh({ reason: "events" })) ?? {};
-          // 同上：快照没成功就不推进游标，这些事件下一轮还会被重读。
-          if (full.ok === true && full.stale !== true && full.merged !== true) advanceFanoutCursor(batch.cursor);
-          return {
-            id: nextId(),
-            outcome: "events",
-            ok: full.ok === true,
-            cancelled: full.aborted === true || full.stale === true,
-            snapshot: full.snapshot ?? null,
-          };
-        }
-        // 无事件且无缺口：游标推进是安全的（Host 明确回答「游标之后什么都没有」）。
-        // 但「没有 fanout 事件」不等于「快照没有变化」：运行中的 turn 会在没有 fanout 事件时
-        // 持续推进墙钟（turn/start 也不会产生 fanout 事件）。因此在运行态必须走一次全量刷新，
-        // 让「用时」与 DSH 状态行一样实时；空闲态仍走「不请求快照、零重渲染」的既有契约。
-        advanceFanoutCursor(batch.cursor);
-        if (snapshotHasRunningWork(latestSnapshotRef.current)) {
-          const full = (await refresh({ reason: "running" })) ?? {};
-          return {
-            id: nextId(),
-            outcome: "running",
-            ok: full.ok === true,
-            cancelled: full.aborted === true || full.stale === true,
-            snapshot: full.snapshot ?? null,
-          };
-        }
-        return { id: nextId(), outcome: "none", ok: true, cancelled: false, snapshot: null };
-      }
-      // 不可判定（缺 events 数组 / 读面失败）：全量降级。
-      const fallback = (await refresh({ reason: "events-unavailable" })) ?? {};
+      const reason = partialBaseline ? "partial" : (retryAfterFailure ? "retry" : "poll");
+      // 取消与代次门禁归 refresh：被取消/被取代的响应以 aborted/stale 收口，
+      // 调度器据此把这一轮记成「取消」（不计失败、不推进空闲档）。
+      const full = (await refresh({ reason })) ?? {};
       return {
         id: nextId(),
-        outcome: "fallback",
-        ok: fallback.ok === true,
-        cancelled: fallback.aborted === true || fallback.stale === true,
-        snapshot: fallback.snapshot ?? null,
+        outcome: reason,
+        ok: full.ok === true,
+        cancelled: full.aborted === true || full.stale === true,
+        snapshot: full.snapshot ?? null,
       };
     };
 
     /**
-     * 跑一轮（含尾随）增量同步：单飞 + 一次尾随，与 refresh 的 pending 语义同构。
+     * 跑一轮（含尾随）：单飞 + 一次尾随，与 refresh 的 pending 语义同构。
      *
      * 在途期间到来的轮询只记一次 pending；结算后立刻补跑**一轮**，绝不并发堆请求。
      * 结果对象带回给调度器记账（失败退避 / 空闲退避 / 运行态判定）。
+     *
+     * 切换 root 时旧 root 的在途快照由 refresh 自己的 root 门禁中止（AbortController 与
+     * 请求代次都在那里），这里只要丢掉旧轮次的尾随标记：旧结果绝不写回新 surface。
      */
     const runPollCycle = () => {
       const state = pollSyncStateRef.current;
       if (state.rootSessionId !== rootSessionId) {
-        // 切换 root：旧 root 的在途轮询立刻取消，尾随标记清零（旧结果绝不写回新 surface）。
-        state.inFlight?.controller?.abort?.();
         state.inFlight = null;
         state.pending = false;
         state.rootSessionId = rootSessionId;
@@ -697,22 +598,18 @@
         state.pending = true;
         return state.inFlight.promise;
       }
-      const request = {
-        rootSessionId,
-        controller: typeof globalThis.AbortController === "function" ? new globalThis.AbortController() : null,
-        promise: null,
-      };
+      const request = { rootSessionId, promise: null };
       state.inFlight = request;
       const promise = (async () => {
         let cycle = null;
         try {
-          cycle = await pollOnce(request);
+          cycle = await pollOnce();
           while (state.pending && state.inFlight === request && pollSurfaceStillCurrent()) {
             state.pending = false;
-            cycle = await pollOnce(request);
+            cycle = await pollOnce();
           }
         } catch {
-          // pollOnce 内部已把 RPC 失败降级为全量；万一仍抛错，按一次失败收口，
+          // refresh 内部已把读取失败收口成状态与结果对象；万一仍抛错，按一次失败收口，
           // 绝不让调度器停在「以为还有一轮在途」的状态。
           pollCycleSequenceRef.current += 1;
           cycle = { id: pollCycleSequenceRef.current, outcome: "error", ok: false, cancelled: false, snapshot: null };
@@ -729,31 +626,20 @@
     return { pollOnce, runPollCycle };
   }
 
-  /** 快照刷新、增量轮询与可暂停调度器（含全部定时器与请求收口）。 */
+  /** 快照刷新、轮询同步与可暂停调度器（含全部定时器与请求收口）。 */
   function useSidebarPanelPolling(frame) {
     const {
-      adoptFanoutCursorFromSnapshot, config, contextRef, fanoutCursorRef, latestPanelErrorRef, latestSnapshotRef,
+      config, contextRef, latestPanelErrorRef, latestSnapshotRef,
       mountedRef, peekCachedSnapshot, pollCycleSequenceRef, pollSyncStateRef, react, refreshStateRef,
       requestSequenceRef, rootSessionId, setState, sidebarSurfaceStillCurrent, state, writeCachedSnapshot,
     } = frame;
 
     /**
-     * 把事件游标推进到 max(当前, 给定值)（票据 15）：null/非法值表示 Host 没给游标 ⇒ 原地不动，
-     * 绝不伪造一个进度；只接受本 root 的推进（旧 root 的迟到结果不得改写新 root 的游标）。
-     */
-    const advanceFanoutCursor = (nextCursor) => {
-      // 推进判据（非法值 / 跨 root / 非前进一律原地不动）归 panel-state-a；这里只写回自己的 ref。
-      const next = PANEL_STATE_A.advanceFanoutCursor(fanoutCursorRef.current, rootSessionId, nextCursor);
-      if (next === null) return false;
-      fanoutCursorRef.current = next;
-      return true;
-    };
-    /**
-     * 刷新动作与单轮增量同步：实现分别在 createPanelRefreshAction / createPanelPollCycle，
+     * 刷新动作与单轮轮询同步：实现分别在 createPanelRefreshAction / createPanelPollCycle，
      * 这里只按本帧依赖（ref、root、setState 等）绑定出同一批函数。
      */
     const refresh = createPanelRefreshAction({
-      adoptFanoutCursorFromSnapshot, config, contextRef, mountedRef, peekCachedSnapshot, refreshStateRef,
+      config, contextRef, mountedRef, peekCachedSnapshot, refreshStateRef,
       requestSequenceRef, rootSessionId, setState, writeCachedSnapshot,
     });
     /**
@@ -775,17 +661,16 @@
      * 空闲阶梯退避、失败退避与隐藏/非活跃暂停都由 PANEL_POLL_TIMINGS 与本调度器统一决定。
      */
     const panelSchedulerRef = typeof react.useRef === "function" ? react.useRef(null) : { current: null };
-    /** 一轮增量同步的结果是否仍属于当前 surface（挂载中 + 同一 root/session + 同一 surface 令牌）。 */
+    /** 一轮轮询同步的结果是否仍属于当前 surface（挂载中 + 同一 root/session + 同一 surface 令牌）。 */
     const pollSurfaceStillCurrent = () => sidebarSurfaceStillCurrent();
-    /** 单轮增量同步与单飞尾随循环：实现见 createPanelPollCycle。 */
+    /** 单轮轮询同步与单飞尾随循环：实现见 createPanelPollCycle。 */
     const { pollOnce, runPollCycle } = createPanelPollCycle({
-      advanceFanoutCursor, config, contextRef, fanoutCursorRef, latestPanelErrorRef, latestSnapshotRef,
+      latestPanelErrorRef, latestSnapshotRef,
       pollCycleSequenceRef, pollSyncStateRef, pollSurfaceStillCurrent, refresh, rootSessionId,
     });
 
     Object.assign(frame, {
-      advanceFanoutCursor, panelSchedulerRef, pollOnce, pollSurfaceStillCurrent, refresh, refreshRef,
-      runPollCycle,
+      panelSchedulerRef, pollOnce, pollSurfaceStillCurrent, refresh, refreshRef, runPollCycle,
     });
   }
 
@@ -1119,7 +1004,6 @@
       if (node === null || typeof node !== "object") continue;
       if (Number.isFinite(node.turnOpenSince) && (node.running === true || node.status === "running")) return true;
       if (Array.isArray(node.children)) pending.push(...node.children);
-      if (Array.isArray(node.shards)) pending.push(...node.shards);
     }
     return false;
   }

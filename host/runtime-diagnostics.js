@@ -42,7 +42,7 @@ const DIAGNOSTIC_MESSAGE_LIMIT = 160;
  * 1. 长度上限——诊断面不随输入增长；
  * 2. 去掉控制字符并压缩换行——消息不会伪造多行日志/UI 结构；
  * 3. 只接受字符串——非字符串一律返回 fallback，不把对象/数组序列化进诊断。
- * 调用方（fanout 并发诊断）的文案由插件内部生成，不拼接设置原文或原始返回值。
+ * 调用方（运行时诊断投影）的文案由插件内部生成，不拼接设置原文或原始返回值。
  */
 export function diagnosticMessage(value, fallback = null) {
   if (typeof value !== "string") return fallback;
@@ -77,60 +77,6 @@ export function safeErrorLabel(error) {
   const name = isObject ? error.name : undefined;
   if (typeof name === "string" && /^[A-Za-z_$][A-Za-z0-9_$.]{0,63}$/.test(name)) return name;
   return isObject ? "Error" : typeof error;
-}
-
-/**
- * 限流诊断的行数上限（票据 26）：role/provider 映射来自设置，诊断投影必须有界。
- * 超出部分按对象插入序截断——它们是低频配置项，不是需要完整分页的数据面。
- */
-const THROTTLE_DIAGNOSTIC_ROW_LIMIT = 16;
-
-/**
- * 限流/排队诊断的只读投影（票据 26）。
- *
- * 输入是 manager.throttleDiagnostics() 的形状：
- *   { roles: {role: row}, providers: {provider: row}, etaMinSamples }
- * 输出改写成有界数组，便于客户端直接渲染，且所有标量都过诊断白名单：
- * - 键名（role/provider）是公开配置，仍截断到 64 字符；
- * - 时间戳/计数/etaMs 用非负安全整数，缺失时显式 null；
- * - etaSource 只接受固定枚举（unknown / historical-average）。
- *
- * 绝不包含任务负载、prompt 或任何会话数据。
- *
- * @param {unknown} value - manager 的限流诊断。
- * @returns {{roles: object[], providers: object[], etaMinSamples: number}}
- */
-export function projectThrottleDiagnostics(value) {
-  const source = value !== null && typeof value === "object" ? value : {};
-  const projectRow = (keyField, key, row) => {
-    const entry = row !== null && typeof row === "object" ? row : {};
-    return Object.freeze({
-      [keyField]: key.slice(0, 64),
-      // limit 0 表示不限制（provider 维度）；role 维度总是 >= 1 的生效默认值。
-      limit: diagnosticCount(entry.limit),
-      running: diagnosticCount(entry.running),
-      queued: diagnosticCount(entry.queued),
-      samples: diagnosticCount(entry.samples),
-      lastThrottledAt: diagnosticTime(entry.lastThrottledAt),
-      etaMs: diagnosticTime(entry.etaMs),
-      etaSource: entry.etaSource === "historical-average" ? "historical-average" : "unknown",
-    });
-  };
-  const projectMap = (map, keyField) => {
-    if (map === null || typeof map !== "object") return Object.freeze([]);
-    const rows = [];
-    for (const key of Object.keys(map)) {
-      if (rows.length >= THROTTLE_DIAGNOSTIC_ROW_LIMIT) break;
-      if (typeof key !== "string" || key.length === 0) continue;
-      rows.push(projectRow(keyField, key, map[key]));
-    }
-    return Object.freeze(rows);
-  };
-  return Object.freeze({
-    roles: projectMap(source.roles, "role"),
-    providers: projectMap(source.providers, "provider"),
-    etaMinSamples: diagnosticCount(source.etaMinSamples),
-  });
 }
 
 /**

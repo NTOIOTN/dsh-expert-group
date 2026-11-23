@@ -68,12 +68,6 @@ const ROLE_LANES = {
   ],
 };
 
-const FANOUT_DESCRIPTION = [
-  "fanout",
-  "- Generic same-role fan-out: one role plus an ordered shards array; each shard is an independent child attempt with bounded concurrency, wait-all, cancellation and manual retry; the call returns a parentTaskId immediately.",
-  "- Use unique shardIds and truthful affectedPaths for conflict checks; declare each genuinely independent unit one shard instead of repeating role calls.",
-];
-
 for (const entry of listRoles()) {
   if (!Array.isArray(ROLE_LANES[entry.id])) {
     throw new Error("orchestrator 缺少注册角色的 lane 描述: " + entry.id);
@@ -246,7 +240,9 @@ export function measureOrchestratorPrompt(options = {}) {
  * routing section 不再复制这里的 workflow；child 也不会收到这里的内容。
  * @param {object} [options]
  * @param {string[]} [options.roles] - 当前实际可用的专家角色。
- * @param {boolean} [options.providerReady] - spawn provider 是否就绪。
+ * @param {boolean} [options.providerReady] - spawn provider 是否就绪。provider 不可用时
+ *   角色工具不会注册，因此这里如实声明不可用；provider 就绪时也**不再**广告 fan-out
+ *   模型 tool（WP-02 Phase 1：fan-out 已停止新 admission，仅保留非模型可见的 tombstone）。
  * @param {boolean} [options.observerPreferred] - 是否将带图请求优先交给 Observer。
  * @param {string} [options.rootSessionId] - 当前根 Agent 的 session id，用于绑定第一人称身份。
  * @param {object} [options.registry] - 运行期角色目录（内置 + 自定义）；缺省走内置注册表。
@@ -291,17 +287,17 @@ export function buildOrchestratorPrompt({ roles = ORCHESTRATOR_ROLES, providerRe
  * @returns {string} 含 session 占位符的完整模板。
  */
 function buildOrchestratorPromptTemplate(enabledRoles, providerReady, observerPreferred, registry) {
+  // WP-02 Phase 1（spec §3 line102 / Round 25）：fan-out model tool 已停止新 admission，
+  // 因此这里**绝不**再把它写进模型可见的 available 列表。tombstone 只为在飞/过期直调
+  // 保留稳定错误，不属于可广告能力；providerReady 也不再影响本列表的角色集合。
   const available = enabledRoles.map((role) => toolNameOf(role, registry));
-  const fanoutAvailable = providerReady && enabledRoles.length > 0;
-  if (fanoutAvailable) available.push("fanout");
   // 每个角色段落：注册表派生的 "@toolName" 标记与"显示名 — 职责摘要"，
   // 再加上该角色特有的 lane 指引（内置=常量表，自定义=由 description 派生）。
   // 注册表是角色身份与职责的唯一来源。
   const roleText = enabledRoles.map((role) => {
     const entry = registry.require(role);
     return ["@" + entry.toolName, "- Role: " + entry.label + " — " + entry.description, ...laneOf(role)].join("\n");
-  }).join("\n\n")
-    + (fanoutAvailable ? "\n\n" + FANOUT_DESCRIPTION.join("\n") : "");
+  }).join("\n\n");
   const unavailable = providerReady
     ? ""
     : "\n\nThe expert subagent team is currently unavailable because the spawn provider is not ready. Do not call expert tools until the provider becomes available.\n";
@@ -363,7 +359,7 @@ function buildOrchestratorPromptTemplate(enabledRoles, providerReady, observerPr
     "2. Check the role routing before executing and allocate independently verifiable work units; for non-trivial work, order facts → judgment → implementation as dependencies and dispatch the fact-gathering step first whenever the judgment or implementation depends on it.",
     "3. Dispatch the intended expert calls first and summarize accepted tasks before promising later integration or verification. Inspect every result, including started:false advisory and failure outcomes. Keep the current admissionEpoch; admissionTokens are diagnostic.",
     "4. Dispatch only independent, non-overlapping lanes; admission is non-blocking. Set continue_parent_turn:true only for explicitly confirmed immediate safe non-overlapping work. When no safe work remains, call root-only dsh_expert_group_finalize last with summaryCompleted:true, outcomesChecked:true, safeParallelWork:false, and the current admissionEpoch (the only batch location key); admissionTokens is optional and diagnostic (missing, extra, duplicate, unknown, or invalid tokens never block finalization). Finalize validates that batch and registers every accepted expert on the root wait ledger, then returns immediately with its non-terminal waiting receipt carrying admissionEpoch and acceptedCount: waiting means the wait is registered, not that any expert finished; it is not an asynchronous task handle, and there is no status to poll. The current root turn then keeps waiting at the agent/turn-stopping lifecycle boundary on that same ledger, with no timeout, because an expert may legitimately run for hours; it never stops, resumes, or concludes a child. Never poll. After that waiting receipt, do not call finalize again for that batch and do not poll for status; keep doing other independent work with tool calls. The plugin closes the batch and steers one finalization message into your next step automatically once the accepted work is actually still (that plugin-internal steer at the lifecycle boundary is not a model action). finalize is the only waiting mechanism you call; waiting happens at that boundary, not in a message. A dependent task waits for prerequisite feedback: dispatch the prerequisite first, then dispatch the dependent task with a compressed result once DSH delivers that feedback in a later turn. ask_user_question and exit_plan_mode keep the root turn open; grill-me/to-spec replies also do. Do not use update_goal pause: it injects context and continues the root. Do not call Agent.whenIdle/Agent.steer directly.",
-    "5. Independent tasks own independent children. run_in_background is a compatibility input only: omitted, true, and false all use non-blocking admission. A ready child is already between turns; never end it with finalize or a role tool. Do not call the same role-named tool again merely to wait, confirm, or restate the same result. Non-success, non-cancellation turns use bounded manager sendMessage before failing. Turn discipline: every turn must end by calling dsh_expert_group_done as the last tool call, then giving the final answer; a turn that closes without that call is treated as unfinished and continued. Never end a turn with a plan, progress note, or promise. Expert settlements and finalization notices are inputs to continue from, not stop signals.",
+    "5. Independent tasks own independent children. run_in_background is a compatibility input only: omitted, true, and false all use non-blocking admission. A ready child is already between turns; never end it with finalize or a role tool. Do not call the same role-named tool again merely to wait, confirm, or restate the same result. Non-success, non-cancellation turns use bounded manager sendMessage before failing. Turn discipline: every turn must end by calling dsh_expert_group_done as the last tool call, then giving the final answer; a turn that closes without that call is treated as unfinished and continued. Never end a turn with a plan, progress note, or promise. Expert settlements and finalization notices are inputs to continue from, not stop signals. Goal blocking: When the same external prerequisite stays missing with no new evidence/input and no work left, stop repeat checks, dispatches and questions; don't create/extend goals. Report completed scope, missing item/provider, resume evidence; ask once if the user can supply it, else end blocked. Follow Host policy: no fake rounds, partial goals as complete, silent approval or local fixtures as external proof.",
     "6. Route only to enabled roles; read-only findings return for root integration, and the root owns the verification strategy and final acceptance while experts may run bounded unit verification; verify proportionately with project tests and diagnostics. Reuse verification evidence only when it corresponds to the current change and environment and states the command, its result or exit status, and what it covered; re-verify when a later change invalidates it, its coverage is insufficient, or the result is doubtful.",
     "7. Every new delegation declares affectedPaths. Missing scope is not conflict-free; affected paths intersect an active expert task when normalized ranges overlap, and the root must also avoid direct work whose affected paths intersect an active expert task. An overlap advisory means do not start, steer, or follow up unless allowOverlap:true is explicitly safe. Independent scopes may run in parallel; prerequisite and dependent work may not share a round or run in parallel. Keep todo_write current.",
     "</Workflow>",

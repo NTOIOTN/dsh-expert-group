@@ -227,7 +227,7 @@ export function createRoleToolExecute({ records, identity, dispatch, core }) {
      */
     async function cancelChild({ childId, parent }) {
       if (!core.spawnProviderReady()) {
-        throw new Error(`subagent provider "spawn" is not available (missing a supported activation seam/provider capabilities/prepareContinuable); the ${role} expert tool cannot cancel a child`);
+        throw new Error(`subagent provider "spawn" is not available (missing a supported activation seam or provider capabilities); the ${role} expert tool cannot cancel a child`);
       }
       const cancelled = await closure.cancelExplicitChild({
         childId,
@@ -390,7 +390,7 @@ export function createRoleToolDispatch({ core, models, roles, storage, records, 
         delegateWithScopeAdmission: (...args) => closure.delegateWithScopeAdmission(...args),
       };
         if (!core.spawnProviderReady()) {
-          throw new Error(`subagent provider "spawn" is not available (missing a supported activation seam/provider capabilities/prepareContinuable); the ${role} expert tool cannot start a child`);
+          throw new Error(`subagent provider "spawn" is not available (missing a supported activation seam or provider capabilities); the ${role} expert tool cannot start a child`);
         }
         phase.value = "selection";
         // 启动前路由（票据 24）：primary -> 有序候选，只对预检类失败降级；
@@ -485,7 +485,7 @@ export function createRoleToolDispatch({ core, models, roles, storage, records, 
           label: args.description,
           prompt: promptContent,
           parent,
-          // 内部字段：只供 startExpertActivation 选择宿主 provider，调用宿主前剥离。
+          // 内部字段：只供 ordinary activation adapter 选择宿主 provider，调用宿主前剥离。
           subagentProvider: subagentTarget.provider,
           agentOptions: {
             provider: selection.provider,
@@ -881,22 +881,37 @@ export function createIndexExpertRoleTools({ closures, definition, observerRoute
     mountedRoleSignatures.set(role, roleDefinitionSignature(roles.roleCatalog().get(role)));
   }
 
-  /** 卸载某角色工具及其 effect；幂等。 */
+  /** 普通角色工具也保留失败 disposer，避免provider刷新重复注册未能移除的旧定义。 */
   function release(role) {
-    if (role === "observer") routeImageToObserver = void 0;
+    if (releaseVerified(role) && role === "observer") routeImageToObserver = void 0;
+  }
+
+  /**
+   * 严格注销：只有底层 effect disposer 成功，才清除 mounted 标记；
+   * 失败时保留句柄与 mounted 状态供后续 cleanup 重试。
+   */
+  function releaseVerified(role) {
     const dispose = toolDisposers.get(role);
-    if (dispose === void 0) return;
+    if (dispose === void 0) return true;
+    try {
+      if (dispose() === false) {
+        logger.warn(`dsh-expert-group: dispose tool ${role} failed: unregister-not-confirmed`);
+        return false;
+      }
+    } catch (error) {
+      logger.warn(`dsh-expert-group: dispose tool ${role} failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
     toolDisposers.delete(role);
     mountedRoleSignatures.delete(role);
-    try { dispose(); } catch (error) {
-      logger.warn(`dsh-expert-group: dispose tool ${role} failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    return true;
   }
 
   return {
     prepareMount,
     commitMount,
     release,
+    releaseVerified,
     roleDefinitionSignature,
     isMounted: (role) => toolDisposers.has(role),
     mountedRoleIds: () => [...toolDisposers.keys()],

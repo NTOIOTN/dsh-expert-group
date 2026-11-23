@@ -9,7 +9,10 @@
  * 三段投影：
  * - 系统 Toast（ADR 0005）：逐字段重建白名单结构，绝不解构 describe() 原对象；
  * - root turn 等待账本（票据 11）：未结算总量/最早等待/能力等级/最近收口投递；
- * - 运行时摘要：fanout 队列与停止边界、持久化/恢复、委派范围、设置代次、storage 与 RPC。
+ * - 运行时摘要：持久化/恢复、委派范围、设置代次、storage 与 RPC。fan-out 父任务 /
+ *   分片的队列与停止边界投影已随 fan-out 整体移除，限流样本与名额释放异常因此在诊断面
+ *   保留键位、恒为 null（无运行期样本）；并发上限的 default/roles/providers 同样没有
+ *   任何运行期来源，固定为中性值（0 / 空对象），只为维持客户端读取形状。
  *
  * ## 铁律（票据 19）
  * 不接收 ctx、不注册、不持状态：所有状态都经各域的命令/只读投影获取。
@@ -21,10 +24,8 @@ import {
   CAPABILITY_REPORT_VERSION,
   RPC_ERROR_CATEGORY_LIMIT,
   diagnosticCount,
-  diagnosticMessage,
   diagnosticTime,
   diagnosticToken,
-  projectThrottleDiagnostics,
 } from "./runtime-diagnostics.js";
 import { AUTO_RECOVERY_LIMIT } from "../shared/recovery-ledger.js";
 import { lastOrdinaryFallbackDiagnostics } from "./route-diagnostics.js";
@@ -32,15 +33,17 @@ import { lastOrdinaryFallbackDiagnostics } from "./route-diagnostics.js";
 /**
  * 创建运行时诊断投影能力面。
  *
- * @param {object} deps - 窄能力面（8 组）。
+ * @param {object} deps - 窄能力面（7 组）。
  * @param {object} deps.host - host 组合门面（同一关注点：host 子服务只读 describe）：
  *   `lineage.describe()`、`handoff.describe()`、`notifications.describe()`。
- * @param {object} deps.settings - settings runtime：`describe()`。
- * @param {object} deps.storage - settings/storage 域：`describe()` 与
- *   `readLastEventRestore()`（冷启动事件历史恢复结论）。
+ * @param {object} deps.settings - settings 读面：`describe()`（settings runtime 的代次/在途写入）。
+ *   惰性兼容输入：fan-out 退役后不再读取任何并发上限派生值。
+ * @param {object} deps.storage - settings/storage 域：`describe()`（binding/表清单只读投影）
+ *   与 `persistenceHealth()`（普通 session/child 写入的只读健康快照；见 readStorageWriteHealth）。
  * @param {object} deps.recovery - 恢复域：`describe()`、`activationCount()`、`recordCount()`。
- * @param {object} deps.fanout - fan-out Host 晚绑定：`getFanoutHost()`。
- * @param {object} deps.roles - 角色目录投影：`activeRoles()`（只用于限制启用角色的上限投影）。
+ * @param {object} [deps.fanout] - fan-out 宿主读面的历史晚绑定：`getFanoutHost()`。
+ *   fan-out 物理删除后装配不再提供该槽位，只剩持久化/预算等历史诊断段的容错读取。
+ *   并发上限也不再有任何来源（限流器已随 fan-out 删除）。
  * @param {object} deps.delegation - 委派跟踪器 + 范围释放诊断：`activeTaskCounts()`、
  *   `readLastRefusedScopeRelease()`。
  * @param {object} deps.observability - 只读诊断源（同一关注点：诊断输入）：
@@ -171,149 +174,115 @@ function describeRootTurnWaitDiagnostics(rootWait) {
 }
 
 /**
- * provider 名的安全投影（票据 05 · F4）。
+ * 普通 session/child 写入健康状态的容错读取（只读投影）。
  *
- * provider 名是用户在设置里写的公开配置（不是会话数据），但仍做两步归一：去掉控制字符
- * 并截断到 64 字符，保证诊断面不会被伪造的多行文本或超长配置污染。
+ * 为什么挂在既有 storage 协作面上：session_overrides / child_models 的每次写入都由
+ * host/persistence-health 的 storage 观察通道记录（index-settings-storage 与
+ * host/session-override-store 在落盘后调用 observeStorageWrite），该状态由组合根唯一持有。
+ * fan-out 物理删除后装配不再提供 fan-out 依赖，若继续读 `fanoutState.persistenceHealth`，
+ * 投影里的 lastFailure/lastSuccess 会永远是空对象（P2 缺陷）；这里改从 storage 协作面读取
+ * 同一份进程内健康状态，不新增能力组、不引入已删除的 fan-out 运行时。
+ *
+ * 只挑选诊断需要的白名单字段：失败分类（failureCategory）、本通道连续失败计数
+ * （consecutiveFailures）、最近失败/成功时间戳（调用方只读 at/category）。
+ *
+ * **嵌套对象也要逐字段重建**（与系统 Toast 段同一纪律）：`persistence-health` 的
+ * `storage.lastFailure` 里还带着 `message`（写入失败时的原始错误正文）、`code`、
+ * `source` 等字段，直接透传等于把正文重新放回诊断读面——只要未来任何一处顺手打印
+ * 该嵌套对象就会泄露。因此这里只保留分类与时间戳两个键：
+ * - `lastFailure: { category, at }`（分类 + 时间戳）；
+ * - `lastSuccess: { at }`（只有时间戳）。
+ * 原始 `message` 与错误堆栈因此**不存在于**投影结果里，而不是「没人打印它」。
+ *
+ * 读面缺失、返回非对象或读取抛错时按「没有写入样本」归一（0/null），诊断面因此永远
+ * 不会成为 meta 的故障点。
+ *
+ * @param {object} storage - storage 协作面（`describe()` + 可选 `persistenceHealth()`）。
+ * @returns {{failureCategory:string|null, consecutiveFailures:number,
+ *   lastFailure:{category:(string|null), at:(number|null)}|null,
+ *   lastSuccess:{at:(number|null)}|null}} 只读健康投影。
  */
-function diagnosticProviderName(value) {
-  if (typeof value !== "string") return null;
-  const cleaned = value.replace(/[\u0000-\u001f\u007f]+/g, "").trim();
-  return cleaned.length === 0 ? null : cleaned.slice(0, 64);
+function readStorageWriteHealth(storage) {
+  let snapshot;
+  try {
+    snapshot = typeof storage?.persistenceHealth === "function" ? storage.persistenceHealth() : undefined;
+  } catch {
+    snapshot = undefined;
+  }
+  const observed = snapshot?.storage;
+  if (observed === null || typeof observed !== "object") {
+    return { failureCategory: null, consecutiveFailures: 0, lastFailure: null, lastSuccess: null };
+  }
+  const failure = observed.lastFailure !== null && typeof observed.lastFailure === "object"
+    ? observed.lastFailure
+    : null;
+  const success = observed.lastSuccess !== null && typeof observed.lastSuccess === "object"
+    ? observed.lastSuccess
+    : null;
+  return {
+    failureCategory: typeof failure?.category === "string" ? failure.category : null,
+    consecutiveFailures: observed.consecutiveFailures,
+    lastFailure: failure === null
+      ? null
+      : {
+        category: typeof failure.category === "string" ? failure.category : null,
+        at: diagnosticTime(failure.at),
+      },
+    lastSuccess: success === null ? null : { at: diagnosticTime(success.at) },
+  };
 }
 
 /**
- * fan-out 段投影（队列/事件/停止边界/并发与限流）。
- * @param {object} diagnosticsState - describeRuntimeDiagnostics 已计算的只读局部量。
- * @returns {object} fanout 投影。
+ * 并发上限子投影的固定中性值（**无上限来源**）。
+ *
+ * 限流器已随 fan-out 物理删除，四个 fan-out 专属设置项（roleConcurrencyLimit /
+ * roleLimits / providerLimits / roleTimeoutMs）也从 Host 的活动路径上移除，因此这里
+ * 不再有任何真实上限来源：
+ * - `default` / `roles` / `providers` 是「无上限配置」的中性值（0 / 空对象），
+ *   **不伪造数值**，也不把宿主子代理名额（maxActiveSubagents）塞进来——它属于宿主名额，
+ *   另有 `meta.hostConcurrencyCap` 投影；
+ * - `throttle` / `providerRelease` 早已无运行期样本，继续保持 null；
+ * - `source` 保留键位：旧枚举 live/snapshot/fallback 都表达「本次解析的来源」，现在
+ *   没有任何来源，固定 unknown；invalid* 三键同理保持 null（读取期归一已不再产生非法值）。
+ *
+ * 键位与形状必须原样保留：客户端仍在读 `diagnostics.fanout.concurrency.throttle`。
+ *
+ * @returns {object} 固定形状的中性并发投影（每次返回新对象，避免调用方改坏共享结构）。
  */
-function projectFanoutDiagnostics(diagnosticsState) {
-  const {
-    fanoutState,
-    managerEventHistory,
-    activeParents,
-    queuedShards,
-    runningShards,
-    concurrency,
-    roleOverrides,
-    providerOverrides,
-    providerRelease,
-    stopState,
-    stopAging,
-  } = diagnosticsState;
+function neutralConcurrencyDiagnostics() {
   return {
-    tasks: diagnosticCount(fanoutState.tasks),
-    activeAttempts: diagnosticCount(fanoutState.activeAttempts),
-    settledTasks: diagnosticCount(fanoutState.settledTasks),
-    activeParents,
-    queuedShards,
-    runningShards,
-    restorePending: fanoutState.restorePending === true,
-    closed: fanoutState.closed === true,
-    /**
-     * 事件历史窗口（票据 04）：
-     * - retained/bytes：当前保留的历史规模；
-     * - dropped/earliestSequence：已被裁剪的累计条数与最早可用序号（gap 判定）；
-     * - restore：冷启动 restoreEvents 的布尔结果（过去被丢弃）。
-     */
-    events: {
-      retained: diagnosticCount(fanoutState.budget?.events),
-      bytes: diagnosticCount(fanoutState.budget?.eventBytes),
-      dropped: diagnosticCount(managerEventHistory?.dropped),
-      earliestSequence: diagnosticTime(managerEventHistory?.earliestSequence),
-      restore: (() => {
-        // 冷启动事件历史恢复的结论由 settings/storage 域持有，这里只读一次投影。
-        const lastEventRestore = diagnosticsState.readLastEventRestore();
-        return lastEventRestore === null
-          ? null
-          : {
-            accepted: lastEventRestore.accepted === true,
-            attempted: lastEventRestore.attempted === true,
-            at: diagnosticTime(lastEventRestore.at),
-          };
-      })(),
-      // Host 自有查询日志（服务 RPC fanout-events）的保留窗口状态；与 manager 的
-      // 持久化事件历史分开计数，两者都只暴露计数/序号。
-      log: fanoutState.eventLog === null || fanoutState.eventLog === undefined
-        ? null
-        : {
-          retained: diagnosticCount(fanoutState.eventLog.count),
-          dropped: diagnosticCount(fanoutState.eventLog.dropped),
-          earliestSequence: diagnosticTime(fanoutState.eventLog.earliestSequence),
-          restoreAccepted: fanoutState.eventLog.restoreAccepted === true,
-        },
-    },
-    /**
-     * 真实停止边界（票据 07）：
-     * - stopPending/legacy：聚合阻塞源与旧快照派生身份的规模；
-     * - boundary/boundarySource：最近一次恢复使用的边界（显式或按进程身份自动）；
-     * - watchdogExpired/attributedAged/needsAttention：宽限/老化/需人工处理的计数。
-     * 这些字段回答"任务为什么还没结算"，不暴露任何任务负载。
-     */
-    stop: {
-      stopPending: diagnosticCount(stopState?.stopPending),
-      unobserved: diagnosticCount(stopState?.unobserved),
-      requested: diagnosticCount(stopState?.requested),
-      watchdogExpired: diagnosticCount(stopState?.watchdogExpired),
-      legacy: diagnosticCount(stopState?.legacy),
-      attributedAged: diagnosticCount(stopState?.attributedAged),
-      needsAttention: diagnosticCount(stopState?.needsAttention),
-      boundary: diagnosticToken(stopState?.boundary, "unknown"),
-      boundarySource: diagnosticToken(stopState?.boundarySource, "unknown"),
-      lastWatchdogAt: diagnosticTime(stopState?.lastWatchdog?.at),
-      aging: stopAging === null || stopAging === undefined
-        ? null
-        : {
-          enabled: stopAging.enabled === true,
-          windowMs: diagnosticCount(stopAging.windowMs),
-          pending: diagnosticCount(stopAging.pending),
-          aged: diagnosticCount(stopAging.aged),
-          skipped: diagnosticCount(stopAging.skipped),
-          lastAgedAt: diagnosticTime(stopAging.lastAged?.at),
-          lastAgedReason: diagnosticToken(stopAging.lastAged?.reason, null),
-        },
-    },
-    concurrency: {
-      default: diagnosticCount(concurrency?.default),
-      roles: roleOverrides,
-      /**
-       * provider 级上限（票据 26）：0 = 显式不限制，未出现 = 未配置（同样不限制）。
-       * 与 roles 一样只投影归一后的生效值。
-       */
-      providers: providerOverrides,
-      /**
-       * 限流/排队诊断（票据 26）：按 role 与 provider 的 limit/running/queued/
-       * lastThrottledAt/etaMs。数据源是 manager 的同一套 running 计数与 shard
-       * 状态（没有第二套计数器）；etaMs 在样本不足时显式为 null + "unknown"。
-       */
-      throttle: fanoutState.throttle === null || fanoutState.throttle === undefined
-        ? null
-        : projectThrottleDiagnostics(fanoutState.throttle),
-      /**
-       * provider 名额释放异常（票据 05 · F4）：最近一条 `PROVIDER_RELEASE_MISMATCH`。
-       *
-       * 只在「释放了一个从未计数的桶」（桶缺失或计数已为 0）时出现，回答"某次执行的名额
-       * 为什么没有归还"。字段只有稳定 code / provider 名 / 时间戳 / 释放来源，null 表示
-       * 本进程内从未发生——不记任务正文、prompt 或任何凭据。
-       */
-      providerRelease: providerRelease === null || providerRelease === undefined
-        ? null
-        : {
-          code: diagnosticToken(providerRelease.code, "unknown"),
-          provider: diagnosticProviderName(providerRelease.provider),
-          at: diagnosticTime(providerRelease.at),
-          source: diagnosticToken(providerRelease.source, "unknown"),
-        },
-      // 解析来源（live / snapshot / fallback）与最近一次非法上限只保留固定
-      // 枚举/类型；message 是插件内部固定文案（不含设置原文或原始返回值），
-      // 经长度与控制字符归一再透出，让用户能解释"设置页=3、实际并发=20"。
-      source: diagnosticToken(concurrency?.source, "unknown"),
-      invalidKind: concurrency?.invalid === undefined ? null : diagnosticToken(concurrency.invalid.kind),
-      invalidValueType: concurrency?.invalid === undefined
-        ? null
-        : diagnosticToken(concurrency.invalid.valueType, "unknown"),
-      invalidMessage: diagnosticMessage(concurrency?.invalid?.message),
-    },
+    default: 0,
+    roles: {},
+    providers: {},
+    throttle: null,
+    providerRelease: null,
+    source: "unknown",
+    invalidKind: null,
+    invalidValueType: null,
+    invalidMessage: null,
+  };
+}
+
+/**
+ * 并发与限流段投影（role / provider 配额、限流与名额释放异常）。
+ *
+ * 历史背景：这一段原先挂在 `fanout` 键下（它当时的唯一样本来源是 fan-out manager 的
+ * describe()），因此 RPC 字段名保留了 `diagnostics.fanout`。fan-out 的父任务 / 分片
+ * 队列、事件窗口与停止边界投影**已经删除**；由于客户端仍在读
+ * `diagnostics.fanout.concurrency.throttle`，键名与该子投影暂时原样保留（后续单独做
+ * 命名清理，不在本次物理删除里改协议字段名）。
+ *
+ * **限流器已随 fan-out 物理删除，不再有任何运行期上限来源**：roleConcurrencyLimit /
+ * roleLimits / providerLimits / roleTimeoutMs 四个设置项也从 Host 的活动路径上移除，
+ * 因此 `default` / `roles` / `providers` 明确改为「无上限配置」的中性值
+ * （0 / 空对象），不再从 settings 派生，也不把宿主子代理名额塞进来（它另有
+ * `meta.hostConcurrencyCap` 投影）。此处保留键位只为维持客户端读取形状。
+ *
+ * @returns {object} 并发与限流投影（形状固定、无运行期样本）。
+ */
+function projectFanoutDiagnostics() {
+  return {
+    concurrency: neutralConcurrencyDiagnostics(),
     /**
      * 时段/层/跨层回退诊断（票据 06）：只投影「最近一次跨层回退」的稳定事实。
      *
@@ -343,32 +312,28 @@ function projectPersistenceDiagnostics(diagnosticsState) {
     healthSuccess,
     healthFailure,
     blockedPersistence,
-    lastRestoreState,
     lastBudgetViolation,
     fanoutState,
   } = diagnosticsState;
   return {
+    // manager 落盘结果（saved/skipped(reason)/failed(bytes)）的唯一写入方是已删除的
+    // fan-out manager：这里恒为 null，只保留字段形状，不按普通写入推断。
     lastResult: primaryPersist === null ? null : diagnosticToken(primaryPersist.status, "unknown"),
     reason: primaryPersist === null ? null : diagnosticToken(primaryPersist.reason, null),
     bytes: primaryPersist === null ? null : diagnosticTime(primaryPersist.bytes),
-    // 分类权威是 Host persistence-health；manager 自带 category 只作为回退。
+    // 分类权威是 Host persistence-health（普通写入的 storage 观察通道）；
+    // manager 自带 category 只在历史数据仍存在时作为回退。
     category: diagnosticToken(primaryCategory, null),
     consecutiveFailures: diagnosticCount(persistenceHealthState.consecutiveFailures),
     lastSuccessAt: diagnosticTime(healthSuccess?.at),
     lastFailureAt: diagnosticTime(healthFailure?.at),
     blocked: blockedPersistence === null ? null : diagnosticToken(blockedPersistence.reason, "unknown"),
-    restore: lastRestoreState === null
-      ? null
-      : {
-        ok: lastRestoreState.ok === true,
-        code: diagnosticToken(lastRestoreState.error?.code, null),
-        field: diagnosticToken(lastRestoreState.error?.field, null),
-        message: diagnosticMessage(lastRestoreState.error?.message),
-        at: diagnosticTime(lastRestoreState.at),
-        restored: diagnosticCount(lastRestoreState.restored),
-        deferred: diagnosticCount(lastRestoreState.deferred),
-        pending: lastRestoreState.pending === true,
-      },
+    // 恢复结果投影：**唯一写入方已随 fan-out 物理删除**（原 fan-out manager 的 restore 结果）。
+    // 装配不再提供 `fanout` 读面（host/index-assembly-wire.js 不传该键），因此
+    // `fanoutState.persistence` 恒为空对象、`persistence.restore` 永远取不到样本，原投影
+    // 分支不可达。这里把键位固定为 null（语义：本进程没有恢复样本），形状不变；
+    // 不补 0、不按普通写入推断历史，也不为它保留已无消费方的正文清洗链。
+    restore: null,
     lastBudgetViolation: lastBudgetViolation === null
       ? null
       : {
@@ -402,7 +367,7 @@ function projectImageRoutes(state) {
   };
 }
 
-export function createRuntimeDiagnostics({ host, settings, storage, recovery, fanout, roles, delegation, observability }) {
+export function createRuntimeDiagnostics({ host, settings, storage, recovery, fanout, delegation, observability }) {
   function describeRuntimeDiagnostics() {
     const settingsState = settings.describe();
     const storageState = storage.describe();
@@ -410,62 +375,38 @@ export function createRuntimeDiagnostics({ host, settings, storage, recovery, fa
     const notificationState = host.notifications.describe();
     const handoffState = host.handoff.describe();
     const recoveryState = recovery.describe();
-    const fanoutHost = fanout.getFanoutHost();
+    // fan-out 宿主读面：只剩持久化/预算等历史诊断段的容错读取（并发上限已无任何来源）；
+    // 装配已不提供该晚绑定，缺失时按空投影归一，绝不抛错。
+    const fanoutHost = typeof fanout?.getFanoutHost === "function" ? fanout.getFanoutHost() : undefined;
     const fanoutState = typeof fanoutHost?.describe === "function" ? fanoutHost.describe() : {};
-    const tasks = typeof fanoutHost?.listTasks === "function" ? fanoutHost.listTasks() : [];
-    // 队列深度按 shard 聚合：maxTasks 有上界（resource-budget），因此这里是常数级工作。
-    let queuedShards = 0, runningShards = 0, activeParents = 0;
-    for (const task of Array.isArray(tasks) ? tasks : []) {
-      const counts = task?.counts ?? {};
-      queuedShards += diagnosticCount(counts.queued);
-      runningShards += diagnosticCount(counts.running);
-      if (diagnosticCount(counts.pending) > 0) activeParents += 1;
-    }
-    const concurrency = fanoutState.concurrencyLimits;
-    const roleLimits = concurrency?.roles;
-    const roleOverrides = {};
-    if (roleLimits !== null && typeof roleLimits === "object") {
-      // 只保留启用角色的上限：角色名是公开契约，不携带任何会话数据。
-      for (const role of roles.activeRoles()) {
-        if (Number.isSafeInteger(roleLimits[role])) roleOverrides[role] = roleLimits[role];
-      }
-    }
-    /**
-     * provider 级上限投影（票据 26）：provider 名是用户在设置里写的公开配置，
-     * 不是会话数据；仍然做条数/长度上限，保证诊断大小不随配置无界增长。
-     */
-    const providerOverrides = {};
-    const providerLimitsState = concurrency?.providers;
-    if (providerLimitsState !== null && typeof providerLimitsState === "object") {
-      for (const provider of Object.keys(providerLimitsState).slice(0, 32)) {
-        const limit = providerLimitsState[provider];
-        if (Number.isSafeInteger(limit)) providerOverrides[provider.slice(0, 64)] = limit;
-      }
-    }
+    // 惰性兼容输入：fan-out 退役后没有任何运行期并发上限来源，并发子投影因此是
+    // 固定中性值（见 neutralConcurrencyDiagnostics），这里不再派生任何配置读值。
     /**
      * 持久化/恢复诊断投影（票据 04）。
      *
      * 分类权威是 host/persistence-health（failureCategory/consecutiveFailures/时间戳），
      * manager 只提供它亲眼观察到的落盘结果（saved/skipped(reason)/failed(bytes)）。
      * 两者合并，但绝不把快照正文、任务负载或错误堆栈放进诊断。
+     *
+     * 数据来源（fan-out 物理删除后的真实情况）：
+     * - lastFailure/lastSuccess/failureCategory/consecutiveFailures：普通 child_models /
+     *   session_overrides 写入的 storage 观察通道（readStorageWriteHealth，经既有 storage
+     *   协作面读取）。这是唯一仍有运行期写入方的健康来源；
+     * - manager 落盘结果（lastResult/reason/bytes）、blocked、budget：原唯一写入方是已删除的
+     *   fan-out manager，故继续从空的 `fanoutState.persistence` 取值为 null——保留键位只为
+     *   维持客户端可见形状，不补 0、不伪造历史；
+     * - restore：唯一写入方同样随 fan-out 物理删除，且装配不再传 `fanout` 读面，取样本的
+     *   分支不可达，因此直接固定为 null（见 projectPersistenceDiagnostics 的 restore 注释）。
      */
     const persistenceState = fanoutState.persistence ?? {};
     const managerPersistence = persistenceState.manager ?? {};
     const managerPersist = managerPersistence.lastResult ?? null;
     const hostPersist = persistenceState.lastResult ?? null;
     const blockedPersistence = persistenceState.blocked ?? null;
-    const persistenceHealthState = fanoutState.persistenceHealth ?? {};
-    const healthFailure = persistenceHealthState.lastFailure ?? null;
-    const healthSuccess = persistenceHealthState.lastSuccess ?? null;
+    const persistenceHealthState = readStorageWriteHealth(storage);
+    const healthFailure = persistenceHealthState.lastFailure;
+    const healthSuccess = persistenceHealthState.lastSuccess;
     const lastBudgetViolation = fanoutState.budget?.lastViolation ?? null;
-    const managerEventHistory = persistenceState.eventHistory ?? null;
-    const lastRestoreState = persistenceState.restore ?? null;
-    /**
-     * 停止边界诊断（票据 07）：manager 的未确认停止视图 + Host 的归属老化窗口。
-     * 只投影计数/固定枚举/时间戳，绝不透出 prompt、结果或会话正文。
-     */
-    const stopState = fanoutState.stop ?? null;
-    const stopAging = stopState?.aging ?? null;
     /**
      * 委派影响范围诊断（票据 07）：只回答「还有多少活动范围、其中多少已脱离 root」与
      * 最近一次 release_scope 被拒绝的摘要（时间/条数/固定原因码）。活动项只计数，
@@ -489,25 +430,13 @@ export function createRuntimeDiagnostics({ host, settings, storage, recovery, fa
     // 两段投影共享同一份只读局部量：避免各自重复读取 host/manager（读取顺序与迁移前一致）。
     const diagnosticsState = {
       fanoutState,
-      managerEventHistory,
-      activeParents,
-      queuedShards,
-      runningShards,
-      concurrency,
-      roleOverrides,
-      providerOverrides,
-      providerRelease: fanoutState.providerRelease ?? null,
-      stopState,
-      stopAging,
       primaryPersist,
       primaryCategory,
       persistenceHealthState,
       healthSuccess,
       healthFailure,
       blockedPersistence,
-      lastRestoreState,
       lastBudgetViolation,
-      readLastEventRestore: () => storage.readLastEventRestore(),
     };
     return {
       version: CAPABILITY_REPORT_VERSION,

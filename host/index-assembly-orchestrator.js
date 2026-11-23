@@ -110,7 +110,10 @@ export function assembleOrchestratorModel(state, caps) {
       },
     },
     // 新建会话触发点（判据：根 agent + 无请求头 + 无 applied 记录；全部在 manager 内）。
-    { kind: "on", event: "agent/created", handler: ({ agent } = {}) => manager.noteAgentCreated(agent) },
+    { kind: "on", event: "agent/created", handler: ({ agent } = {}) => {
+      if (!state.isExactRegisteredAgent(agent)) return;
+      manager.noteAgentCreated(agent);
+    } },
     // 会话结束：释放运行期状态（含自写令牌与排队意图）。
     { kind: "on", event: "agent/disposed", handler: ({ agent } = {}) => manager.noteAgentDisposed(agent) },
     // 防回环 / 手动接管：只消费 model/selection，不改变任何其它事件路径的行为。

@@ -2,7 +2,7 @@
  * 入口 agent/request-error 事件接线域（R4e · 票据 19）。
  *
  * 这是 `ctx.on("agent/request-error")` 的纯 handler：在公开 waterfall 上接管插件
- * root / 专家 child / fan-out 分片的模型失败，按三个触发点决定「重试、换候选、终态」：
+ * root / 专家 child 的模型失败，按三个触发点决定「重试、换候选、终态」：
  * 1. 确定性失败（模型不存在/无 adapter/鉴权失败/上下文超限/配额或余额耗尽
  *    QUOTA、ACCOUNT_QUOTA）→ 有候选立即换，不浪费预算；
  * 2. 其余**不可重试**的请求错误（provider 私有码、未知码等，既不在宿主重试白名单、
@@ -50,8 +50,8 @@ import { waitForRequestRetryDelay } from "./rpc-request-lifecycle.js";
  */
 export function createAgentRequestErrorHandler({ logger, recovery }) {
   /**
-   * 在公开 agent/request-error waterfall 上接管插件 root / 专家 child / fan-out
-   * 分片的模型失败。使用 prepend 保证该边界先于 Host listener：Host 已有 llm/retry
+   * 在公开 agent/request-error waterfall 上接管插件 root / 专家 child 的模型失败。
+   * 使用 prepend 保证该边界先于 Host listener：Host 已有 llm/retry
    * 负责退避时只复用其返回值；Host 未处理的 code 由公开 async hook 使用
    * payload.signal 等待有界退避。这里绝不调用 prompt、私有 steer 或内部 API。
    *

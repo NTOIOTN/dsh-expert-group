@@ -434,7 +434,7 @@ function retryRecoveryDispatchAfterFailure(op, record, session, reason, error) {
  * @returns {object} 重建能力面。
  */
 export function createRecoveryChildRebuild(deps) {
-  const { records, recovery, identity, storage, experts, structured, agents, delegation } = deps;
+  const { records, recovery, identity, storage, experts, structured, snapshot, agents, delegation } = deps;
   const { recordsView, moveRecoveryRecordToChild } = records;
   const { readSnapshot } = storage;
   const {
@@ -442,6 +442,7 @@ export function createRecoveryChildRebuild(deps) {
     resolvePersonaForAdmission,
     resolvePersistedSubagentTarget,
     startExpertActivation,
+    startOrdinaryExpertActivation,
     contextInheritanceError,
   } = experts;
   const { markStructuredRequest } = structured;
@@ -515,6 +516,12 @@ export function createRecoveryChildRebuild(deps) {
           : CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE,
       );
     }
+    if (typeof experts.isLocalProvider !== "function" || !experts.isLocalProvider(subagentTarget.provider)) {
+      throw contextInheritanceError(
+        "cannot rebuild recovery child because the selected external provider does not support continuation",
+        CONTEXT_INHERITANCE_ERROR_CODES.UNAVAILABLE,
+      );
+    }
     const request = {
       label: source.label,
       prompt: [{ type: "text", text: buildExpertTaskPrompt(record.role, promptText) }],
@@ -530,7 +537,7 @@ export function createRecoveryChildRebuild(deps) {
         // ModelSelection 再校验 agent/request waterfall 的一致性；档位只走 marker +
         // listener 会让重建出来的 child 在「路由与父代理不同」时一启动就失败。
         // 取值来自恢复上下文（request.agentOptions 的 marker 快照），绝不重新选档。
-        // 与 fan-out 落盘侧（index-expert-tools-fanout.js 的 writeChildModel）同一判据：
+        // 与 child_models 落盘侧（host/index-settings-storage.js 的 writeChildModel）同一判据：
         // 只有**非空字符串**才写入真实字段。marker 原样保留（child_models 的档位列仍由
         // marker 快照推导），因此空串/坏值不会以"未声明档位"以外的形态进入宿主选择。
         ...(typeof source.reasoningEffort === "string" && source.reasoningEffort.length > 0
@@ -559,13 +566,20 @@ export function createRecoveryChildRebuild(deps) {
     let childId;
     let messageId;
     try {
-      ({ childId, messageId } = await startExpertActivation({
+      const activate = typeof startOrdinaryExpertActivation === "function"
+        ? startOrdinaryExpertActivation
+        : startExpertActivation;
+      ({ childId, messageId } = await activate({
         request,
         label: source.label,
         signal: op.controller?.signal,
         // 恢复重建同样是新 activation：父 Agent 已在 dispatch 边界验证为当前存活对象，
-        // rc.2 的 exact-parent 校验依赖它。
+        // rc.2 的 exact-parent 校验依赖它；本地 provider 还需用私有 intent 关联
+        // agent/created 的 exact replacement Agent。
         parent,
+        role: record.role,
+        rootToken,
+        recoveryRebuild: true,
       }));
       if (!lineage.isLiveGeneration(parent, rootToken)) throw new Error("root generation is no longer live");
     } catch (error) {
@@ -580,13 +594,18 @@ export function createRecoveryChildRebuild(deps) {
       logger.warn(`dsh-expert-group: ignoring late recovery rebuild result for child ${oldChildId}`);
       return void 0;
     }
-    if (typeof childId !== "string" || childId.length === 0 || typeof messageId !== "string" || messageId.length === 0) {
-      throw new Error("replacement continuable child did not return a valid childId and messageId");
+    if (typeof childId !== "string" || childId.length === 0) {
+      throw new Error("replacement continuable child did not return a valid childId");
     }
-    // agent/created 通常已迁移 record；若宿主事件未同步发出，返回后兜底迁移。
-    // acceptance 返回的 Agent 仍是插件实际创建的对象，必须登记到 global guard 身份表。
-    registerPluginExpertChildAgent(agents.get(childId));
-    if (record.childId !== childId) moveRecoveryRecordToChild(record, childId);
+    const localProvider = experts.isLocalProvider?.(subagentTarget.provider) === true;
+    if (localProvider && (typeof messageId !== "string" || messageId.length === 0)) {
+      throw new Error("local replacement child did not return a valid messageId");
+    }
+    // external backend没有local Agent/inbox；只在Host确实注册了replacement Agent时
+    // 安装local guard，record迁移本身允许childId继续作为external backend identity。
+    const replacementAgent = agents.get?.(childId);
+    if (replacementAgent !== undefined) registerPluginExpertChildAgent(replacementAgent);
+    if (record.childId !== childId) moveRecoveryRecordToChild(record, childId, replacementAgent);
     const scope = delegationScopeKey(record.parentId, record.role);
     const current = delegationTracker.getChild(scope);
     // cold-resume 可能从未写入 tracker scope（current === undefined）；应把成功
@@ -611,6 +630,13 @@ export function createRecoveryChildRebuild(deps) {
         binding.messageId = messageId;
         binding.pendingMessage = false;
       }
+    }
+    if (replacementAgent?.id === childId && typeof snapshot?.persistCommittedRecoveryChild === "function") {
+      snapshot.persistCommittedRecoveryChild(replacementAgent, {
+        role: record.role,
+        parentId: record.parentId,
+        effort: experts.resolveEffortOf?.(replacementAgent),
+      });
     }
     return messageId;
   }
@@ -804,10 +830,9 @@ export function createAutoRecoveryDispatch(deps) {
  * @returns {object} 事件桥能力面。
  */
 export function createRecoveryEventBridge(deps) {
-  const { logger, records, handoff, identity, rootWait, notifications, fanout, delegation } = deps;
+  const { logger, records, handoff, identity, rootWait, notifications, delegation } = deps;
   const { agents, isLiveRootAgent } = identity;
   const { notificationHost, rootGenerationRegistry } = notifications;
-  const { getFanoutHost, reconcileUnbarrieredFanoutHandoffs } = fanout;
   const delegationTracker = delegation;
   const {
     getRecord,
@@ -944,9 +969,6 @@ function onSessionEvent(session, event) {
     queueMicrotask(() => {
       try {
       if (typeof session?.id !== "string") return;
-      // completion 事件先交给 fan-out；未识别的 fan-out marker 不应落入旧
-      // recoveryRecords 路径，避免同一 child 被双重结算或自动续跑。
-      if (getFanoutHost()?.handleSessionEvent(session, event) === true) return;
       const liveAgent = agents.get(session.id);
       const record = getRecord(session.id);
       if (record !== void 0) {
@@ -1013,9 +1035,6 @@ function onSessionEvent(session, event) {
           // 延迟 microtask 中必须确认事件仍属于当前 root Session；同 id 新 root
           // 不能被旧代际 user/message 误当作本次等待的用户回答。
           clearRootUserWait(liveAgent, session);
-          // 真实用户输入开启新的 root run：为「已在运行、但本进程还没有登记等待」的
-          // fan-out 任务补登记。判定完全基于当前事实，重复触发是幂等的。
-          reconcileUnbarrieredFanoutHandoffs();
           // 真实用户输入开启新的 root run：只有这里会重置"本 run 至多一次"的终止
           // 通知资格。subagent-settled/agent-message 等注入消息不进入该分支，
           // 因此子代理结算回唤出的续接 turn 仍然属于同一 run，不会重复提示。

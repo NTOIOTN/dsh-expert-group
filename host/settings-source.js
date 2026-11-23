@@ -57,8 +57,8 @@ export const HOST_SUBAGENT_CAPACITY_FIELD = "maxActiveSubagents";
 /*
  * 本模块**只读**宿主名额，不提供任何运行期写入口：默认值 64 由 bundle 补丁
  * （cordis.patch.yml 里的 `- id: subagent` 覆盖项）在安装时声明，profile patch /
- * home patch / CLI overlay 仍按「后者覆盖前者」的常规层序改写它。读取面服务于两件事：
- * ① 派发 resolver 的封顶（effectiveRoleConcurrencyLimitWithHostCap）；② meta 投影。
+ * home patch / CLI overlay 仍按「后者覆盖前者」的常规层序改写它。读取面只服务一件事：
+ * meta 的 `hostConcurrencyCap` 投影（fan-out 退役后不再有「按名额封顶的默认并发」）。
  */
 
 /**

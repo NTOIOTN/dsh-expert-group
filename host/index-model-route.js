@@ -4,9 +4,9 @@
  * 这一域持有三类**纯派生**语义（没有任何模块级可变状态）：
  * 1. 会话级模型覆盖的只读投影与代次读取（sessionOverrideProjectionOf / resolveRole）；
  * 2. 模型目录解析与启动前路由计划（validateSelection* / executeModelRoutePlan /
- *    preflightSelectionEntry / restoredFanoutModelRoute）；
+ *    preflightSelectionEntry）；
  * 3. settings 写入边界的语义校验与提交（validateSettingsCandidate /
- *    commitSettingsCandidate）：提示词覆盖、通知事件、并发映射、上下文继承、单价、
+ *    commitSettingsCandidate）：提示词覆盖、通知事件、上下文继承、单价、
  *    候选模型与默认模型，顺序与错误码逐条不变。
  *
  * ## 组合根保留的职责（票据 16 铁律 1/3）
@@ -22,7 +22,6 @@
  * @module dsh-expert-group/host/index-model-route
  */
 import { imageCapability } from "../image-routing.js";
-import { MAX_CONCURRENCY_LIMIT, MAX_PROVIDER_LIMIT, MIN_CONCURRENCY_LIMIT, MIN_PROVIDER_LIMIT } from "../fanout.js";
 import {
   MAX_MODEL_CANDIDATES_PER_ROLE,
   MODEL_CANDIDATES_EXHAUSTED,
@@ -51,18 +50,14 @@ import {
 import { abortErrorFor, createAbortError } from "./rpc-request-lifecycle.js";
 import { assertInheritContextCandidate, mergeOrchestratorSettingsCandidate, normalizeSnapshot } from "./settings-read-projection.js";
 import {
-  CONFIG_MIGRATION_VERSION,
   NOTIFICATION_EVENT_TYPES,
   SETTINGS_NAMESPACE,
   normalizeNotificationEvents,
-  normalizeRoleConcurrencyLimit,
-  normalizeRoleTimeoutMs,
 } from "./settings-schema.js";
 import { assertModelPrices } from "./usage-projection.js";
 import { mergePeakValleySubmission, peakValleyChangedRoles, resolvePeakValleyProfiles } from "./peak-valley-settings.js";
 import { routeSnapshotMarkerOf as routeSnapshotMarkerValue } from "../shared/route-snapshot.js";
 import { resolvePeakValleyRoute } from "./peak-valley-route.js";
-import { restoredFanoutModelRoute as restoredFanoutModelRouteFrom } from "./fanout-route-restore.js";
 
 /**
  * 创建会话覆盖 / 模型路由 / 设置校验域能力面。
@@ -73,13 +68,9 @@ import { restoredFanoutModelRoute as restoredFanoutModelRouteFrom } from "./fano
  * @param {(callback: Function) => Promise<unknown>} deps.settingsRuntime - host/settings-runtime（提交串行链与目录代次）。
  * @param {(patch: object, revision: number, generation: number) => Promise<unknown>} deps.updateSettingsAtGeneration -
  *   带代次栅栏的宿主写入命令（settingsRuntime.updateAtGeneration 的窄投影）。
- * @param {(namespace: string) => boolean} deps.configMigrationPending - 配置迁移标记投影。
  * @param {object} deps.settingsRead - settings 读面与投影（host/index-settings-storage 的同一实例）。
- * @param {(role: string) => boolean} deps.isActiveRole - 角色是否启用（与 settings 写入面同一判定）。
  * @param {object} deps.roles - 角色目录能力面 { roleCatalog, activeRoles }。
- * @param {() => object|undefined} deps.getFanoutHost - fan-out Host 晚绑定取值。
  * @param {(message: string) => Error} deps.ValidationError - 组合根的 ValidationError 构造器（RPC 400 映射依赖同一类型）。
- * @param {(value: unknown) => (string|undefined)} deps.normalizeSubagentProvider - subagent provider 名归一（纯函数，属 R4d 域）。
  * @returns {object} 域能力面（见各 installer 返回对象）。
  */
 export function createIndexModelRouteDomain(deps) {
@@ -183,7 +174,7 @@ function installSessionOverrides(deps, api) {
  * @returns {object} M2 能力面。
  */
 function installModelSelection(deps, api) {
-  const { llm, settingsRead, getFanoutHost, normalizeSubagentProvider, ValidationError, clock } = deps;
+  const { llm, settingsRead, ValidationError, clock } = deps;
   const { readSnapshot } = settingsRead;
   /**
    * 只读时钟（票据 03）：派发期唯一时间来源。
@@ -555,11 +546,6 @@ function installModelSelection(deps, api) {
     executeModelRoutePlan,
     resolveRoleModelRoute,
     preflightSelectionEntry,
-    restoredFanoutModelRoute: (input) => restoredFanoutModelRouteFrom(input, {
-      getFanoutHost,
-      readSnapshot,
-      normalizeSubagentProvider,
-    }),
     candidateSelectionsOfRole,
     routeMarkerOf,
     // 路由快照 marker（票据 03）：独立于扁平 marker；非法快照返回 undefined，绝不写半截。
@@ -883,7 +869,7 @@ function installSettingsValueValidation(deps, api) {
   };
 }
 /**
- * M4：候选模型 / 并发映射 / 单价的写入面结构校验（票据 24 / 25 / 26）。
+ * M4：候选模型 / 单价的写入面结构校验（票据 24 / 25）。
  *
  * 无状态：只做结构/范围校验，不触碰模型目录（目录解析在 M2 与 M5 里发生）。
  *
@@ -919,70 +905,6 @@ function installModelCandidatesValidation(deps, api) {
     }
 
 
-    /**
-     * 逐角色并发映射的写入面校验（票据 26）。
-     *
-     * 规则（保存时**只**做结构/范围校验，不调用模型目录、不解析模型）：
-     * - 值必须是普通对象（数组/null 都拒绝）；
-     * - 角色键必须属于内置角色集：
-     *   否则一次保存就会写进一个永远不会被调度读到的键，用户看到配置却永不生效；
-     * - 值必须是 1..64 的安全整数（与 roleConcurrencyLimit/任务级上限同界）。
-     *
-     * 非法条目**整次保存拒绝**：并发上限是安全/成本边界，静默丢弃会让用户以为
-     * 限制已生效。读取面对历史坏值另有一套宽容归一（normalizeRoleLimitsForRead）。
-     *
-     * @param {unknown} value - candidate.roleLimits。
-     * @param {readonly string[]} allowedRoles - 候选设置自己的角色 id 集合。
-     * @returns {Record<string, number>} 归一后的映射（用于写入 patch）。
-     */
-    function assertRoleLimitsCandidate(value, allowedRoles) {
-      if (value === null || typeof value !== "object" || Array.isArray(value)) {
-        throw new ValidationError("设置 roleLimits 无效");
-      }
-      const allowed = new Set(Array.isArray(allowedRoles) ? allowedRoles : STATUS_ROLE_IDS);
-      const normalized = {};
-      for (const [role, limit] of Object.entries(value)) {
-        if (role.trim().length === 0 || !allowed.has(role)) {
-          throw new ValidationError("设置 roleLimits 含未知角色: " + role);
-        }
-        if (!Number.isSafeInteger(limit) || limit < MIN_CONCURRENCY_LIMIT || limit > MAX_CONCURRENCY_LIMIT) {
-          throw new ValidationError("设置 roleLimits." + role + " 必须是 " + MIN_CONCURRENCY_LIMIT + "~" + MAX_CONCURRENCY_LIMIT + " 的整数");
-        }
-        normalized[role] = limit;
-      }
-      return normalized;
-    }
-
-
-    /**
-     * 逐 provider 并发映射的写入面校验（票据 26）。
-     *
-     * 规则：
-     * - 值必须是普通对象；
-     * - provider 键只要求非空字符串（**不查模型目录**：目录不可用不应阻塞限流配置保存，
-     *   provider 是否真实存在由模型配置负责）；
-     * - 值是 0..64 的安全整数；0 = 显式不限制（与未设置等价，但语义更明确）。
-     *
-     * @param {unknown} value - candidate.providerLimits。
-     * @returns {Record<string, number>} 归一后的映射。
-     */
-    function assertProviderLimitsCandidate(value) {
-      if (value === null || typeof value !== "object" || Array.isArray(value)) {
-        throw new ValidationError("设置 providerLimits 无效");
-      }
-      const normalized = {};
-      for (const [provider, limit] of Object.entries(value)) {
-        if (provider.trim().length === 0) {
-          throw new ValidationError("设置 providerLimits 的 provider 键必须是非空字符串");
-        }
-        if (!Number.isSafeInteger(limit) || limit < MIN_PROVIDER_LIMIT || limit > MAX_PROVIDER_LIMIT) {
-          throw new ValidationError("设置 providerLimits." + provider + " 必须是 " + MIN_PROVIDER_LIMIT + "~" + MAX_PROVIDER_LIMIT + " 的整数");
-        }
-        normalized[provider] = limit;
-      }
-      return normalized;
-    }
-
 
     /**
      * 逐条校验变更角色的候选模型，并拒绝重复（同一 provider+model+规范化 effort）。
@@ -1015,8 +937,6 @@ function installModelCandidatesValidation(deps, api) {
 
   return {
     assertModelCandidatesCandidate,
-    assertRoleLimitsCandidate,
-    assertProviderLimitsCandidate,
     validateModelCandidatesCandidate,
   };
 }
@@ -1038,8 +958,6 @@ function installSettingsCandidateValidation(deps, api) {
   const normalizePromptOverrideCandidate = (...args) => api.normalizePromptOverrideCandidate(...args);
   const normalizeNotificationEventCandidate = (...args) => api.normalizeNotificationEventCandidate(...args);
   const assertModelCandidatesCandidate = (...args) => api.assertModelCandidatesCandidate(...args);
-  const assertRoleLimitsCandidate = (...args) => api.assertRoleLimitsCandidate(...args);
-  const assertProviderLimitsCandidate = (...args) => api.assertProviderLimitsCandidate(...args);
   const assertModelPricesCandidate = (...args) => api.assertModelPricesCandidate(...args);
   const readSavedSettingsValue = (...args) => api.readSavedSettingsValue(...args);
   const peakValleyError = (...args) => api.peakValleyError(...args);
@@ -1079,22 +997,9 @@ function installSettingsCandidateValidation(deps, api) {
       const notificationEvents = hasNotificationEvents
         ? normalizeNotificationEventCandidate(candidate.notificationEvents)
         : void 0;
-      // 旧客户端没有该字段时保持缺省语义，并在提交 patch 中省略它；显式提供时严格要求安全整数。
-      const hasRoleConcurrencyLimit = candidate.roleConcurrencyLimit !== void 0;
-      const roleConcurrencyLimit = hasRoleConcurrencyLimit
-        ? normalizeRoleConcurrencyLimit(candidate.roleConcurrencyLimit)
-        : void 0;
-      if (hasRoleConcurrencyLimit && roleConcurrencyLimit !== candidate.roleConcurrencyLimit) {
-        throw new ValidationError("设置 roleConcurrencyLimit 无效");
-      }
-      // 角色默认超时（票据 06）：缺字段（旧客户端）不写 patch；显式提供时必须严格
-      // 落在 0 或 1000~86,400,000 的整秒毫秒数上。归一后不等于原值（含 1500、
-      // 负数、字符串）就是非法，绝不静默回退成“不启用”。
-      const hasRoleTimeoutMs = candidate.roleTimeoutMs !== void 0;
-      const roleTimeoutMs = hasRoleTimeoutMs ? normalizeRoleTimeoutMs(candidate.roleTimeoutMs) : void 0;
-      if (hasRoleTimeoutMs && roleTimeoutMs !== candidate.roleTimeoutMs) {
-        throw new ValidationError("设置 roleTimeoutMs 无效");
-      }
+      // 惰性兼容输入：fan-out 时代遗留的 roleConcurrencyLimit / roleLimits / providerLimits /
+      // roleTimeoutMs **不在这里校验**。旧客户端/旧文档带着它们（哪怕是非法值）提交时，
+      // 本端点既不报错也不把它们写入 patch——它们原样留在磁盘上，不会被改写或删除。
       if (candidate.observerPreferred !== void 0 && typeof candidate.observerPreferred !== "boolean") {
         throw new ValidationError("设置 observerPreferred 无效");
       }
@@ -1118,15 +1023,6 @@ function installSettingsCandidateValidation(deps, api) {
       }
       // 角色集合固定为内置六角色（自定义角色能力已删除）。
       const candidateRoleIds = STATUS_ROLE_IDS;
-      /**
-       * 并发映射（票据 26）：缺字段 = 旧客户端/旧文档，不写 patch、保持已有映射；
-       * 显式提供时只做结构/范围校验（不触碰模型目录），非法条目整次保存拒绝。
-       * 判定在任何 await 之前完成，避免半个候选进入后续模型解析。
-       */
-      const hasRoleLimits = candidate.roleLimits !== void 0;
-      const roleLimits = hasRoleLimits ? assertRoleLimitsCandidate(candidate.roleLimits, candidateRoleIds) : void 0;
-      const hasProviderLimits = candidate.providerLimits !== void 0;
-      const providerLimits = hasProviderLimits ? assertProviderLimitsCandidate(candidate.providerLimits) : void 0;
       /**
        * 上下文继承映射（票据 29）：缺字段 = 旧客户端/旧文档，不写 patch、保持已有映射；
        * 显式提供时 fail-closed：Observer、未知角色与非布尔值整次保存拒绝。
@@ -1237,10 +1133,6 @@ function installSettingsCandidateValidation(deps, api) {
           ...(hasFallbackLimit ? { fallbackLimit } : {}),
           ...(hasNotificationEvents ? { notificationEvents } : {}),
           ...(hasPromptOverrides ? { [PROMPT_OVERRIDES_SETTINGS_KEY]: promptOverrides } : {}),
-          // 并发映射按整份映射 replace（票据 26）：空对象 = 显式清空全部覆盖，
-          // 与「缺字段 = 保持原值」是两种不同语义。
-          ...(hasRoleLimits ? { roleLimits } : {}),
-          ...(hasProviderLimits ? { providerLimits } : {}),
           // 上下文继承按整份映射 replace（票据 29）：空对象 = 显式清空全部继承开关。
           ...(hasInheritContext ? { inheritContext } : {}),
           // 单价按整份数组 replace（票据 25）：空数组 = 显式清空全部单价；
@@ -1274,7 +1166,7 @@ function installSettingsCandidateValidation(deps, api) {
  * @returns {object} M6 能力面。
  */
 function installSettingsCommit(deps, api) {
-  const { settings, settingsRuntime, updateSettingsAtGeneration, configMigrationPending, settingsRead, roles, ValidationError } = deps;
+  const { settings, settingsRuntime, updateSettingsAtGeneration, settingsRead, roles, ValidationError } = deps;
   const { describeRolePrompts } = settingsRead;
   const { activeRoles } = roles;
 
@@ -1290,7 +1182,7 @@ function installSettingsCommit(deps, api) {
      * 顺序固定为：
      * 1. 提示词覆盖的完整语义校验（未知角色键、非字符串、纯空白、超 grapheme 上限）
      *    ——在任何 await 之前同步执行，非法候选绝不进入宿主写入；
-     * 2. `validateSettingsCandidate`：provider/defaults/通知/并发/开关的类型与范围校验，
+     * 2. `validateSettingsCandidate`：provider/defaults/通知/开关的类型与范围校验，
      *    以及**变更集中**启用角色的模型目录解析（未变更角色沿用已保存值，票据 20）；
      * 3. 目录代次复核：校验完成到写入之间目录代次变化则拒绝；
      * 4. `updateAtGeneration` 在串行链内带 expectedRevision 写入宿主配置，并在调用
@@ -1350,10 +1242,6 @@ function installSettingsCommit(deps, api) {
       // 响应也维持历史形状（不新增字段）。
       const hasCandidates = candidate?.candidates !== void 0;
       const hasFallbackLimit = candidate?.fallbackLimit !== void 0;
-      // 并发映射（票据 26）同一规则：缺字段 = 旧客户端，不写 patch、不在响应里新增字段；
-      // 显式空对象则表示「清空全部逐角色/provider 覆盖」（与缺字段语义不同）。
-      const hasRoleLimits = candidate?.roleLimits !== void 0;
-      const hasProviderLimits = candidate?.providerLimits !== void 0;
       // 上下文继承（票据 29）同一规则：缺字段 = 保持已有映射且响应保持历史形状；
       // 显式空对象表示全部关闭（与缺字段语义不同）。
       const hasInheritContext = candidate?.inheritContext !== void 0;
@@ -1380,11 +1268,10 @@ function installSettingsCommit(deps, api) {
         if (!settingsRuntime.isCurrentGeneration(generationForWrite)) {
           throw new ValidationError("模型目录在保存期间发生变化，请刷新目录后重试");
         }
-        // 一次性配置迁移的持久化开关：读取面把旧的 10 解释为 20，首次保存把标记
-        // 与其它字段写进同一份 patch；之后 10 原样保留（用户可手动改回）。
-        const migrationMarked = configMigrationPending();
+        // 惰性兼容输入（fan-out 退役）：候选里可能仍带着 roleConcurrencyLimit /
+        // roleLimits / providerLimits / roleTimeoutMs。patch 只按显式字段构造，这四个键
+        // **既不写入也不删除**：旧文档里的值原样保留，保存其它设置永远不报错。
         const patch = {
-          ...(migrationMarked ? { configMigrationVersion: CONFIG_MIGRATION_VERSION } : {}),
           provider: validatedSettings.provider,
           defaults: validatedSettings.defaults,
           // 候选/降级上限只在显式提供时写入；候选按整份映射 replace（与 defaults 同语义）。
@@ -1398,9 +1285,6 @@ function installSettingsCommit(deps, api) {
           notificationVolume: validatedSettings.notificationVolume,
           // 通知事件类型同样「缺字段即不覆盖」：旧客户端保存通知开关不得重置事件过滤。
           ...(candidate.notificationEvents === void 0 ? {} : { notificationEvents: validatedSettings.notificationEvents }),
-          ...(candidate.roleConcurrencyLimit === void 0 ? {} : { roleConcurrencyLimit: validatedSettings.roleConcurrencyLimit }),
-          // 角色默认超时同样「缺字段即不覆盖」：旧客户端保存通知设置不得把它重置为 0。
-          ...(candidate.roleTimeoutMs === void 0 ? {} : { roleTimeoutMs: validatedSettings.roleTimeoutMs }),
           // 旧客户端缺失该字段时不覆盖已有值；新客户端显式提交 true/false。
           ...(candidate.observerPreferred === void 0 ? {} : { observerPreferred: validatedSettings.observerPreferred }),
           // 任务管理同样是「缺字段即不覆盖」：旧客户端保存通知设置不得顺带重置侧边栏注册。
@@ -1411,9 +1295,6 @@ function installSettingsCommit(deps, api) {
           ...(hasSidebarEntryEnabled ? { sidebarEntryEnabled: validatedSettings.sidebarEntryEnabled } : {}),
           // 提示词覆盖按整份映射提交（不做键级合并）：空对象显式清空全部自定义提示词。
           ...(hasPromptOverrides ? { [PROMPT_OVERRIDES_SETTINGS_KEY]: validatedSettings[PROMPT_OVERRIDES_SETTINGS_KEY] } : {}),
-          // 并发映射按整份映射 replace（票据 26）：空对象显式清空覆盖，回到默认值/不限制。
-          ...(hasRoleLimits ? { roleLimits: validatedSettings.roleLimits } : {}),
-          ...(hasProviderLimits ? { providerLimits: validatedSettings.providerLimits } : {}),
           // 上下文继承按整份映射 replace（票据 29）：空对象显式关闭全部继承。
           ...(hasInheritContext ? { inheritContext: validatedSettings.inheritContext } : {}),
           // 单价按整份数组 replace：空数组显式清空；缺字段保持已有值。
@@ -1426,8 +1307,6 @@ function installSettingsCommit(deps, api) {
         const committedSettings = { ...normalizeSnapshot(descriptor?.value, activeRoles()) };
         // 旧客户端没有这些字段；它的提交/返回保持历史形状，新客户端会在 normalize 后显式携带值。
         if (candidate.observerPreferred === void 0) delete committedSettings.observerPreferred;
-        if (candidate.roleConcurrencyLimit === void 0) delete committedSettings.roleConcurrencyLimit;
-        if (candidate.roleTimeoutMs === void 0) delete committedSettings.roleTimeoutMs;
         if (!hasTaskManagementEnabled) delete committedSettings.taskManagementEnabled;
         if (!hasAutoOpenSubagentSidebar) delete committedSettings.autoOpenSubagentSidebar;
         if (!hasSidebarEntryEnabled) delete committedSettings.sidebarEntryEnabled;
@@ -1438,15 +1317,10 @@ function installSettingsCommit(deps, api) {
         // 峰谷同上：旧客户端不传时响应保持历史形状（不新增字段）。
         if (!hasPeakValley) delete committedSettings.peakValley;
         if (!hasOrchestrator) delete committedSettings.orchestrator;
-        // 并发映射同上：旧客户端不传时响应保持历史形状（不新增字段）。
-        if (!hasRoleLimits) delete committedSettings.roleLimits;
-        if (!hasProviderLimits) delete committedSettings.providerLimits;
         // 上下文继承同理：旧客户端不传时响应保持历史形状（不新增字段）。
         if (!hasInheritContext) delete committedSettings.inheritContext;
         // 单价同理：旧客户端不传时响应保持历史形状（不新增字段）。
         if (!hasModelPrices) delete committedSettings.modelPrices;
-        // 并发映射的读取期丢弃诊断同理：它是诊断，不是可回写的配置。
-        delete committedSettings.limitDiagnostics;
         // 上下文继承的读取期丢弃诊断同样只是诊断，不是可回写的配置。
         delete committedSettings.inheritContextDiagnostics;
         // 单价读取期丢弃诊断同样只是诊断，不是可回写的配置。
@@ -1454,12 +1328,6 @@ function installSettingsCommit(deps, api) {
         // 峰谷读取期丢弃诊断同样只是诊断，不是可回写的配置。
         delete committedSettings.peakValleyDiagnostics;
         delete committedSettings.orchestratorDiagnostics;
-        // 迁移标记必须随响应回传：客户端据此关闭读取别名，保存 10 之后读回仍是 10。
-        // 首次保存时标记刚随 patch 落盘；后续保存时文档里本来就有该标记。
-        const committedMigrationVersion = descriptor?.value?.configMigrationVersion;
-        if (Number.isSafeInteger(committedMigrationVersion) && committedMigrationVersion >= 1) {
-          committedSettings.configMigrationVersion = committedMigrationVersion;
-        }
         return {
           settings: committedSettings,
           // 保存成功后直接回传最新只读投影：客户端据此更新基线、dirty 与"已自定义"

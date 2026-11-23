@@ -1069,20 +1069,6 @@
     );
     /** 同键动作去重锁：Set 放在 ref 里，动作期间的重渲染不会重置它。 */
     const pendingSet = typeof react.useRef === "function" ? react.useRef(new Set()) : { current: new Set() };
-    /**
-     * 恢复重试的本地状态（票据 04）：{ rootSessionId, inFlight, error }。
-     *
-     * 为什么用 ref 而不是 state：与 pendingSet 同一模式——重试期间要立刻禁用按钮并显示
-     * 进度，只靠 Host 快照（2.5s 轮询 + 完整快照缓存）会有明显延迟；这里用 ref + bump
-     * 驱动一次同步重渲染。rootSessionId 绑定发起时的 root：同一实例切换 root 后，
-     * 旧请求的迟到结果绝不会显示在新会话的横幅上（也不会把新 root 的按钮标成处理中）。
-     *
-     * error 只保存**重试动作本身**的失败细节（业务失败返回的 error 块或传输/校验异常），
-     * 它是补充信息；恢复失败的主原因码始终来自 snapshot.recovery（Host 权威投影）。
-     */
-    const recoveryRetryRef = typeof react.useRef === "function"
-      ? react.useRef({ rootSessionId: null, inFlight: false, error: null })
-      : { current: { rootSessionId: null, inFlight: false, error: null } };
     const runAction = async (request, key, requiresConfirm, message, options) => {
       // options（票据 25/28）：{ includeErrorCode, safeMessage, refreshMeta }；
       // 默认全部关闭，取消/重试等既有动作的文案与副作用逐字不变。
@@ -1165,76 +1151,13 @@
 
     frame.late.runtimeStatusOfNode = runtimeStatusOfNode;
     Object.assign(frame, {
-      pendingSet, recoveryRetryRef, runAction, runtimeStatusOfNode,
-    });
-  }
-
-  /**
-   * 恢复重试入口（票据 04）：调用 fanout-restore-retry，成功后刷新快照。
-   *
-   * 失败语义（与既有动作错误面完全隔离）：
-   * - RPC 业务失败（restored:false）不是异常：Host 会把稳定原因码放在回执的 error 块里，
-   *   这里记录到横幅的补充行，**不**写入 title 区的「快照读取失败」槽；
-   * - 传输/校验异常（404 根会话不存在、网络失败）同样只记录补充行；横幅本身继续由
-   *   snapshot.recovery 驱动，因此「失败保持错误态与原因码」不依赖一次成功的快照刷新；
-   * - 成功（restored:true）后无论刷新是否成功，下一次成功快照都会把 recovery 变成 ok，
-   *   横幅随之消失（快照不再含 failed 块）。
-   *
-   * 并发边界与 runAction 一致：卸载后不写状态；切换 root 后旧结果只落回旧 root 的账本
-   * 而不污染当前 surface；同一 root 的在途重试直接忽略重复点击。
-   */
-  function useSidebarPanelRunActionPart2(frame) {
-    const {
-      bump, config, contextRef, currentRootRef, mountedRef, recoveryRetryRef, refreshRef,
-    } = frame;
-
-    const retryRecovery = async () => {
-      if (mountedRef.current !== true) return;
-      const targetSessionId = typeof currentRootRef.current === "string" ? currentRootRef.current : "";
-      if (targetSessionId === "") return;
-      const previous = recoveryRetryRef.current;
-      if (previous.rootSessionId === targetSessionId && previous.inFlight === true) return;
-      recoveryRetryRef.current = { rootSessionId: targetSessionId, inFlight: true, error: null };
-      bump((value) => value + 1);
-      let failure = null;
-      try {
-        const result = await callRpc(config, contextRef.current, {
-          action: "fanout-restore-retry",
-          sessionId: targetSessionId,
-        });
-        if (result?.restored !== true) {
-          const error = object(result?.error);
-          const code = text(error.code, null);
-          // restored:false 且没有 error 块 = 磁盘上没有可恢复快照（Host 的既有早退语义）：
-          // 这不是失败，但也没有清除错误态，保持横幅并让用户知道重试没有恢复任何任务。
-          failure = code === null
-            ? { code: "NO_RESTORABLE_SNAPSHOT", message: "当前没有可恢复的持久化任务" }
-            : { code, message: text(error.message, "") };
-        }
-      } catch (error) {
-        failure = {
-          code: "RETRY_FAILED",
-          message: error instanceof Error ? error.message : String(error),
-        };
-      }
-      const stillCurrent = mountedRef.current === true && currentRootRef.current === targetSessionId;
-      recoveryRetryRef.current = { rootSessionId: targetSessionId, inFlight: false, error: stillCurrent ? failure : null };
-      // 卸载或已切走：迟到结果不触发刷新/重渲染（新 surface 自己维护状态）。
-      if (stillCurrent !== true) return;
-      bump((value) => value + 1);
-      // 无论成功还是失败都刷新：成功让横幅随 recovery=ok 消失，失败则把 Host 重新记录的
-      // 原因码/任务树取回来（失败原因码仍以 snapshot.recovery 为权威）。
-      await refreshRef.current();
-    };
-
-    Object.assign(frame, {
-      retryRecovery,
+      pendingSet, runAction, runtimeStatusOfNode,
     });
   }
 
   global[SYMBOL] = Object.freeze({
     useSidebarPanelActionHandlers, useSidebarPanelActionHandlersPart2, useSidebarPanelBatchClose,
-    useSidebarPanelRunAction, useSidebarPanelRunActionPart2, useSidebarPanelTabRecorder,
+    useSidebarPanelRunAction, useSidebarPanelTabRecorder,
     useSidebarPanelTabRecorderPart2,
   });
 })(globalThis);

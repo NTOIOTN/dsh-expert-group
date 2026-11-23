@@ -748,7 +748,7 @@
    * 读取侧的**第二道脱敏**：即便写入侧只落摘要，reason 仍可能来自 error.message（结算失败路径），
    * 因此把「32 位以上的连续标识符字符」整段替换成省略号——JWT（eyJ…）、sk-/hf_ 前缀密钥、
    * 标准 UUID（36 位，完整会话 id 的典型形状）与各类不透明 id 都落在这条判据里。
-   * 下限取 32 是为了绝不误伤 session-guard-unavailable（25 位）、shard-child-missing 这类短码。
+   * 下限取 32 是为了绝不误伤 session-guard-unavailable（25 位）这类短码。
    */
   const SIDEBAR_AUTO_DIAG_SECRET = /[A-Za-z0-9_-]{32,}/g;
   /** 复制与下载都不可用时的兜底文件名（固定名，方便在下载目录里找到）。 */

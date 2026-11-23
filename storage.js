@@ -113,13 +113,9 @@ export function appendLruEntry(entries, key, value, limit = CHILD_LRU_LIMIT) {
  * @param {Array<[string, object]>} [overrideMetaEntries] - session_override_meta 的
  *   [sessionId, { revision }]（票据 21）。第三参数刻意可选：历史调用方/测试只传两张表时
  *   仍得到原来的形状，只是 revision 映射为空（= 全部从 0 开始）。
- * @param {Array<[string, object]>} [templateEntries] - fanout_templates 的 [key, 文档]
- *   （票据 28）。同样可选：只读纯函数测试可以继续只关心 session/child 两张表，
- *   此时模板文档按“空表”归一，绝不让缺失参数变成 undefined 读取。
- * @returns {{sessionOverrides: object, childModels: object, sessionOverrideRevisions: object,
- *   fanoutTemplates: {version: number, templates: object[]}}}
+ * @returns {{sessionOverrides: object, childModels: object, sessionOverrideRevisions: object}}
  */
-export function readDomainSnapshot(sessionEntries, childEntries, overrideMetaEntries, templateEntries) {
+export function readDomainSnapshot(sessionEntries, childEntries, overrideMetaEntries) {
   // 代次只投影合法非负安全整数：坏记录（历史手工写入/未知版本）不得让读取面抛错，
   // 也绝不被当成一个更大的 revision 去绕过 CAS——缺失即按 0 处理。
   const sessionOverrideRevisions = {};
@@ -133,49 +129,7 @@ export function readDomainSnapshot(sessionEntries, childEntries, overrideMetaEnt
     sessionOverrides: Object.fromEntries(sessionEntries ?? []),
     childModels: Object.fromEntries(childEntries ?? []),
     sessionOverrideRevisions,
-    fanoutTemplates: normalizeTemplateDocumentEntries(templateEntries),
   };
-}
-
-/**
- * fanout_templates 单表文档的键（票据 28）。
- *
- * 与 fanout_tasks 完全同构：固定一行 key="current"，值的版本号独立于 storage domain
- * 的 version（domain 仍是 1，新增表不升版）。模板 id 由 Host 生成，绝不拿用户输入
- * 当键或路径；因此这里不需要任何文件系统语义。
- */
-export const FANOUT_TEMPLATE_STORE_KEY = "current";
-
-/** 模板文档版本：读取面不信任 raw.version，统一投影为 1（写入端也只写 1）。 */
-export const FANOUT_TEMPLATE_VERSION = 1;
-
-/** 单库模板数量上限：超过即拒绝新增/更新（更新不增加数量）。 */
-export const FANOUT_TEMPLATE_LIMIT = 32;
-
-/**
- * 把 fanout_templates 的持久化条目归一成 {@link readDomainSnapshot} 的只读投影。
- *
- * 读取面必须宽容：表缺失、key 缺失、结构非法、条目不是普通对象都只意味着“没有模板”，
- * 绝不能让 storage ready 或设置页读取失败。数量上限在读取面同样生效：即使磁盘被外部
- * 写入超量模板，内存投影也只保留前 32 条，避免 UI/RPC 被无界数据拖死。
- *
- * @param {Array<[string, unknown]>} [entries] - storage 表条目。
- * @param {{limit?: number}} [options] - 读取上限覆盖（测试可收紧）。
- * @returns {{version: number, templates: object[]}}
- */
-export function normalizeTemplateDocumentEntries(entries, options = {}) {
-  const limit = Number.isSafeInteger(options.limit) && options.limit >= 0
-    ? options.limit
-    : FANOUT_TEMPLATE_LIMIT;
-  const raw = Array.isArray(entries)
-    ? entries.find(([key]) => key === FANOUT_TEMPLATE_STORE_KEY)?.[1]
-    : undefined;
-  const templates = Array.isArray(raw?.templates)
-    ? raw.templates
-      .filter((entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry))
-      .slice(0, limit)
-    : [];
-  return { version: FANOUT_TEMPLATE_VERSION, templates };
 }
 
 /** 计算先写最新记录、再删除裁剪项的计划。 */

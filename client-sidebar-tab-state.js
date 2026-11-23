@@ -33,12 +33,9 @@
   const PURE_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-pure");
   const PURE = global[PURE_SYMBOL] || {};
   const {
-    FANOUT_SETTLED_STATUSES, RIGHTBAR_FLOAT_SELECTOR, RIGHTBAR_FLOAT_TITLE_SELECTOR,
+    RIGHTBAR_FLOAT_SELECTOR, RIGHTBAR_FLOAT_TITLE_SELECTOR,
     SIDEBAR_AUTO_CLOSE_COOLDOWN_BASE_MS, SIDEBAR_AUTO_CLOSE_COOLDOWN_MAX_MS,
     SIDEBAR_AUTO_KEY_LIMIT, SIDEBAR_TAB_KEY_SEPARATOR,
-    // 分片「会话标识」的唯一规则（票 04）：最新 attempt 的 childId，缺失回退分片自身 childId。
-    // 地址推导三条路径与渲染层因此逐字同源，绝不在这里复制第二份规则。
-    latestShardChildIdOf,
     object, statusOf, text,
   } = PURE;
   const DOM_SYMBOL = Symbol.for("dsh-expert-group/client-sidebar-dom");
@@ -87,25 +84,10 @@
     const addresses = new Set();
     const add = (node, parentId) => {
       const source = object(node);
-      if (source.kind === "fanout") {
-        const shards = Array.isArray(source.shards) ? source.shards : [];
-        for (const shard of shards) {
-          const shardSource = object(shard);
-          // 与运行中 / 空闲候选、渲染层同源：最新 attempt 的 childId，缺失回退分片自身 childId。
-          const childId = text(latestShardChildIdOf(shardSource), null);
-          if (childId === null) continue;
-          const address = subagentChatAddress(addressOf(childId, parentId, {
-            ...shardSource,
-            kind: "expert",
-          }));
-          if (address !== null) addresses.add(address);
-        }
-      } else {
-        const childId = text(source.sessionId, text(source.childId, null));
-        if (childId !== null) {
-          const address = subagentChatAddress(addressOf(childId, parentId, source));
-          if (address !== null) addresses.add(address);
-        }
+      const childId = text(source.sessionId, text(source.childId, null));
+      if (childId !== null) {
+        const address = subagentChatAddress(addressOf(childId, parentId, source));
+        if (address !== null) addresses.add(address);
       }
       if (Array.isArray(source.children)) {
         for (const child of source.children) add(child, parentId);
@@ -117,7 +99,7 @@
   }
 
   /**
-   * 当前 root 专家树里的「运行中」资源地址（普通专家、嵌套专家与最新 fan-out 分片）。
+   * 当前 root 专家树里的「运行中」资源地址（普通专家与嵌套专家）。
    *
    * 与行内渲染使用**同一个**规范地址 helper（addressOf + subagentChatAddress），因此批量候选与
    * 单会话箭头指向的是同一个 contentId，绝不存在第二套地址推导。
@@ -129,37 +111,7 @@
     const addressOf = deps.addressOf;
     const statusOfNode = deps.statusOf;
     const source = object(node);
-    const kind = text(source.kind, null);
-    if (kind === "fanout") {
-      const shards = Array.isArray(source.shards) ? source.shards : [];
-      for (const shard of shards) {
-        const shardSource = object(shard);
-        // 只认最新 attempt 的 childId（与渲染层 latestShardChildIdOf 同源）：旧 attempt 的子会话
-        // 不再由这一行代表，也不是可导航目标。
-        const childId = text(latestShardChildIdOf(shardSource), null);
-        if (childId === null) {
-          /**
-           * 分片没有可用会话标识 ⇒ 进不了候选（没有精确地址就没有可打开的目标），并记一条
-           * 可区分的 shard-child-missing 诊断。
-           *
-           * 诊断只经 `deps.recordShardChildMissing` 这个窄出口写：它由候选层注入，渲染路径同样会
-           * 求值这份地址集合却**不注入**——否则同一条事实会随每一帧渲染把 60 条有界诊断环刷满，
-           * 把真正有用的闸门拒绝挤出去（spec D8 的限频初衷）。Host 投影把 childId 清空时，
-           * 客户端能做的只有这条诊断：自动打开仍未闭环（见票 04 说明）。
-           */
-          deps.recordShardChildMissing?.(text(shardSource.shardId, null));
-          continue;
-        }
-        if (statusOfNode(shardSource, parentId, childId) !== "running") continue;
-        const address = subagentChatAddress(addressOf(childId, parentId, {
-          ...shardSource,
-          kind: "expert",
-        }));
-        if (address !== null) addresses.add(address);
-      }
-      return;
-    }
-    if (kind !== "expert") return;
+    if (text(source.kind, null) !== "expert") return;
     const childId = text(source.sessionId, text(source.childId, null));
     if (childId !== null && statusOfNode(source, parentId, childId) === "running") {
       const address = subagentChatAddress(addressOf(childId, parentId, source));
@@ -201,14 +153,11 @@
     return deps.partial === true && status === deps.neutralStatus;
   }
 
-  /** 空闲分组收纳 ready 直接专家和已结算的 fan-out 父任务（成员判定见 sidebarNodeIsIdleMembership）。 */
+  /** 空闲分组收纳 ready 的普通专家（成员判定见 sidebarNodeIsIdleMembership）。 */
   function sidebarIdleChildren(children, rootSessionId, deps) {
     return (Array.isArray(children) ? children : [])
-      .filter((node) => {
-        if (node.kind === "fanout") return FANOUT_SETTLED_STATUSES.has(statusOf(node));
-        return node.kind === "expert"
-          && sidebarNodeIsIdleMembership(node, rootSessionId, text(node.sessionId, null), deps);
-      });
+      .filter((node) => node.kind === "expert"
+        && sidebarNodeIsIdleMembership(node, rootSessionId, text(node.sessionId, null), deps));
   }
 
   /** 当前 root 专家树里「运行中」的资源地址集合（主代理行批量关闭的唯一候选来源）。 */
@@ -231,21 +180,6 @@
     const addresses = new Set();
     for (const node of Array.isArray(nodes) ? nodes : []) {
       const source = object(node);
-      if (source.kind === "fanout") {
-        for (const shard of Array.isArray(source.shards) ? source.shards : []) {
-          const shardSource = object(shard);
-          // 与运行中候选、已知地址集合、渲染层同源：最新 attempt 的 childId，缺失回退分片自身 childId。
-          const shardChildId = text(latestShardChildIdOf(shardSource), null);
-          // childId 缺失与中性状态一样，都不能进候选：没有精确地址就没有可关闭的目标。
-          if (shardChildId === null || sidebarNodeIsIdleReady(shardSource, rootSessionId, shardChildId, deps) !== true) continue;
-          const shardAddress = subagentChatAddress(deps.addressOf(shardChildId, rootSessionId, {
-            ...shardSource,
-            kind: "expert",
-          }));
-          if (shardAddress !== null) addresses.add(shardAddress);
-        }
-        continue;
-      }
       const childId = text(source.sessionId, text(source.childId, null));
       if (childId === null) continue;
       // 防御式复核：实参与 idleChildren 的成员判定逐字相同，因此对既有成员的结果完全不变。

@@ -1,7 +1,7 @@
 /**
  * 入口专家委派核心域（R4d · 票据 18）。
  *
- * 这一域承载 role 工具与 fan-out 工具共用的**纯能力面**：
+ * 这一域承载 role 工具使用的**纯能力面**：
  * - 结构化输出声明（outputSchema 校验、provider 能力断言）与结构化结果捕获/落盘重试；
  * - 上下文继承通道解析（fork provider 能力位、父日志已完成 turn 判定）与启动适配器；
  * - admission 事实：spawn provider 就绪判定、deny 边界收窄、route key、快照恢复、
@@ -25,6 +25,8 @@
  *
  * @module dsh-expert-group/host/index-expert-tools-core
  */
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { assertObjectJsonSchema } from "@deepseek-ai/dsh-tools";
 import { expertDenyCandidates, readonlyDenyCandidates } from "../shared/protocol.js";
 import { restrictableDenyNamesInScope, restrictableScopeNames } from "./expert-guards.js";
@@ -40,7 +42,9 @@ import {
   STRUCTURED_RESULT_FALLBACK_REASONS,
   utf8ByteLength,
 } from "../shared/structured.js";
-import { isFanoutIdentity } from "../fanout-host.js";
+// 历史数据兼容判定：恢复选择器与快照投影共用唯一来源（见 shared/fanout-history.js），
+// 避免「恢复跳过了、任务树却还显示」这类判定漂移。
+import { isHistoricalFanoutChildRecord } from "../shared/fanout-history.js";
 import { normalizeImageToPng } from "../image-routing.js";
 import { transcodeImageToPng } from "./image-transcode.js";
 
@@ -55,8 +59,8 @@ export function createExpertOutputSchemaSupport({ subagents }) {
   /**
    * 构造结构化声明错误：稳定 code + 有界 violations/字节数，绝不回显 schema 原文。
    *
-   * 三种错误都带 validation=true，角色工具会把它映射成无凭据的 rejected 回执，
-   * fanout 工具则直接抛出并保留 code；错误消息只包含固定文案与路径/字节数。
+   * 三种错误都带 validation=true，角色工具会把它映射成无凭据的 rejected 回执；
+   * 错误消息只包含固定文案与路径/字节数。
    */
   function outputSchemaError(code, message, details = {}) {
     const error = new Error(message);
@@ -666,6 +670,7 @@ export function createExpertChannelResolver({ subagents, storage }) {
 export function createExpertActivationStarter({ subagents, channel, structured }) {
   const { contextInheritanceError, validSubagentProviderName } = channel;
   const { armStructuredResultCapture } = structured;
+  const ordinaryActivationContext = new AsyncLocalStorage();
   /**
    * 宿主 startActivation 的 spec 形状探测（只读、无副作用）。
    *
@@ -705,13 +710,13 @@ export function createExpertActivationStarter({ subagents, channel, structured }
    * startActivation 本身抛错时原样上抛，只有方法不存在才回退旧 startContinuable，
    * 避免把 admission 错误伪装成兼容路径。
    */
-  async function startExpertActivation({ request, label, signal, parent }) {
+  async function startExpertActivation({ request, label, signal, parent, ordinaryIntent }) {
     // 目标 subagent provider（票据 29）：唯一来源是请求上的内部字段，所有调用点
-    // （角色工具、fan-out 分片、恢复重建）在组装请求时写入同一份值。它只用于选择
+    // （角色工具、恢复重建）在组装请求时写入同一份值。它只用于选择
     // 宿主 provider，必须在调用宿主前剥离，绝不作为 SubagentStartRequest 字段透传。
     const targetProvider = validSubagentProviderName(request?.subagentProvider) ?? "spawn";
     // 继承型 provider 由 provider 自己按父日志构造 seed；DEG 只选择 provider、
-    // 传入 shard/persona/toolFilter 等既有字段，绝不添加 agentPreset（官方 fork 的
+    // 传入 persona/toolFilter 等既有字段，绝不添加 agentPreset（官方 fork 的
     // agentPreset 能力位为 false），也绝不自行调用 prepareContinuable/buildForkSeed。
     if (typeof subagents.startActivation === "function") {
       // RC1 manager 会在 admission 前直接调用 signal.throwIfAborted()；缺失或不完整的 signal
@@ -741,9 +746,27 @@ export function createExpertActivationStarter({ subagents, channel, structured }
       // 两代契约都携带同一份精确 parent：rc.1 读 spec.request.parent，rc.2 读 spec.parent。
       // 未知字段（persona/toolFilter 等）在 rc.2 走本地 provider 时被忽略，行为由 DEG 的
       // agent/created composition 兜底保证；绝不为了适配 rc.2 把 rc.1 的合同时序改掉。
-      const activation = activationSpecIsFlat()
-        ? await subagents.startActivation({ ...specBase, ...activationRequest, parent: activationParent })
-        : await subagents.startActivation({ ...specBase, request: { ...activationRequest, parent: activationParent } });
+      const flatSpec = activationSpecIsFlat();
+      const localIdentity = ordinaryIntent?.reservedChildId === undefined
+        ? {}
+        : { childId: ordinaryIntent.reservedChildId };
+      const spec = flatSpec
+        ? { ...specBase, ...activationRequest, parent: activationParent, ...localIdentity }
+        : { ...specBase, ...localIdentity, request: { ...activationRequest, parent: activationParent } };
+      const start = () => subagents.startActivation(spec);
+      const activation = ordinaryIntent === void 0
+        ? await start()
+        : await ordinaryActivationContext.run(ordinaryIntent, start);
+      if (ordinaryIntent !== void 0) {
+        if (ordinaryIntent.reservedChildId !== undefined
+          && activation?.childId !== ordinaryIntent.reservedChildId) {
+          throw new Error("ordinary activation child identity did not match its reserved local id");
+        }
+        if (ordinaryIntent.reservedChildId !== undefined
+          && (typeof activation?.messageId !== "string" || activation.messageId.length === 0)) {
+          throw new Error("ordinary local activation did not return an accepted message id");
+        }
+      }
       // 结构化交付（票据 30）：启动成功即挂接 result，绝不在这里 await 完整结果。
       // request 上的 outputSchema 原样透传给宿主；child_models 只写 structured/标记。
       armStructuredResultCapture(activation, request);
@@ -762,17 +785,74 @@ export function createExpertActivationStarter({ subagents, channel, structured }
       // legacy 宿主同样不能看到 DEG 的内部 provider 选择字段；其余既有字段
       // （label/signal/persona/toolFilter/maxDepth）保持原样，兼容旧契约。
       const { subagentProvider: _legacyProvider, ...legacyRequest } = request ?? {};
-      return subagents.startContinuable({
+      const startLegacy = () => subagents.startContinuable({
         provider: targetProvider,
         label: typeof label === "string" ? label : request?.label,
         request: legacyRequest,
         signal,
       });
+      return ordinaryIntent === undefined
+        ? startLegacy()
+        : ordinaryActivationContext.run(ordinaryIntent, startLegacy);
     }
     throw new Error("subagent provider \"" + targetProvider + "\" has no supported activation method");
   }
 
-  return { startExpertActivation };
+  async function startOrdinaryExpertActivation({ request, label, signal, parent, role, rootToken, recoveryRebuild = false }) {
+    const provider = validSubagentProviderName(request?.subagentProvider) ?? "spawn";
+    const registeredProvider = typeof subagents?.getProvider === "function" ? subagents.getProvider(provider) : void 0;
+    if (registeredProvider === void 0) {
+      throw new Error("ordinary child activation is unavailable for provider \"" + provider + "\"");
+    }
+    const isLocalProvider = typeof registeredProvider.prepareContinuable === "function";
+    if (!isLocalProvider) {
+      throw new Error("ordinary role activation requires a local continuable provider; external providers are unsupported");
+    }
+    // 只有Host声明prepareContinuable的provider才拥有local inbox/Agent correlation；
+    // provider名称只是路由键，不能决定是否预约childId。
+    const reservedChildId = typeof subagents.startActivation === "function" ? randomUUID() : void 0;
+    const intent = {
+      kind: "ordinary",
+      state: "pending",
+      parent: parent ?? request?.parent,
+      rootToken,
+      role,
+      provider,
+      reservedChildId,
+      recoveryRebuild: recoveryRebuild === true,
+      external: !isLocalProvider,
+      legacy: isLocalProvider && typeof subagents.startActivation !== "function",
+      candidates: 0,
+    };
+    try {
+      const activation = await startExpertActivation({ request, label, signal, parent, ordinaryIntent: intent });
+      if (typeof activation?.childId !== "string" || activation.childId.length === 0) {
+        throw new Error("ordinary activation did not return a valid childId");
+      }
+      if (isLocalProvider && (typeof activation?.messageId !== "string" || activation.messageId.length === 0)) {
+        throw new Error("local ordinary activation did not return a valid messageId");
+      }
+      return activation;
+    } catch (error) {
+      intent.state = "failed";
+      throw error;
+    } finally {
+      if (intent.state === "pending") intent.state = "consumed";
+      intent.state = "closed";
+    }
+  }
+
+  function isLocalProvider(providerName) {
+    const provider = typeof subagents?.getProvider === "function" ? subagents.getProvider(providerName) : void 0;
+    return typeof provider?.prepareContinuable === "function";
+  }
+
+  function currentOrdinaryActivationIntent() {
+    const intent = ordinaryActivationContext.getStore();
+    return intent?.kind === "ordinary" ? intent : void 0;
+  }
+
+  return { startExpertActivation, startOrdinaryExpertActivation, currentOrdinaryActivationIntent, isLocalProvider };
 }
 
 /**
@@ -801,8 +881,8 @@ export function createExpertAdmissionFacts({ tools, subagents, storage, getAttac
     const provider = subagents.getProvider("spawn");
     if (provider === void 0) return false;
     const caps = provider.capabilities ?? {};
-    // startActivation 一旦存在即是 RC1 实际 seam；即使 legacy 能力完整，
-    // RC1 capability 不完整也必须 fail-closed，不能报告 ready 后再误走 RC1。
+    // 普通角色任务需要本地 Agent、inbox 和 continuation；RC2启动能力不能把external
+    // one-shot provider变成可续作角色。local身份由Host的prepareContinuable能力定义。
     if (typeof subagents.startActivation === "function") {
       return typeof provider.prepareContinuable === "function"
         && caps.agentOptions === true
@@ -896,6 +976,9 @@ export function createExpertAdmissionFacts({ tools, subagents, storage, getAttac
    * 重启恢复：从 domain childModels 中按 parentId + role + route 找可复用的
    * continuable child。显式 lruSequence 决定新旧；历史缺失序号的记录按 key
    * 稳定排序，绝不依赖 JSON/SQLite 的 entries 插入顺序。
+   *
+   * 历史兼容过滤：属于已删除 fan-out 子系统的记录即使 parentId/role/route 全部命中也不复用
+   * （见 isHistoricalFanoutChildRecord）——那类 child 的生命周期由不存在的 fan-out 父任务拥有。
    */
   function restoreChildFromSnapshot(parentId, roleName, routeKey) {
     const models = source().childModels ?? {};
@@ -912,9 +995,10 @@ export function createExpertAdmissionFacts({ tools, subagents, storage, getAttac
     for (let i = entries.length - 1; i >= 0; i--) {
       const [childId, record] = entries[i];
       if (typeof record !== "object" || record === null) continue;
-      // fan-out child 的 parentTask/shard/attempt 是另一条恢复链；即使 role、
-      // parentId 和 route 相同，也绝不能被普通专家 recovery 复用。
-      if (isFanoutIdentity(record)) continue;
+      // 历史 fan-out child 绝不能被普通派发复用（见 isHistoricalFanoutChildRecord 的说明）：
+      // 它们的生命周期属于已删除的 fan-out 父任务，仅凭 parentId/role/route 命中会让普通
+      // 角色向旧 fan-out child 发送新任务，造成错误续作/错误 recovery 绑定。
+      if (isHistoricalFanoutChildRecord(record)) continue;
       if (record.continuable !== true) continue;
       if (record.role !== roleName || record.parentId !== parentId) continue;
       if (routeKeyOf(record) === routeKey) return childId;
@@ -1021,7 +1105,7 @@ export function createExpertAdmissionFacts({ tools, subagents, storage, getAttac
 }
 
 /**
- * 委派核心域装配：组合上面四组能力面，交出 role / fan-out 工具共用的扁平 API。
+ * 委派核心域装配：组合上面四组能力面，交出 role 工具使用的扁平 API。
  *
  * 组合本身不持有状态，也不做注册；参数按**协作方**计 5 组（tools / subagents /
  * storage / attachments / logger），低于 C3 硬上限 8。

@@ -4,6 +4,8 @@
 
 This project is a subagent plugin for DeepSeek Harness (dsh), in the spirit of omo-slim. The parent agent decomposes tasks, delegates to experts, merges the results, and verifies them; the plugin provides role-based experts with configurable models (every expert can have fallback models and peak/off-peak models), a task sidebar, model configuration, task notifications, and session deletion.
 
+Fan-out is in a stop-new-admissions compatibility phase: ordinary expert tasks are unaffected, while previously accepted tasks remain available for reading, cancellation, draining, and eligible recovery. Dedicated client views and settings have not been removed; full retirement and cutover are not complete.
+
 > This English edition is a translation of [README.md](README.md); if the two versions ever disagree, the Chinese version is authoritative.
 
 ## Installation
@@ -92,8 +94,6 @@ Same capabilities as DSH's built-in model settings page. This was originally bui
 <p align="center"><sub>DEG plugin settings with peak/off-peak mode enabled</sub></p>
 
 - **Observer priority**: off by default. When enabled, images sent by the parent agent are forwarded to the observer subagent for image analysis, which is useful when the parent agent's model cannot accept image input. The observer subagent's model must support image input.
-- **Per-role concurrency limit**: maximum number of concurrent runs for a single role.
-- **Default role timeout**: maximum runtime of a single subagent session.
 
 ## License and acknowledgements
 

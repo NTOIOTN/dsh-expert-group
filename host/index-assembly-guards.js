@@ -74,7 +74,8 @@ export function assembleGuards(state, caps) {
     // 复用双契约枚举（rc.1 roots() / rc.2 list()+身份过滤）而不是直接判定结构身份：
     // 既保留旧实现"只把真正登记在宿主 root 集合里的 Agent 视为 root"的语义，
     // 也避免 rc.2 上恒为 false 让 root guard 静默失效。
-    return state.listRootAgents().includes(agent);
+    const roots = state.listRootAgents();
+    return Array.isArray(roots) && roots.includes(agent);
   }
   /**
    * 返回 root 结构化工具 guard 可用的 workspace root。
@@ -196,13 +197,14 @@ export function assembleGuards(state, caps) {
     label: "dsh-expert-group: root structured guard lifecycle",
     factory: () => {
       const stopCreated = caps.subscribe("agent/created", ({ agent }) => {
+        if (!state.isExactRegisteredAgent(agent)) return;
         installRootStructuredPathGuard(agent);
         installExpertReportGuardForAgent(agent);
       });
       // rc.2 删除 agents.roots()：用双契约枚举补齐插件挂载时已存在的 root。
       const roots = state.listRootAgents();
-      for (const agent of roots) {
-        installRootStructuredPathGuard(agent);
+      if (Array.isArray(roots)) {
+        for (const agent of roots) installRootStructuredPathGuard(agent);
       }
       return () => {
         state.rootStructuredGuardStopping = true;
@@ -334,11 +336,15 @@ export function assembleAutoRecovery(state) {
     experts: {
       roleCatalog,
       resolvePersonaForAdmission: state.resolvePersonaForAdmission,
+      resolveEffortOf: (...args) => state.resolveEffortOf(...args),
       resolvePersistedSubagentTarget: (...args) => state.expertCore.resolvePersistedSubagentTarget(...args),
       startExpertActivation: (...args) => state.expertCore.startExpertActivation(...args),
+      startOrdinaryExpertActivation: (...args) => state.expertCore.startOrdinaryExpertActivation(...args),
+      isLocalProvider: (...args) => state.expertCore.isLocalProvider(...args),
       contextInheritanceError: (...args) => state.expertCore.contextInheritanceError(...args),
     },
     structured: { markStructuredRequest: (...args) => state.expertCore.markStructuredRequest(...args) },
+    snapshot: { persistCommittedRecoveryChild: (...args) => state.persistCommittedRecoveryChild(...args) },
     agents,
     delegation: delegationTracker,
   });
@@ -357,11 +363,6 @@ export function assembleAutoRecovery(state) {
     identity: { agents, isLiveRootAgent: state.isLiveRootAgent },
     rootWait: rootWaitDomain,
     notifications: { notificationHost, rootGenerationRegistry },
-    // fan-out Host 是晚绑定槽：只交出取值函数，避免装配期捕获 undefined。
-    fanout: {
-      getFanoutHost: () => state.fanoutHost,
-      reconcileUnbarrieredFanoutHandoffs: (...args) => state.fanoutWaits?.reconcileUnbarrieredFanoutHandoffs(...args),
-    },
     delegation: delegationTracker,
   });
   // 显式续作（role 工具的 steer 路径）与自动恢复共用同一投递 seam。
@@ -393,15 +394,10 @@ export function assembleAutoRecovery(state) {
         // 卸载：取消全部 root 的等待（等待者以 released:false 收口）、移除监听与引用。
         state.rootTurnWaits.dispose();
         state.clearRootWaitInvalidators();
-        state.fanoutWaits?.clearHandoffWaitRecords();
         // 结构化声明映射只服务本进程派发；卸载时没有可复用的 activation 契约。
-        state.fanoutCaches?.clearAllFanoutOutputSchemas();
-        state.fanoutCaches?.clearAllFanoutRoutes();
         state.expertCore?.clearPendingStructuredPatches();
         // 结构化结果的有界重试定时器必须随卸载清除，避免关闭后仍有回调写已失效的 storage。
         state.expertCore?.clearAllStructuredRetries();
-        // per-shard 排队镜像随账本一起丢弃（票据 26）：dispose 已收口全部 waiter 与 works。
-        state.fanoutWaits?.clearShardWaitRecords();
         state.clearAllParentTurnEnds();
         // pendingHandoffAdmissions 只是 host 索引；cohort 另外持有 root/entry 引用，
         // 卸载时必须先遍历所有 known root 并清空共享 entries，再丢弃数组索引。

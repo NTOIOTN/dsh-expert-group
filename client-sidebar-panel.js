@@ -79,7 +79,7 @@
   const HOOKS_ACTIONS = global[HOOKS_ACTIONS_SYMBOL] || {};
   const {
     useSidebarPanelActionHandlers, useSidebarPanelActionHandlersPart2, useSidebarPanelBatchClose,
-    useSidebarPanelRunAction, useSidebarPanelRunActionPart2, useSidebarPanelTabRecorder,
+    useSidebarPanelRunAction, useSidebarPanelTabRecorder,
     useSidebarPanelTabRecorderPart2,
   } = HOOKS_ACTIONS;
 
@@ -522,7 +522,7 @@
   function assembleSidebarPanelBody(frame) {
     const {
       emptyFilter, errorLabelOf, expand, filterState, idleSidebarResourceAddresses, model,
-      partialSnapshot, pendingSet, react, recoveryRetryRef, renderSidebarBatchSlot, retryRecovery,
+      partialSnapshot, pendingSet, react, renderSidebarBatchSlot,
       rootSessionId, runAction, runningSidebarResourceAddresses, runtimeStatusOfNode, sessionModelEntryRef, setFilterState,
       setSessionModelOpen, setSessionModelReloadToken, sidebarIdleChildren, snapshot, t, viewCtx,
       viewsA, viewsB,
@@ -534,7 +534,7 @@
      *
      * 三条语义：
      * - 过滤状态绑定 root：切换会话后旧搜索词/角色/状态不会把新会话的树整棵隐藏；
-     * - 祖先路径保留：父级用 isVisible（自身命中，或任一子节点/分片命中）决定整棵子树是否展示；
+     * - 祖先路径保留：父级用 isVisible（自身命中，或任一子节点命中）决定整棵子树是否展示；
      * - 批量 slot 在过滤期间隐藏：批量关闭作用于整棵树，不能让用户在「看不见候选」时误关。
      */
     // 过滤派生（绑定 root / 祖先保留 / active 判定）归 panel-state-a；本层只接住结果与 setState。
@@ -547,15 +547,14 @@
     const updateFilter = (patch) => {
       setFilterState(PANEL_STATE_A.nextFilterPatch(filterSource, patch, rootSessionId));
     };
-    // 普通专家按实际运行状态分组，fan-out 父任务则按 manager 的聚合终态进入空闲组。
+    // 普通专家按实际运行状态分组。
     // 轻量快照（partial）下没有活动证据的专家是 unknown：**仍进空闲组显示**（位置与完整快照
     // 一致，不再因证据缺失而换组），但圆点/文案保持中性，且不参与任何批量关闭或抑制清理
     // （见 sidebarNodeIsIdleMembership 与 idleSidebarResourceAddresses 的分工）。
-    // fan-out 展示与取消/重试仍使用各自的 manager 状态，不受分组位置影响。
     const idleChildren = sidebarIdleChildren();
     const visibleChildren = children.filter((node) => !idleChildren.includes(node)).filter((node) => passesFilter(node));
     const visibleIdleChildren = filterActive === true ? idleChildren.filter((node) => passesFilter(node)) : idleChildren;
-    // 两行标题后的批量 slot 内容：主代理行只覆盖运行中的普通专家/最新分片，空闲标题行只覆盖
+    // 两行标题后的批量 slot 内容：主代理行只覆盖运行中的普通专家，空闲标题行只覆盖
     // idleChildren（因此天然继承同一套证据规则：unknown 成员不在其中，绝不成为关闭候选）。
     // 两者都只在渲染期纯读 openTabs inventory 与 close 能力（inventory 读不出来、
     // 或候选存在但 close 缺失时返回 null，不渲染任何东西）；打开能力不参与这里的判定。
@@ -563,7 +562,7 @@
     const rootBatchSlot = filterActive === true ? null : renderSidebarBatchSlot(runningSidebarResourceAddresses(), "运行中的子代理");
     const idleBatchSlot = filterActive === true ? null : renderSidebarBatchSlot(idleSidebarResourceAddresses(idleChildren), t("sidebar.idleGroup.name"));
     const root = snapshot?.root;
-    // ── R6（票据 23）：第三组视图（专家 / 空闲分组 / 分片 / fan-out / 工具条与「会话模型」弹窗）
+    // ── R6（票据 23）：第三组视图（专家 / 空闲分组 / 工具条与「会话模型」弹窗）
     // 在 root 与过滤派生就绪后绑定：它需要本帧的 root、过滤结果与在途动作锁投影。
     /** 行内动作的在途投影（可写 Set 归 Panel）。 */
     const isActionPending = (key) => pendingSet.current.has(key) === true;
@@ -578,7 +577,7 @@
       runAction, isActionPending, runtimeStatusOfNode, sessionModelEntryRef,
       closeSessionModelDialog, toggleSessionModelDialog, retrySessionModelLoad,
     }, viewsA, viewsB);
-    const { renderExpert, renderIdleGroup, renderFanout, renderToolbar, renderSessionModelDialog } = viewsC;
+    const { renderExpert, renderIdleGroup, renderToolbar, renderSessionModelDialog } = viewsC;
     const rootOpen = root === null ? true : expand(root);
     // 根层的可见兄弟集合（票据 18）：普通/空闲成员之外，空闲分组本身也是根的一个可见子项。
     // 过滤把空闲组整体隐藏时它**不计入** setsize/posinset，位置信息必须与用户看到的集合一致。
@@ -587,66 +586,6 @@
     // 根行的圆点走与专家行同一条 partial 规则：轻量快照里没有活动证据的根会话渲染中性圆点，
     // 而不是「已结束」的绿色圆点；完整快照与旧宿主下与既有渲染逐字一致。
     const rootStatus = runtimeStatusOf(root, null, { partial: partialSnapshot });
-    /**
-     * 恢复失败横幅（票据 04）：**独立**于标题栏的「快照读取失败」错误面。
-     *
-     * 两者语义不同，绝不合并：
-     * - 快照读取失败 = 这次 RPC 没拿到任务树（viewState.error + 重试按钮）；
-     * - 恢复失败 = 任务树读得到，但持久化恢复失败（磁盘快照可能不完整，fail-closed 生效），
-     *   需要重新读取持久化快照并重跑恢复。
-     *
-     * 横幅只由 Host 的权威投影 snapshot.recovery 驱动（旧 Host 缺失该块 ⇒ 不渲染）；
-     * 本地 retry 状态只补充「重试中/重试失败」这一行，不替代原因码。
-     */
-    const recovery = snapshot?.recovery ?? null;
-    const recoveryFailed = recovery !== null && recovery.status === "failed";
-    const recoveryRetry = recoveryRetryRef.current;
-    // rootSessionId 绑定：切换 root 后旧请求的 in-flight/error 不属于当前 surface。
-    const recoveryRetryPending = recoveryRetry.inFlight === true && recoveryRetry.rootSessionId === rootSessionId;
-    const recoveryCode = recovery === null ? null : text(recovery.code, "RESTORE_FAILED");
-    // 补充行只在「当前仍是失败态，且重试失败与当前原因码同一来源」时显示：
-    // Host 后来换了原因码（例如先 INVALID_SNAPSHOT、修复后变 BUDGET_EXCEEDED）时，
-    // 旧重试的文案不再适用，必须让位给新的主原因码（两个稳定本地码始终保留）。
-    const recoveryRetryError = recoveryFailed === true
-      && recoveryRetry.rootSessionId === rootSessionId
-      && recoveryRetry.error !== null
-      && (recoveryRetry.error.code === recoveryCode
-        || recoveryRetry.error.code === "RETRY_FAILED"
-        || recoveryRetry.error.code === "NO_RESTORABLE_SNAPSHOT")
-      ? recoveryRetry.error
-      : null;
-    const recoveryMessage = recovery === null ? null : text(recovery.message, null);
-    const recoveryBanner = recoveryFailed !== true
-      ? null
-      : react.createElement("div", {
-        className: "deg_expert_group_recovery",
-        role: "alert",
-        "data-recovery-status": "failed",
-        "data-recovery-code": recoveryCode,
-        // title 提供完整文案：可见行按一行省略，悬停仍可读到全部（仍受 Host 200 字上限约束）。
-        title: recoveryMessage === null ? "恢复失败（" + recoveryCode + "）" : recoveryMessage,
-      },
-      react.createElement("span", { className: "deg_expert_group_recovery_text" },
-        "任务恢复失败（" + recoveryCode + "）" + (recoveryMessage === null ? "" : "：" + recoveryMessage)),
-      recoveryRetryError === null
-        ? null
-        : react.createElement("span", { className: "deg_expert_group_recovery_retry_error", role: "status" },
-          "重试未恢复（" + text(recoveryRetryError.code, "RETRY_FAILED") + "）"
-          + (text(recoveryRetryError.message, "") === "" ? "" : "：" + text(recoveryRetryError.message, ""))),
-      react.createElement("button", {
-        type: "button",
-        className: "deg_expert_group_recovery_retry",
-        // retryable=false 只影响提示语（结构性快照缺陷）；按钮仍保留：重试会重读磁盘，
-        // 外部修复后仍可能成功，入口绝不隐藏。
-        title: recovery.retryable === false
-          ? "该原因通常需要修复持久化快照后才能恢复；点击会重新读取当前持久化快照"
-          : "重新读取当前持久化快照并重跑恢复",
-        "aria-label": t("sidebar.recovery.retry"),
-        "aria-busy": recoveryRetryPending || undefined,
-        disabled: recoveryRetryPending,
-        onClick: retryRecovery,
-        // 文字按钮：进度态把文案换成「重试中…」，可见且可被辅助技术读到。
-      }, recoveryRetryPending ? t("sidebar.recovery.retrying") : t("sidebar.recovery.retry")));
     /**
      * 错误空态（票据 13）：失败且没有任何可展示快照时，标题栏错误槽之外还要有一块**独立**的
      * 正文占位——只留一行「暂无 Expert Group 任务」会让用户以为任务真的不存在。
@@ -667,8 +606,8 @@
 
     Object.assign(frame, {
       children, closeSessionModelDialog, errorEmptyState, filterActive, filterSource, idleBatchSlot,
-      idleChildren, idleGroupVisible, isActionPending, passesFilter, recovery, recoveryBanner,
-      renderExpert, renderFanout, renderIdleGroup, renderSessionModelDialog, renderToolbar, retrySessionModelLoad,
+      idleChildren, idleGroupVisible, isActionPending, passesFilter,
+      renderExpert, renderIdleGroup, renderSessionModelDialog, renderToolbar, retrySessionModelLoad,
       root, rootBatchSlot, rootOpen, rootSiblingCount, rootStatus, taskFilter,
       toggleSessionModelDialog, updateFilter, visibleChildren, visibleIdleChildren,
     });
@@ -677,7 +616,7 @@
   function assembleSidebarPanelBodyPart2(frame) {
     const {
       errorEmptyState, filterActive, idleBatchSlot, idleChildren, idleGroupVisible, primitives,
-      react, renderChevron, renderExpert, renderFanout, renderIdleGroup, renderMetrics,
+      react, renderChevron, renderExpert, renderIdleGroup, renderMetrics,
       renderRowMain, renderToolbar, root, rootBatchSlot, rootOpen, rootSessionId,
       rootSiblingCount, rootStatus, snapshot, t, taskFilter, viewState,
       visibleChildren, visibleIdleChildren,
@@ -713,9 +652,7 @@
               metrics: renderMetrics(root, { kind: "root", runtimeStatus: rootStatus, sessionId: root.sessionId, sessionIds: [root.sessionId] }),
             }))),
             rootOpen ? react.createElement("div", { className: "deg_expert_group_children", role: "group" }, [
-              ...visibleChildren.map((node, index) => node.kind === "fanout"
-                ? renderFanout(node, index, { level: 2, posinset: index + 1, setsize: rootSiblingCount })
-                : renderExpert(node, index, rootSessionId, { level: 2, posinset: index + 1, setsize: rootSiblingCount })),
+              ...visibleChildren.map((node, index) => renderExpert(node, index, rootSessionId, { level: 2, posinset: index + 1, setsize: rootSiblingCount })),
               // 过滤期间：空闲组成员的命中才算命中；整组没有命中时不渲染空分组（由下方空态统一提示）。
               idleGroupVisible
                 ? renderIdleGroup(filterActive === true ? visibleIdleChildren : idleChildren, idleBatchSlot, { level: 2, posinset: visibleChildren.length + 1, setsize: rootSiblingCount })
@@ -744,7 +681,7 @@
   function renderSidebarPanelSection(frame) {
     const {
       announcement, autoOpenDraft, autoOpenEnabled, body, config, diagFeedback, errorLabelOf,
-      exportAutoDiag, panelLocale, peakValleyMarker, primitives, react, recoveryBanner, renderSessionModelDialog,
+      exportAutoDiag, panelLocale, peakValleyMarker, primitives, react, renderSessionModelDialog,
       retry, t, toggleAutoOpen, version, viewState, widthResizer, writeAutoOpenSetting,
     } = frame;
 
@@ -857,7 +794,7 @@
             "data-error-source": panelError.source,
             title: panelError.message,
           }, panelErrorLabel),
-        refreshButton, diagButton, diagStatus), recoveryBanner, body,
+        refreshButton, diagButton, diagStatus), body,
       // 「会话模型」弹窗挂在任务树之后：只在打开时渲染（关闭态 DOM 与既有面板一致）。
       renderSessionModelDialog());
   }
@@ -917,7 +854,6 @@
       useSidebarPanelProjectionRef(frame);
       useSidebarPanelProjectionEffect(frame);
       useSidebarPanelRunAction(frame);
-      useSidebarPanelRunActionPart2(frame);
       // 票据 09：标题栏峰谷时段标记（无条件 Hook；未启用时不创建任何定时器）。
       useSidebarPanelPeakValleyMarker(frame);
       // 票 06：标题栏「诊断」入口（无条件 Hook；只读既有诊断环，点击之外没有任何副作用）。

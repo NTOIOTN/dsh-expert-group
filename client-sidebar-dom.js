@@ -372,21 +372,6 @@
 
 
   /**
-   * 逐动作能力读取（票据 09）：只有 Host 明确给出 allowed 布尔时才作为权威。
-   *
-   * 返回 true/false/null：
-   * - true/false：严格按能力渲染（Host 是唯一判定来源）；
-   * - null：旧 Host/旧快照没有该字段（或形状非法）→ 调用方回退既有的
-   *   ACTIVE_STATUSES / RETRY_STATUSES 推导，兼容未升级的 Host。
-   * 这里刻意不把「有 capabilities 但缺该动作」当成允许：缺项与缺失整块同义，都回退。
-   */
-  function capabilityAllowed(node, action) {
-    const capabilities = object(object(node).capabilities);
-    const entry = object(capabilities[action]);
-    return typeof entry.allowed === "boolean" ? entry.allowed : null;
-  }
-
-  /**
    * 规范运行状态（展示与图标唯一使用的状态）。
    * 模型可用时由模型按官方源字段归一，模型缺失时才退回可证明的 running 布尔。
    */
@@ -488,21 +473,15 @@
    *   也不接受任何 session- 前缀回退；侧栏精简后根会话的权威标题不再出现在任何一行。
    * - 普通专家节点继续显示 Host 投影的最新 dispatch 短描述（context.label /
    *   lastDispatch.description / 冷会话标题），重复 dispatch 后即为最新描述。
-   * - fan-out 分支标题保留 role、分片数与规范运行状态词。
    */
   function titleOf(node) {
     const source = object(node);
-    if (source.kind === "fanout") {
-      const role = text(source.role, "Expert");
-      const count = Array.isArray(source.shards) ? source.shards.length : 0;
-      return role.charAt(0).toUpperCase() + role.slice(1) + " · " + count + " shards · " + RUNTIME_STATUS_LABELS[runtimeStatusOf(source, null)];
-    }
     if (source.kind === "root") return "主代理";
     return text(source.taskName, "未命名任务");
   }
 
   /**
-   * 具名图标（仅用于折叠箭头与 fan-out 取消/重试动作）。
+   * 具名图标（仅用于折叠箭头）。
    *
    * 图标词表按 0.1.7-alpha.2 契约：后缀编码**描边粗细**（`*Regular` = 1px，`*Medium` = 1.3px），
    * 渲染尺寸由 `size` prop 承载；旧的 `*14` / `*16` 后缀名在该版本已全部消失。
@@ -598,7 +577,7 @@
   /**
    * 面板样式表文本常量（按区块分段，注入时按同一顺序拼接）。
    *
-   * 第一段：面板骨架、标题栏、任务树（行 / 分片 / 树线）、行内控件与状态圆点。
+   * 第一段：面板骨架、标题栏、任务树（行 / 树线）、行内控件与状态圆点。
    * 原样搬出 styleTag 的数组字面量：字符串内容与顺序一字未改，只是把
    * 「CSS 文本」与「注入动作」拆成两件事。
    */
@@ -629,18 +608,6 @@
     // .deg_settings_peak_valley_entry_active 选择器组）：两处是同一个视觉标记，只写一份配色。
     // 未启用（disabled）匹配不到那条规则，因此保持纯文字、不画描边。
     ".deg_expert_group_header_peak_valley{flex:0 0 auto;padding:1px 6px;border-radius:6px;font-size:12px;font-weight:400;color:var(--dsw-alias-label-secondary);white-space:nowrap}",
-    // 恢复失败横幅（票据 04）：与标题栏的「快照读取失败」错误面完全独立，位于头部之下、
-    // 任务树之上；失败原因码与一行 message 同排，重试按钮固定右侧。整块用 flex-wrap：
-    // 窄右栏时补充行自动换到第二排，绝不挤压任务树的可点击区域。
-    ".deg_expert_group_recovery{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;margin:6px 0 0;padding:6px 8px;border:1px solid var(--dsw-alias-state-error-primary,var(--dsw-alias-state-warning-primary,#f59e0b));border-radius:6px;background:var(--dsw-alias-bg-layer-2,transparent);color:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-primary));font-weight:600}",
-    // 主文案严格一行：超长 message 用省略号收束，完整内容在 title 里（Host 已限长 200 字符）。
-    ".deg_expert_group_recovery_text{flex:1 1 140px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-    // 补充行（重试动作本身失败）：次级颜色、可换行，绝不覆盖主原因码。
-    ".deg_expert_group_recovery_retry_error{flex:1 1 100%;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-secondary);font-weight:400}",
-    ".deg_expert_group_recovery_retry{flex:0 0 auto;box-sizing:border-box;height:24px;padding:0 8px;border:0;border-radius:5px;background:transparent;color:inherit;font-weight:600;cursor:pointer}",
-    ".deg_expert_group_recovery_retry:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}",
-    ".deg_expert_group_recovery_retry:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-    ".deg_expert_group_recovery_retry:disabled{cursor:default;opacity:.7}",
     ".deg_expert_group_header_action:hover,.deg_expert_group_chevron:hover,.deg_expert_group_action:hover:not(:disabled),.deg_expert_group_sidebar_action:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
     ".deg_expert_group_header_action:focus-visible,.deg_expert_group_chevron:focus-visible,.deg_expert_group_action:focus-visible,.deg_expert_group_sidebar_action:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
     ".deg_expert_group_tree{min-width:0;padding-top:5px}",
@@ -650,7 +617,7 @@
     ".deg_expert_group_announcer{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}",
     // 可导航行的明确焦点轮廓（票据 18）：不再依赖浏览器默认（宿主 reset 有时会把它抹掉）。
     // 任务名是 role=button 的 div，键盘焦点必须一眼可见。
-    ".deg_expert_group_task:focus-visible,.deg_expert_group_fanout_title>.deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
+    ".deg_expert_group_task:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:2px;border-radius:3px}",
     // 右栏宽度拖拽手柄（票据 18）：贴在面板左缘的 6px 竖条，拖拽改变视口比例。
     // touch-action:none 让触控板/触摸屏的拖拽不会被浏览器滚动吃掉；透明背景只在 hover/拖拽时显形。
     ".deg_expert_group_resizer{position:absolute;top:0;left:0;bottom:0;width:6px;cursor:col-resize;touch-action:none;background:transparent;z-index:2}",
@@ -663,13 +630,13 @@
     // 侧栏精简后主行只剩「任务名 + 模型元数据」两行，主行高度随之收敛到 44px；
     // 树线锚点仍以 44px 的主行高度为参照（--deg-parent-row-height），新增块只向下延伸。
     ".deg_expert_group_row{box-sizing:border-box;display:grid;grid-template-columns:20px 20px minmax(0,1fr);min-width:0;min-height:44px;padding:4px 0}",
-    // 第一行必须是 auto：默认单行 16px 时与旧布局逐像素相同；分片第一行换行时按内容撑高，
-    // 绝不把多行文本压进 16px 行盒而与元数据行重叠——它没有省略号语义（见 .deg_expert_group_shard_task）。
+    // 第一行必须是 auto：默认单行 16px 时与旧布局逐像素相同；任务名换行时按内容撑高，
+    // 绝不把多行文本压进 16px 行盒而与元数据行重叠。
     // 第二行（模型元数据）保持 16px 是因为省略号只在单行行盒上生效：行盒被内容撑开时
     // WebKit/Blink 会退化成裁切而不是显示 "…"，原生右栏与项目既有行为都以 "…" 结尾。
     ".deg_expert_group_row_main{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto 16px;min-width:0}",
     // 第一行使用独立的内联容器：任务文字按内容宽度收缩，箭头紧跟在文字后方；名称过长时文字
-    // 只在箭头前的可用空间内省略，不会把箭头推出右栏视口。第一行仍由内容撑高，兼容分片任务名换行。
+    // 只在箭头前的可用空间内省略，不会把箭头推出右栏视口。第一行仍由内容撑高。
     ".deg_expert_group_task_line{grid-area:1 / 1;display:flex;align-items:center;min-width:0;gap:2px}",
     ".deg_expert_group_meta{grid-area:2 / 1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:11px}",
     // 两枚 20px chevron 重叠 10px，总宽 30px；按钮同步预留空间，避免箭头覆盖标题。
@@ -686,15 +653,8 @@
     ".deg_expert_group_double_arrow_icon path{stroke:currentColor;stroke-width:1.5;stroke-linejoin:round}",
     ".deg_expert_group_line{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
     ".deg_expert_group_task{min-width:0;flex:0 1 auto;font-weight:600;cursor:pointer}",
-    // fan-out 分片第一行是「分片代号  任务名称」：代号已经占掉单行相当一部分宽度，
-    // 继续按单行省略会让任务名称几乎不可读。这里改成可换行：完整文本按行折行展示，
-    // overflow-wrap:anywhere 让超长且无分隔符的名称（中文长句、长英文标识）也能折行，
-    // 绝不溢出到第二行或右侧的取消/重试按钮下面。行高由内容撑开（.deg_expert_group_shard
-    // 只设 min-height），因此名称越长行越高而不是被裁掉。
-    ".deg_expert_group_shard_task{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere}",
     ".deg_expert_group_task:hover{text-decoration:underline}",
     ".deg_expert_group_chevron{width:20px;height:20px;padding:0;align-self:start}",
-    ".deg_expert_group_fanout_header>.deg_expert_group_chevron{align-self:center}",
     ".deg_expert_group_chevron_placeholder{display:inline-block;width:20px;height:20px}",
     ".deg_expert_group_status_icon{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;color:var(--dsw-alias-label-secondary)}",
     // 兜底圆点：官方 primitives.StateDot 缺失时才使用，静态、无动画。
@@ -724,34 +684,22 @@
     ".deg_expert_group_sidebar_batch_zero{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--dsw-static-deepseek-450,var(--dsw-alias-state-business-primary,#22d3ee))}",
     // 树线锚点固定在每一级父行的 20px 状态列中心，避免依赖窗口测量。
     ".deg_expert_group_children{position:relative;min-width:0;margin:0;padding:0;--deg-parent-row-height:44px}",
-    ".deg_expert_group_children>.deg_expert_group_node,.deg_expert_group_children>.deg_expert_group_fanout,.deg_expert_group_children>.deg_expert_group_idle_group{--deg-tree-anchor:14px;position:relative}",
-    ".deg_expert_group_children>.deg_expert_group_fanout{--deg-tree-anchor:14px}",
+    ".deg_expert_group_children>.deg_expert_group_node,.deg_expert_group_children>.deg_expert_group_idle_group{--deg-tree-anchor:14px;position:relative}",
     ".deg_expert_group_children>:first-child:before{position:absolute;top:calc(var(--deg-tree-anchor) - var(--deg-parent-row-height));bottom:calc(100% - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
     ".deg_expert_group_children>:not(:last-child):after{position:absolute;top:var(--deg-tree-anchor);bottom:calc(0px - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
 
-    ".deg_expert_group_node>.deg_expert_group_row,.deg_expert_group_fanout_header,.deg_expert_group_idle_group>.deg_expert_group_row{position:relative}",
-    ".deg_expert_group_node:not(.deg_expert_group_node_root)>.deg_expert_group_row:before,.deg_expert_group_fanout_header:before,.deg_expert_group_idle_group>.deg_expert_group_row:before{position:absolute;top:var(--deg-tree-anchor,14px);left:-6px;width:16px;border-top:1px solid var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-    ".deg_expert_group_row>*,.deg_expert_group_fanout_header>*{position:relative;z-index:1}",
+    ".deg_expert_group_node>.deg_expert_group_row,.deg_expert_group_idle_group>.deg_expert_group_row{position:relative}",
+    ".deg_expert_group_node:not(.deg_expert_group_node_root)>.deg_expert_group_row:before,.deg_expert_group_idle_group>.deg_expert_group_row:before{position:absolute;top:var(--deg-tree-anchor,14px);left:-6px;width:16px;border-top:1px solid var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
+    ".deg_expert_group_row>*{position:relative;z-index:1}",
     // 空闲分组没有隐式首项 spacer；折叠、展开和空列表都保持直接相邻。
     ".deg_expert_group_idle_group{position:relative;min-width:0;padding-left:16px;--deg-tree-anchor:14px}",
     ".deg_expert_group_idle_group>.deg_expert_group_children{margin:0;padding:0;--deg-parent-row-height:28px}",
     // 空闲分组标题行同样是 grid：状态列 + chevron 列 + 可收缩标题列 + 批量 trailing slot。
-    // 第四列用 auto（与 .deg_expert_group_fanout_header 的 actions 列同款）：slot 存在时按它自己的
+    // 第四列用 auto：slot 存在时按它自己的
     // 30px 宽占位，slot 为空（没有批量能力）时该列宽度为 0——标题宽度因此与改动前逐像素一致，
     // 绝不会因为「能力缺失」而平白被压掉 30px。空 idleChildren 时该 slot 承载不可交互的零圆点。
     ".deg_expert_group_idle_group>.deg_expert_group_row.deg_expert_group_idle_header{display:grid;grid-template-columns:20px 20px minmax(0,1fr);align-items:center;height:28px;min-height:28px;padding:4px 0}",
     ".deg_expert_group_idle_group>.deg_expert_group_row{margin:0}",
-    ".deg_expert_group_fanout{position:relative;margin-top:0;padding-left:16px}",
-    ".deg_expert_group_fanout_header{display:grid;grid-template-columns:20px 20px minmax(0,1fr) auto;align-items:center;min-width:0;min-height:28px;gap:4px}",
-    ".deg_expert_group_fanout_shards{position:relative;min-width:0;--deg-parent-row-height:28px}",
-    // 分片第一行可以换行，行高不再固定 48px，所以树线锚点绑定到**固定 20px 高**的状态图标
-    // 中心（3px 上内边距 + 10px），而不是行高的一半：水平连接线与垂直树线继续对准状态列，
-    // 多行名称只让行变高，树形结构与高度语义不受影响。
-    ".deg_expert_group_fanout_shards>.deg_expert_group_shard{--deg-tree-anchor:13px;position:relative}",
-    ".deg_expert_group_fanout_shards>.deg_expert_group_shard:first-child:before{position:absolute;top:calc(var(--deg-tree-anchor) - var(--deg-parent-row-height));bottom:calc(100% - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-    ".deg_expert_group_fanout_shards>.deg_expert_group_shard:not(:last-child):after{position:absolute;top:var(--deg-tree-anchor);bottom:calc(0px - var(--deg-tree-anchor));left:10px;width:1px;background:var(--dsw-alias-border-l2);content:\"\";pointer-events:none}",
-    ".deg_expert_group_shard{display:grid;grid-template-columns:20px 20px minmax(0,1fr) auto;min-width:0;min-height:48px;padding:3px 0;gap:0 3px}",
-    ".deg_expert_group_shard[data-expanded=false]{min-height:24px}",
     ".deg_expert_group_actions{display:flex;align-items:flex-start;gap:2px}",
     ".deg_expert_group_action{width:24px;height:24px;padding:0}",
     ".deg_expert_group_action:disabled{opacity:.45;cursor:wait}",
@@ -796,7 +744,6 @@
     // 结构化结果区：有界 JSON 预览按可读前缀展示，超长换行而不是横向滚动/溢出右栏。
     ".deg_expert_group_structured{min-width:0;margin:2px 0 0;padding:2px 4px;border-inline-start:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:15px;overflow-wrap:anywhere;max-height:84px;overflow:auto}",
     ".deg_expert_group_structured[data-fallback=true]{border-inline-start-color:var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b)}",
-    ".deg_expert_group_shard_extra{display:flex;flex-direction:column;min-width:0}",
   ].join("");
 
   /**
@@ -871,13 +818,6 @@
     ".deg_expert_group_attempts_toggle{flex:0 0 auto;align-self:flex-start;box-sizing:border-box;height:20px;margin:1px 0 0;padding:0 4px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}",
     ".deg_expert_group_attempts_toggle:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
     ".deg_expert_group_attempts_toggle:focus-visible{outline:2px solid var(--dsw-alias-interactive-border-focus,var(--dsw-alias-label-primary));outline-offset:1px}",
-    // fan-out 标题列：第二行（用量摘要 / 时间线 / 失败摘要）已整行删除（用户要求：
-    // 父任务不承担会话），这里只剩可点击导航的标题一行。
-    // wrapper 本身必须保留：.deg_expert_group_task:focus-visible 的复合选择器与测试都以它为锚点。
-    // 改为单行 flex（行方向 + 垂直居中）：头部网格 min-height 28px + align-items:center，
-    // 与相邻单行任务行（28px 行高）视觉一致，列方向不再把 wrapper 撑高。
-    ".deg_expert_group_fanout_title{display:flex;align-items:center;min-width:0}",
-    ".deg_expert_group_fanout_title>.deg_expert_group_task{flex:0 1 auto;min-width:0}",
     // 搜索/过滤/会话模型工具条：位于任务树顶部，只在快照已上屏时出现。
     ".deg_expert_group_toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:5px 0 2px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
     ".deg_expert_group_search{flex:1 1 120px;min-width:0;box-sizing:border-box;height:24px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:transparent;color:var(--dsw-alias-label-primary);font-size:11px}",
@@ -1463,7 +1403,7 @@
 
   // 只暴露兄弟模块与主 IIFE 实际消费的符号（无全量外挂）。
   global[SYMBOL] = Object.freeze({
-    RIGHTBAR_DRAG_HANDLE_SELECTOR, SUBAGENT_CHAT_KIND, capabilityAllowed, createBrandIcon,
+    RIGHTBAR_DRAG_HANDLE_SELECTOR, SUBAGENT_CHAT_KIND, createBrandIcon,
     createCatalogLookup, currentSessionIdOf, expertGroupTabIdsOf, getOpenSession,
     hostAppFrameWidthOf, listSnapshot, makeIcon, metadataOf,
     methodOf, normalizeSubagentAddress, paneNodesOf, parseSplitTracks,

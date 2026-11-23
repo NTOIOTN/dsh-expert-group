@@ -375,17 +375,11 @@
      * - 容器身份仍归各自 owner（实例级 ref / realm 级共享账本），本层每次现取 ref.current；
      * - 依赖对象 treeDeps / autoCloseLedger 每帧重建，绝不跨帧复用（旧实现的判据都是闭包值）。
      */
-    const tabTreeDeps = (recordShardChildMissing) => ({
+    const tabTreeDeps = () => ({
       addressOf: subagentAddressOfChild,
       statusOf: runtimeStatusOfNode,
       partial: partialSnapshot,
       neutralStatus: neutralRuntimeStatus,
-      /**
-       * 分片缺少可用会话标识时的诊断出口（票 04）：窄函数注入，地址推导层因此不含任何记账知识。
-       * **只有候选层会传**（见 syncAutoSidebarTabs）；渲染路径同样求值这份地址集合却不传，
-       * 于是同一条事实不会随每一帧渲染刷满有界诊断环。
-       */
-      ...(typeof recordShardChildMissing === "function" ? { recordShardChildMissing } : {}),
     });
     /** 自动关闭预算的四个容器 + 上限：成员 Map 的身份来自主体（实例 ref / 共享账本），本层不 new。 */
     const autoCloseLedger = () => ({
@@ -420,10 +414,10 @@
       tabTreeDeps(),
     );
     const sidebarIdleChildren = () => TAB_STATE.sidebarIdleChildren(sidebarRootChildren(), rootSessionId, tabTreeDeps());
-    const runningSidebarResourceAddresses = (recordShardChildMissing) => TAB_STATE.runningSidebarResourceAddresses(
+    const runningSidebarResourceAddresses = () => TAB_STATE.runningSidebarResourceAddresses(
       sidebarRootChildren(),
       rootSessionId,
-      tabTreeDeps(recordShardChildMissing),
+      tabTreeDeps(),
     );
     const idleSidebarResourceAddresses = (nodes) => TAB_STATE.idleSidebarResourceAddresses(
       nodes,

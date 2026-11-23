@@ -22,8 +22,8 @@
  *
  * ## root 代际退休
  * 2. **root 代际退休**：同 id 的新 root 出现或旧 root 销毁时，按 exact Agent 对象切断
- *    旧代际的全部可恢复边界（终止快照、lineage 绑定、等待账本、fan-out 登记、admission
- *    批次与恢复记录）。迟到旧事件因此无法删除/复活同 id 的新代际。
+ *    旧代际的全部可恢复边界（终止快照、lineage 绑定、等待账本、admission 批次与恢复
+ *    记录）。迟到旧事件因此无法删除/复活同 id 的新代际。
  *
  * ## 铁律（票据 19）
  * 本模块**不接收 ctx**，也不注册任何 `ctx.on` / `ctx.effect`：三个
@@ -40,7 +40,7 @@
  * 旧宿主上的注入判定（effort === undefined / 无 scoped ctx.on / 已安装）、waterfall 的
  * "已带 effort 不覆盖" 语义逐行不变；新宿主上则换成一次幂等的 select() 调用。
  * 退休顺序（终止快照 -> 标记 dispose -> lineage -> 用户等待 ->
- * 代际 token -> 等待账本 -> fan-out 登记 -> admission -> tracker -> 代际表 -> 恢复记录）
+ * 代际 token -> 等待账本 -> admission -> tracker -> 代际表 -> 恢复记录）
  * 与迁移前逐行一致；任一命令缺失只影响自身分支，不改变其它边界的顺序。
  *
  * @module dsh-expert-group/host/index-effort-retire
@@ -71,7 +71,7 @@ function logEffortSelectionFailure(agent, error) {
 /**
  * 创建推理深度注入 + root 代际退休域。
  *
- * @param {object} deps - 窄能力面（7 组）。
+ * @param {object} deps - 窄能力面（6 组）。
  * @param {object} deps.identity - 根身份与代际面：`isRootAgentIdentity`、`lineage`
  *   （releaseAgent/tokenOf）、`rootGenerationRegistry`（generationOf/retire）、
  *   `notificationHost`（retireRoot）。
@@ -83,10 +83,9 @@ function logEffortSelectionFailure(agent, error) {
  * @param {object} deps.recovery - 恢复域：`prunePendingCreationsForParent`、
  *   `dropRebuildsFor`、`dropParentRecoveryRecords`。
  * @param {object} deps.delegation - 委派跟踪器：`dropParent(parentId)`。
- * @param {object} deps.fanout - fan-out 等待登记（晚绑定）：`releaseRetiredRootHandoffs(agent)`。
  * @returns {object} 能力面：effort 解析/安装/释放 + 退休命令。
  */
-export function createEffortRetireDomain({ identity, prelude, rootWait, handoff, recovery, delegation, fanout }) {
+export function createEffortRetireDomain({ identity, prelude, rootWait, handoff, recovery, delegation }) {
   /**
    * exact Agent -> 释放函数；同一 agent 只处理一次。
    *
@@ -138,7 +137,7 @@ export function createEffortRetireDomain({ identity, prelude, rootWait, handoff,
     const model = agent?.options?.model;
     if (typeof provider !== "string" || provider.length === 0) return false;
     if (typeof model !== "string" || model.length === 0) return false;
-    // 与 fan-out/自动恢复写入真实字段的判据对齐：空串与非字符串都不是"显式档位"，
+    // 与自动恢复写入真实字段的判据对齐：空串与非字符串都不是"显式档位"，
     // 直接跳过（不调用 select），让选择保持"未指定"、由 adapter 解析默认档。
     if (typeof effort !== "string" || effort.length === 0) return false;
     try {
@@ -193,22 +192,6 @@ export function createEffortRetireDomain({ identity, prelude, rootWait, handoff,
   }
 
   /**
-   * root 代际退休时摘除它持有的 fan-out 等待登记。
-   *
-   * 为什么必须做：登记记录的归属凭据是注册当时捕获的 exact Agent 对象。旧代际退休后
-   * 它的分片会随 agent/disposed 一起收敛，**不会再产生 task_settled**；若记录仍留在表里
-   * 并保持 active，补建路径就可能（在极端的同 id replacement 场景下）被误导。这里统一
-   * 标记 released 并删除：等待本身由 rootTurnWaits.retire 取消，登记表只负责「这个
-   * parentTaskId 的当前代次是谁」，绝不继承旧代际的等待原因。
-   *
-   * @param {object} previous - 正在退休的 exact root Agent。
-   */
-  function releaseFanoutHandoffRecordsForRetiredRoot(previous) {
-    // 容器 owner 在 host/index-expert-tools-fanout.js：这里只调一条退休命令。
-    fanout.releaseRetiredRootHandoffs(previous);
-  }
-
-  /**
    * 让一个 exact root Agent 的代际整体退休（顺序与迁移前逐行一致）。
    * @param {object} previous - 正在退休的 exact root Agent。
    */
@@ -227,9 +210,6 @@ export function createEffortRetireDomain({ identity, prelude, rootWait, handoff,
     // 代际退休：取消该 root 的全部等待（等待者以 released:false 收口）、移除监听与引用。
     // 旧代际的迟到事件不会再命中任何记录，因此无法释放新 waiter。
     rootWait.rootTurnWaits.retire(previous, "root-generation-retired");
-    // 旧代际的分片不会再产生 task_settled：必须同时摘除它持有的 fan-out 登记，
-    // 否则那些「永远等不到结算」的登记会让后续补建路径被误导。
-    releaseFanoutHandoffRecordsForRetiredRoot(previous);
     handoff.forgetParentTurnEnds(previous);
     handoff.forgetFailedHandoffParent(previous);
     handoff.clearPendingHandoffAdmissions(previous);
@@ -244,7 +224,6 @@ export function createEffortRetireDomain({ identity, prelude, rootWait, handoff,
     resolveEffortOf,
     installEffortInjection,
     disposeEffortInjection,
-    releaseFanoutHandoffRecordsForRetiredRoot,
     retireRootGeneration,
   };
 }

@@ -64,11 +64,6 @@
     Object.freeze({ value: "incomplete", label: "未完成" }),
     Object.freeze({ value: "completed", label: "已完成" }),
   ]);
-  // ACTIVE_STATUSES / RETRY_STATUSES 只服务于 fan-out 管理语义（取消/重试判定），不是展示状态词表。
-  const ACTIVE_STATUSES = new Set(["queued", "waiting", "running"]);
-  const RETRY_STATUSES = new Set(["failed", "timed_out", "interrupted"]);
-  // 父任务的规范终态表示全部分片已结算，且不会把未知/展示态误判为空闲。
-  const FANOUT_SETTLED_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
   const STYLE_ID = "dsh-expert-group/expert-group-sidebar";
   /**
    * Expert Group 页的右侧栏宽度：**恒为视口宽度的 20%**（1600px 视口 ⇒ 320px）。
@@ -611,32 +606,12 @@
     for (const field of ["inputTokens", "outputTokens", "totalTokens", "billedInputTokens", "requests"]) {
       if (typeof usage[field] === "number" && Number.isFinite(usage[field])) return true;
     }
-    // 快照根是 root 字段（不是 children）：先看根节点自身，再看它的子节点/分片/attempt。
+    // 快照根是 root 字段（不是 children）：先看根节点自身，再看它的子节点。
     if (snapshotHasUsageFact(source.root, depth + 1)) return true;
     for (const child of Array.isArray(source.children) ? source.children : []) {
       if (snapshotHasUsageFact(child, depth + 1)) return true;
     }
-    for (const shard of Array.isArray(source.shards) ? source.shards : []) {
-      if (snapshotHasUsageFact(shard, depth + 1)) return true;
-      for (const attempt of Array.isArray(object(shard).attempts) ? object(shard).attempts : []) {
-        if (snapshotHasUsageFact(attempt, depth + 1)) return true;
-      }
-    }
     return false;
-  }
-
-  /**
-   * 分片「最新 attempt 的 childId」，缺失时回退分片自身的 childId（两者都没有返回 null）。
-   *
-   * 分片每次重试都会换一个 child 会话，只有最新 attempt 才代表这一行**当前**对应的 DSH 会话；
-   * 读旧 attempt 的投影会拿到历史会话的数字（用户会看到与状态矛盾的用量）。摘要条聚合与
-   * 按需投影加载必须共用这一条归属规则，避免两处各判一次而漂移。
-   */
-  function latestShardChildIdOf(shard) {
-    const source = object(shard);
-    const attempts = Array.isArray(source.attempts) ? source.attempts : [];
-    const latest = attempts.length === 0 ? null : object(attempts[attempts.length - 1]);
-    return text(latest?.childId, text(source.childId, null));
   }
 
   /**
@@ -650,8 +625,6 @@
    * 归属规则与摘要条同源：
    * - root：根节点的 sessionId；
    * - 普通专家（可嵌套）：node.sessionId；
-   * - 分片：最新 attempt 的 childId，缺失回退 shard.childId；
-   * - fan-out 父任务没有单一会话，只贡献各 shard 的最新 childId；
    * - children 递归（深度与节点数都有界，坏数据/手工构造的超大树不会把渲染期卡死）。
    * 缺失或非字符串的 id 直接跳过，绝不猜一个 id 去请求投影。
    */
@@ -671,7 +644,6 @@
       if (Object.keys(source).length === 0) return;
       visited += 1;
       push(source.sessionId);
-      for (const shard of Array.isArray(source.shards) ? source.shards : []) push(latestShardChildIdOf(shard));
       for (const child of Array.isArray(source.children) ? source.children : []) visit(child, depth + 1);
     };
     visit(object(snapshot).root, 0);
@@ -686,7 +658,7 @@
    * （那会让比例换算与变化检测读到不同的视口）。读不到时返回 null，调用方一律放弃写入，
    * 保留宿主当前值，绝不猜一个宽度。
    */
-  /** fan-out 管理状态：只用于取消/重试判定与 data-task-status，不作为展示状态词。 */
+  /** 节点的原始状态值（协议原样读取）：只用于播报与过滤判定，不作为展示状态词。 */
   function statusOf(node) {
     const value = text(object(node).status, "unknown");
     return value || "unknown";
@@ -695,15 +667,14 @@
   const ANNOUNCEMENT_FINISHED_STATUSES = new Set(["succeeded", "success", "completed", "complete", "done", "ready"]);
   const ANNOUNCEMENT_FAILED_STATUSES = new Set(["failed", "error", "timed_out", "timeout", "interrupted"]);
   const ANNOUNCEMENT_CANCELLED_STATUSES = new Set(["cancelled", "canceled"]);
-  /** 一次播报里最多列出多少个任务：多分片同时结束时只给前 5 个 + 总数，避免长句无法听完。 */
+  /** 一次播报里最多列出多少个任务：多个任务同时结束时只给前 5 个 + 总数，避免长句无法听完。 */
   const ANNOUNCEMENT_MAX_ITEMS = 5;
 
   /**
    * 从 normalized 快照里收集「播报身份 → { name, status }」。
    *
-   * 键必须稳定：普通节点用 id/sessionId，fanout 的分片用 parentTaskId:shardId（shardId 只在
-   * 父任务内唯一）。名称只用于播报文案：root 固定「主代理」（与第一行同源），专家用 taskName，
-   * 分片优先 taskName、其次 shardId。任何字段缺失都不猜名称，回退到稳定 id。
+   * 键必须稳定：普通节点用 id/sessionId。名称只用于播报文案：root 固定「主代理」（与第一行同源），
+   * 专家用 taskName。任何字段缺失都不猜名称，回退到稳定 id。
    */
   function collectAnnouncementTasks(snapshot) {
     const result = new Map();
@@ -719,12 +690,6 @@
         : text(source.taskName, text(source.sessionId, fallbackName));
       result.set(id, { name: text(name, id), status: statusOf(source) });
       for (const child of Array.isArray(source.children) ? source.children : []) visit(child, id);
-      for (const shard of Array.isArray(source.shards) ? source.shards : []) {
-        const shardId = text(shard.shardId, null);
-        if (shardId === null) continue;
-        const shardName = text(shard.taskName, shardId);
-        result.set(id + ":" + shardId, { name: shardName, status: statusOf(shard) });
-      }
     };
     visit(root, "主代理");
     return result;
@@ -861,8 +826,8 @@
 
   // 只暴露兄弟模块与主 IIFE 实际消费的符号（无全量外挂）。
   global[SYMBOL] = Object.freeze({
-    ACTIVE_STATUSES, ANNOUNCEMENT_MAX_ITEMS, ATTEMPT_STATUS_LABELS, BRAND_ICON_PATHS,
-    EXPERT_GROUP_TAB_IDS, FANOUT_SETTLED_STATUSES, OTHER_RIGHTBAR_WIDTH_RATIO, RETRY_STATUSES,
+    ANNOUNCEMENT_MAX_ITEMS, ATTEMPT_STATUS_LABELS, BRAND_ICON_PATHS,
+    EXPERT_GROUP_TAB_IDS, OTHER_RIGHTBAR_WIDTH_RATIO,
     RIGHTBAR_DOCK_HOST_ATTRIBUTE, RIGHTBAR_DOCK_HOST_VALUE, RIGHTBAR_FLOAT_SELECTOR, RIGHTBAR_FLOAT_TITLE_SELECTOR,
     RIGHTBAR_PANEL_SELECTOR, RIGHTBAR_PANEL_SESSION_ATTRIBUTE, RIGHTBAR_PANE_COLUMN_ATTRIBUTE, RIGHTBAR_PANE_ID_ATTRIBUTE,
     RIGHTBAR_PANE_SELECTOR, RIGHTBAR_SPLIT_ATTRIBUTE, RIGHTBAR_SPLIT_SELECTOR, RIGHTBAR_STRIP_TABS_ATTRIBUTE,
@@ -878,7 +843,7 @@
     clampRightbarWidthRatio, closeSettleReason, collectAnnouncementTasks, collectSnapshotSessionIds,
     failureSummaryText, finiteNumber, formatClockText, formatCompactDuration,
     formatDurationText, formatIsoText, isFailureStatusOf, isGeneratedExpertGroupTabId,
-    latestShardChildIdOf, mergedRoleLabelsOf, modelApi, modelFunction,
+    mergedRoleLabelsOf, modelApi, modelFunction,
     normalizeHostMeta, normalizeSessionModelOverrides, normalizeSessionModelSelection, normalizeSessionModelView,
     object, resolveExpertRightbarWidthRatio, retryWarningThreshold, roleLabelFor,
     safeNormalize, sessionModelModelOptions, sessionModelOrchestratorOf, sessionModelRolesOf, sessionModelRowKeysOf, sessionModelSelectionEquals,

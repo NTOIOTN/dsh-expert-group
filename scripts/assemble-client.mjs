@@ -1038,24 +1038,17 @@ export async function probeFreshnessFace(face) {
   record("catalog:older-generation", boundary.acceptCatalogResponse({ generation: 1, groups: [{ id: "older" }] }));
   record("catalog:value-overrides-groups", boundary.acceptCatalogResponse({ generation: 3, value: { groups: [{ id: "explicit" }] } }));
 
-  const fanoutFirst = boundary.beginRequest("fanout", "root-1");
-  record("fanout:first", boundary.acceptFanoutSnapshot({ sessionId: "root-1", generation: 1, cursor: 5, snapshot: { tasks: ["new"] }, requestToken: fanoutFirst }));
-  const fanoutEvents = boundary.beginRequest("fanout", "root-1");
-  record("fanout:events-newer", boundary.acceptFanoutEvents({ sessionId: "root-1", generation: 2, cursor: 6, events: ["event"], requestToken: fanoutEvents }));
-  const fanoutStale = boundary.beginRequest("fanout", "root-1");
-  record("fanout:older-cursor", boundary.acceptFanoutSnapshot({ sessionId: "root-1", generation: 2, cursor: 4, snapshot: { tasks: ["old"] }, requestToken: fanoutStale }));
-  const fanoutInvalid = boundary.beginRequest("fanout", "root-1");
-  record("fanout:invalid-generation", boundary.acceptFanoutSnapshot({ sessionId: "root-1", generation: -1, cursor: 7, requestToken: fanoutInvalid }));
-  record("fanout:action-fresh", boundary.acceptFanoutAction({ sessionId: "root-1", generation: 2, requestToken: boundary.beginRequest("fanout-action", "root-1") }));
-  record("fanout:action-stale-generation", boundary.acceptFanoutAction({ sessionId: "root-1", generation: 1, requestToken: boundary.beginRequest("fanout-action", "root-1") }));
-  record("fanout:action-stale-session", boundary.acceptFanoutAction({ sessionId: "root-2", generation: 2, requestToken: boundary.beginRequest("fanout-action", "root-2") }));
-
-  // session 切换：旧 session 的迟到响应一律拒绝，且新 session 的游标从零重新开始。
-  const lateToken = boundary.beginRequest("fanout", "root-1");
+  // session 切换：旧 session 的迟到响应一律拒绝，新 session 自己的请求立即可用。
+  // 这两条不变量与具体通道无关（代次 + 请求令牌判据在每条 accept 通道上都一样），
+  // 因此由仍保留的 catalog 通道覆盖：切换前发出的请求在切换后到达必须被拒绝，
+  // 切换后重新发出的请求必须被接受。
+  const lateToken = boundary.beginRequest("catalog", "late");
   record("session:switch", boundary.beginSession("root-2"));
-  record("session:late-old-session", boundary.acceptFanoutSnapshot({ sessionId: "root-1", generation: 9, cursor: 99, snapshot: { tasks: ["late"] }, requestToken: lateToken }));
+  record("session:late-old-session", boundary.acceptCatalogResponse({ generation: 3, groups: [{ id: "late" }], requestToken: lateToken }));
   record("session:is-session-current", [boundary.isSessionCurrent(lateToken), boundary.isCurrent(lateToken)]);
-  record("session:new-session-fresh", boundary.acceptFanoutSnapshot({ sessionId: "root-2", generation: 0, cursor: 0, snapshot: { tasks: [] }, requestToken: boundary.beginRequest("fanout", "root-2") }));
+  // 切换后重新发起的请求由新代次签发，因此必须被接受（generation 继续单调，不再是「从零开始」：
+  // catalog 是全局通道，会话切换不重置它的 generation）。
+  record("session:new-session-fresh", boundary.acceptCatalogResponse({ generation: 4, groups: [{ id: "fresh" }], requestToken: boundary.beginRequest("catalog", "fresh") }));
   record("session:snapshot", boundary.snapshot());
 
   // dispose：所有迟到响应一律拒绝，且不再通知订阅者。

@@ -1211,81 +1211,23 @@
   }
 
   /**
-   * 管理行：观察者优先开关、角色并发上限与角色默认超时（秒 ↔ 毫秒只在 UI 换算）。
+   * 管理行：观察者优先开关。
+   *
+   * fan-out 移除后，本行原有的「角色并发上限」与「角色默认超时」两个控件一并删除：它们
+   * 只服务已删除的 fan-out 调度，留着就是不可达的死控件。旧 settings 文档里的
+   * roleConcurrencyLimit / roleTimeoutMs 仍是 Host 的惰性兼容输入（可读、可保存、不报错），
+   * 客户端只是不再显示、不再读取、不再回写它们。
    */
   function renderSettingsManagementRow(view) {
     const {
-      draft, editDraft, saving, t, tExtra,
+      draft, editDraft, saving, t,
     } = view;
-    // 宿主名额与封顶后的实际生效值并进原生 title（不新增可见摘要区块）。
-    // 两个数都取 Host meta 的**已保存**口径：草稿未保存时绝不能把预览值标成「实际生效」。
-    // 名额/生效值读不到（null / 非法）时显示占位「—」，既不当作 0 也不封顶。
-    const cap = view.hostMeta?.hostConcurrencyCap;
-    const eff = view.hostMeta?.effectiveRoleConcurrencyLimit;
 
     const managementRow = (
         react.createElement("div", { className: "deg_settings_row deg_settings_management_row" },
           react.createElement("label", { className: "deg_settings_checkbox" },
             react.createElement("input", { type: "checkbox", "aria-label": t("settings.observerPreferred"), checked: draft.observerPreferred, disabled: saving, onChange: (event) => editDraft((previous) => ({ ...previous, observerPreferred: event.target.checked })) }),
-            react.createElement("span", { className: "deg_settings_label" }, t("settings.observerPreferred"))),
-          // 管理行三个部分都是直接子节点，间距由容器统一给出（与任务行/统一行同节奏）。
-          react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-concurrency-limit" },
-            react.createElement("span", { className: "deg_settings_label" }, t("settings.concurrencyLimit")),
-            react.createElement("input", {
-              id: "deg-settings-role-concurrency-limit",
-              type: "number",
-              "aria-label": t("settings.concurrencyLimit"),
-              // 与相邻「角色默认超时」输入框一致：原生 title 说明取值范围与默认值（悬停可见）；
-              // 末尾追加当前宿主名额与封顶后的实际生效值。
-              title: t("settings.concurrencyLimit.title") + " · " + tExtra("settings.cap.host", {
-                host: cap > 0 ? cap : "—",
-                eff: eff > 0 ? eff : "—",
-              }),
-              min: 1,
-              max: 64,
-              step: 1,
-              inputMode: "numeric",
-              value: draft.roleConcurrencyLimit,
-              disabled: saving,
-              onChange: (event) => {
-                const raw = event.target.value;
-                const number = raw === "" ? null : Number(raw);
-                editDraft((previous) => ({
-                  ...previous,
-                  roleConcurrencyLimit: raw === ""
-                    ? ""
-                    : Number.isFinite(number) ? number : previous.roleConcurrencyLimit,
-                }));
-              },
-            })),
-          // 角色级默认超时（票据 06）：设置页以**秒**展示与编辑（0 = 不启用），提交时换算成
-          // Host 的毫秒字段 roleTimeoutMs；与并发上限同一行的紧凑布局。
-          // 精度与边界由 Host 与管理器共同保证；这里只提供步进与可访问名称。
-          react.createElement("label", { className: "deg_settings_control", htmlFor: "deg-settings-role-timeout-ms" },
-            react.createElement("span", { className: "deg_settings_label" }, t("settings.roleTimeout")),
-            react.createElement("input", {
-              id: "deg-settings-role-timeout-ms",
-              type: "number",
-              "aria-label": t("settings.roleTimeout.aria"),
-              title: t("settings.roleTimeout.title"),
-              min: 0,
-              max: 86400,
-              step: 1,
-              inputMode: "numeric",
-              value: draft.roleTimeoutMs === "" ? "" : draft.roleTimeoutMs / 1000,
-              disabled: saving,
-              onChange: (event) => {
-                const raw = event.target.value;
-                const seconds = raw === "" ? null : Number(raw);
-                editDraft((previous) => ({
-                  ...previous,
-                  // 草稿与 Host 字段保持毫秒；UI 只做秒 ↔ 毫秒换算，整秒取整。
-                  roleTimeoutMs: raw === ""
-                    ? ""
-                    : Number.isFinite(seconds) ? Math.round(seconds) * 1000 : previous.roleTimeoutMs,
-                }));
-              },
-            })))
+            react.createElement("span", { className: "deg_settings_label" }, t("settings.observerPreferred"))))
     );
 
     return managementRow;
@@ -1337,12 +1279,8 @@
   function renderSettingsBody(view, actions) {
     const {
       candidatesError, catalogAvailable, directoryState, draft, error, hasUnsavedChanges, modelConfigHost, modelFieldsChanged,
-      roleLabelOf, roles, save, saved, saving, settingsSnapshot, t, tExtra,
+      roleLabelOf, roles, save, saved, saving, settingsSnapshot, t,
     } = view;
-    // 配置值被宿主名额封顶时，在既有保存状态位尾部补一句显式提示（不新增独立摘要区块）。
-    // 判定只读 Host meta 的**已保存** roleConcurrencyLimit：草稿未保存时不误报受限。
-    // 名额读不到（null / 非法）按不封顶处理：与 Host 的 effectiveRoleConcurrencyLimitWithHostCap 同口径。
-    const capLimit = view.hostMeta?.hostConcurrencyCap;
 
       const modelConfigSection = typeof modelConfigHost === "undefined" || modelConfigHost === null
         ? null
@@ -1406,11 +1344,10 @@
       modelPageDeleteDialog,
         react.createElement("div", { className: "deg_settings_footer" },
           react.createElement("span", { className: "deg_settings_status", role: "status" },
-            (saved ? t("settings.saved") : hasUnsavedChanges ? t("settings.unsaved") : "")
-            + (capLimit > 0 && view.hostMeta?.roleConcurrencyLimit > capLimit ? tExtra("settings.cap.lim") : "")),
+            saved ? t("settings.saved") : hasUnsavedChanges ? t("settings.unsaved") : ""),
           react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving, onClick: actions.discard }, t("settings.discard")),
           // 票据 20：目录不可用只在本次草稿含模型字段变更时禁用保存；通知、任务开关、
-          // 提示词、并发/超时等与模型无关的字段必须照常可保存。
+          // 提示词等与模型无关的字段必须照常可保存。
           react.createElement("button", { type: "button", className: "deg_btn", disabled: !hasUnsavedChanges || saving || (modelFieldsChanged && !catalogAvailable) || settingsSnapshot.writable !== true, onClick: save }, saving ? t("settings.saving") : t("settings.save"))));
   }
 
